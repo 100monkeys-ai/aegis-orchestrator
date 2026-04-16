@@ -39,8 +39,8 @@ use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig, WithToni
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing::{info, warn};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod auth;
 mod commands;
@@ -53,7 +53,7 @@ use commands::{
     InitArgs, NodeCommand, RestartArgs, SecretCommand, StatusArgs, TaskCommand, UninstallArgs,
     UpArgs, WorkflowCommand,
 };
-use output::{structured_output_unsupported, OutputFormat};
+use output::{OutputFormat, structured_output_unsupported};
 
 /// AEGIS Agent Host - Enable autonomous agent execution
 #[derive(Parser)]
@@ -220,10 +220,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load config first to initialize logging properly
-    let config = aegis_orchestrator_core::domain::node_config::NodeConfigManifest::load_or_default(
-        cli.config.clone(),
-    )
-    .unwrap_or_default();
+    let config =
+        match aegis_orchestrator_core::domain::node_config::NodeConfigManifest::load_or_default(
+            cli.config.clone(),
+        ) {
+            Ok(config) => config,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    config_path = ?cli.config,
+                    "Failed to load configuration, falling back to defaults"
+                );
+                aegis_orchestrator_core::domain::node_config::NodeConfigManifest::default()
+            }
+        };
 
     // Initialize logging
     let log_provider = init_logging(
@@ -375,12 +385,13 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Sd
                     }
 
                     if let Some(ca) = &cfg.tls.ca_cert_path {
-                        if let Ok(pem) = std::fs::read(ca) {
-                            let cert = tonic::transport::Certificate::from_pem(pem);
-                            let tls_config =
-                                tonic::transport::ClientTlsConfig::new().ca_certificate(cert);
-                            exporter_builder = exporter_builder.with_tls_config(tls_config);
-                        }
+                        let pem = std::fs::read(ca).with_context(|| {
+                            format!("Failed to read OTLP gRPC CA certificate from path: {ca}")
+                        })?;
+                        let cert = tonic::transport::Certificate::from_pem(pem);
+                        let tls_config =
+                            tonic::transport::ClientTlsConfig::new().ca_certificate(cert);
+                        exporter_builder = exporter_builder.with_tls_config(tls_config);
                     }
 
                     exporter_builder

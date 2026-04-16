@@ -12,6 +12,8 @@ use tracing::{debug, info};
 
 use super::log_sanitizer::sanitize_url;
 
+const MAX_SEARCH_RESULTS: usize = 20;
+
 pub struct ReqwestWebToolAdapter {
     api_key: Option<String>,
     brave_base_url: String,
@@ -64,13 +66,13 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
         let api_key = match &self.api_key {
             Some(k) => k.clone(),
             None => {
-                return Err(SealSessionError::SignatureVerificationFailed(
+                return Err(SealSessionError::ConfigurationError(
                     "web.search is not configured: add api_key to the web.search entry in spec.builtin_dispatchers (e.g. api_key: \"env:BRAVE_SEARCH_API_KEY\")".into(),
                 ))
             }
         };
 
-        let count = request.max_results.min(20);
+        let count = request.max_results.min(MAX_SEARCH_RESULTS);
         let url = format!("{}/res/v1/web/search", self.brave_base_url);
 
         let client = reqwest::Client::new();
@@ -129,7 +131,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
         request: WebFetchRequest,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         if !request.url.starts_with("http://") && !request.url.starts_with("https://") {
-            return Err(SealSessionError::SignatureVerificationFailed(format!(
+            return Err(SealSessionError::InvalidArguments(format!(
                 "Invalid URL: {}. Must start with http:// or https://",
                 request.url
             )));

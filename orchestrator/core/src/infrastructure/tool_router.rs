@@ -16,6 +16,13 @@
 //! - ADR-033: Orchestrator-Mediated MCP Tool Routing
 //! - ADR-035: Signed Envelope Attestation Layer (SEAL)
 //! - ADR-038: Agent Iteration and Tool Gateway
+//!
+//! # Tool naming conventions
+//!
+//! Builtin tool names are defined canonically in `BUILTIN_TOOL_DEFINITIONS`.
+//! For filesystem tools, the canonical create-directory name is `fs.create_dir`.
+//! The alternate dotted form `fs.create.dir` is retained as a legacy compatibility
+//! alias and should not be used for new integrations.
 
 use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::{DomainError, ToolRegistry, ToolServer, ToolServerId, ToolServerStatus};
@@ -225,7 +232,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.workflow.validate", "Validate a workflow manifest against the schema."),
     ("aegis.workflow.update", "Updates an existing Workflow manifest in the registry."),
     ("aegis.workflow.export", "Exports a Workflow manifest by name."),
-    ("aegis.workflow.delete", "Removes a registered workflow from the registry by name."),
+    ("aegis.workflow.delete", "Removes a registered workflow from the registry by workflow name (not UUID)."),
     ("aegis.workflow.run", "Executes a registered workflow by name with optional input parameters."),
     ("aegis.workflow.generate", "Generates a Workflow manifest from a natural-language objective."),
     ("aegis.workflow.logs", "Returns paginated workflow execution events."),
@@ -429,9 +436,7 @@ impl ToolRouter {
         index.clear();
 
         for (server_id, server) in servers.iter() {
-            if server.status == ToolServerStatus::Running
-                || server.status == ToolServerStatus::Stopped
-            {
+            if server.status == ToolServerStatus::Running {
                 for capability in &server.capabilities {
                     index.insert(capability.clone(), *server_id);
                 }
@@ -1653,9 +1658,9 @@ impl ToolServerManager {
                     !stdout.contains("No tasks")
                 }
                 Err(_) => {
-                    // If tasklist itself fails, assume the process is alive
-                    // to avoid false-positive unhealthy marks
-                    true
+                    // If tasklist itself fails, fail closed and report unhealthy.
+                    // This avoids masking real process failures.
+                    false
                 }
             }
         }

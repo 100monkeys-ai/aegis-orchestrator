@@ -83,6 +83,7 @@ use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::{
     application::{
+        CorrelatedActivityStreamService,
         agent::AgentLifecycleService,
         execution::ExecutionService,
         execution::StandardExecutionService,
@@ -90,7 +91,6 @@ use aegis_orchestrator_core::{
         register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
         validation_service::ValidationService,
-        CorrelatedActivityStreamService,
     },
     domain::{
         cluster::{
@@ -98,12 +98,13 @@ use aegis_orchestrator_core::{
             NodeClusterRepository, NodeId, NodeRole,
         },
         iam::IdentityProvider,
-        node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
+        node_config::{IamConfig, IamRealmConfig, NodeConfigManifest, resolve_env_value},
         repository::AgentRepository,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
     },
     infrastructure::{
+        TemporalEventListener,
         event_bus::EventBus,
         iam::StandardIamService,
         llm::registry::ProviderRegistry,
@@ -115,9 +116,8 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::{connect_container_runtime, ContainerRuntime},
+        runtime::{ContainerRuntime, connect_container_runtime},
         temporal_client::TemporalClient,
-        TemporalEventListener,
     },
 };
 
@@ -498,16 +498,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036
     // Note: The Docker daemon relies on this to mount volumes from the host environment.
-    let nfs_server_host = config.spec.runtime.nfs_server_host.as_ref().and_then(|host| {
-        match resolve_env_value(host) {
+    let nfs_server_host = config
+        .spec
+        .runtime
+        .nfs_server_host
+        .as_ref()
+        .and_then(|host| match resolve_env_value(host) {
             Ok(resolved) if !resolved.is_empty() => Some(resolved),
             Ok(_) => None,
             Err(e) => {
-                tracing::debug!("Failed to resolve NFS server host: {}. NFS mounts will default to '127.0.0.1' which works for native Linux/WSL2 deployments, but will fail with 'connection refused' in Docker Desktop unless set to 'host.docker.internal'.", e);
+                tracing::debug!(
+                    "Failed to resolve NFS server host: {}. Using default 127.0.0.1.",
+                    e
+                );
                 None
             }
-        }
-    });
+        });
 
     // Resolve Docker network mode (supports env:VAR_NAME syntax)
     let network_mode = config
@@ -545,12 +551,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             "Failed to create FUSE mount prefix directory — FUSE transport will be unavailable"
         );
     }
-
-    // The FUSE daemon is created after the NFS gateway (which owns the FSAL).
-    // We store None here and set it after nfs_gateway is available.
-    let fuse_daemon_placeholder: Option<
-        Arc<aegis_orchestrator_core::infrastructure::fuse::daemon::FuseFsalDaemon>,
-    > = None;
 
     // Connect to the host-side FUSE daemon's FuseMountService if configured (ADR-107).
     // Absence of spec.runtime.fuse_daemon_endpoint means in-process FUSE mode — no error, no retry.
@@ -597,44 +597,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             None
         }
     };
-
-    let runtime = Arc::new(
-        ContainerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::ContainerRuntimeConfig {
-            bootstrap_script: config.spec.runtime.bootstrap_script.clone(),
-            socket_path: config.spec.runtime.container_socket_path.clone(),
-            network_mode: network_mode.clone(),
-            orchestrator_url,
-            nfs_server_host: nfs_server_host.clone(),
-            nfs_port: config.spec.runtime.nfs_port,
-            nfs_mountport: config.spec.runtime.nfs_mountport,
-            event_bus: event_bus.clone(),
-            credential_resolver: Arc::new(
-                aegis_orchestrator_core::infrastructure::image_manager::NodeConfigCredentialResolver::new(
-                    config.spec.registry_credentials.clone(),
-                ),
-            ),
-            fuse_daemon: fuse_daemon_placeholder.clone(),
-            fuse_mount_prefix: fuse_mount_prefix.clone(),
-            fuse_mount_client: fuse_mount_client.clone(),
-        })
-        .context("Failed to initialize Docker runtime")?,
-    );
-
-    // Only healthcheck Docker if it's the configured isolation mode
-    if config.spec.runtime.default_isolation == "docker" {
-        runtime.healthcheck().await
-            .context("Docker healthcheck failed. Docker isolation is configured but Docker daemon is not accessible.")?;
-        info!("Docker runtime connected and healthy");
-    } else {
-        info!(
-            isolation_mode = %config.spec.runtime.default_isolation,
-            "Docker runtime initialized (healthcheck skipped)"
-        );
-    }
-
-    let supervisor = Arc::new(
-        Supervisor::new(runtime.clone()).with_execution_repository(execution_repo.clone()),
-    );
 
     // Initialize volume service (with SeaweedFS or fallback to local)
     info!("Initializing volume service...");
@@ -736,40 +698,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     });
     info!("Volume cleanup background task spawned (interval: 5 minutes)");
 
-    let agent_container_reaper_runtime = runtime.clone();
-    let agent_container_reaper_execution_repo = execution_repo.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        // First tick fires immediately — clean up any orphans left from a prior crash.
-        let mut first_run = true;
-        loop {
-            interval.tick().await;
-            if first_run {
-                tracing::info!("Running startup orphan container cleanup");
-                first_run = false;
-            }
-            match cleanup_orphaned_agent_containers(
-                agent_container_reaper_runtime.clone(),
-                agent_container_reaper_execution_repo.clone(),
-            )
-            .await
-            {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!(
-                            "Agent container cleanup: {} orphaned container(s) deleted",
-                            count
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Agent container cleanup failed: {}", e);
-                }
-            }
-        }
-    });
-    info!("Agent container cleanup background task spawned (interval: 5 minutes)");
-
     // Initialize Storage Event Persister for audit trail (ADR-036)
     info!("Initializing Storage Event Persister...");
     let storage_event_repo: Arc<
@@ -843,6 +771,78 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
         Some(Arc::new(daemon))
     };
+
+    let runtime = Arc::new(
+        ContainerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::ContainerRuntimeConfig {
+            bootstrap_script: config.spec.runtime.bootstrap_script.clone(),
+            socket_path: config.spec.runtime.container_socket_path.clone(),
+            network_mode: network_mode.clone(),
+            orchestrator_url,
+            nfs_server_host: nfs_server_host.clone(),
+            nfs_port: config.spec.runtime.nfs_port,
+            nfs_mountport: config.spec.runtime.nfs_mountport,
+            event_bus: event_bus.clone(),
+            credential_resolver: Arc::new(
+                aegis_orchestrator_core::infrastructure::image_manager::NodeConfigCredentialResolver::new(
+                    config.spec.registry_credentials.clone(),
+                ),
+            ),
+            fuse_daemon: fuse_daemon.clone(),
+            fuse_mount_prefix: fuse_mount_prefix.clone(),
+            fuse_mount_client: fuse_mount_client.clone(),
+        })
+        .context("Failed to initialize Docker runtime")?,
+    );
+
+    // Only healthcheck Docker if it's the configured isolation mode
+    if config.spec.runtime.default_isolation == "docker" {
+        runtime.healthcheck().await
+            .context("Docker healthcheck failed. Docker isolation is configured but Docker daemon is not accessible.")?;
+        info!("Docker runtime connected and healthy");
+    } else {
+        info!(
+            isolation_mode = %config.spec.runtime.default_isolation,
+            "Docker runtime initialized (healthcheck skipped)"
+        );
+    }
+
+    let supervisor = Arc::new(
+        Supervisor::new(runtime.clone()).with_execution_repository(execution_repo.clone()),
+    );
+
+    let agent_container_reaper_runtime = runtime.clone();
+    let agent_container_reaper_execution_repo = execution_repo.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        // First tick fires immediately — clean up any orphans left from a prior crash.
+        let mut first_run = true;
+        loop {
+            interval.tick().await;
+            if first_run {
+                tracing::info!("Running startup orphan container cleanup");
+                first_run = false;
+            }
+            match cleanup_orphaned_agent_containers(
+                agent_container_reaper_runtime.clone(),
+                agent_container_reaper_execution_repo.clone(),
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(
+                            "Agent container cleanup: {} orphaned container(s) deleted",
+                            count
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Agent container cleanup failed: {}", e);
+                }
+            }
+        }
+    });
+    info!("Agent container cleanup background task spawned (interval: 5 minutes)");
 
     // Initialize security context repository early — needed by StandardAgentLifecycleService (ADR-102).
     let security_context_repo: Arc<
@@ -1873,6 +1873,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
 
+    // Keep sweeper shutdown sender alive until daemon shutdown.
+    let mut _health_sweeper_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+
     // ─── Cluster gRPC server (ADR-059) ─────────────────────────────────────
     // When clustering is enabled, start a second gRPC server on the dedicated
     // cluster port (default 50056) that exposes the inter-node
@@ -2004,11 +2007,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 let primary_local_path = std::env::temp_dir().join("aegis");
                 let fallback_local_path = std::env::temp_dir();
                 let local_provider = Arc::new(
-                    LocalHostStorageProvider::new(&primary_local_path).unwrap_or_else(|_| {
-                        LocalHostStorageProvider::new(&fallback_local_path).expect(
-                            "failed to initialize fallback local storage provider in temp directory",
-                        )
-                    }),
+                    match LocalHostStorageProvider::new(&primary_local_path) {
+                        Ok(provider) => provider,
+                        Err(primary_err) => {
+                            match LocalHostStorageProvider::new(&fallback_local_path) {
+                                Ok(provider) => provider,
+                                Err(fallback_err) => {
+                                    panic!(
+                                        "Failed to initialize local storage provider. Primary path failed: {}. Fallback temp directory failed: {}. Ensure the temp directory is writable and has sufficient space.",
+                                        primary_err, fallback_err
+                                    );
+                                }
+                            }
+                        }
+                    },
                 );
                 let seal_provider = Arc::new(SealStorageProvider::new());
                 let storage_router = Arc::new(StorageRouter::new(
@@ -2069,10 +2081,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 tokio::spawn(async move {
                     sweeper.run(shutdown_rx).await;
                 });
-                // Deliberately forget the sender so the channel stays open for the
-                // lifetime of the process; the sweeper loop exits when the process
-                // terminates.
-                std::mem::forget(shutdown_tx);
+                // Keep sender in lifecycle state so it is dropped during daemon
+                // shutdown, allowing the sweeper to exit cleanly.
+                _health_sweeper_shutdown = Some(shutdown_tx);
                 tracing::info!(
                     stale_threshold_secs = stale_threshold.as_secs(),
                     sweep_interval_secs = sweep_interval.as_secs(),
