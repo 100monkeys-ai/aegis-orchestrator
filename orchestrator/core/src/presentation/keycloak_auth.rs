@@ -81,6 +81,7 @@ where
 /// These endpoints use other auth mechanisms (SEAL attestation, HMAC, or are unauthenticated).
 const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/health",
+    "/v1/billing/prices",
     "/v1/dispatch-gateway",
     "/v1/seal/attest",
     "/v1/seal/invoke",
