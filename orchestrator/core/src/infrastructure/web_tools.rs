@@ -236,6 +236,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -273,6 +274,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
             .with_status(401)
             .with_body(r#"{"message":"Invalid API key"}"#)
             .create_async()
@@ -296,6 +298,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"web":null}"#)
