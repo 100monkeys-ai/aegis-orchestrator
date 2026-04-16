@@ -40,6 +40,7 @@
 pub mod agent;
 pub mod agent_scope;
 pub mod attestation_service;
+pub mod canvas_service;
 pub mod cluster;
 pub mod correlated_activity_stream;
 pub mod credential_service;

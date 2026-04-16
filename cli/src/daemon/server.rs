@@ -1714,6 +1714,35 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
 
+    // Initialize the Vibe-Code Canvas service (ADR-106 Wave C2). Enabled when
+    // a Postgres pool is configured — the canvas session repository and the
+    // git repo binding repository both require it. Until those repositories
+    // ship from Wave A2/B2/C1 migrations the service is None and the
+    // /v1/canvas/* handlers return 503.
+    let canvas_service: Option<
+        Arc<dyn aegis_orchestrator_core::application::canvas_service::CanvasService>,
+    > = db_pool.as_ref().map(|pool| {
+        let session_repo = Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::PostgresCanvasSessionRepository::new(
+                pool.clone(),
+            ),
+        );
+        let git_repo_repo = Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::PostgresGitRepoBindingRepository::new(
+                pool.clone(),
+            ),
+        );
+        Arc::new(
+            aegis_orchestrator_core::application::canvas_service::StandardCanvasService::new(
+                session_repo,
+                volume_service.clone(),
+                git_repo_repo,
+                event_bus.clone(),
+            ),
+        )
+            as Arc<dyn aegis_orchestrator_core::application::canvas_service::CanvasService>
+    });
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -1762,6 +1791,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         stimulus_service: None,
         user_volume_service,
         file_operations_service,
+        canvas_service,
         config: config.clone(),
         start_time: std::time::Instant::now(),
         keycloak_admin: colony_keycloak_admin,
