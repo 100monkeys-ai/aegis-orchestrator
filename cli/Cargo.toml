@@ -80,6 +80,9 @@ tonic = { workspace = true }
 prost = { workspace = true }
 parking_lot = { workspace = true }
 
+# Stripe billing (optional at runtime — feature-gated by STRIPE_SECRET_KEY env)
+stripe = { package = "async-stripe", version = "0.39", features = ["runtime-tokio-hyper"] }
+
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

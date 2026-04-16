@@ -1766,6 +1766,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         start_time: std::time::Instant::now(),
         keycloak_admin: colony_keycloak_admin,
         tenant_repo: colony_tenant_repo,
+        billing_repo: db_pool.as_ref().map(|pool| {
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PostgresBillingRepository::new(
+                    pool.clone(),
+                ),
+            ) as Arc<dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository>
+        }),
     };
 
     info!("Building router...");

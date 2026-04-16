@@ -26,6 +26,9 @@ use crate::daemon::handlers::approvals::{
     approve_request_handler, get_pending_approval_handler, list_pending_approvals_handler,
     reject_request_handler,
 };
+use crate::daemon::handlers::billing::{
+    create_checkout_handler, create_portal_handler, get_subscription_handler, list_invoices_handler,
+};
 use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_handler};
 use crate::daemon::handlers::colony::{
     get_saml_config, get_subscription, invite_member, list_members, remove_member, set_saml_config,
@@ -304,6 +307,11 @@ pub(crate) fn create_router(
         .route("/v1/colony/roles", put(update_role))
         .route("/v1/colony/saml", get(get_saml_config).put(set_saml_config))
         .route("/v1/colony/subscription", get(get_subscription))
+        // Stripe billing integration (BC-12)
+        .route("/v1/billing/checkout", post(create_checkout_handler))
+        .route("/v1/billing/portal", post(create_portal_handler))
+        .route("/v1/billing/subscription", get(get_subscription_handler))
+        .route("/v1/billing/invoices", get(list_invoices_handler))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
