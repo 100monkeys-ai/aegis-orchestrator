@@ -64,10 +64,10 @@
 use crate::domain::agent::AgentId;
 use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
-    AgentLifecycleEvent, ContainerRunEvent, CredentialEvent, ExecutionEvent, GitRepoEvent,
-    IamEvent, ImageManagementEvent, LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent,
-    SealEvent, SecretEvent, StimulusEvent, StorageEvent, SwarmEvent, TenantEvent, ValidationEvent,
-    VolumeEvent, WorkflowEvent,
+    AgentLifecycleEvent, CanvasEvent, ContainerRunEvent, CredentialEvent, ExecutionEvent,
+    GitRepoEvent, IamEvent, ImageManagementEvent, LearningEvent, MCPToolEvent, PolicyEvent,
+    RateLimitEvent, SealEvent, SecretEvent, StimulusEvent, StorageEvent, SwarmEvent, TenantEvent,
+    ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -98,6 +98,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Swarm(_) => "swarm",
         DomainEvent::Credential(_) => "credential",
         DomainEvent::GitRepo(_) => "git_repo",
+        DomainEvent::Canvas(_) => "canvas",
     }
 }
 
@@ -137,6 +138,8 @@ pub enum DomainEvent {
     Credential(CredentialEvent),
     /// BC-7 Git repository binding lifecycle events (ADR-081)
     GitRepo(GitRepoEvent),
+    /// BC-7 Vibe-Code Canvas session lifecycle events (ADR-106)
+    Canvas(CanvasEvent),
 }
 
 impl DomainEvent {
@@ -148,7 +151,8 @@ impl DomainEvent {
             | DomainEvent::Tenant(_)
             | DomainEvent::RateLimit(_)
             | DomainEvent::Credential(_)
-            | DomainEvent::GitRepo(_) => None,
+            | DomainEvent::GitRepo(_)
+            | DomainEvent::Canvas(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -373,7 +377,8 @@ impl DomainEvent {
             | DomainEvent::RateLimit(_)
             | DomainEvent::Swarm(_)
             | DomainEvent::Credential(_)
-            | DomainEvent::GitRepo(_) => None,
+            | DomainEvent::GitRepo(_)
+            | DomainEvent::Canvas(_) => None,
         }
     }
 
@@ -577,6 +582,13 @@ impl DomainEvent {
                 GitRepoEvent::BindingDeleted { deleted_at, .. } => *deleted_at,
                 GitRepoEvent::CommitMade { committed_at, .. } => *committed_at,
                 GitRepoEvent::PushCompleted { pushed_at, .. } => *pushed_at,
+            },
+            DomainEvent::Canvas(event) => match event {
+                CanvasEvent::SessionCreated { created_at, .. } => *created_at,
+                CanvasEvent::FilesWrittenByAgent { written_at, .. } => *written_at,
+                CanvasEvent::GitCommitMade { committed_at, .. } => *committed_at,
+                CanvasEvent::GitPushed { pushed_at, .. } => *pushed_at,
+                CanvasEvent::SessionTerminated { terminated_at, .. } => *terminated_at,
             },
         }
     }
@@ -785,6 +797,13 @@ impl DomainEvent {
                 GitRepoEvent::CommitMade { .. } => "git_repo_commit_made",
                 GitRepoEvent::PushCompleted { .. } => "git_repo_push_completed",
             },
+            DomainEvent::Canvas(event) => match event {
+                CanvasEvent::SessionCreated { .. } => "canvas_session_created",
+                CanvasEvent::FilesWrittenByAgent { .. } => "canvas_files_written_by_agent",
+                CanvasEvent::GitCommitMade { .. } => "canvas_git_commit_made",
+                CanvasEvent::GitPushed { .. } => "canvas_git_pushed",
+                CanvasEvent::SessionTerminated { .. } => "canvas_session_terminated",
+            },
         }
     }
 
@@ -810,6 +829,7 @@ impl DomainEvent {
             DomainEvent::Swarm(_) => "swarm",
             DomainEvent::Credential(_) => "credential",
             DomainEvent::GitRepo(_) => "git_repo",
+            DomainEvent::Canvas(_) => "canvas",
         }
     }
 
@@ -914,6 +934,7 @@ impl DomainEvent {
             DomainEvent::Swarm(_) => Some("swarm"),
             DomainEvent::Credential(_) => Some("credential"),
             DomainEvent::GitRepo(_) => Some("git_repo"),
+            DomainEvent::Canvas(_) => Some("canvas"),
         }
     }
 }
@@ -1047,6 +1068,11 @@ impl EventBus {
     /// Publish a git repo binding lifecycle event (BC-7 ADR-081)
     pub fn publish_git_repo_event(&self, event: GitRepoEvent) {
         self.publish(DomainEvent::GitRepo(event));
+    }
+
+    /// Publish a Vibe-Code Canvas session lifecycle event (BC-7 ADR-106)
+    pub fn publish_canvas_event(&self, event: CanvasEvent) {
+        self.publish(DomainEvent::Canvas(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1442,6 +1468,7 @@ impl AgentEventReceiver {
                 | CredentialEvent::CredentialGrantRevoked { .. } => false,
             },
             DomainEvent::GitRepo(_) => false, // Git repo binding events are tenant-scoped, not per-agent
+            DomainEvent::Canvas(_) => false, // Canvas session events are tenant-scoped, not per-agent
         }
     }
 }

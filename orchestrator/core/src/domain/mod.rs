@@ -38,6 +38,7 @@
 //! | [`llm`] | Cross-cutting | `LLMProvider` trait, LLM request/response value objects |
 //! | [`node_config`] | Infrastructure config | `NodeConfigManifest` parsed from `aegis-config.yaml` |
 //! | [`cluster`] | BC-7 Infrastructure & Hosting | `NodeCluster` aggregate, `NodePeer`, `NodeRouter` (ADR-059) |
+//! | [`canvas`] | BC-7 Storage Gateway | `CanvasSession` aggregate, `WorkspaceMode`, `CanvasTierLimits` (ADR-106) |
 //! | [`credential`] | BC-11 Secrets & Identity | `UserCredentialBinding` aggregate, `CredentialGrant`, `CredentialBindingRepository` (ADR-078) |
 //! | [`git_repo`] | BC-7 Storage Gateway | `GitRepoBinding` aggregate, `GitRef`, `CloneStrategy`, `GitRepoBindingRepository` (ADR-081) |
 //! | [`git_repo_tier_limits`] | BC-7 Storage Gateway | `GitRepoTierLimits` per-`ZaruTier` gating (ADR-081) |
@@ -47,6 +48,7 @@ pub mod agent;
 pub mod api_key;
 pub mod api_scope;
 pub mod billing;
+pub mod canvas;
 pub mod cluster;
 pub mod credential;
 pub mod discovery;
