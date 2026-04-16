@@ -283,14 +283,6 @@ pub trait WorkflowRepository: Send + Sync {
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError>;
 
-    /// Fetch the raw YAML source for a workflow by name (visible scope).
-    /// Returns `None` if the workflow does not exist or has no stored YAML source.
-    async fn find_yaml_source_by_name_visible(
-        &self,
-        tenant_id: &TenantId,
-        name: &str,
-    ) -> Result<Option<String>, RepositoryError>;
-
     /// Update the scope of an existing workflow (for promote/demote).
     async fn update_scope(
         &self,

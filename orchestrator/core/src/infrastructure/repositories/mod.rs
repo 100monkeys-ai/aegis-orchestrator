@@ -901,24 +901,6 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         Ok(None)
     }
 
-    async fn find_yaml_source_by_name_visible(
-        &self,
-        tenant_id: &TenantId,
-        name: &str,
-    ) -> Result<Option<String>, RepositoryError> {
-        use crate::infrastructure::workflow_parser::WorkflowParser;
-
-        let workflow = self.find_by_name_visible(tenant_id, name).await?;
-        match workflow {
-            Some(w) => {
-                let yaml = WorkflowParser::to_yaml(&w)
-                    .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-                Ok(Some(yaml))
-            }
-            None => Ok(None),
-        }
-    }
-
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,
