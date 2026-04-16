@@ -525,7 +525,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .filter(|e| e.agent_id == agent_id)
             .cloned()
             .collect();
-        results.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        results.sort_by_key(|e| Reverse(e.started_at));
         Ok(results.into_iter().take(limit).collect())
     }
 
@@ -550,7 +550,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .map(|tenant_execs| tenant_execs.values().cloned().collect())
             .unwrap_or_default();
         // Sort by started_at desc
-        execution_list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        execution_list.sort_by_key(|e| Reverse(e.started_at));
         Ok(execution_list.into_iter().take(limit).collect())
     }
 
