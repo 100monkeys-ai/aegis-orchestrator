@@ -27,9 +27,9 @@ use super::fsal_backend::{DirectFsalBackend, FsalBackend};
 use super::inode_table::{InodeTable, ROOT_INODE};
 
 use fuser::{
-    AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType as FuseFileType, Filesystem, INodeNo,
-    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyWrite, Request, WriteFlags,
+    AccessFlags, BsdFileFlags, Config as FuseConfig, Errno, FileAttr, FileHandle,
+    FileType as FuseFileType, Filesystem, INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request, SessionACL, WriteFlags,
 };
 use std::ffi::OsStr;
 use std::path::Path;
@@ -165,14 +165,17 @@ impl FuseFsalDaemon {
         // - allow_other: let the container user access the mount (requires /etc/fuse.conf)
         // - default_permissions: let the kernel enforce basic permission checks
         // - fsname: identifies this mount in /proc/mounts
-        let options = vec![
-            fuser::MountOption::FSName(format!("aegis-fsal-{}", context.volume_id)),
-            fuser::MountOption::AllowOther,
-            fuser::MountOption::DefaultPermissions,
-            fuser::MountOption::RW,
-        ];
+        let config = FuseConfig {
+            mount_options: vec![
+                fuser::MountOption::FSName(format!("aegis-fsal-{}", context.volume_id)),
+                fuser::MountOption::DefaultPermissions,
+                fuser::MountOption::RW,
+            ],
+            acl: SessionACL::All, // allow_other: let the container user access the mount
+            ..FuseConfig::default()
+        };
 
-        let session = fuser::spawn_mount2(fs, mountpoint, &options).map_err(|e| {
+        let session = fuser::spawn_mount2(fs, mountpoint, &config).map_err(|e| {
             FuseDaemonError::MountFailed {
                 path: mountpoint.display().to_string(),
                 error: e.to_string(),
@@ -309,7 +312,7 @@ impl Filesystem for FuseFsal {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -320,7 +323,7 @@ impl Filesystem for FuseFsal {
         let (parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -331,7 +334,7 @@ impl Filesystem for FuseFsal {
                 Ok(h) => h,
                 Err(e) => {
                     debug!(error = %e, "FUSE lookup failed");
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             };
@@ -359,7 +362,7 @@ impl Filesystem for FuseFsal {
                 // rather than EIO to allow retries.
                 debug!(error = %e, path = %child_path, "FUSE lookup getattr failed");
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "lookup", "result" => "error").increment(1);
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
             }
         }
     }
@@ -378,7 +381,7 @@ impl Filesystem for FuseFsal {
         let (_handle, path) = match self.resolve_inode(ino) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -399,7 +402,7 @@ impl Filesystem for FuseFsal {
             Err(e) => {
                 warn!(error = %e, ino = ino, path = %path, "FUSE getattr failed");
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "getattr", "result" => "error").increment(1);
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
             }
         }
     }
@@ -421,7 +424,7 @@ impl Filesystem for FuseFsal {
         let (handle, path) = match self.resolve_inode(ino) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -464,7 +467,7 @@ impl Filesystem for FuseFsal {
         let (handle, path) = match self.resolve_inode(ino) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -500,7 +503,7 @@ impl Filesystem for FuseFsal {
         let (_handle, dir_path) = match self.resolve_inode(ino) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -575,7 +578,7 @@ impl Filesystem for FuseFsal {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -586,7 +589,7 @@ impl Filesystem for FuseFsal {
         let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -663,7 +666,7 @@ impl Filesystem for FuseFsal {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -674,7 +677,7 @@ impl Filesystem for FuseFsal {
         let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -732,7 +735,7 @@ impl Filesystem for FuseFsal {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -743,7 +746,7 @@ impl Filesystem for FuseFsal {
         let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -773,7 +776,7 @@ impl Filesystem for FuseFsal {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -784,7 +787,7 @@ impl Filesystem for FuseFsal {
         let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -823,14 +826,14 @@ impl Filesystem for FuseFsal {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let newname_str = match newname.to_str() {
             Some(n) => n,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -848,7 +851,7 @@ impl Filesystem for FuseFsal {
         let (_from_handle, from_parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -856,7 +859,7 @@ impl Filesystem for FuseFsal {
         let (_to_handle, to_parent_path) = match self.resolve_inode(newparent_u64) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -915,7 +918,7 @@ impl Filesystem for FuseFsal {
         let (_handle, path) = match self.resolve_inode(ino) {
             Some(v) => v,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -932,7 +935,7 @@ impl Filesystem for FuseFsal {
                 reply.attr(&FUSE_TTL, &self.convert_attrs(&attrs, ino));
             }
             Err(_) => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
             }
         }
     }
@@ -1003,19 +1006,19 @@ impl Filesystem for FuseFsal {
 // Error mapping
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Map FSAL errors to POSIX errno values for FUSE responses.
-fn fsal_error_to_errno(e: &crate::domain::fsal::FsalError) -> i32 {
+/// Map FSAL errors to fuser `Errno` values for FUSE responses.
+fn fsal_error_to_errno(e: &crate::domain::fsal::FsalError) -> Errno {
     use crate::domain::fsal::FsalError;
     match e {
-        FsalError::UnauthorizedAccess { .. } => libc::EACCES,
-        FsalError::VolumeNotFound(_) => libc::ENOENT,
-        FsalError::VolumeNotAttached(_) => libc::ENOENT,
-        FsalError::PathSanitization(_) => libc::EINVAL,
-        FsalError::Storage(_) => libc::EIO,
-        FsalError::PolicyViolation(_) => libc::EACCES,
-        FsalError::InvalidFileHandle => libc::ESTALE,
-        FsalError::HandleDeserialization(_) => libc::EIO,
-        FsalError::QuotaExceeded { .. } => libc::ENOSPC,
+        FsalError::UnauthorizedAccess { .. } => Errno::EACCES,
+        FsalError::VolumeNotFound(_) => Errno::ENOENT,
+        FsalError::VolumeNotAttached(_) => Errno::ENOENT,
+        FsalError::PathSanitization(_) => Errno::EINVAL,
+        FsalError::Storage(_) => Errno::EIO,
+        FsalError::PolicyViolation(_) => Errno::EACCES,
+        FsalError::InvalidFileHandle => Errno::ESTALE,
+        FsalError::HandleDeserialization(_) => Errno::EIO,
+        FsalError::QuotaExceeded { .. } => Errno::ENOSPC,
     }
 }
 
