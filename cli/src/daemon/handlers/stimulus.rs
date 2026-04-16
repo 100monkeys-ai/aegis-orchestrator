@@ -177,6 +177,22 @@ pub(crate) async fn webhook_handler(
     };
 
     // Convert verified body bytes to String (treat as UTF-8 if possible, else base64)
+    // ── Stripe billing webhook shortcut ──────────────────────────────────────
+    // Stripe events carry structured JSON with `type` and `data` fields.
+    // Route them directly to the billing handler, then continue into the
+    // generic stimulus pipeline so that stimulus registrations still fire.
+    if source == "stripe" {
+        if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&guard.body) {
+            if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                super::billing::process_stripe_event(&state, event_type, &data).await;
+            }
+        }
+    }
+
     let content = String::from_utf8(guard.body.to_vec())
         .unwrap_or_else(|_| base64::engine::general_purpose::STANDARD.encode(&guard.body));
 
