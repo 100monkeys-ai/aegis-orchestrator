@@ -216,6 +216,11 @@ pub struct NodeConfigSpec {
     /// Protects against excessive memory usage. Defaults to 1000 if not configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_execution_list_limit: Option<usize>,
+
+    /// Stripe billing configuration (SaaS mode only).
+    /// If omitted, billing endpoints return 501 Not Implemented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing: Option<BillingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1391,6 +1396,33 @@ pub struct SealGatewayConfig {
     /// gRPC endpoint URL of the gateway invocation service.
     /// Example: "http://aegis-seal-gateway:50055"
     pub url: String,
+}
+
+/// Stripe billing configuration (SaaS mode only).
+/// If omitted from `NodeConfigSpec`, billing endpoints return 501 Not Implemented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BillingConfig {
+    /// Stripe API secret key. Supports `env:VAR_NAME` syntax.
+    pub stripe_secret_key: String,
+
+    /// Stripe webhook signing secret. Supports `env:VAR_NAME` syntax.
+    #[serde(default)]
+    pub stripe_webhook_secret: Option<String>,
+
+    /// Stripe Price IDs per tier and interval.
+    #[serde(default)]
+    pub price_ids: BillingPriceIds,
+}
+
+/// Stripe Price ID mapping for each subscription tier and billing interval.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BillingPriceIds {
+    pub pro_monthly: Option<String>,
+    pub pro_annual: Option<String>,
+    pub business_monthly: Option<String>,
+    pub business_annual: Option<String>,
+    pub enterprise_monthly: Option<String>,
+    pub enterprise_annual: Option<String>,
 }
 
 // Default value functions

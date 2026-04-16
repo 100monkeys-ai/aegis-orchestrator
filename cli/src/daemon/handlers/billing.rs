@@ -3,8 +3,8 @@
 //! # Billing Handlers (BC-12 — Stripe Integration)
 //!
 //! Endpoints for Stripe-powered subscription management. All handlers return
-//! `501 Not Implemented` when `STRIPE_SECRET_KEY` is not set, making the
-//! billing feature fully optional.
+//! `501 Not Implemented` when `BillingConfig` is absent from the node config,
+//! making the billing feature fully optional.
 //!
 //! | Method | Path | Description |
 //! |--------|------|-------------|
@@ -24,6 +24,9 @@ use tracing::{info, warn};
 
 use aegis_orchestrator_core::domain::billing::{SubscriptionStatus, TenantSubscription};
 use aegis_orchestrator_core::domain::iam::UserIdentity;
+use aegis_orchestrator_core::domain::node_config::{
+    resolve_env_value, BillingConfig, BillingPriceIds,
+};
 use aegis_orchestrator_core::domain::tenancy::TenantTier;
 use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
 
@@ -31,8 +34,9 @@ use crate::daemon::state::AppState;
 
 // ── Stripe client helper ────────────────────────────────────────────────────
 
-fn stripe_client() -> Option<stripe::Client> {
-    let key = std::env::var("STRIPE_SECRET_KEY").ok()?;
+/// Build a Stripe client from the resolved `BillingConfig`.
+fn stripe_client_from_config(billing: &BillingConfig) -> Option<stripe::Client> {
+    let key = resolve_env_value(&billing.stripe_secret_key).ok()?;
     if key.is_empty() {
         return None;
     }
@@ -42,23 +46,29 @@ fn stripe_client() -> Option<stripe::Client> {
 fn not_implemented() -> axum::response::Response {
     (
         StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": "billing_not_configured", "message": "Stripe billing is not configured (STRIPE_SECRET_KEY not set)"})),
+        Json(json!({"error": "billing_not_configured", "message": "Stripe billing is not configured"})),
     )
         .into_response()
 }
 
 // ── Price resolution ─────────────────────────────────────────────────────────
 
-/// Resolve a Stripe Price ID from environment variables.
-///
-/// Convention: `STRIPE_PRICE_{TIER}_{INTERVAL}` (e.g. `STRIPE_PRICE_PRO_MONTHLY`).
-fn resolve_price_id(tier: &str, interval: &str) -> Option<String> {
-    let key = format!(
-        "STRIPE_PRICE_{}_{}",
-        tier.to_uppercase(),
-        interval.to_uppercase()
-    );
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+/// Resolve a Stripe Price ID from the `BillingPriceIds` config.
+/// Values support `env:VAR_NAME` syntax via [`resolve_env_value`].
+fn resolve_price_id(price_ids: &BillingPriceIds, tier: &str, interval: &str) -> Option<String> {
+    let raw = match (tier, interval) {
+        ("pro", "monthly") => price_ids.pro_monthly.as_deref(),
+        ("pro", "yearly") | ("pro", "annual") => price_ids.pro_annual.as_deref(),
+        ("business", "monthly") => price_ids.business_monthly.as_deref(),
+        ("business", "yearly") | ("business", "annual") => price_ids.business_annual.as_deref(),
+        ("enterprise", "monthly") => price_ids.enterprise_monthly.as_deref(),
+        ("enterprise", "yearly") | ("enterprise", "annual") => {
+            price_ids.enterprise_annual.as_deref()
+        }
+        _ => None,
+    };
+    raw.and_then(|v| resolve_env_value(v).ok())
+        .filter(|v| !v.is_empty())
 }
 
 // ── Request types ────────────────────────────────────────────────────────────
@@ -94,7 +104,11 @@ pub(crate) async fn create_checkout_handler(
     identity: Option<Extension<UserIdentity>>,
     Json(body): Json<CheckoutRequest>,
 ) -> axum::response::Response {
-    let stripe = match stripe_client() {
+    let billing = match &state.billing_config {
+        Some(c) => c,
+        None => return not_implemented(),
+    };
+    let stripe = match stripe_client_from_config(billing) {
         Some(c) => c,
         None => return not_implemented(),
     };
@@ -110,7 +124,7 @@ pub(crate) async fn create_checkout_handler(
         }
     };
 
-    let price_id = match resolve_price_id(&body.tier, &body.interval) {
+    let price_id = match resolve_price_id(&billing.price_ids, &body.tier, &body.interval) {
         Some(id) => id,
         None => {
             return (
@@ -263,7 +277,11 @@ pub(crate) async fn create_portal_handler(
     identity: Option<Extension<UserIdentity>>,
     Json(body): Json<PortalRequest>,
 ) -> axum::response::Response {
-    let stripe = match stripe_client() {
+    let billing = match &state.billing_config {
+        Some(c) => c,
+        None => return not_implemented(),
+    };
+    let stripe = match stripe_client_from_config(billing) {
         Some(c) => c,
         None => return not_implemented(),
     };
@@ -342,10 +360,9 @@ pub(crate) async fn get_subscription_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
 ) -> axum::response::Response {
-    let _stripe = match stripe_client() {
-        Some(c) => c,
-        None => return not_implemented(),
-    };
+    if state.billing_config.is_none() {
+        return not_implemented();
+    }
 
     let identity = match identity {
         Some(Extension(id)) => id,
@@ -409,7 +426,11 @@ pub(crate) async fn list_invoices_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
 ) -> axum::response::Response {
-    let stripe = match stripe_client() {
+    let billing = match &state.billing_config {
+        Some(c) => c,
+        None => return not_implemented(),
+    };
+    let stripe = match stripe_client_from_config(billing) {
         Some(c) => c,
         None => return not_implemented(),
     };
@@ -866,27 +887,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_price_id_reads_env() {
-        // This test verifies the naming convention logic
-        std::env::set_var("STRIPE_PRICE_PRO_MONTHLY", "price_test_123");
-        let result = resolve_price_id("pro", "monthly");
-        assert_eq!(result, Some("price_test_123".to_string()));
-        std::env::remove_var("STRIPE_PRICE_PRO_MONTHLY");
+    fn resolve_price_id_from_config() {
+        let price_ids = BillingPriceIds {
+            pro_monthly: Some("price_pro_m".to_string()),
+            pro_annual: Some("price_pro_a".to_string()),
+            business_monthly: Some("price_biz_m".to_string()),
+            business_annual: None,
+            enterprise_monthly: None,
+            enterprise_annual: Some("price_ent_a".to_string()),
+        };
+        assert_eq!(
+            resolve_price_id(&price_ids, "pro", "monthly"),
+            Some("price_pro_m".to_string())
+        );
+        assert_eq!(
+            resolve_price_id(&price_ids, "pro", "yearly"),
+            Some("price_pro_a".to_string())
+        );
+        assert_eq!(
+            resolve_price_id(&price_ids, "pro", "annual"),
+            Some("price_pro_a".to_string())
+        );
+        assert_eq!(
+            resolve_price_id(&price_ids, "business", "monthly"),
+            Some("price_biz_m".to_string())
+        );
+        assert_eq!(
+            resolve_price_id(&price_ids, "enterprise", "annual"),
+            Some("price_ent_a".to_string())
+        );
     }
 
     #[test]
     fn resolve_price_id_returns_none_when_unset() {
-        std::env::remove_var("STRIPE_PRICE_NONEXISTENT_YEARLY");
-        let result = resolve_price_id("nonexistent", "yearly");
-        assert!(result.is_none());
+        let price_ids = BillingPriceIds::default();
+        assert!(resolve_price_id(&price_ids, "pro", "monthly").is_none());
+        assert!(resolve_price_id(&price_ids, "nonexistent", "yearly").is_none());
     }
 
     #[test]
     fn resolve_price_id_returns_none_for_empty_value() {
-        std::env::set_var("STRIPE_PRICE_FREE_MONTHLY", "");
-        let result = resolve_price_id("free", "monthly");
-        assert!(result.is_none());
-        std::env::remove_var("STRIPE_PRICE_FREE_MONTHLY");
+        let price_ids = BillingPriceIds {
+            pro_monthly: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(resolve_price_id(&price_ids, "pro", "monthly").is_none());
     }
 
     #[test]

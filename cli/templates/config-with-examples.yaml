@@ -545,6 +545,22 @@ spec:
   #   url: "http://aegis-seal-gateway:50055"
 
   # --------------------------------------------------------------------------
+  # Billing (SaaS mode only, Optional)
+  # --------------------------------------------------------------------------
+  # Stripe integration for subscription management.
+  # Omit this entire section for self-hosted deployments.
+  # billing:
+  #   stripe_secret_key: "env:STRIPE_SECRET_KEY"
+  #   stripe_webhook_secret: "env:STRIPE_WEBHOOK_SECRET"
+  #   price_ids:
+  #     pro_monthly: "env:STRIPE_PRICE_PRO_MONTHLY"
+  #     pro_annual: "env:STRIPE_PRICE_PRO_ANNUAL"
+  #     business_monthly: "env:STRIPE_PRICE_BUSINESS_MONTHLY"
+  #     business_annual: "env:STRIPE_PRICE_BUSINESS_ANNUAL"
+  #     enterprise_monthly: "env:STRIPE_PRICE_ENTERPRISE_MONTHLY"
+  #     enterprise_annual: "env:STRIPE_PRICE_ENTERPRISE_ANNUAL"
+
+  # --------------------------------------------------------------------------
   # Execution Limits (Optional)
   # --------------------------------------------------------------------------
   # Maximum number of executions returned by a single `list_executions` request.

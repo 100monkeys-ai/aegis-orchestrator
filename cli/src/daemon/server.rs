@@ -1773,6 +1773,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
             ) as Arc<dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository>
         }),
+        billing_config: config.spec.billing.clone(),
     };
 
     info!("Building router...");

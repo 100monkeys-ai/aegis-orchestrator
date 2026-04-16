@@ -107,3 +107,8 @@ spec:
   # cortex:
   #   grpc_url: "http://cortex:50052"      # Cortex gRPC service URL
   #   api_key: null                         # Set to your 100monkeys Cortex API key (Zaru SaaS)
+
+  # billing:                                # Stripe billing (SaaS mode only, omit for self-hosted)
+  #   stripe_secret_key: "env:STRIPE_SECRET_KEY"
+  #   price_ids:
+  #     pro_monthly: "env:STRIPE_PRICE_PRO_MONTHLY"

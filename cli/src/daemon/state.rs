@@ -94,4 +94,6 @@ pub(crate) struct AppState {
     /// Billing repository for Stripe subscription state persistence.
     pub(crate) billing_repo:
         Option<Arc<dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository>>,
+    /// Stripe billing configuration from `NodeConfigSpec.billing`.
+    pub(crate) billing_config: Option<aegis_orchestrator_core::domain::node_config::BillingConfig>,
 }
