@@ -73,6 +73,7 @@ use crate::domain::repository::{
 use crate::domain::tenant::TenantId;
 use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};
 use async_trait::async_trait;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -709,7 +710,7 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
             .filter(|w| w.metadata.name == name)
             .cloned()
             .collect();
-        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        results.sort_by_key(|w| Reverse(w.created_at));
         Ok(results)
     }
 
@@ -1016,7 +1017,7 @@ impl crate::domain::repository::WorkflowExecutionRepository
                     .collect()
             })
             .unwrap_or_default();
-        list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        list.sort_by_key(|e| Reverse(e.started_at));
         Ok(list.into_iter().skip(offset).take(limit).collect())
     }
 
@@ -1080,7 +1081,7 @@ impl crate::domain::repository::WorkflowExecutionRepository
             .get(tenant_id)
             .map(|tenant_execs| tenant_execs.values().cloned().collect())
             .unwrap_or_default();
-        list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        list.sort_by_key(|e| Reverse(e.started_at));
         Ok(list.into_iter().skip(offset).take(limit).collect())
     }
 }
