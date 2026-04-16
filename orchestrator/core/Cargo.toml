@@ -68,7 +68,7 @@ bincode = { workspace = true }
 parking_lot = "0.12"
 
 # FUSE FSAL Transport (ADR-107)
-fuser = "0.15"
+fuser = "0.17"
 libc = "0.2"
 
 url = "2.5.8"
