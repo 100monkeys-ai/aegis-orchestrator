@@ -107,7 +107,7 @@ impl OperatorReadModelStore {
     pub async fn list_stimuli(&self) -> Vec<StimulusView> {
         let state = self.state.read().await;
         let mut items: Vec<StimulusView> = state.stimuli.values().cloned().collect();
-        items.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
+        items.sort_by_key(|a| std::cmp::Reverse(a.last_event_at));
         items
     }
 

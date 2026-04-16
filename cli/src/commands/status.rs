@@ -417,7 +417,7 @@ fn load_enabled_services(dir: &Path) -> Result<Vec<EnabledService>> {
         })
         .collect::<Vec<_>>();
 
-    services.sort_by(|left, right| left.name.cmp(&right.name));
+    services.sort_by_key(|s| s.name.clone());
     services.push(EnabledService {
         name: "aegis-daemon".to_string(),
         kind: LocalStatusKind::Daemon,

@@ -180,7 +180,7 @@ impl CorrelatedActivityStreamService {
             }
         }
 
-        history.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        history.sort_by_key(|a| a.timestamp);
         Ok(history)
     }
 
@@ -208,7 +208,7 @@ impl CorrelatedActivityStreamService {
             }
         }
 
-        history.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        history.sort_by_key(|a| a.timestamp);
         Ok(history)
     }
 }

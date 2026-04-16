@@ -208,7 +208,7 @@ impl AgentRepository for InMemoryAgentRepository {
                 }
             }
         }
-        result.sort_by(|a, b| a.name.cmp(&b.name));
+        result.sort_by_key(|a| a.name.clone());
         Ok(result)
     }
 
@@ -830,7 +830,7 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
             }
         }
 
-        result.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        result.sort_by_key(|a| a.metadata.name.clone());
         Ok(result)
     }
 
@@ -847,7 +847,7 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
             }
         }
 
-        result.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        result.sort_by_key(|a| a.metadata.name.clone());
         Ok(result)
     }
 
