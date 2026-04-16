@@ -3,13 +3,14 @@
 //! API key management handlers (ADR-093).
 //!
 //! Routes:
-//!   GET    /v1/api-keys      — list keys for authenticated user
-//!   POST   /v1/api-keys      — create a new key (returns key value once)
-//!   DELETE /v1/api-keys/:id  — revoke a key
+//!   GET    /v1/api-keys           — list keys for authenticated user
+//!   POST   /v1/api-keys           — create a new key (returns key value once)
+//!   DELETE /v1/api-keys/:id       — revoke a key
+//!   POST   /v1/api-keys/validate  — validate a key and return user identity (MCP server auth)
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Extension;
@@ -19,7 +20,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use aegis_orchestrator_core::domain::iam::UserIdentity;
+use aegis_orchestrator_core::domain::iam::{resolve_effective_tenant, IdentityKind, UserIdentity};
 use aegis_orchestrator_core::infrastructure::repositories::postgres_api_key::CreateApiKeyRow;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
@@ -143,6 +144,19 @@ pub(crate) async fn create_api_key_handler(
     let key_value = generate_api_key();
     let key_hash = hash_key(&key_value);
 
+    // Capture identity context at creation time so the validate endpoint
+    // can return it without hitting the IAM provider.
+    let tenant_id = resolve_effective_tenant(Some(&identity), None);
+    let (aegis_role, zaru_tier) = match &identity.identity_kind {
+        IdentityKind::Operator { aegis_role } => {
+            (Some(aegis_role.as_claim_str().to_string()), None)
+        }
+        IdentityKind::ConsumerUser { zaru_tier, .. } => {
+            (None, Some(zaru_tier.to_security_context_name().to_string()))
+        }
+        _ => (None, None),
+    };
+
     let row = CreateApiKeyRow {
         id: Uuid::new_v4(),
         user_id: identity.sub.clone(),
@@ -150,6 +164,9 @@ pub(crate) async fn create_api_key_handler(
         key_hash,
         scopes: payload.scopes,
         expires_at: payload.expires_at,
+        tenant_id: tenant_id.as_str().to_string(),
+        aegis_role,
+        zaru_tier,
     };
 
     match repo.create(&row).await {
@@ -208,5 +225,71 @@ pub(crate) async fn revoke_api_key_handler(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response()),
+    }
+}
+
+/// `POST /v1/api-keys/validate` — Validate an API key and return the associated
+/// user identity. Called by the MCP server to authenticate external clients.
+///
+/// The raw API key is passed in the `Authorization: Bearer aegis_xxx` header.
+/// This endpoint is exempt from IAM/OIDC auth (it IS the auth mechanism for
+/// API-key-based clients).
+pub(crate) async fn validate_api_key_handler(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> axum::response::Response {
+    // Extract Bearer token from Authorization header
+    let token = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let token = match token {
+        Some(t) if t.starts_with("aegis_") => t,
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Missing or invalid API key"})),
+            )
+                .into_response()
+        }
+    };
+
+    let repo = match &state.api_key_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "API key repository not configured"})),
+            )
+                .into_response()
+        }
+    };
+
+    let key_hash = hash_key(token);
+
+    match repo.find_by_key_hash(&key_hash).await {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "user_id": row.user_id,
+                "tenant_id": row.tenant_id,
+                "aegis_role": row.aegis_role,
+                "scopes": row.scopes,
+                "zaru_tier": row.zaru_tier,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid or expired API key"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }

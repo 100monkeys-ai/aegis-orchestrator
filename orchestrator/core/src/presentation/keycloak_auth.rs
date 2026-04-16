@@ -81,6 +81,7 @@ where
 /// These endpoints use other auth mechanisms (SEAL attestation, HMAC, or are unauthenticated).
 const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/health",
+    "/v1/api-keys/validate",
     "/v1/billing/prices",
     "/v1/dispatch-gateway",
     "/v1/seal/attest",
@@ -179,6 +180,7 @@ mod tests {
     #[test]
     fn exempt_paths_recognized() {
         assert!(is_exempt("/health"));
+        assert!(is_exempt("/v1/api-keys/validate"));
         assert!(is_exempt("/v1/dispatch-gateway/some-id"));
         assert!(is_exempt("/v1/seal/attest"));
         assert!(is_exempt("/v1/seal/invoke"));
@@ -193,6 +195,8 @@ mod tests {
         assert!(!is_exempt("/v1/swarms"));
         // temporal-events authenticates via JWT in the handler itself
         assert!(!is_exempt("/v1/temporal-events"));
+        // api-keys CRUD requires JWT; only /validate is exempt
+        assert!(!is_exempt("/v1/api-keys"));
     }
 
     /// Regression: the broad `/v1/executions` prefix was previously exempt,
