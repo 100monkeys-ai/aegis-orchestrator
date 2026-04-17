@@ -147,19 +147,23 @@ impl MembershipRole {
         }
     }
 
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    /// `true` if this role may manage membership (invite, kick, change role).
+    /// Both Owner and Admin qualify.
+    pub fn can_manage_membership(&self) -> bool {
+        matches!(self, MembershipRole::Owner | MembershipRole::Admin)
+    }
+}
+
+impl std::str::FromStr for MembershipRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "owner" => Ok(MembershipRole::Owner),
             "admin" => Ok(MembershipRole::Admin),
             "member" => Ok(MembershipRole::Member),
             other => Err(format!("unknown membership role: {other}")),
         }
-    }
-
-    /// `true` if this role may manage membership (invite, kick, change role).
-    /// Both Owner and Admin qualify.
-    pub fn can_manage_membership(&self) -> bool {
-        matches!(self, MembershipRole::Owner | MembershipRole::Admin)
     }
 }
 
@@ -178,8 +182,12 @@ impl MembershipStatus {
             MembershipStatus::Revoked => "revoked",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for MembershipStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "active" => Ok(MembershipStatus::Active),
             "revoked" => Ok(MembershipStatus::Revoked),
@@ -207,8 +215,12 @@ impl InvitationStatus {
             InvitationStatus::Expired => "expired",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for InvitationStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "pending" => Ok(InvitationStatus::Pending),
             "accepted" => Ok(InvitationStatus::Accepted),

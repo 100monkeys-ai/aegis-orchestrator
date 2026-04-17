@@ -27,6 +27,7 @@
 //! | `PUT` | `/v1/colony/saml` | Bearer JWT (Owner, Enterprise) |
 //! | `GET` | `/v1/colony/subscription` | Bearer JWT |
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Request, State};

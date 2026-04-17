@@ -7,6 +7,8 @@
 //! `teams`, `team_memberships`, and `team_invitations` tables introduced in
 //! migration `022_teams.sql`.
 
+use std::str::FromStr;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;

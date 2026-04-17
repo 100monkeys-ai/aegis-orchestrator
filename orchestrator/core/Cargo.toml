@@ -96,6 +96,7 @@ scopeguard = "1.2"
 tokio-test = "0.4"
 tempfile = "3.27"
 mockito = "1"
+tower = { version = "0.4", features = ["util"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
