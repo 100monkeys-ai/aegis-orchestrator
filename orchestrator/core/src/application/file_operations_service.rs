@@ -224,7 +224,7 @@ impl FileOperationsService {
         Ok(())
     }
 
-    /// Write a file with size limits resolved from the caller's [`ZaruTier`].
+    /// Write a file with size limits resolved from the caller's tier.
     pub async fn write_file_for_tier(
         &self,
         volume_id: &VolumeId,
