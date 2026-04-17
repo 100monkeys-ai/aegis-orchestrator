@@ -135,6 +135,13 @@ fn hydrate_session(row: &sqlx::postgres::PgRow) -> Result<CanvasSession, Reposit
     let status_text: String = row
         .try_get("status")
         .map_err(|e| RepositoryError::Serialization(format!("status: {e}")))?;
+    let name: Option<String> = row
+        .try_get("name")
+        .map_err(|e| RepositoryError::Serialization(format!("name: {e}")))?;
+    let archived: bool = row
+        .try_get::<Option<bool>, _>("archived")
+        .map_err(|e| RepositoryError::Serialization(format!("archived: {e}")))?
+        .unwrap_or(false);
     let created_at: DateTime<Utc> = row
         .try_get("created_at")
         .map_err(|e| RepositoryError::Serialization(format!("created_at: {e}")))?;
@@ -156,6 +163,8 @@ fn hydrate_session(row: &sqlx::postgres::PgRow) -> Result<CanvasSession, Reposit
         git_binding_id,
         workspace_mode,
         status: db_to_status(&status_text)?,
+        name,
+        archived,
         created_at,
         last_active_at,
         domain_events: Vec::new(),
@@ -177,9 +186,9 @@ impl CanvasSessionRepository for PostgresCanvasSessionRepository {
             INSERT INTO canvas_sessions (
                 id, tenant_id, conversation_id, workspace_volume_id,
                 git_binding_id, workspace_mode_kind, workspace_mode_label,
-                status, created_at, last_active_at
+                status, name, archived, created_at, last_active_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id             = EXCLUDED.tenant_id,
                 conversation_id       = EXCLUDED.conversation_id,
@@ -188,6 +197,8 @@ impl CanvasSessionRepository for PostgresCanvasSessionRepository {
                 workspace_mode_kind   = EXCLUDED.workspace_mode_kind,
                 workspace_mode_label  = EXCLUDED.workspace_mode_label,
                 status                = EXCLUDED.status,
+                name                  = EXCLUDED.name,
+                archived              = EXCLUDED.archived,
                 last_active_at        = EXCLUDED.last_active_at
             "#,
         )
@@ -199,6 +210,8 @@ impl CanvasSessionRepository for PostgresCanvasSessionRepository {
         .bind(mode_kind)
         .bind(mode_label)
         .bind(status_text)
+        .bind(session.name.as_deref())
+        .bind(session.archived)
         .bind(session.created_at)
         .bind(session.last_active_at)
         .execute(&self.pool)
@@ -251,18 +264,24 @@ impl CanvasSessionRepository for PostgresCanvasSessionRepository {
     async fn find_by_owner(
         &self,
         tenant_id: &TenantId,
+        include_archived: bool,
     ) -> Result<Vec<CanvasSession>, RepositoryError> {
-        let rows =
-            sqlx::query("SELECT * FROM canvas_sessions WHERE tenant_id = $1 ORDER BY created_at")
-                .bind(tenant_id.as_str())
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| {
-                    RepositoryError::Database(format!(
-                        "Failed to list canvas_sessions for tenant {}: {e}",
-                        tenant_id.as_str()
-                    ))
-                })?;
+        let query = if include_archived {
+            "SELECT * FROM canvas_sessions WHERE tenant_id = $1 ORDER BY created_at"
+        } else {
+            "SELECT * FROM canvas_sessions WHERE tenant_id = $1 AND (archived IS NULL OR archived = FALSE) ORDER BY created_at"
+        };
+
+        let rows = sqlx::query(query)
+            .bind(tenant_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                RepositoryError::Database(format!(
+                    "Failed to list canvas_sessions for tenant {}: {e}",
+                    tenant_id.as_str()
+                ))
+            })?;
 
         let mut sessions = Vec::with_capacity(rows.len());
         for row in &rows {

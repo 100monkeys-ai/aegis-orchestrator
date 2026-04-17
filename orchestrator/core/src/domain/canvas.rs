@@ -301,6 +301,12 @@ pub struct CanvasSession {
     pub git_binding_id: Option<GitRepoBindingId>,
     pub workspace_mode: WorkspaceMode,
     pub status: CanvasSessionStatus,
+    /// Optional human-readable name for the session. When `None`, the UI
+    /// may auto-generate a name from the first user message or a timestamp.
+    pub name: Option<String>,
+    /// Soft-archive flag. Archived sessions are excluded from the default
+    /// list view but remain queryable with `include_archived`.
+    pub archived: bool,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
     /// Event buffer. Drained by [`take_events`](Self::take_events) at the
@@ -324,6 +330,7 @@ impl CanvasSession {
         workspace_volume_id: VolumeId,
         workspace_mode: WorkspaceMode,
         git_binding_id: Option<GitRepoBindingId>,
+        name: Option<String>,
     ) -> Result<Self, String> {
         match (&workspace_mode, git_binding_id) {
             (WorkspaceMode::GitLinked { binding_id }, Some(provided)) => {
@@ -364,6 +371,8 @@ impl CanvasSession {
             git_binding_id,
             workspace_mode: workspace_mode.clone(),
             status: CanvasSessionStatus::Initializing,
+            name,
+            archived: false,
             created_at: now,
             last_active_at: now,
             domain_events: Vec::new(),
@@ -382,6 +391,18 @@ impl CanvasSession {
     /// `last_active_at`.
     pub fn mark_ready(&mut self) {
         self.status = CanvasSessionStatus::Ready;
+        self.last_active_at = Utc::now();
+    }
+
+    /// Update the session's display name.
+    pub fn rename(&mut self, name: Option<String>) {
+        self.name = name;
+        self.last_active_at = Utc::now();
+    }
+
+    /// Set or clear the archived flag.
+    pub fn set_archived(&mut self, archived: bool) {
+        self.archived = archived;
         self.last_active_at = Utc::now();
     }
 
@@ -476,13 +497,15 @@ pub trait CanvasSessionRepository: Send + Sync {
         conversation_id: &ConversationId,
     ) -> Result<Option<CanvasSession>, RepositoryError>;
 
-    /// Return all sessions owned by `tenant_id`.
+    /// Return sessions owned by `tenant_id`.
     ///
-    /// Used by the `GET /v1/canvas/sessions` endpoint (Wave C2) to list the
-    /// caller's active canvas sessions.
+    /// When `include_archived` is `false` (the default for list endpoints),
+    /// only non-archived sessions are returned. When `true`, all sessions
+    /// including archived ones are returned.
     async fn find_by_owner(
         &self,
         tenant_id: &TenantId,
+        include_archived: bool,
     ) -> Result<Vec<CanvasSession>, RepositoryError>;
 
     /// Permanently delete a session row.
@@ -503,6 +526,7 @@ mod tests {
             ConversationId::new(),
             VolumeId::new(),
             WorkspaceMode::Ephemeral,
+            None,
             None,
         )
         .expect("valid ephemeral session")
@@ -534,6 +558,7 @@ mod tests {
                 volume_label: String::new(),
             },
             None,
+            None,
         );
         assert!(err.is_err());
     }
@@ -547,6 +572,7 @@ mod tests {
             VolumeId::new(),
             WorkspaceMode::GitLinked { binding_id: b },
             Some(b),
+            None,
         );
         assert!(ok.is_ok());
 
@@ -556,6 +582,7 @@ mod tests {
             VolumeId::new(),
             WorkspaceMode::GitLinked { binding_id: b },
             Some(GitRepoBindingId::new()),
+            None,
         );
         assert!(mismatch.is_err());
 
@@ -565,7 +592,39 @@ mod tests {
             VolumeId::new(),
             WorkspaceMode::GitLinked { binding_id: b },
             None,
+            None,
         );
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn new_session_with_name() {
+        let session = CanvasSession::new(
+            TenantId::consumer(),
+            ConversationId::new(),
+            VolumeId::new(),
+            WorkspaceMode::Ephemeral,
+            None,
+            Some("My Project".to_string()),
+        )
+        .expect("valid session with name");
+        assert_eq!(session.name, Some("My Project".to_string()));
+        assert!(!session.archived);
+    }
+
+    #[test]
+    fn rename_and_archive() {
+        let mut session = ephemeral_session();
+        assert_eq!(session.name, None);
+        assert!(!session.archived);
+
+        session.rename(Some("Renamed".to_string()));
+        assert_eq!(session.name, Some("Renamed".to_string()));
+
+        session.set_archived(true);
+        assert!(session.archived);
+
+        session.set_archived(false);
+        assert!(!session.archived);
     }
 }

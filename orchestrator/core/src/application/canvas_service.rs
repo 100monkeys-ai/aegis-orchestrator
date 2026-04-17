@@ -98,6 +98,23 @@ pub struct CreateCanvasSessionCommand {
     /// Requested backing mode. Payload-bearing variants (`Persistent`,
     /// `GitLinked`) carry their sub-fields here.
     pub workspace_mode: WorkspaceMode,
+    /// Optional human-readable name for the session.
+    pub name: Option<String>,
+}
+
+/// Command to update a [`CanvasSession`]'s mutable fields (name, archived).
+#[derive(Debug, Clone)]
+pub struct UpdateCanvasSessionCommand {
+    /// Session to update.
+    pub session_id: CanvasSessionId,
+    /// Tenant that owns the session.
+    pub tenant_id: TenantId,
+    /// Caller's user subject.
+    pub owner: String,
+    /// If `Some`, sets the session name (pass `Some(None)` to clear).
+    pub name: Option<Option<String>>,
+    /// If `Some`, sets the archived flag.
+    pub archived: Option<bool>,
 }
 
 // ============================================================================
@@ -115,12 +132,20 @@ pub trait CanvasService: Send + Sync {
         cmd: CreateCanvasSessionCommand,
     ) -> Result<CanvasSession, CanvasError>;
 
-    /// List the caller's active canvas sessions.
+    /// List the caller's canvas sessions. When `include_archived` is false
+    /// (default), archived sessions are excluded.
     async fn list_sessions(
         &self,
         tenant_id: &TenantId,
         owner: &str,
+        include_archived: bool,
     ) -> Result<Vec<CanvasSession>, CanvasError>;
+
+    /// Update a session's name and/or archived flag.
+    async fn update_session(
+        &self,
+        cmd: UpdateCanvasSessionCommand,
+    ) -> Result<CanvasSession, CanvasError>;
 
     /// Load a single session by id; verifies tenant ownership. Returns
     /// [`CanvasError::NotFound`] for missing or mis-tenanted rows (see
@@ -296,6 +321,7 @@ impl CanvasService for StandardCanvasService {
             workspace_volume_id,
             cmd.workspace_mode,
             git_binding_id,
+            cmd.name,
         )
         .map_err(CanvasError::InvalidCommand)?;
 
@@ -311,12 +337,41 @@ impl CanvasService for StandardCanvasService {
         &self,
         tenant_id: &TenantId,
         _owner: &str,
+        include_archived: bool,
     ) -> Result<Vec<CanvasSession>, CanvasError> {
         // ADR-106: canvas sessions are tenant-scoped. Per-user tenants
         // (ADR-097) collapse "owner" and "tenant" to the same boundary for
         // consumer users. Tenant-wide teams (Business/Enterprise) legitimately
         // share sessions across seats within the colony.
-        Ok(self.session_repo.find_by_owner(tenant_id).await?)
+        Ok(self
+            .session_repo
+            .find_by_owner(tenant_id, include_archived)
+            .await?)
+    }
+
+    async fn update_session(
+        &self,
+        cmd: UpdateCanvasSessionCommand,
+    ) -> Result<CanvasSession, CanvasError> {
+        let mut session = self
+            .session_repo
+            .find_by_id(&cmd.session_id)
+            .await?
+            .ok_or(CanvasError::NotFound(cmd.session_id))?;
+
+        if session.tenant_id != cmd.tenant_id {
+            return Err(CanvasError::NotFound(cmd.session_id));
+        }
+
+        if let Some(name) = cmd.name {
+            session.rename(name);
+        }
+        if let Some(archived) = cmd.archived {
+            session.set_archived(archived);
+        }
+
+        self.session_repo.save(&session).await?;
+        Ok(session)
     }
 
     async fn get_session(

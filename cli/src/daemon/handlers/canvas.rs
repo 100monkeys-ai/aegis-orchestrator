@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -25,7 +25,7 @@ use futures::stream::Stream;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::application::canvas_service::{
-    CanvasError, CreateCanvasSessionCommand,
+    CanvasError, CreateCanvasSessionCommand, UpdateCanvasSessionCommand,
 };
 use aegis_orchestrator_core::domain::canvas::{
     CanvasEvent, CanvasSession, CanvasSessionId, ConversationId, WorkspaceMode,
@@ -55,9 +55,31 @@ pub(crate) struct CreateCanvasSessionRequest {
     pub(crate) workspace_mode: WorkspaceMode,
     #[serde(default)]
     pub(crate) git_binding_id: Option<Uuid>,
+    /// Optional human-readable name for the session.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
 }
 
-/// Response envelope returned by create / get / list endpoints.
+/// Request body for `PATCH /v1/canvas/sessions/:id`.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct UpdateCanvasSessionRequest {
+    /// If present, sets the session name. Pass `null` to clear.
+    #[serde(default)]
+    pub(crate) name: Option<Option<String>>,
+    /// If present, sets the archived flag.
+    #[serde(default)]
+    pub(crate) archived: Option<bool>,
+}
+
+/// Query parameters for `GET /v1/canvas/sessions`.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ListSessionsQuery {
+    /// When `true`, include archived sessions in the response.
+    #[serde(default)]
+    pub(crate) archived: Option<bool>,
+}
+
+/// Response envelope returned by create / get / list / update endpoints.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct CanvasSessionResponse {
     id: Uuid,
@@ -67,6 +89,8 @@ pub(crate) struct CanvasSessionResponse {
     git_binding_id: Option<Uuid>,
     workspace_mode: WorkspaceMode,
     status: String,
+    name: Option<String>,
+    archived: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     last_active_at: chrono::DateTime<chrono::Utc>,
 }
@@ -81,6 +105,8 @@ impl From<CanvasSession> for CanvasSessionResponse {
             git_binding_id: s.git_binding_id.map(|b| b.0),
             workspace_mode: s.workspace_mode,
             status: format!("{:?}", s.status),
+            name: s.name,
+            archived: s.archived,
             created_at: s.created_at,
             last_active_at: s.last_active_at,
         }
@@ -167,6 +193,7 @@ pub(crate) async fn create_session_handler(
         tier,
         conversation_id: ConversationId(body.conversation_id.unwrap_or_else(Uuid::new_v4)),
         workspace_mode: body.workspace_mode,
+        name: body.name,
     };
 
     service
@@ -181,11 +208,15 @@ pub(crate) async fn create_session_handler(
         .map_err(canvas_error_response)
 }
 
-/// `GET /v1/canvas/sessions` — list caller's active sessions.
+/// `GET /v1/canvas/sessions` — list caller's sessions.
+///
+/// By default only non-archived sessions are returned. Pass `?archived=true`
+/// to include archived sessions.
 pub(crate) async fn list_sessions_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    Query(query): Query<ListSessionsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("canvas:read")?;
 
@@ -199,9 +230,10 @@ pub(crate) async fn list_sessions_handler(
     let identity_ref = identity.as_ref().map(|e| &e.0);
     let tenant_id = tenant_id_from_identity(identity_ref);
     let owner = user_sub(identity_ref);
+    let include_archived = query.archived.unwrap_or(false);
 
     let sessions = service
-        .list_sessions(&tenant_id, &owner)
+        .list_sessions(&tenant_id, &owner, include_archived)
         .await
         .map_err(canvas_error_response)?;
 
@@ -260,6 +292,42 @@ pub(crate) async fn terminate_session_handler(
         .terminate_session(&CanvasSessionId(id), &tenant_id, &owner)
         .await
         .map(|_| Json(serde_json::json!({ "success": true })))
+        .map_err(canvas_error_response)
+}
+
+/// `PATCH /v1/canvas/sessions/:id` — update session name and/or archived flag.
+pub(crate) async fn update_session_handler(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateCanvasSessionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    scope_guard.require("canvas:write")?;
+
+    let service = state.canvas_service.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "canvas service not configured"})),
+        )
+    })?;
+
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
+    let owner = user_sub(identity_ref);
+
+    let cmd = UpdateCanvasSessionCommand {
+        session_id: CanvasSessionId(id),
+        tenant_id,
+        owner,
+        name: body.name,
+        archived: body.archived,
+    };
+
+    service
+        .update_session(cmd)
+        .await
+        .map(|s| Json(serde_json::to_value(CanvasSessionResponse::from(s)).unwrap()))
         .map_err(canvas_error_response)
 }
 

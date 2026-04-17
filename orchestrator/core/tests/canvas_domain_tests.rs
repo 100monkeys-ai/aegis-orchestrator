@@ -29,6 +29,7 @@ fn ephemeral_session() -> CanvasSession {
         VolumeId::new(),
         WorkspaceMode::Ephemeral,
         None,
+        None,
     )
     .expect("valid ephemeral session")
 }
@@ -128,6 +129,7 @@ fn new_session_is_initializing_and_emits_session_created() {
         volume,
         WorkspaceMode::Ephemeral,
         None,
+        None,
     )
     .expect("valid session");
 
@@ -167,6 +169,7 @@ fn new_session_with_git_linked_mode_succeeds_when_binding_matches() {
             binding_id: binding,
         },
         Some(binding),
+        None,
     )
     .expect("valid git-linked session");
     assert_eq!(session.git_binding_id, Some(binding));
@@ -188,6 +191,7 @@ fn new_session_with_git_linked_mode_fails_when_binding_mismatched() {
             binding_id: binding,
         },
         Some(other),
+        None,
     );
     assert!(err.is_err(), "mismatched git_binding_id must be rejected");
 }
@@ -203,6 +207,7 @@ fn new_session_with_git_linked_mode_fails_when_binding_none() {
             binding_id: binding,
         },
         None,
+        None,
     );
     assert!(err.is_err(), "missing git_binding_id must be rejected");
 }
@@ -217,6 +222,7 @@ fn new_session_with_persistent_empty_label_is_rejected() {
             volume_label: String::new(),
         },
         None,
+        None,
     );
     assert!(err.is_err(), "empty volume_label must be rejected");
 }
@@ -230,6 +236,7 @@ fn new_session_with_persistent_whitespace_label_is_rejected() {
         WorkspaceMode::Persistent {
             volume_label: "   ".to_string(),
         },
+        None,
         None,
     );
     assert!(
@@ -246,6 +253,7 @@ fn new_session_rejects_git_binding_id_on_non_git_mode() {
         VolumeId::new(),
         WorkspaceMode::Ephemeral,
         Some(GitRepoBindingId::new()),
+        None,
     );
     assert!(
         err.is_err(),
@@ -330,6 +338,7 @@ fn mark_commit_emits_git_commit_made() {
             binding_id: binding,
         },
         Some(binding),
+        None,
     )
     .expect("valid git-linked session");
     let _ = session.take_events();
@@ -361,6 +370,7 @@ fn mark_push_emits_git_pushed() {
             binding_id: binding,
         },
         Some(binding),
+        None,
     )
     .expect("valid git-linked session");
     let _ = session.take_events();
