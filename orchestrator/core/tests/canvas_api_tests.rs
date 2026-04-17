@@ -437,8 +437,8 @@ async fn create_session_persistent_free_tier_rejected() {
         conversation_id: ConversationId::new(),
         workspace_mode: WorkspaceMode::Persistent {
             volume_label: "proj".to_string(),
-            name: None,
         },
+        name: None,
     };
 
     let res = h.service.create_session(cmd).await;
