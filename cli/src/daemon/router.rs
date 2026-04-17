@@ -50,8 +50,8 @@ use crate::daemon::handlers::executions::{
     get_execution_handler, list_executions_handler, stream_events_handler,
 };
 use crate::daemon::handlers::git_repo::{
-    create_git_repo, delete_git_repo, get_git_repo, list_git_repos, refresh_git_repo,
-    webhook_git_repo,
+    commit_git_repo, create_git_repo, delete_git_repo, diff_git_repo, get_git_repo, list_git_repos,
+    push_git_repo, refresh_git_repo, webhook_git_repo,
 };
 use crate::daemon::handlers::health::{health_handler, readiness_handler};
 use crate::daemon::handlers::observability::{
@@ -315,6 +315,10 @@ pub(crate) fn create_router(
             get(get_git_repo).delete(delete_git_repo),
         )
         .route("/v1/storage/git/{id}/refresh", post(refresh_git_repo))
+        // BC-7 Canvas git-write (ADR-106 Wave B2) — commit / push / diff
+        .route("/v1/storage/git/{id}/commit", post(commit_git_repo))
+        .route("/v1/storage/git/{id}/push", post(push_git_repo))
+        .route("/v1/storage/git/{id}/diff", get(diff_git_repo))
         // BC-7 Git webhook (ADR-081 Wave A3) — HMAC-authenticated, exempt
         // from Keycloak JWT via EXEMPT_PATH_PREFIXES ("/v1/webhooks").
         .route("/v1/webhooks/git/{secret}", post(webhook_git_repo))

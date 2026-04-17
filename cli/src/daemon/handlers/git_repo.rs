@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Git Repository Binding REST Handlers (BC-7, ADR-081 Wave A2)
+//! # Git Repository Binding REST Handlers (BC-7, ADR-081 Wave A2 + ADR-106 Wave B2)
 //!
 //! HTTP handlers for the `/v1/storage/git/*` surface.
 //!
@@ -11,9 +11,12 @@
 //! | `GET    /v1/storage/git/:id` | `volume:read` | Binding detail (redacted, 404 on non-owner) |
 //! | `DELETE /v1/storage/git/:id` | `volume:write` | Cascade delete binding + volume |
 //! | `POST   /v1/storage/git/:id/refresh` | `volume:write` | Fetch + checkout pinned ref |
+//! | `POST   /v1/storage/git/:id/commit` | `volume:write` | **B2** — stage + commit workdir changes |
+//! | `POST   /v1/storage/git/:id/push` | `volume:write` | **B2** — push current branch to remote |
+//! | `GET    /v1/storage/git/:id/diff` | `volume:read` | **B2** — unified diff (staged or workdir) |
 //! | `POST   /v1/webhooks/git/:secret` | HMAC-only | Inbound git push webhook |
 //!
-//! The first five endpoints require Keycloak JWT. The webhook endpoint
+//! All JSON endpoints require Keycloak JWT. The webhook endpoint
 //! is exempt from JWT middleware (see
 //! `presentation::keycloak_auth::EXEMPT_PATH_PREFIXES`) and is
 //! authenticated **only** by HMAC signature verification against the
@@ -24,8 +27,8 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
@@ -85,6 +88,30 @@ impl From<GitRefDto> for GitRef {
     }
 }
 
+// B2 — Canvas git-write request bodies
+// -----------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct CommitGitRepoRequest {
+    pub(crate) message: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct PushGitRepoRequest {
+    #[serde(default)]
+    pub(crate) remote: Option<String>,
+    /// Branch ref to push. Alias `ref_name` for callers that can't use
+    /// the bare word `ref` (which is also accepted via serde).
+    #[serde(default, rename = "ref", alias = "ref_name")]
+    pub(crate) ref_name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub(crate) struct DiffGitRepoQuery {
+    #[serde(default)]
+    pub(crate) staged: bool,
+}
+
 // ============================================================================
 // Error mapping
 // ============================================================================
@@ -97,7 +124,9 @@ fn git_repo_error_response(e: GitRepoError) -> (StatusCode, Json<serde_json::Val
         GitRepoError::TierLimitExceeded { .. } => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
         GitRepoError::UrlValidationFailed(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         GitRepoError::NotYetImplemented(_) => (StatusCode::NOT_IMPLEMENTED, e.to_string()),
-        GitRepoError::CloneFailed(_) => (StatusCode::BAD_GATEWAY, e.to_string()),
+        GitRepoError::CloneFailed(_) | GitRepoError::GitFailed(_) => {
+            (StatusCode::BAD_GATEWAY, e.to_string())
+        }
         GitRepoError::VolumeProvisioningFailed(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
         }
@@ -106,6 +135,11 @@ fn git_repo_error_response(e: GitRepoError) -> (StatusCode, Json<serde_json::Val
         }
         GitRepoError::WebhookRejected(_) => (StatusCode::UNAUTHORIZED, e.to_string()),
         GitRepoError::Repository(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        // B2 — Canvas git-write
+        GitRepoError::NothingToCommit | GitRepoError::BindingBusy(_) => {
+            (StatusCode::CONFLICT, e.to_string())
+        }
+        GitRepoError::NoHeadBranch => (StatusCode::BAD_REQUEST, e.to_string()),
     };
     (status, Json(json!({ "error": message })))
 }
@@ -125,6 +159,26 @@ fn user_sub(identity: Option<&UserIdentity>) -> String {
     identity
         .map(|i| i.sub.clone())
         .unwrap_or_else(|| "anonymous".to_string())
+}
+
+/// Resolve `(author_name, author_email)` for a canvas commit.
+///
+/// [`UserIdentity`] exposes only `sub` and `email` (no display name).
+/// For the commit signature we fall back to the local-part of the
+/// email as the name. Missing email → `"user@aegis.local"` paired
+/// with `"User"` so the commit still records a valid RFC-5322 address
+/// (libgit2's `Signature::now` rejects empty strings).
+fn commit_author(identity: Option<&UserIdentity>) -> (String, String) {
+    let email = identity
+        .and_then(|i| i.email.clone())
+        .unwrap_or_else(|| "user@aegis.local".to_string());
+    let name = email
+        .split('@')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("User")
+        .to_string();
+    (name, email)
 }
 
 // ============================================================================
@@ -372,4 +426,107 @@ fn detect_webhook_auth(headers: &HeaderMap) -> Option<WebhookAuth> {
         });
     }
     None
+}
+
+// ============================================================================
+// B2 — Canvas git-write handlers (ADR-106 Wave B2)
+// ============================================================================
+
+/// `POST /v1/storage/git/:id/commit` — stage workdir + commit on HEAD.
+///
+/// Body: `{ "message": string }`. Author identity is resolved from the
+/// JWT (email → name via local-part fallback — see [`commit_author`]).
+/// Response: `200 OK` with `{ "commit_sha": "..." }`.
+pub(crate) async fn commit_git_repo(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CommitGitRepoRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    scope_guard.require("volume:write")?;
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
+    let owner = user_sub(identity_ref);
+    let (author_name, author_email) = commit_author(identity_ref);
+    let svc = git_repo_service(&state)?;
+
+    let commit_sha = svc
+        .commit(
+            &GitRepoBindingId(id),
+            &tenant_id,
+            &owner,
+            &body.message,
+            &author_name,
+            &author_email,
+        )
+        .await
+        .map_err(git_repo_error_response)?;
+
+    Ok(Json(json!({ "commit_sha": commit_sha })))
+}
+
+/// `POST /v1/storage/git/:id/push` — push current branch to remote.
+///
+/// Body: `{ "remote"?: string, "ref"?: string }` (defaults: `"origin"`
+/// and the binding's current branch). Response: `204 No Content`.
+pub(crate) async fn push_git_repo(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<PushGitRepoRequest>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    scope_guard.require("volume:write")?;
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
+    let owner = user_sub(identity_ref);
+    let svc = git_repo_service(&state)?;
+
+    let (remote, ref_name) = match body {
+        Some(Json(b)) => (b.remote, b.ref_name),
+        None => (None, None),
+    };
+
+    svc.push(
+        &GitRepoBindingId(id),
+        &tenant_id,
+        &owner,
+        remote.as_deref(),
+        ref_name.as_deref(),
+    )
+    .await
+    .map_err(git_repo_error_response)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/storage/git/:id/diff?staged=bool` — unified diff.
+///
+/// `staged=true` → HEAD-tree vs index; `staged=false` (default) →
+/// index vs workdir. Response: `200 OK` with `text/plain; charset=utf-8`
+/// body.
+pub(crate) async fn diff_git_repo(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<DiffGitRepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    scope_guard.require("volume:read")?;
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
+    let owner = user_sub(identity_ref);
+    let svc = git_repo_service(&state)?;
+
+    let diff_text = svc
+        .diff(&GitRepoBindingId(id), &tenant_id, &owner, query.staged)
+        .await
+        .map_err(git_repo_error_response)?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        diff_text,
+    ))
 }
