@@ -192,6 +192,7 @@ impl CanvasTierLimits {
                 allowed_workspace_modes: vec![
                     WorkspaceModeKind::Ephemeral,
                     WorkspaceModeKind::Persistent,
+                    WorkspaceModeKind::GitLinked,
                 ],
                 git_linked: true,
             },
@@ -199,6 +200,7 @@ impl CanvasTierLimits {
                 allowed_workspace_modes: vec![
                     WorkspaceModeKind::Ephemeral,
                     WorkspaceModeKind::Persistent,
+                    WorkspaceModeKind::GitLinked,
                 ],
                 git_linked: true,
             },
