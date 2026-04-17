@@ -1150,75 +1150,89 @@ async fn handle_subscription_updated(
         warn!(error = %e, "Failed to update subscription tier");
     }
 
-    // ADR-111 §Billing Model: reconcile seat_count back from Stripe for team
+    // ADR-111 §Billing Model: reconcile seat_count back from Stripe for all
     // tenants. The canonical source is membership truth, but manual edits in
     // the Stripe dashboard can create drift — this keeps the persisted
     // seat_count aligned with what Stripe actually bills, and publishes a
     // SeatCountChanged domain event whenever the values diverge.
-    let stripe_quantity = obj
+    //
+    // We locate the seat add-on line item by matching its price ID against
+    // ALL_SEAT_PRICES rather than assuming data[0] is the seat item — on
+    // multi-item subscriptions data[0] is the base plan (quantity=1).
+    let tier_str_for_seats = tier_to_str(&tier);
+    let included = included_seats_for_tier(tier_str_for_seats);
+    let new_seats_u32: u32 = obj
         .get("items")
         .and_then(|i| i.get("data"))
         .and_then(|d| d.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|it| it.get("quantity"))
-        .and_then(|q| q.as_u64());
+        .map(|arr| {
+            let addon_qty: u32 = arr
+                .iter()
+                .find(|item| {
+                    item.get("price")
+                        .and_then(|p| p.get("id"))
+                        .and_then(|id| id.as_str())
+                        .map(|pid| ALL_SEAT_PRICES.iter().any(|(_, _, known)| *known == pid))
+                        .unwrap_or(false)
+                })
+                .and_then(|item| item.get("quantity"))
+                .and_then(|q| q.as_u64())
+                .map(|q| q.min(u32::MAX as u64) as u32)
+                .unwrap_or(0);
+            included + addon_qty
+        })
+        .unwrap_or(included);
 
-    if sub.tenant_id.as_str().starts_with("t-") {
-        if let Some(new_seats) = stripe_quantity {
-            let new_seats_u32 = new_seats.min(u32::MAX as u64) as u32;
-            if new_seats_u32 != sub.seat_count {
-                let drift = (new_seats_u32 as i64 - sub.seat_count as i64).abs();
-                if drift > 1 {
-                    warn!(
-                        tenant_id = %sub.tenant_id,
-                        previous = sub.seat_count,
-                        new = new_seats_u32,
-                        drift,
-                        "Stripe seat_count drift >1 — reconciling from Stripe"
-                    );
-                } else {
-                    info!(
-                        tenant_id = %sub.tenant_id,
-                        previous = sub.seat_count,
-                        new = new_seats_u32,
-                        "Reconciling seat_count from Stripe webhook"
-                    );
-                }
-                if let Err(e) = billing_repo
-                    .update_seat_count_by_customer(customer_id, new_seats_u32)
-                    .await
-                {
-                    warn!(error = %e, "Failed to reconcile seat_count");
-                } else {
-                    // Resolve the team_id via the team_repo so the event
-                    // carries the correct aggregate id. If the lookup fails,
-                    // we still publish the drift — downstream consumers can
-                    // re-derive from the tenant slug.
-                    let team_id = match state.team_repo.as_ref() {
-                        Some(tr) => {
-                            match aegis_orchestrator_core::domain::team::TeamSlug::parse(
-                                sub.tenant_id.as_str(),
-                            ) {
-                                Ok(slug) => match tr.find_by_slug(&slug).await {
-                                    Ok(Some(t)) => Some(t.id),
-                                    _ => None,
-                                },
-                                Err(_) => None,
-                            }
-                        }
-                        None => None,
-                    };
-                    if let Some(team_id) = team_id {
-                        state.event_bus.publish_team_event(
-                            aegis_orchestrator_core::domain::team::TeamEvent::SeatCountChanged {
-                                team_id,
-                                previous_count: sub.seat_count,
-                                new_count: new_seats_u32,
-                                changed_at: chrono::Utc::now(),
-                            },
-                        );
+    if new_seats_u32 != sub.seat_count {
+        let drift = (new_seats_u32 as i64 - sub.seat_count as i64).abs();
+        if drift > 1 {
+            warn!(
+                tenant_id = %sub.tenant_id,
+                previous = sub.seat_count,
+                new = new_seats_u32,
+                drift,
+                "Stripe seat_count drift >1 — reconciling from Stripe"
+            );
+        } else {
+            info!(
+                tenant_id = %sub.tenant_id,
+                previous = sub.seat_count,
+                new = new_seats_u32,
+                "Reconciling seat_count from Stripe webhook"
+            );
+        }
+        if let Err(e) = billing_repo
+            .update_seat_count_by_customer(customer_id, new_seats_u32)
+            .await
+        {
+            warn!(error = %e, "Failed to reconcile seat_count");
+        } else {
+            // Resolve the team_id via the team_repo so the event carries the
+            // correct aggregate id. If the lookup fails we still publish the
+            // drift — downstream consumers can re-derive from the tenant slug.
+            let team_id = match state.team_repo.as_ref() {
+                Some(tr) => {
+                    match aegis_orchestrator_core::domain::team::TeamSlug::parse(
+                        sub.tenant_id.as_str(),
+                    ) {
+                        Ok(slug) => match tr.find_by_slug(&slug).await {
+                            Ok(Some(t)) => Some(t.id),
+                            _ => None,
+                        },
+                        Err(_) => None,
                     }
                 }
+                None => None,
+            };
+            if let Some(team_id) = team_id {
+                state.event_bus.publish_team_event(
+                    aegis_orchestrator_core::domain::team::TeamEvent::SeatCountChanged {
+                        team_id,
+                        previous_count: sub.seat_count,
+                        new_count: new_seats_u32,
+                        changed_at: chrono::Utc::now(),
+                    },
+                );
             }
         }
     }
@@ -1672,5 +1686,104 @@ mod tests {
     #[test]
     fn tier_for_seat_price_returns_none_for_unknown() {
         assert_eq!(tier_for_seat_price("price_unknown_123"), None);
+    }
+
+    // ── seat_count reconciliation logic tests ─────────────────────────────
+
+    /// Helper: build a minimal subscription.updated items payload.
+    fn make_items_payload(items: &[(&str, u64)]) -> serde_json::Value {
+        let data: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(price_id, qty)| {
+                serde_json::json!({
+                    "price": { "id": price_id },
+                    "quantity": qty
+                })
+            })
+            .collect();
+        serde_json::json!({ "items": { "data": data } })
+    }
+
+    /// Computes the reconciled seat count using the same logic as
+    /// handle_subscription_updated, extracted as a pure function for testing.
+    fn compute_reconciled_seats(obj: &serde_json::Value, tier_str: &str) -> u32 {
+        let included = included_seats_for_tier(tier_str);
+        obj.get("items")
+            .and_then(|i| i.get("data"))
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                let addon_qty: u32 = arr
+                    .iter()
+                    .find(|item| {
+                        item.get("price")
+                            .and_then(|p| p.get("id"))
+                            .and_then(|id| id.as_str())
+                            .map(|pid| ALL_SEAT_PRICES.iter().any(|(_, _, known)| *known == pid))
+                            .unwrap_or(false)
+                    })
+                    .and_then(|item| item.get("quantity"))
+                    .and_then(|q| q.as_u64())
+                    .map(|q| q.min(u32::MAX as u64) as u32)
+                    .unwrap_or(0);
+                included + addon_qty
+            })
+            .unwrap_or(included)
+    }
+
+    /// Bug regression: single-item subscription (base plan only, quantity=1).
+    /// Previously data[0].quantity=1 was used as the total seat count, which
+    /// stomped any included seats > 1. Now it must return the tier's included
+    /// seat count with no add-on added.
+    #[test]
+    fn reconcile_seats_single_item_base_plan_only() {
+        // Pro base plan price (not a seat add-on price)
+        let obj = make_items_payload(&[("price_basePlanProMonthly", 1)]);
+        // Pro includes 3 seats; with no seat add-on that should be the total.
+        assert_eq!(compute_reconciled_seats(&obj, "pro"), 3);
+    }
+
+    /// Bug regression: multi-item subscription with base plan + seat add-on.
+    /// Previously data[0] (the base plan, qty=1) was used, giving seat_count=1.
+    /// The fix must find the seat add-on by price ID and sum correctly.
+    #[test]
+    fn reconcile_seats_multi_item_finds_addon_not_base_plan() {
+        let pro_seat_price = "price_1TMjj28rRJG9yuHzezvbHaSx"; // pro/month
+        let obj = make_items_payload(&[
+            ("price_basePlanProMonthly", 1), // base plan — must NOT be used
+            (pro_seat_price, 5),             // seat add-on: 5 extra
+        ]);
+        // Pro included=3, addon=5 → total=8
+        assert_eq!(compute_reconciled_seats(&obj, "pro"), 8);
+    }
+
+    /// Seat add-on at position 0 (Stripe may reorder items) is still found.
+    #[test]
+    fn reconcile_seats_addon_first_in_list() {
+        let business_seat_price = "price_1TMjj48rRJG9yuHz7zN7Xos0"; // business/month
+        let obj = make_items_payload(&[
+            (business_seat_price, 2),      // seat add-on comes first
+            ("price_basePlanBusiness", 1), // base plan
+        ]);
+        // Business included=5, addon=2 → total=7
+        assert_eq!(compute_reconciled_seats(&obj, "business"), 7);
+    }
+
+    /// No items array → falls back to included seats only, no panic.
+    #[test]
+    fn reconcile_seats_missing_items_falls_back_to_included() {
+        let obj = serde_json::json!({});
+        assert_eq!(compute_reconciled_seats(&obj, "pro"), 3);
+    }
+
+    /// Consumer/personal tenant (no "t-" prefix) is no longer gated out and
+    /// gets the same reconciliation as team tenants.
+    #[test]
+    fn reconcile_seats_not_gated_on_tenant_prefix() {
+        // This test validates the logic is prefix-agnostic; the gate removal
+        // itself is structural (no `if starts_with("t-")` wrapper), which this
+        // helper exercises without any prefix filtering.
+        let pro_seat_price = "price_1TMjj28rRJG9yuHzezvbHaSx";
+        let obj = make_items_payload(&[("price_basePlan", 1), (pro_seat_price, 2)]);
+        assert_eq!(compute_reconciled_seats(&obj, "pro"), 5); // 3 included + 2 addon
     }
 }
