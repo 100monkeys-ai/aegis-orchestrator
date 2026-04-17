@@ -89,6 +89,10 @@ pub(crate) struct CheckoutRequest {
     /// Number of extra seats beyond the included count.
     #[serde(default)]
     pub seats: u32,
+    /// Tier slug (pro, business, enterprise) — included in checkout metadata
+    /// so the webhook handler knows which tier was purchased.
+    #[serde(default)]
+    pub tier: Option<String>,
     /// URL to redirect after successful checkout.
     pub success_url: String,
     /// URL to redirect on cancellation.
@@ -454,10 +458,13 @@ pub(crate) async fn create_checkout_handler(
         }
     }
 
-    let tenant_meta: std::collections::HashMap<String, String> =
+    let mut tenant_meta: std::collections::HashMap<String, String> =
         [("tenant_id".to_string(), tenant_id.as_str().to_string())]
             .into_iter()
             .collect();
+    if let Some(ref tier) = body.tier {
+        tenant_meta.insert("tier".to_string(), tier.clone());
+    }
 
     let mut params = stripe::CreateCheckoutSession::new();
     params.customer = Some(customer_id_parsed);
