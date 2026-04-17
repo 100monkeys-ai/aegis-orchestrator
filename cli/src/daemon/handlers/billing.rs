@@ -773,7 +773,7 @@ pub(crate) async fn update_seats_handler(
 
     let update_params = stripe::UpdateSubscription {
         items: Some(items),
-        proration_behavior: Some(stripe::SubscriptionProrationBehavior::AlwaysInvoice),
+        proration_behavior: Some(stripe::generated::billing::subscription_schedule::SubscriptionProrationBehavior::AlwaysInvoice),
         ..Default::default()
     };
 
