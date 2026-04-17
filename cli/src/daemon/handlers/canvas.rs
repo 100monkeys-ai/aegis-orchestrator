@@ -49,7 +49,9 @@ use crate::daemon::state::AppState;
 /// present it MUST match the `binding_id` inside a `GitLinked` variant.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct CreateCanvasSessionRequest {
-    pub(crate) conversation_id: Uuid,
+    /// Optional — if omitted a new UUID is generated (useful for new conversations).
+    #[serde(default)]
+    pub(crate) conversation_id: Option<Uuid>,
     pub(crate) workspace_mode: WorkspaceMode,
     #[serde(default)]
     pub(crate) git_binding_id: Option<Uuid>,
@@ -163,7 +165,7 @@ pub(crate) async fn create_session_handler(
         tenant_id,
         owner,
         tier,
-        conversation_id: ConversationId(body.conversation_id),
+        conversation_id: ConversationId(body.conversation_id.unwrap_or_else(Uuid::new_v4)),
         workspace_mode: body.workspace_mode,
     };
 
