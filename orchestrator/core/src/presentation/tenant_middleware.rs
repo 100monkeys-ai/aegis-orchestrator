@@ -563,8 +563,17 @@ mod tests {
             }),
         );
 
-        // Insert identity into extensions to simulate iam_auth_middleware.
-        let router = if let Some(identity) = identity {
+        // Apply the tenant middleware first so it sits INSIDE the identity
+        // injector (axum applies layers bottom-up — the last `.layer()` call
+        // is the outermost). The injector must run first to populate
+        // `UserIdentity` into request extensions before tenant_context_middleware
+        // reads them, mirroring iam_auth_middleware's contract.
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            state,
+            tenant_context_middleware,
+        ));
+
+        if let Some(identity) = identity {
             router.layer(axum::middleware::from_fn(
                 move |mut req: Request, next: Next| {
                     let identity = identity.clone();
@@ -576,12 +585,7 @@ mod tests {
             ))
         } else {
             router
-        };
-
-        router.layer(axum::middleware::from_fn_with_state(
-            state,
-            tenant_context_middleware,
-        ))
+        }
     }
 
     fn state_with_repos(
