@@ -1,12 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Tool dispatch handlers for aegis.file.*, aegis.volume.*, aegis.git.*,
-//! and aegis.script.* tools.
-//!
-//! These tools were previously implemented in the SEAL gateway as native
-//! tools that proxied HTTP calls to the orchestrator's REST API. Since
-//! the gateway is not deployed, the orchestrator dispatches them directly
-//! via the underlying application services.
+//! Tool dispatch handlers for storage, volume, git, and script operations.
 
 use serde_json::{json, Value};
 
@@ -50,15 +44,12 @@ fn require_i64(args: &Value, key: &str) -> Result<i64, SealSessionError> {
 }
 
 fn commit_author(identity: Option<&UserIdentity>) -> (String, String) {
+    let name = identity
+        .and_then(|i| i.name.clone())
+        .unwrap_or_else(|| "User".to_string());
     let email = identity
         .and_then(|i| i.email.clone())
         .unwrap_or_else(|| "user@aegis.local".to_string());
-    let name = email
-        .split('@')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("User")
-        .to_string();
     (name, email)
 }
 
@@ -151,14 +142,7 @@ impl ToolInvocationService {
         let tier = user_tier(caller);
         let vid = parse_volume_id(volume_id)?;
 
-        let tier_limits = crate::domain::volume::StorageTierLimits::default();
-        let max_file_size = tier_limits
-            .limits
-            .get(&tier)
-            .map(|l| l.max_file_size_bytes)
-            .unwrap_or(50 * 1024 * 1024);
-
-        svc.write_file(&vid, &owner, path, content.as_bytes(), max_file_size)
+        svc.write_file_for_tier(&vid, &owner, path, content.as_bytes(), &tier)
             .await
             .map_err(internal_err)?;
 
@@ -634,19 +618,13 @@ impl ToolInvocationService {
         let owner = user_sub(caller);
         let tenant_id = Self::resolve_tenant_arg(args)?;
 
-        let mut scripts = svc.list(&tenant_id, &owner).await.map_err(internal_err)?;
+        let tag = args.get("tag").and_then(|v| v.as_str());
+        let query = args.get("q").and_then(|v| v.as_str());
 
-        // Apply optional filters (matching the REST handler pattern)
-        if let Some(tag) = args.get("tag").and_then(|v| v.as_str()) {
-            scripts.retain(|s| s.tags.iter().any(|t| t == tag));
-        }
-        if let Some(q) = args.get("q").and_then(|v| v.as_str()) {
-            let needle = q.to_ascii_lowercase();
-            scripts.retain(|s| {
-                s.name.to_ascii_lowercase().contains(&needle)
-                    || s.description.to_ascii_lowercase().contains(&needle)
-            });
-        }
+        let scripts = svc
+            .list_filtered(&tenant_id, &owner, tag, query)
+            .await
+            .map_err(internal_err)?;
 
         let items: Vec<Value> = scripts.iter().map(script_dto).collect();
         ok_direct(json!(items))

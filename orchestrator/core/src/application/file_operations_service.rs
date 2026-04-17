@@ -224,6 +224,25 @@ impl FileOperationsService {
         Ok(())
     }
 
+    /// Write a file with size limits resolved from the caller's [`ZaruTier`].
+    pub async fn write_file_for_tier(
+        &self,
+        volume_id: &VolumeId,
+        owner: &str,
+        path: &str,
+        data: &[u8],
+        tier: &crate::domain::iam::ZaruTier,
+    ) -> Result<(), FileOperationsError> {
+        let tier_limits = crate::domain::volume::StorageTierLimits::default();
+        let max_file_size = tier_limits
+            .limits
+            .get(tier)
+            .map(|l| l.max_file_size_bytes)
+            .unwrap_or(50 * 1024 * 1024);
+        self.write_file(volume_id, owner, path, data, max_file_size)
+            .await
+    }
+
     pub async fn delete_path(
         &self,
         volume_id: &VolumeId,
