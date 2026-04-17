@@ -513,6 +513,9 @@ pub(crate) async fn create_checkout_handler(
     if let Some(ref tier) = body.tier {
         tenant_meta.insert("tier".to_string(), tier.clone());
     }
+    if body.seats > 0 {
+        tenant_meta.insert("extra_seats".to_string(), body.seats.to_string());
+    }
 
     let mut params = stripe::CreateCheckoutSession::new();
     params.customer = Some(customer_id_parsed);
@@ -1066,6 +1069,13 @@ async fn handle_checkout_completed(
 
     let tier = str_to_tier(tier_str);
     let included_seats = included_seats_for_tier(tier_str);
+    let extra_seats: u32 = obj
+        .get("metadata")
+        .and_then(|m| m.get("extra_seats"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let total_seats = included_seats + extra_seats;
     let now = chrono::Utc::now();
 
     let sub = TenantSubscription {
@@ -1078,7 +1088,7 @@ async fn handle_checkout_completed(
         cancel_at_period_end: false,
         created_at: now,
         updated_at: now,
-        seat_count: included_seats,
+        seat_count: total_seats,
     };
 
     if let Err(e) = billing_repo.upsert_subscription(&sub).await {
