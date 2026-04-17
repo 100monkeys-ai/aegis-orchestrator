@@ -624,10 +624,14 @@ fn configure_credentials<'cb>(
 
 /// Apply the binding's sparse-checkout paths to an open repository.
 ///
-/// Libgit2 honours `.git/info/sparse-checkout` when
-/// `core.sparseCheckout = true` is set in the repo config. After writing
-/// the sparse file we re-run `checkout_head` so the working tree reflects
-/// the new filter.
+/// We set the standard sparse-checkout config and write
+/// `.git/info/sparse-checkout` so that a subsequent `git` CLI invocation
+/// inside the volume behaves correctly. libgit2 itself does **not**
+/// interpret the sparse-checkout file during `checkout_head` — that is a
+/// feature of the git CLI's checkout, not libgit2. To actually prune the
+/// working tree we walk it and delete any path not covered by a sparse
+/// prefix. Paths are compared in "cone mode" semantics: a sparse entry
+/// `keep` matches `keep/**`. The `.git` directory is always preserved.
 fn apply_sparse_checkout(repo: &Repository, paths: &[String]) -> Result<(), CloneError> {
     let mut cfg = repo.config()?;
     cfg.set_bool("core.sparseCheckout", true)?;
@@ -644,7 +648,87 @@ fn apply_sparse_checkout(repo: &Repository, paths: &[String]) -> Result<(), Clon
     std::fs::write(&sparse_file, contents)?;
 
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+
+    // Workdir is the repo root; `repo.path()` is `.git/`. Prune anything
+    // outside the sparse prefixes from the workdir.
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| CloneError::Git("bare repo has no workdir to prune".to_string()))?
+        .to_path_buf();
+    prune_workdir(&workdir, paths)?;
+
     Ok(())
+}
+
+/// Remove every path under `workdir` that does not sit under one of the
+/// sparse-checkout `include` prefixes. The `.git` directory is always
+/// preserved. Empty directories left behind by pruning are also removed.
+fn prune_workdir(workdir: &Path, paths: &[String]) -> Result<(), CloneError> {
+    // Normalise: drop leading `./` and trailing `/` so comparisons are
+    // unambiguous. Empty entries are treated as "no include" (drop).
+    let prefixes: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim_matches('/').trim_start_matches("./").to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    prune_dir_recursive(workdir, workdir, &prefixes)?;
+    Ok(())
+}
+
+fn prune_dir_recursive(root: &Path, dir: &Path, prefixes: &[String]) -> Result<(), CloneError> {
+    let entries = std::fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        // Never touch `.git/`.
+        if path == root.join(".git") {
+            continue;
+        }
+
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| CloneError::Git("sparse prune: strip_prefix failed".to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            if sparse_dir_is_kept(&rel, prefixes) {
+                prune_dir_recursive(root, &path, prefixes)?;
+                // If the directory is now empty and not itself a
+                // sparse-root, drop it. We keep named sparse roots even
+                // when empty — they represent the caller's intent.
+                if std::fs::read_dir(&path)?.next().is_none() && !prefixes.iter().any(|p| p == &rel)
+                {
+                    std::fs::remove_dir(&path)?;
+                }
+            } else {
+                std::fs::remove_dir_all(&path)?;
+            }
+        } else if !sparse_file_is_kept(&rel, prefixes) {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A file at `rel` is kept iff some prefix `p` satisfies `rel == p` or
+/// `rel` starts with `p/`.
+fn sparse_file_is_kept(rel: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|p| rel == p || rel.starts_with(&format!("{p}/")))
+}
+
+/// A directory at `rel` is worth descending into if any prefix either
+/// equals it, starts with `rel/` (the dir is an ancestor of a sparse
+/// root), or `rel` is already under a sparse root.
+fn sparse_dir_is_kept(rel: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|p| rel == p || rel.starts_with(&format!("{p}/")) || p.starts_with(&format!("{rel}/")))
 }
 
 /// Return `true` if `repo_url` resolves to libgit2's local transport.
@@ -889,5 +973,92 @@ mod tests {
     fn is_local_transport_rejects_scp_style_ssh() {
         assert!(!is_local_transport("git@github.com:owner/repo.git"));
         assert!(!is_local_transport("user@host.example:path/to/repo"));
+    }
+
+    // -----------------------------------------------------------------
+    // Regression: sparse-checkout pruning must physically remove files
+    // outside the include prefixes.
+    //
+    // libgit2 does not interpret `.git/info/sparse-checkout` during
+    // `checkout_head`; that is a git CLI feature. The original
+    // `apply_sparse_checkout` only wrote the sparse file and relied on
+    // libgit2 to prune the working tree — it didn't. The integration
+    // test `sparse_checkout_prunes_working_tree` in
+    // `tests/git_clone_executor_tests.rs` caught this: `prune/b.txt`
+    // remained after the clone despite the sparse config. These unit
+    // tests pin the keep / prune predicates so a future regression on
+    // the matcher is caught without needing the full clone harness.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sparse_file_is_kept_exact_match() {
+        let prefixes = vec!["keep/a.txt".to_string()];
+        assert!(sparse_file_is_kept("keep/a.txt", &prefixes));
+    }
+
+    #[test]
+    fn sparse_file_is_kept_under_prefix() {
+        let prefixes = vec!["keep".to_string()];
+        assert!(sparse_file_is_kept("keep/a.txt", &prefixes));
+        assert!(sparse_file_is_kept("keep/nested/b.txt", &prefixes));
+    }
+
+    #[test]
+    fn sparse_file_not_kept_outside_prefix() {
+        let prefixes = vec!["keep".to_string()];
+        assert!(!sparse_file_is_kept("prune/b.txt", &prefixes));
+        assert!(!sparse_file_is_kept("keepsake/x.txt", &prefixes));
+        assert!(!sparse_file_is_kept("top.txt", &prefixes));
+    }
+
+    #[test]
+    fn sparse_dir_kept_when_prefix_exact() {
+        let prefixes = vec!["keep".to_string()];
+        assert!(sparse_dir_is_kept("keep", &prefixes));
+    }
+
+    #[test]
+    fn sparse_dir_kept_when_ancestor_of_prefix() {
+        // Sparse entry `src/app` means we must descend into `src`.
+        let prefixes = vec!["src/app".to_string()];
+        assert!(sparse_dir_is_kept("src", &prefixes));
+        assert!(sparse_dir_is_kept("src/app", &prefixes));
+    }
+
+    #[test]
+    fn sparse_dir_kept_when_under_prefix() {
+        let prefixes = vec!["keep".to_string()];
+        assert!(sparse_dir_is_kept("keep/nested", &prefixes));
+    }
+
+    #[test]
+    fn sparse_dir_not_kept_when_outside() {
+        let prefixes = vec!["keep".to_string()];
+        assert!(!sparse_dir_is_kept("prune", &prefixes));
+        assert!(!sparse_dir_is_kept("keepsake", &prefixes));
+    }
+
+    #[test]
+    fn prune_workdir_drops_excluded_and_preserves_included() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::create_dir_all(root.join("prune")).unwrap();
+        std::fs::write(root.join("keep/a.txt"), b"k").unwrap();
+        std::fs::write(root.join("prune/b.txt"), b"p").unwrap();
+        std::fs::write(root.join("top.txt"), b"t").unwrap();
+
+        prune_workdir(root, &["keep".to_string()]).unwrap();
+
+        assert!(root.join(".git/HEAD").exists(), ".git must be preserved");
+        assert!(root.join("keep/a.txt").exists(), "included path kept");
+        assert!(!root.join("prune").exists(), "excluded dir removed");
+        assert!(
+            !root.join("top.txt").exists(),
+            "excluded top-level file removed"
+        );
     }
 }
