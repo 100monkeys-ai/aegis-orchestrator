@@ -1111,7 +1111,9 @@ mod tests {
 
     /// Mock OutputHandlerService for regression tests.
     struct MockOutputHandlerService {
-        result: Mutex<Result<Option<String>>>,
+        result: Mutex<
+            Result<Option<String>, crate::application::output_handler_service::OutputHandlerError>,
+        >,
     }
 
     impl MockOutputHandlerService {
@@ -1123,7 +1125,11 @@ mod tests {
 
         fn returning_err(msg: &str) -> Self {
             Self {
-                result: Mutex::new(Err(anyhow!(msg.to_string()))),
+                result: Mutex::new(Err(
+                    crate::application::output_handler_service::OutputHandlerError::Failed(
+                        msg.to_string(),
+                    ),
+                )),
             }
         }
     }
@@ -1137,10 +1143,18 @@ mod tests {
             _execution_id: Option<&ExecutionId>,
             _tenant_id: &TenantId,
             _intent: Option<&str>,
-        ) -> Result<Option<String>> {
+        ) -> Result<Option<String>, crate::application::output_handler_service::OutputHandlerError>
+        {
             let mut guard = self.result.lock().unwrap();
             // Replace with Err to prevent accidental reuse — tests should only invoke once.
-            std::mem::replace(&mut *guard, Err(anyhow!("already consumed")))
+            std::mem::replace(
+                &mut *guard,
+                Err(
+                    crate::application::output_handler_service::OutputHandlerError::Failed(
+                        "already consumed".to_string(),
+                    ),
+                ),
+            )
         }
     }
 
