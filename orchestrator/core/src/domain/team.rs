@@ -289,7 +289,7 @@ pub enum TeamEvent {
         /// The header that triggered the switch (always `"X-Tenant-Id"` for
         /// team-context switches — operator and service-account paths have
         /// their own audit trails).
-        via_header: &'static str,
+        via_header: String,
         switched_at: DateTime<Utc>,
     },
 }
@@ -722,5 +722,26 @@ mod tests {
         assert!(MembershipRole::Owner.can_manage_membership());
         assert!(MembershipRole::Admin.can_manage_membership());
         assert!(!MembershipRole::Member.can_manage_membership());
+    }
+
+    /// Regression: `TeamEvent` derives `Deserialize` and must be fully
+    /// deserializable as an owned value. Previously `via_header` was typed
+    /// `&'static str`, which forced the derived `Deserialize<'de>` impl to
+    /// require `'de: 'static` and broke doc/check builds with
+    /// "lifetime may not live long enough". `via_header` is now `String`.
+    #[test]
+    fn tenant_context_switched_event_round_trips_serde() {
+        let from = TenantId::consumer();
+        let to = TenantId::consumer();
+        let event = TeamEvent::TenantContextSwitched {
+            caller_user_id: "user-123".to_string(),
+            from_tenant_id: from,
+            to_tenant_id: to,
+            via_header: "X-Tenant-Id".to_string(),
+            switched_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let restored: TeamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, restored);
     }
 }

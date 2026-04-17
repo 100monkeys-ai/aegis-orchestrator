@@ -226,7 +226,7 @@ pub async fn tenant_context_middleware(
                                 caller_user_id: id.sub.clone(),
                                 from_tenant_id: base_tenant.clone(),
                                 to_tenant_id: target_tenant.clone(),
-                                via_header: "X-Tenant-Id",
+                                via_header: "X-Tenant-Id".to_string(),
                                 switched_at: Utc::now(),
                             });
                         let mut request = request;
