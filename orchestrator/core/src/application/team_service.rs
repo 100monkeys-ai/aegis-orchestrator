@@ -197,6 +197,15 @@ pub trait TeamService: Send + Sync {
         &self,
         user_id: &str,
     ) -> Result<Vec<Membership>, TeamServiceError>;
+
+    /// List pending invitations for a team. Caller must be an Owner or Admin
+    /// (enforced by callers via [`ensure_manager`]-equivalent checks — this
+    /// method is currently a thin read-through, with authorization handled at
+    /// the HTTP handler layer that already resolved the active team).
+    async fn list_pending_invitations(
+        &self,
+        team_id: TeamId,
+    ) -> Result<Vec<TeamInvitation>, TeamServiceError>;
 }
 
 // ============================================================================
@@ -592,6 +601,13 @@ impl TeamService for StandardTeamService {
         user_id: &str,
     ) -> Result<Vec<Membership>, TeamServiceError> {
         Ok(self.membership_repo.find_by_user(user_id).await?)
+    }
+
+    async fn list_pending_invitations(
+        &self,
+        team_id: TeamId,
+    ) -> Result<Vec<TeamInvitation>, TeamServiceError> {
+        Ok(self.invitation_repo.find_pending_by_team(&team_id).await?)
     }
 }
 

@@ -40,6 +40,15 @@ pub trait BillingRepository: Send + Sync {
         status: &SubscriptionStatus,
         period_end: Option<DateTime<Utc>>,
     ) -> Result<(), RepositoryError>;
+
+    /// Update the `seat_count` column for a subscription identified by Stripe
+    /// customer id. Used by the Stripe webhook reconciliation path
+    /// (ADR-111 §Billing Model).
+    async fn update_seat_count_by_customer(
+        &self,
+        stripe_customer_id: &str,
+        seat_count: u32,
+    ) -> Result<(), RepositoryError>;
 }
 
 pub struct PostgresBillingRepository {
@@ -203,6 +212,26 @@ impl BillingRepository for PostgresBillingRepository {
             RepositoryError::Database(format!("Failed to update subscription tier: {e}"))
         })?;
 
+        Ok(())
+    }
+
+    async fn update_seat_count_by_customer(
+        &self,
+        stripe_customer_id: &str,
+        seat_count: u32,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r#"
+            UPDATE tenant_subscriptions
+            SET seat_count = $2, updated_at = NOW()
+            WHERE stripe_customer_id = $1
+            "#,
+        )
+        .bind(stripe_customer_id)
+        .bind(seat_count as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(format!("Failed to update seat_count: {e}")))?;
         Ok(())
     }
 }
