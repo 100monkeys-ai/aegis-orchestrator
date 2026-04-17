@@ -122,7 +122,7 @@ use aegis_orchestrator_core::{
 };
 
 use aegis_orchestrator_core::application::credential_service::{
-    CredentialManagementService, StandardCredentialManagementService,
+    CredentialManagementService, OAuthProviderRegistry, StandardCredentialManagementService,
 };
 use aegis_orchestrator_core::domain::credential::CredentialBindingRepository;
 use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
@@ -1467,10 +1467,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         db_pool.as_ref().map(|pool| {
             let repo = Arc::new(PostgresCredentialBindingRepository::new(pool.clone()))
                 as Arc<dyn CredentialBindingRepository>;
+            // OAuth provider registry (RFC 6749 §4.1.3 token exchange). Empty
+            // for now — providers are loaded from node config in a follow-up.
+            // Requests against unregistered providers return
+            // `CredentialError::ProviderNotConfigured`.
+            let oauth_providers = Arc::new(OAuthProviderRegistry::new());
             Arc::new(StandardCredentialManagementService::new(
                 repo,
                 secrets_manager.clone(),
                 event_bus.clone(),
+                oauth_providers,
             )) as Arc<dyn CredentialManagementService>
         });
 
