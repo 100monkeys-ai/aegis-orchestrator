@@ -53,6 +53,9 @@ impl ToolInvocationService {
             discovery_service: None,
             runtime_registry: None,
             file_operations_service: None,
+            user_volume_service: None,
+            git_repo_service: None,
+            script_service: None,
         }
     }
 
@@ -150,6 +153,33 @@ impl ToolInvocationService {
         svc: Arc<crate::application::file_operations_service::FileOperationsService>,
     ) -> Self {
         self.file_operations_service = Some(svc);
+        self
+    }
+
+    /// Attach a `UserVolumeService` to enable `aegis.volume.*` tools.
+    pub fn with_user_volume_service(
+        mut self,
+        svc: Arc<crate::application::user_volume_service::UserVolumeService>,
+    ) -> Self {
+        self.user_volume_service = Some(svc);
+        self
+    }
+
+    /// Attach a `GitRepoService` to enable `aegis.git.*` tools.
+    pub fn with_git_repo_service(
+        mut self,
+        svc: Arc<crate::application::git_repo_service::GitRepoService>,
+    ) -> Self {
+        self.git_repo_service = Some(svc);
+        self
+    }
+
+    /// Attach a `ScriptService` to enable `aegis.script.*` tools.
+    pub fn with_script_service(
+        mut self,
+        svc: Arc<crate::application::script_service::ScriptService>,
+    ) -> Self {
+        self.script_service = Some(svc);
         self
     }
 
@@ -954,6 +984,47 @@ impl ToolInvocationService {
             "aegis.execute.status" => Some(self.invoke_aegis_execute_status_tool(args).await),
             "aegis.execute.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
             "aegis.runtime.list" => Some(self.invoke_aegis_runtime_list_tool(args).await),
+
+            // ── File operations (aegis.file.*) ─────────────────────────
+            "aegis.file.list" => Some(self.invoke_aegis_file_list(args, caller_identity).await),
+            "aegis.file.read" => Some(self.invoke_aegis_file_read(args, caller_identity).await),
+            "aegis.file.write" => Some(self.invoke_aegis_file_write(args, caller_identity).await),
+            "aegis.file.delete" => Some(self.invoke_aegis_file_delete(args, caller_identity).await),
+            "aegis.file.mkdir" => Some(self.invoke_aegis_file_mkdir(args, caller_identity).await),
+
+            // ── Volume operations (aegis.volume.*) ─────────────────────
+            "aegis.volume.create" => {
+                Some(self.invoke_aegis_volume_create(args, caller_identity).await)
+            }
+            "aegis.volume.delete" => {
+                Some(self.invoke_aegis_volume_delete(args, caller_identity).await)
+            }
+            "aegis.volume.list" => Some(self.invoke_aegis_volume_list(args, caller_identity).await),
+            "aegis.volume.quota" => {
+                Some(self.invoke_aegis_volume_quota(args, caller_identity).await)
+            }
+
+            // ── Git operations (aegis.git.*) ──────────────────��────────
+            "aegis.git.clone" => Some(self.invoke_aegis_git_clone(args, caller_identity).await),
+            "aegis.git.commit" => Some(self.invoke_aegis_git_commit(args, caller_identity).await),
+            "aegis.git.delete" => Some(self.invoke_aegis_git_delete(args, caller_identity).await),
+            "aegis.git.diff" => Some(self.invoke_aegis_git_diff(args, caller_identity).await),
+            "aegis.git.list" => Some(self.invoke_aegis_git_list(args, caller_identity).await),
+            "aegis.git.push" => Some(self.invoke_aegis_git_push(args, caller_identity).await),
+            "aegis.git.refresh" => Some(self.invoke_aegis_git_refresh(args, caller_identity).await),
+            "aegis.git.status" => Some(self.invoke_aegis_git_status(args, caller_identity).await),
+
+            // ── Script operations (aegis.script.*) ─────────────────────
+            "aegis.script.delete" => {
+                Some(self.invoke_aegis_script_delete(args, caller_identity).await)
+            }
+            "aegis.script.get" => Some(self.invoke_aegis_script_get(args, caller_identity).await),
+            "aegis.script.list" => Some(self.invoke_aegis_script_list(args, caller_identity).await),
+            "aegis.script.save" => Some(self.invoke_aegis_script_save(args, caller_identity).await),
+            "aegis.script.update" => {
+                Some(self.invoke_aegis_script_update(args, caller_identity).await)
+            }
+
             "aegis.execution.file" => {
                 let tenant_id = match Self::resolve_tenant_arg(args) {
                     Ok(id) => id,

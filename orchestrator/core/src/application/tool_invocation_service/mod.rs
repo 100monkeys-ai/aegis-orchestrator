@@ -8,6 +8,7 @@ mod execute;
 mod facade;
 mod gateway;
 mod runtime;
+mod storage;
 mod system;
 mod tasks;
 #[cfg(test)]
@@ -118,7 +119,14 @@ pub struct ToolInvocationService {
     discovery_service: Option<Arc<dyn crate::application::discovery_service::DiscoveryService>>,
     /// Optional StandardRuntime registry for aegis.runtime.list tool.
     runtime_registry: Option<Arc<StandardRuntimeRegistry>>,
-    /// File operations service for post-mortem execution file reads (aegis.execution.file).
+    /// File operations service for post-mortem execution file reads (aegis.execution.file)
+    /// and user-volume file operations (aegis.file.*).
     file_operations_service:
         Option<Arc<crate::application::file_operations_service::FileOperationsService>>,
+    /// User volume lifecycle service for aegis.volume.* tools.
+    user_volume_service: Option<Arc<crate::application::user_volume_service::UserVolumeService>>,
+    /// Git repository binding service for aegis.git.* tools.
+    git_repo_service: Option<Arc<crate::application::git_repo_service::GitRepoService>>,
+    /// Script service for aegis.script.* tools.
+    script_service: Option<Arc<crate::application::script_service::ScriptService>>,
 }
