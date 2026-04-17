@@ -37,6 +37,106 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use url::Url;
+
+// ============================================================================
+// OAuth Provider Configuration
+// ============================================================================
+
+/// Per-provider OAuth 2.0 client configuration required to exchange an
+/// authorization code for an access token (RFC 6749 §4.1.3).
+///
+/// `client_secret` is optional: public clients (per RFC 6749 §2.1) omit it and
+/// rely on PKCE (RFC 7636) for proof of possession.
+#[derive(Debug, Clone)]
+pub struct OAuthProviderConfig {
+    /// Provider's token endpoint URL. MUST be HTTPS (localhost exempted for dev).
+    pub token_url: String,
+    /// OAuth 2.0 `client_id` registered with the provider.
+    pub client_id: String,
+    /// OAuth 2.0 `client_secret` for confidential clients. `None` for public clients.
+    pub client_secret: Option<SensitiveString>,
+}
+
+/// Registry mapping `CredentialProvider` → `OAuthProviderConfig`.
+///
+/// Shared across the service; loaded at startup from platform configuration.
+pub type OAuthProviderRegistry = HashMap<CredentialProvider, OAuthProviderConfig>;
+
+// ============================================================================
+// Error types
+// ============================================================================
+
+/// Typed errors produced by the credential service during OAuth exchange and
+/// related operations. Wrapped in `anyhow::Result` at the trait boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialError {
+    /// The provider returned an RFC 6749 §5.2 error response (e.g. `invalid_grant`).
+    #[error("OAuth token exchange rejected by provider: {error}{}",
+        .description.as_ref().map(|d| format!(" — {d}")).unwrap_or_default())]
+    OAuthExchangeFailed {
+        error: String,
+        description: Option<String>,
+    },
+    /// The provider's `token_url` is not HTTPS (and not `http://localhost`).
+    #[error("OAuth token_url must use HTTPS (or http://localhost for dev): {0}")]
+    InsecureTokenUrl(String),
+    /// No `OAuthProviderConfig` was registered for the provider.
+    #[error("No OAuth provider configuration registered for: {0}")]
+    ProviderNotConfigured(String),
+    /// Transport-level failure reaching the token endpoint.
+    #[error("OAuth token endpoint transport error: {0}")]
+    HttpError(String),
+    /// Provider returned a malformed or unparseable token response.
+    #[error("OAuth token response was malformed: {0}")]
+    InvalidResponse(String),
+}
+
+/// Enforce HTTPS on the token URL per RFC 6749 §3.1.2.1, with a development
+/// exemption for `http://localhost` / `http://127.0.0.1`.
+fn ensure_secure_token_url(token_url: &str) -> Result<(), CredentialError> {
+    let parsed = Url::parse(token_url)
+        .map_err(|e| CredentialError::InsecureTokenUrl(format!("unparseable: {e}")))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed.host_str().unwrap_or("");
+            if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+                Ok(())
+            } else {
+                Err(CredentialError::InsecureTokenUrl(token_url.to_string()))
+            }
+        }
+        _ => Err(CredentialError::InsecureTokenUrl(token_url.to_string())),
+    }
+}
+
+// ============================================================================
+// Wire-format types for the token endpoint (RFC 6749 §5.1 / §5.2)
+// ============================================================================
+
+/// RFC 6749 §5.1 successful token response.
+///
+/// NEVER derive `Debug` on a value populated from a live response: `Debug` is
+/// derived here because the struct is only used transiently inside the
+/// exchange function and never logged. Values are moved directly into
+/// `SensitiveString` before being stored or returned.
+#[derive(Debug, serde::Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    #[allow(dead_code)]
+    token_type: String,
+    expires_in: Option<u64>,
+    refresh_token: Option<String>,
+    scope: Option<String>,
+}
+
+/// RFC 6749 §5.2 error response.
+#[derive(Debug, serde::Deserialize)]
+struct OAuthErrorResponse {
+    error: String,
+    error_description: Option<String>,
+}
 
 // ============================================================================
 // Command types
@@ -191,18 +291,143 @@ pub struct StandardCredentialManagementService {
     repo: Arc<dyn CredentialBindingRepository>,
     secrets: Arc<SecretsManager>,
     event_bus: Arc<EventBus>,
+    http: reqwest::Client,
+    oauth_providers: Arc<OAuthProviderRegistry>,
 }
 
 impl StandardCredentialManagementService {
+    /// Production constructor.
+    ///
+    /// Builds a default `reqwest::Client` and accepts the `OAuthProviderRegistry`
+    /// loaded from platform configuration.
     pub fn new(
         repo: Arc<dyn CredentialBindingRepository>,
         secrets: Arc<SecretsManager>,
         event_bus: Arc<EventBus>,
+        oauth_providers: Arc<OAuthProviderRegistry>,
     ) -> Self {
         Self {
             repo,
             secrets,
             event_bus,
+            http: reqwest::Client::new(),
+            oauth_providers,
+        }
+    }
+
+    /// Test / advanced constructor that takes an explicit `reqwest::Client`.
+    ///
+    /// Used to point the service at a mockito server for integration tests.
+    pub fn with_http_client(
+        repo: Arc<dyn CredentialBindingRepository>,
+        secrets: Arc<SecretsManager>,
+        event_bus: Arc<EventBus>,
+        oauth_providers: Arc<OAuthProviderRegistry>,
+        http: reqwest::Client,
+    ) -> Self {
+        Self {
+            repo,
+            secrets,
+            event_bus,
+            http,
+            oauth_providers,
+        }
+    }
+
+    /// RFC 6749 §4.1.3 + RFC 7636 authorization-code-for-token exchange.
+    ///
+    /// Posts to `provider.token_url` and returns the parsed token response.
+    /// Never logs the `code`, `code_verifier`, `client_secret`, or any returned
+    /// token material.
+    async fn exchange_authorization_code(
+        &self,
+        provider: &CredentialProvider,
+        code: &str,
+        pending: &OAuthPendingState,
+    ) -> Result<OAuthTokenResponse, CredentialError> {
+        let cfg = self
+            .oauth_providers
+            .get(provider)
+            .ok_or_else(|| CredentialError::ProviderNotConfigured(provider.to_string()))?;
+
+        ensure_secure_token_url(&cfg.token_url)?;
+
+        // Build application/x-www-form-urlencoded body per RFC 6749 §4.1.3.
+        // `client_secret` is included only for confidential clients.
+        let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", &pending.redirect_uri),
+            ("client_id", &cfg.client_id),
+            ("code_verifier", &pending.pkce_verifier),
+        ];
+        let secret_holder;
+        if let Some(s) = &cfg.client_secret {
+            secret_holder = s.expose().to_string();
+            form.push(("client_secret", &secret_holder));
+        }
+
+        tracing::info!(
+            provider = %provider,
+            token_url = %cfg.token_url,
+            "Posting OAuth authorization-code exchange to provider token endpoint"
+        );
+
+        let resp = self
+            .http
+            .post(&cfg.token_url)
+            .header("Accept", "application/json")
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| CredentialError::HttpError(e.to_string()))?;
+
+        let status = resp.status();
+
+        if status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| CredentialError::HttpError(e.to_string()))?;
+            let token: OAuthTokenResponse = serde_json::from_str(&body).map_err(|e| {
+                // Do NOT include the raw body in the error — it contains the token.
+                CredentialError::InvalidResponse(format!("deserialisation failed: {e}"))
+            })?;
+            tracing::info!(
+                provider = %provider,
+                scope = ?token.scope,
+                expires_in = ?token.expires_in,
+                has_refresh_token = token.refresh_token.is_some(),
+                "OAuth authorization-code exchange succeeded"
+            );
+            Ok(token)
+        } else if status.is_client_error() {
+            // RFC 6749 §5.2: expect a JSON error object with `error` + optional
+            // `error_description`. Fall back to a generic variant if the
+            // provider returns something non-conforming.
+            let body = resp.text().await.unwrap_or_default();
+            match serde_json::from_str::<OAuthErrorResponse>(&body) {
+                Ok(err) => {
+                    tracing::warn!(
+                        provider = %provider,
+                        error = %err.error,
+                        "Provider rejected OAuth authorization-code exchange"
+                    );
+                    Err(CredentialError::OAuthExchangeFailed {
+                        error: err.error,
+                        description: err.error_description,
+                    })
+                }
+                Err(_) => Err(CredentialError::OAuthExchangeFailed {
+                    error: format!("http_{}", status.as_u16()),
+                    description: None,
+                }),
+            }
+        } else {
+            Err(CredentialError::HttpError(format!(
+                "unexpected status {} from token endpoint",
+                status
+            )))
         }
     }
 }
@@ -353,7 +578,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
     async fn complete_oauth_connection(
         &self,
         state: &str,
-        _code: &str,
+        code: &str,
     ) -> anyhow::Result<CredentialBindingId> {
         let pending: OAuthPendingState = self
             .repo
@@ -374,18 +599,41 @@ impl CredentialManagementService for StandardCredentialManagementService {
             .await?
             .ok_or_else(|| anyhow!("Credential binding not found for pending OAuth state"))?;
 
-        // TODO: call provider token endpoint using `_code` and `pending.pkce_verifier`
-        // to exchange the authorization code for an access token + optional refresh token.
+        // RFC 6749 §4.1.3 + RFC 7636: exchange the authorization code + PKCE
+        // verifier for an access token at the provider's token endpoint. A
+        // single attempt only — authorization codes are single-use, so retries
+        // are unsafe.
+        let token_response = self
+            .exchange_authorization_code(&binding.provider, code, &pending)
+            .await?;
 
         let secret_path =
             user_credential_path(&binding.tenant_id, &binding.owner_user_id, &binding.id);
 
-        // Write a placeholder token value to OpenBao at the real path.
+        // Persist the tokens returned by the provider. Compute an absolute
+        // `expires_at` so the refresh path doesn't need clock math on read.
         let mut secret_data = HashMap::new();
         secret_data.insert(
             "access_token".to_string(),
-            SensitiveString::new("PENDING_REAL_TOKEN"),
+            SensitiveString::new(token_response.access_token),
         );
+        if let Some(refresh_token) = token_response.refresh_token {
+            secret_data.insert(
+                "refresh_token".to_string(),
+                SensitiveString::new(refresh_token),
+            );
+        }
+        if let Some(expires_in) = token_response.expires_in {
+            let expires_at = Utc::now() + chrono::Duration::seconds(expires_in as i64);
+            secret_data.insert(
+                "expires_at".to_string(),
+                SensitiveString::new(expires_at.to_rfc3339()),
+            );
+        }
+        if let Some(scope) = token_response.scope {
+            secret_data.insert("scope".to_string(), SensitiveString::new(scope));
+        }
+
         self.secrets
             .write_secret(
                 &secret_path.effective_mount(),
