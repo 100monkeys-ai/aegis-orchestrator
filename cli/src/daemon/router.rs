@@ -50,7 +50,8 @@ use crate::daemon::handlers::executions::{
     get_execution_handler, list_executions_handler, stream_events_handler,
 };
 use crate::daemon::handlers::git_repo::{
-    create_git_repo, delete_git_repo, get_git_repo, list_git_repos, refresh_git_repo,
+    commit_git_repo, create_git_repo, delete_git_repo, diff_git_repo, get_git_repo, list_git_repos,
+    push_git_repo, refresh_git_repo,
 };
 use crate::daemon::handlers::health::{health_handler, readiness_handler};
 use crate::daemon::handlers::observability::{
@@ -314,6 +315,10 @@ pub(crate) fn create_router(
             get(get_git_repo).delete(delete_git_repo),
         )
         .route("/v1/storage/git/{id}/refresh", post(refresh_git_repo))
+        // BC-7 Canvas git-write (ADR-106 Wave B2) — commit / push / diff
+        .route("/v1/storage/git/{id}/commit", post(commit_git_repo))
+        .route("/v1/storage/git/{id}/push", post(push_git_repo))
+        .route("/v1/storage/git/{id}/diff", get(diff_git_repo))
         // Colony management (BC-12 / ADR-097): member, SAML IdP, subscription endpoints
         .route("/v1/colony/members", get(list_members).post(invite_member))
         .route("/v1/colony/members/{user_id}", delete(remove_member))
