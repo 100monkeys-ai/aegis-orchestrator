@@ -100,7 +100,7 @@ impl ToolInvocationService {
         let entries = svc
             .list_directory(&vid, &owner, path)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(serde_json::to_value(entries).unwrap_or(json!([])))
     }
@@ -122,7 +122,7 @@ impl ToolInvocationService {
         let content = svc
             .read_file(&vid, &owner, path)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         // Return text content as JSON string; binary as base64
         let text = String::from_utf8(content.data.clone())
@@ -160,7 +160,7 @@ impl ToolInvocationService {
 
         svc.write_file(&vid, &owner, path, content.as_bytes(), max_file_size)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -181,7 +181,7 @@ impl ToolInvocationService {
 
         svc.delete_path(&vid, &owner, path)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -202,7 +202,7 @@ impl ToolInvocationService {
 
         svc.create_directory(&vid, &owner, path)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -234,7 +234,7 @@ impl ToolInvocationService {
             zaru_tier: tier,
         };
 
-        let vol = svc.create_volume(cmd).await.map_err(|e| internal_err(e))?;
+        let vol = svc.create_volume(cmd).await.map_err(internal_err)?;
 
         ok_direct(json!({
             "id": vol.id.to_string(),
@@ -260,7 +260,7 @@ impl ToolInvocationService {
         let vols = svc
             .list_volumes(&tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         let items: Vec<Value> = vols
             .into_iter()
@@ -293,7 +293,7 @@ impl ToolInvocationService {
 
         svc.delete_volume(&vid, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -314,7 +314,7 @@ impl ToolInvocationService {
         let usage = svc
             .get_quota_usage(&tenant_id, &owner, &tier)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({
             "volume_count": usage.volume_count,
@@ -394,7 +394,7 @@ impl ToolInvocationService {
             shallow,
         };
 
-        let binding = svc.create_binding(cmd).await.map_err(|e| internal_err(e))?;
+        let binding = svc.create_binding(cmd).await.map_err(internal_err)?;
 
         // Spawn background clone
         let svc_bg = svc.clone();
@@ -423,7 +423,7 @@ impl ToolInvocationService {
         let bindings = svc
             .list_bindings(&tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         let items: Vec<Value> = bindings.iter().map(redacted_binding).collect();
         ok_direct(json!(items))
@@ -446,7 +446,7 @@ impl ToolInvocationService {
         let binding = svc
             .get_binding(&bid, &tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(redacted_binding(&binding))
     }
@@ -467,7 +467,7 @@ impl ToolInvocationService {
 
         svc.refresh_repo(&bid, &tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -488,7 +488,7 @@ impl ToolInvocationService {
 
         svc.delete_binding(&bid, &tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -519,7 +519,7 @@ impl ToolInvocationService {
                 &author_email,
             )
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"commit_sha": commit_sha}))
     }
@@ -543,7 +543,7 @@ impl ToolInvocationService {
 
         svc.push(&bid, &tenant_id, &owner, remote, ref_name)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -570,7 +570,7 @@ impl ToolInvocationService {
         let diff_text = svc
             .diff(&bid, &tenant_id, &owner, staged)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"diff": diff_text}))
     }
@@ -618,7 +618,7 @@ impl ToolInvocationService {
             tags,
         };
 
-        let script = svc.create(cmd).await.map_err(|e| internal_err(e))?;
+        let script = svc.create(cmd).await.map_err(internal_err)?;
         ok_direct(script_dto(&script))
     }
 
@@ -634,10 +634,7 @@ impl ToolInvocationService {
         let owner = user_sub(caller);
         let tenant_id = Self::resolve_tenant_arg(args)?;
 
-        let mut scripts = svc
-            .list(&tenant_id, &owner)
-            .await
-            .map_err(|e| internal_err(e))?;
+        let mut scripts = svc.list(&tenant_id, &owner).await.map_err(internal_err)?;
 
         // Apply optional filters (matching the REST handler pattern)
         if let Some(tag) = args.get("tag").and_then(|v| v.as_str()) {
@@ -672,12 +669,12 @@ impl ToolInvocationService {
         let script = svc
             .get(&script_id, &tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         let versions = svc
             .list_versions(&script_id, &tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         let mut body = script_dto(&script);
         if let Some(obj) = body.as_object_mut() {
@@ -737,7 +734,7 @@ impl ToolInvocationService {
         let script = svc
             .update(&script_id, &tenant_id, &owner, cmd)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(script_dto(&script))
     }
@@ -758,7 +755,7 @@ impl ToolInvocationService {
 
         svc.delete(&script_id, &tenant_id, &owner)
             .await
-            .map_err(|e| internal_err(e))?;
+            .map_err(internal_err)?;
 
         ok_direct(json!({"success": true}))
     }
