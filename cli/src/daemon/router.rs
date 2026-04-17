@@ -28,7 +28,7 @@ use crate::daemon::handlers::approvals::{
 };
 use crate::daemon::handlers::billing::{
     create_checkout_handler, create_portal_handler, get_subscription_handler,
-    list_invoices_handler, list_prices_handler,
+    list_invoices_handler, list_prices_handler, update_seats_handler,
 };
 use crate::daemon::handlers::canvas::{
     create_session_handler as canvas_create_session_handler,
@@ -364,6 +364,7 @@ pub(crate) fn create_router(
         .route("/v1/billing/prices", get(list_prices_handler))
         .route("/v1/billing/checkout", post(create_checkout_handler))
         .route("/v1/billing/portal", post(create_portal_handler))
+        .route("/v1/billing/seats", post(update_seats_handler))
         .route("/v1/billing/subscription", get(get_subscription_handler))
         .route("/v1/billing/invoices", get(list_invoices_handler))
         .with_state(app_state);

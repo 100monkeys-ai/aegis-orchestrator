@@ -12,6 +12,7 @@
 //! | `POST` | `/v1/billing/checkout` | Create a Stripe Checkout session |
 //! | `POST` | `/v1/billing/portal` | Create a Stripe Customer Portal session |
 //! | `GET`  | `/v1/billing/subscription` | Get current subscription details |
+//! | `POST` | `/v1/billing/seats` | Update seat count on existing subscription |
 //! | `GET`  | `/v1/billing/invoices` | List invoices from Stripe |
 
 use std::sync::Arc;
@@ -103,6 +104,14 @@ pub(crate) struct CheckoutRequest {
 pub(crate) struct PortalRequest {
     /// URL to redirect back to after portal session.
     pub return_url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct UpdateSeatsRequest {
+    /// New total extra seats (0 = remove all extra seats).
+    pub extra_seats: u32,
+    /// Stripe Price ID for the seat add-on.
+    pub seat_price_id: String,
 }
 
 // ── Tier mapping helpers ────────────────────────────────────────────────────
@@ -575,6 +584,175 @@ pub(crate) async fn create_portal_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("Failed to create portal session: {e}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/billing/seats` — Update seat count on an existing subscription.
+///
+/// Finds the seat line item on the Stripe subscription (matched by price ID),
+/// then adds, updates, or removes it depending on the requested `extra_seats`.
+pub(crate) async fn update_seats_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Json(body): Json<UpdateSeatsRequest>,
+) -> axum::response::Response {
+    let billing = match &state.billing_config {
+        Some(c) => c,
+        None => return not_implemented(),
+    };
+    let stripe = match stripe_client_from_config(billing) {
+        Some(c) => c,
+        None => return not_implemented(),
+    };
+
+    let identity = match identity {
+        Some(Extension(id)) => id,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Authentication required"})),
+            )
+                .into_response();
+        }
+    };
+
+    let tenant_id = crate::daemon::handlers::tenant_id_from_identity(Some(&identity));
+
+    let billing_repo = match &state.billing_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Billing repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 1. Get the tenant's existing subscription
+    let sub = match billing_repo.get_subscription(&tenant_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "No subscription found. Please subscribe first."})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let stripe_sub_id: stripe::SubscriptionId = match sub.stripe_subscription_id {
+        Some(ref id) => match id.parse() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("Invalid subscription ID: {e}")})),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "No active Stripe subscription found."})),
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Retrieve the Stripe subscription to find existing seat line item
+    let stripe_sub = match stripe::Subscription::retrieve(&stripe, &stripe_sub_id, &[]).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to retrieve Stripe subscription");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Failed to retrieve subscription from Stripe: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // 3. Find the seat line item by matching price ID
+    let seat_item = stripe_sub.items.data.iter().find(|item| {
+        item.price
+            .as_ref()
+            .map(|p| p.id.to_string() == body.seat_price_id)
+            .unwrap_or(false)
+    });
+
+    // 4. Build the update items list
+    let items = match (body.extra_seats, seat_item) {
+        // Add seats: no existing seat item → add a new line item
+        (extra, None) if extra > 0 => {
+            vec![stripe::UpdateSubscriptionItems {
+                price: Some(body.seat_price_id.clone()),
+                quantity: Some(extra as u64),
+                ..Default::default()
+            }]
+        }
+        // Update seats: existing seat item → update quantity
+        (extra, Some(item)) if extra > 0 => {
+            vec![stripe::UpdateSubscriptionItems {
+                id: Some(item.id.to_string()),
+                quantity: Some(extra as u64),
+                ..Default::default()
+            }]
+        }
+        // Remove seats: existing seat item → delete the line item
+        (0, Some(item)) => {
+            vec![stripe::UpdateSubscriptionItems {
+                id: Some(item.id.to_string()),
+                deleted: Some(true),
+                ..Default::default()
+            }]
+        }
+        // No-op: 0 extra seats and no existing item
+        (0, None) => {
+            return (
+                StatusCode::OK,
+                Json(json!({"success": true, "extra_seats": 0})),
+            )
+                .into_response();
+        }
+        _ => unreachable!(),
+    };
+
+    // 5. Apply the update
+    let mut update_params = stripe::UpdateSubscription::default();
+    update_params.items = Some(items);
+    update_params.proration_behavior =
+        Some(stripe::SubscriptionProrationBehavior::CreateProrations);
+
+    match stripe::Subscription::update(&stripe, &stripe_sub_id, update_params).await {
+        Ok(_) => {
+            info!(
+                tenant_id = %tenant_id,
+                extra_seats = body.extra_seats,
+                "Seat count updated on subscription"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({"success": true, "extra_seats": body.extra_seats})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to update seat count on Stripe subscription");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Failed to update seats: {e}")})),
             )
                 .into_response()
         }
