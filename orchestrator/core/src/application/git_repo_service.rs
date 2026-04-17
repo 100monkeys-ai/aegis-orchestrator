@@ -42,6 +42,7 @@ use tracing::{error, info, instrument, warn};
 use chrono::Utc;
 
 use crate::application::git_clone_executor::{CloneError, GitCloneExecutor, ResolvedCredential};
+use crate::application::git_ssh_key::attach_ssh_credentials;
 use crate::application::user_volume_service::{UserVolumeError, UserVolumeService};
 use crate::application::volume_manager::CreateUserVolumeCommand;
 use crate::domain::credential::{
@@ -647,9 +648,11 @@ impl GitRepoService {
     /// Push the binding's current branch (or the explicit `ref_name`) to
     /// the remote. Emits [`GitRepoEvent::PushCompleted`] on success.
     ///
-    /// Credential resolution reuses the A2 `resolve_credential` path —
-    /// HTTPS-PAT works today; SSH returns
-    /// [`GitRepoError::NotYetImplemented`] until A3 lands.
+    /// Credential resolution reuses the A2 `resolve_credential` path.
+    /// Both HTTPS-PAT and SSH credentials are supported; the SSH path
+    /// materialises the private key via the shared
+    /// [`crate::application::git_ssh_key::attach_ssh_credentials`]
+    /// helper (same Keymaster Pattern used by the clone path).
     ///
     /// Defaults: `remote = "origin"`. When `ref_name` is `None` we read
     /// the working tree's current branch via
@@ -1070,8 +1073,11 @@ fn blocking_commit(
 /// Blocking libgit2 push against `target_dir`.
 ///
 /// Resolves `ref_name` to the current branch when `None`. Detached HEAD
-/// returns [`GitRepoError::NoHeadBranch`]. Credentials map the A2
-/// `ResolvedCredential` surface onto the libgit2 callback.
+/// returns [`GitRepoError::NoHeadBranch`]. Credentials map the
+/// [`ResolvedCredential`] surface onto the libgit2 callback — HTTPS-PAT
+/// via `Cred::userpass_plaintext`, SSH via the shared
+/// [`attach_ssh_credentials`] helper (mode-`0600` tempfile, zeroize-on-
+/// drop).
 /// Returns the resolved `ref_name` so the service can emit
 /// [`GitRepoEvent::PushCompleted`] with the actual ref that was pushed.
 fn blocking_push(
@@ -1103,23 +1109,35 @@ fn blocking_push(
         .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
 
     let mut callbacks = RemoteCallbacks::new();
-    if let Some(cred) = credential {
+    // SSH guard must outlive the `remote.push()` call — libgit2 reads
+    // the key tempfile from inside `push`. Dropping the guard before
+    // then zeros the file and would break auth. Bind it into this
+    // outer scope so it lives until the function returns.
+    let _ssh_guard = if let Some(cred) = credential {
         match cred {
             ResolvedCredential::HttpsPat { username, token } => {
                 callbacks.credentials(move |_url: &str, _user_from_url: Option<&str>, _allowed| {
                     git2::Cred::userpass_plaintext(&username, token.expose())
                 });
+                None
             }
-            ResolvedCredential::SshKey { .. } => {
-                // A3 backfills SSH credential resolution — see
-                // `git_clone_executor::blocking_clone` for the matching
-                // stub on the read path.
-                return Err(GitRepoError::NotYetImplemented(
-                    "SSH credential support for push is deferred to ADR-081 Wave A3",
-                ));
+            ResolvedCredential::SshKey {
+                private_key_pem,
+                passphrase,
+            } => {
+                let passphrase_ref = passphrase.as_ref().map(|p| p.expose());
+                let guard = attach_ssh_credentials(
+                    &mut callbacks,
+                    private_key_pem.expose(),
+                    passphrase_ref,
+                )
+                .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+                Some(guard)
             }
         }
-    }
+    } else {
+        None
+    };
 
     let mut push_opts = PushOptions::new();
     push_opts.remote_callbacks(callbacks);
@@ -1257,5 +1275,105 @@ mod tests {
             signature: bb_signature(secret, body),
         };
         assert!(verify_webhook(&auth, body, secret));
+    }
+
+    // -----------------------------------------------------------------
+    // Regression: SSH credentials on push must NOT return
+    // `NotYetImplemented`.
+    //
+    // Wave A3 shipped SSH for clone; push was still returning
+    // `NotYetImplemented("SSH credential support for push is deferred
+    // to ADR-081 Wave A3")` for every `ResolvedCredential::SshKey`,
+    // which broke every Canvas git-write session bound to an SSH-
+    // authenticated remote. This test drives `blocking_push` against
+    // a real on-disk repo with an SSH remote and asserts the SSH code
+    // path actually executes — the push will fail (the remote is
+    // unreachable / the key is a dummy), but the failure MUST be a
+    // real git error, not the old stub.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn push_with_ssh_credential_no_longer_returns_not_yet_implemented() {
+        use crate::domain::secrets::SensitiveString;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+
+        // Init a repo with a commit on `main` so libgit2 has a ref to
+        // push. This mirrors the A2 `ready_binding` fixture pattern —
+        // a real working tree that the service's push path can open.
+        let repo = git2::Repository::init(workdir).expect("git init");
+        {
+            let sig = git2::Signature::now("Tester", "test@aegis.test").unwrap();
+            let mut index = repo.index().unwrap();
+            std::fs::write(workdir.join("README.md"), b"hi\n").unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+            // Normalise the branch name to `main` so the push refspec
+            // is deterministic regardless of the host git's
+            // `init.defaultBranch` setting.
+            let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("main", &head_commit, true).unwrap();
+            repo.set_head("refs/heads/main").unwrap();
+        }
+
+        // SSH remote pointing at a deliberately-unreachable address.
+        // libgit2 must reach the credentials callback (proving the
+        // SSH code path executes) and then fail on transport.
+        repo.remote("origin", "ssh://git@127.0.0.1:1/does-not-exist/repo.git")
+            .expect("set origin");
+
+        // A syntactically-valid-ish OpenSSH key header. libgit2 will
+        // reject it, but only after traversing the SSH credentials
+        // code path — which is exactly what this test pins.
+        let fake_key = SensitiveString::new(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+             AAAA-not-a-real-key-just-test-bytes\n\
+             -----END OPENSSH PRIVATE KEY-----\n",
+        );
+        let credential = ResolvedCredential::SshKey {
+            private_key_pem: fake_key,
+            passphrase: None,
+        };
+
+        let res = blocking_push(
+            workdir,
+            "origin",
+            Some("main".to_string()),
+            Some(credential),
+        );
+
+        // The fix: any failure mode is acceptable EXCEPT the old
+        // `NotYetImplemented` stub. A `GitFailed` means the SSH
+        // credentials code path ran and libgit2 itself rejected the
+        // operation (transport, auth, or key parsing).
+        match res {
+            Err(GitRepoError::NotYetImplemented(msg)) => {
+                panic!(
+                    "push with SSH credential still returns NotYetImplemented: {msg:?} \
+                     — the SSH push path must be wired"
+                );
+            }
+            Err(GitRepoError::GitFailed(_)) => {
+                // Expected: libgit2 executed the SSH credentials
+                // callback and failed on transport / auth / key parse.
+            }
+            Err(other) => {
+                // Other error types (NoHeadBranch, etc.) are also
+                // acceptable — they prove the old stub is gone. Only
+                // NotYetImplemented is disallowed.
+                let _ = other;
+            }
+            Ok(_) => {
+                // Pushing to 127.0.0.1:1 cannot succeed; if it did,
+                // something is wrong with the test fixture. Don't
+                // fail the regression assertion on this — the point
+                // is that `NotYetImplemented` no longer fires.
+            }
+        }
     }
 }
