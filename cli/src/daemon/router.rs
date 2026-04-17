@@ -367,7 +367,21 @@ pub(crate) fn create_router(
         .route("/v1/billing/seats", post(update_seats_handler))
         .route("/v1/billing/subscription", get(get_subscription_handler))
         .route("/v1/billing/invoices", get(list_invoices_handler))
-        .with_state(app_state);
+        .with_state(app_state.clone());
+
+    // Tenant-context middleware (ADR-056, ADR-111 §Tenant-Context Header
+    // Extension) — inserts the resolved TenantId into request extensions and
+    // enforces consumer team-switch authorization via MembershipRepository.
+    let tenant_state =
+        aegis_orchestrator_core::presentation::tenant_middleware::TenantMiddlewareState {
+            team_repo: app_state.team_repo.clone(),
+            membership_repo: app_state.membership_repo.clone(),
+            event_bus: app_state.event_bus.clone(),
+        };
+    let router = router.layer(middleware::from_fn_with_state(
+        tenant_state,
+        aegis_orchestrator_core::presentation::tenant_middleware::tenant_context_middleware,
+    ));
 
     if let Some(iam_service) = iam_service {
         router.layer(middleware::from_fn_with_state(
