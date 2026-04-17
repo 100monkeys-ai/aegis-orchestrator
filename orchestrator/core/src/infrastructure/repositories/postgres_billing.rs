@@ -88,6 +88,7 @@ fn row_to_subscription(row: &sqlx::postgres::PgRow) -> Result<TenantSubscription
         cancel_at_period_end: row.get("cancel_at_period_end"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+        seat_count: row.get::<i32, _>("seat_count") as u32,
     })
 }
 
@@ -99,9 +100,9 @@ impl BillingRepository for PostgresBillingRepository {
             INSERT INTO tenant_subscriptions (
                 tenant_id, stripe_customer_id, stripe_subscription_id,
                 tier, status, current_period_end, cancel_at_period_end,
-                created_at, updated_at
+                created_at, updated_at, seat_count
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (tenant_id) DO UPDATE SET
                 stripe_customer_id = EXCLUDED.stripe_customer_id,
                 stripe_subscription_id = EXCLUDED.stripe_subscription_id,
@@ -109,7 +110,8 @@ impl BillingRepository for PostgresBillingRepository {
                 status = EXCLUDED.status,
                 current_period_end = EXCLUDED.current_period_end,
                 cancel_at_period_end = EXCLUDED.cancel_at_period_end,
-                updated_at = EXCLUDED.updated_at
+                updated_at = EXCLUDED.updated_at,
+                seat_count = EXCLUDED.seat_count
             "#,
         )
         .bind(sub.tenant_id.as_str())
@@ -121,6 +123,7 @@ impl BillingRepository for PostgresBillingRepository {
         .bind(sub.cancel_at_period_end)
         .bind(sub.created_at)
         .bind(sub.updated_at)
+        .bind(sub.seat_count as i32)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to upsert subscription: {e}")))?;
@@ -136,7 +139,7 @@ impl BillingRepository for PostgresBillingRepository {
             r#"
             SELECT tenant_id, stripe_customer_id, stripe_subscription_id,
                    tier, status, current_period_end, cancel_at_period_end,
-                   created_at, updated_at
+                   created_at, updated_at, seat_count
             FROM tenant_subscriptions
             WHERE tenant_id = $1
             "#,
@@ -160,7 +163,7 @@ impl BillingRepository for PostgresBillingRepository {
             r#"
             SELECT tenant_id, stripe_customer_id, stripe_subscription_id,
                    tier, status, current_period_end, cancel_at_period_end,
-                   created_at, updated_at
+                   created_at, updated_at, seat_count
             FROM tenant_subscriptions
             WHERE stripe_customer_id = $1
             "#,

@@ -421,6 +421,7 @@ pub(crate) async fn create_checkout_handler(
                     cancel_at_period_end: false,
                     created_at: now,
                     updated_at: now,
+                    seat_count: 1,
                 };
                 if let Err(e) = billing_repo.upsert_subscription(&new_sub).await {
                     warn!(error = %e, "Failed to persist new Stripe customer mapping");
@@ -1037,6 +1038,7 @@ async fn handle_checkout_completed(
         cancel_at_period_end: false,
         created_at: now,
         updated_at: now,
+        seat_count: 1,
     };
 
     if let Err(e) = billing_repo.upsert_subscription(&sub).await {

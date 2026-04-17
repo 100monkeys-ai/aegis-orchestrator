@@ -82,6 +82,7 @@ pub mod shared_kernel;
 pub mod stimulus;
 pub mod storage;
 pub mod supervisor;
+pub mod team;
 pub mod tenancy;
 pub mod tenant;
 pub mod validation;

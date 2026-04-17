@@ -1411,6 +1411,12 @@ pub struct BillingConfig {
     /// Stripe webhook signing secret. Supports `env:VAR_NAME` syntax.
     #[serde(default)]
     pub stripe_webhook_secret: Option<String>,
+
+    /// HMAC-SHA256 key used to sign team invitation tokens (ADR-111
+    /// §Invitation Flow). Supports `env:VAR_NAME` syntax. If absent, team
+    /// invitations are disabled and the invitation endpoint returns 501.
+    #[serde(default)]
+    pub invitation_hmac_key: Option<String>,
 }
 
 // Default value functions

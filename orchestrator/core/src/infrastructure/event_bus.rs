@@ -67,7 +67,7 @@ use crate::domain::events::{
     AgentLifecycleEvent, CanvasEvent, ContainerRunEvent, CredentialEvent, ExecutionEvent,
     GitRepoEvent, IamEvent, ImageManagementEvent, LearningEvent, MCPToolEvent, PolicyEvent,
     RateLimitEvent, ScriptEvent, SealEvent, SecretEvent, StimulusEvent, StorageEvent, SwarmEvent,
-    TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
+    TeamEvent, TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -100,6 +100,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::GitRepo(_) => "git_repo",
         DomainEvent::Canvas(_) => "canvas",
         DomainEvent::Script(_) => "script",
+        DomainEvent::Team(_) => "team",
     }
 }
 
@@ -143,6 +144,8 @@ pub enum DomainEvent {
     Canvas(CanvasEvent),
     /// BC-7 Script persistence lifecycle events (ADR-110 §D7)
     Script(ScriptEvent),
+    /// Team tenancy lifecycle and audit events (ADR-111)
+    Team(TeamEvent),
 }
 
 impl DomainEvent {
@@ -156,7 +159,8 @@ impl DomainEvent {
             | DomainEvent::Credential(_)
             | DomainEvent::GitRepo(_)
             | DomainEvent::Canvas(_)
-            | DomainEvent::Script(_) => None,
+            | DomainEvent::Script(_)
+            | DomainEvent::Team(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -383,7 +387,8 @@ impl DomainEvent {
             | DomainEvent::Credential(_)
             | DomainEvent::GitRepo(_)
             | DomainEvent::Canvas(_)
-            | DomainEvent::Script(_) => None,
+            | DomainEvent::Script(_)
+            | DomainEvent::Team(_) => None,
         }
     }
 
@@ -599,6 +604,17 @@ impl DomainEvent {
                 ScriptEvent::Created { created_at, .. } => *created_at,
                 ScriptEvent::Updated { updated_at, .. } => *updated_at,
                 ScriptEvent::Deleted { deleted_at, .. } => *deleted_at,
+            },
+            DomainEvent::Team(event) => match event {
+                TeamEvent::TeamProvisioned { provisioned_at, .. } => *provisioned_at,
+                TeamEvent::InvitationSent { sent_at, .. } => *sent_at,
+                TeamEvent::InvitationAccepted { accepted_at, .. } => *accepted_at,
+                TeamEvent::InvitationCancelled { cancelled_at, .. } => *cancelled_at,
+                TeamEvent::InvitationExpired { expired_at, .. } => *expired_at,
+                TeamEvent::MembershipRevoked { revoked_at, .. } => *revoked_at,
+                TeamEvent::MembershipRoleChanged { changed_at, .. } => *changed_at,
+                TeamEvent::SeatCountChanged { changed_at, .. } => *changed_at,
+                TeamEvent::TenantContextSwitched { switched_at, .. } => *switched_at,
             },
         }
     }
@@ -819,6 +835,17 @@ impl DomainEvent {
                 ScriptEvent::Updated { .. } => "script_updated",
                 ScriptEvent::Deleted { .. } => "script_deleted",
             },
+            DomainEvent::Team(event) => match event {
+                TeamEvent::TeamProvisioned { .. } => "team_provisioned",
+                TeamEvent::InvitationSent { .. } => "team_invitation_sent",
+                TeamEvent::InvitationAccepted { .. } => "team_invitation_accepted",
+                TeamEvent::InvitationCancelled { .. } => "team_invitation_cancelled",
+                TeamEvent::InvitationExpired { .. } => "team_invitation_expired",
+                TeamEvent::MembershipRevoked { .. } => "team_membership_revoked",
+                TeamEvent::MembershipRoleChanged { .. } => "team_membership_role_changed",
+                TeamEvent::SeatCountChanged { .. } => "team_seat_count_changed",
+                TeamEvent::TenantContextSwitched { .. } => "tenant_context_switched",
+            },
         }
     }
 
@@ -846,6 +873,7 @@ impl DomainEvent {
             DomainEvent::GitRepo(_) => "git_repo",
             DomainEvent::Canvas(_) => "canvas",
             DomainEvent::Script(_) => "script",
+            DomainEvent::Team(_) => "team",
         }
     }
 
@@ -952,6 +980,7 @@ impl DomainEvent {
             DomainEvent::GitRepo(_) => Some("git_repo"),
             DomainEvent::Canvas(_) => Some("canvas"),
             DomainEvent::Script(_) => Some("script"),
+            DomainEvent::Team(_) => Some("team"),
         }
     }
 }
@@ -1093,6 +1122,11 @@ impl EventBus {
     }
 
     /// Publish a Script persistence lifecycle event (BC-7 ADR-110 §D7)
+    /// Publish a team-tenancy event (ADR-111).
+    pub fn publish_team_event(&self, event: TeamEvent) {
+        self.publish(DomainEvent::Team(event));
+    }
+
     pub fn publish_script_event(&self, event: ScriptEvent) {
         self.publish(DomainEvent::Script(event));
     }
@@ -1492,6 +1526,7 @@ impl AgentEventReceiver {
             DomainEvent::GitRepo(_) => false, // Git repo binding events are tenant-scoped, not per-agent
             DomainEvent::Canvas(_) => false, // Canvas session events are tenant-scoped, not per-agent
             DomainEvent::Script(_) => false, // Script persistence events are tenant-scoped, not per-agent
+            DomainEvent::Team(_) => false,   // Team tenancy events are tenant-scoped, not per-agent
         }
     }
 }

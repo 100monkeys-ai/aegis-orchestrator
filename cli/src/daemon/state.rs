@@ -98,6 +98,11 @@ pub(crate) struct AppState {
     /// Postgres pool is available and migration 021 has been applied.
     pub(crate) script_service:
         Option<Arc<aegis_orchestrator_core::application::script_service::ScriptService>>,
+    /// Team tenancy service (ADR-111). Optional until a Postgres pool, a
+    /// `BillingConfig`, and an `invitation_hmac_key` are all configured.
+    #[allow(dead_code)] // handlers land in Phase 2
+    pub(crate) team_service:
+        Option<Arc<dyn aegis_orchestrator_core::application::team_service::TeamService>>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
     /// Keycloak Admin REST client for colony management endpoints.
