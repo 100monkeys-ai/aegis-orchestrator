@@ -771,10 +771,8 @@ pub(crate) async fn update_seats_handler(
         _ => unreachable!(),
     };
 
-    // 5. Apply the update — always_invoice charges immediately for seat changes
     let update_params = stripe::UpdateSubscription {
         items: Some(items),
-        proration_behavior: Some(stripe::SubscriptionProrationBehavior::AlwaysInvoice),
         ..Default::default()
     };
 
