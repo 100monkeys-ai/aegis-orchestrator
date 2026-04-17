@@ -39,8 +39,9 @@ use crate::daemon::handlers::canvas::{
 };
 use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_handler};
 use crate::daemon::handlers::colony::{
-    get_saml_config, get_subscription, invite_member, list_members, remove_member, set_saml_config,
-    update_role,
+    accept_invitation, cancel_invitation, create_invitation, create_team, delete_team,
+    get_saml_config, get_subscription, list_invitations, list_members, list_teams, remove_member,
+    set_saml_config, update_role,
 };
 use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
@@ -354,10 +355,24 @@ pub(crate) fn create_router(
             "/v1/canvas/sessions/{id}",
             get(canvas_get_session_handler).delete(canvas_terminate_session_handler),
         )
-        // Colony management (BC-12 / ADR-097): member, SAML IdP, subscription endpoints
-        .route("/v1/colony/members", get(list_members).post(invite_member))
+        // Colony management (BC-12 / ADR-111): team CRUD, membership, invitations
+        .route("/v1/colony/teams", get(list_teams).post(create_team))
+        .route("/v1/colony/teams/{team_id}", delete(delete_team))
+        .route("/v1/colony/members", get(list_members))
         .route("/v1/colony/members/{user_id}", delete(remove_member))
         .route("/v1/colony/roles", put(update_role))
+        .route(
+            "/v1/colony/invitations",
+            get(list_invitations).post(create_invitation),
+        )
+        .route(
+            "/v1/colony/invitations/{invitation_id}",
+            delete(cancel_invitation),
+        )
+        .route(
+            "/v1/colony/invitations/{token}/accept",
+            post(accept_invitation),
+        )
         .route("/v1/colony/saml", get(get_saml_config).put(set_saml_config))
         .route("/v1/colony/subscription", get(get_subscription))
         // Stripe billing integration (BC-12)
@@ -367,7 +382,21 @@ pub(crate) fn create_router(
         .route("/v1/billing/seats", post(update_seats_handler))
         .route("/v1/billing/subscription", get(get_subscription_handler))
         .route("/v1/billing/invoices", get(list_invoices_handler))
-        .with_state(app_state);
+        .with_state(app_state.clone());
+
+    // Tenant-context middleware (ADR-056, ADR-111 §Tenant-Context Header
+    // Extension) — inserts the resolved TenantId into request extensions and
+    // enforces consumer team-switch authorization via MembershipRepository.
+    let tenant_state =
+        aegis_orchestrator_core::presentation::tenant_middleware::TenantMiddlewareState {
+            team_repo: app_state.team_repo.clone(),
+            membership_repo: app_state.membership_repo.clone(),
+            event_bus: app_state.event_bus.clone(),
+        };
+    let router = router.layer(middleware::from_fn_with_state(
+        tenant_state,
+        aegis_orchestrator_core::presentation::tenant_middleware::tenant_context_middleware,
+    ));
 
     if let Some(iam_service) = iam_service {
         router.layer(middleware::from_fn_with_state(

@@ -40,6 +40,7 @@
 pub mod agent;
 pub mod agent_scope;
 pub mod attestation_service;
+pub mod billing_service;
 pub mod canvas_service;
 pub mod cluster;
 pub mod correlated_activity_stream;
@@ -73,6 +74,7 @@ pub mod start_workflow_execution;
 pub mod stimulus;
 pub mod storage_event_persister;
 pub mod storage_router;
+pub mod team_service;
 pub mod temporal_mapper;
 pub mod tenant_onboarding;
 pub mod tenant_provisioning;

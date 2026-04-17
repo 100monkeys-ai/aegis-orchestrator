@@ -1830,6 +1830,92 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             as Arc<dyn aegis_orchestrator_core::application::canvas_service::CanvasService>
     });
 
+    // Team tenancy service (ADR-111). Wired when:
+    //   * Postgres is available for the team repos,
+    //   * a `BillingConfig` is present to drive the Stripe customer lifecycle,
+    //   * a `TenantRepository` is available for the backing tenant row.
+    // Phase 1 stops at service construction — handlers land in Phase 2.
+    // Team repositories (ADR-111). Constructed whenever a Postgres pool is
+    // available so the tenant middleware can gate `X-Tenant-Id: t-{uuid}`
+    // header switching on Active membership — independent of whether the
+    // BillingConfig-dependent TeamService is wired.
+    let team_repo_opt: Option<Arc<dyn aegis_orchestrator_core::domain::team::TeamRepository>> =
+        db_pool.as_ref().map(|pool| {
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PgTeamRepository::new(
+                    pool.clone(),
+                ),
+            ) as Arc<dyn aegis_orchestrator_core::domain::team::TeamRepository>
+        });
+    let membership_repo_opt: Option<
+        Arc<dyn aegis_orchestrator_core::domain::team::MembershipRepository>,
+    > = db_pool.as_ref().map(|pool| {
+        Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::PgMembershipRepository::new(
+                pool.clone(),
+            ),
+        ) as Arc<dyn aegis_orchestrator_core::domain::team::MembershipRepository>
+    });
+
+    let team_service: Option<
+        Arc<dyn aegis_orchestrator_core::application::team_service::TeamService>,
+    > = match (
+        db_pool.as_ref(),
+        config.spec.billing.as_ref(),
+        colony_tenant_repo.as_ref(),
+        team_repo_opt.as_ref(),
+        membership_repo_opt.as_ref(),
+    ) {
+        (
+            Some(pool),
+            Some(billing_cfg),
+            Some(tenant_repo),
+            Some(team_repo),
+            Some(membership_repo),
+        ) => {
+            let invitation_repo = Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PgTeamInvitationRepository::new(
+                    pool.clone(),
+                ),
+            );
+            let billing_repo_for_service: Arc<
+                dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository,
+            > = Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PostgresBillingRepository::new(
+                    pool.clone(),
+                ),
+            );
+            let billing_service: Arc<
+                dyn aegis_orchestrator_core::application::billing_service::BillingService,
+            > = Arc::new(crate::daemon::billing_service::StripeBillingService::new(
+                billing_cfg.clone(),
+                billing_repo_for_service,
+            ));
+            let hmac_key = billing_cfg
+                .invitation_hmac_key
+                .as_ref()
+                .and_then(|k| {
+                    aegis_orchestrator_core::domain::node_config::resolve_env_value(k).ok()
+                })
+                .map(|s| s.into_bytes());
+            Some(Arc::new(
+                aegis_orchestrator_core::application::team_service::StandardTeamService::new(
+                    team_repo.clone(),
+                    membership_repo.clone(),
+                    invitation_repo,
+                    tenant_repo.clone(),
+                    billing_service,
+                    event_bus.clone(),
+                    hmac_key,
+                ),
+            )
+                as Arc<
+                    dyn aegis_orchestrator_core::application::team_service::TeamService,
+                >)
+        }
+        _ => None,
+    };
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -1881,6 +1967,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         git_repo_service,
         canvas_service,
         script_service,
+        team_service,
+        team_repo: team_repo_opt.clone(),
+        membership_repo: membership_repo_opt.clone(),
         config: config.clone(),
         start_time: std::time::Instant::now(),
         keycloak_admin: colony_keycloak_admin,

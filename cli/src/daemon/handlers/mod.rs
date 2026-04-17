@@ -83,6 +83,24 @@ pub(crate) fn tenant_id_from_request(
     resolve_effective_tenant(identity, delegation_tenant_id)
 }
 
+/// Read the `TenantId` resolved by the `tenant_context_middleware` (ADR-056 /
+/// ADR-111) out of the request's extensions.
+///
+/// The middleware always inserts a `TenantId` for non-exempt paths; if the
+/// extension is somehow missing (tests bypassing the middleware, misconfigured
+/// router), fall back to the caller's JWT-derived tenant so handlers still
+/// behave deterministically.
+pub(crate) fn resolved_tenant(
+    request: &axum::extract::Request,
+    identity: Option<&UserIdentity>,
+) -> TenantId {
+    request
+        .extensions()
+        .get::<TenantId>()
+        .cloned()
+        .unwrap_or_else(|| tenant_id_from_identity(identity))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -23,6 +23,18 @@ pub struct TenantSubscription {
     pub cancel_at_period_end: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Number of paid seats on this subscription (ADR-111).
+    ///
+    /// For consumer (per-user) subscriptions this is always `1`. For
+    /// [`TenantKind::Team`](crate::domain::tenancy::TenantKind::Team)
+    /// subscriptions, this tracks the active membership count and is kept in
+    /// sync with Stripe via `BillingService::sync_seats`.
+    #[serde(default = "default_seat_count")]
+    pub seat_count: u32,
+}
+
+fn default_seat_count() -> u32 {
+    1
 }
 
 /// Stripe subscription lifecycle status.
@@ -156,6 +168,7 @@ mod tests {
             cancel_at_period_end: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            seat_count: 1,
         };
         let json = serde_json::to_string(&sub).unwrap();
         let deserialized: TenantSubscription = serde_json::from_str(&json).unwrap();

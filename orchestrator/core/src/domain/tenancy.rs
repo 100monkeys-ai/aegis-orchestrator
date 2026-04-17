@@ -29,6 +29,35 @@ pub enum TenantTier {
     System,
 }
 
+/// Tenant kind classification (ADR-056, extended by ADR-111).
+///
+/// Identifies the provenance and ownership model of a tenant.
+///
+/// - `Consumer` — per-user tenant provisioned under ADR-097 (`u-{uuid}`).
+/// - `Enterprise` — enterprise tenant with a dedicated Keycloak realm (ADR-041).
+/// - `Team` — shared tenant owned by a team; owns a Stripe subscription whose
+///   seats cover active members. See ADR-111.
+/// - `System` — platform-internal tenant (`aegis-system`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantKind {
+    Consumer,
+    Enterprise,
+    Team,
+    System,
+}
+
+impl TenantKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TenantKind::Consumer => "consumer",
+            TenantKind::Enterprise => "enterprise",
+            TenantKind::Team => "team",
+            TenantKind::System => "system",
+        }
+    }
+}
+
 /// Discriminant for per-tenant resource quota types (ADR-056).
 ///
 /// Used in `TenantEvent::TenantQuotaExceeded` and `TenantEvent::TenantQuotaUpdated`
@@ -146,5 +175,34 @@ impl Tenant {
         self.status = TenantStatus::Deleted;
         self.deleted_at = Some(Utc::now());
         self.updated_at = Utc::now();
+    }
+
+    /// Return `true` if this tenant is a team tenant (ADR-111).
+    ///
+    /// Team tenants are identified by the `t-{uuid}` slug prefix, matching the
+    /// slug convention set out in ADR-111 §Decision. The prefix is the single
+    /// source of truth — team tenants are materialized with `TenantKind::Team`
+    /// and their slug always matches this pattern.
+    pub fn is_team(&self) -> bool {
+        self.slug.as_str().starts_with("t-")
+    }
+
+    /// Derive the [`TenantKind`] of this tenant from its slug (ADR-111).
+    ///
+    /// The kind is not persisted as a column on `tenants` today; it is
+    /// reconstructed deterministically from the slug prefix. This matches the
+    /// naming convention established by ADR-056 (`aegis-system`, `zaru-consumer`)
+    /// and extended by ADR-097 (`u-{uuid}`) and ADR-111 (`t-{uuid}`).
+    pub fn kind(&self) -> TenantKind {
+        let s = self.slug.as_str();
+        if s == "aegis-system" {
+            TenantKind::System
+        } else if s == "zaru-consumer" || s.starts_with("u-") {
+            TenantKind::Consumer
+        } else if s.starts_with("t-") {
+            TenantKind::Team
+        } else {
+            TenantKind::Enterprise
+        }
     }
 }

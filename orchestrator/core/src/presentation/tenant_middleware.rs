@@ -1,13 +1,20 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! TenantContext middleware (ADR-056)
+//! TenantContext middleware (ADR-056, ADR-111 §Tenant-Context Header Extension)
 //!
 //! Extracts `TenantId` from validated `UserIdentity` and inserts it into
 //! request extensions. Runs after `iam_auth_middleware`.
 //!
-//! When an `Arc<EventBus>` is present in request extensions (injected by the
-//! router via `axum::Extension`), admin cross-tenant access is audited by
-//! publishing a [`TenantEvent::AdminCrossTenantAccess`] domain event (gap 056-9).
+//! # Tenant Resolution Order
+//!
+//! 1. **Operator override** — `X-Aegis-Tenant` on an admin `Operator`
+//!    identity. Audited via [`TenantEvent::AdminCrossTenantAccess`].
+//! 2. **Service-account delegation** — `X-Tenant-Id` on a `ServiceAccount`
+//!    identity (ADR-100).
+//! 3. **Consumer team switch** — `X-Tenant-Id: t-{uuid}` on a `ConsumerUser`
+//!    or `TenantUser` identity. The caller MUST have an Active membership on
+//!    the target team. Audited via [`TeamEvent::TenantContextSwitched`].
+//! 4. **JWT default** — derive from the validated identity's claims.
 
 use std::sync::Arc;
 
@@ -15,11 +22,37 @@ use chrono::Utc;
 
 use crate::domain::events::TenantEvent;
 use crate::domain::iam::{IdentityKind, UserIdentity};
+use crate::domain::team::{MembershipRepository, TeamEvent, TeamRepository, TeamSlug};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
 
-/// Derive TenantId from a UserIdentity
+/// State carried into [`tenant_context_middleware`] via
+/// [`axum::middleware::from_fn_with_state`].
+///
+/// Holds the collaborators required to resolve a consumer/tenant user's
+/// `X-Tenant-Id` header against the team membership table (ADR-111).
+#[derive(Clone)]
+pub struct TenantMiddlewareState {
+    /// Resolves a `t-{uuid}` slug to a `Team` (and therefore a `TeamId`).
+    /// `None` disables the consumer team-switch branch — the middleware then
+    /// behaves as if the header were absent for consumer callers.
+    pub team_repo: Option<Arc<dyn TeamRepository>>,
+    /// Authorization primitive for the consumer team-switch branch.
+    pub membership_repo: Option<Arc<dyn MembershipRepository>>,
+    /// Event bus used to publish [`TenantEvent::AdminCrossTenantAccess`] and
+    /// [`TeamEvent::TenantContextSwitched`] audit events.
+    pub event_bus: Arc<EventBus>,
+}
+
+/// Derive the base [`TenantId`] from a [`UserIdentity`] — the JWT-default
+/// branch of the resolution order.
 pub fn derive_tenant_id(identity: &UserIdentity) -> TenantId {
     match &identity.identity_kind {
         IdentityKind::ConsumerUser { tenant_id, .. } => tenant_id.clone(),
@@ -31,7 +64,7 @@ pub fn derive_tenant_id(identity: &UserIdentity) -> TenantId {
     }
 }
 
-/// Paths exempt from tenant extraction (match the IAM exempt paths)
+/// Paths exempt from tenant extraction (match the IAM exempt paths).
 fn is_tenant_exempt(path: &str) -> bool {
     path == "/health"
         || path.starts_with("/v1/dispatch-gateway")
@@ -40,11 +73,25 @@ fn is_tenant_exempt(path: &str) -> bool {
         || path == "/v1/temporal-events"
 }
 
-/// TenantContext middleware
+/// JSON error body used for consumer-team-switch failures.
+fn forbid(code: &'static str, message: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": code, "message": message })),
+    )
+        .into_response()
+}
+
+/// TenantContext middleware.
 ///
-/// Extracts TenantId from UserIdentity (inserted by iam_auth_middleware).
-/// Supports admin cross-tenant access via X-Aegis-Tenant header.
-pub async fn tenant_context_middleware(request: Request, next: Next) -> Response {
+/// Resolves the effective [`TenantId`] from the authenticated
+/// [`UserIdentity`] and, when present, honours a header-based override
+/// according to the rules documented at the module level.
+pub async fn tenant_context_middleware(
+    State(state): State<TenantMiddlewareState>,
+    request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path().to_string();
 
     // Skip tenant extraction for exempt paths
@@ -52,65 +99,166 @@ pub async fn tenant_context_middleware(request: Request, next: Next) -> Response
         return next.run(request).await;
     }
 
-    // Extract UserIdentity from extensions (set by iam_auth_middleware)
+    // Extract UserIdentity from extensions (set by iam_auth_middleware).
     let identity = request.extensions().get::<UserIdentity>().cloned();
 
-    let tenant_id = match &identity {
-        Some(id) => {
-            let base_tenant = derive_tenant_id(id);
-
-            // Check for admin cross-tenant header
-            if let Some(override_slug) = request.headers().get("x-aegis-tenant") {
-                if let IdentityKind::Operator { ref aegis_role } = id.identity_kind {
-                    if aegis_role.is_admin() {
-                        if let Ok(slug_str) = override_slug.to_str() {
-                            match TenantId::from_realm_slug(slug_str) {
-                                Ok(target_tenant) => {
-                                    tracing::info!(
-                                        admin_sub = %id.sub,
-                                        source_tenant = %base_tenant,
-                                        target_tenant = %target_tenant,
-                                        "Admin cross-tenant access"
-                                    );
-                                    // Publish AdminCrossTenantAccess audit event (gap 056-9).
-                                    // EventBus is injected via axum::Extension when wired.
-                                    if let Some(event_bus) =
-                                        request.extensions().get::<Arc<EventBus>>().cloned()
-                                    {
-                                        event_bus.publish_tenant_event(
-                                            TenantEvent::AdminCrossTenantAccess {
-                                                admin_identity: id.sub.clone(),
-                                                target_tenant_id: target_tenant.clone(),
-                                                accessed_at: Utc::now(),
-                                            },
-                                        );
-                                    }
-                                    target_tenant
-                                }
-                                Err(_) => base_tenant,
-                            }
-                        } else {
-                            base_tenant
-                        }
-                    } else {
-                        base_tenant
-                    }
-                } else {
-                    base_tenant
-                }
-            } else {
-                base_tenant
-            }
-        }
-        None => {
-            // No identity — this happens for unauthenticated paths that somehow
-            // got past iam_auth_middleware. Use default tenant.
-            TenantId::default()
-        }
+    let Some(id) = identity else {
+        // No identity — authentication was skipped or failed upstream. Fall
+        // back to default tenant so handlers behave as before.
+        let mut request = request;
+        request.extensions_mut().insert(TenantId::default());
+        return next.run(request).await;
     };
 
+    let base_tenant = derive_tenant_id(&id);
+
+    // 1. Operator cross-tenant override.
+    if let Some(override_slug) = request.headers().get("x-aegis-tenant") {
+        if let IdentityKind::Operator { ref aegis_role } = id.identity_kind {
+            if aegis_role.is_admin() {
+                if let Ok(slug_str) = override_slug.to_str() {
+                    if let Ok(target_tenant) = TenantId::from_realm_slug(slug_str) {
+                        tracing::info!(
+                            admin_sub = %id.sub,
+                            source_tenant = %base_tenant,
+                            target_tenant = %target_tenant,
+                            "Admin cross-tenant access"
+                        );
+                        state
+                            .event_bus
+                            .publish_tenant_event(TenantEvent::AdminCrossTenantAccess {
+                                admin_identity: id.sub.clone(),
+                                target_tenant_id: target_tenant.clone(),
+                                accessed_at: Utc::now(),
+                            });
+                        let mut request = request;
+                        request.extensions_mut().insert(target_tenant);
+                        return next.run(request).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2/3. `X-Tenant-Id` header dispatch.
+    //
+    // Service-account callers follow ADR-100 delegation (branch 2); consumer /
+    // tenant-user callers follow ADR-111 team-switch (branch 3). The two
+    // branches are disjoint by identity kind.
+    if let Some(header_val) = request
+        .headers()
+        .get("x-tenant-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    {
+        match &id.identity_kind {
+            IdentityKind::ServiceAccount { .. } => {
+                // ADR-100: service-account delegation.
+                if !header_val.is_empty() {
+                    if let Ok(target) = TenantId::from_realm_slug(&header_val) {
+                        let mut request = request;
+                        request.extensions_mut().insert(target);
+                        return next.run(request).await;
+                    }
+                }
+                // Empty / invalid → fall through to base_tenant below.
+            }
+            IdentityKind::ConsumerUser { .. } | IdentityKind::TenantUser { .. } => {
+                // ADR-111: consumer team-switch.
+                //
+                // Consumers MAY only switch to a `t-{uuid}` team slug they
+                // are an Active member of. Any other value is a forbidden
+                // tenant switch.
+                let team_slug = match TeamSlug::parse(&header_val) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return forbid(
+                            "forbidden_tenant_switch",
+                            "Consumers may only switch tenant context to teams they belong to.",
+                        );
+                    }
+                };
+
+                let (Some(team_repo), Some(membership_repo)) =
+                    (state.team_repo.as_ref(), state.membership_repo.as_ref())
+                else {
+                    // Team domain not wired on this node — refuse rather than
+                    // silently fall back to the JWT tenant, which would hide
+                    // the misconfiguration.
+                    return forbid(
+                        "not_a_team_member",
+                        "You are not an active member of this team.",
+                    );
+                };
+
+                let team = match team_repo.find_by_slug(&team_slug).await {
+                    Ok(Some(team)) => team,
+                    Ok(None) => {
+                        // Don't leak existence.
+                        return forbid(
+                            "not_a_team_member",
+                            "You are not an active member of this team.",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "team_repo.find_by_slug failed");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": "internal" })),
+                        )
+                            .into_response();
+                    }
+                };
+
+                match membership_repo.is_active_member(&id.sub, &team.id).await {
+                    Ok(true) => {
+                        let target_tenant = team.tenant_id.clone();
+                        tracing::info!(
+                            user_sub = %id.sub,
+                            source_tenant = %base_tenant,
+                            target_tenant = %target_tenant,
+                            team_id = %team.id,
+                            "Consumer tenant-context switch"
+                        );
+                        state
+                            .event_bus
+                            .publish_team_event(TeamEvent::TenantContextSwitched {
+                                caller_user_id: id.sub.clone(),
+                                from_tenant_id: base_tenant.clone(),
+                                to_tenant_id: target_tenant.clone(),
+                                via_header: "X-Tenant-Id",
+                                switched_at: Utc::now(),
+                            });
+                        let mut request = request;
+                        request.extensions_mut().insert(target_tenant);
+                        return next.run(request).await;
+                    }
+                    Ok(false) => {
+                        return forbid(
+                            "not_a_team_member",
+                            "You are not an active member of this team.",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "membership_repo.is_active_member failed");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": "internal" })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            IdentityKind::Operator { .. } => {
+                // Operators use `X-Aegis-Tenant`, not `X-Tenant-Id`. Ignore
+                // the header and fall through to the base tenant.
+            }
+        }
+    }
+
+    // 4. JWT default.
     let mut request = request;
-    request.extensions_mut().insert(tenant_id);
+    request.extensions_mut().insert(base_tenant);
     next.run(request).await
 }
 
@@ -118,6 +266,18 @@ pub async fn tenant_context_middleware(request: Request, next: Next) -> Response
 mod tests {
     use super::*;
     use crate::domain::iam::{AegisRole, ZaruTier};
+    use crate::domain::repository::RepositoryError;
+    use crate::domain::team::{
+        Membership, MembershipRole, MembershipStatus, Team, TeamId, TeamInvitation,
+        TeamInvitationId, TeamInvitationRepository,
+    };
+    use async_trait::async_trait;
+    use axum::{body::Body, http::Request as HttpRequest, routing::get, Router};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    // ----- derive_tenant_id unit tests (unchanged behaviour) -----
 
     #[test]
     fn derive_consumer_tenant() {
@@ -188,5 +348,424 @@ mod tests {
         assert!(is_tenant_exempt("/v1/temporal-events"));
         assert!(!is_tenant_exempt("/v1/executions"));
         assert!(!is_tenant_exempt("/v1/agents"));
+    }
+
+    // ----- In-memory repositories (ADR-111 Phase 1.5 test doubles) -----
+
+    /// In-memory [`TeamRepository`] for middleware tests.
+    #[derive(Default)]
+    struct InMemoryTeamRepo {
+        by_slug: Mutex<HashMap<String, Team>>,
+    }
+
+    impl InMemoryTeamRepo {
+        fn insert(&self, team: Team) {
+            self.by_slug
+                .lock()
+                .unwrap()
+                .insert(team.slug.as_str().to_string(), team);
+        }
+    }
+
+    #[async_trait]
+    impl TeamRepository for InMemoryTeamRepo {
+        async fn save(&self, team: &Team) -> Result<(), RepositoryError> {
+            self.insert(team.clone());
+            Ok(())
+        }
+        async fn find_by_id(&self, id: &TeamId) -> Result<Option<Team>, RepositoryError> {
+            Ok(self
+                .by_slug
+                .lock()
+                .unwrap()
+                .values()
+                .find(|t| t.id == *id)
+                .cloned())
+        }
+        async fn find_by_slug(&self, slug: &TeamSlug) -> Result<Option<Team>, RepositoryError> {
+            Ok(self.by_slug.lock().unwrap().get(slug.as_str()).cloned())
+        }
+        async fn find_by_owner(&self, owner_user_id: &str) -> Result<Vec<Team>, RepositoryError> {
+            Ok(self
+                .by_slug
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|t| t.owner_user_id == owner_user_id)
+                .cloned()
+                .collect())
+        }
+        async fn delete(&self, id: &TeamId) -> Result<(), RepositoryError> {
+            self.by_slug.lock().unwrap().retain(|_, t| t.id != *id);
+            Ok(())
+        }
+    }
+
+    /// In-memory [`MembershipRepository`] for middleware tests.
+    #[derive(Default)]
+    struct InMemoryMembershipRepo {
+        memberships: Mutex<Vec<Membership>>,
+    }
+
+    impl InMemoryMembershipRepo {
+        fn insert(&self, m: Membership) {
+            self.memberships.lock().unwrap().push(m);
+        }
+    }
+
+    #[async_trait]
+    impl MembershipRepository for InMemoryMembershipRepo {
+        async fn save(&self, m: &Membership) -> Result<(), RepositoryError> {
+            self.insert(m.clone());
+            Ok(())
+        }
+        async fn find_by_team(&self, team_id: &TeamId) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.team_id == *team_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_by_user(&self, user_id: &str) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn is_active_member(
+            &self,
+            user_id: &str,
+            team_id: &TeamId,
+        ) -> Result<bool, RepositoryError> {
+            Ok(self.memberships.lock().unwrap().iter().any(|m| {
+                m.user_id == user_id
+                    && m.team_id == *team_id
+                    && m.status == MembershipStatus::Active
+            }))
+        }
+        async fn count_active(&self, team_id: &TeamId) -> Result<u32, RepositoryError> {
+            Ok(self
+                .memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.team_id == *team_id && m.status == MembershipStatus::Active)
+                .count() as u32)
+        }
+        async fn revoke(&self, team_id: &TeamId, user_id: &str) -> Result<(), RepositoryError> {
+            for m in self.memberships.lock().unwrap().iter_mut() {
+                if m.team_id == *team_id && m.user_id == user_id {
+                    m.status = MembershipStatus::Revoked;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Unused-in-middleware invitation repo — kept here so the in-memory
+    /// fixtures mirror the full Team aggregate trio for future reuse.
+    #[allow(dead_code)]
+    struct InMemoryInvitationRepo;
+
+    #[async_trait]
+    impl TeamInvitationRepository for InMemoryInvitationRepo {
+        async fn save(&self, _i: &TeamInvitation) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            _id: &TeamInvitationId,
+        ) -> Result<Option<TeamInvitation>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_token_hash(
+            &self,
+            _t: &str,
+        ) -> Result<Option<TeamInvitation>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_pending_by_team(
+            &self,
+            _id: &TeamId,
+        ) -> Result<Vec<TeamInvitation>, RepositoryError> {
+            Ok(Vec::new())
+        }
+        async fn mark_accepted(&self, _id: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn mark_cancelled(&self, _id: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn mark_expired(&self, _id: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    // ----- Middleware integration tests -----
+
+    fn consumer_identity(sub: &str) -> UserIdentity {
+        UserIdentity {
+            sub: sub.to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Free,
+                tenant_id: TenantId::consumer(),
+            },
+        }
+    }
+
+    fn operator_identity() -> UserIdentity {
+        UserIdentity {
+            sub: "op-1".into(),
+            realm_slug: "aegis-system".into(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::Operator {
+                aegis_role: AegisRole::Admin,
+            },
+        }
+    }
+
+    fn service_account_identity() -> UserIdentity {
+        UserIdentity {
+            sub: "svc-1".into(),
+            realm_slug: "aegis-system".into(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::ServiceAccount {
+                client_id: "aegis-temporal-worker".into(),
+            },
+        }
+    }
+
+    /// Build a minimal axum app with the middleware mounted. The inner
+    /// handler extracts the resolved [`TenantId`] and echoes it back as the
+    /// response body, which the test asserts against.
+    fn build_app(state: TenantMiddlewareState, identity: Option<UserIdentity>) -> Router {
+        let router = Router::new().route(
+            "/v1/agents",
+            get(|req: Request| async move {
+                let tid = req
+                    .extensions()
+                    .get::<TenantId>()
+                    .cloned()
+                    .unwrap_or_else(TenantId::default);
+                tid.as_str().to_string()
+            }),
+        );
+
+        // Insert identity into extensions to simulate iam_auth_middleware.
+        let router = if let Some(identity) = identity {
+            router.layer(axum::middleware::from_fn(
+                move |mut req: Request, next: Next| {
+                    let identity = identity.clone();
+                    async move {
+                        req.extensions_mut().insert(identity);
+                        next.run(req).await
+                    }
+                },
+            ))
+        } else {
+            router
+        };
+
+        router.layer(axum::middleware::from_fn_with_state(
+            state,
+            tenant_context_middleware,
+        ))
+    }
+
+    fn state_with_repos(
+        team_repo: Arc<dyn TeamRepository>,
+        membership_repo: Arc<dyn MembershipRepository>,
+    ) -> TenantMiddlewareState {
+        TenantMiddlewareState {
+            team_repo: Some(team_repo),
+            membership_repo: Some(membership_repo),
+            event_bus: Arc::new(EventBus::new(64)),
+        }
+    }
+
+    async fn call(app: Router, req: HttpRequest<Body>) -> (StatusCode, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn consumer_without_header_falls_back_to_jwt_tenant() {
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, TenantId::consumer().as_str());
+    }
+
+    #[tokio::test]
+    async fn consumer_with_header_for_active_team_overrides_tenant() {
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+
+        let team = Team::provision(
+            "Acme".into(),
+            "user-1".into(),
+            crate::domain::tenancy::TenantTier::Pro,
+        )
+        .unwrap();
+        let slug = team.slug.as_str().to_string();
+        let expected_tenant = team.tenant_id.as_str().to_string();
+        let team_id = team.id;
+        team_repo.insert(team);
+        membership_repo.insert(Membership::new_active(
+            team_id,
+            "user-1".into(),
+            MembershipRole::Owner,
+        ));
+
+        let state = state_with_repos(team_repo.clone(), membership_repo.clone());
+        let app = build_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected_tenant);
+    }
+
+    #[tokio::test]
+    async fn consumer_with_header_for_unrelated_team_is_forbidden() {
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+
+        let team = Team::provision(
+            "Someone else's team".into(),
+            "other-user".into(),
+            crate::domain::tenancy::TenantTier::Pro,
+        )
+        .unwrap();
+        let slug = team.slug.as_str().to_string();
+        team_repo.insert(team);
+
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("not_a_team_member"));
+    }
+
+    #[tokio::test]
+    async fn consumer_with_header_for_revoked_membership_is_forbidden() {
+        // Regression: previously-active membership that has been revoked must
+        // not allow tenant-context switching.
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+
+        let team = Team::provision(
+            "Acme".into(),
+            "owner".into(),
+            crate::domain::tenancy::TenantTier::Pro,
+        )
+        .unwrap();
+        let slug = team.slug.as_str().to_string();
+        let team_id = team.id;
+        team_repo.insert(team);
+
+        let mut m = Membership::new_active(team_id, "user-1".into(), MembershipRole::Member);
+        m.status = MembershipStatus::Revoked;
+        membership_repo.insert(m);
+
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("not_a_team_member"));
+    }
+
+    #[tokio::test]
+    async fn consumer_with_non_team_shaped_header_is_forbidden_tenant_switch() {
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-tenant-id", "u-some-other-user")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("forbidden_tenant_switch"));
+    }
+
+    #[tokio::test]
+    async fn service_account_with_x_tenant_id_preserves_adr_100_behavior() {
+        // Regression guard: adding the consumer branch MUST NOT affect the
+        // service-account delegation path (ADR-100).
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_app(state, Some(service_account_identity()));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-tenant-id", "u-some-tenant")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "u-some-tenant");
+    }
+
+    #[tokio::test]
+    async fn operator_with_x_aegis_tenant_still_overrides() {
+        // Regression guard: the admin cross-tenant path must still function.
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_app(state, Some(operator_identity()));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-aegis-tenant", "u-target")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "u-target");
     }
 }

@@ -59,6 +59,7 @@ pub mod postgres_git_repo;
 pub mod postgres_realm;
 pub mod postgres_script;
 pub mod postgres_storage_event;
+pub mod postgres_team;
 pub mod postgres_tenant;
 pub mod postgres_volume;
 pub use postgres_api_key::PostgresApiKeyRepository;
@@ -67,6 +68,7 @@ pub use postgres_credential::PostgresCredentialBindingRepository;
 pub use postgres_git_repo::PostgresGitRepoBindingRepository;
 pub use postgres_realm::PostgresRealmRepository;
 pub use postgres_script::PostgresScriptRepository;
+pub use postgres_team::{PgMembershipRepository, PgTeamInvitationRepository, PgTeamRepository};
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
 
