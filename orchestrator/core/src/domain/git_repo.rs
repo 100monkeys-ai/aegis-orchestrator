@@ -501,10 +501,7 @@ pub fn validate_repo_url(url: &str) -> Result<(), String> {
     if let Some(rest) = url.strip_prefix("https://") {
         // Strip optional userinfo (`user:pass@`) before extracting the host.
         let after_userinfo = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
-        let host = after_userinfo
-            .split(|c: char| c == '/' || c == ':')
-            .next()
-            .unwrap_or("");
+        let host = after_userinfo.split(['/', ':']).next().unwrap_or("");
         if host.is_empty() {
             return Err("HTTPS URL must have a non-empty host".to_string());
         }

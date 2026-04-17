@@ -219,7 +219,7 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
         let sparse_paths_json = binding
             .sparse_paths
             .as_ref()
-            .map(|paths| serde_json::to_value(paths))
+            .map(serde_json::to_value)
             .transpose()
             .map_err(|e| RepositoryError::Serialization(format!("sparse_paths: {e}")))?;
 

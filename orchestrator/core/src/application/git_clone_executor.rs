@@ -647,6 +647,45 @@ fn apply_sparse_checkout(repo: &Repository, paths: &[String]) -> Result<(), Clon
     Ok(())
 }
 
+/// Return `true` if `repo_url` resolves to libgit2's local transport.
+///
+/// libgit2 uses its local transport for `file://` URLs and for paths that
+/// don't carry a transport scheme (bare filesystem paths). The local
+/// transport does not implement the shallow-fetch extension and will
+/// abort any fetch that requests `depth != 0`.
+fn is_local_transport(repo_url: &str) -> bool {
+    // Explicit `file://` scheme.
+    if repo_url.starts_with("file://") {
+        return true;
+    }
+    // Any URL with a recognised non-local scheme is remote. Anything else
+    // (a bare filesystem path like `/srv/repos/foo.git` or `./foo.git`)
+    // is handled by libgit2's local transport.
+    let scheme_end = repo_url.find("://");
+    match scheme_end {
+        Some(_) => false,
+        None => {
+            // SCP-style `user@host:path` is an SSH remote, not local.
+            !is_scp_like(repo_url)
+        }
+    }
+}
+
+/// Detect SCP-style SSH URLs like `git@github.com:owner/repo.git`.
+///
+/// Rule: a `:` appears before the first `/`, and there's a non-empty
+/// segment before the `:`. Absolute paths (`:` never present, or present
+/// only after `/`) are excluded.
+fn is_scp_like(repo_url: &str) -> bool {
+    let first_slash = repo_url.find('/');
+    let first_colon = repo_url.find(':');
+    match (first_colon, first_slash) {
+        (Some(c), Some(s)) => c < s && c > 0,
+        (Some(c), None) => c > 0,
+        _ => false,
+    }
+}
+
 /// Run the libgit2 clone on the calling (blocking) thread.
 fn blocking_clone(
     repo_url: &str,
@@ -665,7 +704,15 @@ fn blocking_clone(
 
     let mut fetch_opts = FetchOptions::new();
     fetch_opts.remote_callbacks(callbacks);
-    if shallow {
+    // libgit2's local transport (`file://` and bare filesystem paths)
+    // cannot honour a shallow fetch — it returns "shallow fetch is not
+    // supported by the local transport" and aborts the whole clone. We
+    // never issue shallow fetches over local transport in production
+    // (the service-layer URL validator rejects `file://`), but test
+    // fixtures bypass that validator to exercise the executor against a
+    // real bare repo on disk. Silently drop the depth hint for local
+    // transport so both paths behave consistently.
+    if shallow && !is_local_transport(repo_url) {
         fetch_opts.depth(1);
     }
 
@@ -798,5 +845,49 @@ mod tests {
     fn shell_escape_quotes_single_quotes() {
         assert_eq!(shell_escape("a'b"), "'a'\\''b'");
         assert_eq!(shell_escape("abc"), "'abc'");
+    }
+
+    // -----------------------------------------------------------------
+    // Regression: libgit2's local transport rejects shallow fetches.
+    //
+    // `blocking_clone` must NOT set `depth(1)` on a `file://` URL or a
+    // bare filesystem path, otherwise libgit2 aborts with
+    // `"shallow fetch is not supported by the local transport"` and the
+    // integration tests in `tests/git_clone_executor_tests.rs` fail.
+    // These tests pin the classifier so the depth-suppression branch is
+    // guarded going forward.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_local_transport_accepts_file_scheme() {
+        assert!(is_local_transport("file:///srv/repos/foo.git"));
+        assert!(is_local_transport("file:///tmp/x"));
+    }
+
+    #[test]
+    fn is_local_transport_accepts_bare_filesystem_paths() {
+        assert!(is_local_transport("/srv/repos/foo.git"));
+        assert!(is_local_transport("./foo.git"));
+        assert!(is_local_transport("foo.git"));
+    }
+
+    #[test]
+    fn is_local_transport_rejects_https() {
+        assert!(!is_local_transport("https://github.com/owner/repo.git"));
+        assert!(!is_local_transport(
+            "https://x-access-token:pat@github.com/o/r.git"
+        ));
+    }
+
+    #[test]
+    fn is_local_transport_rejects_ssh_schemes() {
+        assert!(!is_local_transport("ssh://git@github.com/owner/repo.git"));
+        assert!(!is_local_transport("git://github.com/owner/repo.git"));
+    }
+
+    #[test]
+    fn is_local_transport_rejects_scp_style_ssh() {
+        assert!(!is_local_transport("git@github.com:owner/repo.git"));
+        assert!(!is_local_transport("user@host.example:path/to/repo"));
     }
 }
