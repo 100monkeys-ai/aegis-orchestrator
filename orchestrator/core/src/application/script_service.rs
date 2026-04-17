@@ -172,6 +172,29 @@ impl ScriptService {
         Ok(scripts)
     }
 
+    /// List scripts with optional tag and text-search filters applied.
+    #[instrument(skip(self))]
+    pub async fn list_filtered(
+        &self,
+        tenant_id: &TenantId,
+        created_by: &str,
+        tag: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<Vec<Script>, ScriptServiceError> {
+        let mut scripts = self.list(tenant_id, created_by).await?;
+        if let Some(tag) = tag {
+            scripts.retain(|s| s.tags.iter().any(|t| t == tag));
+        }
+        if let Some(q) = query {
+            let needle = q.to_ascii_lowercase();
+            scripts.retain(|s| {
+                s.name.to_ascii_lowercase().contains(&needle)
+                    || s.description.to_ascii_lowercase().contains(&needle)
+            });
+        }
+        Ok(scripts)
+    }
+
     // -----------------------------------------------------------------------
     // get
     // -----------------------------------------------------------------------
