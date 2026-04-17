@@ -3,7 +3,7 @@
 //! # Stripe-backed Billing Service (ADR-111)
 //!
 //! Production implementation of
-//! [`BillingService`](aegis_orchestrator_core::application::billing_service::BillingService)
+//! [`BillingService`]
 //! wired to the `async-stripe` client and the `BillingRepository`. Lives in
 //! the CLI crate to keep the Stripe SDK dependency confined to the binary.
 
@@ -21,7 +21,7 @@ use chrono::Utc;
 use tracing::{info, warn};
 
 /// Stripe-backed implementation of
-/// [`BillingService`](aegis_orchestrator_core::application::billing_service::BillingService)
+/// [`BillingService`]
 /// (ADR-111).
 pub struct StripeBillingService {
     config: BillingConfig,

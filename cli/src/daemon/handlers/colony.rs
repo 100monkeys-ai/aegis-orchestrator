@@ -5,7 +5,7 @@
 //! The Colony surface is the product entry point for team tenants: CRUD over
 //! `Team`, invitation lifecycle, membership management, role updates, SAML
 //! configuration, and subscription summaries. All handlers delegate the
-//! tenancy logic to [`TeamService`](aegis_orchestrator_core::application::team_service::TeamService)
+//! tenancy logic to [`TeamService`]
 //! and resolve the active tenant from request extensions populated by
 //! [`tenant_context_middleware`](aegis_orchestrator_core::presentation::tenant_middleware::tenant_context_middleware).
 //!

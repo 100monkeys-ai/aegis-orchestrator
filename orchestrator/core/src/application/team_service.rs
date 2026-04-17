@@ -32,7 +32,6 @@ use crate::domain::team::{
     TeamInvitation, TeamInvitationId, TeamInvitationRepository, TeamRepository,
 };
 use crate::domain::tenancy::{Tenant, TenantTier};
-use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 
 type HmacSha256 = Hmac<Sha256>;
