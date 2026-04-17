@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # `GitCloneExecutor` Integration Tests (BC-7, ADR-081 Wave A2)
+//! # `GitCloneExecutor` Integration Tests (BC-7, ADR-081 Waves A2 / A3)
 //!
 //! Clones a local bare git repository fixture with `libgit2` and
 //! asserts:
@@ -8,10 +8,11 @@
 //! - Public clone succeeds, returns a resolvable commit SHA, and
 //!   populates the target directory with real files.
 //! - A bad URL surfaces as [`CloneError::Git`].
-//! - [`GitCloneExecutor::select_strategy`] always returns
-//!   [`CloneStrategy::Libgit2`] in A2.
-//! - [`GitCloneExecutor::fetch_and_checkout`] returns
-//!   [`CloneError::NotYetImplemented`] (A3 will implement).
+//! - [`GitCloneExecutor::select_strategy`] routes HostPath backends to
+//!   libgit2 and SeaweedFS / OpenDAL / SEAL backends to EphemeralCli.
+//! - [`GitCloneExecutor::fetch_and_checkout`] performs ref pinning for
+//!   Branch / Tag / Commit variants.
+//! - Sparse checkout prunes the working tree to the requested paths.
 //!
 //! ## URL validation bypass in tests
 //!
@@ -24,7 +25,6 @@
 //!
 //! [`GitRepoService`]: aegis_orchestrator_core::application::git_repo_service::GitRepoService
 //! [`CloneError::Git`]: aegis_orchestrator_core::application::git_clone_executor::CloneError
-//! [`CloneError::NotYetImplemented`]: aegis_orchestrator_core::application::git_clone_executor::CloneError
 //! [`CloneStrategy::Libgit2`]: aegis_orchestrator_core::domain::git_repo::CloneStrategy
 
 use std::path::Path;
@@ -244,22 +244,253 @@ async fn clone_bad_url_returns_clone_error() {
 }
 
 #[tokio::test]
-async fn select_strategy_always_libgit2_in_a2() {
+async fn select_strategy_routes_by_volume_backend() {
+    use aegis_orchestrator_core::domain::volume::{
+        FilerEndpoint, StorageClass, Volume, VolumeBackend, VolumeOwnership, VolumeStatus,
+    };
+
     let executor = test_executor();
     let binding = test_binding("https://github.com/octocat/Hello-World.git");
-    assert_eq!(executor.select_strategy(&binding), CloneStrategy::Libgit2);
+
+    // HostPath → Libgit2
+    let hp_volume = Volume {
+        id: VolumeId::new(),
+        name: "hp".to_string(),
+        tenant_id: TenantId::consumer(),
+        storage_class: StorageClass::persistent(),
+        backend: VolumeBackend::HostPath {
+            path: std::path::PathBuf::from("/tmp/x"),
+        },
+        size_limit_bytes: 1,
+        status: VolumeStatus::Available,
+        ownership: VolumeOwnership::persistent("u"),
+        created_at: chrono::Utc::now(),
+        attached_at: None,
+        detached_at: None,
+        expires_at: None,
+        host_node_id: None,
+    };
+    assert_eq!(
+        executor.select_strategy(&binding, &hp_volume),
+        CloneStrategy::Libgit2
+    );
+
+    // SeaweedFS → EphemeralCli
+    let sw_volume = Volume {
+        backend: VolumeBackend::SeaweedFS {
+            filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+            remote_path: "/volumes/x".to_string(),
+        },
+        ..hp_volume
+    };
+    assert!(matches!(
+        executor.select_strategy(&binding, &sw_volume),
+        CloneStrategy::EphemeralCli { .. }
+    ));
 }
 
 #[tokio::test]
-async fn fetch_and_checkout_is_not_yet_implemented() {
+async fn fetch_and_checkout_branch_fast_forwards() {
     let tmp = tempfile::tempdir().unwrap();
-    let target = tmp.path().join("dummy");
+    let url = build_bare_fixture(tmp.path());
+    let target = tmp.path().join("cloned");
     let executor = test_executor();
-    let binding = test_binding("https://github.com/octocat/Hello-World.git");
+    let binding = test_binding(&url);
 
-    let err = executor
+    // Initial clone
+    let initial_sha = executor
+        .clone(&binding, &target, None, true)
+        .await
+        .expect("initial clone");
+
+    // Make a second commit on the upstream work tree so a fetch will
+    // actually advance HEAD.
+    let work = tmp.path().join("work");
+    let repo = git2::Repository::open(&work).unwrap();
+    std::fs::write(work.join("new.txt"), b"second\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("new.txt")).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("A3 Tester", "a3@aegis.test").unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent])
+        .unwrap();
+
+    // Push the new tip into the bare fixture that `binding.repo_url`
+    // points at. libgit2 in the working repo needs to know about origin.
+    let bare_path = tmp.path().join("fixture.git");
+    let bare = git2::Repository::open(&bare_path).unwrap();
+    // Copy the new commit into the bare repo by fetching it.
+    let mut remote = bare
+        .remote_anonymous(&format!("file://{}", work.display()))
+        .unwrap();
+    remote
+        .fetch(&["+refs/heads/main:refs/heads/main"], None, None)
+        .unwrap();
+
+    let new_sha = executor
         .fetch_and_checkout(&binding, &target, None)
         .await
-        .expect_err("A2 fetch_and_checkout must be a stub");
-    assert!(matches!(err, CloneError::NotYetImplemented(_)));
+        .expect("fetch_and_checkout should succeed");
+    assert_ne!(new_sha, initial_sha, "HEAD should advance after fetch");
+    assert!(
+        target.join("new.txt").exists(),
+        "new file present after fetch"
+    );
+}
+
+#[tokio::test]
+async fn fetch_and_checkout_tag_pins_to_tag_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let url = build_bare_fixture(tmp.path());
+    let target = tmp.path().join("cloned");
+    let executor = test_executor();
+
+    // Tag HEAD as v1.0.0 in the upstream work repo, then copy the tag
+    // into the bare fixture.
+    let work = tmp.path().join("work");
+    {
+        let repo = git2::Repository::open(&work).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Tagger", "t@aegis.test").unwrap();
+        repo.tag("v1.0.0", head.as_object(), &sig, "release", false)
+            .unwrap();
+    }
+    {
+        let bare_path = tmp.path().join("fixture.git");
+        let bare = git2::Repository::open(&bare_path).unwrap();
+        let mut remote = bare
+            .remote_anonymous(&format!("file://{}", work.display()))
+            .unwrap();
+        remote
+            .fetch(&["+refs/tags/v1.0.0:refs/tags/v1.0.0"], None, None)
+            .unwrap();
+    }
+
+    // First do a plain clone with the executor (default branch main).
+    let binding_branch = test_binding(&url);
+    let branch_sha = executor
+        .clone(&binding_branch, &target, None, true)
+        .await
+        .unwrap();
+
+    // Now construct a tag-pinned binding and fetch_and_checkout at the
+    // same target. Tag resolves to the same commit as main.
+    let binding_tag = GitRepoBinding::new(
+        TenantId::consumer(),
+        None,
+        url.clone(),
+        GitRef::Tag("v1.0.0".to_string()),
+        None,
+        VolumeId::new(),
+        "fixture-tag".to_string(),
+        CloneStrategy::Libgit2,
+        false,
+        None,
+    );
+
+    let tag_sha = executor
+        .fetch_and_checkout(&binding_tag, &target, None)
+        .await
+        .expect("tag fetch should succeed");
+    assert_eq!(branch_sha, tag_sha);
+}
+
+#[tokio::test]
+async fn fetch_and_checkout_commit_pins_to_exact_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    let url = build_bare_fixture(tmp.path());
+    let target = tmp.path().join("cloned");
+    let executor = test_executor();
+
+    let binding_branch = test_binding(&url);
+    let initial_sha = executor
+        .clone(&binding_branch, &target, None, false)
+        .await
+        .unwrap();
+
+    let binding_commit = GitRepoBinding::new(
+        TenantId::consumer(),
+        None,
+        url.clone(),
+        GitRef::Commit(initial_sha.clone()),
+        None,
+        VolumeId::new(),
+        "fixture-commit".to_string(),
+        CloneStrategy::Libgit2,
+        false,
+        None,
+    );
+    let pinned_sha = executor
+        .fetch_and_checkout(&binding_commit, &target, None)
+        .await
+        .expect("commit fetch should succeed");
+    assert_eq!(initial_sha, pinned_sha);
+}
+
+#[tokio::test]
+async fn sparse_checkout_prunes_working_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    // Build an upstream with two paths; sparse-checkout will keep only
+    // one of them.
+    let mut init_opts = git2::RepositoryInitOptions::new();
+    init_opts.initial_head("main");
+    let repo = git2::Repository::init_opts(&work, &init_opts).unwrap();
+    let mut cfg = repo.config().unwrap();
+    cfg.set_str("user.name", "A3").unwrap();
+    cfg.set_str("user.email", "a3@aegis.test").unwrap();
+    std::fs::create_dir_all(work.join("keep")).unwrap();
+    std::fs::create_dir_all(work.join("prune")).unwrap();
+    std::fs::write(work.join("keep/a.txt"), b"k\n").unwrap();
+    std::fs::write(work.join("prune/b.txt"), b"p\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("keep/a.txt")).unwrap();
+    index.add_path(std::path::Path::new("prune/b.txt")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("A3", "a3@aegis.test").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let bare = tmp.path().join("fixture.git");
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.bare(true);
+    builder
+        .clone(&format!("file://{}", work.display()), &bare)
+        .unwrap();
+    let url = format!("file://{}", bare.display());
+
+    let target = tmp.path().join("cloned");
+    let executor = test_executor();
+
+    let binding = GitRepoBinding::new(
+        TenantId::consumer(),
+        None,
+        url,
+        GitRef::Branch("main".to_string()),
+        Some(vec!["keep".to_string()]),
+        VolumeId::new(),
+        "sparse".to_string(),
+        CloneStrategy::Libgit2,
+        false,
+        None,
+    );
+    executor
+        .clone(&binding, &target, None, true)
+        .await
+        .expect("clone + sparse should succeed");
+
+    assert!(
+        target.join("keep/a.txt").exists(),
+        "sparse-included path should be present"
+    );
+    assert!(
+        !target.join("prune/b.txt").exists(),
+        "sparse-excluded path should be pruned"
+    );
 }

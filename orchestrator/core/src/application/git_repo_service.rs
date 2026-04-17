@@ -3,39 +3,46 @@
 //! # Git Repository Binding Application Service (BC-7 Storage Gateway, ADR-081)
 //!
 //! [`GitRepoService`] — the primary interface for creating, listing,
-//! cloning, and deleting [`GitRepoBinding`]s. All business logic lives
-//! here; the HTTP layer is a thin shell that translates requests into
-//! command structs and maps errors onto status codes.
+//! cloning, refreshing, and deleting [`GitRepoBinding`]s. All business
+//! logic lives here; the HTTP layer is a thin shell that translates
+//! requests into command structs and maps errors onto status codes.
 //!
-//! ## A2 Scope (Phase 1)
+//! ## A3 Scope (Phases 2 / 3 / 4)
 //!
 //! | Method | Status |
 //! |---|---|
 //! | [`GitRepoService::create_binding`] | implemented |
-//! | [`GitRepoService::clone_repo`] | implemented |
+//! | [`GitRepoService::clone_repo`] | implemented (HostPath + EphemeralCli) |
 //! | [`GitRepoService::list_bindings`] | implemented |
 //! | [`GitRepoService::get_binding`] | implemented |
 //! | [`GitRepoService::delete_binding`] | implemented |
-//! | [`GitRepoService::refresh_repo`] | **A3 stub** — returns `NotYetImplemented` |
-//! | [`GitRepoService::handle_webhook`] | **A3 stub** — returns `NotYetImplemented` |
+//! | [`GitRepoService::refresh_repo`] | implemented (fetch + checkout pin) |
+//! | [`GitRepoService::handle_webhook`] | implemented (HMAC validated) |
 //!
 //! ## Keymaster Pattern
 //!
 //! Credentials never enter the binding row. The service resolves them
-//! just-in-time from [`SecretsManager`] inside [`Self::clone_repo`],
-//! passes them to [`GitCloneExecutor`], and drops them immediately after
-//! the git operation returns.
+//! just-in-time from [`SecretsManager`] inside [`Self::clone_repo`] /
+//! [`Self::refresh_repo`], passes them to [`GitCloneExecutor`], and drops
+//! them immediately after the git operation returns.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tracing::{error, info, instrument, warn};
 
 use crate::application::git_clone_executor::{CloneError, GitCloneExecutor, ResolvedCredential};
 use crate::application::user_volume_service::{UserVolumeError, UserVolumeService};
 use crate::application::volume_manager::CreateUserVolumeCommand;
-use crate::domain::credential::CredentialBindingId;
+use crate::domain::credential::{
+    CredentialBindingId, CredentialBindingRepository, CredentialStatus, CredentialType,
+    UserCredentialBinding,
+};
 use crate::domain::git_repo::{
     validate_repo_url, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
     GitRepoBindingRepository,
@@ -43,6 +50,7 @@ use crate::domain::git_repo::{
 use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
 use crate::domain::iam::ZaruTier;
 use crate::domain::repository::RepositoryError;
+use crate::domain::secrets::AccessContext;
 use crate::domain::shared_kernel::TenantId;
 use crate::domain::volume::{Volume, VolumeBackend};
 use crate::infrastructure::event_bus::EventBus;
@@ -132,6 +140,9 @@ pub enum GitRepoError {
     #[error("volume provisioning failed: {0}")]
     VolumeProvisioningFailed(String),
 
+    #[error("webhook rejected: {0}")]
+    WebhookRejected(String),
+
     #[error("not yet implemented: {0}")]
     NotYetImplemented(&'static str),
 }
@@ -143,26 +154,45 @@ impl From<UserVolumeError> for GitRepoError {
 }
 
 // ============================================================================
+// Webhook provider kinds
+// ============================================================================
+
+/// Inbound webhook provider. Controls HMAC algorithm and header lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookProvider {
+    /// GitHub — `X-Hub-Signature-256: sha256=<hex>` over the raw body.
+    GitHub,
+    /// GitLab — `X-Gitlab-Token: <secret>` constant-time equality with
+    /// the binding's `webhook_secret`.
+    GitLab,
+    /// Bitbucket — `X-Hub-Signature: sha1=<hex>` over the raw body
+    /// (legacy BitBucket Server variant).
+    Bitbucket,
+}
+
+/// Parsed authentication material extracted from a webhook request.
+#[derive(Debug, Clone)]
+pub struct WebhookAuth {
+    pub provider: WebhookProvider,
+    /// Raw `sha256=<hex>` / `sha1=<hex>` / `<token>` value as it appeared
+    /// on the incoming header.
+    pub signature: String,
+}
+
+// ============================================================================
 // Service
 // ============================================================================
 
 /// Application service for [`GitRepoBinding`] lifecycle management.
-///
-/// Wired via [`GitRepoService::new`] with:
-/// - `repo` — Postgres (or in-memory for tests) binding repository
-/// - `volume_service` — quota-enforcing persistent volume provisioner
-/// - `clone_executor` — libgit2-backed clone / fetch primitive
-/// - `secret_manager` — OpenBao-backed credential resolver
-/// - `event_bus` — publishes domain events after aggregate commits
 pub struct GitRepoService {
     repo: Arc<dyn GitRepoBindingRepository>,
     volume_service: Arc<UserVolumeService>,
     clone_executor: Arc<GitCloneExecutor>,
-    /// Retained for A3's full credential-resolution flow; unused on
-    /// A2's public-only clone path.
-    #[allow(dead_code)]
     secret_manager: Arc<SecretsManager>,
+    credential_repo: Option<Arc<dyn CredentialBindingRepository>>,
     event_bus: Arc<EventBus>,
+    /// Orchestrator identifier used in [`AccessContext`] audit rows.
+    orchestrator_id: String,
 }
 
 impl GitRepoService {
@@ -178,8 +208,25 @@ impl GitRepoService {
             volume_service,
             clone_executor,
             secret_manager,
+            credential_repo: None,
             event_bus,
+            orchestrator_id: "git-repo-service".to_string(),
         }
+    }
+
+    /// Inject the credential-binding repository. When present, the
+    /// service resolves private-repo credentials via the Keymaster
+    /// pattern; absent, any binding that carries a
+    /// `credential_binding_id` will fail with `NotYetImplemented`.
+    pub fn with_credential_repo(mut self, repo: Arc<dyn CredentialBindingRepository>) -> Self {
+        self.credential_repo = Some(repo);
+        self
+    }
+
+    /// Override the orchestrator identifier used in audit events.
+    pub fn with_orchestrator_id(mut self, id: impl Into<String>) -> Self {
+        self.orchestrator_id = id.into();
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -196,10 +243,8 @@ impl GitRepoService {
         &self,
         cmd: CreateGitRepoCommand,
     ) -> Result<GitRepoBinding, GitRepoError> {
-        // 1) URL validation (ADR-081 §Security).
         validate_repo_url(&cmd.repo_url).map_err(GitRepoError::UrlValidationFailed)?;
 
-        // 2) Tier limit check.
         let limits = GitRepoTierLimits::for_tier(cmd.zaru_tier.clone());
         if let Some(max) = limits.max_bindings {
             let current = self.repo.count_by_owner(&cmd.tenant_id, &cmd.owner).await?;
@@ -208,7 +253,6 @@ impl GitRepoService {
             }
         }
 
-        // 3) Provision a persistent volume for the binding.
         let volume = self
             .volume_service
             .create_volume(CreateUserVolumeCommand {
@@ -220,7 +264,29 @@ impl GitRepoService {
             })
             .await?;
 
-        // 4) Construct the aggregate in Pending state.
+        // Generate a webhook secret whenever auto_refresh is requested.
+        // The secret doubles as the URL path parameter and as the HMAC
+        // key for GitLab-style header-token verification.
+        let webhook_secret = if cmd.auto_refresh {
+            Some(uuid::Uuid::new_v4().simple().to_string())
+        } else {
+            None
+        };
+
+        // Pick a clone strategy based on the backing volume's backend.
+        let provisional_strategy = match &volume.backend {
+            VolumeBackend::HostPath { .. } => CloneStrategy::Libgit2,
+            VolumeBackend::SeaweedFS { .. } => CloneStrategy::EphemeralCli {
+                reason: "SeaweedFS volume requires FUSE-mounted container".to_string(),
+            },
+            VolumeBackend::OpenDal { .. } => CloneStrategy::EphemeralCli {
+                reason: "OpenDAL volume requires FUSE-mounted container".to_string(),
+            },
+            VolumeBackend::Seal { .. } => CloneStrategy::EphemeralCli {
+                reason: "SEAL remote-node volume requires FUSE-mounted container".to_string(),
+            },
+        };
+
         let mut binding = GitRepoBinding::new(
             cmd.tenant_id.clone(),
             cmd.credential_binding_id,
@@ -229,12 +295,11 @@ impl GitRepoService {
             cmd.sparse_paths.clone(),
             volume.id,
             cmd.label.clone(),
-            CloneStrategy::Libgit2,
+            provisional_strategy,
             cmd.auto_refresh,
-            None, // webhook_secret — A3 wires this when auto_refresh enabled.
+            webhook_secret,
         );
 
-        // 5) Persist + publish.
         self.repo.save(&binding).await?;
         self.drain_and_publish(&mut binding);
         info!(binding_id = %binding.id, volume_id = %volume.id, "git repo binding created");
@@ -245,15 +310,8 @@ impl GitRepoService {
     // clone_repo
     // -----------------------------------------------------------------------
 
-    /// Execute the libgit2 clone for `id` and transition the binding to
+    /// Execute the clone for `id` and transition the binding to
     /// [`GitRepoStatus::Ready`] (or `Failed` on error).
-    ///
-    /// Typically invoked via `tokio::spawn` right after
-    /// [`Self::create_binding`] — the HTTP response returns the Pending
-    /// binding immediately while this task runs in the background.
-    ///
-    /// The shallow flag comes from the binding's clone strategy
-    /// derivation — for A2 we always shallow-clone.
     #[instrument(skip(self), fields(binding_id = %id))]
     pub async fn clone_repo(&self, id: &GitRepoBindingId) -> Result<(), GitRepoError> {
         let mut binding = self
@@ -262,13 +320,10 @@ impl GitRepoService {
             .await?
             .ok_or(GitRepoError::BindingNotFound)?;
 
-        // Transition Pending → Cloning.
         binding.start_clone();
         self.repo.save(&binding).await?;
         self.drain_and_publish(&mut binding);
 
-        // Resolve target directory from the volume backend. A2 only
-        // supports HostPath-backed volumes for direct libgit2 writes.
         let volume = match self
             .volume_service
             .volume_repo
@@ -286,15 +341,6 @@ impl GitRepoService {
             }
         };
 
-        let target_dir = match host_path_for_volume(&volume) {
-            Ok(p) => p,
-            Err(e) => {
-                self.fail(&mut binding, e.clone()).await;
-                return Err(GitRepoError::VolumeProvisioningFailed(e));
-            }
-        };
-
-        // Resolve credential (Keymaster: just-in-time, tightly scoped).
         let credential = match self.resolve_credential(&binding).await {
             Ok(c) => c,
             Err(e) => {
@@ -305,13 +351,36 @@ impl GitRepoService {
         };
 
         let started = std::time::Instant::now();
-        let shallow = true; // A2: always shallow. A3 honours CreateGitRepoCommand::shallow.
+        let shallow = true;
 
-        match self
-            .clone_executor
-            .clone(&binding, &target_dir, credential, shallow)
-            .await
-        {
+        let strategy = self.clone_executor.select_strategy(&binding, &volume);
+        // Persist the strategy back to the binding so the UI / operators
+        // can see the real routing that was used.
+        if strategy != binding.clone_strategy {
+            binding.clone_strategy = strategy.clone();
+        }
+
+        let clone_result = match strategy {
+            CloneStrategy::Libgit2 => {
+                let target_dir = match host_path_for_volume(&volume) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.fail(&mut binding, e.clone()).await;
+                        return Err(GitRepoError::VolumeProvisioningFailed(e));
+                    }
+                };
+                self.clone_executor
+                    .clone(&binding, &target_dir, credential, shallow)
+                    .await
+            }
+            CloneStrategy::EphemeralCli { .. } => {
+                self.clone_executor
+                    .clone_ephemeral(&binding, &volume, credential, shallow)
+                    .await
+            }
+        };
+
+        match clone_result {
             Ok(sha) => {
                 let duration_ms = started.elapsed().as_millis() as u64;
                 binding.complete_clone(sha.clone(), duration_ms);
@@ -333,14 +402,12 @@ impl GitRepoService {
     }
 
     // -----------------------------------------------------------------------
-    // refresh_repo — A3 stub
+    // refresh_repo
     // -----------------------------------------------------------------------
 
-    /// **A3 STUB.** Refresh an existing binding against the remote.
-    ///
-    /// Validates ownership and returns
-    /// [`GitRepoError::NotYetImplemented`] — A3 implements the fetch +
-    /// checkout flow and the associated event emissions.
+    /// Refresh an existing binding against the remote. Transitions the
+    /// binding through `Ready → Refreshing → Ready` (or `Failed`), emits
+    /// the matching `Refresh*` events, and updates `last_commit_sha`.
     #[instrument(skip(self), fields(binding_id = %id))]
     pub async fn refresh_repo(
         &self,
@@ -348,23 +415,94 @@ impl GitRepoService {
         tenant_id: &TenantId,
         owner: &str,
     ) -> Result<(), GitRepoError> {
-        // Ownership gate via get_binding (returns 404 for non-owners).
-        let _binding = self.get_binding(id, tenant_id, owner).await?;
-        Err(GitRepoError::NotYetImplemented(
-            "refresh_repo is deferred to ADR-081 Wave A3",
-        ))
+        let mut binding = self.get_binding(id, tenant_id, owner).await?;
+        self.do_refresh(&mut binding).await
+    }
+
+    /// Internal refresh entry point that bypasses the ownership gate.
+    /// Invoked by the webhook handler once the HMAC signature has been
+    /// verified.
+    async fn do_refresh(&self, binding: &mut GitRepoBinding) -> Result<(), GitRepoError> {
+        let old_sha = binding
+            .last_commit_sha
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        binding.start_refresh();
+        self.repo.save(binding).await?;
+        self.drain_and_publish(binding);
+
+        let volume = match self
+            .volume_service
+            .volume_repo
+            .find_by_id(binding.volume_id)
+            .await
+        {
+            Ok(Some(v)) => v,
+            _ => {
+                let msg = format!(
+                    "volume {} not found for binding {}",
+                    binding.volume_id, binding.id
+                );
+                self.fail_refresh(binding, msg.clone()).await;
+                return Err(GitRepoError::VolumeProvisioningFailed(msg));
+            }
+        };
+
+        let credential = match self.resolve_credential(binding).await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                self.fail_refresh(binding, msg.clone()).await;
+                return Err(e);
+            }
+        };
+
+        let target_dir = match host_path_for_volume(&volume) {
+            Ok(p) => p,
+            Err(e) => {
+                // SeaweedFS / OpenDAL / SEAL refresh is currently only
+                // supported through a fresh ephemeral clone. For Phase 3
+                // we mark this as NotYetImplemented rather than silently
+                // dropping to a different code path.
+                let msg = format!("refresh via ephemeral CLI not yet implemented: {e}");
+                self.fail_refresh(binding, msg.clone()).await;
+                return Err(GitRepoError::NotYetImplemented(
+                    "refresh for non-HostPath volumes requires ephemeral-cli re-clone (ADR-081 Phase 5)",
+                ));
+            }
+        };
+
+        let started = std::time::Instant::now();
+        match self
+            .clone_executor
+            .fetch_and_checkout(binding, &target_dir, credential)
+            .await
+        {
+            Ok(new_sha) => {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                binding.complete_refresh(old_sha, new_sha.clone(), duration_ms);
+                self.repo.save(binding).await?;
+                self.drain_and_publish(binding);
+                info!(new_commit_sha = %new_sha, duration_ms, "refresh completed");
+                Ok(())
+            }
+            Err(e) => {
+                let msg = match &e {
+                    CloneError::Git(m) => format!("git: {m}"),
+                    CloneError::Io(m) => format!("io: {m}"),
+                    CloneError::NotYetImplemented(m) => format!("not_yet_implemented: {m}"),
+                };
+                self.fail_refresh(binding, msg.clone()).await;
+                Err(GitRepoError::CloneFailed(msg))
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
     // list_bindings
     // -----------------------------------------------------------------------
 
-    /// List all bindings owned by `owner` within `tenant_id`.
-    ///
-    /// A1's repository is tenant-scoped (not owner-scoped). A2 filters
-    /// bindings by cross-referencing each `volume_id` against the
-    /// caller's volume list, which carries the real ownership stamp
-    /// (`VolumeOwnership::Persistent.owner`).
     #[instrument(skip(self))]
     pub async fn list_bindings(
         &self,
@@ -381,12 +519,6 @@ impl GitRepoService {
             .collect())
     }
 
-    /// Load a single binding, verifying tenant + ownership.
-    ///
-    /// Returns [`GitRepoError::BindingNotFound`] — **not** `NotOwned` —
-    /// when the binding exists but belongs to a different owner. This
-    /// prevents leaking the existence of other users' bindings through
-    /// the REST surface (ADR-081 §Security).
     #[instrument(skip(self), fields(binding_id = %id))]
     pub async fn get_binding(
         &self,
@@ -402,7 +534,6 @@ impl GitRepoService {
         if &binding.tenant_id != tenant_id {
             return Err(GitRepoError::BindingNotFound);
         }
-        // Ownership gate: the binding's volume must be owned by `owner`.
         let owned_volumes = self.volume_service.list_volumes(tenant_id, owner).await?;
         if !owned_volumes.iter().any(|v| v.id == binding.volume_id) {
             return Err(GitRepoError::BindingNotFound);
@@ -414,8 +545,6 @@ impl GitRepoService {
     // delete_binding
     // -----------------------------------------------------------------------
 
-    /// Delete the binding and its backing volume. Emits
-    /// [`crate::domain::git_repo::GitRepoEvent::BindingDeleted`].
     #[instrument(skip(self), fields(binding_id = %id))]
     pub async fn delete_binding(
         &self,
@@ -423,15 +552,9 @@ impl GitRepoService {
         tenant_id: &TenantId,
         owner: &str,
     ) -> Result<(), GitRepoError> {
-        // Ownership gate via get_binding (returns 404 for non-owners).
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
-
-        // Cascade: volume delete first (so a partial failure surfaces
-        // as VolumeProvisioningFailed without orphaning the binding
-        // row).
         let volume_id = binding.volume_id;
         let _ = self.volume_service.delete_volume(&volume_id, owner).await;
-
         binding.mark_deleted();
         self.drain_and_publish(&mut binding);
         self.repo.delete(&binding.id).await?;
@@ -439,31 +562,74 @@ impl GitRepoService {
     }
 
     // -----------------------------------------------------------------------
-    // handle_webhook — A3 stub
+    // handle_webhook
     // -----------------------------------------------------------------------
 
-    /// **A3 STUB.** Handle an inbound webhook from a git provider.
+    /// Handle an inbound webhook. Validates the HMAC signature using the
+    /// binding's `webhook_secret` then triggers a refresh.
+    ///
+    /// Returns `Ok(())` on success, `WebhookRejected` on bad signature or
+    /// unknown secret, `NotYetImplemented` when the binding is not
+    /// configured for auto-refresh, and other variants propagate from
+    /// the refresh path.
     pub async fn handle_webhook(
         &self,
-        _secret: &str,
-        _signature: &str,
-        _payload: &[u8],
+        secret: &str,
+        auth: &WebhookAuth,
+        payload: &[u8],
     ) -> Result<(), GitRepoError> {
-        Err(GitRepoError::NotYetImplemented(
-            "handle_webhook is deferred to ADR-081 Wave A3",
-        ))
+        let mut binding = self
+            .repo
+            .find_by_webhook_secret(secret)
+            .await?
+            .ok_or_else(|| GitRepoError::WebhookRejected("unknown webhook secret".into()))?;
+
+        let Some(stored_secret) = binding.webhook_secret.as_ref() else {
+            return Err(GitRepoError::WebhookRejected(
+                "binding has no webhook secret configured".into(),
+            ));
+        };
+
+        if !verify_webhook(auth, payload, stored_secret.as_bytes()) {
+            return Err(GitRepoError::WebhookRejected(
+                "hmac signature verification failed".into(),
+            ));
+        }
+
+        // Emit WebhookReceived event.
+        let source = match auth.provider {
+            WebhookProvider::GitHub => "github",
+            WebhookProvider::GitLab => "gitlab",
+            WebhookProvider::Bitbucket => "bitbucket",
+        };
+        binding
+            .domain_events
+            .push(crate::domain::git_repo::GitRepoEvent::WebhookReceived {
+                id: binding.id,
+                source: source.to_string(),
+                received_at: chrono::Utc::now(),
+            });
+        self.drain_and_publish(&mut binding);
+
+        self.do_refresh(&mut binding).await
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Transition the binding to `Failed { error }`, persist, and emit
-    /// events. Errors inside this helper are logged but never mask the
-    /// original failure reason.
     async fn fail(&self, binding: &mut GitRepoBinding, error: String) {
-        warn!(binding_id = %binding.id, %error, "marking binding as Failed");
+        warn!(binding_id = %binding.id, %error, "marking binding as Failed (clone)");
         binding.fail_clone(error);
+        if let Err(e) = self.repo.save(binding).await {
+            error!(?e, "failed to persist Failed binding state");
+        }
+        self.drain_and_publish(binding);
+    }
+
+    async fn fail_refresh(&self, binding: &mut GitRepoBinding, error: String) {
+        warn!(binding_id = %binding.id, %error, "marking binding as Failed (refresh)");
+        binding.fail_refresh(error);
         if let Err(e) = self.repo.save(binding).await {
             error!(?e, "failed to persist Failed binding state");
         }
@@ -472,42 +638,101 @@ impl GitRepoService {
 
     /// Resolve a [`ResolvedCredential`] from OpenBao if the binding has
     /// a credential pinned. Returns `Ok(None)` for public repos.
-    ///
-    /// Called inside [`Self::clone_repo`] so the token lives on the
-    /// stack for the duration of the git operation only.
-    ///
-    /// **A2 NOTE:** full credential-binding lookup requires wiring a
-    /// [`crate::domain::credential::CredentialBindingRepository`] into
-    /// this service so we can resolve `credential_binding_id →
-    /// SecretPath` verbatim. A2 ships **public-repo clone only**; when
-    /// a binding carries a credential id, we return
-    /// [`GitRepoError::NotYetImplemented`] and mark the binding
-    /// `Failed`. A3 extends this with the full OpenBao lookup + SSH
-    /// key handling per ADR-081 §Security.
-    ///
-    /// TODO(A3): inject `Arc<dyn CredentialBindingRepository>` and
-    /// resolve `binding.credential_binding_id` → `UserCredentialBinding`
-    /// → `secret_path`, then call
-    /// `secret_manager.read_secret_field(effective_mount, path, "value",
-    /// …)` verbatim. Branch on `CredentialType::Secret` (→ HttpsPat) vs
-    /// `CredentialType::SshKey` (→ SshKey + `scopeguard` temp file).
     async fn resolve_credential(
         &self,
         binding: &GitRepoBinding,
     ) -> Result<Option<ResolvedCredential>, GitRepoError> {
-        let Some(_cred_id) = binding.credential_binding_id else {
+        let Some(cred_id) = binding.credential_binding_id else {
             return Ok(None);
         };
 
-        // Intentionally fail loudly in A2 when a credential is required.
-        // A3 will replace this with a real lookup.
-        let _ = self.secret_manager.clone(); // keep the field alive for A3.
-        Err(GitRepoError::NotYetImplemented(
-            "credential-backed clone (private repos) is deferred to ADR-081 Wave A3",
-        ))
+        let repo = self
+            .credential_repo
+            .as_ref()
+            .ok_or(GitRepoError::NotYetImplemented(
+                "credential-backed clone requires CredentialBindingRepository injection",
+            ))?;
+
+        let cb = repo
+            .find_by_id(&cred_id)
+            .await
+            .map_err(|e| GitRepoError::SecretResolutionFailed(e.to_string()))?
+            .ok_or_else(|| {
+                GitRepoError::SecretResolutionFailed(format!(
+                    "credential binding {cred_id} not found"
+                ))
+            })?;
+
+        // Tenant isolation — the credential must belong to the same
+        // tenant as the git repo binding.
+        if cb.tenant_id != binding.tenant_id {
+            return Err(GitRepoError::SecretResolutionFailed(
+                "credential binding tenant mismatch".into(),
+            ));
+        }
+
+        if cb.status != CredentialStatus::Active {
+            return Err(GitRepoError::SecretResolutionFailed(format!(
+                "credential binding {cred_id} is not active (status={:?})",
+                cb.status
+            )));
+        }
+
+        let ctx = AccessContext::system(&self.orchestrator_id);
+        let engine = cb.secret_path.effective_mount();
+
+        match cb.credential_type {
+            CredentialType::Secret | CredentialType::OAuth2 | CredentialType::ServiceAccount => {
+                // For PAT / OAuth / service-account credentials we read
+                // the canonical "value" field from the KV record. The
+                // optional "username" field lets callers override the
+                // default `x-access-token`.
+                let pat = self
+                    .secret_manager
+                    .read_secret_field(&engine, &cb.secret_path.path, "value", &ctx)
+                    .await
+                    .map_err(|e| GitRepoError::SecretResolutionFailed(e.to_string()))?;
+
+                // Differentiate PAT vs SSH by reading an optional
+                // "kind" field. When absent, default to PAT (preserves
+                // existing API-key bindings).
+                let kind = self
+                    .secret_manager
+                    .read_secret_field(&engine, &cb.secret_path.path, "kind", &ctx)
+                    .await
+                    .map(|s| s.expose_owned())
+                    .unwrap_or_else(|_| "pat".to_string());
+
+                if kind == "ssh_key" {
+                    let passphrase = self
+                        .secret_manager
+                        .read_secret_field(&engine, &cb.secret_path.path, "passphrase", &ctx)
+                        .await
+                        .ok();
+                    return Ok(Some(ResolvedCredential::SshKey {
+                        private_key_pem: pat,
+                        passphrase,
+                    }));
+                }
+
+                let username = self
+                    .secret_manager
+                    .read_secret_field(&engine, &cb.secret_path.path, "username", &ctx)
+                    .await
+                    .map(|s| s.expose_owned())
+                    .unwrap_or_else(|_| default_username_for(&cb));
+
+                Ok(Some(ResolvedCredential::HttpsPat {
+                    username,
+                    token: pat,
+                }))
+            }
+            CredentialType::Variable => Err(GitRepoError::SecretResolutionFailed(
+                "non-secret credentials cannot be used for git authentication".into(),
+            )),
+        }
     }
 
-    /// Drain buffered aggregate events and publish each to the event bus.
     fn drain_and_publish(&self, binding: &mut GitRepoBinding) {
         for event in binding.take_events() {
             self.event_bus.publish_git_repo_event(event);
@@ -515,23 +740,165 @@ impl GitRepoService {
     }
 }
 
+fn default_username_for(cb: &UserCredentialBinding) -> String {
+    use crate::domain::credential::CredentialProvider;
+    match &cb.provider {
+        CredentialProvider::GitHub => "x-access-token".to_string(),
+        CredentialProvider::Custom(_) => "x-access-token".to_string(),
+        _ => "x-access-token".to_string(),
+    }
+}
+
+// ============================================================================
+// HMAC verification
+// ============================================================================
+
+/// Verify an inbound webhook signature against the stored secret.
+///
+/// Returns `true` when the signature matches; `false` for any failure
+/// (malformed header, algorithm mismatch, hex decode failure, or
+/// signature mismatch). All comparisons use constant-time equality.
+pub fn verify_webhook(auth: &WebhookAuth, payload: &[u8], secret: &[u8]) -> bool {
+    match auth.provider {
+        WebhookProvider::GitLab => ct_slice_eq(secret, auth.signature.as_bytes()),
+        WebhookProvider::GitHub => {
+            let Some(hex_sig) = auth.signature.strip_prefix("sha256=") else {
+                return false;
+            };
+            let Ok(given) = hex::decode(hex_sig) else {
+                return false;
+            };
+            let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret) else {
+                return false;
+            };
+            mac.update(payload);
+            let expected = mac.finalize().into_bytes();
+            ct_slice_eq(&given, expected.as_slice())
+        }
+        WebhookProvider::Bitbucket => {
+            let Some(hex_sig) = auth.signature.strip_prefix("sha1=") else {
+                return false;
+            };
+            let Ok(given) = hex::decode(hex_sig) else {
+                return false;
+            };
+            let Ok(mut mac) = Hmac::<Sha1>::new_from_slice(secret) else {
+                return false;
+            };
+            mac.update(payload);
+            let expected = mac.finalize().into_bytes();
+            ct_slice_eq(&given, expected.as_slice())
+        }
+    }
+}
+
+/// Length-checked constant-time slice equality. `subtle`'s
+/// `ConstantTimeEq::ct_eq` on `[T]` panics when lengths differ, so we
+/// short-circuit the length check ourselves.
+fn ct_slice_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
+
 // ============================================================================
 // Module-private helpers
 // ============================================================================
 
-/// Resolve the on-disk clone target for a volume's backend.
-///
-/// A2 only supports [`VolumeBackend::HostPath`] — the direct libgit2
-/// write path. Remote SeaweedFS and cross-node SEAL backends will be
-/// handled via the `EphemeralCliEngine` fallback in A3.
+/// Resolve the on-disk clone target for a HostPath-backed volume.
 fn host_path_for_volume(volume: &Volume) -> Result<PathBuf, String> {
     match &volume.backend {
         VolumeBackend::HostPath { path } => Ok(path.clone()),
         VolumeBackend::SeaweedFS { .. }
         | VolumeBackend::OpenDal { .. }
         | VolumeBackend::Seal { .. } => Err(format!(
-            "A2 git clone only supports HostPath volumes; volume {} has backend {:?}",
+            "libgit2 clone only supports HostPath volumes; volume {} has backend {:?}",
             volume.id, volume.backend
         )),
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gh_signature(secret: &[u8], body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(body);
+        let out = mac.finalize().into_bytes();
+        format!("sha256={}", hex::encode(out))
+    }
+
+    fn bb_signature(secret: &[u8], body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha1>::new_from_slice(secret).unwrap();
+        mac.update(body);
+        let out = mac.finalize().into_bytes();
+        format!("sha1={}", hex::encode(out))
+    }
+
+    #[test]
+    fn github_hmac_verifies() {
+        let body = b"{\"ref\":\"refs/heads/main\"}";
+        let secret = b"s3cr3t";
+        let auth = WebhookAuth {
+            provider: WebhookProvider::GitHub,
+            signature: gh_signature(secret, body),
+        };
+        assert!(verify_webhook(&auth, body, secret));
+    }
+
+    #[test]
+    fn github_hmac_rejects_wrong_secret() {
+        let body = b"payload";
+        let auth = WebhookAuth {
+            provider: WebhookProvider::GitHub,
+            signature: gh_signature(b"right", body),
+        };
+        assert!(!verify_webhook(&auth, body, b"wrong"));
+    }
+
+    #[test]
+    fn github_hmac_rejects_wrong_body() {
+        let secret = b"s";
+        let auth = WebhookAuth {
+            provider: WebhookProvider::GitHub,
+            signature: gh_signature(secret, b"a"),
+        };
+        assert!(!verify_webhook(&auth, b"b", secret));
+    }
+
+    #[test]
+    fn github_hmac_rejects_missing_prefix() {
+        let auth = WebhookAuth {
+            provider: WebhookProvider::GitHub,
+            signature: "deadbeef".to_string(),
+        };
+        assert!(!verify_webhook(&auth, b"", b"s"));
+    }
+
+    #[test]
+    fn gitlab_token_verifies_constant_time() {
+        let auth = WebhookAuth {
+            provider: WebhookProvider::GitLab,
+            signature: "shared-secret".to_string(),
+        };
+        assert!(verify_webhook(&auth, b"", b"shared-secret"));
+        assert!(!verify_webhook(&auth, b"", b"shared-secre-"));
+    }
+
+    #[test]
+    fn bitbucket_hmac_verifies() {
+        let body = b"bb";
+        let secret = b"s";
+        let auth = WebhookAuth {
+            provider: WebhookProvider::Bitbucket,
+            signature: bb_signature(secret, body),
+        };
+        assert!(verify_webhook(&auth, body, secret));
     }
 }

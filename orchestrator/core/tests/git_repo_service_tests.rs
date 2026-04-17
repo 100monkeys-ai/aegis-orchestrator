@@ -572,7 +572,12 @@ async fn delete_binding_emits_deleted_event() {
 }
 
 #[tokio::test]
-async fn refresh_repo_returns_not_yet_implemented() {
+async fn refresh_repo_fails_without_cloned_volume() {
+    // In A3 refresh_repo is implemented, but a freshly-created binding
+    // has no cloned working tree yet — fetch_and_checkout against an
+    // empty directory returns CloneError::Git, which the service maps to
+    // CloneFailed. (The full happy-path is covered by
+    // git_clone_executor_tests::fetch_and_checkout_branch_fast_forwards.)
     let fx = build_fixture();
     let t = TenantId::consumer();
     let binding = fx
@@ -589,7 +594,137 @@ async fn refresh_repo_returns_not_yet_implemented() {
 
     let res = fx.service.refresh_repo(&binding.id, &t, "alice").await;
     assert!(
-        matches!(res, Err(GitRepoError::NotYetImplemented(_))),
-        "A2 refresh must stub; got {res:?}"
+        matches!(res, Err(GitRepoError::CloneFailed(_))),
+        "refresh against an uncloned binding should surface CloneFailed; got {res:?}"
     );
+}
+
+#[tokio::test]
+async fn refresh_repo_refuses_non_owner() {
+    let fx = build_fixture();
+    let t = TenantId::consumer();
+    let binding = fx
+        .service
+        .create_binding(CreateGitRepoCommand::new(
+            t.clone(),
+            "alice",
+            ZaruTier::Pro,
+            "https://github.com/a/one.git",
+            "alice-one",
+        ))
+        .await
+        .unwrap();
+
+    let res = fx.service.refresh_repo(&binding.id, &t, "mallory").await;
+    assert!(
+        matches!(res, Err(GitRepoError::BindingNotFound)),
+        "non-owner refresh must 404, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn handle_webhook_rejects_unknown_secret() {
+    use aegis_orchestrator_core::application::git_repo_service::{WebhookAuth, WebhookProvider};
+    let fx = build_fixture();
+    let auth = WebhookAuth {
+        provider: WebhookProvider::GitLab,
+        signature: "anything".to_string(),
+    };
+    let res = fx
+        .service
+        .handle_webhook("no-such-secret", &auth, b"")
+        .await;
+    assert!(
+        matches!(res, Err(GitRepoError::WebhookRejected(_))),
+        "unknown secret should 401, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn handle_webhook_rejects_bad_signature() {
+    use aegis_orchestrator_core::application::git_repo_service::{WebhookAuth, WebhookProvider};
+    // Direct manipulation: insert a binding with a webhook_secret and
+    // then submit a webhook with the wrong signature.
+    let fx = build_fixture();
+    let t = TenantId::consumer();
+    let binding = fx
+        .service
+        .create_binding(CreateGitRepoCommand {
+            tenant_id: t.clone(),
+            owner: "alice".to_string(),
+            zaru_tier: ZaruTier::Pro,
+            credential_binding_id: None,
+            repo_url: "https://github.com/a/one.git".to_string(),
+            git_ref: Default::default(),
+            sparse_paths: None,
+            label: "alice-one".to_string(),
+            auto_refresh: true,
+            shallow: true,
+        })
+        .await
+        .unwrap();
+
+    let secret = binding
+        .webhook_secret
+        .clone()
+        .expect("auto_refresh → secret");
+
+    let auth = WebhookAuth {
+        provider: WebhookProvider::GitHub,
+        signature: "sha256=deadbeef".to_string(),
+    };
+    let res = fx.service.handle_webhook(&secret, &auth, b"payload").await;
+    assert!(
+        matches!(res, Err(GitRepoError::WebhookRejected(_))),
+        "bad sig should 401, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn handle_webhook_accepts_valid_github_signature() {
+    use aegis_orchestrator_core::application::git_repo_service::{WebhookAuth, WebhookProvider};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let fx = build_fixture();
+    let t = TenantId::consumer();
+    let binding = fx
+        .service
+        .create_binding(CreateGitRepoCommand {
+            tenant_id: t.clone(),
+            owner: "alice".to_string(),
+            zaru_tier: ZaruTier::Pro,
+            credential_binding_id: None,
+            repo_url: "https://github.com/a/one.git".to_string(),
+            git_ref: Default::default(),
+            sparse_paths: None,
+            label: "alice-one".to_string(),
+            auto_refresh: true,
+            shallow: true,
+        })
+        .await
+        .unwrap();
+    let secret = binding.webhook_secret.clone().unwrap();
+
+    let body = b"{\"ref\":\"refs/heads/main\"}";
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    let sig_hex = hex::encode(mac.finalize().into_bytes());
+    let auth = WebhookAuth {
+        provider: WebhookProvider::GitHub,
+        signature: format!("sha256={sig_hex}"),
+    };
+
+    // Signature is valid; refresh will then fail because there's no
+    // cloned working tree yet — we only assert that the error is NOT
+    // WebhookRejected (i.e. authentication passed).
+    let res = fx.service.handle_webhook(&secret, &auth, body).await;
+    match res {
+        Err(GitRepoError::CloneFailed(_))
+        | Err(GitRepoError::VolumeProvisioningFailed(_))
+        | Ok(()) => {} // all acceptable — hmac verification succeeded
+        Err(GitRepoError::WebhookRejected(m)) => {
+            panic!("valid signature should NOT be rejected, got: {m}");
+        }
+        Err(other) => panic!("unexpected error variant: {other:?}"),
+    }
 }
