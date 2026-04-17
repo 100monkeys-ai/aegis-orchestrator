@@ -39,6 +39,8 @@
 //! | [`node_config`] | Infrastructure config | `NodeConfigManifest` parsed from `aegis-config.yaml` |
 //! | [`cluster`] | BC-7 Infrastructure & Hosting | `NodeCluster` aggregate, `NodePeer`, `NodeRouter` (ADR-059) |
 //! | [`credential`] | BC-11 Secrets & Identity | `UserCredentialBinding` aggregate, `CredentialGrant`, `CredentialBindingRepository` (ADR-078) |
+//! | [`git_repo`] | BC-7 Storage Gateway | `GitRepoBinding` aggregate, `GitRef`, `CloneStrategy`, `GitRepoBindingRepository` (ADR-081) |
+//! | [`git_repo_tier_limits`] | BC-7 Storage Gateway | `GitRepoTierLimits` per-`ZaruTier` gating (ADR-081) |
 //! | [`iam`] | BC-13 IAM & Identity Federation | `IdentityRealm`, `UserIdentity`, `IdentityProvider` trait (ADR-041) |
 
 pub mod agent;
@@ -53,6 +55,8 @@ pub mod env_guard;
 pub mod events;
 pub mod execution;
 pub mod fsal;
+pub mod git_repo;
+pub mod git_repo_tier_limits;
 pub mod iam;
 pub mod llm;
 pub mod mcp;
