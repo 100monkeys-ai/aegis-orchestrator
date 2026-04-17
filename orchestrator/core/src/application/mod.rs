@@ -59,6 +59,8 @@ pub mod ports;
 // pub mod workflow_engine; Removed during Temporal integration
 pub mod complete_workflow_execution;
 pub mod file_operations_service;
+pub mod git_clone_executor;
+pub mod git_repo_service;
 pub mod inner_loop_service;
 pub mod nfs_gateway;
 pub mod register_workflow;

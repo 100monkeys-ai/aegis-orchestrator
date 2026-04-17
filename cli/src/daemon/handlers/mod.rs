@@ -18,6 +18,7 @@ pub(crate) mod cortex;
 pub(crate) mod credentials;
 pub(crate) mod dispatch;
 pub(crate) mod executions;
+pub(crate) mod git_repo;
 pub(crate) mod health;
 pub(crate) mod observability;
 pub(crate) mod seal;

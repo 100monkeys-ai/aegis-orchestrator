@@ -85,6 +85,11 @@ pub(crate) struct AppState {
     pub(crate) stimulus_service: Option<Arc<dyn StimulusService>>,
     pub(crate) user_volume_service: Arc<UserVolumeService>,
     pub(crate) file_operations_service: Arc<FileOperationsService>,
+    /// BC-7 Git Repository Binding service (ADR-081). Optional until
+    /// the surrounding infrastructure (git2-backed executor, volume
+    /// service, OpenBao) is wired in at startup.
+    pub(crate) git_repo_service:
+        Option<Arc<aegis_orchestrator_core::application::git_repo_service::GitRepoService>>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
     /// Keycloak Admin REST client for colony management endpoints.
