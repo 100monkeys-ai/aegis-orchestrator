@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{middleware, Router};
 
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
@@ -36,6 +36,7 @@ use crate::daemon::handlers::canvas::{
     list_sessions_handler as canvas_list_sessions_handler,
     stream_session_events_handler as canvas_stream_events_handler,
     terminate_session_handler as canvas_terminate_session_handler,
+    update_session_handler as canvas_update_session_handler,
 };
 use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_handler};
 use crate::daemon::handlers::colony::{
@@ -353,7 +354,9 @@ pub(crate) fn create_router(
         )
         .route(
             "/v1/canvas/sessions/{id}",
-            get(canvas_get_session_handler).delete(canvas_terminate_session_handler),
+            get(canvas_get_session_handler)
+                .patch(canvas_update_session_handler)
+                .delete(canvas_terminate_session_handler),
         )
         // Colony management (BC-12 / ADR-111): team CRUD, membership, invitations
         .route("/v1/colony/teams", get(list_teams).post(create_team))

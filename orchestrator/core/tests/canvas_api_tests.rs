@@ -86,13 +86,14 @@ impl CanvasSessionRepository for InMemoryCanvasRepo {
     async fn find_by_owner(
         &self,
         tenant_id: &TenantId,
+        include_archived: bool,
     ) -> Result<Vec<CanvasSession>, RepositoryError> {
         Ok(self
             .sessions
             .read()
             .unwrap()
             .values()
-            .filter(|s| &s.tenant_id == tenant_id)
+            .filter(|s| &s.tenant_id == tenant_id && (include_archived || !s.archived))
             .cloned()
             .collect())
     }
@@ -407,6 +408,7 @@ async fn create_session_ephemeral_free_tier_succeeds() {
         tier: ZaruTier::Free,
         conversation_id: ConversationId::new(),
         workspace_mode: WorkspaceMode::Ephemeral,
+        name: None,
     };
 
     let session = h.service.create_session(cmd).await.expect("creates");
@@ -435,6 +437,7 @@ async fn create_session_persistent_free_tier_rejected() {
         conversation_id: ConversationId::new(),
         workspace_mode: WorkspaceMode::Persistent {
             volume_label: "proj".to_string(),
+            name: None,
         },
     };
 
@@ -477,6 +480,7 @@ async fn create_session_git_linked_rejects_non_ready_binding() {
         tier: ZaruTier::Enterprise,
         conversation_id: ConversationId::new(),
         workspace_mode: WorkspaceMode::GitLinked { binding_id },
+        name: None,
     };
 
     let res = h.service.create_session(cmd).await;
@@ -503,6 +507,7 @@ async fn create_session_git_linked_rejects_wrong_tenant() {
         tier: ZaruTier::Enterprise,
         conversation_id: ConversationId::new(),
         workspace_mode: WorkspaceMode::GitLinked { binding_id },
+        name: None,
     };
 
     let res = h.service.create_session(cmd).await;
@@ -528,6 +533,7 @@ async fn create_session_git_linked_enterprise_succeeds() {
         tier: ZaruTier::Enterprise,
         conversation_id: ConversationId::new(),
         workspace_mode: WorkspaceMode::GitLinked { binding_id },
+        name: None,
     };
 
     let session = h
@@ -562,6 +568,7 @@ async fn create_session_git_linked_pro_tier_succeeds() {
         tier: ZaruTier::Pro,
         conversation_id: ConversationId::new(),
         workspace_mode: WorkspaceMode::GitLinked { binding_id },
+        name: None,
     };
 
     let session = h
@@ -595,6 +602,7 @@ async fn list_sessions_returns_only_callers_tenant() {
                 tier: ZaruTier::Free,
                 conversation_id: ConversationId::new(),
                 workspace_mode: WorkspaceMode::Ephemeral,
+                name: None,
             })
             .await
             .unwrap();
@@ -607,15 +615,24 @@ async fn list_sessions_returns_only_callers_tenant() {
             tier: ZaruTier::Free,
             conversation_id: ConversationId::new(),
             workspace_mode: WorkspaceMode::Ephemeral,
+            name: None,
         })
         .await
         .unwrap();
 
-    let alice_sessions = h.service.list_sessions(&tenant_a, "alice").await.unwrap();
+    let alice_sessions = h
+        .service
+        .list_sessions(&tenant_a, "alice", false)
+        .await
+        .unwrap();
     assert_eq!(alice_sessions.len(), 2);
     assert!(alice_sessions.iter().all(|s| s.tenant_id == tenant_a));
 
-    let bob_sessions = h.service.list_sessions(&tenant_b, "bob").await.unwrap();
+    let bob_sessions = h
+        .service
+        .list_sessions(&tenant_b, "bob", false)
+        .await
+        .unwrap();
     assert_eq!(bob_sessions.len(), 1);
     assert_eq!(bob_sessions[0].tenant_id, tenant_b);
 }
@@ -638,6 +655,7 @@ async fn get_session_wrong_tenant_returns_not_found() {
             tier: ZaruTier::Free,
             conversation_id: ConversationId::new(),
             workspace_mode: WorkspaceMode::Ephemeral,
+            name: None,
         })
         .await
         .unwrap();
@@ -675,6 +693,7 @@ async fn terminate_session_ephemeral_deletes_volume() {
             tier: ZaruTier::Free,
             conversation_id: ConversationId::new(),
             workspace_mode: WorkspaceMode::Ephemeral,
+            name: None,
         })
         .await
         .unwrap();
@@ -711,6 +730,7 @@ async fn terminate_session_git_linked_retains_volume() {
             tier: ZaruTier::Enterprise,
             conversation_id: ConversationId::new(),
             workspace_mode: WorkspaceMode::GitLinked { binding_id },
+            name: None,
         })
         .await
         .unwrap();
@@ -742,6 +762,7 @@ async fn terminate_session_wrong_tenant_returns_not_found() {
             tier: ZaruTier::Free,
             conversation_id: ConversationId::new(),
             workspace_mode: WorkspaceMode::Ephemeral,
+            name: None,
         })
         .await
         .unwrap();
@@ -777,6 +798,7 @@ async fn create_session_publishes_session_created_event() {
             tier: ZaruTier::Free,
             conversation_id: ConversationId::new(),
             workspace_mode: WorkspaceMode::Ephemeral,
+            name: None,
         })
         .await
         .unwrap();
