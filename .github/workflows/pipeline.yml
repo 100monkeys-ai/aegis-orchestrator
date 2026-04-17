@@ -19,7 +19,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: 100monkeys-ai/aegis-runtime
   # Self-hosted runner /tmp may be noexec — use the work dir for temp files
-  TMPDIR: /opt/aegis/devops/tmp
+  TMPDIR: /home/runner/_work/_tmp
 
 jobs:
   # ── Stage 1: All checks in parallel ────────────────────────────────────────
@@ -27,6 +27,9 @@ jobs:
     name: Format
     runs-on: [self-hosted, aegis-devops]
     steps:
+      - name: Ensure TMPDIR
+        run: mkdir -p /home/runner/_work/_tmp
+
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
@@ -46,6 +49,9 @@ jobs:
     name: Clippy
     runs-on: [self-hosted, aegis-devops]
     steps:
+      - name: Ensure TMPDIR
+        run: mkdir -p /home/runner/_work/_tmp
+
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
@@ -65,6 +71,9 @@ jobs:
     name: Test
     runs-on: [self-hosted, aegis-devops]
     steps:
+      - name: Ensure TMPDIR
+        run: mkdir -p /home/runner/_work/_tmp
+
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
@@ -86,6 +95,9 @@ jobs:
     env:
       RUSTDOCFLAGS: "--cfg docsrs -D warnings"
     steps:
+      - name: Ensure TMPDIR
+        run: mkdir -p /home/runner/_work/_tmp
+
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
@@ -122,6 +134,9 @@ jobs:
       packages: write
 
     steps:
+      - name: Ensure TMPDIR
+        run: mkdir -p /home/runner/_work/_tmp
+
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
