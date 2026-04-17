@@ -67,6 +67,7 @@ pub mod nfs_gateway;
 pub mod register_workflow;
 pub mod repository_factory;
 pub mod run_container_step;
+pub mod script_service;
 pub mod start_workflow_execution;
 pub mod stimulus;
 pub mod storage_event_persister;

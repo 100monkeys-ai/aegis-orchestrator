@@ -22,6 +22,7 @@ pub(crate) mod executions;
 pub(crate) mod git_repo;
 pub(crate) mod health;
 pub(crate) mod observability;
+pub(crate) mod script;
 pub(crate) mod seal;
 pub(crate) mod stimulus;
 pub(crate) mod swarms;

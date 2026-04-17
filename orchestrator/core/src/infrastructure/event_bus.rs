@@ -66,8 +66,8 @@ use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
     AgentLifecycleEvent, CanvasEvent, ContainerRunEvent, CredentialEvent, ExecutionEvent,
     GitRepoEvent, IamEvent, ImageManagementEvent, LearningEvent, MCPToolEvent, PolicyEvent,
-    RateLimitEvent, SealEvent, SecretEvent, StimulusEvent, StorageEvent, SwarmEvent, TenantEvent,
-    ValidationEvent, VolumeEvent, WorkflowEvent,
+    RateLimitEvent, ScriptEvent, SealEvent, SecretEvent, StimulusEvent, StorageEvent, SwarmEvent,
+    TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -99,6 +99,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Credential(_) => "credential",
         DomainEvent::GitRepo(_) => "git_repo",
         DomainEvent::Canvas(_) => "canvas",
+        DomainEvent::Script(_) => "script",
     }
 }
 
@@ -140,6 +141,8 @@ pub enum DomainEvent {
     GitRepo(GitRepoEvent),
     /// BC-7 Vibe-Code Canvas session lifecycle events (ADR-106)
     Canvas(CanvasEvent),
+    /// BC-7 Script persistence lifecycle events (ADR-110 §D7)
+    Script(ScriptEvent),
 }
 
 impl DomainEvent {
@@ -152,7 +155,8 @@ impl DomainEvent {
             | DomainEvent::RateLimit(_)
             | DomainEvent::Credential(_)
             | DomainEvent::GitRepo(_)
-            | DomainEvent::Canvas(_) => None,
+            | DomainEvent::Canvas(_)
+            | DomainEvent::Script(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -378,7 +382,8 @@ impl DomainEvent {
             | DomainEvent::Swarm(_)
             | DomainEvent::Credential(_)
             | DomainEvent::GitRepo(_)
-            | DomainEvent::Canvas(_) => None,
+            | DomainEvent::Canvas(_)
+            | DomainEvent::Script(_) => None,
         }
     }
 
@@ -589,6 +594,11 @@ impl DomainEvent {
                 CanvasEvent::GitCommitMade { committed_at, .. } => *committed_at,
                 CanvasEvent::GitPushed { pushed_at, .. } => *pushed_at,
                 CanvasEvent::SessionTerminated { terminated_at, .. } => *terminated_at,
+            },
+            DomainEvent::Script(event) => match event {
+                ScriptEvent::Created { created_at, .. } => *created_at,
+                ScriptEvent::Updated { updated_at, .. } => *updated_at,
+                ScriptEvent::Deleted { deleted_at, .. } => *deleted_at,
             },
         }
     }
@@ -804,6 +814,11 @@ impl DomainEvent {
                 CanvasEvent::GitPushed { .. } => "canvas_git_pushed",
                 CanvasEvent::SessionTerminated { .. } => "canvas_session_terminated",
             },
+            DomainEvent::Script(event) => match event {
+                ScriptEvent::Created { .. } => "script_created",
+                ScriptEvent::Updated { .. } => "script_updated",
+                ScriptEvent::Deleted { .. } => "script_deleted",
+            },
         }
     }
 
@@ -830,6 +845,7 @@ impl DomainEvent {
             DomainEvent::Credential(_) => "credential",
             DomainEvent::GitRepo(_) => "git_repo",
             DomainEvent::Canvas(_) => "canvas",
+            DomainEvent::Script(_) => "script",
         }
     }
 
@@ -935,6 +951,7 @@ impl DomainEvent {
             DomainEvent::Credential(_) => Some("credential"),
             DomainEvent::GitRepo(_) => Some("git_repo"),
             DomainEvent::Canvas(_) => Some("canvas"),
+            DomainEvent::Script(_) => Some("script"),
         }
     }
 }
@@ -1073,6 +1090,11 @@ impl EventBus {
     /// Publish a Vibe-Code Canvas session lifecycle event (BC-7 ADR-106)
     pub fn publish_canvas_event(&self, event: CanvasEvent) {
         self.publish(DomainEvent::Canvas(event));
+    }
+
+    /// Publish a Script persistence lifecycle event (BC-7 ADR-110 §D7)
+    pub fn publish_script_event(&self, event: ScriptEvent) {
+        self.publish(DomainEvent::Script(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1469,6 +1491,7 @@ impl AgentEventReceiver {
             },
             DomainEvent::GitRepo(_) => false, // Git repo binding events are tenant-scoped, not per-agent
             DomainEvent::Canvas(_) => false, // Canvas session events are tenant-scoped, not per-agent
+            DomainEvent::Script(_) => false, // Script persistence events are tenant-scoped, not per-agent
         }
     }
 }

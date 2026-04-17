@@ -42,6 +42,8 @@
 //! | [`credential`] | BC-11 Secrets & Identity | `UserCredentialBinding` aggregate, `CredentialGrant`, `CredentialBindingRepository` (ADR-078) |
 //! | [`git_repo`] | BC-7 Storage Gateway | `GitRepoBinding` aggregate, `GitRef`, `CloneStrategy`, `GitRepoBindingRepository` (ADR-081) |
 //! | [`git_repo_tier_limits`] | BC-7 Storage Gateway | `GitRepoTierLimits` per-`ZaruTier` gating (ADR-081) |
+//! | [`script`] | BC-7 Storage Gateway | `Script` aggregate, `Visibility`, `ScriptRepository` (ADR-110 §D7) |
+//! | [`script_tier_limits`] | BC-7 Storage Gateway | `ScriptTierLimits` per-`ZaruTier` gating (ADR-110 §D7) |
 //! | [`iam`] | BC-13 IAM & Identity Federation | `IdentityRealm`, `UserIdentity`, `IdentityProvider` trait (ADR-041) |
 
 pub mod agent;
@@ -70,6 +72,8 @@ pub mod rate_limit;
 pub mod repository;
 pub mod runtime;
 pub mod runtime_registry;
+pub mod script;
+pub mod script_tier_limits;
 pub mod seal_session;
 pub mod seal_session_repository;
 pub mod secrets;

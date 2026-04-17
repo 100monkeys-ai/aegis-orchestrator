@@ -44,6 +44,9 @@ pub use super::git_repo::GitRepoEvent;
 // Re-export BC-7 Vibe-Code Canvas events so they sit alongside the other
 // `*Event` enums in the single domain event catalog (ADR-106).
 pub use super::canvas::CanvasEvent;
+// Re-export BC-7 Script persistence events so they sit alongside the other
+// `*Event` enums in the single domain event catalog (ADR-110 §D7).
+pub use super::script::ScriptEvent;
 use crate::domain::execution::{CodeDiff, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::secrets::AccessContext;

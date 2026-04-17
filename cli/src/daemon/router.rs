@@ -65,6 +65,9 @@ use crate::daemon::handlers::observability::{
     dashboard_summary_handler, get_stimulus_handler, list_security_incidents_handler,
     list_stimuli_handler, list_storage_violations_handler,
 };
+use crate::daemon::handlers::script::{
+    create_script, delete_script, get_script, list_scripts, update_script,
+};
 use crate::daemon::handlers::seal::{
     attest_seal_handler, invoke_seal_handler, list_seal_tools_handler,
 };
@@ -329,6 +332,13 @@ pub(crate) fn create_router(
         // BC-7 Git webhook (ADR-081 Wave A3) — HMAC-authenticated, exempt
         // from Keycloak JWT via EXEMPT_PATH_PREFIXES ("/v1/webhooks").
         .route("/v1/webhooks/git/{secret}", post(webhook_git_repo))
+        // BC-7 Script persistence (ADR-110 §D7) — saved TypeScript
+        // programs for Live Mode / Code Mode client-side execution.
+        .route("/v1/scripts", post(create_script).get(list_scripts))
+        .route(
+            "/v1/scripts/{id}",
+            get(get_script).put(update_script).delete(delete_script),
+        )
         // BC-7 Vibe-Code Canvas sessions (ADR-106, Wave C2). SSE must be
         // registered before the `{id}` catch-all so axum does not match the
         // literal `events` segment as a session id.

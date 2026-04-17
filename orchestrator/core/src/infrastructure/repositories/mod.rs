@@ -57,6 +57,7 @@ pub mod postgres_credential;
 pub mod postgres_execution;
 pub mod postgres_git_repo;
 pub mod postgres_realm;
+pub mod postgres_script;
 pub mod postgres_storage_event;
 pub mod postgres_tenant;
 pub mod postgres_volume;
@@ -65,6 +66,7 @@ pub use postgres_canvas::PostgresCanvasSessionRepository;
 pub use postgres_credential::PostgresCredentialBindingRepository;
 pub use postgres_git_repo::PostgresGitRepoBindingRepository;
 pub use postgres_realm::PostgresRealmRepository;
+pub use postgres_script::PostgresScriptRepository;
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
 

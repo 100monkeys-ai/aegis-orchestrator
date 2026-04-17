@@ -1776,6 +1776,25 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )
     });
 
+    // Initialize the Script persistence service (ADR-110 §D7). Enabled
+    // when a Postgres pool is configured and migration 021 has been
+    // applied. When absent, the /v1/scripts/* handlers return 503.
+    let script_service: Option<
+        Arc<aegis_orchestrator_core::application::script_service::ScriptService>,
+    > = db_pool.as_ref().map(|pool| {
+        let repo = Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::PostgresScriptRepository::new(
+                pool.clone(),
+            ),
+        ) as Arc<dyn aegis_orchestrator_core::domain::script::ScriptRepository>;
+        Arc::new(
+            aegis_orchestrator_core::application::script_service::ScriptService::new(
+                repo,
+                event_bus.clone(),
+            ),
+        )
+    });
+
     // Initialize the Vibe-Code Canvas service (ADR-106 Wave C2). Enabled when
     // a Postgres pool is configured — the canvas session repository and the
     // git repo binding repository both require it. Until those repositories
@@ -1855,6 +1874,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         file_operations_service,
         git_repo_service,
         canvas_service,
+        script_service,
         config: config.clone(),
         start_time: std::time::Instant::now(),
         keycloak_admin: colony_keycloak_admin,

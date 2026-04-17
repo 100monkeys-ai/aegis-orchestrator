@@ -94,6 +94,10 @@ pub(crate) struct AppState {
     /// BC-7 Vibe-Code Canvas session service (ADR-106 Wave C2). Optional until
     /// the orchestrator is configured with the canvas repository/migration 020.
     pub(crate) canvas_service: Option<Arc<dyn CanvasService>>,
+    /// BC-7 Script persistence service (ADR-110 §D7). Optional until a
+    /// Postgres pool is available and migration 021 has been applied.
+    pub(crate) script_service:
+        Option<Arc<aegis_orchestrator_core::application::script_service::ScriptService>>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
     /// Keycloak Admin REST client for colony management endpoints.
