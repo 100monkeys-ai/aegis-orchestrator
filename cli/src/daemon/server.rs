@@ -1663,14 +1663,29 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .iam
         .as_ref()
         .and_then(|iam| iam.keycloak_admin.as_ref())
-        .map(|admin_cfg| {
-            let host = resolve_env_value(&admin_cfg.host)
-                .unwrap_or_else(|_| admin_cfg.host.clone());
-            let username = resolve_env_value(&admin_cfg.admin_username)
-                .unwrap_or_else(|_| admin_cfg.admin_username.clone());
-            let password = resolve_env_value(&admin_cfg.admin_password)
-                .unwrap_or_else(|_| admin_cfg.admin_password.clone());
-            Arc::new(
+        .and_then(|admin_cfg| {
+            let host = match resolve_env_value(&admin_cfg.host) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("Keycloak admin host not resolvable: {e} — admin client disabled");
+                    return None;
+                }
+            };
+            let username = match resolve_env_value(&admin_cfg.admin_username) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!("Keycloak admin username not resolvable: {e} — admin client disabled");
+                    return None;
+                }
+            };
+            let password = match resolve_env_value(&admin_cfg.admin_password) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Keycloak admin password not resolvable: {e} — admin client disabled");
+                    return None;
+                }
+            };
+            Some(Arc::new(
                 aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient::new(
                     aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminConfig {
                         host,
@@ -1678,7 +1693,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         admin_password: password,
                     },
                 ),
-            )
+            ))
         });
 
     // Tenant Provisioning Service (ADR-097)
