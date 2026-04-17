@@ -14,7 +14,7 @@
 //!
 //! All JSON endpoints require Keycloak JWT. Handlers themselves do no
 //! business logic — they translate JSON into command structs and defer
-//! to [`ScriptService`](aegis_orchestrator_core::application::script_service::ScriptService).
+//! to [`ScriptService`].
 
 use std::sync::Arc;
 
