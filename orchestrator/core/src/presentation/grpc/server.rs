@@ -1431,6 +1431,16 @@ impl AegisRuntime for AegisRuntimeService {
                 result: result.unwrap_or_default(),
                 error: String::new(),
             })),
+            // ADR-103: deferred handler variants (Container, McpTool) map to
+            // gRPC UNIMPLEMENTED (HTTP 501 equivalent) at the daemon boundary.
+            // Surfacing this as a Status rather than embedding it in the
+            // response body lets clients distinguish "the feature doesn't
+            // exist" from "the feature ran but failed".
+            Err(
+                crate::application::output_handler_service::OutputHandlerError::NotYetImplemented(
+                    msg,
+                ),
+            ) => Err(Status::unimplemented(msg)),
             Err(e) => Ok(Response::new(InvokeOutputHandlerResponse {
                 success: false,
                 result: String::new(),
@@ -2685,7 +2695,9 @@ mod tests {
     /// when the service IS attached, the handler does not return UNAVAILABLE.
     #[tokio::test]
     async fn invoke_output_handler_not_unavailable_when_service_wired() {
-        use crate::application::output_handler_service::OutputHandlerService;
+        use crate::application::output_handler_service::{
+            OutputHandlerError, OutputHandlerService,
+        };
         use crate::domain::output_handler::OutputHandlerConfig;
 
         struct StubOutputHandler;
@@ -2698,7 +2710,7 @@ mod tests {
                 _parent_execution_id: Option<&ExecutionId>,
                 _tenant_id: &TenantId,
                 _intent: Option<&str>,
-            ) -> Result<Option<String>> {
+            ) -> std::result::Result<Option<String>, OutputHandlerError> {
                 Ok(Some("stub-result".to_string()))
             }
         }
@@ -2797,7 +2809,9 @@ mod tests {
     /// standalone execution.
     #[tokio::test]
     async fn invoke_output_handler_accepts_empty_execution_id() {
-        use crate::application::output_handler_service::OutputHandlerService;
+        use crate::application::output_handler_service::{
+            OutputHandlerError, OutputHandlerService,
+        };
         use crate::domain::output_handler::OutputHandlerConfig;
 
         struct AssertNoParentHandler;
@@ -2810,7 +2824,7 @@ mod tests {
                 parent_execution_id: Option<&ExecutionId>,
                 _tenant_id: &TenantId,
                 _intent: Option<&str>,
-            ) -> Result<Option<String>> {
+            ) -> std::result::Result<Option<String>, OutputHandlerError> {
                 assert!(
                     parent_execution_id.is_none(),
                     "empty execution_id in gRPC request must be passed as None to invoke()"
@@ -2867,7 +2881,9 @@ mod tests {
     /// passed as `Some(&ExecutionId)` to the output handler service.
     #[tokio::test]
     async fn invoke_output_handler_passes_execution_id_when_present() {
-        use crate::application::output_handler_service::OutputHandlerService;
+        use crate::application::output_handler_service::{
+            OutputHandlerError, OutputHandlerService,
+        };
         use crate::domain::output_handler::OutputHandlerConfig;
 
         let expected_id = ExecutionId::new();
@@ -2885,7 +2901,7 @@ mod tests {
                 parent_execution_id: Option<&ExecutionId>,
                 _tenant_id: &TenantId,
                 _intent: Option<&str>,
-            ) -> Result<Option<String>> {
+            ) -> std::result::Result<Option<String>, OutputHandlerError> {
                 let parent = parent_execution_id.expect(
                     "non-empty execution_id in gRPC request must be passed as Some to invoke()",
                 );

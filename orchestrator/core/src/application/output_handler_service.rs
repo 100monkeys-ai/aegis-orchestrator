@@ -12,8 +12,13 @@
 //! |---------|--------|
 //! | `Agent` | Implemented — spawns child execution and polls to completion |
 //! | `Webhook` | Implemented — HTTP POST via `reqwest` |
-//! | `Container` | ADR-103 phase 2 — panics at runtime if used |
-//! | `McpTool` | ADR-103 phase 2 — panics at runtime if used |
+//! | `Container` | ADR-103 phase 2 — returns [`OutputHandlerError::NotYetImplemented`] |
+//! | `McpTool` | ADR-103 phase 2 — returns [`OutputHandlerError::NotYetImplemented`] |
+//!
+//! Deferred variants MUST NOT panic the worker loop; they return a structured
+//! [`OutputHandlerError::NotYetImplemented`] that maps to `gRPC UNIMPLEMENTED`
+//! (HTTP 501 equivalent) at the daemon boundary and is surfaced on the
+//! execution's status record when invoked from the async worker loop.
 //!
 //! ## Required/Optional Semantics
 //!
@@ -27,10 +32,41 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::output_handler::OutputHandlerConfig;
 use crate::domain::shared_kernel::TenantId;
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
+
+/// Service-layer errors for [`OutputHandlerService`].
+///
+/// These map onto gRPC/HTTP status codes at the daemon boundary:
+///
+/// | Variant | gRPC | HTTP equivalent |
+/// |---------|------|-----------------|
+/// | [`OutputHandlerError::NotYetImplemented`] | `UNIMPLEMENTED` | `501 Not Implemented` |
+/// | [`OutputHandlerError::Failed`]            | `INTERNAL`       | `500 Internal Server Error` |
+#[derive(Debug, Error)]
+pub enum OutputHandlerError {
+    /// Handler variant is recognized but its implementation is deferred to a
+    /// later ADR-103 phase. Returned by `Container` and `McpTool` variants
+    /// today. MUST map to `501 Not Implemented` / gRPC `UNIMPLEMENTED` at the
+    /// daemon boundary — never a panic.
+    #[error("output handler not yet implemented: {0}")]
+    NotYetImplemented(String),
+
+    /// Handler invocation failed at runtime (network error, agent resolution
+    /// failure, timeout, non-success HTTP status, etc.). Maps to gRPC
+    /// `INTERNAL` / HTTP `500`.
+    #[error("output handler failed: {0}")]
+    Failed(String),
+}
+
+impl From<anyhow::Error> for OutputHandlerError {
+    fn from(e: anyhow::Error) -> Self {
+        OutputHandlerError::Failed(e.to_string())
+    }
+}
 
 /// Primary interface for dispatching output handlers after execution completes.
 #[async_trait]
@@ -58,7 +94,7 @@ pub trait OutputHandlerService: Send + Sync {
         parent_execution_id: Option<&ExecutionId>,
         tenant_id: &TenantId,
         intent: Option<&str>,
-    ) -> Result<Option<String>>;
+    ) -> Result<Option<String>, OutputHandlerError>;
 }
 
 /// Production implementation of [`OutputHandlerService`].
@@ -91,7 +127,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
         parent_execution_id: Option<&ExecutionId>,
         _tenant_id: &TenantId,
         intent: Option<&str>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<String>, OutputHandlerError> {
         let handler_type = config.handler_type_name();
 
         // Use the parent execution ID for event correlation when available,
@@ -106,33 +142,38 @@ impl OutputHandlerService for StandardOutputHandlerService {
                 handler_type: handler_type.to_string(),
             });
 
-        let result = match config {
+        let result: Result<Option<String>, OutputHandlerError> = match config {
             OutputHandlerConfig::Agent {
                 agent_id,
                 input_template,
                 timeout_seconds,
                 ..
-            } => {
-                invoke_agent_handler(
-                    &self.execution_service,
-                    &self.agent_lifecycle_service,
-                    agent_id,
-                    input_template.as_deref(),
-                    final_output,
-                    parent_execution_id.copied(),
-                    *timeout_seconds,
-                    intent,
-                )
-                .await
-            }
+            } => invoke_agent_handler(
+                &self.execution_service,
+                &self.agent_lifecycle_service,
+                agent_id,
+                input_template.as_deref(),
+                final_output,
+                parent_execution_id.copied(),
+                *timeout_seconds,
+                intent,
+            )
+            .await
+            .map_err(OutputHandlerError::from),
 
-            OutputHandlerConfig::Container { .. } => {
-                todo!("Container output handler — ADR-103 phase 2")
-            }
+            // ADR-103 phase 2: Container and McpTool variants are declared in
+            // the domain type for forward compatibility but their executors
+            // are not yet implemented. Return a structured error instead of
+            // a `todo!()` panic so user-supplied agent YAMLs referencing
+            // these variants fail cleanly at the execution boundary rather
+            // than crashing the worker loop.
+            OutputHandlerConfig::Container { .. } => Err(OutputHandlerError::NotYetImplemented(
+                "Container output handler is deferred to ADR-103 phase 2".into(),
+            )),
 
-            OutputHandlerConfig::McpTool { .. } => {
-                todo!("McpTool output handler — ADR-103 phase 2")
-            }
+            OutputHandlerConfig::McpTool { .. } => Err(OutputHandlerError::NotYetImplemented(
+                "McpTool output handler is deferred to ADR-103 phase 2".into(),
+            )),
 
             OutputHandlerConfig::Webhook {
                 url,
@@ -142,17 +183,16 @@ impl OutputHandlerService for StandardOutputHandlerService {
                 timeout_seconds,
                 retry: _,
                 ..
-            } => {
-                invoke_webhook_handler(
-                    url,
-                    method,
-                    headers,
-                    body_template.as_deref(),
-                    final_output,
-                    *timeout_seconds,
-                )
-                .await
-            }
+            } => invoke_webhook_handler(
+                url,
+                method,
+                headers,
+                body_template.as_deref(),
+                final_output,
+                *timeout_seconds,
+            )
+            .await
+            .map_err(OutputHandlerError::from),
         };
 
         match &result {
@@ -194,7 +234,7 @@ async fn invoke_agent_handler(
     parent_execution_id: Option<ExecutionId>,
     timeout_seconds: Option<u64>,
     intent: Option<&str>,
-) -> Result<Option<String>> {
+) -> anyhow::Result<Option<String>> {
     // Resolve the agent by name or ID. Use the system tenant so global agents are always
     // visible regardless of the execution's tenant context.
     let agents = agent_lifecycle_service
@@ -285,7 +325,7 @@ async fn invoke_webhook_handler(
     body_template: Option<&str>,
     final_output: &str,
     timeout_seconds: Option<u64>,
-) -> Result<Option<String>> {
+) -> anyhow::Result<Option<String>> {
     // Render the body template if provided.
     let body = if let Some(template) = body_template {
         let mut hb = handlebars::Handlebars::new();
