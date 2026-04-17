@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
@@ -504,8 +504,9 @@ pub(crate) async fn push_git_repo(
 /// `GET /v1/storage/git/:id/diff?staged=bool` — unified diff.
 ///
 /// `staged=true` → HEAD-tree vs index; `staged=false` (default) →
-/// index vs workdir. Response: `200 OK` with `text/plain; charset=utf-8`
-/// body.
+/// index vs workdir. Response: `200 OK` with JSON body `{"diff": "..."}`.
+/// The JSON envelope is required because downstream consumers (SEAL
+/// gateway's `HttpClient`) JSON-parse every orchestrator response.
 pub(crate) async fn diff_git_repo(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
@@ -526,7 +527,6 @@ pub(crate) async fn diff_git_repo(
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        diff_text,
+        Json(serde_json::json!({ "diff": diff_text })),
     ))
 }
