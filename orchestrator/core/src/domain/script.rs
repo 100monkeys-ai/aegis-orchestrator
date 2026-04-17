@@ -86,18 +86,13 @@ impl std::fmt::Display for ScriptId {
 /// enum (so the schema is marketplace-ready) but rejected at construction
 /// with [`ScriptError::VisibilityNotSupported`] until the marketplace ADR
 /// defines the product surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
+    #[default]
     Private,
     Tenant,
     Public,
-}
-
-impl Default for Visibility {
-    fn default() -> Self {
-        Self::Private
-    }
 }
 
 impl Visibility {
@@ -583,5 +578,15 @@ mod tests {
         for v in [Visibility::Private, Visibility::Tenant, Visibility::Public] {
             assert_eq!(Visibility::from_str_ci(v.as_str()), Some(v));
         }
+    }
+
+    /// Regression: the derived `Default` impl (clippy::derivable_impls) must
+    /// preserve the original behaviour of a hand-written `impl Default` that
+    /// returned `Visibility::Private`. If the `#[default]` attribute is moved
+    /// to another variant, new scripts would silently adopt the wrong
+    /// visibility scope.
+    #[test]
+    fn visibility_default_is_private() {
+        assert_eq!(Visibility::default(), Visibility::Private);
     }
 }
