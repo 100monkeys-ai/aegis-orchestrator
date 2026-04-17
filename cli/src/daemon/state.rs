@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use aegis_orchestrator_core::{
     application::{
-        credential_service::CredentialManagementService, execution::StandardExecutionService,
-        file_operations_service::FileOperationsService, lifecycle::StandardAgentLifecycleService,
+        canvas_service::CanvasService, credential_service::CredentialManagementService,
+        execution::StandardExecutionService, file_operations_service::FileOperationsService,
+        lifecycle::StandardAgentLifecycleService,
         register_workflow::StandardRegisterWorkflowUseCase,
         start_workflow_execution::StandardStartWorkflowExecutionUseCase, stimulus::StimulusService,
         user_volume_service::UserVolumeService, CorrelatedActivityStreamService,
@@ -90,6 +91,9 @@ pub(crate) struct AppState {
     /// service, OpenBao) is wired in at startup.
     pub(crate) git_repo_service:
         Option<Arc<aegis_orchestrator_core::application::git_repo_service::GitRepoService>>,
+    /// BC-7 Vibe-Code Canvas session service (ADR-106 Wave C2). Optional until
+    /// the orchestrator is configured with the canvas repository/migration 020.
+    pub(crate) canvas_service: Option<Arc<dyn CanvasService>>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
     /// Keycloak Admin REST client for colony management endpoints.

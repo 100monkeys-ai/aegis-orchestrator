@@ -30,6 +30,13 @@ use crate::daemon::handlers::billing::{
     create_checkout_handler, create_portal_handler, get_subscription_handler,
     list_invoices_handler, list_prices_handler,
 };
+use crate::daemon::handlers::canvas::{
+    create_session_handler as canvas_create_session_handler,
+    get_session_handler as canvas_get_session_handler,
+    list_sessions_handler as canvas_list_sessions_handler,
+    stream_session_events_handler as canvas_stream_events_handler,
+    terminate_session_handler as canvas_terminate_session_handler,
+};
 use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_handler};
 use crate::daemon::handlers::colony::{
     get_saml_config, get_subscription, invite_member, list_members, remove_member, set_saml_config,
@@ -322,6 +329,21 @@ pub(crate) fn create_router(
         // BC-7 Git webhook (ADR-081 Wave A3) — HMAC-authenticated, exempt
         // from Keycloak JWT via EXEMPT_PATH_PREFIXES ("/v1/webhooks").
         .route("/v1/webhooks/git/{secret}", post(webhook_git_repo))
+        // BC-7 Vibe-Code Canvas sessions (ADR-106, Wave C2). SSE must be
+        // registered before the `{id}` catch-all so axum does not match the
+        // literal `events` segment as a session id.
+        .route(
+            "/v1/canvas/sessions",
+            post(canvas_create_session_handler).get(canvas_list_sessions_handler),
+        )
+        .route(
+            "/v1/canvas/sessions/{id}/events",
+            get(canvas_stream_events_handler),
+        )
+        .route(
+            "/v1/canvas/sessions/{id}",
+            get(canvas_get_session_handler).delete(canvas_terminate_session_handler),
+        )
         // Colony management (BC-12 / ADR-097): member, SAML IdP, subscription endpoints
         .route("/v1/colony/members", get(list_members).post(invite_member))
         .route("/v1/colony/members/{user_id}", delete(remove_member))
