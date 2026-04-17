@@ -3,7 +3,8 @@
 //! # Git Clone Executor (BC-7 Storage Gateway, ADR-081 §Domain Service)
 //!
 //! Low-level clone / fetch primitive. Owns all interaction with `git2`
-//! (libgit2) so that the application service ([`GitRepoService`]) stays
+//! (libgit2) so that the application service
+//! ([`crate::application::git_repo_service::GitRepoService`]) stays
 //! transport-agnostic.
 //!
 //! ## A3 Scope (Phases 2 / 3 / 4)
@@ -460,7 +461,7 @@ impl GitCloneExecutor {
     ///   the clone and dropped immediately afterward.
     /// - `shallow == true` sets `depth = 1` on the fetch.
     #[instrument(skip(self, credential), fields(binding_id = %binding.id, repo_url = %binding.repo_url))]
-    pub async fn clone(
+    pub async fn clone_libgit2(
         &self,
         binding: &GitRepoBinding,
         target_dir: &Path,

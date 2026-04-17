@@ -25,9 +25,9 @@
 //! ## Keymaster Pattern
 //!
 //! Credentials never enter the binding row. The service resolves them
-//! just-in-time from [`SecretsManager`] inside [`Self::clone_repo`] /
-//! [`Self::refresh_repo`], passes them to [`GitCloneExecutor`], and drops
-//! them immediately after the git operation returns.
+//! just-in-time from [`SecretsManager`] inside [`GitRepoService::clone_repo`]
+//! / [`GitRepoService::refresh_repo`], passes them to [`GitCloneExecutor`],
+//! and drops them immediately after the git operation returns.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -398,7 +398,7 @@ impl GitRepoService {
                     }
                 };
                 self.clone_executor
-                    .clone(&binding, &target_dir, credential, shallow)
+                    .clone_libgit2(&binding, &target_dir, credential, shallow)
                     .await
             }
             CloneStrategy::EphemeralCli { .. } => {
@@ -647,8 +647,8 @@ impl GitRepoService {
     /// Push the binding's current branch (or the explicit `ref_name`) to
     /// the remote. Emits [`GitRepoEvent::PushCompleted`] on success.
     ///
-    /// Credential resolution reuses the A2 [`Self::resolve_credential`]
-    /// path — HTTPS-PAT works today; SSH returns
+    /// Credential resolution reuses the A2 `resolve_credential` path —
+    /// HTTPS-PAT works today; SSH returns
     /// [`GitRepoError::NotYetImplemented`] until A3 lands.
     ///
     /// Defaults: `remote = "origin"`. When `ref_name` is `None` we read

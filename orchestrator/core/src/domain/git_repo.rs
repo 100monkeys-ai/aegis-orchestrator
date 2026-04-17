@@ -26,7 +26,7 @@
 //! | [`GitRepoBinding`] | Aggregate root |
 //! | [`GitRepoBindingRepository`] | Repository trait (Postgres impl in infrastructure) |
 //!
-//! See [`crate::domain::git_repo_tier_limits`] for per-[`ZaruTier`] gating.
+//! See [`crate::domain::git_repo_tier_limits`] for per-[`crate::domain::iam::ZaruTier`] gating.
 
 use crate::domain::credential::CredentialBindingId;
 use crate::domain::repository::RepositoryError;

@@ -104,9 +104,9 @@ impl std::fmt::Display for ConversationId {
 /// - [`WorkspaceMode::Persistent`] — volume survives across sessions under the
 ///   given `volume_label`; counts against [ADR-079] per-user volume quota.
 /// - [`WorkspaceMode::GitLinked`] — the workspace volume is the working tree
-///   of the referenced [`GitRepoBinding`] (ADR-081). The agent edits the
-///   cloned repository directly; commit/push routes through the canvas SEAL
-///   tools.
+///   of the referenced [`crate::domain::git_repo::GitRepoBinding`] (ADR-081).
+///   The agent edits the cloned repository directly; commit/push routes
+///   through the canvas SEAL tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceMode {
     Ephemeral,

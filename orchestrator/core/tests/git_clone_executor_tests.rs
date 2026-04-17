@@ -216,7 +216,7 @@ async fn clone_public_file_url_succeeds() {
     let executor = test_executor();
 
     let sha = executor
-        .clone(&binding, &target, None, true)
+        .clone_libgit2(&binding, &target, None, true)
         .await
         .expect("clone should succeed");
 
@@ -234,7 +234,7 @@ async fn clone_bad_url_returns_clone_error() {
     let executor = test_executor();
 
     let err = executor
-        .clone(&binding, &target, None, true)
+        .clone_libgit2(&binding, &target, None, true)
         .await
         .expect_err("bad URL must fail");
     assert!(
@@ -299,7 +299,7 @@ async fn fetch_and_checkout_branch_fast_forwards() {
 
     // Initial clone
     let initial_sha = executor
-        .clone(&binding, &target, None, true)
+        .clone_libgit2(&binding, &target, None, true)
         .await
         .expect("initial clone");
 
@@ -372,7 +372,7 @@ async fn fetch_and_checkout_tag_pins_to_tag_commit() {
     // First do a plain clone with the executor (default branch main).
     let binding_branch = test_binding(&url);
     let branch_sha = executor
-        .clone(&binding_branch, &target, None, true)
+        .clone_libgit2(&binding_branch, &target, None, true)
         .await
         .unwrap();
 
@@ -407,7 +407,7 @@ async fn fetch_and_checkout_commit_pins_to_exact_sha() {
 
     let binding_branch = test_binding(&url);
     let initial_sha = executor
-        .clone(&binding_branch, &target, None, false)
+        .clone_libgit2(&binding_branch, &target, None, false)
         .await
         .unwrap();
 
@@ -481,7 +481,7 @@ async fn sparse_checkout_prunes_working_tree() {
         None,
     );
     executor
-        .clone(&binding, &target, None, true)
+        .clone_libgit2(&binding, &target, None, true)
         .await
         .expect("clone + sparse should succeed");
 
