@@ -29,7 +29,6 @@
 //! - Sparse checkout — applied post-clone by writing
 //!   `.git/info/sparse-checkout` and re-running `checkout_head`.
 
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -37,6 +36,7 @@ use git2::{Cred, FetchOptions, Oid, RemoteCallbacks, Repository};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
+use crate::application::git_ssh_key::{attach_ssh_credentials, SshKeyTempFile};
 use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
 use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::{AegisFSAL, FsalAccessPolicy};
@@ -542,30 +542,11 @@ impl GitCloneExecutor {
 // Blocking git2 helpers
 // ============================================================================
 
-/// Dropper guard owning an on-disk SSH key temp file. On drop it zero-
-/// fills the file and removes it — regardless of whether the libgit2
-/// operation succeeded or panicked.
-struct SshKeyTempFile {
-    path: PathBuf,
-    key_len: usize,
-}
-
-impl Drop for SshKeyTempFile {
-    fn drop(&mut self) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.path) {
-            use std::io::Write;
-            let zeros = vec![0u8; self.key_len];
-            let _ = f.write_all(&zeros);
-            let _ = f.sync_all();
-        }
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Attach a credentials callback to `callbacks` that honours
-/// `credential`. For SSH keys, materialises the private key to a
-/// temporary file in mode 0600 and returns a drop-guard that will zero
-/// + remove the file on drop.
+/// `credential`. For SSH keys, delegates to the shared
+/// [`attach_ssh_credentials`] helper which materialises the key to a
+/// mode-`0600` tempfile and returns a drop-guard that zeroes + removes
+/// the file on drop.
 fn configure_credentials<'cb>(
     callbacks: &mut RemoteCallbacks<'cb>,
     credential: Option<ResolvedCredential>,
@@ -584,39 +565,9 @@ fn configure_credentials<'cb>(
             private_key_pem,
             passphrase,
         } => {
-            let tmp_uuid = uuid::Uuid::new_v4();
-            let key_path = std::env::temp_dir().join(format!("aegis-git-{tmp_uuid}"));
-            let key_len = private_key_pem.expose().len();
-
-            {
-                use std::fs::OpenOptions;
-                use std::io::Write;
-                let mut f = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&key_path)?;
-                f.write_all(private_key_pem.expose().as_bytes())?;
-                f.sync_all()?;
-            }
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-
-            let guard = SshKeyTempFile {
-                path: key_path.clone(),
-                key_len,
-            };
-
-            let passphrase_string = passphrase.as_ref().map(|p| p.expose().to_string());
-            let key_path_cb = key_path.clone();
-            callbacks.credentials(move |_url, username_from_url, _allowed| {
-                Cred::ssh_key(
-                    username_from_url.unwrap_or("git"),
-                    None,
-                    &key_path_cb,
-                    passphrase_string.as_deref(),
-                )
-            });
-
+            let passphrase_ref = passphrase.as_ref().map(|p| p.expose());
+            let guard =
+                attach_ssh_credentials(callbacks, private_key_pem.expose(), passphrase_ref)?;
             Ok(Some(guard))
         }
     }
