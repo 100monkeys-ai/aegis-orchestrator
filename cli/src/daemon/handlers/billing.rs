@@ -22,7 +22,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use aegis_orchestrator_core::domain::billing::{SubscriptionStatus, TenantSubscription};
 use aegis_orchestrator_core::domain::iam::UserIdentity;
@@ -149,6 +149,34 @@ fn seat_product_tier(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+// ── Seat price mapping (tier × interval → Stripe price ID) ─────────────────
+
+/// All known seat add-on price IDs across all tiers and billing intervals.
+const ALL_SEAT_PRICES: &[(&str, &str, &str)] = &[
+    ("pro", "month", "price_1TMjj28rRJG9yuHzezvbHaSx"),
+    ("pro", "year", "price_1TMjj38rRJG9yuHzHE8aDa2i"),
+    ("business", "month", "price_1TMjj48rRJG9yuHz7zN7Xos0"),
+    ("business", "year", "price_1TMjj58rRJG9yuHzTR7JgC7N"),
+    ("enterprise", "month", "price_1TMjj68rRJG9yuHzH0fB8R1b"),
+    ("enterprise", "year", "price_1TMjj68rRJG9yuHzsUsJEE61"),
+];
+
+/// Look up the seat add-on price ID for a given tier and billing interval.
+fn seat_price_for_tier(tier: &str, interval: &str) -> Option<&'static str> {
+    ALL_SEAT_PRICES
+        .iter()
+        .find(|(t, i, _)| *t == tier && *i == interval)
+        .map(|(_, _, price_id)| *price_id)
+}
+
+/// Reverse-lookup: given a seat price ID, return `(tier, interval)`.
+fn tier_for_seat_price(price_id: &str) -> Option<(&'static str, &'static str)> {
+    ALL_SEAT_PRICES
+        .iter()
+        .find(|(_, _, pid)| *pid == price_id)
+        .map(|(tier, interval, _)| (*tier, *interval))
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -1176,11 +1204,136 @@ async fn handle_subscription_updated(
         }
     }
 
+    // ── Seat add-on tier migration ─────────────────────────────────────────
+    // When the base plan tier changes (e.g. Pro → Business via Stripe Portal),
+    // the seat add-on line item may still reference the old tier's price. Detect
+    // this and swap it to the new tier's seat price, preserving quantity.
+    migrate_seat_addon_if_needed(state, obj, &tier).await;
+
     info!(
         tenant_id = %sub.tenant_id,
         status = status_str,
         "Subscription updated"
     );
+}
+
+/// If the subscription has a seat add-on from a different tier than the current
+/// base plan, swap it to the correct tier's seat price (same interval, same qty).
+async fn migrate_seat_addon_if_needed(
+    state: &AppState,
+    subscription_obj: &serde_json::Value,
+    new_tier: &TenantTier,
+) {
+    let new_tier_str = tier_to_str(new_tier);
+
+    // Free / System tiers don't have seat add-ons
+    if matches!(new_tier, TenantTier::Free | TenantTier::System) {
+        return;
+    }
+
+    let items = match subscription_obj
+        .get("items")
+        .and_then(|i| i.get("data"))
+        .and_then(|d| d.as_array())
+    {
+        Some(arr) => arr,
+        None => return,
+    };
+
+    // Find a seat add-on item whose price belongs to a *different* tier
+    let seat_item = items.iter().find_map(|item| {
+        let price_id = item
+            .get("price")
+            .and_then(|p| p.get("id"))
+            .and_then(|id| id.as_str())?;
+        let (seat_tier, interval) = tier_for_seat_price(price_id)?;
+        if seat_tier != new_tier_str {
+            let item_id = item.get("id").and_then(|id| id.as_str())?;
+            let quantity = item.get("quantity").and_then(|q| q.as_u64()).unwrap_or(1);
+            Some((item_id.to_string(), seat_tier, interval, quantity))
+        } else {
+            None // seat already matches the current tier
+        }
+    });
+
+    let (old_item_id, old_tier, interval, quantity) = match seat_item {
+        Some(s) => s,
+        None => return, // no mismatched seat item — nothing to do
+    };
+
+    let new_seat_price = match seat_price_for_tier(new_tier_str, interval) {
+        Some(p) => p,
+        None => {
+            warn!(
+                tier = new_tier_str,
+                interval, "No seat price configured for tier/interval — cannot migrate seat add-on"
+            );
+            return;
+        }
+    };
+
+    // Build a Stripe client to perform the migration
+    let billing = match &state.billing_config {
+        Some(c) => c,
+        None => return,
+    };
+    let stripe_client = match stripe_client_from_config(billing) {
+        Some(c) => c,
+        None => return,
+    };
+
+    let sub_id_str = match subscription_obj.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return,
+    };
+    let sub_id: stripe::SubscriptionId = match sub_id_str.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "Failed to parse subscription ID for seat migration");
+            return;
+        }
+    };
+
+    let update_params = stripe::UpdateSubscription {
+        items: Some(vec![
+            // Remove the old tier's seat item
+            stripe::UpdateSubscriptionItems {
+                id: Some(old_item_id.clone()),
+                deleted: Some(true),
+                ..Default::default()
+            },
+            // Add the new tier's seat item with the same quantity
+            stripe::UpdateSubscriptionItems {
+                price: Some(new_seat_price.to_string()),
+                quantity: Some(quantity),
+                ..Default::default()
+            },
+        ]),
+        proration_behavior: Some(stripe::SubscriptionProrationBehavior::AlwaysInvoice),
+        ..Default::default()
+    };
+
+    match stripe::Subscription::update(&stripe_client, &sub_id, update_params).await {
+        Ok(_) => {
+            info!(
+                subscription_id = sub_id_str,
+                old_tier = old_tier,
+                new_tier = new_tier_str,
+                interval,
+                quantity,
+                "Migrated seat add-on to new tier price"
+            );
+        }
+        Err(e) => {
+            error!(
+                error = %e,
+                subscription_id = sub_id_str,
+                old_tier = old_tier,
+                new_tier = new_tier_str,
+                "Failed to migrate seat add-on to new tier price"
+            );
+        }
+    }
 }
 
 async fn handle_subscription_deleted(
@@ -1442,5 +1595,64 @@ mod tests {
     fn extract_tier_returns_none_when_absent() {
         let obj = serde_json::json!({});
         assert_eq!(extract_tier_from_subscription(&obj), None);
+    }
+
+    // ── seat_price_for_tier tests ──────────────────────────────────────────
+
+    #[test]
+    fn seat_price_for_tier_returns_correct_prices() {
+        assert_eq!(
+            seat_price_for_tier("pro", "month"),
+            Some("price_1TMjj28rRJG9yuHzezvbHaSx")
+        );
+        assert_eq!(
+            seat_price_for_tier("pro", "year"),
+            Some("price_1TMjj38rRJG9yuHzHE8aDa2i")
+        );
+        assert_eq!(
+            seat_price_for_tier("business", "month"),
+            Some("price_1TMjj48rRJG9yuHz7zN7Xos0")
+        );
+        assert_eq!(
+            seat_price_for_tier("business", "year"),
+            Some("price_1TMjj58rRJG9yuHzTR7JgC7N")
+        );
+        assert_eq!(
+            seat_price_for_tier("enterprise", "month"),
+            Some("price_1TMjj68rRJG9yuHzH0fB8R1b")
+        );
+        assert_eq!(
+            seat_price_for_tier("enterprise", "year"),
+            Some("price_1TMjj68rRJG9yuHzsUsJEE61")
+        );
+    }
+
+    #[test]
+    fn seat_price_for_tier_returns_none_for_unknown() {
+        assert_eq!(seat_price_for_tier("free", "month"), None);
+        assert_eq!(seat_price_for_tier("pro", "weekly"), None);
+    }
+
+    // ── tier_for_seat_price tests ──────────────────────────────────────────
+
+    #[test]
+    fn tier_for_seat_price_reverse_lookup() {
+        assert_eq!(
+            tier_for_seat_price("price_1TMjj28rRJG9yuHzezvbHaSx"),
+            Some(("pro", "month"))
+        );
+        assert_eq!(
+            tier_for_seat_price("price_1TMjj58rRJG9yuHzTR7JgC7N"),
+            Some(("business", "year"))
+        );
+        assert_eq!(
+            tier_for_seat_price("price_1TMjj68rRJG9yuHzsUsJEE61"),
+            Some(("enterprise", "year"))
+        );
+    }
+
+    #[test]
+    fn tier_for_seat_price_returns_none_for_unknown() {
+        assert_eq!(tier_for_seat_price("price_unknown_123"), None);
     }
 }
