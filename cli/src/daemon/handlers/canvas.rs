@@ -25,7 +25,7 @@ use futures::stream::Stream;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::application::canvas_service::{
-    CanvasError, CanvasService, CreateCanvasSessionCommand,
+    CanvasError, CreateCanvasSessionCommand,
 };
 use aegis_orchestrator_core::domain::canvas::{
     CanvasEvent, CanvasSession, CanvasSessionId, ConversationId, WorkspaceMode,

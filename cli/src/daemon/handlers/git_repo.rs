@@ -22,7 +22,7 @@
 //! authenticated **only** by HMAC signature verification against the
 //! binding's `webhook_secret`. The handlers themselves do no business
 //! logic — they translate JSON into command structs and defer to
-//! [`GitRepoService`].
+//! [`GitRepoService`](aegis_orchestrator_core::application::git_repo_service::GitRepoService).
 
 use std::sync::Arc;
 
