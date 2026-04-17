@@ -120,7 +120,7 @@ pub enum CredentialType {
 }
 
 /// The external service or platform this credential authenticates with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialProvider {
     OpenAI,
@@ -482,6 +482,25 @@ mod tests {
         assert_eq!(
             CredentialProvider::Custom("stripe".to_string()).to_string(),
             "stripe"
+        );
+    }
+
+    /// Regression: `CredentialProvider` must implement `Hash` so it can be
+    /// used as a `HashMap` key in `OAuthProviderRegistry` (CL5). Prior to
+    /// this test the `Hash` derive was missing and `credential_service.rs`
+    /// failed to compile when looking up OAuth provider configs by provider.
+    #[test]
+    fn credential_provider_is_hashable() {
+        use std::collections::HashMap;
+        let mut map: HashMap<CredentialProvider, &'static str> = HashMap::new();
+        map.insert(CredentialProvider::OpenAI, "openai");
+        map.insert(CredentialProvider::GitHub, "github");
+        map.insert(CredentialProvider::Custom("stripe".to_string()), "stripe");
+        assert_eq!(map.get(&CredentialProvider::OpenAI), Some(&"openai"));
+        assert_eq!(map.get(&CredentialProvider::GitHub), Some(&"github"));
+        assert_eq!(
+            map.get(&CredentialProvider::Custom("stripe".to_string())),
+            Some(&"stripe")
         );
     }
 }

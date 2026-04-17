@@ -651,8 +651,8 @@ impl GitRepoService {
     /// Credential resolution reuses the A2 `resolve_credential` path.
     /// Both HTTPS-PAT and SSH credentials are supported; the SSH path
     /// materialises the private key via the shared
-    /// [`crate::application::git_ssh_key::attach_ssh_credentials`]
-    /// helper (same Keymaster Pattern used by the clone path).
+    /// `git_ssh_key::attach_ssh_credentials` helper (same Keymaster
+    /// Pattern used by the clone path).
     ///
     /// Defaults: `remote = "origin"`. When `ref_name` is `None` we read
     /// the working tree's current branch via
