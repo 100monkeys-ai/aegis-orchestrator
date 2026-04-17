@@ -773,6 +773,7 @@ pub(crate) async fn update_seats_handler(
 
     let update_params = stripe::UpdateSubscription {
         items: Some(items),
+        proration_behavior: Some(stripe::UpdateSubscriptionProrationBehavior::AlwaysInvoice),
         ..Default::default()
     };
 
@@ -783,21 +784,67 @@ pub(crate) async fn update_seats_handler(
                 extra_seats = body.extra_seats,
                 "Seat count updated on subscription"
             );
-            (
-                StatusCode::OK,
-                Json(json!({"success": true, "extra_seats": body.extra_seats})),
-            )
-                .into_response()
         }
         Err(e) => {
             warn!(error = %e, "Failed to update seat count on Stripe subscription");
-            (
+            return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("Failed to update seats: {e}")})),
             )
-                .into_response()
+                .into_response();
         }
     }
+
+    // Immediately collect any open proration invoice so the customer is charged
+    // now rather than at the next billing cycle.
+    if body.extra_seats > 0 {
+        let list_params = stripe::ListInvoices {
+            subscription: Some(stripe_sub_id.clone()),
+            status: Some(stripe::InvoiceStatusFilter::Open),
+            limit: Some(1),
+            ..Default::default()
+        };
+
+        match stripe::Invoice::list(&stripe, &list_params).await {
+            Ok(invoices) => {
+                if let Some(invoice) = invoices.data.into_iter().next() {
+                    match stripe::Invoice::pay(&stripe, &invoice.id, stripe::PayInvoice::default())
+                        .await
+                    {
+                        Ok(_) => {
+                            info!(
+                                tenant_id = %tenant_id,
+                                invoice_id = %invoice.id,
+                                "Proration invoice paid immediately"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, invoice_id = %invoice.id, "Failed to pay proration invoice");
+                            return (
+                                StatusCode::PAYMENT_REQUIRED,
+                                Json(json!({"error": format!("Seat update succeeded but payment failed: {e}")})),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to list open invoices after seat update");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("Seat update succeeded but could not retrieve invoice: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({"success": true, "extra_seats": body.extra_seats})),
+    )
+        .into_response()
 }
 
 /// `GET /v1/billing/subscription` — Get current subscription details.
