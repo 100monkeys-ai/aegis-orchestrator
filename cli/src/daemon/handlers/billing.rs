@@ -30,6 +30,8 @@ use aegis_orchestrator_core::domain::node_config::{resolve_env_value, BillingCon
 use aegis_orchestrator_core::domain::tenancy::TenantTier;
 use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
 
+use stripe::generated::billing::subscription::SubscriptionProrationBehavior;
+
 use crate::daemon::state::AppState;
 
 // ── Stripe client helper ────────────────────────────────────────────────────
@@ -773,7 +775,7 @@ pub(crate) async fn update_seats_handler(
 
     let update_params = stripe::UpdateSubscription {
         items: Some(items),
-        proration_behavior: Some(stripe::generated::billing::subscription_schedule::SubscriptionProrationBehavior::AlwaysInvoice),
+        proration_behavior: Some(SubscriptionProrationBehavior::AlwaysInvoice),
         ..Default::default()
     };
 
