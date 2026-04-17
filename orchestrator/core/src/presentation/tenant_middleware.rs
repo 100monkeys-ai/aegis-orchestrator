@@ -275,7 +275,7 @@ mod tests {
     use axum::{body::Body, http::Request as HttpRequest, routing::get, Router};
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use tower::ServiceExt;
+    use tower::util::ServiceExt;
 
     // ----- derive_tenant_id unit tests (unchanged behaviour) -----
 
