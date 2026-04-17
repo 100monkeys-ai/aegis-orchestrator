@@ -160,16 +160,18 @@ fn tier_str(t: &TenantTier) -> &'static str {
     }
 }
 
-fn team_service(state: &AppState) -> Result<Arc<dyn TeamService>, axum::response::Response> {
+fn team_service(state: &AppState) -> Result<Arc<dyn TeamService>, Box<axum::response::Response>> {
     state.team_service.clone().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "teams_not_configured",
-                "message": "Team tenancy is not configured on this node",
-            })),
+        Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "teams_not_configured",
+                    "message": "Team tenancy is not configured on this node",
+                })),
+            )
+                .into_response(),
         )
-            .into_response()
     })
 }
 
@@ -211,25 +213,29 @@ fn map_service_error(err: TeamServiceError) -> axum::response::Response {
         .into_response()
 }
 
-fn parse_team_id(s: &str) -> Result<TeamId, axum::response::Response> {
+fn parse_team_id(s: &str) -> Result<TeamId, Box<axum::response::Response>> {
     match Uuid::parse_str(s) {
         Ok(u) => Ok(TeamId(u)),
-        Err(_) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_team_id"})),
-        )
-            .into_response()),
+        Err(_) => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_team_id"})),
+            )
+                .into_response(),
+        )),
     }
 }
 
-fn parse_invitation_id(s: &str) -> Result<TeamInvitationId, axum::response::Response> {
+fn parse_invitation_id(s: &str) -> Result<TeamInvitationId, Box<axum::response::Response>> {
     match Uuid::parse_str(s) {
         Ok(u) => Ok(TeamInvitationId(u)),
-        Err(_) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_invitation_id"})),
-        )
-            .into_response()),
+        Err(_) => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_invitation_id"})),
+            )
+                .into_response(),
+        )),
     }
 }
 
@@ -316,7 +322,7 @@ pub(crate) async fn list_teams(
     };
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let memberships = match svc.list_memberships_for_user(&identity.sub).await {
         Ok(m) => m,
@@ -412,7 +418,7 @@ pub(crate) async fn create_team(
     };
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let team = match svc
         .provision_team(ProvisionTeamCommand {
@@ -463,7 +469,7 @@ pub(crate) async fn delete_team(
     };
     let team_id = match parse_team_id(&team_id_str) {
         Ok(t) => t,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let team_repo = match state.team_repo.clone() {
         Some(r) => r,
@@ -687,7 +693,7 @@ pub(crate) async fn create_invitation(
 
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
 
     let issued = match svc
@@ -779,7 +785,7 @@ pub(crate) async fn list_invitations(
 
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let pending = match svc.list_pending_invitations(team.id).await {
         Ok(v) => v,
@@ -818,11 +824,11 @@ pub(crate) async fn cancel_invitation(
     };
     let invitation_id = match parse_invitation_id(&invitation_id_str) {
         Ok(i) => i,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match svc
         .cancel_invitation(invitation_id, identity.sub.clone())
@@ -855,7 +861,7 @@ pub(crate) async fn accept_invitation(
     };
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let membership = match svc
         .accept_invitation(AcceptInvitationCommand {
@@ -905,7 +911,7 @@ pub(crate) async fn remove_member(
     };
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(e) = svc
         .revoke_membership(team.id, target_user_id.clone(), identity.sub.clone())
@@ -999,7 +1005,7 @@ pub(crate) async fn update_role(
 
     let svc = match team_service(&state) {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match svc
         .update_role(team.id, payload.user_id, new_role, identity.sub.clone())
