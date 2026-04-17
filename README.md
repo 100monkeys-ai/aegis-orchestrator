@@ -3,7 +3,7 @@
 The runtime and orchestration layer for AEGIS: policy-governed infrastructure for running autonomous AI agents without giving up control.
 
 [![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Documentation](https://img.shields.io/badge/docs-docs.100monkeys.ai-brightgreen.svg)](https://docs.100monkeys.ai)
 
 AEGIS is built for teams that want automation to be useful in production, not just impressive in a demo. If you are a DevOps engineer, SRE, or developer trying to run agents with predictable behavior, strong isolation, and operational visibility, this repository is the place to start.
@@ -56,7 +56,7 @@ aegis status
 aegis agent deploy <manifest.yaml>
 ```
 
-See the [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest) for the schema and the [Deploying Agents guide](https://docs.100monkeys.ai/docs/guides/deploying-agents) for examples.
+See the [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest) for the schema and the [Deploying Agents guide](https://docs.100monkeys.ai/docs/agents/deploying-agents) for examples.
 
 ### 5. Execute a task
 
@@ -136,14 +136,10 @@ Use these when you are ready to configure and build:
 - [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli)
 - [Node Config Reference](https://docs.100monkeys.ai/docs/reference/node-config)
 - [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest)
-- [LLM Providers Guide](https://docs.100monkeys.ai/docs/guides/llm-providers)
-- [Deploying Agents](https://docs.100monkeys.ai/docs/guides/deploying-agents)
-- [Building Workflows](https://docs.100monkeys.ai/docs/guides/building-workflows)
-- [Building Swarms](https://docs.100monkeys.ai/docs/guides/building-swarms)
-
-## Billing
-
-Stripe billing integration is available for SaaS deployments (e.g. Zaru at myzaru.com). Billing is a deployment-level concern configured via environment variables in the Zaru client and `aegis-platform-deployment`, not in the orchestrator node config. Self-hosted deployments can omit all Stripe variables and the billing UI is hidden automatically. See the [Billing Configuration](https://docs.100monkeys.ai/docs/guides/billing) guide for setup details.
+- [LLM Providers](https://docs.100monkeys.ai/docs/deployment/llm-providers)
+- [Deploying Agents](https://docs.100monkeys.ai/docs/agents/deploying-agents)
+- [Building Workflows](https://docs.100monkeys.ai/docs/workflows/building-workflows)
+- [Building Swarms](https://docs.100monkeys.ai/docs/workflows/building-swarms)
 
 ## Development
 
