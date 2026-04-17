@@ -688,7 +688,7 @@ pub(crate) async fn update_seats_handler(
     let seat_item = stripe_sub.items.data.iter().find(|item| {
         item.price
             .as_ref()
-            .map(|p| p.id.to_string() == body.seat_price_id)
+            .map(|p| p.id.as_str() == body.seat_price_id)
             .unwrap_or(false)
     });
 
@@ -730,9 +730,10 @@ pub(crate) async fn update_seats_handler(
     };
 
     // 5. Apply the update
-    let mut update_params = stripe::UpdateSubscription::default();
-    update_params.items = Some(items);
-    // Stripe defaults to create_prorations — no need to set explicitly
+    let update_params = stripe::UpdateSubscription {
+        items: Some(items),
+        ..Default::default()
+    };
 
     match stripe::Subscription::update(&stripe, &stripe_sub_id, update_params).await {
         Ok(_) => {
