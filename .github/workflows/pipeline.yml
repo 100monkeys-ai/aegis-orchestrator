@@ -18,6 +18,8 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: 100monkeys-ai/aegis-runtime
+  # Self-hosted runner /tmp may be noexec — use the work dir for temp files
+  TMPDIR: ${{ github.workspace }}/tmp
 
 jobs:
   # ── Stage 1: All checks in parallel ────────────────────────────────────────
