@@ -732,8 +732,7 @@ pub(crate) async fn update_seats_handler(
     // 5. Apply the update
     let mut update_params = stripe::UpdateSubscription::default();
     update_params.items = Some(items);
-    update_params.proration_behavior =
-        Some(stripe::SubscriptionProrationBehavior::CreateProrations);
+    // Stripe defaults to create_prorations — no need to set explicitly
 
     match stripe::Subscription::update(&stripe, &stripe_sub_id, update_params).await {
         Ok(_) => {
