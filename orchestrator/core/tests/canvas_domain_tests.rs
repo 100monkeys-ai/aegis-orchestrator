@@ -55,21 +55,22 @@ fn tier_limits_free_allows_ephemeral_only() {
 }
 
 #[test]
-fn tier_limits_pro_allows_ephemeral_and_persistent_and_flags_git_linked_true() {
+fn tier_limits_pro_allows_all_modes_including_git_linked() {
     let limits = CanvasTierLimits::for_tier(ZaruTier::Pro);
     assert_eq!(
         limits.allowed_workspace_modes,
-        vec![WorkspaceModeKind::Ephemeral, WorkspaceModeKind::Persistent]
+        vec![
+            WorkspaceModeKind::Ephemeral,
+            WorkspaceModeKind::Persistent,
+            WorkspaceModeKind::GitLinked,
+        ]
     );
     assert!(limits.git_linked);
     assert!(limits.is_allowed(&WorkspaceMode::Ephemeral));
     assert!(limits.is_allowed(&WorkspaceMode::Persistent {
         volume_label: "proj".into()
     }));
-    // Pro gets `git_linked: true` per the tier table but GitLinked *mode* is
-    // reserved to Enterprise in the allowed-modes list. `is_allowed` must
-    // reject the combination.
-    assert!(!limits.is_allowed(&WorkspaceMode::GitLinked {
+    assert!(limits.is_allowed(&WorkspaceMode::GitLinked {
         binding_id: GitRepoBindingId::new(),
     }));
 }
@@ -79,10 +80,14 @@ fn tier_limits_business_matches_pro_modes() {
     let limits = CanvasTierLimits::for_tier(ZaruTier::Business);
     assert_eq!(
         limits.allowed_workspace_modes,
-        vec![WorkspaceModeKind::Ephemeral, WorkspaceModeKind::Persistent]
+        vec![
+            WorkspaceModeKind::Ephemeral,
+            WorkspaceModeKind::Persistent,
+            WorkspaceModeKind::GitLinked,
+        ]
     );
     assert!(limits.git_linked);
-    assert!(!limits.is_allowed(&WorkspaceMode::GitLinked {
+    assert!(limits.is_allowed(&WorkspaceMode::GitLinked {
         binding_id: GitRepoBindingId::new(),
     }));
 }

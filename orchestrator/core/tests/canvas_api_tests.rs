@@ -542,21 +542,18 @@ async fn create_session_git_linked_enterprise_succeeds() {
     assert!(h.volumes.created().is_empty());
 }
 
-/// Locks in the C1 decision: the Pro-tier workspace-mode allow-list omits
-/// `GitLinked` even though the ADR-106 §Sub-Decision 5 table marks the
-/// Git-Linked column "Yes". [`CanvasTierLimits::is_allowed`] applies the
-/// strict workspace-column interpretation; a Pro user attempting to bind a
-/// canvas to a git repo is rejected with `NotAllowedByTier`.
-///
-/// If the product decision changes, extend the Pro/Business branches of
-/// `CanvasTierLimits::for_tier` to include `WorkspaceModeKind::GitLinked`
-/// and update this test to assert success.
+/// Pro-tier users can create git-linked canvas sessions. ADR-106
+/// §Sub-Decision 5's Git-Linked column reads "Yes" for both Pro and Business;
+/// the Workspace-Modes column reads "Ephemeral + Persistent" but the
+/// per-column "Yes" for Git-Linked is the authoritative gate. Pro and Business
+/// both get all three workspace kinds.
 #[tokio::test]
-async fn create_session_git_linked_pro_tier_rejected_per_c1_tier_table() {
+async fn create_session_git_linked_pro_tier_succeeds() {
     let h = build_harness();
     let tenant = TenantId::consumer();
     let binding = ready_git_binding(tenant.clone());
     let binding_id = binding.id;
+    let expected_volume = binding.volume_id;
     h.git_repos.insert(binding);
 
     let cmd = CreateCanvasSessionCommand {
@@ -567,11 +564,16 @@ async fn create_session_git_linked_pro_tier_rejected_per_c1_tier_table() {
         workspace_mode: WorkspaceMode::GitLinked { binding_id },
     };
 
-    let res = h.service.create_session(cmd).await;
-    assert!(
-        matches!(res, Err(CanvasError::NotAllowedByTier)),
-        "expected NotAllowedByTier under C1 tier table, got {res:?}"
-    );
+    let session = h
+        .service
+        .create_session(cmd)
+        .await
+        .expect("git-linked pro session");
+
+    assert_eq!(session.workspace_volume_id, expected_volume);
+    assert_eq!(session.git_binding_id, Some(binding_id));
+    // Git-linked reuses the binding's volume — no new volume provisioned.
+    assert!(h.volumes.created().is_empty());
 }
 
 // ============================================================================
