@@ -51,6 +51,7 @@ use crate::daemon::handlers::executions::{
 };
 use crate::daemon::handlers::git_repo::{
     create_git_repo, delete_git_repo, get_git_repo, list_git_repos, refresh_git_repo,
+    webhook_git_repo,
 };
 use crate::daemon::handlers::health::{health_handler, readiness_handler};
 use crate::daemon::handlers::observability::{
@@ -307,13 +308,16 @@ pub(crate) fn create_router(
         .route("/v1/volumes/{id}/files/upload", post(volumes::upload_file))
         .route("/v1/volumes/{id}/files/mkdir", post(volumes::mkdir))
         .route("/v1/volumes/{id}/files/move", post(volumes::move_path))
-        // BC-7 Git Repository Bindings (ADR-081 Wave A2)
+        // BC-7 Git Repository Bindings (ADR-081 Waves A2 / A3)
         .route("/v1/storage/git", post(create_git_repo).get(list_git_repos))
         .route(
             "/v1/storage/git/{id}",
             get(get_git_repo).delete(delete_git_repo),
         )
         .route("/v1/storage/git/{id}/refresh", post(refresh_git_repo))
+        // BC-7 Git webhook (ADR-081 Wave A3) — HMAC-authenticated, exempt
+        // from Keycloak JWT via EXEMPT_PATH_PREFIXES ("/v1/webhooks").
+        .route("/v1/webhooks/git/{secret}", post(webhook_git_repo))
         // Colony management (BC-12 / ADR-097): member, SAML IdP, subscription endpoints
         .route("/v1/colony/members", get(list_members).post(invite_member))
         .route("/v1/colony/members/{user_id}", delete(remove_member))

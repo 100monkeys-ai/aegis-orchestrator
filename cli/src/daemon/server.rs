@@ -1517,7 +1517,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
     let run_container_step_use_case = Arc::new(
         aegis_orchestrator_core::application::run_container_step::RunContainerStepUseCase::new(
-            container_step_runner,
+            container_step_runner.clone(),
         ),
     );
     info!("Container step runner initialized");
@@ -1714,22 +1714,41 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
 
-    // Initialize git repo service (ADR-081 Wave A2). Requires a Postgres
-    // pool for the binding repository; left as `None` when the pool is
-    // absent. The handlers return 503 in that case.
+    // Initialize git repo service (ADR-081 Waves A2 / A3). Requires a
+    // Postgres pool for the binding repository; left as `None` when the
+    // pool is absent. The handlers return 503 in that case.
     let git_repo_service: Option<Arc<aegis_orchestrator_core::application::git_repo_service::GitRepoService>> = db_pool.as_ref().map(|pool| {
         let repo = Arc::new(
             aegis_orchestrator_core::infrastructure::repositories::PostgresGitRepoBindingRepository::new(
                 pool.clone(),
             ),
         ) as Arc<dyn aegis_orchestrator_core::domain::git_repo::GitRepoBindingRepository>;
+
+        // Phase 3: EphemeralCliEngine for non-HostPath volume backends
+        // (SeaweedFS / OpenDAL / SEAL). Spawns alpine/git through the
+        // shared ADR-050 ContainerStepRunner with FUSE-mounted target.
+        let cli_engine = Arc::new(
+            aegis_orchestrator_core::application::git_clone_executor::EphemeralCliEngine::new(
+                container_step_runner.clone(),
+                Arc::new(nfs_gateway.volume_registry().clone()),
+            ),
+        );
+
         let clone_executor = Arc::new(
             aegis_orchestrator_core::application::git_clone_executor::GitCloneExecutor::new(
                 secrets_manager.clone(),
                 nfs_gateway.fsal().clone(),
-                None,
+                Some(cli_engine),
             ),
         );
+
+        // Credential binding repository for Keymaster-pattern credential
+        // resolution (ADR-081 §Security). Shares the Postgres pool with
+        // the BC-11 credential service.
+        let credential_repo: Arc<dyn CredentialBindingRepository> = Arc::new(
+            PostgresCredentialBindingRepository::new(pool.clone()),
+        );
+
         Arc::new(
             aegis_orchestrator_core::application::git_repo_service::GitRepoService::new(
                 repo,
@@ -1737,7 +1756,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 clone_executor,
                 secrets_manager.clone(),
                 event_bus.clone(),
-            ),
+            )
+            .with_credential_repo(credential_repo),
         )
     });
 

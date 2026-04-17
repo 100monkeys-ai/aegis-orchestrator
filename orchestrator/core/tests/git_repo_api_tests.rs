@@ -18,7 +18,9 @@
 //! | `GET /v1/storage/git` returns only caller's bindings | `get_list_tenant_scoped` |
 //! | `GET /v1/storage/git/:id` with wrong owner → 404 | `get_binding_wrong_owner_returns_not_found` |
 //! | `DELETE /v1/storage/git/:id` cleans up volume | `delete_binding_cleans_up_volume` |
-//! | `POST /v1/storage/git/:id/refresh` → 501 (A3) | `refresh_returns_not_yet_implemented` |
+//! | `POST /v1/storage/git/:id/refresh` → 404 for non-owner | `refresh_refuses_non_owner` |
+//! | `POST /v1/webhooks/git/:secret` rejects bad hmac | `webhook_rejects_bad_signature` |
+//! | `POST /v1/webhooks/git/:secret` accepts valid hmac | `webhook_accepts_valid_signature` |
 //!
 //! [`GitRepoService`]: aegis_orchestrator_core::application::git_repo_service::GitRepoService
 
@@ -99,9 +101,15 @@ impl GitRepoBindingRepository for InMemoryGitRepoBindingRepository {
     }
     async fn find_by_webhook_secret(
         &self,
-        _secret: &str,
+        secret: &str,
     ) -> Result<Option<GitRepoBinding>, RepositoryError> {
-        Ok(None)
+        Ok(self
+            .bindings
+            .read()
+            .unwrap()
+            .values()
+            .find(|b| b.webhook_secret.as_deref() == Some(secret))
+            .cloned())
     }
     async fn count_by_owner(
         &self,
@@ -494,10 +502,9 @@ async fn delete_binding_cleans_up_volume() {
 }
 
 #[tokio::test]
-async fn refresh_returns_not_yet_implemented() {
-    // POST /v1/storage/git/:id/refresh → 501 / NotYetImplemented in A2.
-    // A3 will update this assertion to expect success (and remove the
-    // comment).
+async fn refresh_refuses_non_owner() {
+    // POST /v1/storage/git/:id/refresh — non-owner sees 404 (same
+    // ownership gate pattern as delete).
     let fx = build_fixture();
     let t = TenantId::consumer();
     let binding = fx
@@ -512,6 +519,80 @@ async fn refresh_returns_not_yet_implemented() {
         .await
         .unwrap();
 
-    let res = fx.service.refresh_repo(&binding.id, &t, "alice").await;
-    assert!(matches!(res, Err(GitRepoError::NotYetImplemented(_))));
+    let res = fx.service.refresh_repo(&binding.id, &t, "mallory").await;
+    assert!(matches!(res, Err(GitRepoError::BindingNotFound)));
+}
+
+#[tokio::test]
+async fn webhook_rejects_bad_signature() {
+    use aegis_orchestrator_core::application::git_repo_service::{WebhookAuth, WebhookProvider};
+    let fx = build_fixture();
+    let t = TenantId::consumer();
+    let binding = fx
+        .service
+        .create_binding(CreateGitRepoCommand {
+            tenant_id: t.clone(),
+            owner: "alice".to_string(),
+            zaru_tier: ZaruTier::Pro,
+            credential_binding_id: None,
+            repo_url: "https://github.com/a/1.git".to_string(),
+            git_ref: Default::default(),
+            sparse_paths: None,
+            label: "a1".to_string(),
+            auto_refresh: true,
+            shallow: true,
+        })
+        .await
+        .unwrap();
+    let secret = binding.webhook_secret.clone().unwrap();
+    let auth = WebhookAuth {
+        provider: WebhookProvider::GitHub,
+        signature: "sha256=deadbeef".to_string(),
+    };
+    let res = fx.service.handle_webhook(&secret, &auth, b"").await;
+    assert!(matches!(res, Err(GitRepoError::WebhookRejected(_))));
+}
+
+#[tokio::test]
+async fn webhook_accepts_valid_signature() {
+    use aegis_orchestrator_core::application::git_repo_service::{WebhookAuth, WebhookProvider};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let fx = build_fixture();
+    let t = TenantId::consumer();
+    let binding = fx
+        .service
+        .create_binding(CreateGitRepoCommand {
+            tenant_id: t.clone(),
+            owner: "alice".to_string(),
+            zaru_tier: ZaruTier::Pro,
+            credential_binding_id: None,
+            repo_url: "https://github.com/a/1.git".to_string(),
+            git_ref: Default::default(),
+            sparse_paths: None,
+            label: "a1".to_string(),
+            auto_refresh: true,
+            shallow: true,
+        })
+        .await
+        .unwrap();
+    let secret = binding.webhook_secret.clone().unwrap();
+    let body = b"payload";
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+    let auth = WebhookAuth {
+        provider: WebhookProvider::GitHub,
+        signature: sig,
+    };
+    // HMAC verification succeeds, refresh then fails because there's no
+    // cloned tree — we only assert the authentication layer accepted it.
+    let res = fx.service.handle_webhook(&secret, &auth, body).await;
+    match res {
+        Err(GitRepoError::WebhookRejected(m)) => {
+            panic!("valid sig must not be rejected: {m}")
+        }
+        _ => {}
+    }
 }

@@ -10,22 +10,30 @@
 //! | `GET    /v1/storage/git` | `volume:read`  | List caller's bindings (redacted) |
 //! | `GET    /v1/storage/git/:id` | `volume:read` | Binding detail (redacted, 404 on non-owner) |
 //! | `DELETE /v1/storage/git/:id` | `volume:write` | Cascade delete binding + volume |
-//! | `POST   /v1/storage/git/:id/refresh` | `volume:write` | A2 returns 501 (A3 implements) |
+//! | `POST   /v1/storage/git/:id/refresh` | `volume:write` | Fetch + checkout pinned ref |
+//! | `POST   /v1/webhooks/git/:secret` | HMAC-only | Inbound git push webhook |
 //!
-//! All five endpoints require Keycloak JWT. The handlers themselves do
-//! no business logic — they translate JSON into command structs and
-//! defer to [`GitRepoService`].
+//! The first five endpoints require Keycloak JWT. The webhook endpoint
+//! is exempt from JWT middleware (see
+//! `presentation::keycloak_auth::EXEMPT_PATH_PREFIXES`) and is
+//! authenticated **only** by HMAC signature verification against the
+//! binding's `webhook_secret`. The handlers themselves do no business
+//! logic — they translate JSON into command structs and defer to
+//! [`GitRepoService`].
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
 use uuid::Uuid;
 
-use aegis_orchestrator_core::application::git_repo_service::{CreateGitRepoCommand, GitRepoError};
+use aegis_orchestrator_core::application::git_repo_service::{
+    CreateGitRepoCommand, GitRepoError, WebhookAuth, WebhookProvider,
+};
 use aegis_orchestrator_core::domain::credential::CredentialBindingId;
 use aegis_orchestrator_core::domain::git_repo::{GitRef, GitRepoBinding, GitRepoBindingId};
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
@@ -96,6 +104,7 @@ fn git_repo_error_response(e: GitRepoError) -> (StatusCode, Json<serde_json::Val
         GitRepoError::SecretResolutionFailed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
+        GitRepoError::WebhookRejected(_) => (StatusCode::UNAUTHORIZED, e.to_string()),
         GitRepoError::Repository(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     (status, Json(json!({ "error": message })))
@@ -282,9 +291,8 @@ pub(crate) async fn delete_git_repo(
     Ok(Json(json!({ "success": true })))
 }
 
-/// `POST /v1/storage/git/:id/refresh` — A2 returns `501 Not Implemented`.
-/// Wave A3 wires `GitRepoService::refresh_repo` through to
-/// `fetch_and_checkout`.
+/// `POST /v1/storage/git/:id/refresh` — fetch + checkout the binding's
+/// pinned [`GitRef`] and update `last_commit_sha`.
 pub(crate) async fn refresh_git_repo(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
@@ -302,4 +310,66 @@ pub(crate) async fn refresh_git_repo(
         .map_err(git_repo_error_response)?;
 
     Ok(Json(json!({ "success": true })))
+}
+
+// ============================================================================
+// Webhook endpoint
+// ============================================================================
+
+/// `POST /v1/webhooks/git/:secret` — inbound git push webhook.
+///
+/// Authentication: HMAC signature verified against the binding's stored
+/// `webhook_secret`. Supports GitHub (`X-Hub-Signature-256`), GitLab
+/// (`X-Gitlab-Token`), and Bitbucket (`X-Hub-Signature`) formats.
+/// **No JWT is required** — the path is exempt via
+/// `EXEMPT_PATH_PREFIXES` in the keycloak middleware.
+pub(crate) async fn webhook_git_repo(
+    State(state): State<Arc<AppState>>,
+    Path(secret): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let svc = git_repo_service(&state)?;
+
+    let auth = match detect_webhook_auth(&headers) {
+        Some(a) => a,
+        None => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "missing or unrecognized webhook signature header"
+                })),
+            ));
+        }
+    };
+
+    match svc.handle_webhook(&secret, &auth, &body).await {
+        Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({ "received": true })))),
+        Err(e) => Err(git_repo_error_response(e)),
+    }
+}
+
+fn detect_webhook_auth(headers: &HeaderMap) -> Option<WebhookAuth> {
+    if let Some(v) = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+    {
+        return Some(WebhookAuth {
+            provider: WebhookProvider::GitHub,
+            signature: v.to_string(),
+        });
+    }
+    if let Some(v) = headers.get("x-gitlab-token").and_then(|v| v.to_str().ok()) {
+        return Some(WebhookAuth {
+            provider: WebhookProvider::GitLab,
+            signature: v.to_string(),
+        });
+    }
+    if let Some(v) = headers.get("x-hub-signature").and_then(|v| v.to_str().ok()) {
+        return Some(WebhookAuth {
+            provider: WebhookProvider::Bitbucket,
+            signature: v.to_string(),
+        });
+    }
+    None
 }
