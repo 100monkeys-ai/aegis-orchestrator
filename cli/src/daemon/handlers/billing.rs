@@ -773,7 +773,7 @@ pub(crate) async fn update_seats_handler(
 
     let update_params = stripe::UpdateSubscription {
         items: Some(items),
-        proration_behavior: Some(stripe::UpdateSubscriptionProrationBehavior::AlwaysInvoice),
+        proration_behavior: Some(stripe::SubscriptionProrationBehavior::AlwaysInvoice),
         ..Default::default()
     };
 
@@ -800,7 +800,7 @@ pub(crate) async fn update_seats_handler(
     if body.extra_seats > 0 {
         let list_params = stripe::ListInvoices {
             subscription: Some(stripe_sub_id.clone()),
-            status: Some(stripe::InvoiceStatusFilter::Open),
+            status: Some(stripe::InvoiceStatus::Open),
             limit: Some(1),
             ..Default::default()
         };
@@ -808,9 +808,7 @@ pub(crate) async fn update_seats_handler(
         match stripe::Invoice::list(&stripe, &list_params).await {
             Ok(invoices) => {
                 if let Some(invoice) = invoices.data.into_iter().next() {
-                    match stripe::Invoice::pay(&stripe, &invoice.id, stripe::PayInvoice::default())
-                        .await
-                    {
+                    match stripe::Invoice::pay(&stripe, &invoice.id).await {
                         Ok(_) => {
                             info!(
                                 tenant_id = %tenant_id,
