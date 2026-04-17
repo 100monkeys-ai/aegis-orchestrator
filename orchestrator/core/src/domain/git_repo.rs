@@ -501,7 +501,17 @@ pub fn validate_repo_url(url: &str) -> Result<(), String> {
     if let Some(rest) = url.strip_prefix("https://") {
         // Strip optional userinfo (`user:pass@`) before extracting the host.
         let after_userinfo = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
-        let host = after_userinfo.split(['/', ':']).next().unwrap_or("");
+        // Bracketed IPv6 literal per RFC-3986: `[…]` may contain `:` and
+        // must be handled before the generic `/:`-split. Anything else is
+        // a hostname or IPv4 literal where the first `/` or `:` ends it.
+        let host = if let Some(bracket_body) = after_userinfo.strip_prefix('[') {
+            let end = bracket_body
+                .find(']')
+                .ok_or_else(|| "HTTPS URL has unterminated IPv6 bracket".to_string())?;
+            &bracket_body[..end]
+        } else {
+            after_userinfo.split(['/', ':']).next().unwrap_or("")
+        };
         if host.is_empty() {
             return Err("HTTPS URL must have a non-empty host".to_string());
         }
