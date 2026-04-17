@@ -151,6 +151,16 @@ fn seat_product_tier(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Included seats per tier (matches the product_name_to_tier mapping).
+fn included_seats_for_tier(tier: &str) -> u32 {
+    match tier {
+        "pro" => 3,
+        "business" => 5,
+        "enterprise" => 10,
+        _ => 1,
+    }
+}
+
 // ── Seat price mapping (tier × interval → Stripe price ID) ─────────────────
 
 /// All known seat add-on price IDs across all tiers and billing intervals.
@@ -1055,6 +1065,7 @@ async fn handle_checkout_completed(
         .unwrap_or("pro");
 
     let tier = str_to_tier(tier_str);
+    let included_seats = included_seats_for_tier(tier_str);
     let now = chrono::Utc::now();
 
     let sub = TenantSubscription {
@@ -1067,7 +1078,7 @@ async fn handle_checkout_completed(
         cancel_at_period_end: false,
         created_at: now,
         updated_at: now,
-        seat_count: 1,
+        seat_count: included_seats,
     };
 
     if let Err(e) = billing_repo.upsert_subscription(&sub).await {
