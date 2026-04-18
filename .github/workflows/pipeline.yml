@@ -181,6 +181,10 @@ jobs:
           path: aegis-proto
           clean: false
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator
+
       # Build the release binary using the persistent cargo cache
       - name: Build release binary
         working-directory: aegis-orchestrator
