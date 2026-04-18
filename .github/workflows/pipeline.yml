@@ -200,14 +200,6 @@ jobs:
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7} \
             .
 
-      # Deploy locally — restart the core pod with the new image
-      - name: Deploy to local pod
-        run: |
-          podman pod stop aegis-core || true
-          podman pod rm aegis-core || true
-          # The pod will be recreated by make redeploy using the local image
-          cd ~/aegis-platform-deployment && make redeploy POD=core
-
       # Push to GHCR in parallel with deploy (for external consumers)
       - name: Log in to GHCR
         uses: docker/login-action@v4
