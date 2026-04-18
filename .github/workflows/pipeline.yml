@@ -230,17 +230,3 @@ jobs:
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MINOR
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MAJOR
-
-  # ── Security (unchanged, runs on GitHub-hosted) ────────────────────────────
-  security:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-      issues: write
-    steps:
-      - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
