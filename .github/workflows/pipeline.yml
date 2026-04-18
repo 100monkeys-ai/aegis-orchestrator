@@ -3,7 +3,6 @@
 #
 # Unified CI/CD pipeline for aegis-orchestrator.
 # All checks must pass before the build+deploy stage runs.
-# Runs on the self-hosted aegis-devops runner for fast incremental builds.
 
 name: Pipeline
 
@@ -18,28 +17,36 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: 100monkeys-ai/aegis-runtime
-  # Self-hosted runner /tmp may be noexec — use the work dir for temp files
-  TMPDIR: /home/runner/_work/_tmp
 
 jobs:
   # ── Stage 1: All checks in parallel ────────────────────────────────────────
   fmt:
     name: Format
-    runs-on: [self-hosted, aegis-devops]
+    runs-on: ubuntu-latest
     steps:
-      - name: Ensure TMPDIR
-        run: mkdir -p /home/runner/_work/_tmp
-
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
-          clean: false
 
       - uses: actions/checkout@v6
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
-          clean: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libfuse3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Check formatting
         working-directory: aegis-orchestrator
@@ -47,21 +54,31 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: [self-hosted, aegis-devops]
+    runs-on: ubuntu-latest
     steps:
-      - name: Ensure TMPDIR
-        run: mkdir -p /home/runner/_work/_tmp
-
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
-          clean: false
 
       - uses: actions/checkout@v6
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
-          clean: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libfuse3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Clippy
         working-directory: aegis-orchestrator
@@ -69,21 +86,29 @@ jobs:
 
   test:
     name: Test
-    runs-on: [self-hosted, aegis-devops]
+    runs-on: ubuntu-latest
     steps:
-      - name: Ensure TMPDIR
-        run: mkdir -p /home/runner/_work/_tmp
-
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
-          clean: false
 
       - uses: actions/checkout@v6
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
-          clean: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libfuse3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Run tests
         working-directory: aegis-orchestrator
@@ -91,23 +116,31 @@ jobs:
 
   doc:
     name: Documentation
-    runs-on: [self-hosted, aegis-devops]
+    runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: "--cfg docsrs -D warnings"
     steps:
-      - name: Ensure TMPDIR
-        run: mkdir -p /home/runner/_work/_tmp
-
       - uses: actions/checkout@v6
         with:
           path: aegis-orchestrator
-          clean: false
 
       - uses: actions/checkout@v6
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
-          clean: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libfuse3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Build documentation
         working-directory: aegis-orchestrator
@@ -122,12 +155,12 @@ jobs:
             -p aegis-orchestrator-sdk \
             -p aegis-orchestrator
 
-  # ── Stage 2: Build + Deploy + Publish (only after ALL checks pass) ─────────
+  # ── Stage 2: Build + Publish (only after ALL checks pass) ──────────────────
   build-deploy:
     name: Build, Deploy & Publish
     needs: [fmt, clippy, test, doc]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-    runs-on: [self-hosted, aegis-devops]
+    runs-on: ubuntu-latest
 
     permissions:
       contents: read
