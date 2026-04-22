@@ -52,6 +52,7 @@ jobs:
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: "v2-ubuntu22"
           workspaces: aegis-orchestrator -> target
 
       - name: Build release binary
