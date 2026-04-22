@@ -18,6 +18,10 @@ use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
 use async_trait::async_trait;
 use chrono::Utc;
+use stripe_billing::subscription::{
+    CancelSubscription, RetrieveSubscription, UpdateSubscription, UpdateSubscriptionItems,
+};
+use stripe_core::customer::CreateCustomer;
 use tracing::{info, warn};
 
 /// Stripe-backed implementation of
@@ -69,14 +73,14 @@ impl BillingService for StripeBillingService {
             Some(id) => id.clone(),
             None => return Err(BillingServiceError::NoActiveSubscription),
         };
-        let parsed_sub_id: stripe::SubscriptionId =
-            stripe_sub_id.parse().map_err(|e: stripe::ParseIdError| {
-                BillingServiceError::InvalidStripeId(e.to_string())
-            })?;
+        let parsed_sub_id: stripe_billing::SubscriptionId = stripe_sub_id
+            .parse()
+            .expect("SubscriptionId parse is infallible");
 
         // Retrieve the subscription so we can target the first line item by
         // id — Stripe requires item-level updates to reference the item id.
-        let remote = stripe::Subscription::retrieve(&stripe_client, &parsed_sub_id, &[])
+        let remote = RetrieveSubscription::new(parsed_sub_id.clone())
+            .send(&stripe_client)
             .await
             .map_err(|e| BillingServiceError::Stripe(e.to_string()))?;
 
@@ -85,16 +89,15 @@ impl BillingService for StripeBillingService {
                 BillingServiceError::Stripe("subscription has no items".to_string())
             })?;
 
-        let update = stripe::UpdateSubscription {
-            items: Some(vec![stripe::UpdateSubscriptionItems {
-                id: Some(item.id.to_string()),
-                quantity: Some(active_member_count as u64),
-                ..Default::default()
-            }]),
+        let update_item = UpdateSubscriptionItems {
+            id: Some(item.id.to_string()),
+            quantity: Some(active_member_count as u64),
             ..Default::default()
         };
 
-        stripe::Subscription::update(&stripe_client, &parsed_sub_id, update)
+        UpdateSubscription::new(parsed_sub_id)
+            .items(vec![update_item])
+            .send(&stripe_client)
             .await
             .map_err(|e| BillingServiceError::Stripe(e.to_string()))?;
 
@@ -124,8 +127,6 @@ impl BillingService for StripeBillingService {
     ) -> Result<String, BillingServiceError> {
         let stripe_client = self.stripe_client()?;
 
-        let mut params = stripe::CreateCustomer::new();
-        params.email = Some(&owner_email);
         let metadata: std::collections::HashMap<String, String> = [
             ("tenant_id".to_string(), tenant_id.as_str().to_string()),
             ("team_id".to_string(), team_id.to_string()),
@@ -133,9 +134,11 @@ impl BillingService for StripeBillingService {
         ]
         .into_iter()
         .collect();
-        params.metadata = Some(metadata);
 
-        let customer = stripe::Customer::create(&stripe_client, params)
+        let customer = CreateCustomer::new()
+            .email(owner_email)
+            .metadata(metadata)
+            .send(&stripe_client)
             .await
             .map_err(|e| BillingServiceError::Stripe(e.to_string()))?;
         let customer_id = customer.id.to_string();
@@ -185,17 +188,10 @@ impl BillingService for StripeBillingService {
         };
 
         if let Some(stripe_sub_id) = sub.stripe_subscription_id.clone() {
-            let parsed: stripe::SubscriptionId =
-                stripe_sub_id.parse().map_err(|e: stripe::ParseIdError| {
-                    BillingServiceError::InvalidStripeId(e.to_string())
-                })?;
-            if let Err(e) = stripe::Subscription::cancel(
-                &stripe_client,
-                &parsed,
-                stripe::CancelSubscription::default(),
-            )
-            .await
-            {
+            let parsed: stripe_billing::SubscriptionId = stripe_sub_id
+                .parse()
+                .expect("SubscriptionId parse is infallible");
+            if let Err(e) = CancelSubscription::new(parsed).send(&stripe_client).await {
                 warn!(error = %e, "Failed to cancel Stripe subscription");
                 return Err(BillingServiceError::Stripe(e.to_string()));
             }

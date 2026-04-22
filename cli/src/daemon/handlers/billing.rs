@@ -30,7 +30,23 @@ use aegis_orchestrator_core::domain::node_config::{resolve_env_value, BillingCon
 use aegis_orchestrator_core::domain::tenancy::TenantTier;
 use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
 
-use stripe::generated::billing::subscription::SubscriptionProrationBehavior;
+use stripe_billing::billing_portal_session::CreateBillingPortalSession;
+use stripe_billing::invoice::{ListInvoice, PayInvoice};
+use stripe_billing::subscription::{
+    RetrieveSubscription, UpdateSubscription, UpdateSubscriptionItems,
+    UpdateSubscriptionProrationBehavior,
+};
+// Shared type re-exports from sub-crates
+use stripe_billing::{InvoiceStatus, SubscriptionId};
+use stripe_checkout::checkout_session::{
+    CreateCheckoutSession, CreateCheckoutSessionLineItems, CreateCheckoutSessionSubscriptionData,
+};
+use stripe_checkout::CheckoutSessionMode;
+use stripe_core::customer::{CreateCustomer, UpdateCustomer};
+use stripe_core::CustomerId;
+use stripe_product::price::ListPrice;
+use stripe_product::product::ListProduct;
+use stripe_product::RecurringInterval;
 
 use crate::daemon::state::AppState;
 
@@ -210,11 +226,12 @@ pub(crate) async fn list_prices_handler(
     };
 
     // 1. List all active products
-    let mut product_params = stripe::ListProducts::new();
-    product_params.active = Some(true);
-    product_params.limit = Some(100);
-
-    let products = match stripe::Product::list(&client, &product_params).await {
+    let products = match ListProduct::new()
+        .active(true)
+        .limit(100)
+        .send(&client)
+        .await
+    {
         Ok(list) => list.data,
         Err(e) => {
             warn!(error = %e, "Failed to list Stripe products");
@@ -229,12 +246,7 @@ pub(crate) async fn list_prices_handler(
     // Filter to Zaru products only
     let zaru_products: Vec<_> = products
         .iter()
-        .filter(|p| {
-            p.name
-                .as_deref()
-                .map(|n| n.starts_with("Zaru"))
-                .unwrap_or(false)
-        })
+        .filter(|p| p.name.starts_with("Zaru"))
         .collect();
 
     // 2. Build a map of tier -> TierPricing
@@ -243,10 +255,7 @@ pub(crate) async fn list_prices_handler(
 
     // Initialize base plan entries
     for product in &zaru_products {
-        let name = match product.name.as_deref() {
-            Some(n) => n,
-            None => continue,
-        };
+        let name = product.name.as_str();
         if let Some((tier, included_seats)) = product_name_to_tier(name) {
             tier_map.entry(tier).or_insert_with(|| TierPricing {
                 tier: tier.to_string(),
@@ -264,18 +273,16 @@ pub(crate) async fn list_prices_handler(
 
     // 3. For each Zaru product, list active prices and assign to tiers
     for product in &zaru_products {
-        let name = match product.name.as_deref() {
-            Some(n) => n,
-            None => continue,
-        };
+        let name = product.name.as_str();
 
         let product_id_str = product.id.to_string();
-        let mut price_params = stripe::ListPrices::new();
-        price_params.product = Some(stripe::IdOrCreate::Id(&product_id_str));
-        price_params.active = Some(true);
-        price_params.limit = Some(50);
-
-        let prices = match stripe::Price::list(&client, &price_params).await {
+        let prices = match ListPrice::new()
+            .product(product_id_str)
+            .active(true)
+            .limit(50)
+            .send(&client)
+            .await
+        {
             Ok(list) => list.data,
             Err(e) => {
                 warn!(error = %e, product_id = %product.id, "Failed to list prices for product");
@@ -302,10 +309,7 @@ pub(crate) async fn list_prices_handler(
 
         for price in &prices {
             let amount = price.unit_amount.unwrap_or(0);
-            let currency = price
-                .currency
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "usd".to_string());
+            let currency = price.currency.to_string();
 
             let info = PriceInfo {
                 price_id: price.id.to_string(),
@@ -313,23 +317,20 @@ pub(crate) async fn list_prices_handler(
                 currency,
             };
 
-            let interval = price
-                .recurring
-                .as_ref()
-                .map(|r| r.interval)
-                .unwrap_or(stripe::RecurringInterval::Month);
+            // recurring is Option<Recurring>; interval is RecurringInterval (non-optional inside)
+            let interval = price.recurring.as_ref().map(|r| r.interval.clone());
 
             match (is_seat_addon, interval) {
-                (false, stripe::RecurringInterval::Month) => {
+                (false, Some(RecurringInterval::Month)) => {
                     tier_entry.monthly = Some(info);
                 }
-                (false, stripe::RecurringInterval::Year) => {
+                (false, Some(RecurringInterval::Year)) => {
                     tier_entry.annual = Some(info);
                 }
-                (true, stripe::RecurringInterval::Month) => {
+                (true, Some(RecurringInterval::Month)) => {
                     tier_entry.seat_monthly = Some(info);
                 }
-                (true, stripe::RecurringInterval::Year) => {
+                (true, Some(RecurringInterval::Year)) => {
                     tier_entry.seat_annual = Some(info);
                 }
                 _ => {}
@@ -376,18 +377,6 @@ pub(crate) async fn create_checkout_handler(
         }
     };
 
-    // Validate price_id format
-    let price_id_parsed: stripe::PriceId = match body.price_id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid price_id: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
     let tenant_id = crate::daemon::handlers::tenant_id_from_identity(Some(&identity));
 
     // Look up or create Stripe customer
@@ -418,35 +407,38 @@ pub(crate) async fn create_checkout_handler(
         // Sync name/email to Stripe on every checkout in case they changed
         let name = identity.name.as_deref().unwrap_or("");
         let email = identity.email.as_deref().unwrap_or("");
-        if let Ok(cid) = sub.stripe_customer_id.parse::<stripe::CustomerId>() {
-            let mut update = stripe::UpdateCustomer::new();
-            if !name.is_empty() {
-                update.name = Some(name);
-            }
-            if !email.is_empty() {
-                update.email = Some(email);
-            }
-            if let Err(e) = stripe::Customer::update(&stripe, &cid, update).await {
-                warn!(error = %e, "Failed to sync customer name/email to Stripe");
-            }
+        let cid: CustomerId = sub
+            .stripe_customer_id
+            .parse()
+            .expect("CustomerId parse is infallible");
+        let mut update = UpdateCustomer::new(cid);
+        if !name.is_empty() {
+            update = update.name(name.to_string());
+        }
+        if !email.is_empty() {
+            update = update.email(email.to_string());
+        }
+        if let Err(e) = update.send(&stripe).await {
+            warn!(error = %e, "Failed to sync customer name/email to Stripe");
         }
         sub.stripe_customer_id.clone()
     } else {
         // Create a new Stripe customer
         let email = identity.email.as_deref().unwrap_or("");
         let name = identity.name.as_deref().unwrap_or("");
-        let mut params = stripe::CreateCustomer::new();
-        params.email = Some(email);
-        if !name.is_empty() {
-            params.name = Some(name);
-        }
-        params.metadata = Some(
+        let mut create = CreateCustomer::new().metadata(
             [("tenant_id".to_string(), tenant_id.as_str().to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<_, _>>(),
         );
+        if !email.is_empty() {
+            create = create.email(email.to_string());
+        }
+        if !name.is_empty() {
+            create = create.name(name.to_string());
+        }
 
-        match stripe::Customer::create(&stripe, params).await {
+        match create.send(&stripe).await {
             Ok(customer) => {
                 let cust_id = customer.id.to_string();
                 // Persist the customer mapping
@@ -479,28 +471,16 @@ pub(crate) async fn create_checkout_handler(
         }
     };
 
-    // Create Checkout Session
-    let customer_id_parsed: stripe::CustomerId = match customer_id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Invalid customer ID: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
     // Build line items: base plan + optional seat add-on
-    let mut line_items = vec![stripe::CreateCheckoutSessionLineItems {
-        price: Some(price_id_parsed.to_string()),
+    let mut line_items = vec![CreateCheckoutSessionLineItems {
+        price: Some(body.price_id.clone()),
         quantity: Some(1),
         ..Default::default()
     }];
 
     if let Some(ref seat_price_id) = body.seat_price_id {
         if body.seats > 0 {
-            line_items.push(stripe::CreateCheckoutSessionLineItems {
+            line_items.push(CreateCheckoutSessionLineItems {
                 price: Some(seat_price_id.clone()),
                 quantity: Some(body.seats as u64),
                 ..Default::default()
@@ -519,21 +499,21 @@ pub(crate) async fn create_checkout_handler(
         tenant_meta.insert("extra_seats".to_string(), body.seats.to_string());
     }
 
-    let mut params = stripe::CreateCheckoutSession::new();
-    params.customer = Some(customer_id_parsed);
-    params.mode = Some(stripe::CheckoutSessionMode::Subscription);
-    params.success_url = Some(&body.success_url);
-    params.cancel_url = Some(&body.cancel_url);
-    params.line_items = Some(line_items);
-    // Set metadata on both the session and the subscription so the webhook
-    // handler can find tenant_id regardless of which object Stripe sends.
-    params.metadata = Some(tenant_meta.clone());
-    params.subscription_data = Some(stripe::CreateCheckoutSessionSubscriptionData {
-        metadata: Some(tenant_meta),
+    let sub_data = CreateCheckoutSessionSubscriptionData {
+        metadata: Some(tenant_meta.clone()),
         ..Default::default()
-    });
+    };
 
-    match stripe::CheckoutSession::create(&stripe, params).await {
+    let params = CreateCheckoutSession::new()
+        .customer(customer_id)
+        .mode(CheckoutSessionMode::Subscription)
+        .success_url(body.success_url.clone())
+        .cancel_url(body.cancel_url.clone())
+        .line_items(line_items)
+        .metadata(tenant_meta)
+        .subscription_data(sub_data);
+
+    match params.send(&stripe).await {
         Ok(session) => {
             let url = session.url.unwrap_or_default();
             info!(tenant_id = %tenant_id, price_id = %body.price_id, "Checkout session created");
@@ -607,21 +587,12 @@ pub(crate) async fn create_portal_handler(
         }
     };
 
-    let customer_id: stripe::CustomerId = match sub.stripe_customer_id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Invalid customer ID: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
-    let mut params = stripe::CreateBillingPortalSession::new(customer_id);
-    params.return_url = Some(&body.return_url);
-
-    match stripe::BillingPortalSession::create(&stripe, params).await {
+    match CreateBillingPortalSession::new()
+        .customer(sub.stripe_customer_id.clone())
+        .return_url(body.return_url.clone())
+        .send(&stripe)
+        .await
+    {
         Ok(session) => (StatusCode::OK, Json(json!({"url": session.url}))).into_response(),
         Err(e) => {
             warn!(error = %e, "Failed to create portal session");
@@ -695,17 +666,8 @@ pub(crate) async fn update_seats_handler(
         }
     };
 
-    let stripe_sub_id: stripe::SubscriptionId = match sub.stripe_subscription_id {
-        Some(ref id) => match id.parse() {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("Invalid subscription ID: {e}")})),
-                )
-                    .into_response();
-            }
-        },
+    let stripe_sub_id: SubscriptionId = match sub.stripe_subscription_id {
+        Some(ref id) => id.parse().expect("SubscriptionId parse is infallible"),
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -716,7 +678,10 @@ pub(crate) async fn update_seats_handler(
     };
 
     // 2. Retrieve the Stripe subscription to find existing seat line item
-    let stripe_sub = match stripe::Subscription::retrieve(&stripe, &stripe_sub_id, &[]).await {
+    let stripe_sub = match RetrieveSubscription::new(stripe_sub_id.clone())
+        .send(&stripe)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "Failed to retrieve Stripe subscription");
@@ -729,18 +694,18 @@ pub(crate) async fn update_seats_handler(
     };
 
     // 3. Find the seat line item by matching price ID
-    let seat_item = stripe_sub.items.data.iter().find(|item| {
-        item.price
-            .as_ref()
-            .map(|p| p.id.as_str() == body.seat_price_id)
-            .unwrap_or(false)
-    });
+    // In the new API, price is Price (not Option<Price>)
+    let seat_item = stripe_sub
+        .items
+        .data
+        .iter()
+        .find(|item| item.price.id.as_str() == body.seat_price_id);
 
     // 4. Build the update items list
     let items = match (body.extra_seats, seat_item) {
         // Add seats: no existing seat item → add a new line item
         (extra, None) if extra > 0 => {
-            vec![stripe::UpdateSubscriptionItems {
+            vec![UpdateSubscriptionItems {
                 price: Some(body.seat_price_id.clone()),
                 quantity: Some(extra as u64),
                 ..Default::default()
@@ -748,7 +713,7 @@ pub(crate) async fn update_seats_handler(
         }
         // Update seats: existing seat item → update quantity
         (extra, Some(item)) if extra > 0 => {
-            vec![stripe::UpdateSubscriptionItems {
+            vec![UpdateSubscriptionItems {
                 id: Some(item.id.to_string()),
                 quantity: Some(extra as u64),
                 ..Default::default()
@@ -756,7 +721,7 @@ pub(crate) async fn update_seats_handler(
         }
         // Remove seats: existing seat item → delete the line item
         (0, Some(item)) => {
-            vec![stripe::UpdateSubscriptionItems {
+            vec![UpdateSubscriptionItems {
                 id: Some(item.id.to_string()),
                 deleted: Some(true),
                 ..Default::default()
@@ -773,13 +738,12 @@ pub(crate) async fn update_seats_handler(
         _ => unreachable!(),
     };
 
-    let update_params = stripe::UpdateSubscription {
-        items: Some(items),
-        proration_behavior: Some(SubscriptionProrationBehavior::AlwaysInvoice),
-        ..Default::default()
-    };
-
-    match stripe::Subscription::update(&stripe, &stripe_sub_id, update_params).await {
+    match UpdateSubscription::new(stripe_sub_id.clone())
+        .items(items)
+        .proration_behavior(UpdateSubscriptionProrationBehavior::AlwaysInvoice)
+        .send(&stripe)
+        .await
+    {
         Ok(_) => {
             info!(
                 tenant_id = %tenant_id,
@@ -800,31 +764,33 @@ pub(crate) async fn update_seats_handler(
     // Immediately collect any open proration invoice so the customer is charged
     // now rather than at the next billing cycle.
     if body.extra_seats > 0 {
-        let list_params = stripe::ListInvoices {
-            subscription: Some(stripe_sub_id.clone()),
-            status: Some(stripe::InvoiceStatus::Open),
-            limit: Some(1),
-            ..Default::default()
-        };
-
-        match stripe::Invoice::list(&stripe, &list_params).await {
+        match ListInvoice::new()
+            .subscription(stripe_sub_id.as_str().to_string())
+            .status(InvoiceStatus::Open)
+            .limit(1)
+            .send(&stripe)
+            .await
+        {
             Ok(invoices) => {
                 if let Some(invoice) = invoices.data.into_iter().next() {
-                    match stripe::Invoice::pay(&stripe, &invoice.id).await {
-                        Ok(_) => {
-                            info!(
-                                tenant_id = %tenant_id,
-                                invoice_id = %invoice.id,
-                                "Proration invoice paid immediately"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(error = %e, invoice_id = %invoice.id, "Failed to pay proration invoice");
-                            return (
-                                StatusCode::PAYMENT_REQUIRED,
-                                Json(json!({"error": format!("Seat update succeeded but payment failed: {e}")})),
-                            )
-                                .into_response();
+                    // Invoice.id is Option<InvoiceId> in the new API
+                    if let Some(inv_id) = invoice.id.clone() {
+                        match PayInvoice::new(inv_id.clone()).send(&stripe).await {
+                            Ok(_) => {
+                                info!(
+                                    tenant_id = %tenant_id,
+                                    invoice_id = %inv_id,
+                                    "Proration invoice paid immediately"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, invoice_id = %inv_id, "Failed to pay proration invoice");
+                                return (
+                                    StatusCode::PAYMENT_REQUIRED,
+                                    Json(json!({"error": format!("Seat update succeeded but payment failed: {e}")})),
+                                )
+                                    .into_response();
+                            }
                         }
                     }
                 }
@@ -966,32 +932,22 @@ pub(crate) async fn list_invoices_handler(
         }
     };
 
-    let customer_id: stripe::CustomerId = match sub.stripe_customer_id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Invalid customer ID: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
-    let mut params = stripe::ListInvoices::new();
-    params.customer = Some(customer_id);
-
-    match stripe::Invoice::list(&stripe, &params).await {
+    match ListInvoice::new()
+        .customer(sub.stripe_customer_id.clone())
+        .send(&stripe)
+        .await
+    {
         Ok(list) => {
             let invoices: Vec<serde_json::Value> = list
                 .data
                 .iter()
                 .map(|inv| {
                     json!({
-                        "id": inv.id.to_string(),
+                        "id": inv.id.as_ref().map(|id| id.to_string()),
                         "amount_due": inv.amount_due,
                         "amount_paid": inv.amount_paid,
-                        "currency": inv.currency.map(|c| c.to_string()),
-                        "status": inv.status.map(|s| format!("{:?}", s)),
+                        "currency": inv.currency.to_string(),
+                        "status": inv.status.as_ref().map(|s| format!("{s:?}")),
                         "created": inv.created,
                         "hosted_invoice_url": inv.hosted_invoice_url,
                         "invoice_pdf": inv.invoice_pdf,
@@ -1366,33 +1322,30 @@ async fn migrate_seat_addon_if_needed(
         Some(id) => id,
         None => return,
     };
-    let sub_id: stripe::SubscriptionId = match sub_id_str.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %e, "Failed to parse subscription ID for seat migration");
-            return;
-        }
-    };
+    let sub_id: SubscriptionId = sub_id_str
+        .parse()
+        .expect("SubscriptionId parse is infallible");
 
-    let update_params = stripe::UpdateSubscription {
-        items: Some(vec![
-            // Remove the old tier's seat item
-            stripe::UpdateSubscriptionItems {
-                id: Some(old_item_id.clone()),
-                deleted: Some(true),
-                ..Default::default()
-            },
-            // Add the new tier's seat item with the same quantity
-            stripe::UpdateSubscriptionItems {
-                price: Some(new_seat_price.to_string()),
-                quantity: Some(quantity),
-                ..Default::default()
-            },
-        ]),
-        ..Default::default()
-    };
+    let update_items = vec![
+        // Remove the old tier's seat item
+        UpdateSubscriptionItems {
+            id: Some(old_item_id.clone()),
+            deleted: Some(true),
+            ..Default::default()
+        },
+        // Add the new tier's seat item with the same quantity
+        UpdateSubscriptionItems {
+            price: Some(new_seat_price.to_string()),
+            quantity: Some(quantity),
+            ..Default::default()
+        },
+    ];
 
-    match stripe::Subscription::update(&stripe_client, &sub_id, update_params).await {
+    match UpdateSubscription::new(sub_id)
+        .items(update_items)
+        .send(&stripe_client)
+        .await
+    {
         Ok(_) => {
             info!(
                 subscription_id = sub_id_str,

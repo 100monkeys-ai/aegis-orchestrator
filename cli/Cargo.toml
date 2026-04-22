@@ -84,7 +84,11 @@ prost = { workspace = true }
 parking_lot = { workspace = true }
 
 # Stripe billing (optional at runtime — feature-gated by STRIPE_SECRET_KEY env)
-stripe = { package = "async-stripe", version = "0.39", features = ["runtime-tokio-hyper-rustls"] }
+stripe = { package = "async-stripe", version = "=1.0.0-rc.5", features = ["rustls-tls-webpki-roots", "rustls-aws-lc-rs"] }
+stripe-billing = { package = "async-stripe-billing", version = "=1.0.0-rc.5", features = ["billing_portal_session", "invoice", "subscription"] }
+stripe-checkout = { package = "async-stripe-checkout", version = "=1.0.0-rc.5", features = ["checkout_session"] }
+stripe-core = { package = "async-stripe-core", version = "=1.0.0-rc.5", features = ["customer"] }
+stripe-product = { package = "async-stripe-product", version = "=1.0.0-rc.5", features = ["product", "price"] }
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]
