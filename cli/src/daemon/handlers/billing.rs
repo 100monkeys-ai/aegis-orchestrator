@@ -1878,13 +1878,19 @@ pub(crate) async fn preview_tier_change_handler(
             // `amount_due` on the upcoming invoice preview includes BOTH the
             // proration lines AND the next period's full charge — Stripe's
             // "upcoming invoice" concept rolls them together. We only want
-            // the immediate prorated delta here. Filter to lines flagged
-            // `proration: true`.
+            // the immediate prorated delta here. The `proration` flag in
+            // async-stripe 1.0 is on `line.parent.subscription_item_details`.
             let proration_total: i64 = preview_invoice
                 .lines
                 .data
                 .iter()
-                .filter(|l| l.proration)
+                .filter(|l| {
+                    l.parent
+                        .as_ref()
+                        .and_then(|p| p.subscription_item_details.as_ref())
+                        .map(|sid| sid.proration)
+                        .unwrap_or(false)
+                })
                 .map(|l| l.amount)
                 .sum();
 
