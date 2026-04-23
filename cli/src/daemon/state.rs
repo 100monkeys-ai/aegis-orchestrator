@@ -124,6 +124,13 @@ pub(crate) struct AppState {
         Option<Arc<dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository>>,
     /// Stripe billing configuration from `NodeConfigSpec.billing`.
     pub(crate) billing_config: Option<aegis_orchestrator_core::domain::node_config::BillingConfig>,
+    /// Effective personal-tier synchronizer (ADR-111 Phase 3). Owns all writes
+    /// to the Keycloak `zaru_tier` attribute, computing `max(personal,
+    /// active_colony_tiers)` before each write. Optional until Keycloak admin,
+    /// billing repo, team repo, and membership repo are all wired.
+    pub(crate) effective_tier_service: Option<
+        Arc<dyn aegis_orchestrator_core::application::effective_tier_service::EffectiveTierService>,
+    >,
     /// Base URL for the zaru-client service (e.g. `https://myzaru.com`).
     /// Loaded from the `ZARU_URL` environment variable. Used to call internal
     /// endpoints such as `/api/internal/invalidate-sessions` after a tier change.

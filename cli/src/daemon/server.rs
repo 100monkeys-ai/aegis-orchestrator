@@ -1857,6 +1857,66 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ) as Arc<dyn aegis_orchestrator_core::domain::team::MembershipRepository>
     });
 
+    // Effective tier service (ADR-111 Phase 3). Constructed BEFORE TeamService
+    // so membership transitions (accept_invitation / revoke_membership) can
+    // recompute the affected user's effective tier. Requires Keycloak admin,
+    // billing repo, team repo, and membership repo — if any are missing the
+    // service is disabled and billing/team paths fall back gracefully.
+    let effective_tier_service: Option<
+        Arc<dyn aegis_orchestrator_core::application::effective_tier_service::EffectiveTierService>,
+    > = match (
+        colony_keycloak_admin.as_ref(),
+        db_pool.as_ref(),
+        team_repo_opt.as_ref(),
+        membership_repo_opt.as_ref(),
+    ) {
+        (Some(kc), Some(pool), Some(team_repo), Some(membership_repo)) => {
+            let billing_repo_for_tier: Arc<
+                dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository,
+            > = Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PostgresBillingRepository::new(
+                    pool.clone(),
+                ),
+            );
+            let zaru_url = config
+                .spec
+                .zaru
+                .as_ref()
+                .and_then(|cfg| resolve_env_value(&cfg.public_url).ok());
+            let zaru_secret = config
+                .spec
+                .zaru
+                .as_ref()
+                .and_then(|cfg| resolve_env_value(&cfg.internal_secret).ok());
+            let port: Arc<
+                dyn aegis_orchestrator_core::application::effective_tier_service::TierSyncPort,
+            > = Arc::new(
+                aegis_orchestrator_core::application::effective_tier_service::KeycloakTierSyncPort::new(
+                    kc.clone(),
+                    zaru_url,
+                    zaru_secret,
+                ),
+            );
+            Some(Arc::new(
+                aegis_orchestrator_core::application::effective_tier_service::StandardEffectiveTierService::new(
+                    team_repo.clone(),
+                    membership_repo.clone(),
+                    billing_repo_for_tier,
+                    port,
+                ),
+            )
+                as Arc<
+                    dyn aegis_orchestrator_core::application::effective_tier_service::EffectiveTierService,
+                >)
+        }
+        _ => {
+            tracing::warn!(
+                "EffectiveTierService disabled: missing keycloak_admin, db_pool, team_repo, or membership_repo"
+            );
+            None
+        }
+    };
+
     let team_service: Option<
         Arc<dyn aegis_orchestrator_core::application::team_service::TeamService>,
     > = match (
@@ -1907,6 +1967,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     billing_service,
                     event_bus.clone(),
                     hmac_key,
+                    effective_tier_service.clone(),
                 ),
             )
                 as Arc<
@@ -1970,6 +2031,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         team_service,
         team_repo: team_repo_opt.clone(),
         membership_repo: membership_repo_opt.clone(),
+        effective_tier_service,
         config: config.clone(),
         start_time: std::time::Instant::now(),
         keycloak_admin: colony_keycloak_admin,

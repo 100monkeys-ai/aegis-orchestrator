@@ -73,6 +73,14 @@ impl SubscriptionStatus {
             Self::None => "none",
         }
     }
+
+    /// `true` iff the subscription is in a state that entitles the tenant to
+    /// the paid tier's benefits — i.e. `Active` or `Trialing`. Used by
+    /// `EffectiveTierService` (ADR-111 Phase 3) to decide whether the personal
+    /// subscription's tier should contribute to the effective-tier `max()`.
+    pub fn is_active_or_trialing(&self) -> bool {
+        matches!(self, Self::Active | Self::Trialing)
+    }
 }
 
 impl std::fmt::Display for SubscriptionStatus {

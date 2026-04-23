@@ -51,6 +51,22 @@ impl TenantTier {
         matches!(self, TenantTier::Business | TenantTier::Enterprise)
     }
 
+    /// Canonical string form used as the Keycloak `zaru_tier` attribute value
+    /// and as the persisted `tier` column on `tenant_subscriptions` rows.
+    ///
+    /// Single source of truth for the tier → string mapping. Centralizing here
+    /// prevents drift between the `billing.rs` webhook handlers and the
+    /// `EffectiveTierService` (ADR-111 Phase 3).
+    pub fn as_keycloak_str(&self) -> &'static str {
+        match self {
+            TenantTier::Free => "free",
+            TenantTier::Pro => "pro",
+            TenantTier::Business => "business",
+            TenantTier::Enterprise => "enterprise",
+            TenantTier::System => "system",
+        }
+    }
+
     /// Rank for effective-tier computation via `max()`.
     ///
     /// System is incomparable in effect (it is the platform-internal tier and

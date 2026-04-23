@@ -26,6 +26,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::application::billing_service::{BillingService, BillingServiceError};
+use crate::application::effective_tier_service::EffectiveTierService;
 use crate::domain::repository::{RepositoryError, TenantRepository};
 use crate::domain::team::{
     InvitationStatus, Membership, MembershipRepository, MembershipRole, Team, TeamEvent, TeamId,
@@ -223,6 +224,11 @@ pub struct StandardTeamService {
     /// `BillingConfig.invitation_hmac_key` is absent — invitation operations
     /// then return [`TeamServiceError::InvitationsNotConfigured`].
     invitation_hmac_key: Option<Vec<u8>>,
+    /// Effective tier synchronizer (ADR-111 Phase 3). When set, membership
+    /// transitions (accept / revoke) trigger a recompute + Keycloak sync for
+    /// the affected user. Optional so the service works in environments
+    /// without Keycloak wired (e.g. tests).
+    effective_tier_service: Option<Arc<dyn EffectiveTierService>>,
 }
 
 impl StandardTeamService {
@@ -234,6 +240,7 @@ impl StandardTeamService {
         billing_service: Arc<dyn BillingService>,
         event_bus: Arc<EventBus>,
         invitation_hmac_key: Option<Vec<u8>>,
+        effective_tier_service: Option<Arc<dyn EffectiveTierService>>,
     ) -> Self {
         Self {
             team_repo,
@@ -243,6 +250,7 @@ impl StandardTeamService {
             billing_service,
             event_bus,
             invitation_hmac_key,
+            effective_tier_service,
         }
     }
 
@@ -460,6 +468,21 @@ impl TeamService for StandardTeamService {
         );
         self.membership_repo.save(&membership).await?;
 
+        // ADR-111 Phase 3: lift the joining member's effective personal tier
+        // to match this colony's tier. Failures here are logged but do not
+        // abort the invitation flow — the membership is saved and seats are
+        // resynced regardless; a subsequent recompute will heal the tier.
+        if let Some(service) = &self.effective_tier_service {
+            if let Err(e) = service.recompute_for_user(&cmd.authenticated_user_id).await {
+                tracing::warn!(
+                    error = %e,
+                    user_id = %cmd.authenticated_user_id,
+                    team_id = %invitation.team_id,
+                    "effective tier recompute failed on accept_invitation"
+                );
+            }
+        }
+
         // Resync Stripe seats.
         let team = self
             .team_repo
@@ -532,6 +555,19 @@ impl TeamService for StandardTeamService {
         }
 
         self.membership_repo.revoke(&team_id, &user_id).await?;
+
+        // ADR-111 Phase 3: drop the revoked member's effective tier back to
+        // their personal subscription tier (or any remaining active colony).
+        if let Some(service) = &self.effective_tier_service {
+            if let Err(e) = service.recompute_for_user(&user_id).await {
+                tracing::warn!(
+                    error = %e,
+                    user_id = %user_id,
+                    team_id = %team_id,
+                    "effective tier recompute failed on revoke_membership"
+                );
+            }
+        }
 
         let team = self
             .team_repo
@@ -896,6 +932,7 @@ mod tests {
             Arc::new(NoopBilling),
             Arc::new(EventBus::with_default_capacity()),
             Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
+            None,
         )
     }
 

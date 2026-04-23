@@ -1108,8 +1108,10 @@ async fn handle_checkout_completed(
         return;
     }
 
-    // Sync tier to Keycloak
-    sync_tier_to_keycloak(state, &tenant_id, &tier).await;
+    // Sync tier to Keycloak via EffectiveTierService (ADR-111 Phase 3) —
+    // consumer tenants route through effective-tier computation; enterprise
+    // tenants fall back to the legacy direct path.
+    sync_tier(state, &tenant_id, &tier).await;
 
     info!(
         tenant_id = %tenant_id,
@@ -1164,8 +1166,9 @@ async fn handle_subscription_updated(
     }
 
     // Propagate the new tier to Keycloak so JWT claims reflect it immediately
-    // (e.g. Pro → Business upgrades via the Stripe portal).
-    sync_tier_to_keycloak(state, &sub.tenant_id, &tier).await;
+    // (e.g. Pro → Business upgrades via the Stripe portal). Routed through the
+    // EffectiveTierService (ADR-111 Phase 3) for consumer tenants.
+    sync_tier(state, &sub.tenant_id, &tier).await;
 
     // ADR-111 §Billing Model: reconcile seat_count back from Stripe for all
     // tenants. The canonical source is membership truth, but manual edits in
@@ -1417,7 +1420,7 @@ async fn handle_subscription_deleted(
         return;
     }
 
-    sync_tier_to_keycloak(state, &sub.tenant_id, &TenantTier::Free).await;
+    sync_tier(state, &sub.tenant_id, &TenantTier::Free).await;
 
     info!(
         tenant_id = %sub.tenant_id,
@@ -1462,14 +1465,13 @@ async fn handle_payment_failed(billing_repo: &dyn BillingRepository, payload: &s
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Legacy adapter — defers to `TenantTier::as_keycloak_str` (ADR-111 Phase 3).
+///
+/// Retained as a thin wrapper so this file's many call-sites keep reading the
+/// same way; the single source of truth for the string mapping is on
+/// `TenantTier` itself.
 fn tier_to_str(tier: &TenantTier) -> &'static str {
-    match tier {
-        TenantTier::Free => "free",
-        TenantTier::Pro => "pro",
-        TenantTier::Business => "business",
-        TenantTier::Enterprise => "enterprise",
-        TenantTier::System => "system",
-    }
+    tier.as_keycloak_str()
 }
 
 fn str_to_tier(s: &str) -> TenantTier {
@@ -1549,6 +1551,48 @@ fn consumer_tenant_id_to_user_sub(
         &s[16..20],
         &s[20..32]
     ))
+}
+
+/// Dispatch the post-subscription-change Keycloak tier sync.
+///
+/// For consumer tenants, delegates to the `EffectiveTierService` (ADR-111
+/// Phase 3), which computes `max(personal, active_colony_tiers)` and writes
+/// the resulting effective tier to Keycloak — this is the ONLY correct path
+/// for per-user consumer subscriptions because a user's effective tier may be
+/// higher than their personal subscription tier due to colony membership.
+///
+/// For enterprise tenants (dedicated `tenant-{slug}` realms), falls back to
+/// the legacy [`sync_tier_to_keycloak`] path since enterprise realms have a
+/// different identity model and are unaffected by the colony-tier model.
+async fn sync_tier(
+    state: &AppState,
+    tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+    tier: &TenantTier,
+) {
+    if let Some(user_sub) = consumer_tenant_id_to_user_sub(tenant_id) {
+        if let Some(service) = &state.effective_tier_service {
+            match service.recompute_for_user(&user_sub).await {
+                Ok(effective) => {
+                    tracing::debug!(
+                        user_sub = %user_sub,
+                        ?effective,
+                        "effective tier recomputed after billing event"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        user_sub = %user_sub,
+                        "effective tier recompute failed"
+                    );
+                }
+            }
+            return;
+        }
+        // EffectiveTierService not wired — fall through to direct sync so the
+        // user's JWT at minimum reflects their personal subscription.
+    }
+    sync_tier_to_keycloak(state, tenant_id, tier).await;
 }
 
 /// Sync the billing tier to Keycloak's `zaru_tier` user attribute.
