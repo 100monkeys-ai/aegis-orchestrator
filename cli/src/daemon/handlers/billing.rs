@@ -737,6 +737,35 @@ struct CurrentSubItems {
 }
 
 /// Extract [`CurrentSubItems`] from a retrieved Stripe subscription object.
+/// Extract the current tier from a typed Stripe Subscription by reading
+/// price metadata on the base plan item. Mirrors `extract_tier_from_subscription`
+/// (which operates on a JSON blob) but avoids the Serialize-roundtrip since
+/// `stripe_billing::Subscription` doesn't derive Serialize.
+fn extract_tier_from_typed_subscription(sub: &stripe_billing::Subscription) -> Option<TenantTier> {
+    // Prefer the item explicitly flagged as the base plan.
+    let base_tier = sub.items.data.iter().find_map(|item| {
+        let kind = item.price.metadata.get("kind").map(String::as_str)?;
+        if kind != "base" {
+            return None;
+        }
+        item.price
+            .metadata
+            .get("tier")
+            .map(|s| str_to_tier(s.as_str()))
+    });
+    if let Some(t) = base_tier {
+        return Some(t);
+    }
+
+    // Fallback: first item with a `tier` in its price metadata.
+    sub.items.data.iter().find_map(|item| {
+        item.price
+            .metadata
+            .get("tier")
+            .map(|s| str_to_tier(s.as_str()))
+    })
+}
+
 fn current_sub_items_from(sub: &stripe_billing::Subscription) -> CurrentSubItems {
     let mut base_item_id = None;
     let mut seat_item_id = None;
@@ -1716,8 +1745,7 @@ pub(crate) async fn preview_tier_change_handler(
 
     let current = current_sub_items_from(&stripe_sub);
     let current_tier =
-        extract_tier_from_subscription(&serde_json::to_value(&stripe_sub).unwrap_or_default())
-            .unwrap_or(TenantTier::Free);
+        extract_tier_from_typed_subscription(&stripe_sub).unwrap_or(TenantTier::Free);
     let current_seats = stripe_sub
         .items
         .data
@@ -1873,8 +1901,7 @@ pub(crate) async fn change_tier_handler(
 
     let current = current_sub_items_from(&stripe_sub);
     let current_tier =
-        extract_tier_from_subscription(&serde_json::to_value(&stripe_sub).unwrap_or_default())
-            .unwrap_or(TenantTier::Free);
+        extract_tier_from_typed_subscription(&stripe_sub).unwrap_or(TenantTier::Free);
     let current_seats = stripe_sub
         .items
         .data
