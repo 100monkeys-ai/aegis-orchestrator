@@ -44,6 +44,7 @@ use crate::daemon::handlers::colony::{
     get_saml_config, get_subscription, list_invitations, list_members, list_teams, remove_member,
     set_saml_config, update_role,
 };
+use crate::daemon::handlers::consumer::ensure_provisioned_handler;
 use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
@@ -385,6 +386,11 @@ pub(crate) fn create_router(
         .route("/v1/billing/seats", post(update_seats_handler))
         .route("/v1/billing/subscription", get(get_subscription_handler))
         .route("/v1/billing/invoices", get(list_invoices_handler))
+        // Consumer self-service (ADR-097) — login-time tenant provisioning self-heal
+        .route(
+            "/v1/consumer/ensure-provisioned",
+            post(ensure_provisioned_handler),
+        )
         .with_state(app_state.clone());
 
     // Tenant-context middleware (ADR-056, ADR-111 §Tenant-Context Header

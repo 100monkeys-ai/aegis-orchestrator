@@ -15,6 +15,7 @@ pub(crate) mod billing;
 pub(crate) mod canvas;
 pub(crate) mod cluster;
 pub(crate) mod colony;
+pub(crate) mod consumer;
 pub(crate) mod cortex;
 pub(crate) mod credentials;
 pub(crate) mod dispatch;
