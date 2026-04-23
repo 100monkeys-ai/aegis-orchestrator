@@ -43,7 +43,7 @@ use stripe_checkout::checkout_session::{
     CreateCheckoutSession, CreateCheckoutSessionLineItems, CreateCheckoutSessionSubscriptionData,
 };
 use stripe_checkout::CheckoutSessionMode;
-use stripe_core::customer::{CreateCustomer, UpdateCustomer};
+use stripe_core::customer::{CreateCustomer, RetrieveCustomer, UpdateCustomer};
 use stripe_core::CustomerId;
 use stripe_product::price::ListPrice;
 use stripe_product::product::ListProduct;
@@ -460,29 +460,49 @@ pub(crate) async fn create_checkout_handler(
         }
     };
 
-    let customer_id = if let Some(ref sub) = existing_sub {
-        // Sync name/email to Stripe on every checkout in case they changed
-        let name = identity.name.as_deref().unwrap_or("");
-        let email = identity.email.as_deref().unwrap_or("");
-        let cid: CustomerId = sub
-            .stripe_customer_id
-            .parse()
-            .expect("CustomerId parse is infallible");
-        let mut update = UpdateCustomer::new(cid);
-        if !name.is_empty() {
-            update = update.name(name.to_string());
+    let name = identity.name.as_deref().unwrap_or("");
+    let email = identity.email.as_deref().unwrap_or("");
+
+    // Try to reuse the cached Stripe customer from tenant_subscriptions.
+    // If the cached ID no longer exists in Stripe (e.g. after a sandbox
+    // reset), we fall through and create a fresh one.
+    let reused = match existing_sub.as_ref() {
+        Some(sub) => {
+            let cid: CustomerId = sub
+                .stripe_customer_id
+                .parse()
+                .expect("CustomerId parse is infallible");
+            match RetrieveCustomer::new(cid.clone()).send(&stripe).await {
+                Ok(_) => {
+                    // Customer still exists — sync name/email and reuse.
+                    let mut update = UpdateCustomer::new(cid);
+                    if !name.is_empty() {
+                        update = update.name(name.to_string());
+                    }
+                    if !email.is_empty() {
+                        update = update.email(email.to_string());
+                    }
+                    if let Err(e) = update.send(&stripe).await {
+                        warn!(error = %e, "Failed to sync customer name/email to Stripe");
+                    }
+                    Some(sub.stripe_customer_id.clone())
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        cached_customer_id = %sub.stripe_customer_id,
+                        "Cached Stripe customer no longer exists — creating a new one",
+                    );
+                    None
+                }
+            }
         }
-        if !email.is_empty() {
-            update = update.email(email.to_string());
-        }
-        if let Err(e) = update.send(&stripe).await {
-            warn!(error = %e, "Failed to sync customer name/email to Stripe");
-        }
-        sub.stripe_customer_id.clone()
+        None => None,
+    };
+
+    let customer_id = if let Some(id) = reused {
+        id
     } else {
-        // Create a new Stripe customer
-        let email = identity.email.as_deref().unwrap_or("");
-        let name = identity.name.as_deref().unwrap_or("");
         let mut create = CreateCustomer::new().metadata(
             [("tenant_id".to_string(), tenant_id.as_str().to_string())]
                 .into_iter()
@@ -498,19 +518,27 @@ pub(crate) async fn create_checkout_handler(
         match create.send(&stripe).await {
             Ok(customer) => {
                 let cust_id = customer.id.to_string();
-                // Persist the customer mapping
+                // Persist the customer mapping (upsert — may be replacing a
+                // stale cached ID, so preserve existing tier/status when present).
                 let now = chrono::Utc::now();
-                let new_sub = TenantSubscription {
-                    tenant_id: tenant_id.clone(),
-                    stripe_customer_id: cust_id.clone(),
-                    stripe_subscription_id: None,
-                    tier: TenantTier::Free,
-                    status: SubscriptionStatus::None,
-                    current_period_end: None,
-                    cancel_at_period_end: false,
-                    created_at: now,
-                    updated_at: now,
-                    seat_count: 1,
+                let new_sub = match existing_sub.as_ref() {
+                    Some(prev) => TenantSubscription {
+                        stripe_customer_id: cust_id.clone(),
+                        updated_at: now,
+                        ..prev.clone()
+                    },
+                    None => TenantSubscription {
+                        tenant_id: tenant_id.clone(),
+                        stripe_customer_id: cust_id.clone(),
+                        stripe_subscription_id: None,
+                        tier: TenantTier::Free,
+                        status: SubscriptionStatus::None,
+                        current_period_end: None,
+                        cancel_at_period_end: false,
+                        created_at: now,
+                        updated_at: now,
+                        seat_count: 1,
+                    },
                 };
                 if let Err(e) = billing_repo.upsert_subscription(&new_sub).await {
                     warn!(error = %e, "Failed to persist new Stripe customer mapping");
