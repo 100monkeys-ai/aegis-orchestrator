@@ -117,51 +117,48 @@ async fn ensure_stripe_customer(
         .map_err(|e| format!("get_subscription_by_user_sub: {e}"))?;
 
     if let Some(ref sub) = existing_sub {
-        if let Ok(cid) = sub.stripe_customer_id.parse::<CustomerId>() {
-            if RetrieveCustomer::new(cid.clone())
-                .send(stripe)
-                .await
-                .is_ok()
-            {
-                // Still alive — sync identity fields and reuse.
-                let mut update = UpdateCustomer::new(cid);
-                if !identity_name.is_empty() {
-                    update = update.name(identity_name.to_string());
-                }
-                if !identity_email.is_empty() {
-                    update = update.email(identity_email.to_string());
-                }
-                if let Err(e) = update.send(stripe).await {
-                    warn!(error = %e, "Failed to sync customer name/email to Stripe");
-                }
-                // Heal any tenant_id drift on the DB row (e.g. the cached row
-                // was written before the per-user tenant was provisioned).
-                if &sub.tenant_id != tenant_id {
-                    info!(
-                        user_sub = %user_sub,
-                        previous_tenant = %sub.tenant_id,
-                        new_tenant = %tenant_id,
-                        "Rebinding billing row to resolved tenant_id"
-                    );
-                    if let Err(e) = billing_repo
-                        .update_tenant_id_for_user_sub(user_sub, tenant_id)
-                        .await
-                    {
-                        warn!(error = %e, "Failed to rebind tenant_id on billing row");
-                    }
-                }
-                return Ok(sub.stripe_customer_id.clone());
+        let cid: CustomerId = sub
+            .stripe_customer_id
+            .parse()
+            .expect("CustomerId parse is infallible");
+        if RetrieveCustomer::new(cid.clone())
+            .send(stripe)
+            .await
+            .is_ok()
+        {
+            // Still alive — sync identity fields and reuse.
+            let mut update = UpdateCustomer::new(cid);
+            if !identity_name.is_empty() {
+                update = update.name(identity_name.to_string());
             }
-            warn!(
-                cached_customer_id = %sub.stripe_customer_id,
-                "Cached Stripe customer no longer exists — falling through to search"
-            );
-        } else {
-            warn!(
-                cached_customer_id = %sub.stripe_customer_id,
-                "Cached Stripe customer id is unparseable — falling through to search"
-            );
+            if !identity_email.is_empty() {
+                update = update.email(identity_email.to_string());
+            }
+            if let Err(e) = update.send(stripe).await {
+                warn!(error = %e, "Failed to sync customer name/email to Stripe");
+            }
+            // Heal any tenant_id drift on the DB row (e.g. the cached row
+            // was written before the per-user tenant was provisioned).
+            if &sub.tenant_id != tenant_id {
+                info!(
+                    user_sub = %user_sub,
+                    previous_tenant = %sub.tenant_id,
+                    new_tenant = %tenant_id,
+                    "Rebinding billing row to resolved tenant_id"
+                );
+                if let Err(e) = billing_repo
+                    .update_tenant_id_for_user_sub(user_sub, tenant_id)
+                    .await
+                {
+                    warn!(error = %e, "Failed to rebind tenant_id on billing row");
+                }
+            }
+            return Ok(sub.stripe_customer_id.clone());
         }
+        warn!(
+            cached_customer_id = %sub.stripe_customer_id,
+            "Cached Stripe customer no longer exists — falling through to search"
+        );
     }
 
     // 2. Stripe search on metadata['user_sub'] — authoritative lookup.
@@ -239,7 +236,8 @@ async fn ensure_stripe_customer(
             warn!(error = %e, "Failed to persist Stripe customer mapping after search");
         }
         // Sync identity fields onto the resolved customer.
-        if let Ok(cid) = cust_id.parse::<CustomerId>() {
+        let cid: CustomerId = cust_id.parse().expect("CustomerId parse is infallible");
+        {
             let mut update = UpdateCustomer::new(cid);
             if !identity_name.is_empty() {
                 update = update.name(identity_name.to_string());
