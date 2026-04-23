@@ -73,6 +73,29 @@ struct TokenResponse {
     expires_in: i64,
 }
 
+/// Build the full user representation body for a Keycloak PUT /users/{id} call,
+/// merging `attribute = [value]` into the user's existing attributes.
+///
+/// `createdTimestamp` is intentionally excluded — Keycloak rejects it on PUT.
+fn build_set_attribute_body(
+    user: &KeycloakUser,
+    attribute: &str,
+    value: &str,
+) -> serde_json::Value {
+    let mut attrs: std::collections::HashMap<String, Vec<String>> =
+        user.attributes.clone().unwrap_or_default();
+    attrs.insert(attribute.to_string(), vec![value.to_string()]);
+
+    serde_json::json!({
+        "id": user.id,
+        "email": user.email,
+        "firstName": user.first_name,
+        "lastName": user.last_name,
+        "enabled": true,
+        "attributes": attrs
+    })
+}
+
 impl KeycloakAdminClient {
     pub fn new(config: KeycloakAdminConfig) -> Self {
         Self {
@@ -180,28 +203,32 @@ impl KeycloakAdminClient {
     }
 
     /// Set a user attribute on a Keycloak user in the given realm.
+    ///
+    /// Keycloak's PUT `/admin/realms/{realm}/users/{id}` is a **full replace**:
+    /// sending only `{"attributes": {...}}` causes Keycloak to null out `email`
+    /// and reject with 400 `error-user-attribute-required`.  We therefore build
+    /// a complete user representation, merging the new attribute over the
+    /// existing ones.
     pub async fn set_user_attribute(
         &self,
         realm: &str,
-        user_id: &str,
+        user: &KeycloakUser,
         attribute: &str,
         value: &str,
     ) -> Result<(), KeycloakAdminError> {
         let token = self.get_admin_token().await?;
         let url = format!(
             "{}/admin/realms/{}/users/{}",
-            self.config.host, realm, user_id
+            self.config.host, realm, user.id
         );
+
+        let body = build_set_attribute_body(user, attribute, value);
 
         let resp = self
             .http
             .put(&url)
             .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "attributes": {
-                    attribute: [value]
-                }
-            }))
+            .json(&body)
             .send()
             .await?;
 
@@ -869,5 +896,91 @@ impl KeycloakAdminClient {
         }
 
         Ok(user_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── build_set_attribute_body ───────────────────────────────────────────
+
+    /// The PUT body must include `id`, `email`, `firstName`, `lastName`,
+    /// `enabled: true`, and the merged attributes map.  `createdTimestamp`
+    /// must be absent (Keycloak rejects it on PUT).
+    #[test]
+    fn set_user_attribute_includes_existing_fields() {
+        let mut existing_attrs = std::collections::HashMap::new();
+        existing_attrs.insert("tenant_id".to_string(), vec!["u-abc".to_string()]);
+
+        let user = KeycloakUser {
+            id: "user-123".to_string(),
+            email: Some("alice@example.com".to_string()),
+            first_name: Some("Alice".to_string()),
+            last_name: Some("Smith".to_string()),
+            created_timestamp: 1_700_000_000,
+            attributes: Some(existing_attrs),
+        };
+
+        let body = build_set_attribute_body(&user, "zaru_tier", "pro");
+
+        // Required identity fields are present.
+        assert_eq!(body["id"], "user-123");
+        assert_eq!(body["email"], "alice@example.com");
+        assert_eq!(body["firstName"], "Alice");
+        assert_eq!(body["lastName"], "Smith");
+        assert_eq!(body["enabled"], true);
+
+        // createdTimestamp must NOT be present — Keycloak rejects it on PUT.
+        assert!(
+            body.get("createdTimestamp").is_none(),
+            "createdTimestamp must be omitted from PUT body"
+        );
+
+        // New attribute is set.
+        assert_eq!(body["attributes"]["zaru_tier"][0], "pro");
+
+        // Existing attribute is preserved.
+        assert_eq!(body["attributes"]["tenant_id"][0], "u-abc");
+    }
+
+    /// When the user has no existing attributes the body is still well-formed
+    /// and the new attribute is included.
+    #[test]
+    fn set_user_attribute_handles_no_existing_attributes() {
+        let user = KeycloakUser {
+            id: "user-456".to_string(),
+            email: None,
+            first_name: None,
+            last_name: None,
+            created_timestamp: 0,
+            attributes: None,
+        };
+
+        let body = build_set_attribute_body(&user, "zaru_tier", "business");
+
+        assert_eq!(body["id"], "user-456");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["attributes"]["zaru_tier"][0], "business");
+    }
+
+    /// A new value for an existing attribute key overwrites the old one.
+    #[test]
+    fn set_user_attribute_overwrites_existing_key() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("zaru_tier".to_string(), vec!["free".to_string()]);
+
+        let user = KeycloakUser {
+            id: "user-789".to_string(),
+            email: Some("bob@example.com".to_string()),
+            first_name: None,
+            last_name: None,
+            created_timestamp: 0,
+            attributes: Some(attrs),
+        };
+
+        let body = build_set_attribute_body(&user, "zaru_tier", "business");
+
+        assert_eq!(body["attributes"]["zaru_tier"][0], "business");
     }
 }

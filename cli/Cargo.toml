@@ -90,6 +90,9 @@ stripe-checkout = { package = "async-stripe-checkout", version = "=1.0.0-rc.5", 
 stripe-core = { package = "async-stripe-core", version = "=1.0.0-rc.5", features = ["customer"] }
 stripe-product = { package = "async-stripe-product", version = "=1.0.0-rc.5", features = ["product", "price"] }
 
+[dev-dependencies]
+mockito = "1"
+
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
