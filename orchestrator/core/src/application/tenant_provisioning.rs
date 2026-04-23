@@ -58,7 +58,15 @@ impl TenantProvisioningService {
     }
 
     /// Provision a per-user tenant for a consumer user at signup (ADR-097).
-    /// Idempotent: returns existing tenant if already provisioned.
+    ///
+    /// Idempotent by construction. The DB row and the Keycloak attributes are
+    /// two separate side-effects — a previous partial run may have inserted
+    /// one but not the other. Every call reconciles BOTH: insert the tenants
+    /// row if missing, and write the Keycloak attributes if they don't match
+    /// the resolved tenant/tier.
+    ///
+    /// Any caller that sees `Ok(_)` can assume the tenants row AND the
+    /// Keycloak `tenant_id` + `zaru_tier` attributes are in sync.
     pub async fn provision_user_tenant(
         &self,
         user_sub: &str,
@@ -66,35 +74,12 @@ impl TenantProvisioningService {
     ) -> Result<Tenant, ProvisioningError> {
         let tenant_id = TenantId::for_consumer_user(user_sub)
             .map_err(|e| ProvisioningError::InvalidSub(e.to_string()))?;
-
-        // Idempotent: check if already provisioned
-        if let Some(existing) = self.tenant_repo.find_by_slug(&tenant_id).await? {
-            return Ok(existing);
-        }
-
-        let tier = Self::map_zaru_tier(zaru_tier);
         let slug = tenant_id.as_str().to_string();
         let keycloak_realm = "zaru-consumer".to_string();
-        let openbao_namespace = format!("tenant-{}/", slug);
 
-        let mut tenant = Tenant::new(
-            tenant_id.clone(),
-            format!("User {}", &user_sub[..8.min(user_sub.len())]),
-            tier,
-            keycloak_realm.clone(),
-            openbao_namespace,
-        );
-        tenant.quotas = TenantQuotas::for_tier(&tier);
-
-        // Fetch the full Keycloak user so set_user_attribute can send the
-        // complete user representation on PUT (Keycloak rejects partial bodies).
-        //
-        // If the user has not yet been materialised in Keycloak (webhook race
-        // with the REGISTER event), return a distinct, retryable error rather
-        // than a hard 500 — the user record will appear shortly, and
-        // provisioning is idempotent on retry. We also skip the tenant insert
-        // below so a subsequent retry can complete the full provisioning flow
-        // atomically.
+        // Fetch the full Keycloak user first — `set_user_attribute` needs the
+        // complete representation on PUT, and we must fail fast with a
+        // retryable error if the user record hasn't materialised yet.
         let kc_user = match self
             .keycloak_admin
             .get_user("zaru-consumer", user_sub)
@@ -112,25 +97,64 @@ impl TenantProvisioningService {
             }
         };
 
-        self.tenant_repo.insert(&tenant).await?;
+        // Resolve the tenant: keep the existing row if present, insert otherwise.
+        // Either way we drop through to the Keycloak attribute reconciliation
+        // below so previously-partial provisioning state self-heals.
+        let tenant = match self.tenant_repo.find_by_slug(&tenant_id).await? {
+            Some(existing) => existing,
+            None => {
+                let tier = Self::map_zaru_tier(zaru_tier);
+                let openbao_namespace = format!("tenant-{}/", slug);
+                let mut tenant = Tenant::new(
+                    tenant_id.clone(),
+                    format!("User {}", &user_sub[..8.min(user_sub.len())]),
+                    tier,
+                    keycloak_realm.clone(),
+                    openbao_namespace,
+                );
+                tenant.quotas = TenantQuotas::for_tier(&tier);
+                self.tenant_repo.insert(&tenant).await?;
+                self.event_bus
+                    .publish_tenant_event(TenantEvent::UserTenantProvisioned {
+                        tenant_slug: slug.clone(),
+                        user_sub: user_sub.to_string(),
+                        tier: tier_to_str(&tier).to_string(),
+                        keycloak_realm: keycloak_realm.clone(),
+                        provisioned_at: Utc::now(),
+                    });
+                tenant
+            }
+        };
 
-        // Set tenant_id and zaru_tier attributes on Keycloak user so the
-        // protocol mappers can include them as JWT claims on subsequent logins.
-        self.keycloak_admin
-            .set_user_attribute("zaru-consumer", &kc_user, "tenant_id", &slug)
-            .await?;
-        self.keycloak_admin
-            .set_user_attribute("zaru-consumer", &kc_user, "zaru_tier", tier_to_str(&tier))
-            .await?;
+        // Reconcile Keycloak attributes against the resolved tenant. If the
+        // attributes already match, skip the PUT (cheap early return). If they
+        // don't match (or are absent), write them now — this self-heals any
+        // prior partial-provisioning state where the DB row was inserted but
+        // Keycloak writes silently failed.
+        let tenant_id_attr = kc_user
+            .attributes
+            .as_ref()
+            .and_then(|a| a.get("tenant_id"))
+            .and_then(|v| v.first())
+            .map(|s| s.as_str());
+        if tenant_id_attr != Some(slug.as_str()) {
+            self.keycloak_admin
+                .set_user_attribute("zaru-consumer", &kc_user, "tenant_id", &slug)
+                .await?;
+        }
 
-        self.event_bus
-            .publish_tenant_event(TenantEvent::UserTenantProvisioned {
-                tenant_slug: slug,
-                user_sub: user_sub.to_string(),
-                tier: tier_to_str(&tier).to_string(),
-                keycloak_realm,
-                provisioned_at: Utc::now(),
-            });
+        let desired_tier_str = tier_to_str(&tenant.tier);
+        let zaru_tier_attr = kc_user
+            .attributes
+            .as_ref()
+            .and_then(|a| a.get("zaru_tier"))
+            .and_then(|v| v.first())
+            .map(|s| s.as_str());
+        if zaru_tier_attr != Some(desired_tier_str) {
+            self.keycloak_admin
+                .set_user_attribute("zaru-consumer", &kc_user, "zaru_tier", desired_tier_str)
+                .await?;
+        }
 
         Ok(tenant)
     }
