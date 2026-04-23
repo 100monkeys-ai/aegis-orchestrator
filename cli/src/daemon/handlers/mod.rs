@@ -52,13 +52,30 @@ pub(crate) struct CortexQueryParams {
 pub(crate) const TENANT_DELEGATION_HEADER: &str = "x-tenant-id";
 
 pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
-    match identity.map(|identity| &identity.identity_kind) {
-        Some(IdentityKind::ConsumerUser { tenant_id, .. }) => tenant_id.clone(),
-        Some(IdentityKind::TenantUser { tenant_slug }) => {
-            TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
+    match identity {
+        Some(UserIdentity {
+            identity_kind: IdentityKind::ConsumerUser { tenant_id, .. },
+            sub,
+            ..
+        }) => {
+            // Self-heal: if the JWT's tenant_id claim was absent, the IAM
+            // service falls back to the shared "zaru-consumer" slug. For any
+            // per-user concern (billing, tier sync, provisioning), derive the
+            // real per-user tenant from the sub. ADR-097.
+            if tenant_id.is_consumer() {
+                TenantId::for_consumer_user(sub).unwrap_or_else(|_| tenant_id.clone())
+            } else {
+                tenant_id.clone()
+            }
         }
-        Some(IdentityKind::Operator { .. }) => TenantId::system(),
-        Some(IdentityKind::ServiceAccount { .. }) => TenantId::system(),
+        Some(identity) => match &identity.identity_kind {
+            IdentityKind::TenantUser { tenant_slug } => {
+                TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
+            }
+            IdentityKind::Operator { .. } => TenantId::system(),
+            IdentityKind::ServiceAccount { .. } => TenantId::system(),
+            IdentityKind::ConsumerUser { .. } => unreachable!("handled above"),
+        },
         None => TenantId::default(),
     }
 }
