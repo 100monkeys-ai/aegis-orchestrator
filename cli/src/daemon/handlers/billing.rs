@@ -70,19 +70,12 @@ fn stripe_client_from_config(billing: &BillingConfig) -> Option<stripe::Client> 
 // network error is treated as "missing" so the caller self-heals rather than
 // bubbling opaque Stripe errors to the user.
 
-/// Returns true if the Stripe customer still exists.
-async fn stripe_customer_exists(stripe: &stripe::Client, customer_id: &str) -> bool {
-    let Ok(cid) = customer_id.parse::<CustomerId>() else {
-        return false;
-    };
-    RetrieveCustomer::new(cid).send(stripe).await.is_ok()
-}
-
 /// Returns true if the Stripe subscription still exists.
 async fn stripe_subscription_exists(stripe: &stripe::Client, subscription_id: &str) -> bool {
-    let Ok(sid) = subscription_id.parse::<SubscriptionId>() else {
-        return false;
-    };
+    // SubscriptionId::from_str is infallible in async-stripe.
+    let sid: SubscriptionId = subscription_id
+        .parse()
+        .expect("SubscriptionId parse is infallible");
     RetrieveSubscription::new(sid).send(stripe).await.is_ok()
 }
 
