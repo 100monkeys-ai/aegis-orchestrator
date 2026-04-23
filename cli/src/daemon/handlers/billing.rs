@@ -1493,6 +1493,34 @@ fn extract_tier_from_subscription(obj: &serde_json::Value) -> Option<TenantTier>
         })
 }
 
+/// POST `/api/internal/invalidate-sessions` on the zaru-client for `user_id`.
+///
+/// Called after a successful `set_user_attribute` so that the next request from
+/// the affected user picks up the updated `zaru_tier` JWT claim without waiting
+/// for natural token expiry.  Silently no-ops when `ZARU_URL` or
+/// `ZARU_INTERNAL_SECRET` are not configured.
+async fn invalidate_zaru_sessions(state: &AppState, user_id: &str) {
+    let (url, secret) = match (
+        state.zaru_url.as_deref(),
+        state.zaru_internal_secret.as_deref(),
+    ) {
+        (Some(u), Some(s)) => (u, s),
+        _ => return,
+    };
+
+    let endpoint = format!("{}/api/internal/invalidate-sessions", url);
+    let client = reqwest::Client::new();
+    if let Err(e) = client
+        .post(&endpoint)
+        .bearer_auth(secret)
+        .json(&serde_json::json!({ "user_id": user_id }))
+        .send()
+        .await
+    {
+        warn!(error = %e, user_id, "Failed to invalidate zaru sessions");
+    }
+}
+
 /// Sync the billing tier to Keycloak's `zaru_tier` user attribute.
 async fn sync_tier_to_keycloak(
     state: &AppState,
@@ -1531,6 +1559,8 @@ async fn sync_tier_to_keycloak(
                         user_id = %user.id,
                         "Failed to sync zaru_tier to Keycloak"
                     );
+                } else {
+                    invalidate_zaru_sessions(state, &user.id).await;
                 }
             }
         }

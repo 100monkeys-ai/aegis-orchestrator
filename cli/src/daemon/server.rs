@@ -1982,6 +1982,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ) as Arc<dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository>
         }),
         billing_config: config.spec.billing.clone(),
+        zaru_url: std::env::var("ZARU_URL").ok(),
+        zaru_internal_secret: std::env::var("ZARU_INTERNAL_SECRET").ok(),
     };
 
     info!("Building router...");

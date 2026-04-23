@@ -124,4 +124,11 @@ pub(crate) struct AppState {
         Option<Arc<dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository>>,
     /// Stripe billing configuration from `NodeConfigSpec.billing`.
     pub(crate) billing_config: Option<aegis_orchestrator_core::domain::node_config::BillingConfig>,
+    /// Base URL for the zaru-client service (e.g. `https://myzaru.com`).
+    /// Loaded from the `ZARU_URL` environment variable. Used to call internal
+    /// endpoints such as `/api/internal/invalidate-sessions` after a tier change.
+    pub(crate) zaru_url: Option<String>,
+    /// Shared secret for zaru-client internal endpoints.
+    /// Loaded from the `ZARU_INTERNAL_SECRET` environment variable.
+    pub(crate) zaru_internal_secret: Option<String>,
 }
