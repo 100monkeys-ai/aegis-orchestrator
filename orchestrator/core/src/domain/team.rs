@@ -479,16 +479,17 @@ impl Team {
 
     /// Return the tier-specific seat cap (ADR-111 §Tier Gating).
     ///
-    /// - Pro: 5
-    /// - Business: 25
+    /// Business and Enterprise have no hard seat cap — owners may purchase
+    /// extra seats beyond the included count. Free, Pro, and System tiers
+    /// cannot own a colony (see [`TenantTier::allows_colony`]).
+    ///
+    /// - Business: unlimited (`u32::MAX`)
     /// - Enterprise: unlimited (`u32::MAX`)
-    /// - Free / System: 0 (no seats — teams cannot exist on these tiers)
+    /// - Free / Pro / System: 0 (no colony — teams cannot exist on these tiers)
     pub fn max_seats(&self) -> u32 {
         match self.tier {
-            TenantTier::Pro => 5,
-            TenantTier::Business => 25,
-            TenantTier::Enterprise => u32::MAX,
-            TenantTier::Free | TenantTier::System => 0,
+            TenantTier::Business | TenantTier::Enterprise => u32::MAX,
+            TenantTier::Free | TenantTier::Pro | TenantTier::System => 0,
         }
     }
 }
@@ -781,11 +782,14 @@ mod tests {
 
     #[test]
     fn max_seats_matches_tier_gating() {
+        // Pro cannot own a colony at the application layer (team_service),
+        // but domain-level Team::provision doesn't gate — so we can still
+        // construct one here and assert it has no seats.
         let pro = Team::provision("p".into(), "u".into(), TenantTier::Pro).unwrap();
         let biz = Team::provision("b".into(), "u".into(), TenantTier::Business).unwrap();
         let ent = Team::provision("e".into(), "u".into(), TenantTier::Enterprise).unwrap();
-        assert_eq!(pro.max_seats(), 5);
-        assert_eq!(biz.max_seats(), 25);
+        assert_eq!(pro.max_seats(), 0);
+        assert_eq!(biz.max_seats(), u32::MAX);
         assert_eq!(ent.max_seats(), u32::MAX);
     }
 
