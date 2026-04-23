@@ -1233,7 +1233,10 @@ pub(crate) async fn create_checkout_handler(
         .cancel_url(body.cancel_url.clone())
         .line_items(line_items)
         .metadata(tenant_meta)
-        .subscription_data(sub_data);
+        .subscription_data(sub_data)
+        // Enable the "Have a promotion code?" field on the Stripe Checkout page
+        // so users can apply promotional codes / discounts during signup.
+        .allow_promotion_codes(true);
 
     match params.send(&stripe).await {
         Ok(session) => {
