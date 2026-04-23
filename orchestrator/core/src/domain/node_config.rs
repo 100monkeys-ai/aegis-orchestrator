@@ -221,6 +221,10 @@ pub struct NodeConfigSpec {
     /// If omitted, billing endpoints return 501 Not Implemented.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing: Option<BillingConfig>,
+
+    /// Zaru consumer product configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zaru: Option<ZaruConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1398,6 +1402,15 @@ pub struct SealGatewayConfig {
     pub url: String,
 }
 
+/// Configuration for the Zaru consumer product service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZaruConfig {
+    /// Base URL for the zaru-client service. Supports `env:VAR_NAME` syntax.
+    pub public_url: String,
+    /// Shared secret for zaru-client internal endpoints. Supports `env:VAR_NAME` syntax.
+    pub internal_secret: String,
+}
+
 /// Stripe billing configuration (SaaS mode only).
 /// If omitted from `NodeConfigSpec`, billing endpoints return 501 Not Implemented.
 ///
@@ -1618,6 +1631,7 @@ impl Default for NodeConfigSpec {
             force_deploy_builtins: None,
             max_execution_list_limit: None,
             billing: None,
+            zaru: None,
         }
     }
 }
@@ -2189,6 +2203,7 @@ mod tests {
                 force_deploy_builtins: None,
                 max_execution_list_limit: None,
                 billing: None,
+                zaru: None,
             },
         };
 

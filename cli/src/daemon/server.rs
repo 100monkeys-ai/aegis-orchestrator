@@ -83,6 +83,7 @@ use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::{
     application::{
+        CorrelatedActivityStreamService,
         agent::AgentLifecycleService,
         execution::ExecutionService,
         execution::StandardExecutionService,
@@ -90,7 +91,6 @@ use aegis_orchestrator_core::{
         register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
         validation_service::ValidationService,
-        CorrelatedActivityStreamService,
     },
     domain::{
         cluster::{
@@ -98,12 +98,13 @@ use aegis_orchestrator_core::{
             NodeClusterRepository, NodeId, NodeRole,
         },
         iam::IdentityProvider,
-        node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
+        node_config::{IamConfig, IamRealmConfig, NodeConfigManifest, resolve_env_value},
         repository::AgentRepository,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
     },
     infrastructure::{
+        TemporalEventListener,
         event_bus::EventBus,
         iam::StandardIamService,
         llm::registry::ProviderRegistry,
@@ -115,9 +116,8 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::{connect_container_runtime, ContainerRuntime},
+        runtime::{ContainerRuntime, connect_container_runtime},
         temporal_client::TemporalClient,
-        TemporalEventListener,
     },
 };
 
@@ -1982,8 +1982,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ) as Arc<dyn aegis_orchestrator_core::infrastructure::repositories::BillingRepository>
         }),
         billing_config: config.spec.billing.clone(),
-        zaru_url: std::env::var("ZARU_PUBLIC_URL").ok(),
-        zaru_internal_secret: std::env::var("ZARU_INTERNAL_SECRET").ok(),
+        zaru_url: config
+            .spec
+            .zaru
+            .as_ref()
+            .and_then(|cfg| resolve_env_value(&cfg.public_url).ok()),
+        zaru_internal_secret: config
+            .spec
+            .zaru
+            .as_ref()
+            .and_then(|cfg| resolve_env_value(&cfg.internal_secret).ok()),
     };
 
     info!("Building router...");
