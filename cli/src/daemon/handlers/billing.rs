@@ -2128,25 +2128,64 @@ fn str_to_tier(s: &str) -> TenantTier {
     }
 }
 
-/// Try to extract the tier from a Stripe subscription object's plan/price metadata.
+/// Try to extract the tier from a Stripe subscription object.
+///
+/// The **price** metadata is ground truth — it reflects what the customer is
+/// actually being charged for right now. The subscription-level metadata is
+/// stamped at checkout creation and is **not updated by Stripe when the
+/// customer changes their plan via the billing portal**, so it goes stale on
+/// every upgrade/downgrade. We read the price metadata first and only fall
+/// back to the subscription metadata if no price metadata is found.
+///
+/// Among the subscription's items, we look for the base plan (`metadata.kind
+/// == "base"`). If the kind marker isn't present (older data), we take the
+/// first item whose metadata carries a `tier` field, which excludes seat
+/// add-ons with a different tier label.
 fn extract_tier_from_subscription(obj: &serde_json::Value) -> Option<TenantTier> {
-    // Check metadata first
+    let items = obj
+        .get("items")
+        .and_then(|items| items.get("data"))
+        .and_then(|d| d.as_array());
+
+    // Price metadata (ground truth — reflects current plan).
+    if let Some(items) = items {
+        // Prefer the item explicitly flagged as the base plan.
+        let base_tier = items
+            .iter()
+            .filter_map(|item| {
+                let meta = item.get("price").and_then(|p| p.get("metadata"))?;
+                let kind = meta.get("kind").and_then(|v| v.as_str())?;
+                if kind != "base" {
+                    return None;
+                }
+                meta.get("tier").and_then(|v| v.as_str()).map(str_to_tier)
+            })
+            .next();
+        if let Some(t) = base_tier {
+            return Some(t);
+        }
+
+        // Fallback: first item with a tier in its price metadata.
+        let any_tier = items
+            .iter()
+            .filter_map(|item| {
+                item.get("price")
+                    .and_then(|p| p.get("metadata"))
+                    .and_then(|m| m.get("tier"))
+                    .and_then(|v| v.as_str())
+                    .map(str_to_tier)
+            })
+            .next();
+        if let Some(t) = any_tier {
+            return Some(t);
+        }
+    }
+
+    // Last resort: subscription-level metadata. Stale after portal upgrades.
     obj.get("metadata")
         .and_then(|m| m.get("tier"))
         .and_then(|v| v.as_str())
         .map(str_to_tier)
-        .or_else(|| {
-            // Check items.data[0].price.metadata.tier
-            obj.get("items")
-                .and_then(|items| items.get("data"))
-                .and_then(|data| data.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|item| item.get("price"))
-                .and_then(|price| price.get("metadata"))
-                .and_then(|m| m.get("tier"))
-                .and_then(|v| v.as_str())
-                .map(str_to_tier)
-        })
 }
 
 /// POST `/api/internal/invalidate-sessions` on the zaru-client for `user_id`.
