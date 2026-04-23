@@ -190,32 +190,78 @@ fn included_seats_for_tier(tier: &str) -> u32 {
     }
 }
 
-// ── Seat price mapping (tier × interval → Stripe price ID) ─────────────────
+// ── Seat price identification (via Stripe price metadata) ──────────────────
+//
+// The bootstrap script stamps every Stripe price with `metadata.kind` — `base`
+// for plan prices and `seat` for seat add-ons — plus `metadata.tier` naming
+// the tier slug (pro / business / enterprise). The orchestrator reads those
+// metadata fields directly from webhook payloads and Stripe API responses so
+// the price IDs themselves are opaque. This lets Jeshua wipe and re-bootstrap
+// Stripe with fresh IDs without any code changes.
 
-/// Known seat add-on price IDs across all colony-capable tiers and billing
-/// intervals. Per ADR-111, Pro is personal-only and intentionally absent —
-/// there is no Pro seat add-on.
-const ALL_SEAT_PRICES: &[(&str, &str, &str)] = &[
-    ("business", "month", "price_1TMjj48rRJG9yuHz7zN7Xos0"),
-    ("business", "year", "price_1TMjj58rRJG9yuHzTR7JgC7N"),
-    ("enterprise", "month", "price_1TMjj68rRJG9yuHzH0fB8R1b"),
-    ("enterprise", "year", "price_1TMjj68rRJG9yuHzsUsJEE61"),
-];
-
-/// Look up the seat add-on price ID for a given tier and billing interval.
-fn seat_price_for_tier(tier: &str, interval: &str) -> Option<&'static str> {
-    ALL_SEAT_PRICES
-        .iter()
-        .find(|(t, i, _)| *t == tier && *i == interval)
-        .map(|(_, _, price_id)| *price_id)
+/// Given a Stripe subscription item JSON payload, return `(tier, interval)`
+/// if the item is a seat add-on (`price.metadata.kind == "seat"`), else None.
+///
+/// Both `tier` and `interval` come straight off the webhook payload:
+///   * `tier` from `price.metadata.tier`
+///   * `interval` from `price.recurring.interval`
+fn tier_for_seat_item(item: &serde_json::Value) -> Option<(String, String)> {
+    let price = item.get("price")?;
+    let metadata = price.get("metadata")?;
+    let kind = metadata.get("kind").and_then(|v| v.as_str())?;
+    if kind != "seat" {
+        return None;
+    }
+    let tier = metadata.get("tier").and_then(|v| v.as_str())?.to_string();
+    let interval = price
+        .get("recurring")
+        .and_then(|r| r.get("interval"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    Some((tier, interval))
 }
 
-/// Reverse-lookup: given a seat price ID, return `(tier, interval)`.
-fn tier_for_seat_price(price_id: &str) -> Option<(&'static str, &'static str)> {
-    ALL_SEAT_PRICES
-        .iter()
-        .find(|(_, _, pid)| *pid == price_id)
-        .map(|(tier, interval, _)| (*tier, *interval))
+/// Returns `true` if the subscription item is a seat add-on line
+/// (`price.metadata.kind == "seat"`).
+fn item_is_seat_addon(item: &serde_json::Value) -> bool {
+    item.get("price")
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("kind"))
+        .and_then(|v| v.as_str())
+        == Some("seat")
+}
+
+/// Query Stripe for the active seat price ID matching `(tier, interval)`.
+///
+/// Stripe's `prices.list` does not support metadata-keyed queries, so we list
+/// active prices and filter in-memory on `metadata.kind == "seat"` +
+/// `metadata.tier` + `recurring.interval`. Returns `None` when no matching
+/// price exists (e.g. freshly bootstrapped tier missing its seat add-on).
+async fn find_seat_price_id(client: &stripe::Client, tier: &str, interval: &str) -> Option<String> {
+    let prices = match ListPrice::new().active(true).limit(100).send(client).await {
+        Ok(list) => list.data,
+        Err(e) => {
+            warn!(error = %e, "Failed to list Stripe prices while resolving seat price");
+            return None;
+        }
+    };
+    for p in prices {
+        if p.metadata.get("kind").map(String::as_str) != Some("seat") {
+            continue;
+        }
+        if p.metadata.get("tier").map(String::as_str) != Some(tier) {
+            continue;
+        }
+        let price_interval = p
+            .recurring
+            .as_ref()
+            .map(|r| r.interval.as_str().to_string());
+        if price_interval.as_deref() != Some(interval) {
+            continue;
+        }
+        return Some(p.id.to_string());
+    }
+    None
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -1182,9 +1228,9 @@ async fn handle_subscription_updated(
     // seat_count aligned with what Stripe actually bills, and publishes a
     // SeatCountChanged domain event whenever the values diverge.
     //
-    // We locate the seat add-on line item by matching its price ID against
-    // ALL_SEAT_PRICES rather than assuming data[0] is the seat item — on
-    // multi-item subscriptions data[0] is the base plan (quantity=1).
+    // We locate the seat add-on line item by matching `price.metadata.kind ==
+    // "seat"` rather than assuming data[0] is the seat item — on multi-item
+    // subscriptions data[0] is the base plan (quantity=1).
     let tier_str_for_seats = tier_to_str(&tier);
     let included = included_seats_for_tier(tier_str_for_seats);
     let new_seats_u32: u32 = obj
@@ -1194,13 +1240,7 @@ async fn handle_subscription_updated(
         .map(|arr| {
             let addon_qty: u32 = arr
                 .iter()
-                .find(|item| {
-                    item.get("price")
-                        .and_then(|p| p.get("id"))
-                        .and_then(|id| id.as_str())
-                        .map(|pid| ALL_SEAT_PRICES.iter().any(|(_, _, known)| *known == pid))
-                        .unwrap_or(false)
-                })
+                .find(|item| item_is_seat_addon(item))
                 .and_then(|item| item.get("quantity"))
                 .and_then(|q| q.as_u64())
                 .map(|q| q.min(u32::MAX as u64) as u32)
@@ -1301,11 +1341,7 @@ async fn migrate_seat_addon_if_needed(
 
     // Find a seat add-on item whose price belongs to a *different* tier
     let seat_item = items.iter().find_map(|item| {
-        let price_id = item
-            .get("price")
-            .and_then(|p| p.get("id"))
-            .and_then(|id| id.as_str())?;
-        let (seat_tier, interval) = tier_for_seat_price(price_id)?;
+        let (seat_tier, interval) = tier_for_seat_item(item)?;
         if seat_tier != new_tier_str {
             let item_id = item.get("id").and_then(|id| id.as_str())?;
             let quantity = item.get("quantity").and_then(|q| q.as_u64()).unwrap_or(1);
@@ -1320,17 +1356,6 @@ async fn migrate_seat_addon_if_needed(
         None => return, // no mismatched seat item — nothing to do
     };
 
-    let new_seat_price = match seat_price_for_tier(new_tier_str, interval) {
-        Some(p) => p,
-        None => {
-            warn!(
-                tier = new_tier_str,
-                interval, "No seat price configured for tier/interval — cannot migrate seat add-on"
-            );
-            return;
-        }
-    };
-
     // Build a Stripe client to perform the migration
     let billing = match &state.billing_config {
         Some(c) => c,
@@ -1339,6 +1364,18 @@ async fn migrate_seat_addon_if_needed(
     let stripe_client = match stripe_client_from_config(billing) {
         Some(c) => c,
         None => return,
+    };
+
+    let new_seat_price = match find_seat_price_id(&stripe_client, new_tier_str, &interval).await {
+        Some(p) => p,
+        None => {
+            warn!(
+                tier = new_tier_str,
+                interval = %interval,
+                "No active Stripe seat price (metadata.kind=seat) for tier/interval — cannot migrate seat add-on"
+            );
+            return;
+        }
     };
 
     let sub_id_str = match subscription_obj.get("id").and_then(|v| v.as_str()) {
@@ -1358,7 +1395,7 @@ async fn migrate_seat_addon_if_needed(
         },
         // Add the new tier's seat item with the same quantity
         UpdateSubscriptionItems {
-            price: Some(new_seat_price.to_string()),
+            price: Some(new_seat_price.clone()),
             quantity: Some(quantity),
             ..Default::default()
         },
@@ -1827,14 +1864,6 @@ mod tests {
     }
 
     #[test]
-    fn all_seat_prices_excludes_pro() {
-        // Regression for ADR-111 Phase 2: Pro has no seat add-on price.
-        for (tier, _, _) in ALL_SEAT_PRICES {
-            assert_ne!(*tier, "pro", "Pro must not appear in ALL_SEAT_PRICES");
-        }
-    }
-
-    #[test]
     fn pro_has_zero_included_seats() {
         assert_eq!(included_seats_for_tier("pro"), 0);
     }
@@ -1888,69 +1917,131 @@ mod tests {
         assert_eq!(extract_tier_from_subscription(&obj), None);
     }
 
-    // ── seat_price_for_tier tests ──────────────────────────────────────────
+    // ── tier_for_seat_item tests ───────────────────────────────────────────
+    //
+    // Seat add-ons are identified by `price.metadata.kind == "seat"` on the
+    // webhook payload. Price IDs are opaque — Jeshua can wipe/rebuild Stripe
+    // without touching code. `tier` and `interval` come from the same payload.
 
     #[test]
-    fn seat_price_for_tier_returns_correct_prices() {
-        // Per ADR-111: Pro has no seat add-on — `seat_price_for_tier("pro", _)`
-        // must return None.
-        assert_eq!(seat_price_for_tier("pro", "month"), None);
-        assert_eq!(seat_price_for_tier("pro", "year"), None);
+    fn tier_for_seat_item_returns_tier_from_metadata() {
+        let item = serde_json::json!({
+            "id": "si_test",
+            "quantity": 3,
+            "price": {
+                "id": "price_opaque_id",
+                "metadata": { "kind": "seat", "tier": "business" },
+                "recurring": { "interval": "month" }
+            }
+        });
         assert_eq!(
-            seat_price_for_tier("business", "month"),
-            Some("price_1TMjj48rRJG9yuHz7zN7Xos0")
+            tier_for_seat_item(&item),
+            Some(("business".to_string(), "month".to_string()))
         );
+
+        let item_year = serde_json::json!({
+            "price": {
+                "metadata": { "kind": "seat", "tier": "enterprise" },
+                "recurring": { "interval": "year" }
+            }
+        });
         assert_eq!(
-            seat_price_for_tier("business", "year"),
-            Some("price_1TMjj58rRJG9yuHzTR7JgC7N")
-        );
-        assert_eq!(
-            seat_price_for_tier("enterprise", "month"),
-            Some("price_1TMjj68rRJG9yuHzH0fB8R1b")
-        );
-        assert_eq!(
-            seat_price_for_tier("enterprise", "year"),
-            Some("price_1TMjj68rRJG9yuHzsUsJEE61")
+            tier_for_seat_item(&item_year),
+            Some(("enterprise".to_string(), "year".to_string()))
         );
     }
 
     #[test]
-    fn seat_price_for_tier_returns_none_for_unknown() {
-        assert_eq!(seat_price_for_tier("free", "month"), None);
-        assert_eq!(seat_price_for_tier("pro", "weekly"), None);
-    }
-
-    // ── tier_for_seat_price tests ──────────────────────────────────────────
-
-    #[test]
-    fn tier_for_seat_price_reverse_lookup() {
-        // Per ADR-111: the Pro seat price IDs are no longer recognized —
-        // they were removed with the rest of the Pro seat-add-on plumbing.
-        assert_eq!(tier_for_seat_price("price_1TMjj28rRJG9yuHzezvbHaSx"), None);
-        assert_eq!(
-            tier_for_seat_price("price_1TMjj58rRJG9yuHzTR7JgC7N"),
-            Some(("business", "year"))
-        );
-        assert_eq!(
-            tier_for_seat_price("price_1TMjj68rRJG9yuHzsUsJEE61"),
-            Some(("enterprise", "year"))
-        );
+    fn tier_for_seat_item_returns_none_for_base_kind() {
+        // Base plan items (metadata.kind == "base") must not be classified as
+        // seat add-ons — that would cause the reconciliation path to treat
+        // the base plan quantity as extra seats.
+        let item = serde_json::json!({
+            "price": {
+                "id": "price_base_plan",
+                "metadata": { "kind": "base", "tier": "business" },
+                "recurring": { "interval": "month" }
+            }
+        });
+        assert_eq!(tier_for_seat_item(&item), None);
     }
 
     #[test]
-    fn tier_for_seat_price_returns_none_for_unknown() {
-        assert_eq!(tier_for_seat_price("price_unknown_123"), None);
+    fn tier_for_seat_item_returns_none_without_metadata() {
+        // Degrade gracefully when metadata is missing (e.g. a price that
+        // predates the bootstrap stamping). Must not panic or misclassify.
+        let no_metadata = serde_json::json!({
+            "price": { "id": "price_legacy", "recurring": { "interval": "month" } }
+        });
+        assert_eq!(tier_for_seat_item(&no_metadata), None);
+
+        let no_kind = serde_json::json!({
+            "price": {
+                "metadata": { "tier": "business" },
+                "recurring": { "interval": "month" }
+            }
+        });
+        assert_eq!(tier_for_seat_item(&no_kind), None);
+
+        let no_tier = serde_json::json!({
+            "price": {
+                "metadata": { "kind": "seat" },
+                "recurring": { "interval": "month" }
+            }
+        });
+        assert_eq!(tier_for_seat_item(&no_tier), None);
+
+        let no_interval = serde_json::json!({
+            "price": {
+                "metadata": { "kind": "seat", "tier": "business" }
+            }
+        });
+        assert_eq!(tier_for_seat_item(&no_interval), None);
+    }
+
+    #[test]
+    fn item_is_seat_addon_only_true_for_seat_kind() {
+        let seat = serde_json::json!({
+            "price": { "metadata": { "kind": "seat", "tier": "business" } }
+        });
+        assert!(item_is_seat_addon(&seat));
+
+        let base = serde_json::json!({
+            "price": { "metadata": { "kind": "base", "tier": "business" } }
+        });
+        assert!(!item_is_seat_addon(&base));
+
+        let bare = serde_json::json!({ "price": { "id": "price_x" } });
+        assert!(!item_is_seat_addon(&bare));
     }
 
     // ── seat_count reconciliation logic tests ─────────────────────────────
 
-    /// Helper: build a minimal subscription.updated items payload.
-    fn make_items_payload(items: &[(&str, u64)]) -> serde_json::Value {
+    /// Test payload item kind — base plan or seat add-on. Matches the
+    /// `metadata.kind` stamp the bootstrap script applies to every price.
+    enum ItemKind {
+        Base,
+        Seat,
+    }
+
+    /// Helper: build a minimal subscription.updated items payload. Each item
+    /// is stamped with `price.metadata.kind` and `price.metadata.tier` to
+    /// match what the bootstrap script produces — that is the sole signal the
+    /// orchestrator uses to classify items.
+    fn make_items_payload(items: &[(ItemKind, &str, &str, u64)]) -> serde_json::Value {
         let data: Vec<serde_json::Value> = items
             .iter()
-            .map(|(price_id, qty)| {
+            .map(|(kind, tier, interval, qty)| {
+                let kind_str = match kind {
+                    ItemKind::Base => "base",
+                    ItemKind::Seat => "seat",
+                };
                 serde_json::json!({
-                    "price": { "id": price_id },
+                    "price": {
+                        "id": format!("price_opaque_{}_{}_{}", kind_str, tier, interval),
+                        "metadata": { "kind": kind_str, "tier": tier },
+                        "recurring": { "interval": interval }
+                    },
                     "quantity": qty
                 })
             })
@@ -1968,13 +2059,7 @@ mod tests {
             .map(|arr| {
                 let addon_qty: u32 = arr
                     .iter()
-                    .find(|item| {
-                        item.get("price")
-                            .and_then(|p| p.get("id"))
-                            .and_then(|id| id.as_str())
-                            .map(|pid| ALL_SEAT_PRICES.iter().any(|(_, _, known)| *known == pid))
-                            .unwrap_or(false)
-                    })
+                    .find(|item| item_is_seat_addon(item))
                     .and_then(|item| item.get("quantity"))
                     .and_then(|q| q.as_u64())
                     .map(|q| q.min(u32::MAX as u64) as u32)
@@ -1990,21 +2075,20 @@ mod tests {
     /// seat count with no add-on added.
     #[test]
     fn reconcile_seats_single_item_base_plan_only() {
-        // Business base plan price (not a seat add-on price)
-        let obj = make_items_payload(&[("price_basePlanBusinessMonthly", 1)]);
+        // Business base plan (metadata.kind=base) only, no seat add-on.
+        let obj = make_items_payload(&[(ItemKind::Base, "business", "month", 1)]);
         // Business includes 5 seats; with no seat add-on that should be the total.
         assert_eq!(compute_reconciled_seats(&obj, "business"), 5);
     }
 
     /// Bug regression: multi-item subscription with base plan + seat add-on.
     /// Previously data[0] (the base plan, qty=1) was used, giving seat_count=1.
-    /// The fix must find the seat add-on by price ID and sum correctly.
+    /// The fix must find the seat add-on by metadata.kind and sum correctly.
     #[test]
     fn reconcile_seats_multi_item_finds_addon_not_base_plan() {
-        let business_seat_price = "price_1TMjj48rRJG9yuHz7zN7Xos0"; // business/month
         let obj = make_items_payload(&[
-            ("price_basePlanBusinessMonthly", 1), // base plan — must NOT be used
-            (business_seat_price, 5),             // seat add-on: 5 extra
+            (ItemKind::Base, "business", "month", 1), // base plan — must NOT be used
+            (ItemKind::Seat, "business", "month", 5), // seat add-on: 5 extra
         ]);
         // Business included=5, addon=5 → total=10
         assert_eq!(compute_reconciled_seats(&obj, "business"), 10);
@@ -2013,10 +2097,9 @@ mod tests {
     /// Seat add-on at position 0 (Stripe may reorder items) is still found.
     #[test]
     fn reconcile_seats_addon_first_in_list() {
-        let business_seat_price = "price_1TMjj48rRJG9yuHz7zN7Xos0"; // business/month
         let obj = make_items_payload(&[
-            (business_seat_price, 2),      // seat add-on comes first
-            ("price_basePlanBusiness", 1), // base plan
+            (ItemKind::Seat, "business", "month", 2), // seat add-on comes first
+            (ItemKind::Base, "business", "month", 1), // base plan
         ]);
         // Business included=5, addon=2 → total=7
         assert_eq!(compute_reconciled_seats(&obj, "business"), 7);
@@ -2036,8 +2119,10 @@ mod tests {
         // This test validates the logic is prefix-agnostic; the gate removal
         // itself is structural (no `if starts_with("t-")` wrapper), which this
         // helper exercises without any prefix filtering.
-        let business_seat_price = "price_1TMjj48rRJG9yuHz7zN7Xos0";
-        let obj = make_items_payload(&[("price_basePlan", 1), (business_seat_price, 2)]);
+        let obj = make_items_payload(&[
+            (ItemKind::Base, "business", "month", 1),
+            (ItemKind::Seat, "business", "month", 2),
+        ]);
         assert_eq!(compute_reconciled_seats(&obj, "business"), 7); // 5 included + 2 addon
     }
 
