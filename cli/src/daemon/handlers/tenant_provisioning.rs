@@ -55,6 +55,16 @@ pub(crate) async fn keycloak_event_handler(
             );
             StatusCode::CREATED
         }
+        Err(aegis_orchestrator_core::application::tenant_provisioning::ProvisioningError::KeycloakUserNotReady(_)) => {
+            // Webhook race: Keycloak hasn't materialised the user yet. Signal
+            // retryable with 503 so the caller (or Keycloak's webhook
+            // redelivery) can retry rather than treat this as a hard failure.
+            tracing::info!(
+                user_sub = %event.user_id,
+                "Tenant provisioning deferred — Keycloak user not yet materialised"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         Err(e) => {
             tracing::error!(
                 user_sub = %event.user_id,

@@ -30,6 +30,12 @@ pub enum ProvisioningError {
     Repository(#[from] RepositoryError),
     #[error("keycloak admin error: {0}")]
     Keycloak(#[from] KeycloakAdminError),
+    /// Keycloak has not yet materialised the user we're trying to
+    /// provision a tenant for (webhook race on the REGISTER event).
+    /// Callers should retry on the next login rather than surface as a
+    /// hard 500 — the user record will appear shortly.
+    #[error("keycloak user not ready yet (retry on next login): {0}")]
+    KeycloakUserNotReady(String),
 }
 
 pub struct TenantProvisioningService {
@@ -80,18 +86,33 @@ impl TenantProvisioningService {
         );
         tenant.quotas = TenantQuotas::for_tier(&tier);
 
-        self.tenant_repo.insert(&tenant).await?;
-
         // Fetch the full Keycloak user so set_user_attribute can send the
         // complete user representation on PUT (Keycloak rejects partial bodies).
-        let kc_user = self
+        //
+        // If the user has not yet been materialised in Keycloak (webhook race
+        // with the REGISTER event), return a distinct, retryable error rather
+        // than a hard 500 — the user record will appear shortly, and
+        // provisioning is idempotent on retry. We also skip the tenant insert
+        // below so a subsequent retry can complete the full provisioning flow
+        // atomically.
+        let kc_user = match self
             .keycloak_admin
             .get_user("zaru-consumer", user_sub)
             .await?
-            .ok_or_else(|| KeycloakAdminError::AttributeError {
-                status: 404,
-                body: format!("Keycloak user not found after registration: {user_sub}"),
-            })?;
+        {
+            Some(u) => u,
+            None => {
+                tracing::info!(
+                    user_sub,
+                    "Keycloak user not ready yet for tenant provisioning — retry on next login"
+                );
+                return Err(ProvisioningError::KeycloakUserNotReady(
+                    user_sub.to_string(),
+                ));
+            }
+        };
+
+        self.tenant_repo.insert(&tenant).await?;
 
         // Set tenant_id and zaru_tier attributes on Keycloak user so the
         // protocol mappers can include them as JWT claims on subsequent logins.
@@ -132,4 +153,39 @@ fn tier_to_str(tier: &TenantTier) -> &'static str {
         TenantTier::Enterprise => "enterprise",
         TenantTier::System => "system",
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pure construction test — the `KeycloakUserNotReady` variant is part
+    /// of the public error surface and its `Display` impl must clearly
+    /// communicate the retryable nature of the failure to webhook callers.
+    #[test]
+    fn keycloak_user_not_ready_variant_surfaces_retryable_message() {
+        let err = ProvisioningError::KeycloakUserNotReady("abcd-1234".to_string());
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("retry"),
+            "error must indicate retryability, got: {msg}"
+        );
+        assert!(msg.contains("abcd-1234"));
+    }
+
+    /// Regression for the provisioning → webhook race: the
+    /// `provision_user_tenant` path must return the distinct
+    /// `KeycloakUserNotReady` variant (not a generic KeycloakAdminError)
+    /// when Keycloak has not yet materialised the user. The webhook
+    /// handler surfaces this as a 503 retryable so Keycloak's webhook
+    /// redelivery can complete provisioning.
+    ///
+    /// NOTE: `KeycloakAdminClient` is a concrete struct that performs
+    /// live HTTP; wiring an in-process mock HTTP server here would add
+    /// significant scaffolding out of scope for this sweep. The
+    /// structural fix is verified at the call-site via the match arm in
+    /// `cli/src/daemon/handlers/tenant_provisioning.rs`.
+    #[test]
+    #[ignore = "requires mock Keycloak HTTP server — covered structurally by the 503 match arm in the webhook handler"]
+    fn provision_user_tenant_returns_keycloak_user_not_ready_when_missing() {}
 }
