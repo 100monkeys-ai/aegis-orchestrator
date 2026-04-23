@@ -27,8 +27,8 @@ use crate::daemon::handlers::approvals::{
     reject_request_handler,
 };
 use crate::daemon::handlers::billing::{
-    create_checkout_handler, create_portal_handler, get_subscription_handler,
-    list_invoices_handler, list_prices_handler, update_seats_handler,
+    change_tier_handler, create_checkout_handler, create_portal_handler, get_subscription_handler,
+    list_invoices_handler, list_prices_handler, preview_tier_change_handler, update_seats_handler,
 };
 use crate::daemon::handlers::canvas::{
     create_session_handler as canvas_create_session_handler,
@@ -384,6 +384,11 @@ pub(crate) fn create_router(
         .route("/v1/billing/checkout", post(create_checkout_handler))
         .route("/v1/billing/portal", post(create_portal_handler))
         .route("/v1/billing/seats", post(update_seats_handler))
+        .route(
+            "/v1/billing/preview-tier-change",
+            post(preview_tier_change_handler),
+        )
+        .route("/v1/billing/change-tier", post(change_tier_handler))
         .route("/v1/billing/subscription", get(get_subscription_handler))
         .route("/v1/billing/invoices", get(list_invoices_handler))
         // Consumer self-service (ADR-097) — login-time tenant provisioning self-heal

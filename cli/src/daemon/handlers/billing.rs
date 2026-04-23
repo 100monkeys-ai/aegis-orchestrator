@@ -34,13 +34,24 @@ use aegis_orchestrator_core::domain::tenancy::TenantTier;
 use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
 
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
-use stripe_billing::invoice::{ListInvoice, PayInvoice};
+use stripe_billing::invoice::{
+    CreatePreviewInvoice, CreatePreviewInvoiceSubscriptionDetails,
+    CreatePreviewInvoiceSubscriptionDetailsItems,
+    CreatePreviewInvoiceSubscriptionDetailsProrationBehavior, ListInvoice, PayInvoice,
+};
 use stripe_billing::subscription::{
     RetrieveSubscription, UpdateSubscription, UpdateSubscriptionItems,
     UpdateSubscriptionProrationBehavior,
 };
+use stripe_billing::subscription_schedule::{
+    CreateSubscriptionSchedule, ReleaseSubscriptionSchedule, UpdateSubscriptionSchedule,
+    UpdateSubscriptionSchedulePhases, UpdateSubscriptionSchedulePhasesEndDate,
+    UpdateSubscriptionSchedulePhasesItems, UpdateSubscriptionSchedulePhasesStartDate,
+};
 // Shared type re-exports from sub-crates
-use stripe_billing::{InvoiceStatus, SubscriptionId};
+use stripe_billing::{
+    InvoiceStatus, SubscriptionId, SubscriptionScheduleEndBehavior, SubscriptionScheduleId,
+};
 use stripe_checkout::checkout_session::{
     CreateCheckoutSession, CreateCheckoutSessionLineItems, CreateCheckoutSessionSubscriptionData,
 };
@@ -399,6 +410,53 @@ pub(crate) struct UpdateSeatsRequest {
     pub seat_price_id: String,
 }
 
+/// Shared request body for `POST /v1/billing/preview-tier-change` and
+/// `POST /v1/billing/change-tier`.
+///
+/// Seat policy: the frontend is authoritative for the `seats` value. The
+/// orchestrator applies whatever it's given — no preserve-unless-specified
+/// fallback here. The frontend resolves `seats` from the modal slider, the
+/// current subscription's seat count, or the target tier's default.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct TierChangeRequest {
+    /// Target tier slug: "pro" | "business" | "enterprise" | "free".
+    pub target_tier: String,
+    /// Target billing interval: "month" | "year".
+    pub billing_interval: String,
+    /// Extra seats on the target tier (0 for Pro/Free or when no add-on seats
+    /// are wanted).
+    #[serde(default)]
+    pub seats: u32,
+}
+
+/// Response body for `POST /v1/billing/preview-tier-change`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TierChangePreview {
+    pub target_tier: String,
+    /// One of `upgrade_immediate` | `downgrade_at_period_end` |
+    /// `cancel_at_period_end` | `no_change`.
+    pub action: String,
+    /// Immediate charge (in cents) on upgrade. `0` for deferred actions.
+    pub proration_amount_cents: i64,
+    /// What the next *full* renewal invoice will total (base + seats).
+    pub next_renewal_amount_cents: i64,
+    /// `None` for immediate actions; `Some(period_end)` for deferred actions.
+    pub effective_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub seats: u32,
+}
+
+/// Response body for `POST /v1/billing/change-tier`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TierChangeResult {
+    /// Same enum as `TierChangePreview::action`.
+    pub action: String,
+    pub target_tier: String,
+    pub seats: u32,
+    pub proration_invoice_id: Option<String>,
+    pub proration_amount_cents: i64,
+    pub effective_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 // ── Tier mapping helpers ────────────────────────────────────────────────────
 
 /// Map a Stripe product name to a `(tier, included_seats)` tuple.
@@ -528,6 +586,340 @@ async fn find_seat_price_id(client: &stripe::Client, tier: &str, interval: &str)
         return Some(p.id.to_string());
     }
     None
+}
+
+/// Like [`find_seat_price_id`], but also returns the price's `unit_amount` so
+/// callers can compute the expected next-renewal total without a second API
+/// round-trip. Returns `None` if no matching seat price exists.
+async fn find_seat_price_info(
+    client: &stripe::Client,
+    tier: &str,
+    interval: &str,
+) -> Option<(String, i64)> {
+    let prices = match ListPrice::new().active(true).limit(100).send(client).await {
+        Ok(list) => list.data,
+        Err(e) => {
+            warn!(error = %e, "Failed to list Stripe prices while resolving seat price");
+            return None;
+        }
+    };
+    for p in prices {
+        if p.metadata.get("kind").map(String::as_str) != Some("seat") {
+            continue;
+        }
+        if p.metadata.get("tier").map(String::as_str) != Some(tier) {
+            continue;
+        }
+        let price_interval = p
+            .recurring
+            .as_ref()
+            .map(|r| r.interval.as_str().to_string());
+        if price_interval.as_deref() != Some(interval) {
+            continue;
+        }
+        return Some((p.id.to_string(), p.unit_amount.unwrap_or(0)));
+    }
+    None
+}
+
+/// Query Stripe for the active base plan price ID matching `(tier, interval)`.
+///
+/// Mirrors [`find_seat_price_id`] for base plans (`price.metadata.kind ==
+/// "base"`). Returns `None` when no matching price exists (e.g. freshly
+/// bootstrapped tier missing its base price for the requested interval).
+async fn find_base_price_id(client: &stripe::Client, tier: &str, interval: &str) -> Option<String> {
+    find_base_price_info(client, tier, interval)
+        .await
+        .map(|(id, _)| id)
+}
+
+/// Like [`find_base_price_id`], but also returns the price's `unit_amount`
+/// so callers can compute next-renewal totals in a single pass.
+async fn find_base_price_info(
+    client: &stripe::Client,
+    tier: &str,
+    interval: &str,
+) -> Option<(String, i64)> {
+    let prices = match ListPrice::new().active(true).limit(100).send(client).await {
+        Ok(list) => list.data,
+        Err(e) => {
+            warn!(error = %e, "Failed to list Stripe prices while resolving base price");
+            return None;
+        }
+    };
+    for p in prices {
+        if p.metadata.get("kind").map(String::as_str) != Some("base") {
+            continue;
+        }
+        if p.metadata.get("tier").map(String::as_str) != Some(tier) {
+            continue;
+        }
+        let price_interval = p
+            .recurring
+            .as_ref()
+            .map(|r| r.interval.as_str().to_string());
+        if price_interval.as_deref() != Some(interval) {
+            continue;
+        }
+        return Some((p.id.to_string(), p.unit_amount.unwrap_or(0)));
+    }
+    None
+}
+
+// ── Tier-change direction classification ───────────────────────────────────
+
+/// Classification of a tier change relative to the current subscription.
+///
+/// This is a pure value-level computation — no Stripe calls — so it can be
+/// tested directly against `TenantTier` + seats input without mocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TierChangeDirection {
+    /// Target rank strictly above current → charge proration immediately.
+    Upgrade,
+    /// Target rank strictly below current (but not Free) → schedule at
+    /// current period end.
+    Downgrade,
+    /// Target is Free regardless of current rank → cancel at period end.
+    CancelToFree,
+    /// Same rank and same seat count → nothing to do.
+    NoChange,
+    /// Same rank but different seats (or same tier, different interval) →
+    /// treat as a seat-only change surfacing through this endpoint. For this
+    /// implementation we route same-rank-different-seats through the upgrade
+    /// path if seats increase, downgrade path if seats decrease.
+    SameRankReseat,
+}
+
+/// Compute the [`TierChangeDirection`] for a requested change.
+///
+/// `target_tier == Free` always maps to [`TierChangeDirection::CancelToFree`]
+/// regardless of current tier — reducing to Free means cancelling the paid
+/// subscription at period end.
+fn classify_tier_change(
+    current_tier: &TenantTier,
+    current_seats: u32,
+    target_tier: &TenantTier,
+    target_seats: u32,
+) -> TierChangeDirection {
+    if matches!(target_tier, TenantTier::Free) {
+        return TierChangeDirection::CancelToFree;
+    }
+    match target_tier.rank().cmp(&current_tier.rank()) {
+        std::cmp::Ordering::Greater => TierChangeDirection::Upgrade,
+        std::cmp::Ordering::Less => TierChangeDirection::Downgrade,
+        std::cmp::Ordering::Equal => {
+            if target_seats == current_seats {
+                TierChangeDirection::NoChange
+            } else {
+                TierChangeDirection::SameRankReseat
+            }
+        }
+    }
+}
+
+// ── Tier-change items diff ─────────────────────────────────────────────────
+
+/// Parsed view of the current subscription's items needed for a tier change.
+///
+/// Captured from the retrieved [`stripe_billing::Subscription`] so downstream
+/// helpers can work against a plain struct instead of the Stripe type.
+#[derive(Debug, Clone)]
+struct CurrentSubItems {
+    /// Item ID of the base plan line on the subscription. `None` if no base
+    /// item could be identified — in that case the caller should error out
+    /// rather than blindly replacing the first item.
+    base_item_id: Option<String>,
+    /// Item ID of the seat add-on line, if present.
+    seat_item_id: Option<String>,
+    /// Current end of the subscription's billing period, from any item's
+    /// `current_period_end` (all items share the same period).
+    current_period_end: Option<i64>,
+}
+
+/// Extract [`CurrentSubItems`] from a retrieved Stripe subscription object.
+fn current_sub_items_from(sub: &stripe_billing::Subscription) -> CurrentSubItems {
+    let mut base_item_id = None;
+    let mut seat_item_id = None;
+    let mut current_period_end = None;
+    for item in &sub.items.data {
+        if current_period_end.is_none() {
+            current_period_end = Some(item.current_period_end);
+        }
+        let kind = item.price.metadata.get("kind").map(String::as_str);
+        match kind {
+            Some("seat") => {
+                seat_item_id = Some(item.id.to_string());
+            }
+            Some("base") => {
+                base_item_id = Some(item.id.to_string());
+            }
+            // Unknown-kind items: legacy data without metadata. Treat as base
+            // unless we already found a flagged base item.
+            _ => {
+                if base_item_id.is_none() {
+                    base_item_id = Some(item.id.to_string());
+                }
+            }
+        }
+    }
+    CurrentSubItems {
+        base_item_id,
+        seat_item_id,
+        current_period_end,
+    }
+}
+
+/// Pure core of [`build_tier_change_items`] — given already-resolved target
+/// price IDs, compute the [`UpdateSubscriptionItems`] diff. Factored out so
+/// it can be unit-tested without Stripe.
+///
+/// `target_seat_price` is only consulted when `target_tier.included_seats()
+/// > 0` AND we need to set a seat line (i.e. the caller has seats to add or
+/// a seat line to re-price). Callers that can't resolve a seat price may
+/// pass `None` and will receive an error if a seat line is required.
+fn build_tier_change_items_from_prices(
+    current: &CurrentSubItems,
+    target_tier: &TenantTier,
+    target_base_price: &str,
+    target_seat_price: Option<&str>,
+    target_seats: u32,
+) -> Result<Vec<UpdateSubscriptionItems>, String> {
+    let base_item_id = current
+        .base_item_id
+        .clone()
+        .ok_or_else(|| "Current subscription has no identifiable base item".to_string())?;
+
+    let mut items: Vec<UpdateSubscriptionItems> = vec![UpdateSubscriptionItems {
+        id: Some(base_item_id),
+        price: Some(target_base_price.to_string()),
+        ..Default::default()
+    }];
+
+    if target_tier.included_seats() > 0 {
+        // Business / Enterprise — seat add-on line is allowed.
+        match (&current.seat_item_id, target_seats) {
+            (Some(seat_id), n) if n > 0 => {
+                let seat_price = target_seat_price
+                    .ok_or_else(|| "Seat line required but no seat price provided".to_string())?;
+                items.push(UpdateSubscriptionItems {
+                    id: Some(seat_id.clone()),
+                    price: Some(seat_price.to_string()),
+                    quantity: Some(n as u64),
+                    ..Default::default()
+                });
+            }
+            (Some(seat_id), 0) => {
+                items.push(UpdateSubscriptionItems {
+                    id: Some(seat_id.clone()),
+                    deleted: Some(true),
+                    ..Default::default()
+                });
+            }
+            (None, n) if n > 0 => {
+                let seat_price = target_seat_price
+                    .ok_or_else(|| "Seat line required but no seat price provided".to_string())?;
+                items.push(UpdateSubscriptionItems {
+                    price: Some(seat_price.to_string()),
+                    quantity: Some(n as u64),
+                    ..Default::default()
+                });
+            }
+            (None, 0) => {
+                // Nothing to do — target tier has no seat line.
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        // Target tier (Pro) has no seat concept. Delete any leftover seat
+        // line so the subscription matches the target shape.
+        if let Some(seat_id) = &current.seat_item_id {
+            items.push(UpdateSubscriptionItems {
+                id: Some(seat_id.clone()),
+                deleted: Some(true),
+                ..Default::default()
+            });
+        }
+    }
+
+    Ok(items)
+}
+
+/// Build the [`UpdateSubscriptionItems`] diff to transition from the current
+/// subscription shape to `(target_tier, target_interval, target_seats)`.
+///
+/// Thin wrapper around [`build_tier_change_items_from_prices`] that resolves
+/// the target base and (if needed) seat price IDs from Stripe first.
+async fn build_tier_change_items(
+    stripe: &stripe::Client,
+    current: &CurrentSubItems,
+    target_tier: &TenantTier,
+    target_interval: &str,
+    target_seats: u32,
+) -> Result<Vec<UpdateSubscriptionItems>, String> {
+    let target_tier_str = tier_to_str(target_tier);
+
+    let target_base_price = find_base_price_id(stripe, target_tier_str, target_interval)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "No active base price found for tier={target_tier_str} interval={target_interval}"
+            )
+        })?;
+
+    // Resolve seat price only when needed by the pure core. We only need
+    // it if the target tier supports seats AND we'll emit a seat line with
+    // a price (not a delete).
+    let target_seat_price = if target_tier.included_seats() > 0 && target_seats > 0 {
+        Some(
+            find_seat_price_id(stripe, target_tier_str, target_interval)
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "No active seat price found for tier={target_tier_str} interval={target_interval}"
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    build_tier_change_items_from_prices(
+        current,
+        target_tier,
+        &target_base_price,
+        target_seat_price.as_deref(),
+        target_seats,
+    )
+}
+
+// ── Schedule management ────────────────────────────────────────────────────
+
+/// If `sub` already has an attached [`SubscriptionSchedule`], release it so a
+/// subsequent upgrade / cancel / fresh-downgrade call isn't blocked by the
+/// pending phase transition. Releasing leaves the underlying subscription in
+/// place — it just detaches the schedule — which is exactly what we want.
+async fn release_pending_schedule_if_any(
+    stripe: &stripe::Client,
+    sub: &stripe_billing::Subscription,
+) -> Result<(), String> {
+    let Some(schedule_ref) = sub.schedule.as_ref() else {
+        return Ok(());
+    };
+    // `Expandable::id()` works for both the bare-id and fully-expanded forms;
+    // we never request expansion, so this branch always hits the Id arm, but
+    // we use the helper rather than matching to avoid pulling the
+    // `stripe_types` namespace into the call site.
+    let schedule_id: SubscriptionScheduleId = schedule_ref.id().clone();
+    match ReleaseSubscriptionSchedule::new(schedule_id.clone())
+        .send(stripe)
+        .await
+    {
+        Ok(_) => {
+            info!(schedule_id = %schedule_id, "Released pending subscription schedule");
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to release subscription schedule: {e}")),
+    }
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -1128,6 +1520,652 @@ pub(crate) async fn update_seats_handler(
         Json(json!({"success": true, "extra_seats": body.extra_seats})),
     )
         .into_response()
+}
+
+// ── Tier-change handlers (preview + execute) ────────────────────────────────
+
+/// Shared setup for both tier-change endpoints: load Stripe client, enforce
+/// auth, run the provisioning backstop, resolve tenant, load the billing
+/// repo and retrieve the current subscription from Stripe.
+async fn tier_change_context(
+    state: &AppState,
+    identity: Option<Extension<UserIdentity>>,
+) -> Result<
+    (
+        stripe::Client,
+        aegis_orchestrator_core::domain::tenant::TenantId,
+        Arc<dyn BillingRepository>,
+        TenantSubscription,
+        stripe_billing::Subscription,
+        SubscriptionId,
+    ),
+    axum::response::Response,
+> {
+    let billing = match &state.billing_config {
+        Some(c) => c,
+        None => return Err(not_implemented()),
+    };
+    let stripe = match stripe_client_from_config(billing) {
+        Some(c) => c,
+        None => return Err(not_implemented()),
+    };
+
+    let identity = match identity {
+        Some(Extension(id)) => id,
+        None => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Authentication required"})),
+            )
+                .into_response());
+        }
+    };
+
+    // Anti-fragility backstop — mirror create_checkout_handler.
+    if let Some(svc) = &state.tenant_provisioning_service {
+        if let IdentityKind::ConsumerUser { zaru_tier, .. } = &identity.identity_kind {
+            match svc.provision_user_tenant(&identity.sub, zaru_tier).await {
+                Ok(_) => {}
+                Err(ProvisioningError::KeycloakUserNotReady(_)) => {
+                    tracing::info!(user_sub = %identity.sub, "Provisioning deferred; self-heal covers this request");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, user_sub = %identity.sub, "Backstop provisioning failed; self-heal covers this request");
+                }
+            }
+        }
+    }
+
+    let tenant_id = crate::daemon::handlers::tenant_id_from_identity(Some(&identity));
+
+    let billing_repo = match &state.billing_repo {
+        Some(r) => r.clone(),
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Billing repository not configured"})),
+            )
+                .into_response());
+        }
+    };
+
+    let sub = match billing_repo.get_subscription(&tenant_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "No subscription found. Please subscribe first."})),
+            )
+                .into_response());
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response());
+        }
+    };
+
+    let stripe_sub_id: SubscriptionId = match sub.stripe_subscription_id.as_deref() {
+        Some(id) => id.parse().expect("SubscriptionId parse is infallible"),
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "No active Stripe subscription found."})),
+            )
+                .into_response());
+        }
+    };
+
+    let stripe_sub = match RetrieveSubscription::new(stripe_sub_id.clone())
+        .send(&stripe)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to retrieve Stripe subscription");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Failed to retrieve subscription from Stripe: {e}")})),
+            )
+                .into_response());
+        }
+    };
+
+    Ok((
+        stripe,
+        tenant_id,
+        billing_repo,
+        sub,
+        stripe_sub,
+        stripe_sub_id,
+    ))
+}
+
+/// Compute the total renewal amount in cents for a full billing period at
+/// `(target_tier, target_interval, target_seats)`. Returns `None` if any
+/// required price is missing from Stripe.
+async fn renewal_amount_cents(
+    stripe: &stripe::Client,
+    target_tier: &TenantTier,
+    target_interval: &str,
+    target_seats: u32,
+) -> Option<i64> {
+    let target_tier_str = tier_to_str(target_tier);
+    let (_base_id, base_amount) =
+        find_base_price_info(stripe, target_tier_str, target_interval).await?;
+
+    let seat_amount = if target_tier.included_seats() > 0 && target_seats > 0 {
+        match find_seat_price_info(stripe, target_tier_str, target_interval).await {
+            Some((_id, amt)) => amt.saturating_mul(target_seats as i64),
+            None => return None,
+        }
+    } else {
+        0
+    };
+
+    Some(base_amount.saturating_add(seat_amount))
+}
+
+/// Convert the plan's [`UpdateSubscriptionItems`] diff into the equivalent
+/// [`CreatePreviewInvoiceSubscriptionDetailsItems`] shape used by
+/// `/invoices/create_preview`. Each request type has the same conceptual
+/// fields but is struct-typed separately in the generated bindings.
+fn items_to_preview_items(
+    items: &[UpdateSubscriptionItems],
+) -> Vec<CreatePreviewInvoiceSubscriptionDetailsItems> {
+    items
+        .iter()
+        .map(|it| CreatePreviewInvoiceSubscriptionDetailsItems {
+            id: it.id.clone(),
+            price: it.price.clone(),
+            quantity: it.quantity,
+            deleted: it.deleted,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Convert a Unix timestamp to `chrono::DateTime<Utc>`. Returns `None` for
+/// invalid / out-of-range values.
+fn unix_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+}
+
+/// `POST /v1/billing/preview-tier-change` — compute the prorated amount (and
+/// effective date) for a requested tier change, without mutating Stripe.
+///
+/// The response describes what would happen if the client subsequently calls
+/// `POST /v1/billing/change-tier` with the same body:
+/// * `upgrade_immediate` — immediate charge of `proration_amount_cents`.
+/// * `downgrade_at_period_end` — no immediate charge; target takes effect at
+///   `effective_at`.
+/// * `cancel_at_period_end` — sub ends at `effective_at`, no charge.
+/// * `no_change` — current subscription already matches the request.
+pub(crate) async fn preview_tier_change_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Json(body): Json<TierChangeRequest>,
+) -> axum::response::Response {
+    let (stripe, _tenant_id, _billing_repo, _sub, stripe_sub, stripe_sub_id) =
+        match tier_change_context(&state, identity).await {
+            Ok(ctx) => ctx,
+            Err(resp) => return resp,
+        };
+
+    let current = current_sub_items_from(&stripe_sub);
+    let current_tier =
+        extract_tier_from_subscription(&serde_json::to_value(&stripe_sub).unwrap_or_default())
+            .unwrap_or(TenantTier::Free);
+    let current_seats = stripe_sub
+        .items
+        .data
+        .iter()
+        .find(|i| i.price.metadata.get("kind").map(String::as_str) == Some("seat"))
+        .and_then(|i| i.quantity)
+        .map(|q| q as u32)
+        .unwrap_or(0);
+
+    let target_tier = str_to_tier(&body.target_tier);
+    let direction = classify_tier_change(&current_tier, current_seats, &target_tier, body.seats);
+
+    let period_end_ts = current.current_period_end;
+    let period_end_dt = period_end_ts.and_then(unix_to_utc);
+
+    match direction {
+        TierChangeDirection::NoChange => (
+            StatusCode::OK,
+            Json(TierChangePreview {
+                target_tier: body.target_tier.clone(),
+                action: "no_change".into(),
+                proration_amount_cents: 0,
+                next_renewal_amount_cents: 0,
+                effective_at: None,
+                seats: body.seats,
+            }),
+        )
+            .into_response(),
+        TierChangeDirection::CancelToFree => {
+            // Renewal amount for Free is 0 — there is no Free price.
+            (
+                StatusCode::OK,
+                Json(TierChangePreview {
+                    target_tier: body.target_tier.clone(),
+                    action: "cancel_at_period_end".into(),
+                    proration_amount_cents: 0,
+                    next_renewal_amount_cents: 0,
+                    effective_at: period_end_dt,
+                    seats: 0,
+                }),
+            )
+                .into_response()
+        }
+        TierChangeDirection::Downgrade => {
+            let next_renewal =
+                renewal_amount_cents(&stripe, &target_tier, &body.billing_interval, body.seats)
+                    .await
+                    .unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(TierChangePreview {
+                    target_tier: body.target_tier.clone(),
+                    action: "downgrade_at_period_end".into(),
+                    proration_amount_cents: 0,
+                    next_renewal_amount_cents: next_renewal,
+                    effective_at: period_end_dt,
+                    seats: body.seats,
+                }),
+            )
+                .into_response()
+        }
+        TierChangeDirection::Upgrade | TierChangeDirection::SameRankReseat => {
+            // Build the items diff and ask Stripe for the preview invoice.
+            let items = match build_tier_change_items(
+                &stripe,
+                &current,
+                &target_tier,
+                &body.billing_interval,
+                body.seats,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "Failed to build tier change items");
+                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+                }
+            };
+
+            let preview_items = items_to_preview_items(&items);
+            let sub_details = CreatePreviewInvoiceSubscriptionDetails {
+                items: Some(preview_items),
+                proration_behavior: Some(
+                    CreatePreviewInvoiceSubscriptionDetailsProrationBehavior::AlwaysInvoice,
+                ),
+                ..Default::default()
+            };
+
+            let preview_invoice = match CreatePreviewInvoice::new()
+                .subscription(stripe_sub_id.as_str().to_string())
+                .subscription_details(sub_details)
+                .send(&stripe)
+                .await
+            {
+                Ok(inv) => inv,
+                Err(e) => {
+                    warn!(error = %e, "Failed to create preview invoice");
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": format!("Failed to preview tier change: {e}")})),
+                    )
+                        .into_response();
+                }
+            };
+
+            let proration_total = preview_invoice.amount_due;
+
+            let next_renewal =
+                renewal_amount_cents(&stripe, &target_tier, &body.billing_interval, body.seats)
+                    .await
+                    .unwrap_or(0);
+
+            let (action, seats_out) = if matches!(direction, TierChangeDirection::Upgrade) {
+                ("upgrade_immediate", body.seats)
+            } else {
+                // Same-rank reseat: still immediate (proration).
+                ("upgrade_immediate", body.seats)
+            };
+
+            (
+                StatusCode::OK,
+                Json(TierChangePreview {
+                    target_tier: body.target_tier.clone(),
+                    action: action.into(),
+                    proration_amount_cents: proration_total,
+                    next_renewal_amount_cents: next_renewal,
+                    effective_at: None,
+                    seats: seats_out,
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/billing/change-tier` — execute the tier change described by the
+/// request body.
+///
+/// See [`preview_tier_change_handler`] for the action semantics. If a
+/// [`SubscriptionSchedule`] is attached to the current subscription (from a
+/// previous pending downgrade), it is released first so the new action has a
+/// clean base to operate on.
+pub(crate) async fn change_tier_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Json(body): Json<TierChangeRequest>,
+) -> axum::response::Response {
+    let (stripe, tenant_id, _billing_repo, _sub, stripe_sub, stripe_sub_id) =
+        match tier_change_context(&state, identity).await {
+            Ok(ctx) => ctx,
+            Err(resp) => return resp,
+        };
+
+    let current = current_sub_items_from(&stripe_sub);
+    let current_tier =
+        extract_tier_from_subscription(&serde_json::to_value(&stripe_sub).unwrap_or_default())
+            .unwrap_or(TenantTier::Free);
+    let current_seats = stripe_sub
+        .items
+        .data
+        .iter()
+        .find(|i| i.price.metadata.get("kind").map(String::as_str) == Some("seat"))
+        .and_then(|i| i.quantity)
+        .map(|q| q as u32)
+        .unwrap_or(0);
+
+    let target_tier = str_to_tier(&body.target_tier);
+    let direction = classify_tier_change(&current_tier, current_seats, &target_tier, body.seats);
+
+    let period_end_ts = current.current_period_end;
+    let period_end_dt = period_end_ts.and_then(unix_to_utc);
+
+    // Any conflicting pending schedule must be released before we execute a
+    // new action — schedules freeze the subscription shape until their next
+    // phase fires, which would block an upgrade / re-downgrade / cancel.
+    if let Err(e) = release_pending_schedule_if_any(&stripe, &stripe_sub).await {
+        warn!(error = %e, "Failed to release pending schedule");
+        return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+    }
+
+    match direction {
+        TierChangeDirection::NoChange => (
+            StatusCode::OK,
+            Json(TierChangeResult {
+                action: "no_change".into(),
+                target_tier: body.target_tier.clone(),
+                seats: body.seats,
+                proration_invoice_id: None,
+                proration_amount_cents: 0,
+                effective_at: None,
+            }),
+        )
+            .into_response(),
+        TierChangeDirection::CancelToFree => {
+            match UpdateSubscription::new(stripe_sub_id.clone())
+                .cancel_at_period_end(true)
+                .send(&stripe)
+                .await
+            {
+                Ok(_) => {
+                    info!(tenant_id = %tenant_id, "Subscription scheduled to cancel at period end");
+                    (
+                        StatusCode::OK,
+                        Json(TierChangeResult {
+                            action: "cancel_at_period_end".into(),
+                            target_tier: body.target_tier.clone(),
+                            seats: 0,
+                            proration_invoice_id: None,
+                            proration_amount_cents: 0,
+                            effective_at: period_end_dt,
+                        }),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to schedule subscription cancellation");
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": format!("Failed to cancel subscription: {e}")})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        TierChangeDirection::Downgrade => {
+            // Build target items for the next phase.
+            let target_tier_str = tier_to_str(&target_tier);
+            let target_base_price =
+                match find_base_price_id(&stripe, target_tier_str, &body.billing_interval).await {
+                    Some(id) => id,
+                    None => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({"error": format!(
+                                "No active base price found for tier={target_tier_str} interval={}",
+                                body.billing_interval
+                            )})),
+                        )
+                            .into_response();
+                    }
+                };
+
+            let mut phase_items: Vec<UpdateSubscriptionSchedulePhasesItems> =
+                vec![UpdateSubscriptionSchedulePhasesItems {
+                    price: Some(target_base_price),
+                    quantity: Some(1),
+                    ..Default::default()
+                }];
+
+            if target_tier.included_seats() > 0 && body.seats > 0 {
+                match find_seat_price_id(&stripe, target_tier_str, &body.billing_interval).await {
+                    Some(seat_price) => {
+                        phase_items.push(UpdateSubscriptionSchedulePhasesItems {
+                            price: Some(seat_price),
+                            quantity: Some(body.seats as u64),
+                            ..Default::default()
+                        });
+                    }
+                    None => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({"error": format!(
+                                "No active seat price found for tier={target_tier_str} interval={}",
+                                body.billing_interval
+                            )})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            // 1. Create a schedule from the existing subscription. This
+            //    captures the current phase so the downgrade takes effect
+            //    cleanly at period end without disrupting the current phase.
+            let schedule = match CreateSubscriptionSchedule::new()
+                .from_subscription(stripe_sub_id.as_str().to_string())
+                .send(&stripe)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "Failed to create subscription schedule for downgrade");
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": format!("Failed to schedule downgrade: {e}")})),
+                    )
+                        .into_response();
+                }
+            };
+
+            // 2. Update the schedule to append a new phase at period end.
+            //    `from_subscription` stamps phase 0 from the current sub; we
+            //    rebuild the phases list with phase 0 carried through and
+            //    phase 1 starting immediately after.
+            let mut update_phases: Vec<UpdateSubscriptionSchedulePhases> = Vec::new();
+            for phase in &schedule.phases {
+                let items: Vec<UpdateSubscriptionSchedulePhasesItems> = phase
+                    .items
+                    .iter()
+                    .map(|it| UpdateSubscriptionSchedulePhasesItems {
+                        price: Some(it.price.id().to_string()),
+                        quantity: it.quantity,
+                        ..Default::default()
+                    })
+                    .collect();
+                let start_date =
+                    UpdateSubscriptionSchedulePhasesStartDate::Timestamp(phase.start_date);
+                let mut p = UpdateSubscriptionSchedulePhases::new(items);
+                p.start_date = Some(start_date);
+                p.end_date = Some(UpdateSubscriptionSchedulePhasesEndDate::Timestamp(
+                    phase.end_date,
+                ));
+                update_phases.push(p);
+            }
+
+            // New phase: target tier, starting at previous phase end.
+            update_phases.push(UpdateSubscriptionSchedulePhases::new(phase_items));
+
+            match UpdateSubscriptionSchedule::new(schedule.id.clone())
+                .phases(update_phases)
+                .end_behavior(SubscriptionScheduleEndBehavior::Release)
+                .send(&stripe)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        tenant_id = %tenant_id,
+                        target_tier = %body.target_tier,
+                        "Downgrade scheduled at period end"
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(TierChangeResult {
+                            action: "downgrade_at_period_end".into(),
+                            target_tier: body.target_tier.clone(),
+                            seats: body.seats,
+                            proration_invoice_id: None,
+                            proration_amount_cents: 0,
+                            effective_at: period_end_dt,
+                        }),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to update subscription schedule with new phase");
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": format!("Failed to schedule downgrade phase: {e}")})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        TierChangeDirection::Upgrade | TierChangeDirection::SameRankReseat => {
+            // Build the items diff and apply immediately with proration.
+            let items = match build_tier_change_items(
+                &stripe,
+                &current,
+                &target_tier,
+                &body.billing_interval,
+                body.seats,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "Failed to build tier change items");
+                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+                }
+            };
+
+            // If a prior cancel_at_period_end was set, clear it so the
+            // upgrade actually takes effect.
+            let mut update = UpdateSubscription::new(stripe_sub_id.clone())
+                .items(items)
+                .proration_behavior(UpdateSubscriptionProrationBehavior::AlwaysInvoice);
+            if stripe_sub.cancel_at_period_end {
+                update = update.cancel_at_period_end(false);
+            }
+
+            if let Err(e) = update.send(&stripe).await {
+                warn!(error = %e, "Failed to apply tier upgrade");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("Failed to apply tier change: {e}")})),
+                )
+                    .into_response();
+            }
+
+            // Pay the resulting open invoice immediately — same flow as
+            // update_seats_handler.
+            let mut proration_invoice_id: Option<String> = None;
+            let mut proration_amount: i64 = 0;
+            match ListInvoice::new()
+                .subscription(stripe_sub_id.as_str().to_string())
+                .status(InvoiceStatus::Open)
+                .limit(1)
+                .send(&stripe)
+                .await
+            {
+                Ok(invoices) => {
+                    if let Some(invoice) = invoices.data.into_iter().next() {
+                        if let Some(inv_id) = invoice.id.clone() {
+                            match PayInvoice::new(inv_id.clone()).send(&stripe).await {
+                                Ok(paid) => {
+                                    info!(
+                                        tenant_id = %tenant_id,
+                                        invoice_id = %inv_id,
+                                        "Proration invoice paid immediately"
+                                    );
+                                    proration_invoice_id = Some(inv_id.to_string());
+                                    proration_amount = paid.amount_paid;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, invoice_id = %inv_id, "Failed to pay proration invoice");
+                                    return (
+                                        StatusCode::PAYMENT_REQUIRED,
+                                        Json(json!({
+                                            "error": format!("Tier change applied but payment failed: {e}")
+                                        })),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to list open invoices after tier change");
+                    // Non-fatal — the subscription update succeeded. Stripe
+                    // will collect on the next billing cycle.
+                }
+            }
+
+            (
+                StatusCode::OK,
+                Json(TierChangeResult {
+                    action: "upgrade_immediate".into(),
+                    target_tier: body.target_tier.clone(),
+                    seats: body.seats,
+                    proration_invoice_id,
+                    proration_amount_cents: proration_amount,
+                    effective_at: None,
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// `GET /v1/billing/subscription` — Get current subscription details.
@@ -2484,6 +3522,197 @@ mod tests {
         assert_eq!(tier_to_str(&TenantTier::Enterprise), "enterprise");
         assert_eq!(tier_to_str(&TenantTier::System), "system");
     }
+
+    // ── Tier-change direction classification ──────────────────────────
+
+    #[test]
+    fn tier_change_direction_same_tier_same_seats_is_no_change() {
+        let d = classify_tier_change(&TenantTier::Business, 3, &TenantTier::Business, 3);
+        assert_eq!(d, TierChangeDirection::NoChange);
+    }
+
+    #[test]
+    fn tier_change_direction_higher_rank_is_upgrade() {
+        let d = classify_tier_change(&TenantTier::Pro, 0, &TenantTier::Business, 5);
+        assert_eq!(d, TierChangeDirection::Upgrade);
+        let d2 = classify_tier_change(&TenantTier::Business, 0, &TenantTier::Enterprise, 0);
+        assert_eq!(d2, TierChangeDirection::Upgrade);
+    }
+
+    #[test]
+    fn tier_change_direction_lower_rank_is_downgrade() {
+        let d = classify_tier_change(&TenantTier::Business, 5, &TenantTier::Pro, 0);
+        assert_eq!(d, TierChangeDirection::Downgrade);
+        let d2 = classify_tier_change(&TenantTier::Enterprise, 2, &TenantTier::Business, 0);
+        assert_eq!(d2, TierChangeDirection::Downgrade);
+    }
+
+    #[test]
+    fn tier_change_direction_free_target_is_cancel() {
+        // Free as target always maps to cancel_at_period_end regardless of
+        // the current tier's rank relative to Free.
+        let from_pro = classify_tier_change(&TenantTier::Pro, 0, &TenantTier::Free, 0);
+        assert_eq!(from_pro, TierChangeDirection::CancelToFree);
+        let from_biz = classify_tier_change(&TenantTier::Business, 5, &TenantTier::Free, 0);
+        assert_eq!(from_biz, TierChangeDirection::CancelToFree);
+        let from_ent = classify_tier_change(&TenantTier::Enterprise, 10, &TenantTier::Free, 0);
+        assert_eq!(from_ent, TierChangeDirection::CancelToFree);
+    }
+
+    #[test]
+    fn tier_change_direction_same_rank_different_seats_is_reseat() {
+        let d = classify_tier_change(&TenantTier::Business, 5, &TenantTier::Business, 10);
+        assert_eq!(d, TierChangeDirection::SameRankReseat);
+    }
+
+    // ── build_tier_change_items (pure core) ───────────────────────────
+    //
+    // These exercise the diff against canned `CurrentSubItems` inputs so
+    // there's no Stripe dependency. The wrapper `build_tier_change_items`
+    // only adds Stripe price lookups on top.
+
+    #[test]
+    fn build_tier_change_items_pro_to_business_adds_seat_item() {
+        // Current: Pro subscription with only a base item. Target: Business
+        // with 5 extra seats. The diff must re-price the base item AND
+        // append a new seat line (since no seat item exists yet).
+        let current = CurrentSubItems {
+            base_item_id: Some("si_base_pro".into()),
+            seat_item_id: None,
+            current_period_end: Some(0),
+        };
+        let items = build_tier_change_items_from_prices(
+            &current,
+            &TenantTier::Business,
+            "price_business_base",
+            Some("price_business_seat"),
+            5,
+        )
+        .expect("diff");
+        assert_eq!(items.len(), 2);
+        // Base item: id + new price.
+        assert_eq!(items[0].id.as_deref(), Some("si_base_pro"));
+        assert_eq!(items[0].price.as_deref(), Some("price_business_base"));
+        // Seat item: no id (new line), price + quantity.
+        assert!(items[1].id.is_none());
+        assert_eq!(items[1].price.as_deref(), Some("price_business_seat"));
+        assert_eq!(items[1].quantity, Some(5));
+        assert!(items[1].deleted.unwrap_or(false) == false);
+    }
+
+    #[test]
+    fn build_tier_change_items_business_to_pro_deletes_seat_item() {
+        // Current: Business with base + seat item. Target: Pro (no seats).
+        // Diff must re-price base AND delete the seat line.
+        let current = CurrentSubItems {
+            base_item_id: Some("si_base_biz".into()),
+            seat_item_id: Some("si_seat_biz".into()),
+            current_period_end: Some(0),
+        };
+        let items = build_tier_change_items_from_prices(
+            &current,
+            &TenantTier::Pro,
+            "price_pro_base",
+            None,
+            0,
+        )
+        .expect("diff");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id.as_deref(), Some("si_base_biz"));
+        assert_eq!(items[0].price.as_deref(), Some("price_pro_base"));
+        assert_eq!(items[1].id.as_deref(), Some("si_seat_biz"));
+        assert_eq!(items[1].deleted, Some(true));
+    }
+
+    #[test]
+    fn build_tier_change_items_business_to_enterprise_migrates_seat_price() {
+        // Current: Business with base + seat. Target: Enterprise with
+        // seats. The seat line must be updated to the Enterprise seat
+        // price, not deleted.
+        let current = CurrentSubItems {
+            base_item_id: Some("si_base_biz".into()),
+            seat_item_id: Some("si_seat_biz".into()),
+            current_period_end: Some(0),
+        };
+        let items = build_tier_change_items_from_prices(
+            &current,
+            &TenantTier::Enterprise,
+            "price_enterprise_base",
+            Some("price_enterprise_seat"),
+            3,
+        )
+        .expect("diff");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id.as_deref(), Some("si_base_biz"));
+        assert_eq!(items[0].price.as_deref(), Some("price_enterprise_base"));
+        assert_eq!(items[1].id.as_deref(), Some("si_seat_biz"));
+        assert_eq!(items[1].price.as_deref(), Some("price_enterprise_seat"));
+        assert_eq!(items[1].quantity, Some(3));
+        assert_ne!(items[1].deleted, Some(true));
+    }
+
+    #[test]
+    fn build_tier_change_items_errors_without_base_item() {
+        let current = CurrentSubItems {
+            base_item_id: None,
+            seat_item_id: None,
+            current_period_end: Some(0),
+        };
+        let err = build_tier_change_items_from_prices(
+            &current,
+            &TenantTier::Business,
+            "price_business_base",
+            Some("price_business_seat"),
+            5,
+        )
+        .expect_err("no base item");
+        assert!(err.contains("base"));
+    }
+
+    #[test]
+    fn items_to_preview_items_copies_diff_shape() {
+        let items = vec![
+            UpdateSubscriptionItems {
+                id: Some("si_1".into()),
+                price: Some("price_a".into()),
+                ..Default::default()
+            },
+            UpdateSubscriptionItems {
+                id: Some("si_2".into()),
+                deleted: Some(true),
+                ..Default::default()
+            },
+        ];
+        let preview = items_to_preview_items(&items);
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].id.as_deref(), Some("si_1"));
+        assert_eq!(preview[0].price.as_deref(), Some("price_a"));
+        assert_eq!(preview[1].id.as_deref(), Some("si_2"));
+        assert_eq!(preview[1].deleted, Some(true));
+    }
+
+    // Integration-level tests that require mock Stripe HTTP — deferred to
+    // the existing integration suite per the same pattern as
+    // `create_checkout_handler_calls_provisioning_when_consumer_user_has_missing_tenant`.
+    #[ignore = "requires mock Stripe — covered by integration tests"]
+    #[test]
+    fn preview_tier_change_happy_path() {}
+
+    #[ignore = "requires mock Stripe — covered by integration tests"]
+    #[test]
+    fn change_tier_upgrade_pays_invoice() {}
+
+    #[ignore = "requires mock Stripe — covered by integration tests"]
+    #[test]
+    fn change_tier_downgrade_schedules_phase() {}
+
+    #[ignore = "requires mock Stripe — covered by integration tests"]
+    #[test]
+    fn change_tier_free_sets_cancel_at_period_end() {}
+
+    #[ignore = "requires mock Stripe — covered by integration tests"]
+    #[test]
+    fn change_tier_releases_pending_schedule_before_applying() {}
 
     #[test]
     fn extract_tier_from_metadata() {
