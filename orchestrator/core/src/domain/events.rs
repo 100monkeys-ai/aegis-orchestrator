@@ -1310,6 +1310,53 @@ pub enum TenantEvent {
     },
 }
 
+/// Cross-context drift events — emitted whenever a cached external
+/// identifier (Stripe customer/subscription, Keycloak user/realm) is
+/// discovered to be missing or stale at the point of use. Observers can
+/// route these to alerting, reconciliation jobs, or audit trails.
+///
+/// Producers treat cached IDs as hints, not contracts — every miss is
+/// self-healed if possible and surfaced here for observability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DriftEvent {
+    /// A Keycloak user referenced by a cached tenant/subscription no
+    /// longer exists in the expected realm.
+    KeycloakUserMissing {
+        tenant_id: TenantId,
+        user_sub: String,
+        detected_at: DateTime<Utc>,
+    },
+    /// A Keycloak realm referenced by enterprise tenant sync no longer
+    /// exists or cannot be listed.
+    KeycloakRealmMissing {
+        realm: String,
+        tenant_id: Option<TenantId>,
+        detected_at: DateTime<Utc>,
+    },
+    /// A Stripe customer referenced by a cached mapping no longer
+    /// exists on Stripe's side (e.g. sandbox reset).
+    StripeCustomerMissing {
+        customer_id: String,
+        tenant_id: Option<TenantId>,
+        detected_at: DateTime<Utc>,
+    },
+    /// A Stripe subscription referenced by a cached mapping no longer
+    /// exists.
+    StripeSubscriptionMissing {
+        subscription_id: String,
+        tenant_id: TenantId,
+        detected_at: DateTime<Utc>,
+    },
+    /// A tenant subscription row references a team tenant whose
+    /// underlying team aggregate is missing — a dangling/orphaned
+    /// subscription row.
+    OrphanSubscription {
+        tenant_id: TenantId,
+        stripe_customer_id: String,
+        detected_at: DateTime<Utc>,
+    },
+}
+
 /// Rate limit enforcement events (ADR-072).
 ///
 /// Published by [`crate::infrastructure::rate_limit::CompositeRateLimitEnforcer`] when a
