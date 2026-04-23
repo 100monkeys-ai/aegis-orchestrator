@@ -1521,7 +1521,36 @@ async fn invalidate_zaru_sessions(state: &AppState, user_id: &str) {
     }
 }
 
+/// Derive the Keycloak user `sub` (UUID with hyphens) from a per-user consumer
+/// `TenantId` of the form `u-<32 hex chars>`.  Returns `None` for any other
+/// tenant ID format.
+fn consumer_tenant_id_to_user_sub(
+    tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+) -> Option<String> {
+    let s = tenant_id.as_str().strip_prefix("u-")?;
+    if s.len() != 32 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &s[0..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..32]
+    ))
+}
+
 /// Sync the billing tier to Keycloak's `zaru_tier` user attribute.
+///
+/// For per-user consumer tenants (`u-<hex>`): derives the Keycloak sub from the
+/// tenant ID and updates only that single user in `zaru-consumer`.
+///
+/// For enterprise tenants (`tenant-<slug>`): lists users in the dedicated realm
+/// (enterprise realms have exactly one user per tenant).
+///
+/// The shared consumer realm sentinel (`"zaru-consumer"`) is rejected — billing
+/// events always carry per-user tenant IDs, never the shared realm slug.
 async fn sync_tier_to_keycloak(
     state: &AppState,
     tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
@@ -1537,35 +1566,63 @@ async fn sync_tier_to_keycloak(
 
     let tier_value = tier_to_str(tier);
 
-    // For consumer tenants, the realm is "zaru-consumer".
-    // For enterprise tenants, the realm is "tenant-{slug}".
-    let realm = if tenant_id.is_consumer() {
-        "zaru-consumer".to_string()
-    } else {
-        format!("tenant-{}", tenant_id.as_str())
-    };
+    if tenant_id.is_consumer() {
+        // The literal "zaru-consumer" slug should never appear in billing events.
+        warn!(
+            tenant_id = %tenant_id,
+            "sync_tier_to_keycloak received shared consumer realm slug — expected a per-user tenant ID; skipping"
+        );
+        return;
+    }
 
-    // List all users in the realm and update their zaru_tier attribute.
-    // In practice, consumer tenants have a single user per subscription.
-    match kc.list_realm_users(&realm).await {
-        Ok(users) => {
-            for user in users {
+    if let Some(user_sub) = consumer_tenant_id_to_user_sub(tenant_id) {
+        // Per-user consumer tenant: update only the single affected user.
+        let realm = "zaru-consumer";
+        match kc.get_user(realm, &user_sub).await {
+            Ok(Some(user)) => {
                 if let Err(e) = kc
-                    .set_user_attribute(&realm, &user, "zaru_tier", tier_value)
+                    .set_user_attribute(realm, &user, "zaru_tier", tier_value)
                     .await
                 {
                     warn!(
                         error = %e,
-                        user_id = %user.id,
+                        user_id = %user_sub,
                         "Failed to sync zaru_tier to Keycloak"
                     );
                 } else {
                     invalidate_zaru_sessions(state, &user.id).await;
                 }
             }
+            Ok(None) => {
+                warn!(user_sub = %user_sub, "Keycloak user not found for consumer tenant sync");
+            }
+            Err(e) => {
+                warn!(error = %e, user_sub = %user_sub, "Failed to fetch Keycloak user for tier sync");
+            }
         }
-        Err(e) => {
-            warn!(error = %e, realm = %realm, "Failed to list users for tier sync");
+    } else {
+        // Enterprise tenant: dedicated realm, one user per realm.
+        let realm = format!("tenant-{}", tenant_id.as_str());
+        match kc.list_realm_users(&realm).await {
+            Ok(users) => {
+                for user in users {
+                    if let Err(e) = kc
+                        .set_user_attribute(&realm, &user, "zaru_tier", tier_value)
+                        .await
+                    {
+                        warn!(
+                            error = %e,
+                            user_id = %user.id,
+                            "Failed to sync zaru_tier to Keycloak"
+                        );
+                    } else {
+                        invalidate_zaru_sessions(state, &user.id).await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, realm = %realm, "Failed to list users for tier sync");
+            }
         }
     }
 }
@@ -1892,5 +1949,27 @@ mod tests {
 
         // Pre-existing attributes are preserved (not nulled out).
         assert_eq!(put_body["attributes"]["tenant_id"][0], "u-pro-user");
+    }
+
+    // ── consumer_tenant_id_to_user_sub regression ─────────────────────────
+
+    #[test]
+    fn consumer_tenant_id_to_user_sub_round_trips() {
+        use aegis_orchestrator_core::domain::tenant::TenantId;
+
+        // Valid per-user consumer tenant ID → UUID with hyphens.
+        let tenant_id = TenantId::from_string("u-d7f8170035d349b6b237c391ccc19035").unwrap();
+        assert_eq!(
+            consumer_tenant_id_to_user_sub(&tenant_id),
+            Some("d7f81700-35d3-49b6-b237-c391ccc19035".to_string())
+        );
+
+        // The shared consumer realm slug is not a per-user tenant — must return None.
+        let shared = TenantId::consumer();
+        assert_eq!(consumer_tenant_id_to_user_sub(&shared), None);
+
+        // An enterprise tenant slug is not a per-user consumer tenant — must return None.
+        let enterprise = TenantId::from_string("acme-corp").unwrap();
+        assert_eq!(consumer_tenant_id_to_user_sub(&enterprise), None);
     }
 }

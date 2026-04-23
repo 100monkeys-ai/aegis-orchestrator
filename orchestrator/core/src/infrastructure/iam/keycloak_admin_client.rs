@@ -241,13 +241,13 @@ impl KeycloakAdminClient {
         Ok(())
     }
 
-    /// List all users in a realm.
+    /// List all users in a realm (up to 1000).
     pub async fn list_realm_users(
         &self,
         realm: &str,
     ) -> Result<Vec<KeycloakUser>, KeycloakAdminError> {
         let token = self.get_admin_token().await?;
-        let url = format!("{}/admin/realms/{}/users", self.config.host, realm);
+        let url = format!("{}/admin/realms/{}/users?max=1000", self.config.host, realm);
 
         let resp = self.http.get(&url).bearer_auth(&token).send().await?;
 
