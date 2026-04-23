@@ -155,6 +155,7 @@ impl BillingService for StripeBillingService {
             created_at: now,
             updated_at: now,
             seat_count: 1,
+            user_sub: None,
         };
         self.subscription_repo
             .upsert_subscription(&sub)

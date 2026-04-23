@@ -463,6 +463,7 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 seat_count: 0,
+                user_sub: None,
             };
             self.subs
                 .lock()
@@ -516,6 +517,19 @@ mod tests {
             &self,
             _stripe_customer_id: &str,
             _seat_count: u32,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn get_subscription_by_user_sub(
+            &self,
+            _user_sub: &str,
+        ) -> Result<Option<TenantSubscription>, RepositoryError> {
+            Ok(None)
+        }
+        async fn update_tenant_id_for_user_sub(
+            &self,
+            _user_sub: &str,
+            _new_tenant_id: &TenantId,
         ) -> Result<(), RepositoryError> {
             Ok(())
         }

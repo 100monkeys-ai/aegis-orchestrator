@@ -31,6 +31,14 @@ pub struct TenantSubscription {
     /// sync with Stripe via `BillingService::sync_seats`.
     #[serde(default = "default_seat_count")]
     pub seat_count: u32,
+    /// Immutable Keycloak `sub` UUID that anchors consumer billing identity.
+    ///
+    /// For consumer (per-user) subscriptions this is `Some(sub)` — the
+    /// authoritative identity axis resilient to `tenant_id` drift. For team
+    /// subscriptions this is `None`; team billing remains keyed on
+    /// `tenant_id`.
+    #[serde(default)]
+    pub user_sub: Option<String>,
 }
 
 fn default_seat_count() -> u32 {
@@ -177,6 +185,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             seat_count: 1,
+            user_sub: Some("kc-sub-abc123".to_string()),
         };
         let json = serde_json::to_string(&sub).unwrap();
         let deserialized: TenantSubscription = serde_json::from_str(&json).unwrap();

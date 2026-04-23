@@ -40,6 +40,24 @@ pub trait BillingRepository: Send + Sync {
         stripe_subscription_id: &str,
     ) -> Result<Option<TenantSubscription>, RepositoryError>;
 
+    /// Look up subscription by immutable Keycloak `user_sub`. This is the
+    /// authoritative identity axis for consumer (per-user) subscriptions
+    /// and is resilient to `tenant_id` drift.
+    async fn get_subscription_by_user_sub(
+        &self,
+        user_sub: &str,
+    ) -> Result<Option<TenantSubscription>, RepositoryError>;
+
+    /// Rebind a consumer subscription row to a new `tenant_id`, keyed on
+    /// the immutable `user_sub`. Used when the cached `tenant_id` on a
+    /// subscription row drifts away from the JWT-resolved tenant for the
+    /// same Keycloak user.
+    async fn update_tenant_id_for_user_sub(
+        &self,
+        user_sub: &str,
+        new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError>;
+
     /// Clear the `stripe_subscription_id` column for a tenant. Used when
     /// the cached subscription no longer exists in Stripe and we want to
     /// prevent further operations on a dead reference.
@@ -114,6 +132,7 @@ fn row_to_subscription(row: &sqlx::postgres::PgRow) -> Result<TenantSubscription
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         seat_count: row.get::<i32, _>("seat_count") as u32,
+        user_sub: row.get("user_sub"),
     })
 }
 
@@ -125,9 +144,9 @@ impl BillingRepository for PostgresBillingRepository {
             INSERT INTO tenant_subscriptions (
                 tenant_id, stripe_customer_id, stripe_subscription_id,
                 tier, status, current_period_end, cancel_at_period_end,
-                created_at, updated_at, seat_count
+                created_at, updated_at, seat_count, user_sub
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (tenant_id) DO UPDATE SET
                 stripe_customer_id = EXCLUDED.stripe_customer_id,
                 stripe_subscription_id = EXCLUDED.stripe_subscription_id,
@@ -136,7 +155,8 @@ impl BillingRepository for PostgresBillingRepository {
                 current_period_end = EXCLUDED.current_period_end,
                 cancel_at_period_end = EXCLUDED.cancel_at_period_end,
                 updated_at = EXCLUDED.updated_at,
-                seat_count = EXCLUDED.seat_count
+                seat_count = EXCLUDED.seat_count,
+                user_sub = EXCLUDED.user_sub
             "#,
         )
         .bind(sub.tenant_id.as_str())
@@ -149,6 +169,7 @@ impl BillingRepository for PostgresBillingRepository {
         .bind(sub.created_at)
         .bind(sub.updated_at)
         .bind(sub.seat_count as i32)
+        .bind(&sub.user_sub)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to upsert subscription: {e}")))?;
@@ -164,7 +185,7 @@ impl BillingRepository for PostgresBillingRepository {
             r#"
             SELECT tenant_id, stripe_customer_id, stripe_subscription_id,
                    tier, status, current_period_end, cancel_at_period_end,
-                   created_at, updated_at, seat_count
+                   created_at, updated_at, seat_count, user_sub
             FROM tenant_subscriptions
             WHERE tenant_id = $1
             "#,
@@ -188,7 +209,7 @@ impl BillingRepository for PostgresBillingRepository {
             r#"
             SELECT tenant_id, stripe_customer_id, stripe_subscription_id,
                    tier, status, current_period_end, cancel_at_period_end,
-                   created_at, updated_at, seat_count
+                   created_at, updated_at, seat_count, user_sub
             FROM tenant_subscriptions
             WHERE stripe_customer_id = $1
             "#,
@@ -212,7 +233,7 @@ impl BillingRepository for PostgresBillingRepository {
             r#"
             SELECT tenant_id, stripe_customer_id, stripe_subscription_id,
                    tier, status, current_period_end, cancel_at_period_end,
-                   created_at, updated_at, seat_count
+                   created_at, updated_at, seat_count, user_sub
             FROM tenant_subscriptions
             WHERE stripe_subscription_id = $1
             "#,
@@ -244,6 +265,52 @@ impl BillingRepository for PostgresBillingRepository {
         .await
         .map_err(|e| {
             RepositoryError::Database(format!("Failed to clear stripe_subscription_id: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn get_subscription_by_user_sub(
+        &self,
+        user_sub: &str,
+    ) -> Result<Option<TenantSubscription>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, stripe_customer_id, stripe_subscription_id,
+                   tier, status, current_period_end, cancel_at_period_end,
+                   created_at, updated_at, seat_count, user_sub
+            FROM tenant_subscriptions
+            WHERE user_sub = $1
+            "#,
+        )
+        .bind(user_sub)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        match row {
+            Some(ref r) => Ok(Some(row_to_subscription(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn update_tenant_id_for_user_sub(
+        &self,
+        user_sub: &str,
+        new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r#"
+            UPDATE tenant_subscriptions
+            SET tenant_id = $2, updated_at = NOW()
+            WHERE user_sub = $1
+            "#,
+        )
+        .bind(user_sub)
+        .bind(new_tenant_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to rebind tenant_id for user_sub: {e}"))
         })?;
         Ok(())
     }

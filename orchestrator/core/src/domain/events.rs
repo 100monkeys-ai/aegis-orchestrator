@@ -1355,6 +1355,15 @@ pub enum DriftEvent {
         stripe_customer_id: String,
         detected_at: DateTime<Utc>,
     },
+    /// Multiple Stripe customers were found with the same `user_sub`
+    /// metadata — a prior duplicate-creation bug left degenerate state.
+    /// The resolver picks the most recently created one and surfaces
+    /// this event so the extras can be audited / cleaned up.
+    DuplicateStripeCustomer {
+        user_sub: String,
+        matches: Vec<String>,
+        detected_at: DateTime<Utc>,
+    },
 }
 
 /// Rate limit enforcement events (ADR-072).

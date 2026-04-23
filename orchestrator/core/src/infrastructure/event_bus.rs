@@ -628,7 +628,8 @@ impl DomainEvent {
                 | DriftEvent::KeycloakRealmMissing { detected_at, .. }
                 | DriftEvent::StripeCustomerMissing { detected_at, .. }
                 | DriftEvent::StripeSubscriptionMissing { detected_at, .. }
-                | DriftEvent::OrphanSubscription { detected_at, .. } => *detected_at,
+                | DriftEvent::OrphanSubscription { detected_at, .. }
+                | DriftEvent::DuplicateStripeCustomer { detected_at, .. } => *detected_at,
             },
         }
     }
@@ -867,6 +868,7 @@ impl DomainEvent {
                 DriftEvent::StripeCustomerMissing { .. } => "drift_stripe_customer_missing",
                 DriftEvent::StripeSubscriptionMissing { .. } => "drift_stripe_subscription_missing",
                 DriftEvent::OrphanSubscription { .. } => "drift_orphan_subscription",
+                DriftEvent::DuplicateStripeCustomer { .. } => "drift_duplicate_stripe_customer",
             },
         }
     }

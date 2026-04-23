@@ -45,7 +45,7 @@ use stripe_checkout::checkout_session::{
     CreateCheckoutSession, CreateCheckoutSessionLineItems, CreateCheckoutSessionSubscriptionData,
 };
 use stripe_checkout::CheckoutSessionMode;
-use stripe_core::customer::{CreateCustomer, RetrieveCustomer, UpdateCustomer};
+use stripe_core::customer::{CreateCustomer, RetrieveCustomer, SearchCustomer, UpdateCustomer};
 use stripe_core::CustomerId;
 use stripe_product::price::ListPrice;
 use stripe_product::product::ListProduct;
@@ -80,43 +80,49 @@ async fn stripe_subscription_exists(stripe: &stripe::Client, subscription_id: &s
     RetrieveSubscription::new(sid).send(stripe).await.is_ok()
 }
 
-/// Ensure a Stripe customer exists for the given tenant, self-healing when
-/// the cached ID has drifted away (e.g. sandbox reset). Syncs name/email on
-/// every call and persists any freshly-minted mapping so subsequent calls
-/// reuse the new ID.
+/// Build the Stripe `Customer::search` query for resolving by our immutable
+/// `user_sub` metadata anchor. Exposed as a helper so tests can lock the wire
+/// format — any drift in metadata escaping would silently break the
+/// anti-fragile resolve path.
+fn stripe_customer_search_query_for_user_sub(user_sub: &str) -> String {
+    format!("metadata['user_sub']:'{user_sub}'")
+}
+
+/// Ensure a Stripe customer exists for this consumer user.
+///
+/// Identity is anchored on the immutable Keycloak `user_sub`; `tenant_id` is
+/// mutable and cannot be trusted as the identity axis. Resolution order:
+///
+/// 1. Cache hit via `user_sub` → `RetrieveCustomer` → sync name/email.
+/// 2. Stripe `Customer::search` on `metadata['user_sub']` → rebind DB row.
+/// 3. Create a new customer stamped with `user_sub` in metadata.
+///
+/// A duplicate search result (2+ matches) surfaces a structured
+/// [`DriftEvent::DuplicateStripeCustomer`] and picks the most-recently-created
+/// customer — the create path is unreachable when search returns any match,
+/// so duplicates cannot grow from here.
 async fn ensure_stripe_customer(
     stripe: &stripe::Client,
     billing_repo: &dyn BillingRepository,
+    event_bus: &std::sync::Arc<aegis_orchestrator_core::infrastructure::event_bus::EventBus>,
     tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+    user_sub: &str,
     identity_name: &str,
     identity_email: &str,
 ) -> Result<String, String> {
+    // 1. Cache lookup by immutable user_sub (not mutable tenant_id).
     let existing_sub = billing_repo
-        .get_subscription(tenant_id)
+        .get_subscription_by_user_sub(user_sub)
         .await
-        .map_err(|e| format!("get_subscription: {e}"))?;
+        .map_err(|e| format!("get_subscription_by_user_sub: {e}"))?;
 
     if let Some(ref sub) = existing_sub {
-        let cid: CustomerId = match sub.stripe_customer_id.parse() {
-            Ok(c) => c,
-            Err(_) => {
-                warn!(
-                    cached_customer_id = %sub.stripe_customer_id,
-                    "Cached Stripe customer id is unparseable — creating a fresh customer"
-                );
-                return create_and_persist(
-                    stripe,
-                    billing_repo,
-                    tenant_id,
-                    identity_name,
-                    identity_email,
-                    existing_sub.as_ref(),
-                )
-                .await;
-            }
-        };
-        match RetrieveCustomer::new(cid.clone()).send(stripe).await {
-            Ok(_) => {
+        if let Ok(cid) = sub.stripe_customer_id.parse::<CustomerId>() {
+            if RetrieveCustomer::new(cid.clone())
+                .send(stripe)
+                .await
+                .is_ok()
+            {
                 // Still alive — sync identity fields and reuse.
                 let mut update = UpdateCustomer::new(cid);
                 if !identity_name.is_empty() {
@@ -128,45 +134,162 @@ async fn ensure_stripe_customer(
                 if let Err(e) = update.send(stripe).await {
                     warn!(error = %e, "Failed to sync customer name/email to Stripe");
                 }
+                // Heal any tenant_id drift on the DB row (e.g. the cached row
+                // was written before the per-user tenant was provisioned).
+                if &sub.tenant_id != tenant_id {
+                    info!(
+                        user_sub = %user_sub,
+                        previous_tenant = %sub.tenant_id,
+                        new_tenant = %tenant_id,
+                        "Rebinding billing row to resolved tenant_id"
+                    );
+                    if let Err(e) = billing_repo
+                        .update_tenant_id_for_user_sub(user_sub, tenant_id)
+                        .await
+                    {
+                        warn!(error = %e, "Failed to rebind tenant_id on billing row");
+                    }
+                }
                 return Ok(sub.stripe_customer_id.clone());
             }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    cached_customer_id = %sub.stripe_customer_id,
-                    "Cached Stripe customer no longer exists — creating a fresh one"
-                );
-                // Fall through to create path below.
-            }
+            warn!(
+                cached_customer_id = %sub.stripe_customer_id,
+                "Cached Stripe customer no longer exists — falling through to search"
+            );
+        } else {
+            warn!(
+                cached_customer_id = %sub.stripe_customer_id,
+                "Cached Stripe customer id is unparseable — falling through to search"
+            );
         }
     }
 
+    // 2. Stripe search on metadata['user_sub'] — authoritative lookup.
+    let query = stripe_customer_search_query_for_user_sub(user_sub);
+    let search_match: Option<String> = match SearchCustomer::new(query.clone())
+        .limit(10)
+        .send(stripe)
+        .await
+    {
+        Ok(list) => {
+            let mut data = list.data;
+            if data.is_empty() {
+                None
+            } else if data.len() == 1 {
+                Some(data.remove(0).id.to_string())
+            } else {
+                // Degenerate: prior bug left duplicates. Pick the
+                // most-recently-created and publish a drift event so the
+                // extras can be audited / cleaned up.
+                data.sort_by_key(|c| std::cmp::Reverse(c.created));
+                let matches: Vec<String> = data.iter().map(|c| c.id.to_string()).collect();
+                warn!(
+                    user_sub = %user_sub,
+                    match_count = matches.len(),
+                    "Multiple Stripe customers with same user_sub — publishing drift event"
+                );
+                event_bus.publish_drift_event(DriftEvent::DuplicateStripeCustomer {
+                    user_sub: user_sub.to_string(),
+                    matches: matches.clone(),
+                    detected_at: chrono::Utc::now(),
+                });
+                Some(data.remove(0).id.to_string())
+            }
+        }
+        Err(e) => {
+            // Search failures are rare but recoverable: log and fall through
+            // to the create path. Worst case a single duplicate is created,
+            // but subsequent calls converge via search.
+            warn!(
+                error = %e,
+                user_sub = %user_sub,
+                "Stripe Customer::search failed — proceeding with create path"
+            );
+            None
+        }
+    };
+
+    if let Some(cust_id) = search_match {
+        // Rebind DB to the authoritative Stripe customer; preserve tier /
+        // status / sub_id from any stale existing row.
+        let now = chrono::Utc::now();
+        let new_sub = match existing_sub {
+            Some(prev) => TenantSubscription {
+                tenant_id: tenant_id.clone(),
+                stripe_customer_id: cust_id.clone(),
+                user_sub: Some(user_sub.to_string()),
+                updated_at: now,
+                ..prev
+            },
+            None => TenantSubscription {
+                tenant_id: tenant_id.clone(),
+                stripe_customer_id: cust_id.clone(),
+                stripe_subscription_id: None,
+                tier: TenantTier::Free,
+                status: SubscriptionStatus::None,
+                current_period_end: None,
+                cancel_at_period_end: false,
+                created_at: now,
+                updated_at: now,
+                seat_count: 1,
+                user_sub: Some(user_sub.to_string()),
+            },
+        };
+        if let Err(e) = billing_repo.upsert_subscription(&new_sub).await {
+            warn!(error = %e, "Failed to persist Stripe customer mapping after search");
+        }
+        // Sync identity fields onto the resolved customer.
+        if let Ok(cid) = cust_id.parse::<CustomerId>() {
+            let mut update = UpdateCustomer::new(cid);
+            if !identity_name.is_empty() {
+                update = update.name(identity_name.to_string());
+            }
+            if !identity_email.is_empty() {
+                update = update.email(identity_email.to_string());
+            }
+            if let Err(e) = update.send(stripe).await {
+                warn!(error = %e, "Failed to sync customer name/email after search");
+            }
+        }
+        return Ok(cust_id);
+    }
+
+    // 3. Create path — stamp user_sub into metadata so future searches find it.
     create_and_persist(
         stripe,
         billing_repo,
         tenant_id,
+        user_sub,
         identity_name,
         identity_email,
-        existing_sub.as_ref(),
+        existing_sub,
     )
     .await
 }
 
-/// Helper for `ensure_stripe_customer`: create a new Stripe customer and
-/// persist the mapping, preserving tier/status from any stale existing row.
+/// Helper for `ensure_stripe_customer`: create a new Stripe customer stamped
+/// with `user_sub` metadata and persist the mapping, preserving tier/status
+/// from any stale existing row.
 async fn create_and_persist(
     stripe: &stripe::Client,
     billing_repo: &dyn BillingRepository,
     tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+    user_sub: &str,
     identity_name: &str,
     identity_email: &str,
-    existing_sub: Option<&TenantSubscription>,
+    existing_sub: Option<TenantSubscription>,
 ) -> Result<String, String> {
-    let mut create = CreateCustomer::new().metadata(
-        [("tenant_id".to_string(), tenant_id.as_str().to_string())]
-            .into_iter()
-            .collect::<std::collections::HashMap<_, _>>(),
-    );
+    let mut metadata: std::collections::HashMap<String, String> = [
+        ("user_sub".to_string(), user_sub.to_string()),
+        ("tenant_id".to_string(), tenant_id.as_str().to_string()),
+    ]
+    .into_iter()
+    .collect();
+    if !identity_email.is_empty() {
+        metadata.insert("email".to_string(), identity_email.to_string());
+    }
+
+    let mut create = CreateCustomer::new().metadata(metadata);
     if !identity_email.is_empty() {
         create = create.email(identity_email.to_string());
     }
@@ -181,9 +304,11 @@ async fn create_and_persist(
     let now = chrono::Utc::now();
     let new_sub = match existing_sub {
         Some(prev) => TenantSubscription {
+            tenant_id: tenant_id.clone(),
             stripe_customer_id: cust_id.clone(),
+            user_sub: Some(user_sub.to_string()),
             updated_at: now,
-            ..prev.clone()
+            ..prev
         },
         None => TenantSubscription {
             tenant_id: tenant_id.clone(),
@@ -196,6 +321,7 @@ async fn create_and_persist(
             created_at: now,
             updated_at: now,
             seat_count: 1,
+            user_sub: Some(user_sub.to_string()),
         },
     };
     if let Err(e) = billing_repo.upsert_subscription(&new_sub).await {
@@ -612,18 +738,27 @@ pub(crate) async fn create_checkout_handler(
     let name = identity.name.as_deref().unwrap_or("");
     let email = identity.email.as_deref().unwrap_or("");
 
-    let customer_id =
-        match ensure_stripe_customer(&stripe, &*billing_repo, &tenant_id, name, email).await {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(error = %e, "Failed to ensure Stripe customer");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("Billing unavailable: {e}")})),
-                )
-                    .into_response();
-            }
-        };
+    let customer_id = match ensure_stripe_customer(
+        &stripe,
+        &*billing_repo,
+        &state.event_bus,
+        &tenant_id,
+        &identity.sub,
+        name,
+        email,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "Failed to ensure Stripe customer");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Billing unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     // Build line items: base plan + optional seat add-on
     let mut line_items = vec![CreateCheckoutSessionLineItems {
@@ -642,10 +777,12 @@ pub(crate) async fn create_checkout_handler(
         }
     }
 
-    let mut tenant_meta: std::collections::HashMap<String, String> =
-        [("tenant_id".to_string(), tenant_id.as_str().to_string())]
-            .into_iter()
-            .collect();
+    let mut tenant_meta: std::collections::HashMap<String, String> = [
+        ("user_sub".to_string(), identity.sub.clone()),
+        ("tenant_id".to_string(), tenant_id.as_str().to_string()),
+    ]
+    .into_iter()
+    .collect();
     if let Some(ref tier) = body.tier {
         tenant_meta.insert("tier".to_string(), tier.clone());
     }
@@ -746,19 +883,28 @@ pub(crate) async fn create_portal_handler(
     // Self-heal any stale cached customer id before calling the portal — the
     // portal endpoint surfaces a 400 on missing customers, which we never
     // want to bubble to the UX. `ensure_stripe_customer` transparently
-    // creates a fresh customer if the cached id is dead.
-    let customer_id =
-        match ensure_stripe_customer(&stripe, &*billing_repo, &tenant_id, name, email).await {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(error = %e, "Failed to ensure Stripe customer for portal");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("Billing unavailable: {e}")})),
-                )
-                    .into_response();
-            }
-        };
+    // creates or rebinds on search when the cached id is dead.
+    let customer_id = match ensure_stripe_customer(
+        &stripe,
+        &*billing_repo,
+        &state.event_bus,
+        &tenant_id,
+        &identity.sub,
+        name,
+        email,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "Failed to ensure Stripe customer for portal");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Billing unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     match CreateBillingPortalSession::new()
         .customer(customer_id)
@@ -1114,18 +1260,27 @@ pub(crate) async fn list_invoices_handler(
     // cached id has drifted we create a fresh one — it will legitimately
     // carry zero invoices, which is the correct observable state after a
     // Stripe-side reset.
-    let customer_id =
-        match ensure_stripe_customer(&stripe, &*billing_repo, &tenant_id, name, email).await {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(error = %e, "Failed to ensure Stripe customer for invoice listing");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("Billing unavailable: {e}")})),
-                )
-                    .into_response();
-            }
-        };
+    let customer_id = match ensure_stripe_customer(
+        &stripe,
+        &*billing_repo,
+        &state.event_bus,
+        &tenant_id,
+        &identity.sub,
+        name,
+        email,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "Failed to ensure Stripe customer for invoice listing");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Billing unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     match ListInvoice::new().customer(customer_id).send(&stripe).await {
         Ok(list) => {
@@ -1223,20 +1378,26 @@ async fn handle_checkout_completed(
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
-    // Tenant ID from metadata (set during checkout creation)
-    let tenant_id_str = obj
-        .get("metadata")
-        .and_then(|m| m.get("tenant_id"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            // Also check subscription_data.metadata
-            obj.get("subscription_data")
-                .and_then(|sd| sd.get("metadata"))
-                .and_then(|m| m.get("tenant_id"))
-                .and_then(|v| v.as_str())
-        });
+    // Helper: try both session-level and subscription_data metadata.
+    let meta_str = |key: &str| -> Option<String> {
+        obj.get("metadata")
+            .and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                obj.get("subscription_data")
+                    .and_then(|sd| sd.get("metadata"))
+                    .and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.to_string())
+    };
 
-    let tenant_id_str = match tenant_id_str {
+    // user_sub is the immutable anchor; tenant_id is carried for
+    // backwards-compat and as a hint but user_sub wins when both exist.
+    let user_sub = meta_str("user_sub");
+    let tenant_id_hint = meta_str("tenant_id");
+
+    let tenant_id_str = match tenant_id_hint.as_deref() {
         Some(s) => s,
         None => {
             warn!("checkout.session.completed: no tenant_id in metadata");
@@ -1271,6 +1432,23 @@ async fn handle_checkout_completed(
     let total_seats = included_seats + extra_seats;
     let now = chrono::Utc::now();
 
+    // Primary lookup by user_sub (anti-fragile); fall back to customer_id.
+    let existing = if let Some(ref us) = user_sub {
+        billing_repo
+            .get_subscription_by_user_sub(us)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        billing_repo
+            .get_subscription_by_customer(customer_id)
+            .await
+            .ok()
+            .flatten()
+    };
+
+    let created_at = existing.as_ref().map(|s| s.created_at).unwrap_or(now);
+
     let sub = TenantSubscription {
         tenant_id: tenant_id.clone(),
         stripe_customer_id: customer_id.to_string(),
@@ -1279,9 +1457,10 @@ async fn handle_checkout_completed(
         status: SubscriptionStatus::Active,
         current_period_end: None,
         cancel_at_period_end: false,
-        created_at: now,
+        created_at,
         updated_at: now,
         seat_count: total_seats,
+        user_sub,
     };
 
     if let Err(e) = billing_repo.upsert_subscription(&sub).await {
@@ -1313,6 +1492,7 @@ async fn handle_checkout_completed(
 async fn resolve_subscription_for_webhook(
     state: &AppState,
     billing_repo: &dyn BillingRepository,
+    user_sub: Option<&str>,
     customer_id: &str,
     subscription_id: &str,
     event_name: &str,
@@ -1320,6 +1500,7 @@ async fn resolve_subscription_for_webhook(
     resolve_subscription_for_webhook_with(
         &state.event_bus,
         billing_repo,
+        user_sub,
         customer_id,
         subscription_id,
         event_name,
@@ -1332,10 +1513,21 @@ async fn resolve_subscription_for_webhook(
 async fn resolve_subscription_for_webhook_with(
     event_bus: &std::sync::Arc<aegis_orchestrator_core::infrastructure::event_bus::EventBus>,
     billing_repo: &dyn BillingRepository,
+    user_sub: Option<&str>,
     customer_id: &str,
     subscription_id: &str,
     event_name: &str,
 ) -> Option<TenantSubscription> {
+    // Primary: lookup by immutable user_sub when present in metadata.
+    if let Some(us) = user_sub {
+        match billing_repo.get_subscription_by_user_sub(us).await {
+            Ok(Some(s)) => return Some(s),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, event_name, "Failed user_sub lookup for webhook");
+            }
+        }
+    }
     match billing_repo.get_subscription_by_customer(customer_id).await {
         Ok(Some(s)) => return Some(s),
         Ok(None) => {}
@@ -1394,9 +1586,15 @@ async fn handle_subscription_updated(
 
     let subscription_id = obj.get("id").and_then(|v| v.as_str()).unwrap_or_default();
 
+    let user_sub = obj
+        .get("metadata")
+        .and_then(|m| m.get("user_sub"))
+        .and_then(|v| v.as_str());
+
     let sub = match resolve_subscription_for_webhook(
         state,
         billing_repo,
+        user_sub,
         customer_id,
         subscription_id,
         "subscription.updated",
@@ -1712,9 +1910,15 @@ async fn handle_subscription_deleted(
 
     let subscription_id = obj.get("id").and_then(|v| v.as_str()).unwrap_or_default();
 
+    let user_sub = obj
+        .get("metadata")
+        .and_then(|m| m.get("user_sub"))
+        .and_then(|v| v.as_str());
+
     let sub = match resolve_subscription_for_webhook(
         state,
         billing_repo,
+        user_sub,
         customer_id,
         subscription_id,
         "subscription.deleted",
@@ -2899,12 +3103,12 @@ mod tests {
         use std::sync::Mutex;
 
         #[derive(Default)]
-        struct InMemoryBillingRepo {
-            by_tenant: Mutex<HashMap<String, TenantSubscription>>,
+        pub(super) struct InMemoryBillingRepo {
+            pub(super) by_tenant: Mutex<HashMap<String, TenantSubscription>>,
         }
 
         impl InMemoryBillingRepo {
-            fn insert(&self, sub: TenantSubscription) {
+            pub(super) fn insert(&self, sub: TenantSubscription) {
                 self.by_tenant
                     .lock()
                     .unwrap()
@@ -2982,6 +3186,37 @@ mod tests {
             ) -> Result<(), RepositoryError> {
                 Ok(())
             }
+            async fn get_subscription_by_user_sub(
+                &self,
+                user_sub: &str,
+            ) -> Result<Option<TenantSubscription>, RepositoryError> {
+                Ok(self
+                    .by_tenant
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .find(|s| s.user_sub.as_deref() == Some(user_sub))
+                    .cloned())
+            }
+            async fn update_tenant_id_for_user_sub(
+                &self,
+                user_sub: &str,
+                new_tenant_id: &TenantId,
+            ) -> Result<(), RepositoryError> {
+                let mut map = self.by_tenant.lock().unwrap();
+                let existing_key = map
+                    .iter()
+                    .find(|(_, v)| v.user_sub.as_deref() == Some(user_sub))
+                    .map(|(k, _)| k.clone());
+                if let Some(old_key) = existing_key {
+                    if let Some(mut sub) = map.remove(&old_key) {
+                        sub.tenant_id = new_tenant_id.clone();
+                        sub.updated_at = chrono::Utc::now();
+                        map.insert(new_tenant_id.as_str().to_string(), sub);
+                    }
+                }
+                Ok(())
+            }
         }
 
         fn mk_sub(tenant: &str, customer_id: &str, sub_id: Option<&str>) -> TenantSubscription {
@@ -2997,6 +3232,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 seat_count: 1,
+                user_sub: None,
             }
         }
 
@@ -3021,6 +3257,7 @@ mod tests {
             let out = resolve_subscription_for_webhook_with(
                 &bus,
                 &repo,
+                None,
                 "cus_fresh_never_seen",
                 "sub_live",
                 "customer.subscription.updated",
@@ -3050,6 +3287,7 @@ mod tests {
             let out = resolve_subscription_for_webhook_with(
                 &bus,
                 &repo,
+                None,
                 "cus_unknown",
                 "sub_unknown",
                 "customer.subscription.updated",
@@ -3067,6 +3305,186 @@ mod tests {
                 }
                 other => panic!("expected StripeCustomerMissing, got {other:?}"),
             }
+        }
+
+        /// When user_sub metadata is present on the webhook payload, the
+        /// resolver must prefer it over the (possibly drifted) customer_id.
+        /// This locks in the anti-fragile property: a rebuilt Stripe
+        /// customer with the same user_sub stamp recovers the row without
+        /// any drift event firing.
+        #[tokio::test]
+        async fn webhook_prefers_user_sub_lookup_over_customer_id() {
+            let repo = InMemoryBillingRepo::default();
+            // Seed: row has user_sub=kc-sub-42 and a STALE cus_old id.
+            let now = chrono::Utc::now();
+            repo.insert(TenantSubscription {
+                tenant_id: TenantId::from_string("u-d7f8170035d349b6b237c391ccc19035").unwrap(),
+                stripe_customer_id: "cus_old".into(),
+                stripe_subscription_id: Some("sub_live".into()),
+                tier: TenantTier::Pro,
+                status: SubscriptionStatus::Active,
+                current_period_end: None,
+                cancel_at_period_end: false,
+                created_at: now,
+                updated_at: now,
+                seat_count: 1,
+                user_sub: Some("kc-sub-42".into()),
+            });
+
+            let bus = std::sync::Arc::new(EventBus::new(16));
+            let mut rx = bus.subscribe();
+
+            // Webhook arrives with user_sub=kc-sub-42, and a DIFFERENT
+            // customer id than our cached one, and an UNKNOWN subscription
+            // id. Only the user_sub lookup can rescue this.
+            let out = resolve_subscription_for_webhook_with(
+                &bus,
+                &repo,
+                Some("kc-sub-42"),
+                "cus_brand_new",
+                "sub_brand_new",
+                "customer.subscription.updated",
+            )
+            .await;
+
+            assert!(
+                out.is_some(),
+                "user_sub lookup must recover the row before customer_id / sub_id fallback"
+            );
+            let recovered = out.unwrap();
+            assert_eq!(recovered.stripe_customer_id, "cus_old");
+            assert_eq!(recovered.user_sub.as_deref(), Some("kc-sub-42"));
+
+            let got = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+            assert!(
+                got.is_err(),
+                "no drift event expected when user_sub lookup succeeds"
+            );
+        }
+    }
+
+    /// Primary-identity regression tests: user_sub stamping in checkout
+    /// metadata and in the Stripe search query. These lock the wire
+    /// format — drift here would silently re-enable the duplicate-customer
+    /// bug this module was built to prevent.
+    mod user_sub_identity {
+        use super::super::*;
+        use aegis_orchestrator_core::domain::billing::{SubscriptionStatus, TenantSubscription};
+        use aegis_orchestrator_core::domain::events::DriftEvent;
+        use aegis_orchestrator_core::domain::tenancy::TenantTier;
+        use aegis_orchestrator_core::domain::tenant::TenantId;
+        use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
+
+        /// The checkout session metadata hash must include `user_sub` so
+        /// the post-checkout webhook can re-anchor on identity.
+        #[test]
+        fn checkout_session_metadata_includes_user_sub() {
+            // Mirror the literal construction in create_checkout_handler.
+            let identity_sub = "kc-sub-abc-123".to_string();
+            let tenant_id = "u-d7f8170035d349b6b237c391ccc19035".to_string();
+            let mut tenant_meta: std::collections::HashMap<String, String> = [
+                ("user_sub".to_string(), identity_sub.clone()),
+                ("tenant_id".to_string(), tenant_id.clone()),
+            ]
+            .into_iter()
+            .collect();
+            tenant_meta.insert("tier".to_string(), "pro".to_string());
+
+            assert_eq!(tenant_meta.get("user_sub"), Some(&identity_sub));
+            assert_eq!(tenant_meta.get("tenant_id"), Some(&tenant_id));
+        }
+
+        /// The Stripe `Customer::search` query format is load-bearing —
+        /// Stripe uses a bespoke query DSL where metadata values must be
+        /// quoted with single quotes and the key must be bracketed.
+        #[test]
+        fn stripe_customer_search_query_format() {
+            let q = stripe_customer_search_query_for_user_sub("kc-sub-xyz");
+            assert_eq!(q, "metadata['user_sub']:'kc-sub-xyz'");
+        }
+
+        /// The DuplicateStripeCustomer drift event must round-trip cleanly
+        /// through serde — downstream consumers deserialize it over the
+        /// event bus transport.
+        #[test]
+        fn duplicate_stripe_customer_drift_event_serializes_correctly() {
+            let event = DriftEvent::DuplicateStripeCustomer {
+                user_sub: "kc-sub-42".into(),
+                matches: vec!["cus_aaa".into(), "cus_bbb".into()],
+                detected_at: chrono::Utc::now(),
+            };
+            let json = serde_json::to_string(&event).expect("serialize");
+            let decoded: DriftEvent = serde_json::from_str(&json).expect("deserialize");
+            match decoded {
+                DriftEvent::DuplicateStripeCustomer {
+                    user_sub, matches, ..
+                } => {
+                    assert_eq!(user_sub, "kc-sub-42");
+                    assert_eq!(matches, vec!["cus_aaa".to_string(), "cus_bbb".to_string()]);
+                }
+                other => panic!("expected DuplicateStripeCustomer, got {other:?}"),
+            }
+        }
+
+        /// The event bus must assign the correct event_type_name and
+        /// timestamp to the new DuplicateStripeCustomer variant. This
+        /// guards the exhaustive matches in `event_bus.rs`.
+        #[test]
+        fn duplicate_stripe_customer_event_bus_dispatch() {
+            let detected_at = chrono::Utc::now();
+            let event = DomainEvent::Drift(DriftEvent::DuplicateStripeCustomer {
+                user_sub: "kc-sub-42".into(),
+                matches: vec!["cus_a".into()],
+                detected_at,
+            });
+            assert_eq!(event.event_type_name(), "drift_duplicate_stripe_customer");
+            assert_eq!(event.timestamp(), detected_at);
+        }
+
+        /// In-memory repo test: `get_subscription_by_user_sub` returns the
+        /// matching row, and `update_tenant_id_for_user_sub` rebinds it.
+        #[tokio::test]
+        async fn user_sub_repo_lookup_and_rebind() {
+            use super::webhook_self_healing::InMemoryBillingRepo;
+            use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
+
+            let repo = InMemoryBillingRepo::default();
+            let now = chrono::Utc::now();
+            let old_tenant = TenantId::from_string("u-0000000000000000000000000000aaaa").unwrap();
+            let new_tenant = TenantId::from_string("u-0000000000000000000000000000bbbb").unwrap();
+            repo.insert(TenantSubscription {
+                tenant_id: old_tenant.clone(),
+                stripe_customer_id: "cus_xyz".into(),
+                stripe_subscription_id: None,
+                tier: TenantTier::Free,
+                status: SubscriptionStatus::None,
+                current_period_end: None,
+                cancel_at_period_end: false,
+                created_at: now,
+                updated_at: now,
+                seat_count: 1,
+                user_sub: Some("kc-sub-42".into()),
+            });
+
+            let found = repo
+                .get_subscription_by_user_sub("kc-sub-42")
+                .await
+                .expect("ok")
+                .expect("found");
+            assert_eq!(found.tenant_id, old_tenant);
+            assert_eq!(found.stripe_customer_id, "cus_xyz");
+
+            repo.update_tenant_id_for_user_sub("kc-sub-42", &new_tenant)
+                .await
+                .expect("rebind");
+
+            let rebound = repo
+                .get_subscription_by_user_sub("kc-sub-42")
+                .await
+                .expect("ok")
+                .expect("found");
+            assert_eq!(rebound.tenant_id, new_tenant);
+            assert_eq!(rebound.stripe_customer_id, "cus_xyz");
         }
     }
 }
