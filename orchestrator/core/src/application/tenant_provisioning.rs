@@ -74,7 +74,7 @@ impl TenantProvisioningService {
         let mut tenant = Tenant::new(
             tenant_id.clone(),
             format!("User {}", &user_sub[..8.min(user_sub.len())]),
-            tier.clone(),
+            tier,
             keycloak_realm.clone(),
             openbao_namespace,
         );

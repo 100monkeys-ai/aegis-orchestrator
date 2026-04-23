@@ -87,7 +87,7 @@ impl TenantTier {
 
 impl PartialOrd for TenantTier {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.rank().cmp(&other.rank()))
+        Some(self.cmp(other))
     }
 }
 

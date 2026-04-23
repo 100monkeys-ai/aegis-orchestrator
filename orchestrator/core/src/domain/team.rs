@@ -202,17 +202,12 @@ impl std::str::FromStr for MembershipStatus {
 /// (Stripe webhook reports past-due beyond grace, or admin intervention),
 /// Phase 4 transitions the team to `Suspended` — which gates member access
 /// to team resources without destroying the team or its data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TeamStatus {
+    #[default]
     Active,
     Suspended,
-}
-
-impl Default for TeamStatus {
-    fn default() -> Self {
-        TeamStatus::Active
-    }
 }
 
 impl TeamStatus {

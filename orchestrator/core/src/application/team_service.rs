@@ -232,6 +232,7 @@ pub struct StandardTeamService {
 }
 
 impl StandardTeamService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         team_repo: Arc<dyn TeamRepository>,
         membership_repo: Arc<dyn MembershipRepository>,
@@ -329,7 +330,7 @@ impl TeamService for StandardTeamService {
         let tenant_row = Tenant::new(
             team.tenant_id.clone(),
             cmd.display_name.clone(),
-            team.tier.clone(),
+            team.tier,
             keycloak_realm,
             openbao_namespace,
         );
@@ -345,7 +346,7 @@ impl TeamService for StandardTeamService {
 
         // Provision the Stripe customer + TenantSubscription row.
         self.billing_service
-            .provision_team_customer(team.id, cmd.owner_email, &team.tenant_id, team.tier.clone())
+            .provision_team_customer(team.id, cmd.owner_email, &team.tenant_id, team.tier)
             .await?;
 
         // Drain events & publish.
