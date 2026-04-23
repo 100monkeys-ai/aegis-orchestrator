@@ -7,10 +7,15 @@
 //! background tokio task. Failed indexing is logged but never blocks the
 //! registration flow.
 
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::Mutex;
+use tonic::Status;
 
 use crate::domain::agent::AgentManifest;
 use crate::domain::events::{AgentLifecycleEvent, WorkflowEvent};
@@ -19,11 +24,67 @@ use crate::domain::shared_kernel::AgentId;
 use crate::domain::tenant::TenantId;
 use crate::domain::workflow::WorkflowId;
 use crate::infrastructure::aegis_cortex_proto::{
-    IndexAgentRequest, IndexWorkflowRequest, RemoveDiscoveryAgentRequest,
-    RemoveDiscoveryWorkflowRequest,
+    IndexAgentRequest, IndexAgentResponse, IndexWorkflowRequest, IndexWorkflowResponse,
+    RemoveDiscoveryAgentRequest, RemoveDiscoveryAgentResponse, RemoveDiscoveryWorkflowRequest,
+    RemoveDiscoveryWorkflowResponse,
 };
 use crate::infrastructure::cortex_client::CortexGrpcClient;
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CortexDiscoveryClient trait
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Narrow trait over the subset of Cortex RPCs used by the discovery event
+/// handler. Enables substituting a fake in tests without standing up a real
+/// gRPC channel. Implemented for `CortexGrpcClient` below.
+#[async_trait]
+pub trait CortexDiscoveryClient: Send + Sync + 'static {
+    async fn index_agent(&self, request: IndexAgentRequest) -> Result<IndexAgentResponse, Status>;
+
+    async fn index_workflow(
+        &self,
+        request: IndexWorkflowRequest,
+    ) -> Result<IndexWorkflowResponse, Status>;
+
+    async fn remove_discovery_agent(
+        &self,
+        request: RemoveDiscoveryAgentRequest,
+    ) -> Result<RemoveDiscoveryAgentResponse, Status>;
+
+    async fn remove_discovery_workflow(
+        &self,
+        request: RemoveDiscoveryWorkflowRequest,
+    ) -> Result<RemoveDiscoveryWorkflowResponse, Status>;
+}
+
+#[async_trait]
+impl CortexDiscoveryClient for CortexGrpcClient {
+    async fn index_agent(&self, request: IndexAgentRequest) -> Result<IndexAgentResponse, Status> {
+        CortexGrpcClient::index_agent(self, request).await
+    }
+
+    async fn index_workflow(
+        &self,
+        request: IndexWorkflowRequest,
+    ) -> Result<IndexWorkflowResponse, Status> {
+        CortexGrpcClient::index_workflow(self, request).await
+    }
+
+    async fn remove_discovery_agent(
+        &self,
+        request: RemoveDiscoveryAgentRequest,
+    ) -> Result<RemoveDiscoveryAgentResponse, Status> {
+        CortexGrpcClient::remove_discovery_agent(self, request).await
+    }
+
+    async fn remove_discovery_workflow(
+        &self,
+        request: RemoveDiscoveryWorkflowRequest,
+    ) -> Result<RemoveDiscoveryWorkflowResponse, Status> {
+        CortexGrpcClient::remove_discovery_workflow(self, request).await
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DiscoveryIndexEventHandler
@@ -35,16 +96,22 @@ use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 /// Spawn via [`DiscoveryIndexEventHandler::spawn`] — the returned
 /// `JoinHandle` runs until the event bus is closed.
 pub struct DiscoveryIndexEventHandler {
-    cortex_client: Arc<CortexGrpcClient>,
+    cortex_client: Arc<dyn CortexDiscoveryClient>,
     agent_repo: Arc<dyn AgentRepository>,
     workflow_repo: Arc<dyn WorkflowRepository>,
     event_bus: Arc<EventBus>,
+    /// Fingerprint of the last successful index for each agent. Used by
+    /// [`Self::reconcile_drift`] to skip unchanged records. Populated by every
+    /// successful `handle_agent_upsert`.
+    agent_index_cache: Mutex<HashMap<AgentId, u64>>,
+    /// Fingerprint of the last successful index for each workflow.
+    workflow_index_cache: Mutex<HashMap<WorkflowId, u64>>,
 }
 
 impl DiscoveryIndexEventHandler {
     /// Create a new handler with all required dependencies.
     pub fn new(
-        cortex_client: Arc<CortexGrpcClient>,
+        cortex_client: Arc<dyn CortexDiscoveryClient>,
         agent_repo: Arc<dyn AgentRepository>,
         workflow_repo: Arc<dyn WorkflowRepository>,
         event_bus: Arc<EventBus>,
@@ -54,6 +121,8 @@ impl DiscoveryIndexEventHandler {
             agent_repo,
             workflow_repo,
             event_bus,
+            agent_index_cache: Mutex::new(HashMap::new()),
+            workflow_index_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -114,10 +183,71 @@ impl DiscoveryIndexEventHandler {
     }
 
     // ──────────────────────────────────────────────────────────────────────
+    // Fingerprints
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Compute a stable u64 fingerprint of the fields that describe an agent
+    /// in the Cortex discovery index. `updated_at` is deliberately excluded —
+    /// it changes every call and would defeat the cache.
+    fn fingerprint_agent(req: &IndexAgentRequest) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        req.agent_id.hash(&mut hasher);
+        req.tenant_id.hash(&mut hasher);
+        req.name.hash(&mut hasher);
+        req.version.hash(&mut hasher);
+        req.description.hash(&mut hasher);
+        // `labels` is a HashMap — hash via a sorted key list for determinism.
+        let mut label_pairs: Vec<(&String, &String)> = req.labels.iter().collect();
+        label_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in label_pairs {
+            k.hash(&mut hasher);
+            v.hash(&mut hasher);
+        }
+        for tool in &req.tools {
+            tool.hash(&mut hasher);
+        }
+        req.task_description.hash(&mut hasher);
+        req.runtime_language.hash(&mut hasher);
+        req.status.hash(&mut hasher);
+        req.is_platform_template.hash(&mut hasher);
+        req.input_schema.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Compute a stable u64 fingerprint of the fields that describe a
+    /// workflow in the Cortex discovery index. `updated_at` is excluded.
+    fn fingerprint_workflow(req: &IndexWorkflowRequest) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        req.workflow_id.hash(&mut hasher);
+        req.tenant_id.hash(&mut hasher);
+        req.name.hash(&mut hasher);
+        req.version.hash(&mut hasher);
+        req.description.hash(&mut hasher);
+        let mut label_pairs: Vec<(&String, &String)> = req.labels.iter().collect();
+        label_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in label_pairs {
+            k.hash(&mut hasher);
+            v.hash(&mut hasher);
+        }
+        for s in &req.state_names {
+            s.hash(&mut hasher);
+        }
+        for a in &req.agent_names {
+            a.hash(&mut hasher);
+        }
+        req.is_platform_template.hash(&mut hasher);
+        req.input_schema.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     // Agent handlers
     // ──────────────────────────────────────────────────────────────────────
 
-    async fn handle_agent_upsert(&self, agent_id: &AgentId, manifest: &AgentManifest) {
+    fn build_agent_index_request(
+        agent_id: &AgentId,
+        manifest: &AgentManifest,
+    ) -> IndexAgentRequest {
         let name = &manifest.metadata.name;
         let version = &manifest.metadata.version;
         let description = manifest
@@ -143,7 +273,7 @@ impl DiscoveryIndexEventHandler {
             .unwrap_or("unknown")
             .to_string();
 
-        let req = IndexAgentRequest {
+        IndexAgentRequest {
             agent_id: agent_id.to_string(),
             tenant_id: TenantId::consumer().to_string(),
             name: name.clone(),
@@ -161,12 +291,18 @@ impl DiscoveryIndexEventHandler {
                 .input_schema
                 .as_ref()
                 .and_then(|v| serde_json::to_string(v).ok()),
-        };
+        }
+    }
+
+    async fn handle_agent_upsert(&self, agent_id: &AgentId, manifest: &AgentManifest) {
+        let req = Self::build_agent_index_request(agent_id, manifest);
+        let fp = Self::fingerprint_agent(&req);
 
         if let Err(e) = self.index_agent_with_retry(req).await {
             tracing::warn!(agent_id = %agent_id, error = %e, "Failed to index deployed agent in Cortex");
         } else {
             tracing::debug!(agent_id = %agent_id, "Indexed deployed agent in Cortex");
+            self.agent_index_cache.lock().await.insert(*agent_id, fp);
         }
     }
 
@@ -200,6 +336,7 @@ impl DiscoveryIndexEventHandler {
             tracing::warn!(agent_id = %agent_id, error = %e, "Failed to remove agent from Cortex index");
         } else {
             tracing::debug!(agent_id = %agent_id, "Removed agent from Cortex discovery index");
+            self.agent_index_cache.lock().await.remove(agent_id);
         }
     }
 
@@ -213,6 +350,7 @@ impl DiscoveryIndexEventHandler {
             tracing::warn!(workflow_id = %workflow_id, error = %e, "Failed to remove workflow from Cortex index");
         } else {
             tracing::info!(workflow_id = %workflow_id, "Removed workflow from Cortex discovery index");
+            self.workflow_index_cache.lock().await.remove(workflow_id);
         }
     }
 
@@ -302,6 +440,40 @@ impl DiscoveryIndexEventHandler {
         None
     }
 
+    fn build_workflow_index_request(
+        workflow: &crate::domain::workflow::Workflow,
+        name: &str,
+        version: &str,
+    ) -> IndexWorkflowRequest {
+        let description = workflow
+            .metadata
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        let labels = workflow.metadata.labels.clone();
+        let state_names: Vec<String> = workflow.spec.states.keys().map(|s| s.to_string()).collect();
+        let agent_names: Vec<String> = extract_agent_names_from_workflow(workflow);
+
+        IndexWorkflowRequest {
+            workflow_id: workflow.id.to_string(),
+            tenant_id: workflow.tenant_id.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            description,
+            labels,
+            state_names,
+            agent_names,
+            is_platform_template: false,
+            updated_at: Utc::now().to_rfc3339(),
+            input_schema: workflow
+                .metadata
+                .input_schema
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok()),
+        }
+    }
+
     async fn handle_workflow_upsert(&self, workflow_id: &WorkflowId, name: &str, version: &str) {
         // Look up full workflow from repo to get description, states, agents, labels.
         // Searches across both the consumer and system tenants so that built-in
@@ -321,38 +493,17 @@ impl DiscoveryIndexEventHandler {
             }
         };
 
-        let description = workflow
-            .metadata
-            .description
-            .as_deref()
-            .unwrap_or_default()
-            .to_string();
-        let labels = workflow.metadata.labels.clone();
-        let state_names: Vec<String> = workflow.spec.states.keys().map(|s| s.to_string()).collect();
-        let agent_names: Vec<String> = extract_agent_names_from_workflow(&workflow);
-
-        let req = IndexWorkflowRequest {
-            workflow_id: workflow_id.to_string(),
-            tenant_id: workflow.tenant_id.to_string(),
-            name: name.to_string(),
-            version: version.to_string(),
-            description,
-            labels,
-            state_names,
-            agent_names,
-            is_platform_template: false,
-            updated_at: Utc::now().to_rfc3339(),
-            input_schema: workflow
-                .metadata
-                .input_schema
-                .as_ref()
-                .and_then(|v| serde_json::to_string(v).ok()),
-        };
+        let req = Self::build_workflow_index_request(&workflow, name, version);
+        let fp = Self::fingerprint_workflow(&req);
 
         if let Err(e) = self.index_workflow_with_retry(req).await {
             tracing::warn!(workflow_id = %workflow_id, error = %e, "Failed to index workflow in Cortex");
         } else {
             tracing::debug!(workflow_id = %workflow_id, name = name, "Indexed workflow in Cortex");
+            self.workflow_index_cache
+                .lock()
+                .await
+                .insert(*workflow_id, fp);
         }
     }
 
@@ -412,10 +563,12 @@ impl DiscoveryIndexEventHandler {
     // Backfill / Reconcile
     // ──────────────────────────────────────────────────────────────────────
 
-    /// Index all known agents and workflows into Cortex. Shared by [`Self::backfill`]
-    /// and [`Self::reconcile`].
-    async fn index_all(&self) -> anyhow::Result<(usize, usize)> {
-        // ── Agents ──────────────────────────────────────────────────────
+    /// Backfill the Cortex discovery index from all existing agents and workflows.
+    /// Called once at startup. Unconditionally re-indexes every record — use
+    /// [`Self::reconcile`] for the periodic drift-detection pass.
+    pub async fn backfill(&self) -> anyhow::Result<(usize, usize)> {
+        tracing::info!("Starting Cortex discovery index backfill");
+
         let agents = self
             .agent_repo
             .list_all_for_tenant(&TenantId::consumer())
@@ -431,7 +584,6 @@ impl DiscoveryIndexEventHandler {
             }
         }
 
-        // ── Workflows ───────────────────────────────────────────────────
         let workflows = self
             .workflow_repo
             .list_all_for_tenant(&TenantId::consumer())
@@ -449,26 +601,97 @@ impl DiscoveryIndexEventHandler {
             }
         }
 
+        tracing::info!(
+            agent_count,
+            workflow_count,
+            "Cortex discovery index backfill complete"
+        );
         Ok((agent_count, workflow_count))
     }
 
-    /// Backfill the Cortex discovery index from all existing agents and workflows.
-    /// Called once at startup.
-    pub async fn backfill(&self) -> anyhow::Result<(usize, usize)> {
-        tracing::info!("Starting Cortex discovery index backfill");
-        let result = self.index_all().await?;
-        tracing::info!(
-            agent_count = result.0,
-            workflow_count = result.1,
-            "Cortex discovery index backfill complete"
-        );
-        Ok(result)
+    /// Reconcile the Cortex discovery index against all known agents and
+    /// workflows. Called periodically to correct drift caused by event lag or
+    /// transient Cortex failures. Skips records whose fingerprint matches the
+    /// cached last-indexed fingerprint — unchanged records are silent no-ops.
+    pub async fn reconcile(&self) -> anyhow::Result<ReconcileSummary> {
+        self.reconcile_drift().await
     }
 
-    /// Reconcile the Cortex discovery index against all known agents and workflows.
-    /// Called periodically to correct any drift caused by event lag or transient failures.
-    pub async fn reconcile(&self) -> anyhow::Result<(usize, usize)> {
-        self.index_all().await
+    /// Drift-only reconciliation: iterate all agents and workflows, skip any
+    /// whose current fingerprint matches the cached one. Returns counts of
+    /// checked vs actually re-indexed records.
+    async fn reconcile_drift(&self) -> anyhow::Result<ReconcileSummary> {
+        let mut summary = ReconcileSummary::default();
+
+        // ── Agents ──────────────────────────────────────────────────────
+        let agents = self
+            .agent_repo
+            .list_all_for_tenant(&TenantId::consumer())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list agents for reconciliation: {e}"))?;
+
+        for agent in &agents {
+            summary.agents_checked += 1;
+            let req = Self::build_agent_index_request(&agent.id, &agent.manifest);
+            let fp = Self::fingerprint_agent(&req);
+            let cached = self.agent_index_cache.lock().await.get(&agent.id).copied();
+            if cached == Some(fp) {
+                continue;
+            }
+
+            if let Err(e) = self.index_agent_with_retry(req).await {
+                tracing::warn!(agent_id = %agent.id, error = %e, "Failed to re-index drifted agent");
+            } else {
+                tracing::debug!(agent_id = %agent.id, "Re-indexed drifted agent");
+                self.agent_index_cache.lock().await.insert(agent.id, fp);
+                summary.agents_indexed += 1;
+            }
+        }
+
+        // ── Workflows ───────────────────────────────────────────────────
+        let workflows = self
+            .workflow_repo
+            .list_all_for_tenant(&TenantId::consumer())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list workflows for reconciliation: {e}"))?;
+
+        for workflow in &workflows {
+            summary.workflows_checked += 1;
+            let version = workflow.metadata.version.as_deref().unwrap_or("0.1.0");
+            let req =
+                Self::build_workflow_index_request(workflow, &workflow.metadata.name, version);
+            let fp = Self::fingerprint_workflow(&req);
+            let cached = self
+                .workflow_index_cache
+                .lock()
+                .await
+                .get(&workflow.id)
+                .copied();
+            if cached == Some(fp) {
+                continue;
+            }
+
+            if let Err(e) = self.index_workflow_with_retry(req).await {
+                tracing::warn!(workflow_id = %workflow.id, error = %e, "Failed to re-index drifted workflow");
+            } else {
+                tracing::debug!(workflow_id = %workflow.id, "Re-indexed drifted workflow");
+                self.workflow_index_cache
+                    .lock()
+                    .await
+                    .insert(workflow.id, fp);
+                summary.workflows_indexed += 1;
+            }
+        }
+
+        tracing::debug!(
+            agents_checked = summary.agents_checked,
+            agents_indexed = summary.agents_indexed,
+            workflows_checked = summary.workflows_checked,
+            workflows_indexed = summary.workflows_indexed,
+            "Discovery drift reconciliation complete"
+        );
+
+        Ok(summary)
     }
 
     /// Spawn a background tokio task that calls [`Self::reconcile`] on the given interval.
@@ -480,10 +703,12 @@ impl DiscoveryIndexEventHandler {
             loop {
                 ticker.tick().await;
                 match self.reconcile().await {
-                    Ok((agents, workflows)) => {
+                    Ok(summary) => {
                         tracing::debug!(
-                            agents_indexed = agents,
-                            workflows_indexed = workflows,
+                            agents_checked = summary.agents_checked,
+                            agents_indexed = summary.agents_indexed,
+                            workflows_checked = summary.workflows_checked,
+                            workflows_indexed = summary.workflows_indexed,
                             "Discovery reconciliation complete"
                         );
                     }
@@ -494,6 +719,16 @@ impl DiscoveryIndexEventHandler {
             }
         })
     }
+}
+
+/// Counters returned by [`DiscoveryIndexEventHandler::reconcile`] describing
+/// how many records were examined vs. actually re-indexed on a drift pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileSummary {
+    pub agents_checked: usize,
+    pub agents_indexed: usize,
+    pub workflows_checked: usize,
+    pub workflows_indexed: usize,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -513,4 +748,303 @@ fn extract_agent_names_from_workflow(workflow: &crate::domain::workflow::Workflo
         }
     }
     names
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::{
+        Agent, AgentManifest, AgentSpec, ImagePullPolicy, ManifestMetadata, RuntimeConfig,
+        TaskConfig,
+    };
+    use crate::domain::workflow::{
+        StateKind, StateName, Workflow, WorkflowMetadata, WorkflowSpec, WorkflowState,
+    };
+    use crate::infrastructure::aegis_cortex_proto::{
+        IndexAgentResponse, IndexWorkflowResponse, RemoveDiscoveryAgentResponse,
+        RemoveDiscoveryWorkflowResponse,
+    };
+    use crate::infrastructure::repositories::{
+        InMemoryAgentRepository, InMemoryWorkflowRepository,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ─── Fake Cortex client ───────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct FakeCortexClient {
+        index_agent_calls: AtomicUsize,
+        index_workflow_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CortexDiscoveryClient for FakeCortexClient {
+        async fn index_agent(
+            &self,
+            _request: IndexAgentRequest,
+        ) -> Result<IndexAgentResponse, Status> {
+            self.index_agent_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(IndexAgentResponse::default())
+        }
+
+        async fn index_workflow(
+            &self,
+            _request: IndexWorkflowRequest,
+        ) -> Result<IndexWorkflowResponse, Status> {
+            self.index_workflow_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(IndexWorkflowResponse::default())
+        }
+
+        async fn remove_discovery_agent(
+            &self,
+            _request: RemoveDiscoveryAgentRequest,
+        ) -> Result<RemoveDiscoveryAgentResponse, Status> {
+            Ok(RemoveDiscoveryAgentResponse::default())
+        }
+
+        async fn remove_discovery_workflow(
+            &self,
+            _request: RemoveDiscoveryWorkflowRequest,
+        ) -> Result<RemoveDiscoveryWorkflowResponse, Status> {
+            Ok(RemoveDiscoveryWorkflowResponse::default())
+        }
+    }
+
+    // ─── Fixtures ─────────────────────────────────────────────────────────
+
+    fn make_manifest(name: &str) -> AgentManifest {
+        AgentManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "Agent".to_string(),
+            metadata: ManifestMetadata {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                description: Some(format!("desc for {name}")),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+            },
+            spec: AgentSpec {
+                runtime: RuntimeConfig {
+                    language: Some("python".to_string()),
+                    version: Some("3.11".to_string()),
+                    image: None,
+                    image_pull_policy: ImagePullPolicy::IfNotPresent,
+                    isolation: "inherit".to_string(),
+                    model: "default".to_string(),
+                    temperature: None,
+                },
+                task: Some(TaskConfig {
+                    instruction: Some(format!("task for {name}")),
+                    prompt_template: None,
+                    input_data: None,
+                }),
+                context: vec![],
+                execution: None,
+                security: None,
+                schedule: None,
+                tools: vec![],
+                env: HashMap::new(),
+                volumes: vec![],
+                advanced: None,
+                input_schema: None,
+                security_context: None,
+                output_handler: None,
+            },
+        }
+    }
+
+    fn make_agent(name: &str) -> Agent {
+        let manifest = make_manifest(name);
+        let mut agent = Agent::new(manifest);
+        agent.tenant_id = TenantId::consumer();
+        agent
+    }
+
+    fn make_workflow(name: &str, description: &str) -> Workflow {
+        let metadata = WorkflowMetadata {
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            description: Some(description.to_string()),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            input_schema: None,
+            output_schema: None,
+            output_template: None,
+        };
+
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![],
+                timeout: None,
+                max_state_visits: None,
+            },
+        );
+
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states,
+            storage: Default::default(),
+            max_total_transitions: None,
+        };
+
+        let mut wf = Workflow::new(metadata, spec).expect("valid workflow");
+        wf.tenant_id = TenantId::consumer();
+        wf
+    }
+
+    async fn seed_agents(
+        repo: &InMemoryAgentRepository,
+        names: &[&str],
+    ) -> Vec<crate::domain::shared_kernel::AgentId> {
+        let mut ids = Vec::new();
+        for name in names {
+            let agent = make_agent(name);
+            repo.save_for_tenant(&TenantId::consumer(), &agent)
+                .await
+                .unwrap();
+            ids.push(agent.id);
+        }
+        ids
+    }
+
+    async fn seed_workflows(repo: &InMemoryWorkflowRepository, names: &[&str]) -> Vec<WorkflowId> {
+        let mut ids = Vec::new();
+        for name in names {
+            let wf = make_workflow(name, "initial");
+            repo.save_for_tenant(&TenantId::consumer(), &wf)
+                .await
+                .unwrap();
+            ids.push(wf.id);
+        }
+        ids
+    }
+
+    fn make_handler(
+        cortex: Arc<FakeCortexClient>,
+        agent_repo: Arc<InMemoryAgentRepository>,
+        workflow_repo: Arc<InMemoryWorkflowRepository>,
+    ) -> DiscoveryIndexEventHandler {
+        let event_bus = Arc::new(EventBus::new(1024));
+        DiscoveryIndexEventHandler::new(cortex, agent_repo, workflow_repo, event_bus)
+    }
+
+    // ─── Regression tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reconcile_skips_unchanged_agents() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+
+        let ids = seed_agents(&agent_repo, &["alpha", "bravo", "charlie"]).await;
+        assert_eq!(ids.len(), 3);
+
+        let handler = make_handler(cortex.clone(), agent_repo.clone(), workflow_repo);
+
+        // Backfill: expect 3 index_agent calls (one per agent).
+        handler.backfill().await.expect("backfill ok");
+        assert_eq!(
+            cortex.index_agent_calls.load(Ordering::SeqCst),
+            3,
+            "backfill should index every agent"
+        );
+
+        // Reconcile with no changes: expect 0 additional index_agent calls.
+        let summary = handler.reconcile().await.expect("reconcile ok");
+        assert_eq!(
+            cortex.index_agent_calls.load(Ordering::SeqCst),
+            3,
+            "reconcile should skip agents whose fingerprint is unchanged"
+        );
+        assert_eq!(summary.agents_checked, 3);
+        assert_eq!(summary.agents_indexed, 0);
+
+        // Mutate one agent's manifest (change description).
+        let mut mutated = agent_repo
+            .find_by_id_for_tenant(&TenantId::consumer(), ids[1])
+            .await
+            .unwrap()
+            .expect("agent exists");
+        let mut new_manifest = mutated.manifest.clone();
+        new_manifest.metadata.description = Some("mutated description".to_string());
+        mutated.update_manifest(new_manifest);
+        agent_repo
+            .save_for_tenant(&TenantId::consumer(), &mutated)
+            .await
+            .unwrap();
+
+        // Reconcile: expect exactly 1 additional index_agent call for the mutated agent.
+        let summary = handler.reconcile().await.expect("reconcile ok");
+        assert_eq!(
+            cortex.index_agent_calls.load(Ordering::SeqCst),
+            4,
+            "reconcile should re-index only the mutated agent"
+        );
+        assert_eq!(summary.agents_checked, 3);
+        assert_eq!(summary.agents_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_unchanged_workflows() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+
+        let ids = seed_workflows(&workflow_repo, &["wf-a", "wf-b", "wf-c"]).await;
+        assert_eq!(ids.len(), 3);
+
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo.clone());
+
+        // Backfill: expect 3 index_workflow calls.
+        handler.backfill().await.expect("backfill ok");
+        assert_eq!(
+            cortex.index_workflow_calls.load(Ordering::SeqCst),
+            3,
+            "backfill should index every workflow"
+        );
+
+        // Reconcile with no changes: expect 0 additional index_workflow calls.
+        let summary = handler.reconcile().await.expect("reconcile ok");
+        assert_eq!(
+            cortex.index_workflow_calls.load(Ordering::SeqCst),
+            3,
+            "reconcile should skip workflows whose fingerprint is unchanged"
+        );
+        assert_eq!(summary.workflows_checked, 3);
+        assert_eq!(summary.workflows_indexed, 0);
+
+        // Mutate one workflow (description change).
+        let mut mutated = workflow_repo
+            .find_by_id_for_tenant(&TenantId::consumer(), ids[2])
+            .await
+            .unwrap()
+            .expect("workflow exists");
+        mutated.metadata.description = Some("mutated wf desc".to_string());
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &mutated)
+            .await
+            .unwrap();
+
+        // Reconcile: expect exactly 1 additional index_workflow call.
+        let summary = handler.reconcile().await.expect("reconcile ok");
+        assert_eq!(
+            cortex.index_workflow_calls.load(Ordering::SeqCst),
+            4,
+            "reconcile should re-index only the mutated workflow"
+        );
+        assert_eq!(summary.workflows_checked, 3);
+        assert_eq!(summary.workflows_indexed, 1);
+    }
 }

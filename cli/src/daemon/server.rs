@@ -1249,9 +1249,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
 
         // Spawn event handler to keep Cortex discovery index in sync
+        let cortex_discovery: Arc<
+            dyn aegis_orchestrator_core::infrastructure::discovery::event_handler::CortexDiscoveryClient,
+        > = cx.clone();
         let handler = Arc::new(
             aegis_orchestrator_core::infrastructure::discovery::DiscoveryIndexEventHandler::new(
-                cx.clone(),
+                cortex_discovery,
                 agent_repo.clone(),
                 workflow_repo.clone(),
                 event_bus.clone(),
