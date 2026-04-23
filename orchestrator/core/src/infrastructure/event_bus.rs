@@ -1557,6 +1557,7 @@ impl AgentEventReceiver {
             DomainEvent::Canvas(_) => false, // Canvas session events are tenant-scoped, not per-agent
             DomainEvent::Script(_) => false, // Script persistence events are tenant-scoped, not per-agent
             DomainEvent::Team(_) => false,   // Team tenancy events are tenant-scoped, not per-agent
+            DomainEvent::Drift(_) => false,  // Drift events are system-wide, not per-agent
         }
     }
 }
