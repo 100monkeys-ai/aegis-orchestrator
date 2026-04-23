@@ -1898,7 +1898,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     kc.clone(),
                     zaru_url,
                     zaru_secret,
-                ),
+                )
+                .with_event_bus(event_bus.clone()),
             );
             Some(Arc::new(
                 aegis_orchestrator_core::application::effective_tier_service::StandardEffectiveTierService::new(

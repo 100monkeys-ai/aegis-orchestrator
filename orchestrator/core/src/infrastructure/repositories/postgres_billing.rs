@@ -32,6 +32,22 @@ pub trait BillingRepository: Send + Sync {
         stripe_customer_id: &str,
     ) -> Result<Option<TenantSubscription>, RepositoryError>;
 
+    /// Look up subscription by Stripe subscription ID. Used by webhook
+    /// self-healing when the `stripe_customer_id` lookup misses (e.g.
+    /// the cached customer id drifted).
+    async fn get_subscription_by_stripe_sub_id(
+        &self,
+        stripe_subscription_id: &str,
+    ) -> Result<Option<TenantSubscription>, RepositoryError>;
+
+    /// Clear the `stripe_subscription_id` column for a tenant. Used when
+    /// the cached subscription no longer exists in Stripe and we want to
+    /// prevent further operations on a dead reference.
+    async fn clear_stripe_subscription_id(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError>;
+
     /// Update tier, status, and period end for an existing subscription.
     async fn update_tier(
         &self,
@@ -186,6 +202,50 @@ impl BillingRepository for PostgresBillingRepository {
             Some(ref r) => Ok(Some(row_to_subscription(r)?)),
             None => Ok(None),
         }
+    }
+
+    async fn get_subscription_by_stripe_sub_id(
+        &self,
+        stripe_subscription_id: &str,
+    ) -> Result<Option<TenantSubscription>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, stripe_customer_id, stripe_subscription_id,
+                   tier, status, current_period_end, cancel_at_period_end,
+                   created_at, updated_at, seat_count
+            FROM tenant_subscriptions
+            WHERE stripe_subscription_id = $1
+            "#,
+        )
+        .bind(stripe_subscription_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        match row {
+            Some(ref r) => Ok(Some(row_to_subscription(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn clear_stripe_subscription_id(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r#"
+            UPDATE tenant_subscriptions
+            SET stripe_subscription_id = NULL, updated_at = NOW()
+            WHERE tenant_id = $1
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to clear stripe_subscription_id: {e}"))
+        })?;
+        Ok(())
     }
 
     async fn update_tier(
