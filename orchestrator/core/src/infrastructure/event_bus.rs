@@ -614,6 +614,7 @@ impl DomainEvent {
                 TeamEvent::MembershipRevoked { revoked_at, .. } => *revoked_at,
                 TeamEvent::MembershipRoleChanged { changed_at, .. } => *changed_at,
                 TeamEvent::SeatCountChanged { changed_at, .. } => *changed_at,
+                TeamEvent::StatusChanged { changed_at, .. } => *changed_at,
                 TeamEvent::TenantContextSwitched { switched_at, .. } => *switched_at,
             },
         }
@@ -844,6 +845,7 @@ impl DomainEvent {
                 TeamEvent::MembershipRevoked { .. } => "team_membership_revoked",
                 TeamEvent::MembershipRoleChanged { .. } => "team_membership_role_changed",
                 TeamEvent::SeatCountChanged { .. } => "team_seat_count_changed",
+                TeamEvent::StatusChanged { .. } => "team_status_changed",
                 TeamEvent::TenantContextSwitched { .. } => "tenant_context_switched",
             },
         }
