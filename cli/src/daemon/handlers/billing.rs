@@ -417,16 +417,28 @@ pub(crate) struct UpdateSeatsRequest {
 /// orchestrator applies whatever it's given — no preserve-unless-specified
 /// fallback here. The frontend resolves `seats` from the modal slider, the
 /// current subscription's seat count, or the target tier's default.
+///
+/// `seats` is the **total** seat count (including the tier's included seats),
+/// matching the UX the user sees ("Total seats: 5"). Internally the
+/// orchestrator converts this into an extra-seat quantity for the Stripe
+/// seat line item via `extra_seats_for(target_tier, seats)`.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct TierChangeRequest {
     /// Target tier slug: "pro" | "business" | "enterprise" | "free".
     pub target_tier: String,
     /// Target billing interval: "month" | "year".
     pub billing_interval: String,
-    /// Extra seats on the target tier (0 for Pro/Free or when no add-on seats
-    /// are wanted).
+    /// Total seats on the target tier (including included seats).
+    /// Set to the target tier's `included_seats` for no extra seats.
     #[serde(default)]
     pub seats: u32,
+}
+
+/// Number of *extra* seats (Stripe seat line item quantity) for a given total
+/// seat count on a target tier. Total below the tier's included seat count
+/// clamps to 0.
+fn extra_seats_for(target_tier: &TenantTier, total_seats: u32) -> u32 {
+    total_seats.saturating_sub(target_tier.included_seats())
 }
 
 /// Response body for `POST /v1/billing/preview-tier-change`.
@@ -1756,7 +1768,15 @@ pub(crate) async fn preview_tier_change_handler(
         .unwrap_or(0);
 
     let target_tier = str_to_tier(&body.target_tier);
-    let direction = classify_tier_change(&current_tier, current_seats, &target_tier, body.seats);
+    // Frontend sends `seats` as TOTAL (includes the tier's included seats).
+    // Convert to extra-seat count for all internal math and Stripe calls.
+    let target_extra_seats = extra_seats_for(&target_tier, body.seats);
+    let direction = classify_tier_change(
+        &current_tier,
+        current_seats,
+        &target_tier,
+        target_extra_seats,
+    );
 
     let period_end_ts = current.current_period_end;
     let period_end_dt = period_end_ts.and_then(unix_to_utc);
@@ -1790,10 +1810,14 @@ pub(crate) async fn preview_tier_change_handler(
                 .into_response()
         }
         TierChangeDirection::Downgrade => {
-            let next_renewal =
-                renewal_amount_cents(&stripe, &target_tier, &body.billing_interval, body.seats)
-                    .await
-                    .unwrap_or(0);
+            let next_renewal = renewal_amount_cents(
+                &stripe,
+                &target_tier,
+                &body.billing_interval,
+                target_extra_seats,
+            )
+            .await
+            .unwrap_or(0);
             (
                 StatusCode::OK,
                 Json(TierChangePreview {
@@ -1814,7 +1838,7 @@ pub(crate) async fn preview_tier_change_handler(
                 &current,
                 &target_tier,
                 &body.billing_interval,
-                body.seats,
+                target_extra_seats,
             )
             .await
             {
@@ -1851,12 +1875,27 @@ pub(crate) async fn preview_tier_change_handler(
                 }
             };
 
-            let proration_total = preview_invoice.amount_due;
+            // `amount_due` on the upcoming invoice preview includes BOTH the
+            // proration lines AND the next period's full charge — Stripe's
+            // "upcoming invoice" concept rolls them together. We only want
+            // the immediate prorated delta here. Filter to lines flagged
+            // `proration: true`.
+            let proration_total: i64 = preview_invoice
+                .lines
+                .data
+                .iter()
+                .filter(|l| l.proration)
+                .map(|l| l.amount)
+                .sum();
 
-            let next_renewal =
-                renewal_amount_cents(&stripe, &target_tier, &body.billing_interval, body.seats)
-                    .await
-                    .unwrap_or(0);
+            let next_renewal = renewal_amount_cents(
+                &stripe,
+                &target_tier,
+                &body.billing_interval,
+                target_extra_seats,
+            )
+            .await
+            .unwrap_or(0);
 
             let (action, seats_out) = if matches!(direction, TierChangeDirection::Upgrade) {
                 ("upgrade_immediate", body.seats)
@@ -1912,7 +1951,15 @@ pub(crate) async fn change_tier_handler(
         .unwrap_or(0);
 
     let target_tier = str_to_tier(&body.target_tier);
-    let direction = classify_tier_change(&current_tier, current_seats, &target_tier, body.seats);
+    // Frontend sends `seats` as TOTAL (includes the tier's included seats).
+    // Convert to extra-seat count for all internal math and Stripe calls.
+    let target_extra_seats = extra_seats_for(&target_tier, body.seats);
+    let direction = classify_tier_change(
+        &current_tier,
+        current_seats,
+        &target_tier,
+        target_extra_seats,
+    );
 
     let period_end_ts = current.current_period_end;
     let period_end_dt = period_end_ts.and_then(unix_to_utc);
@@ -1994,12 +2041,12 @@ pub(crate) async fn change_tier_handler(
                     ..Default::default()
                 }];
 
-            if target_tier.included_seats() > 0 && body.seats > 0 {
+            if target_tier.included_seats() > 0 && target_extra_seats > 0 {
                 match find_seat_price_id(&stripe, target_tier_str, &body.billing_interval).await {
                     Some(seat_price) => {
                         phase_items.push(UpdateSubscriptionSchedulePhasesItems {
                             price: Some(seat_price),
-                            quantity: Some(body.seats as u64),
+                            quantity: Some(target_extra_seats as u64),
                             ..Default::default()
                         });
                     }
@@ -2105,7 +2152,7 @@ pub(crate) async fn change_tier_handler(
                 &current,
                 &target_tier,
                 &body.billing_interval,
-                body.seats,
+                target_extra_seats,
             )
             .await
             {
