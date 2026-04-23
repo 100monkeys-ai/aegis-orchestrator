@@ -923,7 +923,7 @@ async fn build_tier_change_items(
 
 // ── Schedule management ────────────────────────────────────────────────────
 
-/// If `sub` already has an attached [`SubscriptionSchedule`], release it so a
+/// If `sub` already has an attached `SubscriptionSchedule`, release it so a
 /// subsequent upgrade / cancel / fresh-downgrade call isn't blocked by the
 /// pending phase transition. Releasing leaves the underlying subscription in
 /// place — it just detaches the schedule — which is exactly what we want.
@@ -1885,7 +1885,7 @@ pub(crate) async fn preview_tier_change_handler(
 /// request body.
 ///
 /// See [`preview_tier_change_handler`] for the action semantics. If a
-/// [`SubscriptionSchedule`] is attached to the current subscription (from a
+/// `SubscriptionSchedule` is attached to the current subscription (from a
 /// previous pending downgrade), it is released first so the new action has a
 /// clean base to operate on.
 pub(crate) async fn change_tier_handler(
