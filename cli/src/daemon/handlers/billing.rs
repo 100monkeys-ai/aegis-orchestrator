@@ -27,6 +27,7 @@ use tracing::{error, info, warn};
 use aegis_orchestrator_core::domain::billing::{SubscriptionStatus, TenantSubscription};
 use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::domain::node_config::{resolve_env_value, BillingConfig};
+use aegis_orchestrator_core::domain::team::TeamStatus;
 use aegis_orchestrator_core::domain::tenancy::TenantTier;
 use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
 
@@ -1170,6 +1171,11 @@ async fn handle_subscription_updated(
     // EffectiveTierService (ADR-111 Phase 3) for consumer tenants.
     sync_tier(state, &sub.tenant_id, &tier).await;
 
+    // Colony suspension: if this subscription belongs to a team tenant and
+    // the tier dropped below Business, suspend the colony so team-context
+    // requests are rejected. Re-suspension is idempotent.
+    reconcile_team_suspension(state, &sub.tenant_id, &tier).await;
+
     // ADR-111 §Billing Model: reconcile seat_count back from Stripe for all
     // tenants. The canonical source is membership truth, but manual edits in
     // the Stripe dashboard can create drift — this keeps the persisted
@@ -1422,10 +1428,94 @@ async fn handle_subscription_deleted(
 
     sync_tier(state, &sub.tenant_id, &TenantTier::Free).await;
 
+    // Colony suspension: deletion drops the tenant to Free, which cannot own
+    // a colony. Suspend the team so team-context requests are rejected.
+    reconcile_team_suspension(state, &sub.tenant_id, &TenantTier::Free).await;
+
     info!(
         tenant_id = %sub.tenant_id,
         "Subscription deleted — downgraded to free"
     );
+}
+
+/// Reconcile team colony status against the (possibly new) subscription tier.
+///
+/// When `tenant_id` is a team tenant (`t-{uuid}`):
+///
+/// - If `tier` no longer allows a colony (below Business) and the team is
+///   currently `Active`, suspend it.
+/// - If `tier` allows a colony and the team is currently `Suspended`, resume
+///   it.
+/// - In either case, recompute all member effective tiers so the shared
+///   ceiling tracks the new colony state immediately.
+///
+/// No-op for non-team tenants, and tolerant of the team_repo /
+/// effective_tier_service being unconfigured (degraded mode).
+async fn reconcile_team_suspension(
+    state: &AppState,
+    tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+    tier: &TenantTier,
+) {
+    let (Some(team_repo), Some(service)) = (
+        state.team_repo.as_ref(),
+        state.effective_tier_service.as_ref(),
+    ) else {
+        return;
+    };
+    reconcile_team_suspension_with(team_repo.as_ref(), service.as_ref(), tenant_id, tier).await;
+}
+
+/// Core suspension reconciliation — parameterised by the collaborators so
+/// unit tests can exercise the full state transition without constructing an
+/// [`AppState`].
+async fn reconcile_team_suspension_with(
+    team_repo: &dyn aegis_orchestrator_core::domain::team::TeamRepository,
+    service: &dyn aegis_orchestrator_core::application::effective_tier_service::EffectiveTierService,
+    tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+    tier: &TenantTier,
+) {
+    if !tenant_id.is_team() {
+        return;
+    }
+    match team_repo.find_by_tenant_id(tenant_id).await {
+        Ok(Some(mut team)) => {
+            let allows = tier.allows_colony();
+            let should_suspend = !allows && team.status == TeamStatus::Active;
+            let should_resume = allows && team.status == TeamStatus::Suspended;
+            if should_suspend {
+                if let Err(e) = team.suspend() {
+                    warn!(error = %e, team_id = %team.id, "failed to suspend team");
+                } else if let Err(e) = team_repo.save(&team).await {
+                    warn!(error = %e, team_id = %team.id, "failed to persist suspended team");
+                } else {
+                    info!(team_id = %team.id, "colony suspended");
+                }
+            } else if should_resume {
+                if let Err(e) = team.resume() {
+                    warn!(error = %e, team_id = %team.id, "failed to resume team");
+                } else if let Err(e) = team_repo.save(&team).await {
+                    warn!(error = %e, team_id = %team.id, "failed to persist resumed team");
+                } else {
+                    info!(team_id = %team.id, "colony resumed");
+                }
+            }
+            // Either way, recompute all member tiers so the shared ceiling
+            // tracks the new colony state.
+            if let Err(e) = service.recompute_for_team(&team.id).await {
+                warn!(
+                    error = %e,
+                    team_id = %team.id,
+                    "failed to recompute team tiers after suspension state change"
+                );
+            }
+        }
+        Ok(None) => {
+            warn!(tenant_id = %tenant_id, "team not found for team tenant subscription event");
+        }
+        Err(e) => {
+            warn!(error = %e, tenant_id = %tenant_id, "failed to look up team for suspension check");
+        }
+    }
 }
 
 async fn handle_payment_failed(billing_repo: &dyn BillingRepository, payload: &serde_json::Value) {
@@ -2022,6 +2112,223 @@ mod tests {
 
         // Pre-existing attributes are preserved (not nulled out).
         assert_eq!(put_body["attributes"]["tenant_id"][0], "u-pro-user");
+    }
+
+    // ── colony suspension (Phase 4) ───────────────────────────────────────
+    //
+    // These tests exercise `reconcile_team_suspension_with` — the pure form
+    // of the AppState helper used from `handle_subscription_updated` and
+    // `handle_subscription_deleted`. The full webhook path is exercised in
+    // the middleware tests; here we pin the state transition so a regression
+    // that dropped the suspend/resume logic (or wired it up on the wrong
+    // tier boundary) is caught by a unit test.
+
+    mod colony_suspension {
+        use super::super::*;
+        use aegis_orchestrator_core::application::effective_tier_service::{
+            EffectiveTierError, EffectiveTierService,
+        };
+        use aegis_orchestrator_core::domain::repository::RepositoryError;
+        use aegis_orchestrator_core::domain::team::{
+            Team, TeamId, TeamRepository, TeamSlug, TeamStatus,
+        };
+        use aegis_orchestrator_core::domain::tenancy::TenantTier;
+        use aegis_orchestrator_core::domain::tenant::TenantId;
+        use async_trait::async_trait;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct InMemoryTeamRepo {
+            by_tenant: Mutex<HashMap<String, Team>>,
+        }
+
+        impl InMemoryTeamRepo {
+            fn insert(&self, team: Team) {
+                self.by_tenant
+                    .lock()
+                    .unwrap()
+                    .insert(team.tenant_id.as_str().to_string(), team);
+            }
+            fn get(&self, tenant_id: &TenantId) -> Option<Team> {
+                self.by_tenant
+                    .lock()
+                    .unwrap()
+                    .get(tenant_id.as_str())
+                    .cloned()
+            }
+        }
+
+        #[async_trait]
+        impl TeamRepository for InMemoryTeamRepo {
+            async fn save(&self, team: &Team) -> Result<(), RepositoryError> {
+                self.insert(team.clone());
+                Ok(())
+            }
+            async fn find_by_id(&self, id: &TeamId) -> Result<Option<Team>, RepositoryError> {
+                Ok(self
+                    .by_tenant
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .find(|t| t.id == *id)
+                    .cloned())
+            }
+            async fn find_by_slug(&self, slug: &TeamSlug) -> Result<Option<Team>, RepositoryError> {
+                Ok(self
+                    .by_tenant
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .find(|t| &t.slug == slug)
+                    .cloned())
+            }
+            async fn find_by_owner(
+                &self,
+                owner_user_id: &str,
+            ) -> Result<Vec<Team>, RepositoryError> {
+                Ok(self
+                    .by_tenant
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|t| t.owner_user_id == owner_user_id)
+                    .cloned()
+                    .collect())
+            }
+            async fn find_by_tenant_id(
+                &self,
+                tenant_id: &TenantId,
+            ) -> Result<Option<Team>, RepositoryError> {
+                Ok(self
+                    .by_tenant
+                    .lock()
+                    .unwrap()
+                    .get(tenant_id.as_str())
+                    .cloned())
+            }
+            async fn delete(&self, id: &TeamId) -> Result<(), RepositoryError> {
+                self.by_tenant.lock().unwrap().retain(|_, t| t.id != *id);
+                Ok(())
+            }
+        }
+
+        /// Recording stub — captures the team ids passed to
+        /// `recompute_for_team` so tests can assert side effects.
+        #[derive(Default)]
+        struct RecordingTierService {
+            recomputed: Mutex<Vec<TeamId>>,
+        }
+
+        #[async_trait]
+        impl EffectiveTierService for RecordingTierService {
+            async fn recompute_for_user(
+                &self,
+                _user_id: &str,
+            ) -> Result<TenantTier, EffectiveTierError> {
+                Ok(TenantTier::Free)
+            }
+            async fn recompute_for_team(&self, team_id: &TeamId) -> Result<(), EffectiveTierError> {
+                self.recomputed.lock().unwrap().push(*team_id);
+                Ok(())
+            }
+        }
+
+        fn mk_active_business_team() -> Team {
+            let mut team =
+                Team::provision("Acme".into(), "owner-1".into(), TenantTier::Business).unwrap();
+            let _ = team.take_events();
+            team
+        }
+
+        #[tokio::test]
+        async fn subscription_downgrade_to_pro_suspends_team_colony() {
+            let team_repo = std::sync::Arc::new(InMemoryTeamRepo::default());
+            let service = std::sync::Arc::new(RecordingTierService::default());
+            let team = mk_active_business_team();
+            let tenant_id = team.tenant_id.clone();
+            let team_id = team.id;
+            team_repo.insert(team);
+
+            reconcile_team_suspension_with(
+                team_repo.as_ref(),
+                service.as_ref(),
+                &tenant_id,
+                &TenantTier::Pro,
+            )
+            .await;
+
+            let reloaded = team_repo.get(&tenant_id).expect("team persisted");
+            assert_eq!(reloaded.status, TeamStatus::Suspended);
+            assert_eq!(service.recomputed.lock().unwrap().as_slice(), &[team_id]);
+        }
+
+        #[tokio::test]
+        async fn subscription_deleted_suspends_team_colony() {
+            // Deletion lands as Free at the billing layer — same effect: below
+            // Business → colony suspended.
+            let team_repo = std::sync::Arc::new(InMemoryTeamRepo::default());
+            let service = std::sync::Arc::new(RecordingTierService::default());
+            let team = mk_active_business_team();
+            let tenant_id = team.tenant_id.clone();
+            let team_id = team.id;
+            team_repo.insert(team);
+
+            reconcile_team_suspension_with(
+                team_repo.as_ref(),
+                service.as_ref(),
+                &tenant_id,
+                &TenantTier::Free,
+            )
+            .await;
+
+            let reloaded = team_repo.get(&tenant_id).expect("team persisted");
+            assert_eq!(reloaded.status, TeamStatus::Suspended);
+            assert_eq!(service.recomputed.lock().unwrap().as_slice(), &[team_id]);
+        }
+
+        #[tokio::test]
+        async fn subscription_upgrade_to_business_resumes_suspended_team() {
+            let team_repo = std::sync::Arc::new(InMemoryTeamRepo::default());
+            let service = std::sync::Arc::new(RecordingTierService::default());
+            let mut team = mk_active_business_team();
+            team.suspend().unwrap();
+            let _ = team.take_events();
+            let tenant_id = team.tenant_id.clone();
+            let team_id = team.id;
+            team_repo.insert(team);
+
+            reconcile_team_suspension_with(
+                team_repo.as_ref(),
+                service.as_ref(),
+                &tenant_id,
+                &TenantTier::Business,
+            )
+            .await;
+
+            let reloaded = team_repo.get(&tenant_id).expect("team persisted");
+            assert_eq!(reloaded.status, TeamStatus::Active);
+            assert_eq!(service.recomputed.lock().unwrap().as_slice(), &[team_id]);
+        }
+
+        #[tokio::test]
+        async fn non_team_tenant_is_no_op() {
+            // Regression guard: reconciliation must not fire on personal /
+            // consumer tenant subscriptions — those never own a colony.
+            let team_repo = std::sync::Arc::new(InMemoryTeamRepo::default());
+            let service = std::sync::Arc::new(RecordingTierService::default());
+            let personal = TenantId::from_realm_slug("u-abc123").unwrap();
+
+            reconcile_team_suspension_with(
+                team_repo.as_ref(),
+                service.as_ref(),
+                &personal,
+                &TenantTier::Free,
+            )
+            .await;
+
+            assert!(service.recomputed.lock().unwrap().is_empty());
+        }
     }
 
     // ── consumer_tenant_id_to_user_sub regression ─────────────────────────

@@ -27,11 +27,13 @@ use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
+
+use crate::domain::team::TeamStatus;
 
 /// State carried into [`tenant_context_middleware`] via
 /// [`axum::middleware::from_fn_with_state`].
@@ -82,6 +84,64 @@ fn forbid(code: &'static str, message: &'static str) -> Response {
         .into_response()
 }
 
+/// Recovery allowlist for suspended team tenants.
+///
+/// A suspended colony MUST remain reachable on a narrow set of paths so the
+/// team owner can inspect the team and restore a Business-or-higher
+/// subscription via the billing portal. Everything else 402s.
+fn suspension_allowlisted(method: &Method, path: &str) -> bool {
+    // Billing endpoints (checkout, portal, subscription, seats, invoices)
+    // must remain reachable so the owner can self-serve recovery.
+    path.starts_with("/v1/billing")
+        // Read-only team views let the owner see who is affected by the
+        // suspension while deciding how to recover.
+        || (method == Method::GET && path.starts_with("/v1/teams"))
+}
+
+/// Apply the ADR-111 colony suspension gate.
+///
+/// When the resolved tenant is a team colony whose status is `Suspended`,
+/// reject the request with HTTP 402 Payment Required — unless the path is in
+/// the recovery allowlist ([`suspension_allowlisted`]).
+///
+/// Returns `Some(response)` when the gate fired (caller must short-circuit).
+/// Returns `None` when the request is allowed to proceed.
+async fn suspension_gate(
+    state: &TenantMiddlewareState,
+    method: &Method,
+    path: &str,
+    tenant_id: &TenantId,
+) -> Option<Response> {
+    if !tenant_id.is_team() {
+        return None;
+    }
+    if suspension_allowlisted(method, path) {
+        return None;
+    }
+    let team_repo = state.team_repo.as_ref()?;
+    match team_repo.find_by_tenant_id(tenant_id).await {
+        Ok(Some(team)) if team.status == TeamStatus::Suspended => {
+            let body = serde_json::json!({
+                "error": "colony_suspended",
+                "team_id": team.id,
+                "tenant_id": tenant_id,
+                "reason": "owner_subscription_below_business",
+                "remediation": "Team owner must restore a Business or Enterprise subscription."
+            });
+            Some((StatusCode::PAYMENT_REQUIRED, Json(body)).into_response())
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                tenant_id = %tenant_id,
+                "failed to check team status for suspension gate"
+            );
+            None
+        }
+    }
+}
+
 /// TenantContext middleware.
 ///
 /// Resolves the effective [`TenantId`] from the authenticated
@@ -110,6 +170,8 @@ pub async fn tenant_context_middleware(
         return next.run(request).await;
     };
 
+    let method = request.method().clone();
+
     let base_tenant = derive_tenant_id(&id);
 
     // 1. Operator cross-tenant override.
@@ -131,6 +193,11 @@ pub async fn tenant_context_middleware(
                                 target_tenant_id: target_tenant.clone(),
                                 accessed_at: Utc::now(),
                             });
+                        if let Some(gate) =
+                            suspension_gate(&state, &method, &path, &target_tenant).await
+                        {
+                            return gate;
+                        }
                         let mut request = request;
                         request.extensions_mut().insert(target_tenant);
                         return next.run(request).await;
@@ -156,6 +223,9 @@ pub async fn tenant_context_middleware(
                 // ADR-100: service-account delegation.
                 if !header_val.is_empty() {
                     if let Ok(target) = TenantId::from_realm_slug(&header_val) {
+                        if let Some(gate) = suspension_gate(&state, &method, &path, &target).await {
+                            return gate;
+                        }
                         let mut request = request;
                         request.extensions_mut().insert(target);
                         return next.run(request).await;
@@ -229,6 +299,11 @@ pub async fn tenant_context_middleware(
                                 via_header: "X-Tenant-Id".to_string(),
                                 switched_at: Utc::now(),
                             });
+                        if let Some(gate) =
+                            suspension_gate(&state, &method, &path, &target_tenant).await
+                        {
+                            return gate;
+                        }
                         let mut request = request;
                         request.extensions_mut().insert(target_tenant);
                         return next.run(request).await;
@@ -257,6 +332,9 @@ pub async fn tenant_context_middleware(
     }
 
     // 4. JWT default.
+    if let Some(gate) = suspension_gate(&state, &method, &path, &base_tenant).await {
+        return gate;
+    }
     let mut request = request;
     request.extensions_mut().insert(base_tenant);
     next.run(request).await
@@ -778,6 +856,199 @@ mod tests {
         let (status, body) = call(app, req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "u-some-tenant");
+    }
+
+    // ----- ADR-111 Phase 4 colony suspension gate -----
+
+    /// Build a team that is Active on the Business tier with `user-1` as the
+    /// sole active owner-member. Returns (repo, membership_repo, team_slug,
+    /// team_id, tenant_id).
+    fn suspended_team_fixture() -> (
+        Arc<InMemoryTeamRepo>,
+        Arc<InMemoryMembershipRepo>,
+        String,
+        TeamId,
+        TenantId,
+    ) {
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+
+        let mut team = Team::provision(
+            "Acme".into(),
+            "user-1".into(),
+            crate::domain::tenancy::TenantTier::Business,
+        )
+        .unwrap();
+        team.suspend().unwrap();
+        let _ = team.take_events();
+        let slug = team.slug.as_str().to_string();
+        let team_id = team.id;
+        let tenant_id = team.tenant_id.clone();
+        team_repo.insert(team);
+        membership_repo.insert(Membership::new_active(
+            team_id,
+            "user-1".into(),
+            MembershipRole::Owner,
+        ));
+        (team_repo, membership_repo, slug, team_id, tenant_id)
+    }
+
+    /// Build a router whose test handler accepts arbitrary method + path,
+    /// so we can exercise the suspension gate against billing / team /
+    /// other routes.
+    fn build_suspension_app(
+        state: TenantMiddlewareState,
+        identity: Option<UserIdentity>,
+    ) -> Router {
+        let handler = |req: Request| async move {
+            let tid = req
+                .extensions()
+                .get::<TenantId>()
+                .cloned()
+                .unwrap_or_else(TenantId::default);
+            tid.as_str().to_string()
+        };
+
+        let router = Router::new()
+            .route("/v1/agents", get(handler))
+            .route("/v1/billing/portal", axum::routing::post(handler))
+            .route("/v1/teams", get(handler))
+            .route("/v1/teams", axum::routing::post(handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                tenant_context_middleware,
+            ));
+
+        if let Some(identity) = identity {
+            router.layer(axum::middleware::from_fn(
+                move |mut req: Request, next: Next| {
+                    let identity = identity.clone();
+                    async move {
+                        req.extensions_mut().insert(identity);
+                        next.run(req).await
+                    }
+                },
+            ))
+        } else {
+            router
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_team_tenant_request_returns_402() {
+        let (team_repo, membership_repo, slug, _team_id, _tenant_id) = suspended_team_fixture();
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_suspension_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert!(
+            body.contains("colony_suspended"),
+            "expected colony_suspended in body, got: {body}"
+        );
+        assert!(body.contains("owner_subscription_below_business"));
+    }
+
+    #[tokio::test]
+    async fn suspended_team_tenant_allows_billing_portal() {
+        // Recovery allowlist: POST /v1/billing/portal must remain reachable
+        // so the owner can restore a Business subscription.
+        let (team_repo, membership_repo, slug, _team_id, tenant_id) = suspended_team_fixture();
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_suspension_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/v1/billing/portal")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "billing portal must bypass suspension gate, got {status} body={body}"
+        );
+        assert_eq!(body, tenant_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn suspended_team_tenant_allows_team_read() {
+        // GET /v1/teams must remain reachable so the owner can see what is
+        // affected by the suspension.
+        let (team_repo, membership_repo, slug, _team_id, tenant_id) = suspended_team_fixture();
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_suspension_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("/v1/teams")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, tenant_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn suspended_team_tenant_blocks_team_write() {
+        // Write endpoints on /v1/teams are NOT allowlisted — a suspended
+        // colony must refuse mutations until it is resumed.
+        let (team_repo, membership_repo, slug, _team_id, _tenant_id) = suspended_team_fixture();
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_suspension_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/v1/teams")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _body) = call(app, req).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn active_team_tenant_request_passes_gate() {
+        // Regression guard: gate must only fire for Suspended teams —
+        // Active teams pass through untouched.
+        let team_repo = Arc::new(InMemoryTeamRepo::default());
+        let membership_repo = Arc::new(InMemoryMembershipRepo::default());
+        let mut team = Team::provision(
+            "Acme".into(),
+            "user-1".into(),
+            crate::domain::tenancy::TenantTier::Business,
+        )
+        .unwrap();
+        let _ = team.take_events();
+        let slug = team.slug.as_str().to_string();
+        let tenant_id = team.tenant_id.clone();
+        let team_id = team.id;
+        team.status = TeamStatus::Active;
+        team_repo.insert(team);
+        membership_repo.insert(Membership::new_active(
+            team_id,
+            "user-1".into(),
+            MembershipRole::Owner,
+        ));
+
+        let state = state_with_repos(team_repo, membership_repo);
+        let app = build_suspension_app(state, Some(consumer_identity("user-1")));
+
+        let req = HttpRequest::builder()
+            .uri("/v1/agents")
+            .header("x-tenant-id", slug)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, tenant_id.as_str());
     }
 
     #[tokio::test]

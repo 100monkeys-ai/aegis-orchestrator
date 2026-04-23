@@ -232,6 +232,11 @@ impl TenantId {
         self.0 == CONSUMER_SLUG
     }
 
+    /// True when this tenant is a Team colony (slug starts with "t-").
+    pub fn is_team(&self) -> bool {
+        self.as_str().starts_with("t-")
+    }
+
     fn validate(value: &str) -> Result<(), TenantIdError> {
         if value.is_empty() {
             return Err(TenantIdError::Empty);

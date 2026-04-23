@@ -97,6 +97,23 @@ mod tests {
     }
 
     #[test]
+    fn tenant_id_is_team_flag() {
+        // Team colony slugs are of shape `t-{uuid}` (see ADR-111 / TeamSlug).
+        let team = TenantId::from_realm_slug("t-abc123").unwrap();
+        assert!(team.is_team());
+        assert!(!team.is_consumer());
+        assert!(!team.is_system());
+
+        // Consumer / system / per-user tenants are not teams.
+        assert!(!TenantId::consumer().is_team());
+        assert!(!TenantId::system().is_team());
+        let personal = TenantId::from_realm_slug("u-abc123").unwrap();
+        assert!(!personal.is_team());
+        let enterprise = TenantId::from_realm_slug("acme-corp").unwrap();
+        assert!(!enterprise.is_team());
+    }
+
+    #[test]
     fn display_outputs_inner_string() {
         assert_eq!(TenantId::consumer().to_string(), "zaru-consumer");
     }
