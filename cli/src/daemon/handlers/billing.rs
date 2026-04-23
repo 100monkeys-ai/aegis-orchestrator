@@ -134,15 +134,23 @@ pub(crate) struct UpdateSeatsRequest {
 
 // ── Tier mapping helpers ────────────────────────────────────────────────────
 
-/// Map a Stripe product name to a (tier, included_seats) tuple.
-/// Returns `None` for products that are seat add-ons.
+/// Map a Stripe product name to a `(tier, included_seats)` tuple.
+///
+/// Per ADR-111 (colony tier model): Pro is a personal subscription with **no
+/// seats** — `provision_team` rejects Pro via
+/// [`TenantTier::allows_colony`], so the Pro mapping here only ever fires for
+/// personal-tier sync paths and sanity checks. Business/Enterprise are the
+/// only tiers that may own a colony and carry seats (5 / 10 respectively).
+///
+/// Returns `None` for products that are seat add-ons — those are matched
+/// separately via [`seat_product_tier`].
 fn product_name_to_tier(name: &str) -> Option<(&'static str, u32)> {
     // Skip seat add-on products — they are matched separately
     if name.contains("Extra Seat") {
         return None;
     }
     if name.starts_with("Zaru Pro") {
-        Some(("pro", 3))
+        Some(("pro", 0))
     } else if name.starts_with("Zaru Business") {
         Some(("business", 5))
     } else if name.starts_with("Zaru Enterprise") {
@@ -153,14 +161,14 @@ fn product_name_to_tier(name: &str) -> Option<(&'static str, u32)> {
 }
 
 /// Extract the tier prefix from a seat add-on product name.
-/// e.g. "Zaru Pro - Extra Seat" -> "pro"
+///
+/// Per ADR-111: Pro is personal-only and has no seat add-on. Only Business
+/// and Enterprise seat add-ons are recognized.
 fn seat_product_tier(name: &str) -> Option<&'static str> {
     if !name.contains("Extra Seat") {
         return None;
     }
-    if name.starts_with("Zaru Pro") {
-        Some("pro")
-    } else if name.starts_with("Zaru Business") {
+    if name.starts_with("Zaru Business") {
         Some("business")
     } else if name.starts_with("Zaru Enterprise") {
         Some("enterprise")
@@ -169,22 +177,24 @@ fn seat_product_tier(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Included seats per tier (matches the product_name_to_tier mapping).
+/// Included seats per tier. Delegates to the domain
+/// [`TenantTier::included_seats`] so the billing and domain layers cannot
+/// drift. Pro returns 0 via the `_` arm — a Pro subscription is personal and
+/// carries no seats.
 fn included_seats_for_tier(tier: &str) -> u32 {
     match tier {
-        "pro" => 3,
-        "business" => 5,
-        "enterprise" => 10,
-        _ => 1,
+        "business" => TenantTier::Business.included_seats(),
+        "enterprise" => TenantTier::Enterprise.included_seats(),
+        _ => 0,
     }
 }
 
 // ── Seat price mapping (tier × interval → Stripe price ID) ─────────────────
 
-/// All known seat add-on price IDs across all tiers and billing intervals.
+/// Known seat add-on price IDs across all colony-capable tiers and billing
+/// intervals. Per ADR-111, Pro is personal-only and intentionally absent —
+/// there is no Pro seat add-on.
 const ALL_SEAT_PRICES: &[(&str, &str, &str)] = &[
-    ("pro", "month", "price_1TMjj28rRJG9yuHzezvbHaSx"),
-    ("pro", "year", "price_1TMjj38rRJG9yuHzHE8aDa2i"),
     ("business", "month", "price_1TMjj48rRJG9yuHz7zN7Xos0"),
     ("business", "year", "price_1TMjj58rRJG9yuHzTR7JgC7N"),
     ("enterprise", "month", "price_1TMjj68rRJG9yuHzH0fB8R1b"),
@@ -1633,12 +1643,21 @@ mod tests {
 
     #[test]
     fn product_name_to_tier_maps_base_plans() {
-        assert_eq!(product_name_to_tier("Zaru Pro"), Some(("pro", 3)));
+        // Per ADR-111: Pro is personal-only and carries zero seats. Business
+        // (5) and Enterprise (10) are the colony tiers.
+        assert_eq!(product_name_to_tier("Zaru Pro"), Some(("pro", 0)));
         assert_eq!(product_name_to_tier("Zaru Business"), Some(("business", 5)));
         assert_eq!(
             product_name_to_tier("Zaru Enterprise"),
             Some(("enterprise", 10))
         );
+    }
+
+    #[test]
+    fn product_name_to_tier_maps_pro_to_zero_seats() {
+        // Regression for ADR-111 Phase 2: Pro must never advertise seats.
+        assert_eq!(product_name_to_tier("Zaru Pro"), Some(("pro", 0)));
+        assert_eq!(product_name_to_tier("Zaru Pro - Monthly"), Some(("pro", 0)));
     }
 
     #[test]
@@ -1654,7 +1673,9 @@ mod tests {
 
     #[test]
     fn seat_product_tier_maps_correctly() {
-        assert_eq!(seat_product_tier("Zaru Pro - Extra Seat"), Some("pro"));
+        // Per ADR-111: Pro has no seat add-on — `seat_product_tier` must not
+        // recognize a "Zaru Pro - Extra Seat" product.
+        assert_eq!(seat_product_tier("Zaru Pro - Extra Seat"), None);
         assert_eq!(
             seat_product_tier("Zaru Business - Extra Seat"),
             Some("business")
@@ -1669,6 +1690,19 @@ mod tests {
     fn seat_product_tier_rejects_non_seat_products() {
         assert_eq!(seat_product_tier("Zaru Pro"), None);
         assert_eq!(seat_product_tier("Zaru Business"), None);
+    }
+
+    #[test]
+    fn all_seat_prices_excludes_pro() {
+        // Regression for ADR-111 Phase 2: Pro has no seat add-on price.
+        for (tier, _, _) in ALL_SEAT_PRICES {
+            assert_ne!(*tier, "pro", "Pro must not appear in ALL_SEAT_PRICES");
+        }
+    }
+
+    #[test]
+    fn pro_has_zero_included_seats() {
+        assert_eq!(included_seats_for_tier("pro"), 0);
     }
 
     #[test]
@@ -1724,14 +1758,10 @@ mod tests {
 
     #[test]
     fn seat_price_for_tier_returns_correct_prices() {
-        assert_eq!(
-            seat_price_for_tier("pro", "month"),
-            Some("price_1TMjj28rRJG9yuHzezvbHaSx")
-        );
-        assert_eq!(
-            seat_price_for_tier("pro", "year"),
-            Some("price_1TMjj38rRJG9yuHzHE8aDa2i")
-        );
+        // Per ADR-111: Pro has no seat add-on — `seat_price_for_tier("pro", _)`
+        // must return None.
+        assert_eq!(seat_price_for_tier("pro", "month"), None);
+        assert_eq!(seat_price_for_tier("pro", "year"), None);
         assert_eq!(
             seat_price_for_tier("business", "month"),
             Some("price_1TMjj48rRJG9yuHz7zN7Xos0")
@@ -1760,10 +1790,9 @@ mod tests {
 
     #[test]
     fn tier_for_seat_price_reverse_lookup() {
-        assert_eq!(
-            tier_for_seat_price("price_1TMjj28rRJG9yuHzezvbHaSx"),
-            Some(("pro", "month"))
-        );
+        // Per ADR-111: the Pro seat price IDs are no longer recognized —
+        // they were removed with the rest of the Pro seat-add-on plumbing.
+        assert_eq!(tier_for_seat_price("price_1TMjj28rRJG9yuHzezvbHaSx"), None);
         assert_eq!(
             tier_for_seat_price("price_1TMjj58rRJG9yuHzTR7JgC7N"),
             Some(("business", "year"))
@@ -1827,10 +1856,10 @@ mod tests {
     /// seat count with no add-on added.
     #[test]
     fn reconcile_seats_single_item_base_plan_only() {
-        // Pro base plan price (not a seat add-on price)
-        let obj = make_items_payload(&[("price_basePlanProMonthly", 1)]);
-        // Pro includes 3 seats; with no seat add-on that should be the total.
-        assert_eq!(compute_reconciled_seats(&obj, "pro"), 3);
+        // Business base plan price (not a seat add-on price)
+        let obj = make_items_payload(&[("price_basePlanBusinessMonthly", 1)]);
+        // Business includes 5 seats; with no seat add-on that should be the total.
+        assert_eq!(compute_reconciled_seats(&obj, "business"), 5);
     }
 
     /// Bug regression: multi-item subscription with base plan + seat add-on.
@@ -1838,13 +1867,13 @@ mod tests {
     /// The fix must find the seat add-on by price ID and sum correctly.
     #[test]
     fn reconcile_seats_multi_item_finds_addon_not_base_plan() {
-        let pro_seat_price = "price_1TMjj28rRJG9yuHzezvbHaSx"; // pro/month
+        let business_seat_price = "price_1TMjj48rRJG9yuHz7zN7Xos0"; // business/month
         let obj = make_items_payload(&[
-            ("price_basePlanProMonthly", 1), // base plan — must NOT be used
-            (pro_seat_price, 5),             // seat add-on: 5 extra
+            ("price_basePlanBusinessMonthly", 1), // base plan — must NOT be used
+            (business_seat_price, 5),             // seat add-on: 5 extra
         ]);
-        // Pro included=3, addon=5 → total=8
-        assert_eq!(compute_reconciled_seats(&obj, "pro"), 8);
+        // Business included=5, addon=5 → total=10
+        assert_eq!(compute_reconciled_seats(&obj, "business"), 10);
     }
 
     /// Seat add-on at position 0 (Stripe may reorder items) is still found.
@@ -1863,7 +1892,7 @@ mod tests {
     #[test]
     fn reconcile_seats_missing_items_falls_back_to_included() {
         let obj = serde_json::json!({});
-        assert_eq!(compute_reconciled_seats(&obj, "pro"), 3);
+        assert_eq!(compute_reconciled_seats(&obj, "business"), 5);
     }
 
     /// Consumer/personal tenant (no "t-" prefix) is no longer gated out and
@@ -1873,9 +1902,9 @@ mod tests {
         // This test validates the logic is prefix-agnostic; the gate removal
         // itself is structural (no `if starts_with("t-")` wrapper), which this
         // helper exercises without any prefix filtering.
-        let pro_seat_price = "price_1TMjj28rRJG9yuHzezvbHaSx";
-        let obj = make_items_payload(&[("price_basePlan", 1), (pro_seat_price, 2)]);
-        assert_eq!(compute_reconciled_seats(&obj, "pro"), 5); // 3 included + 2 addon
+        let business_seat_price = "price_1TMjj48rRJG9yuHz7zN7Xos0";
+        let obj = make_items_payload(&[("price_basePlan", 1), (business_seat_price, 2)]);
+        assert_eq!(compute_reconciled_seats(&obj, "business"), 7); // 5 included + 2 addon
     }
 
     // ── subscription_updated_syncs_keycloak regression ────────────────────

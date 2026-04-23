@@ -292,25 +292,30 @@ impl StandardTeamService {
 #[async_trait]
 impl TeamService for StandardTeamService {
     async fn provision_team(&self, cmd: ProvisionTeamCommand) -> Result<Team, TeamServiceError> {
-        if matches!(cmd.tier, TenantTier::Free | TenantTier::System) {
+        // Per ADR-111 (colony tier model): only Business and Enterprise may
+        // own a colony. Free/Pro are personal-only; System is never a
+        // user-facing tier.
+        if !cmd.tier.allows_colony() {
             return Err(TeamServiceError::TierNotPermitted(cmd.tier));
         }
 
         let mut team = Team::provision(
             cmd.display_name.clone(),
             cmd.owner_user_id.clone(),
-            cmd.tier.clone(),
+            cmd.tier,
         )
         .map_err(TeamServiceError::InvalidCommand)?;
 
-        // Insert the backing tenants row (ADR-056). The Keycloak realm is
-        // `zaru-consumer` for Pro/Business (group-scoped) and `team-{slug}`
-        // for Enterprise (dedicated realm) — see ADR-111 §Keycloak Strategy.
-        // Phase 1 inserts the row with the tier-driven realm name but does
-        // not create the Keycloak group/realm yet; Phase 2 wires that.
+        // Insert the backing tenants row (ADR-056). Business shares the
+        // `zaru-consumer` realm via group-scoped membership; Enterprise gets
+        // its own dedicated realm. The `allows_colony()` guard above
+        // guarantees we never see Free/Pro/System here.
         let keycloak_realm = match team.tier {
+            TenantTier::Business => "zaru-consumer".to_string(),
             TenantTier::Enterprise => format!("team-{}", team.slug.as_str()),
-            _ => "zaru-consumer".to_string(),
+            TenantTier::Free | TenantTier::Pro | TenantTier::System => {
+                unreachable!("allows_colony() guard rejects these tiers")
+            }
         };
         let openbao_namespace = format!("tenant-{}", team.tenant_id.as_str());
         let tenant_row = Tenant::new(
@@ -617,4 +622,343 @@ impl TeamService for StandardTeamService {
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::team::{MembershipStatus, TeamInvitationRepository, TeamSlug, TeamStatus};
+    use crate::domain::tenancy::{Tenant, TenantQuotas, TenantStatus};
+    use std::sync::Mutex;
+
+    // ── In-memory fixtures ──────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct MemTeamRepo {
+        teams: Mutex<Vec<Team>>,
+    }
+
+    #[async_trait]
+    impl TeamRepository for MemTeamRepo {
+        async fn save(&self, team: &Team) -> Result<(), RepositoryError> {
+            let mut g = self.teams.lock().unwrap();
+            if let Some(existing) = g.iter_mut().find(|t| t.id == team.id) {
+                *existing = team.clone();
+            } else {
+                g.push(team.clone());
+            }
+            Ok(())
+        }
+        async fn find_by_id(&self, id: &TeamId) -> Result<Option<Team>, RepositoryError> {
+            Ok(self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == *id)
+                .cloned())
+        }
+        async fn find_by_slug(&self, slug: &TeamSlug) -> Result<Option<Team>, RepositoryError> {
+            Ok(self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.slug == *slug)
+                .cloned())
+        }
+        async fn find_by_owner(&self, owner_user_id: &str) -> Result<Vec<Team>, RepositoryError> {
+            Ok(self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.owner_user_id == owner_user_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_by_tenant_id(
+            &self,
+            tenant_id: &crate::domain::tenant::TenantId,
+        ) -> Result<Option<Team>, RepositoryError> {
+            Ok(self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| &t.tenant_id == tenant_id)
+                .cloned())
+        }
+        async fn delete(&self, id: &TeamId) -> Result<(), RepositoryError> {
+            self.teams.lock().unwrap().retain(|t| t.id != *id);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemMembershipRepo {
+        items: Mutex<Vec<Membership>>,
+    }
+
+    #[async_trait]
+    impl MembershipRepository for MemMembershipRepo {
+        async fn save(&self, m: &Membership) -> Result<(), RepositoryError> {
+            self.items.lock().unwrap().push(m.clone());
+            Ok(())
+        }
+        async fn find_by_team(&self, team_id: &TeamId) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.team_id == *team_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_by_user(&self, user_id: &str) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_active_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.user_id == user_id && m.status == MembershipStatus::Active)
+                .cloned()
+                .collect())
+        }
+        async fn is_active_member(
+            &self,
+            user_id: &str,
+            team_id: &TeamId,
+        ) -> Result<bool, RepositoryError> {
+            Ok(self.items.lock().unwrap().iter().any(|m| {
+                m.user_id == user_id
+                    && m.team_id == *team_id
+                    && m.status == MembershipStatus::Active
+            }))
+        }
+        async fn count_active(&self, team_id: &TeamId) -> Result<u32, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.team_id == *team_id && m.status == MembershipStatus::Active)
+                .count() as u32)
+        }
+        async fn revoke(&self, team_id: &TeamId, user_id: &str) -> Result<(), RepositoryError> {
+            for m in self.items.lock().unwrap().iter_mut() {
+                if m.team_id == *team_id && m.user_id == user_id {
+                    m.status = MembershipStatus::Revoked;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct MemInvitationRepo;
+
+    #[async_trait]
+    impl TeamInvitationRepository for MemInvitationRepo {
+        async fn save(&self, _: &TeamInvitation) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            _: &TeamInvitationId,
+        ) -> Result<Option<TeamInvitation>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_by_token_hash(
+            &self,
+            _: &str,
+        ) -> Result<Option<TeamInvitation>, RepositoryError> {
+            Ok(None)
+        }
+        async fn find_pending_by_team(
+            &self,
+            _: &TeamId,
+        ) -> Result<Vec<TeamInvitation>, RepositoryError> {
+            Ok(Vec::new())
+        }
+        async fn mark_accepted(&self, _: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn mark_cancelled(&self, _: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn mark_expired(&self, _: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemTenantRepo {
+        rows: Mutex<Vec<Tenant>>,
+    }
+
+    #[async_trait]
+    impl crate::domain::repository::TenantRepository for MemTenantRepo {
+        async fn find_by_slug(
+            &self,
+            slug: &crate::domain::tenant::TenantId,
+        ) -> Result<Option<Tenant>, RepositoryError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| &t.slug == slug)
+                .cloned())
+        }
+        async fn find_all_active(&self) -> Result<Vec<Tenant>, RepositoryError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == TenantStatus::Active)
+                .cloned()
+                .collect())
+        }
+        async fn insert(&self, tenant: &Tenant) -> Result<(), RepositoryError> {
+            self.rows.lock().unwrap().push(tenant.clone());
+            Ok(())
+        }
+        async fn update_status(
+            &self,
+            _slug: &crate::domain::tenant::TenantId,
+            _status: &TenantStatus,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn update_quotas(
+            &self,
+            _slug: &crate::domain::tenant::TenantId,
+            _quotas: &TenantQuotas,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    struct NoopBilling;
+
+    #[async_trait]
+    impl BillingService for NoopBilling {
+        async fn sync_seats(
+            &self,
+            _: TeamId,
+            _: &crate::domain::tenant::TenantId,
+            _: u32,
+        ) -> Result<u32, BillingServiceError> {
+            Ok(0)
+        }
+        async fn provision_team_customer(
+            &self,
+            _: TeamId,
+            _: String,
+            _: &crate::domain::tenant::TenantId,
+            _: TenantTier,
+        ) -> Result<String, BillingServiceError> {
+            Ok("cus_test".to_string())
+        }
+        async fn cancel_team_subscription(
+            &self,
+            _: &crate::domain::tenant::TenantId,
+        ) -> Result<(), BillingServiceError> {
+            Ok(())
+        }
+    }
+
+    fn build_service() -> StandardTeamService {
+        StandardTeamService::new(
+            Arc::new(MemTeamRepo::default()),
+            Arc::new(MemMembershipRepo::default()),
+            Arc::new(MemInvitationRepo),
+            Arc::new(MemTenantRepo::default()),
+            Arc::new(NoopBilling),
+            Arc::new(EventBus::with_default_capacity()),
+            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
+        )
+    }
+
+    fn cmd(tier: TenantTier) -> ProvisionTeamCommand {
+        ProvisionTeamCommand {
+            display_name: "Acme".into(),
+            owner_user_id: "user-1".into(),
+            owner_email: "owner@example.com".into(),
+            tier,
+        }
+    }
+
+    // ── provision_team tier gating (ADR-111) ────────────────────────────────
+
+    #[tokio::test]
+    async fn provision_team_rejects_free() {
+        let svc = build_service();
+        let err = svc.provision_team(cmd(TenantTier::Free)).await;
+        assert!(matches!(
+            err,
+            Err(TeamServiceError::TierNotPermitted(TenantTier::Free))
+        ));
+    }
+
+    #[tokio::test]
+    async fn provision_team_rejects_pro() {
+        // Per ADR-111: Pro is personal-only and cannot own a colony.
+        let svc = build_service();
+        let err = svc.provision_team(cmd(TenantTier::Pro)).await;
+        assert!(matches!(
+            err,
+            Err(TeamServiceError::TierNotPermitted(TenantTier::Pro))
+        ));
+    }
+
+    #[tokio::test]
+    async fn provision_team_rejects_system() {
+        let svc = build_service();
+        let err = svc.provision_team(cmd(TenantTier::System)).await;
+        assert!(matches!(
+            err,
+            Err(TeamServiceError::TierNotPermitted(TenantTier::System))
+        ));
+    }
+
+    #[tokio::test]
+    async fn provision_team_accepts_business_with_5_included_seats() {
+        let svc = build_service();
+        let team = svc.provision_team(cmd(TenantTier::Business)).await.unwrap();
+        assert_eq!(team.tier, TenantTier::Business);
+        assert_eq!(team.status, TeamStatus::Active);
+        assert_eq!(team.tier.included_seats(), 5);
+    }
+
+    #[tokio::test]
+    async fn provision_team_accepts_enterprise_with_10_included_seats() {
+        let svc = build_service();
+        let team = svc
+            .provision_team(cmd(TenantTier::Enterprise))
+            .await
+            .unwrap();
+        assert_eq!(team.tier, TenantTier::Enterprise);
+        assert_eq!(team.status, TeamStatus::Active);
+        assert_eq!(team.tier.included_seats(), 10);
+    }
 }

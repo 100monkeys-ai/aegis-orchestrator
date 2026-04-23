@@ -395,6 +395,18 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn find_by_tenant_id(
+            &self,
+            tenant_id: &TenantId,
+        ) -> Result<Option<Team>, RepositoryError> {
+            Ok(self
+                .by_slug
+                .lock()
+                .unwrap()
+                .values()
+                .find(|t| &t.tenant_id == tenant_id)
+                .cloned())
+        }
         async fn delete(&self, id: &TeamId) -> Result<(), RepositoryError> {
             self.by_slug.lock().unwrap().retain(|_, t| t.id != *id);
             Ok(())
@@ -436,6 +448,19 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|m| m.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_active_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.user_id == user_id && m.status == MembershipStatus::Active)
                 .cloned()
                 .collect())
         }

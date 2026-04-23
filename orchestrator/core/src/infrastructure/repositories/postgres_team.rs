@@ -19,6 +19,7 @@ use crate::domain::repository::RepositoryError;
 use crate::domain::team::{
     InvitationStatus, Membership, MembershipRepository, MembershipRole, MembershipStatus, Team,
     TeamId, TeamInvitation, TeamInvitationId, TeamInvitationRepository, TeamRepository, TeamSlug,
+    TeamStatus,
 };
 use crate::domain::tenancy::TenantTier;
 use crate::domain::tenant::TenantId;
@@ -59,6 +60,15 @@ fn row_to_team(row: &sqlx::postgres::PgRow) -> Result<Team, RepositoryError> {
     let tenant_id = TenantId::from_string(&tenant_id_str)
         .map_err(|e| RepositoryError::Serialization(format!("invalid tenant id: {e}")))?;
     let tier_str: String = row.get("tier");
+    // `status` is added by migration 024_colony_tier_cleanup.sql (ADR-111).
+    // Defensive: default to Active if a legacy row somehow lacks the column.
+    let status_str: Option<String> = row.try_get("status").ok();
+    let status = match status_str.as_deref() {
+        Some(s) => s
+            .parse::<TeamStatus>()
+            .map_err(RepositoryError::Serialization)?,
+        None => TeamStatus::Active,
+    };
     Ok(Team {
         id: TeamId(id),
         slug,
@@ -66,6 +76,7 @@ fn row_to_team(row: &sqlx::postgres::PgRow) -> Result<Team, RepositoryError> {
         owner_user_id: row.get("owner_user_id"),
         tier: parse_tier(&tier_str)?,
         tenant_id,
+        status,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         domain_events: Vec::new(),
@@ -128,13 +139,14 @@ impl TeamRepository for PgTeamRepository {
         sqlx::query(
             r#"
             INSERT INTO teams (
-                id, slug, display_name, owner_user_id, tier, tenant_id,
+                id, slug, display_name, owner_user_id, tier, tenant_id, status,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (id) DO UPDATE SET
                 display_name = EXCLUDED.display_name,
                 tier = EXCLUDED.tier,
+                status = EXCLUDED.status,
                 updated_at = EXCLUDED.updated_at
             "#,
         )
@@ -144,6 +156,7 @@ impl TeamRepository for PgTeamRepository {
         .bind(&team.owner_user_id)
         .bind(tier_to_str(&team.tier))
         .bind(team.tenant_id.as_str())
+        .bind(team.status.as_str())
         .bind(team.created_at)
         .bind(team.updated_at)
         .execute(&self.pool)
@@ -177,6 +190,18 @@ impl TeamRepository for PgTeamRepository {
             .await
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         rows.iter().map(row_to_team).collect()
+    }
+
+    async fn find_by_tenant_id(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Option<Team>, RepositoryError> {
+        let row = sqlx::query("SELECT * FROM teams WHERE tenant_id = $1")
+            .bind(tenant_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        row.as_ref().map(row_to_team).transpose()
     }
 
     async fn delete(&self, id: &TeamId) -> Result<(), RepositoryError> {
@@ -245,6 +270,19 @@ impl MembershipRepository for PgMembershipRepository {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        rows.iter().map(row_to_membership).collect()
+    }
+
+    async fn find_active_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<Membership>, RepositoryError> {
+        let rows =
+            sqlx::query("SELECT * FROM team_memberships WHERE user_id = $1 AND status = 'active'")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
         rows.iter().map(row_to_membership).collect()
     }
 

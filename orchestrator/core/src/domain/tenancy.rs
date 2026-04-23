@@ -18,8 +18,8 @@ pub enum TenantStatus {
     Deleted,
 }
 
-/// Tenant tier classification (ADR-097)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Tenant tier classification (ADR-097, refined by ADR-111).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TenantTier {
     Free,
@@ -27,6 +27,58 @@ pub enum TenantTier {
     Business,
     Enterprise,
     System,
+}
+
+impl TenantTier {
+    /// Number of seats included in a subscription at this tier.
+    ///
+    /// Per ADR-111 (colony tier model): Business includes 5 seats, Enterprise
+    /// includes 10. Free, Pro, and System include 0 — Free/Pro are personal
+    /// tiers that cannot own a colony, and System is platform-internal.
+    pub fn included_seats(&self) -> u32 {
+        match self {
+            TenantTier::Business => 5,
+            TenantTier::Enterprise => 10,
+            _ => 0,
+        }
+    }
+
+    /// Whether this tier may own a colony (team tenant).
+    ///
+    /// Per ADR-111: only Business and Enterprise may provision colonies. Free
+    /// and Pro are personal-only; System is never a user-facing tier.
+    pub fn allows_colony(&self) -> bool {
+        matches!(self, TenantTier::Business | TenantTier::Enterprise)
+    }
+
+    /// Rank for effective-tier computation via `max()`.
+    ///
+    /// System is incomparable in effect (it is the platform-internal tier and
+    /// ranks above everything here), but callers computing an effective tier
+    /// for a user-facing session must handle System explicitly — System users
+    /// operate with implicit elevated privilege rather than through `max()`
+    /// composition.
+    pub fn rank(&self) -> u8 {
+        match self {
+            TenantTier::Free => 0,
+            TenantTier::Pro => 1,
+            TenantTier::Business => 2,
+            TenantTier::Enterprise => 3,
+            TenantTier::System => u8::MAX,
+        }
+    }
+}
+
+impl PartialOrd for TenantTier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.rank().cmp(&other.rank()))
+    }
+}
+
+impl Ord for TenantTier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
 }
 
 /// Tenant kind classification (ADR-056, extended by ADR-111).
@@ -204,5 +256,52 @@ impl Tenant {
         } else {
             TenantKind::Enterprise
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn included_seats_matrix() {
+        // Per ADR-111: only Business (5) and Enterprise (10) include seats.
+        assert_eq!(TenantTier::Free.included_seats(), 0);
+        assert_eq!(TenantTier::Pro.included_seats(), 0);
+        assert_eq!(TenantTier::Business.included_seats(), 5);
+        assert_eq!(TenantTier::Enterprise.included_seats(), 10);
+        assert_eq!(TenantTier::System.included_seats(), 0);
+    }
+
+    #[test]
+    fn allows_colony_matrix() {
+        assert!(!TenantTier::Free.allows_colony());
+        assert!(!TenantTier::Pro.allows_colony());
+        assert!(TenantTier::Business.allows_colony());
+        assert!(TenantTier::Enterprise.allows_colony());
+        assert!(!TenantTier::System.allows_colony());
+    }
+
+    #[test]
+    fn tier_ordering_is_free_pro_business_enterprise() {
+        // `max()` composition is how Phase 3's EffectiveTierService lifts a
+        // personal tier to a covering colony tier. Assert the ordering backs it.
+        assert_eq!(
+            std::cmp::max(TenantTier::Free, TenantTier::Pro),
+            TenantTier::Pro
+        );
+        assert_eq!(
+            std::cmp::max(TenantTier::Pro, TenantTier::Business),
+            TenantTier::Business
+        );
+        assert_eq!(
+            std::cmp::max(TenantTier::Business, TenantTier::Enterprise),
+            TenantTier::Enterprise
+        );
+        assert!(TenantTier::Free < TenantTier::Pro);
+        assert!(TenantTier::Pro < TenantTier::Business);
+        assert!(TenantTier::Business < TenantTier::Enterprise);
+        // System ranks above all — incomparable in intent but deterministic.
+        assert!(TenantTier::Enterprise < TenantTier::System);
     }
 }

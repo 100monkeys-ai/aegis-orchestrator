@@ -196,6 +196,46 @@ impl std::str::FromStr for MembershipStatus {
     }
 }
 
+/// Lifecycle state of a [`Team`] (ADR-111 §Team Status).
+///
+/// A team is `Active` by default. When a team's billing subscription lapses
+/// (Stripe webhook reports past-due beyond grace, or admin intervention),
+/// Phase 4 transitions the team to `Suspended` — which gates member access
+/// to team resources without destroying the team or its data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamStatus {
+    Active,
+    Suspended,
+}
+
+impl Default for TeamStatus {
+    fn default() -> Self {
+        TeamStatus::Active
+    }
+}
+
+impl TeamStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TeamStatus::Active => "active",
+            TeamStatus::Suspended => "suspended",
+        }
+    }
+}
+
+impl std::str::FromStr for TeamStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(TeamStatus::Active),
+            "suspended" => Ok(TeamStatus::Suspended),
+            other => Err(format!("unknown team status: {other}")),
+        }
+    }
+}
+
 /// Lifecycle state of a [`TeamInvitation`] (ADR-111 §Domain Model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -294,6 +334,15 @@ pub enum TeamEvent {
         new_count: u32,
         changed_at: DateTime<Utc>,
     },
+    /// Team lifecycle status transitioned between Active and Suspended
+    /// (ADR-111 §Team Status). Emitted by [`Team::suspend`] and
+    /// [`Team::resume`].
+    StatusChanged {
+        team_id: TeamId,
+        previous: TeamStatus,
+        current: TeamStatus,
+        changed_at: DateTime<Utc>,
+    },
     TenantContextSwitched {
         caller_user_id: String,
         from_tenant_id: TenantId,
@@ -324,6 +373,10 @@ pub struct Team {
     pub owner_user_id: String,
     pub tier: TenantTier,
     pub tenant_id: TenantId,
+    /// Current lifecycle status (ADR-111 §Team Status). New teams default to
+    /// [`TeamStatus::Active`]; Phase 4 billing enforcement flips this to
+    /// [`TeamStatus::Suspended`] when a subscription lapses.
+    pub status: TeamStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Event buffer. Drained via [`take_events`](Self::take_events) at the
@@ -363,8 +416,9 @@ impl Team {
             slug,
             display_name,
             owner_user_id: owner_user_id.clone(),
-            tier: tier.clone(),
+            tier,
             tenant_id: tenant_id.clone(),
+            status: TeamStatus::Active,
             created_at: now,
             updated_at: now,
             domain_events: Vec::new(),
@@ -377,6 +431,44 @@ impl Team {
             provisioned_at: now,
         });
         Ok(team)
+    }
+
+    /// Transition this team to [`TeamStatus::Suspended`] (ADR-111 §Team
+    /// Status). Idempotent — calling `suspend()` on an already-suspended
+    /// team is a no-op and emits no event.
+    pub fn suspend(&mut self) -> Result<(), String> {
+        if self.status == TeamStatus::Suspended {
+            return Ok(());
+        }
+        let previous = self.status;
+        self.status = TeamStatus::Suspended;
+        self.updated_at = Utc::now();
+        self.domain_events.push(TeamEvent::StatusChanged {
+            team_id: self.id,
+            previous,
+            current: self.status,
+            changed_at: self.updated_at,
+        });
+        Ok(())
+    }
+
+    /// Transition this team to [`TeamStatus::Active`] (ADR-111 §Team Status).
+    /// Idempotent — calling `resume()` on an already-active team is a no-op
+    /// and emits no event.
+    pub fn resume(&mut self) -> Result<(), String> {
+        if self.status == TeamStatus::Active {
+            return Ok(());
+        }
+        let previous = self.status;
+        self.status = TeamStatus::Active;
+        self.updated_at = Utc::now();
+        self.domain_events.push(TeamEvent::StatusChanged {
+            team_id: self.id,
+            previous,
+            current: self.status,
+            changed_at: self.updated_at,
+        });
+        Ok(())
     }
 
     /// Drain and return the buffered [`TeamEvent`]s. The application service
@@ -581,6 +673,14 @@ pub trait TeamRepository: Send + Sync {
     async fn find_by_id(&self, id: &TeamId) -> Result<Option<Team>, RepositoryError>;
     async fn find_by_slug(&self, slug: &TeamSlug) -> Result<Option<Team>, RepositoryError>;
     async fn find_by_owner(&self, owner_user_id: &str) -> Result<Vec<Team>, RepositoryError>;
+    /// Look up the team anchored at a given tenant id (ADR-111). Used to
+    /// resolve a team aggregate from its backing `tenants` row — for example
+    /// when a subscription webhook keyed on `tenant_id` needs to locate the
+    /// corresponding [`Team`].
+    async fn find_by_tenant_id(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Option<Team>, RepositoryError>;
     async fn delete(&self, id: &TeamId) -> Result<(), RepositoryError>;
 }
 
@@ -595,6 +695,12 @@ pub trait MembershipRepository: Send + Sync {
     async fn save(&self, membership: &Membership) -> Result<(), RepositoryError>;
     async fn find_by_team(&self, team_id: &TeamId) -> Result<Vec<Membership>, RepositoryError>;
     async fn find_by_user(&self, user_id: &str) -> Result<Vec<Membership>, RepositoryError>;
+
+    /// Return every **active** membership for a user, filtering out revoked
+    /// rows (ADR-111). Phase 3's `EffectiveTierService` uses this to compute
+    /// the set of colonies currently covering a user.
+    async fn find_active_for_user(&self, user_id: &str)
+        -> Result<Vec<Membership>, RepositoryError>;
 
     /// Authorization primitive for team-context `X-Tenant-Id` switching.
     /// Returns `true` iff the user currently has an Active membership on the
@@ -734,6 +840,70 @@ mod tests {
         assert!(MembershipRole::Owner.can_manage_membership());
         assert!(MembershipRole::Admin.can_manage_membership());
         assert!(!MembershipRole::Member.can_manage_membership());
+    }
+
+    #[test]
+    fn team_provision_defaults_to_active_status() {
+        let team =
+            Team::provision("My Team".into(), "user-1".into(), TenantTier::Business).unwrap();
+        assert_eq!(team.status, TeamStatus::Active);
+    }
+
+    #[test]
+    fn team_suspend_emits_status_changed_event() {
+        let mut team =
+            Team::provision("My Team".into(), "user-1".into(), TenantTier::Business).unwrap();
+        // Drain the provisioning event so the assertion targets suspend's event.
+        let _ = team.take_events();
+        team.suspend().unwrap();
+        assert_eq!(team.status, TeamStatus::Suspended);
+        let events = team.take_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            TeamEvent::StatusChanged {
+                previous, current, ..
+            } => {
+                assert_eq!(*previous, TeamStatus::Active);
+                assert_eq!(*current, TeamStatus::Suspended);
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_suspend_is_idempotent() {
+        let mut team =
+            Team::provision("My Team".into(), "user-1".into(), TenantTier::Business).unwrap();
+        let _ = team.take_events();
+        team.suspend().unwrap();
+        let _ = team.take_events();
+        // Second suspend must be a no-op — no state change, no event.
+        team.suspend().unwrap();
+        assert_eq!(team.status, TeamStatus::Suspended);
+        assert!(team.take_events().is_empty());
+    }
+
+    #[test]
+    fn team_resume_is_idempotent() {
+        let mut team =
+            Team::provision("My Team".into(), "user-1".into(), TenantTier::Business).unwrap();
+        let _ = team.take_events();
+        // Already Active — resume must be a no-op.
+        team.resume().unwrap();
+        assert_eq!(team.status, TeamStatus::Active);
+        assert!(team.take_events().is_empty());
+
+        // Suspend then resume emits exactly one event for the resume.
+        team.suspend().unwrap();
+        let _ = team.take_events();
+        team.resume().unwrap();
+        let events = team.take_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], TeamEvent::StatusChanged { .. }));
+
+        // Second resume is a no-op.
+        team.resume().unwrap();
+        assert!(team.take_events().is_empty());
     }
 
     /// Regression: `TeamEvent` derives `Deserialize` and must be fully
