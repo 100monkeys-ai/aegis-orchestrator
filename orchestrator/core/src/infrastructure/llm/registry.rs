@@ -583,6 +583,7 @@ mod tests {
                 force_deploy_builtins: None,
                 max_execution_list_limit: None,
                 billing: None,
+                zaru: None,
             },
         };
 
