@@ -717,7 +717,7 @@ pub(crate) async fn create_invitation(
     if let Some(kc) = state.keycloak_admin.clone() {
         if let Err(e) = kc
             .invite_team_user(
-                team.tier.clone(),
+                team.tier,
                 team.slug.as_str(),
                 &issued.invitee_email,
                 role,

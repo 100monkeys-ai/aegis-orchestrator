@@ -1141,7 +1141,7 @@ async fn handle_checkout_completed(
         tenant_id: tenant_id.clone(),
         stripe_customer_id: customer_id.to_string(),
         stripe_subscription_id: Some(subscription_id.to_string()),
-        tier: tier.clone(),
+        tier,
         status: SubscriptionStatus::Active,
         current_period_end: None,
         cancel_at_period_end: false,
@@ -1203,7 +1203,7 @@ async fn handle_subscription_updated(
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
 
     // Determine tier from price metadata or existing
-    let tier = extract_tier_from_subscription(obj).unwrap_or(sub.tier.clone());
+    let tier = extract_tier_from_subscription(obj).unwrap_or(sub.tier);
 
     if let Err(e) = billing_repo
         .update_tier(&sub.tenant_id, &tier, &status, period_end)
