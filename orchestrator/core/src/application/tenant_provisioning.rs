@@ -15,7 +15,7 @@
 //! This service writes the `tenant_id` Keycloak user attribute (it is the
 //! orchestrator's responsibility to stamp the tenant binding). The
 //! `zaru_tier` attribute is owned by
-//! [`EffectiveTierService`][crate::application::effective_tier_service::EffectiveTierService]
+//! [`crate::application::effective_tier_service::EffectiveTierService`]
 //! — which is the single writer for that attribute across the platform. This
 //! service delegates the `zaru_tier` write by calling `recompute_for_user`
 //! at the end of provisioning.
