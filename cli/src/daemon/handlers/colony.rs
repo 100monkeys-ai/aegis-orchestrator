@@ -1217,8 +1217,30 @@ pub(crate) async fn get_subscription(
                 .into_response()
         }
     };
+    // Keep the repo probe as the tenant existence check; the tier is resolved
+    // from the subscription row below (single source of truth).
+    let _ = &tenant;
 
-    let members_limit: u32 = match &tenant.tier {
+    // Resolve the tier from `tenant_subscriptions.tier` — there is no tier
+    // column on the tenants row anymore. A missing/canceled subscription
+    // collapses to Free.
+    let effective_tier: TenantTier = match state.billing_repo.as_ref() {
+        Some(br) => match br.get_subscription(&tenant_id).await {
+            Ok(Some(sub))
+                if matches!(
+                    sub.status,
+                    aegis_orchestrator_core::domain::billing::SubscriptionStatus::Active
+                        | aegis_orchestrator_core::domain::billing::SubscriptionStatus::Trialing
+                ) =>
+            {
+                sub.tier
+            }
+            _ => TenantTier::Free,
+        },
+        None => TenantTier::Free,
+    };
+
+    let members_limit: u32 = match &effective_tier {
         TenantTier::Free => 1,
         TenantTier::Pro => 5,
         TenantTier::Business => 25,
@@ -1266,7 +1288,7 @@ pub(crate) async fn get_subscription(
     };
 
     let resp = SubscriptionResponse {
-        tier: tier_str(&tenant.tier).to_string(),
+        tier: tier_str(&effective_tier).to_string(),
         members_used,
         members_limit,
         seat_count,

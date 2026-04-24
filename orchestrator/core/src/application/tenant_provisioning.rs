@@ -9,16 +9,27 @@
 //!
 //! If a tenant already exists for the given user `sub`, the service returns
 //! the existing tenant without side effects.
+//!
+//! ## zaru_tier ownership
+//!
+//! This service writes the `tenant_id` Keycloak user attribute (it is the
+//! orchestrator's responsibility to stamp the tenant binding). The
+//! `zaru_tier` attribute is owned by
+//! [`EffectiveTierService`][crate::application::effective_tier_service::EffectiveTierService]
+//! — which is the single writer for that attribute across the platform. This
+//! service delegates the `zaru_tier` write by calling `recompute_for_user`
+//! at the end of provisioning.
 
 use std::sync::Arc;
 
 use chrono::Utc;
 
+use crate::application::effective_tier_service::EffectiveTierService;
 use crate::domain::events::TenantEvent;
 use crate::domain::iam::ZaruTier;
 use crate::domain::repository::{RepositoryError, TenantRepository};
 use crate::domain::shared_kernel::TenantId;
-use crate::domain::tenancy::{Tenant, TenantQuotas, TenantTier};
+use crate::domain::tenancy::{Tenant, TenantTier};
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::iam::keycloak_admin_client::{KeycloakAdminClient, KeycloakAdminError};
 
@@ -42,6 +53,7 @@ pub struct TenantProvisioningService {
     tenant_repo: Arc<dyn TenantRepository>,
     keycloak_admin: Arc<KeycloakAdminClient>,
     event_bus: Arc<EventBus>,
+    effective_tier_service: Option<Arc<dyn EffectiveTierService>>,
 }
 
 impl TenantProvisioningService {
@@ -49,11 +61,13 @@ impl TenantProvisioningService {
         tenant_repo: Arc<dyn TenantRepository>,
         keycloak_admin: Arc<KeycloakAdminClient>,
         event_bus: Arc<EventBus>,
+        effective_tier_service: Option<Arc<dyn EffectiveTierService>>,
     ) -> Self {
         Self {
             tenant_repo,
             keycloak_admin,
             event_bus,
+            effective_tier_service,
         }
     }
 
@@ -62,11 +76,16 @@ impl TenantProvisioningService {
     /// Idempotent by construction. The DB row and the Keycloak attributes are
     /// two separate side-effects — a previous partial run may have inserted
     /// one but not the other. Every call reconciles BOTH: insert the tenants
-    /// row if missing, and write the Keycloak attributes if they don't match
-    /// the resolved tenant/tier.
+    /// row if missing, and write the Keycloak `tenant_id` attribute if it
+    /// doesn't match. The `zaru_tier` attribute is owned exclusively by
+    /// [`EffectiveTierService`] — we delegate the write to it so billing
+    /// state (the single source of truth) drives the Keycloak claim.
     ///
-    /// Any caller that sees `Ok(_)` can assume the tenants row AND the
-    /// Keycloak `tenant_id` + `zaru_tier` attributes are in sync.
+    /// Any caller that sees `Ok(_)` can assume the tenants row is present
+    /// and the Keycloak `tenant_id` attribute matches the resolved tenant.
+    /// The `zaru_tier` attribute will also be in sync if the EffectiveTierService
+    /// is wired — if the best-effort recompute call fails it is logged and
+    /// provisioning still succeeds.
     pub async fn provision_user_tenant(
         &self,
         user_sub: &str,
@@ -105,20 +124,18 @@ impl TenantProvisioningService {
             None => {
                 let tier = Self::map_zaru_tier(zaru_tier);
                 let openbao_namespace = format!("tenant-{}/", slug);
-                let mut tenant = Tenant::new(
+                let tenant = Tenant::new(
                     tenant_id.clone(),
                     format!("User {}", &user_sub[..8.min(user_sub.len())]),
-                    tier,
                     keycloak_realm.clone(),
                     openbao_namespace,
                 );
-                tenant.quotas = TenantQuotas::for_tier(&tier);
                 self.tenant_repo.insert(&tenant).await?;
                 self.event_bus
                     .publish_tenant_event(TenantEvent::UserTenantProvisioned {
                         tenant_slug: slug.clone(),
                         user_sub: user_sub.to_string(),
-                        tier: tier_to_str(&tier).to_string(),
+                        tier: tier.as_keycloak_str().to_string(),
                         keycloak_realm: keycloak_realm.clone(),
                         provisioned_at: Utc::now(),
                     });
@@ -126,11 +143,10 @@ impl TenantProvisioningService {
             }
         };
 
-        // Reconcile Keycloak attributes against the resolved tenant. If the
-        // attributes already match, skip the PUT (cheap early return). If they
-        // don't match (or are absent), write them now — this self-heals any
-        // prior partial-provisioning state where the DB row was inserted but
-        // Keycloak writes silently failed.
+        // Reconcile Keycloak `tenant_id` attribute against the resolved tenant.
+        // If the attribute already matches, skip the PUT (cheap early return).
+        // Otherwise write it now — this self-heals any prior partial-provisioning
+        // state where the DB row was inserted but Keycloak writes silently failed.
         let tenant_id_attr = kc_user
             .attributes
             .as_ref()
@@ -143,17 +159,24 @@ impl TenantProvisioningService {
                 .await?;
         }
 
-        let desired_tier_str = tier_to_str(&tenant.tier);
-        let zaru_tier_attr = kc_user
-            .attributes
-            .as_ref()
-            .and_then(|a| a.get("zaru_tier"))
-            .and_then(|v| v.first())
-            .map(|s| s.as_str());
-        if zaru_tier_attr != Some(desired_tier_str) {
-            self.keycloak_admin
-                .set_user_attribute("zaru-consumer", &kc_user, "zaru_tier", desired_tier_str)
-                .await?;
+        // Delegate the `zaru_tier` attribute write to EffectiveTierService —
+        // which is the single source of truth writer that reads from
+        // tenant_subscriptions.tier. A failure here is non-fatal: the tenant
+        // has been provisioned, and the next login / webhook / periodic
+        // reconciliation will converge the claim.
+        if let Some(svc) = &self.effective_tier_service {
+            if let Err(e) = svc.recompute_for_user(user_sub).await {
+                tracing::warn!(
+                    error = %e,
+                    user_sub,
+                    "EffectiveTierService::recompute_for_user failed during tenant provisioning; zaru_tier claim may be stale until next recompute"
+                );
+            }
+        } else {
+            tracing::debug!(
+                user_sub,
+                "EffectiveTierService not wired — skipping zaru_tier recompute during provisioning"
+            );
         }
 
         Ok(tenant)
@@ -166,16 +189,6 @@ impl TenantProvisioningService {
             ZaruTier::Business => TenantTier::Business,
             ZaruTier::Enterprise => TenantTier::Enterprise,
         }
-    }
-}
-
-fn tier_to_str(tier: &TenantTier) -> &'static str {
-    match tier {
-        TenantTier::Free => "free",
-        TenantTier::Pro => "pro",
-        TenantTier::Business => "business",
-        TenantTier::Enterprise => "enterprise",
-        TenantTier::System => "system",
     }
 }
 

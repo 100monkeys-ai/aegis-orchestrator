@@ -107,15 +107,18 @@ impl TenantOnboardingService {
             return Err(TenantOnboardingError::OpenBao(e.to_string()));
         }
 
-        // Step 4: Insert into tenants table.
-        let mut tenant = Tenant::new(
+        // Step 4: Insert into tenants table. `tier` and `quotas` are retained
+        // on the command signature for callers (and as inputs to the provisioning
+        // event) but are NOT persisted on the tenants row — tier lives
+        // exclusively on `tenant_subscriptions.tier` and quotas derive from it
+        // dynamically via `TenantQuotas::for_tier`.
+        let tenant = Tenant::new(
             slug.clone(),
             display_name,
-            tier,
             keycloak_realm.clone(),
             openbao_namespace.clone(),
         );
-        tenant.quotas = quotas;
+        let _ = quotas; // intentionally dropped — see doc comment above.
 
         if let Err(e) = self.tenant_repo.insert(&tenant).await {
             // Rollback: delete OpenBao namespace and Keycloak realm.
@@ -141,25 +144,17 @@ impl TenantOnboardingService {
         }
 
         // Step 5: Publish TenantProvisioned event (best-effort; failure is logged, not fatal).
+        // Tier is sourced from the caller's `tier` argument — it is no longer
+        // persisted on the tenants row.
         self.event_bus
             .publish_tenant_event(TenantEvent::TenantProvisioned {
                 tenant_slug: slug_str.clone(),
-                tier: tier_to_str(&tenant.tier).to_string(),
+                tier: tier.as_keycloak_str().to_string(),
                 keycloak_realm,
                 openbao_namespace,
                 provisioned_at: Utc::now(),
             });
 
         Ok(tenant)
-    }
-}
-
-fn tier_to_str(tier: &TenantTier) -> &'static str {
-    match tier {
-        TenantTier::Free => "free",
-        TenantTier::Pro => "pro",
-        TenantTier::Business => "business",
-        TenantTier::Enterprise => "enterprise",
-        TenantTier::System => "system",
     }
 }

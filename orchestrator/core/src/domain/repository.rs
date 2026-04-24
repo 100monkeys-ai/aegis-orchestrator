@@ -500,13 +500,6 @@ pub trait TenantRepository: Send + Sync {
         slug: &TenantId,
         status: &crate::domain::tenancy::TenantStatus,
     ) -> Result<(), RepositoryError>;
-
-    /// Update tenant quotas
-    async fn update_quotas(
-        &self,
-        slug: &TenantId,
-        quotas: &crate::domain::tenancy::TenantQuotas,
-    ) -> Result<(), RepositoryError>;
 }
 
 /// Repository errors

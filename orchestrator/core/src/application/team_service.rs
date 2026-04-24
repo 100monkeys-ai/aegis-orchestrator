@@ -330,7 +330,6 @@ impl TeamService for StandardTeamService {
         let tenant_row = Tenant::new(
             team.tenant_id.clone(),
             cmd.display_name.clone(),
-            team.tier,
             keycloak_realm,
             openbao_namespace,
         );
@@ -669,7 +668,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::domain::team::{MembershipStatus, TeamInvitationRepository, TeamSlug, TeamStatus};
-    use crate::domain::tenancy::{Tenant, TenantQuotas, TenantStatus};
+    use crate::domain::tenancy::{Tenant, TenantStatus};
     use std::sync::Mutex;
 
     // ── In-memory fixtures ──────────────────────────────────────────────────
@@ -883,13 +882,6 @@ mod tests {
             &self,
             _slug: &crate::domain::tenant::TenantId,
             _status: &TenantStatus,
-        ) -> Result<(), RepositoryError> {
-            Ok(())
-        }
-        async fn update_quotas(
-            &self,
-            _slug: &crate::domain::tenant::TenantId,
-            _quotas: &TenantQuotas,
         ) -> Result<(), RepositoryError> {
             Ok(())
         }

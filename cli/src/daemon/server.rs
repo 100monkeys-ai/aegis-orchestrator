@@ -1705,28 +1705,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ))
         });
 
-    // Tenant Provisioning Service (ADR-097)
-    // Requires both a database pool (for TenantRepository) and Keycloak admin credentials.
-    let tenant_provisioning_service: Option<
-        Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
-    > = match (colony_tenant_repo.clone(), colony_keycloak_admin.clone()) {
-        (Some(repo), Some(client)) => {
-            info!("Tenant provisioning service initialized (ADR-097)");
-            Some(Arc::new(
-                aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService::new(
-                    repo,
-                    client,
-                    event_bus.clone(),
-                ),
-            ))
-        }
-        _ => {
-            debug!(
-                "Tenant provisioning service disabled (requires database + keycloak_admin config)"
-            );
-            None
-        }
-    };
+    // Tenant Provisioning Service (ADR-097) is constructed AFTER the
+    // EffectiveTierService below, because provisioning delegates the
+    // `zaru_tier` Keycloak attribute write to it. Placeholder binding kept
+    // here so the variable is in scope for the AppState assembly below.
 
     // Initialize user volume service and file operations service (Gap 079)
     let user_volume_service = Arc::new(
@@ -1916,6 +1898,35 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         _ => {
             tracing::warn!(
                 "EffectiveTierService disabled: missing keycloak_admin, db_pool, team_repo, or membership_repo"
+            );
+            None
+        }
+    };
+
+    // Tenant Provisioning Service (ADR-097). Constructed AFTER
+    // `effective_tier_service` so provisioning can delegate the Keycloak
+    // `zaru_tier` attribute write to the single-source-of-truth writer.
+    // Requires both a database pool (for TenantRepository) and Keycloak
+    // admin credentials; the `effective_tier_service` is optional — if it
+    // is not wired, provisioning still stamps the `tenant_id` attribute and
+    // logs that the zaru_tier claim will converge on the next recompute.
+    let tenant_provisioning_service: Option<
+        Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
+    > = match (colony_tenant_repo.clone(), colony_keycloak_admin.clone()) {
+        (Some(repo), Some(client)) => {
+            info!("Tenant provisioning service initialized (ADR-097)");
+            Some(Arc::new(
+                aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService::new(
+                    repo,
+                    client,
+                    event_bus.clone(),
+                    effective_tier_service.clone(),
+                ),
+            ))
+        }
+        _ => {
+            debug!(
+                "Tenant provisioning service disabled (requires database + keycloak_admin config)"
             );
             None
         }
