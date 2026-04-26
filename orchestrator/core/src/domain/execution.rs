@@ -220,6 +220,37 @@ pub struct ExecutionInput {
     /// of `VolumeOwnership::Execution`, and the NFS volume registration carries
     /// this ID so FSAL `authorize()` can match it without DB ownership mutations.
     pub workflow_execution_id: Option<uuid::Uuid>,
+    /// Structured references to files attached at dispatch time (ADR-113).
+    /// Each ref points to a file in a tenant-scoped volume that the agent may
+    /// read via the `aegis.attachment.read` tool. Empty when the dispatch
+    /// carries no attachments. The shape mirrors `workspace_volume_id` —
+    /// structured, not an opaque fileId — so attachments are deterministic at
+    /// dispatch time per ADR-092 and never LLM-mediated.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRef>,
+}
+
+/// Structured reference to a file attached at dispatch time (ADR-113).
+///
+/// Mirrors the `aegis_runtime.AttachmentRef` proto message and is carried on
+/// `ExecutionInput.attachments` so attached files are passed through the
+/// execution pipeline without being mediated by the LLM. The agent reads the
+/// file via the `aegis.attachment.read` tool using `(volume_id, path)`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRef {
+    /// Tenant-scoped volume containing the file.
+    pub volume_id: crate::domain::shared_kernel::VolumeId,
+    /// POSIX path within the volume.
+    pub path: String,
+    /// Original filename (for display / agent reasoning).
+    pub name: String,
+    /// Content-sniffed MIME type (e.g. `text/plain`, `application/pdf`).
+    pub mime_type: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Optional SHA-256 hex digest of file contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +621,7 @@ mod tests {
             workspace_volume_mount_path: None,
             workspace_remote_path: None,
             workflow_execution_id: None,
+            attachments: Vec::new(),
         }
     }
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 
 mod agents;
+mod attachments;
 mod audit;
 mod discovery;
 mod execute;

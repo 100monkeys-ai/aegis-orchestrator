@@ -248,6 +248,7 @@ impl ToolInvocationService {
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
                     workflow_execution_id: None,
+                    attachments: Vec::new(),
                 },
                 "aegis-system-agent-runtime".to_string(),
                 caller_identity,

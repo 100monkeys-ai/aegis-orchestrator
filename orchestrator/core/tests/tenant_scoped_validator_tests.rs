@@ -100,6 +100,7 @@ impl ExecutionService for TenantScopedMockExecutionService {
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
                 workflow_execution_id: None,
+                attachments: Vec::new(),
             },
             3,
             "aegis-system-operator".to_string(),

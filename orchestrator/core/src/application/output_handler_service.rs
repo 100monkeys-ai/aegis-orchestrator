@@ -272,6 +272,7 @@ async fn invoke_agent_handler(
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
         workflow_execution_id: None,
+        attachments: Vec::new(),
     };
 
     let child_exec_id = if let Some(parent_id) = parent_execution_id {

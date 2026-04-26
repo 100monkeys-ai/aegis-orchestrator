@@ -74,6 +74,8 @@ libc = "0.2"
 
 url = "2.5.8"
 html2md = "0.2"
+# Content-based MIME sniffing (ADR-113 attachment uploads).
+infer = "0.16"
 
 # Cryptography & Security (SEAL)
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
