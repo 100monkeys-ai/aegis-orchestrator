@@ -54,6 +54,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parking_lot",
+ "percent-encoding",
  "prost",
  "rand 0.9.4",
  "rand_core 0.6.4",
