@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Connect to a Docker-compatible container runtime (Docker or Podman) using an
 /// optional explicit socket path. Falls back to `Docker::connect_with_local_defaults()`
@@ -516,7 +516,13 @@ impl ContainerRuntime {
 
 #[async_trait]
 impl AgentRuntime for ContainerRuntime {
+    #[tracing::instrument(
+        skip_all,
+        fields(execution_id = %config.execution_id, image = %config.image)
+    )]
     async fn spawn(&self, config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+        info!(target: "runtime_spawn", step = "spawn_enter", "spawn called");
+
         // Validate isolation mode first
         config.validate_isolation()?;
 
@@ -524,6 +530,15 @@ impl AgentRuntime for ContainerRuntime {
 
         // Ensure the image is available locally (ADR-045); publish lifecycle events.
         let pull_start = std::time::Instant::now();
+        let ensure_image_start = std::time::Instant::now();
+        info!(
+            target: "image_pull",
+            step = "started",
+            image = %image,
+            execution_id = %config.execution_id,
+            pull_policy = ?config.image_pull_policy,
+            "image pull lifecycle: started"
+        );
         self.event_bus
             .publish_image_event(ImageManagementEvent::ImagePullStarted {
                 execution_id: config.execution_id,
@@ -531,12 +546,34 @@ impl AgentRuntime for ContainerRuntime {
                 pull_policy: config.image_pull_policy,
                 started_at: Utc::now(),
             });
+        info!(
+            target: "runtime_spawn",
+            step = "ensure_image_begin",
+            image = %config.image,
+            pull_policy = ?config.image_pull_policy
+        );
         let pull_source = match self
             .image_manager
             .ensure_image(&image, config.image_pull_policy, None)
             .await
         {
             Ok(source) => {
+                let elapsed_ms = ensure_image_start.elapsed().as_millis() as u64;
+                info!(
+                    target: "runtime_spawn",
+                    step = "ensure_image_complete",
+                    source = ?source,
+                    elapsed_ms = elapsed_ms
+                );
+                info!(
+                    target: "image_pull",
+                    step = "completed",
+                    image = %image,
+                    execution_id = %config.execution_id,
+                    source = ?source,
+                    elapsed_ms = elapsed_ms,
+                    "image pull lifecycle: completed"
+                );
                 self.event_bus
                     .publish_image_event(ImageManagementEvent::ImagePullCompleted {
                         execution_id: config.execution_id,
@@ -548,11 +585,29 @@ impl AgentRuntime for ContainerRuntime {
                 source
             }
             Err(e) => {
+                let elapsed_ms = ensure_image_start.elapsed().as_millis() as u64;
+                let err_str = e.to_string();
+                error!(
+                    target: "runtime_spawn",
+                    step = "ensure_image_failed",
+                    image = %config.image,
+                    error = %e,
+                    elapsed_ms = elapsed_ms
+                );
+                error!(
+                    target: "image_pull",
+                    step = "failed",
+                    image = %image,
+                    execution_id = %config.execution_id,
+                    error = %err_str,
+                    elapsed_ms = elapsed_ms,
+                    "image pull lifecycle: failed"
+                );
                 self.event_bus
                     .publish_image_event(ImageManagementEvent::ImagePullFailed {
                         execution_id: config.execution_id,
                         image: image.clone(),
-                        reason: e.to_string(),
+                        reason: err_str,
                         failed_at: Utc::now(),
                     });
                 return Err(e);

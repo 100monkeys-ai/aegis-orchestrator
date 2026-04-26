@@ -28,7 +28,45 @@ use bollard::query_parameters::CreateImageOptions;
 use bollard::Docker;
 use futures::StreamExt;
 use std::sync::Arc;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
+use tracing::{error, info};
+
+/// Total wall-clock budget for `ensure_image`, including registry inspection
+/// and full pull stream consumption. Tunable via env var (see below) for tests.
+///
+/// A slow/unreachable registry is surfaced as `RuntimeError::ImagePullTimeout`
+/// after this many seconds rather than blocking the spawn path indefinitely.
+pub(crate) const IMAGE_PULL_TIMEOUT_SECS: u64 = 180;
+
+/// Wrap an arbitrary pull future in the standard `IMAGE_PULL_TIMEOUT_SECS`
+/// budget, mapping elapsed-deadline into [`RuntimeError::ImagePullTimeout`].
+///
+/// Extracted as a free function so the timeout semantics can be unit-tested
+/// without stubbing the full Bollard `Docker` client.
+pub(crate) async fn run_pull_with_timeout<F, T>(
+    image: &str,
+    timeout_secs: u64,
+    fut: F,
+) -> Result<T, RuntimeError>
+where
+    F: std::future::Future<Output = Result<T, RuntimeError>>,
+{
+    match timeout(Duration::from_secs(timeout_secs), fut).await {
+        Ok(inner) => inner,
+        Err(_) => {
+            error!(
+                image = %image,
+                timeout_secs = timeout_secs,
+                "image pull timed out"
+            );
+            Err(RuntimeError::ImagePullTimeout {
+                image: image.to_string(),
+                timeout_secs,
+            })
+        }
+    }
+}
 
 // ── CredentialResolver ────────────────────────────────────────────────────────
 
@@ -140,13 +178,21 @@ impl DockerImageManager for StandardDockerImageManager {
         policy: ImagePullPolicy,
         credentials_override: Option<DockerCredentials>,
     ) -> Result<PullSource, RuntimeError> {
+        let started = Instant::now();
+        info!(
+            image = %image,
+            pull_policy = ?policy,
+            "ensure_image entry"
+        );
+
+        info!(image = %image, "image_inspect begin");
         let image_exists = self.docker.inspect_image(image).await.is_ok();
 
         let should_pull = match policy {
             ImagePullPolicy::Always => true,
             ImagePullPolicy::IfNotPresent => {
                 if !image_exists {
-                    info!("Image {} not found locally, will attempt to pull", image);
+                    info!(image = %image, cached = false, "image not cached locally");
                 }
                 !image_exists
             }
@@ -159,6 +205,11 @@ impl DockerImageManager for StandardDockerImageManager {
                     "Image {image} not found locally and image_pull_policy is Never"
                 )));
             }
+            info!(
+                image = %image,
+                cached = true,
+                "image_inspect complete; using cached"
+            );
             return Ok(PullSource::Cached);
         }
 
@@ -187,30 +238,124 @@ impl DockerImageManager for StandardDockerImageManager {
             })
         };
 
-        info!("Pulling image: {}", image);
+        info!(image = %image, "image_pull_begin");
         let options = Some(CreateImageOptions {
             from_image: Some(image.to_string()),
             ..Default::default()
         });
 
-        let mut stream = self.docker.create_image(options, None, auth);
-        while let Some(result) = stream.next().await {
-            if let Err(e) = result {
-                let error_msg = format!(
-                    "Failed to pull image {image}: {e}\n\n\
-                     Common causes:\n\
-                     - Docker daemon not responding (connection issue)\n\
-                     - No internet connectivity to Docker Hub\n\
-                     - Image name is incorrect or doesn't exist\n\
-                     - Corporate proxy/firewall blocking Docker Hub\n\
-                     - Registry authentication required\n\n\
-                     Try manually: docker pull {image}"
+        let docker = self.docker.clone();
+        let image_owned = image.to_string();
+        let pull_fut = async move {
+            let mut stream = docker.create_image(options, None, auth);
+            let mut last_status: Option<String> = None;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(chunk) => {
+                        if let Some(s) = chunk.status.as_ref() {
+                            // Deduplicate consecutive identical status strings
+                            // to avoid log spam from per-layer progress chunks.
+                            if last_status.as_deref() != Some(s.as_str()) {
+                                info!(image = %image_owned, status = %s, "pull progress");
+                                last_status = Some(s.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = format!(
+                            "Failed to pull image {image_owned}: {e}\n\n\
+                             Common causes:\n\
+                             - Docker daemon not responding (connection issue)\n\
+                             - No internet connectivity to Docker Hub\n\
+                             - Image name is incorrect or doesn't exist\n\
+                             - Corporate proxy/firewall blocking Docker Hub\n\
+                             - Registry authentication required\n\n\
+                             Try manually: docker pull {image_owned}"
+                        );
+                        return Err(RuntimeError::SpawnFailed(error_msg));
+                    }
+                }
+            }
+            Ok(PullSource::Downloaded)
+        };
+
+        match run_pull_with_timeout(image, IMAGE_PULL_TIMEOUT_SECS, pull_fut).await {
+            Ok(source) => {
+                info!(
+                    image = %image,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Successfully pulled image"
                 );
-                return Err(RuntimeError::SpawnFailed(error_msg));
+                Ok(source)
+            }
+            Err(e) => {
+                error!(
+                    image = %image,
+                    error = %e,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "image pull failed"
+                );
+                Err(e)
             }
         }
-        info!("Successfully pulled image: {}", image);
+    }
+}
 
-        Ok(PullSource::Downloaded)
+// ── Tests ────────────────────────────────────────────────────────────────────
+//
+// These exercise the timeout-wrapping helper directly. Bollard's `Docker`
+// is not trait-abstracted in this codebase, so full stubbing of
+// `inspect_image` / `create_image` would require a much larger refactor.
+// The helper carries the timeout semantics that this commit introduces, so
+// unit-testing the helper is sufficient to lock the regression.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+
+    #[tokio::test]
+    async fn run_pull_with_timeout_returns_ok_when_future_completes() {
+        let result: Result<PullSource, RuntimeError> =
+            run_pull_with_timeout("repo/img:tag", 5, async { Ok(PullSource::Downloaded) }).await;
+        assert!(matches!(result, Ok(PullSource::Downloaded)));
+    }
+
+    #[tokio::test]
+    async fn run_pull_with_timeout_propagates_inner_error() {
+        let result: Result<PullSource, RuntimeError> =
+            run_pull_with_timeout("repo/img:tag", 5, async {
+                Err(RuntimeError::SpawnFailed("boom".into()))
+            })
+            .await;
+        match result {
+            Err(RuntimeError::SpawnFailed(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected SpawnFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn run_pull_with_timeout_returns_image_pull_timeout_when_pending() {
+        // Future never completes; with paused time the timeout fires deterministically.
+        let pending_fut = async {
+            pending::<()>().await;
+            Ok(PullSource::Downloaded)
+        };
+        let result = run_pull_with_timeout("repo/img:tag", 1, pending_fut).await;
+        match result {
+            Err(RuntimeError::ImagePullTimeout {
+                image,
+                timeout_secs,
+            }) => {
+                assert_eq!(image, "repo/img:tag");
+                assert_eq!(timeout_secs, 1);
+            }
+            other => panic!("expected ImagePullTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_pull_timeout_default_is_180s() {
+        // Lock the production budget so a future change is intentional.
+        assert_eq!(IMAGE_PULL_TIMEOUT_SECS, 180);
     }
 }

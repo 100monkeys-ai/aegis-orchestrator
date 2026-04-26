@@ -271,6 +271,16 @@ pub enum RuntimeError {
     /// Contains the timeout duration in seconds for diagnostics.
     #[error("Execution timed out after {0} seconds")]
     TimedOut(u64),
+    /// `ensure_image` did not complete within `IMAGE_PULL_TIMEOUT_SECS`.
+    /// Surfaces a slow/unreachable registry as a fast, typed failure rather
+    /// than an unbounded silent hang in the spawn path.
+    #[error("Image pull for '{image}' timed out after {timeout_secs} seconds")]
+    ImagePullTimeout {
+        /// Fully-qualified image reference whose pull stalled.
+        image: String,
+        /// Wall-clock budget in seconds that elapsed before timeout.
+        timeout_secs: u64,
+    },
     /// The execution was cancelled via [`crate::application::execution::ExecutionService::cancel_execution`].
     /// The Supervisor observed the cancellation token and terminated the running instance.
     #[error("Execution was cancelled")]
