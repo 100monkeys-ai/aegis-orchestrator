@@ -198,6 +198,12 @@ pub trait EffectiveTierService: Send + Sync {
     /// Individual per-user failures are logged and do not abort the team-wide
     /// recompute.
     async fn recompute_for_team(&self, team_id: &TeamId) -> Result<(), EffectiveTierError>;
+
+    /// Compute the caller's effective tier (max of personal subscription tier
+    /// and active colony memberships) without writing to Keycloak. Used by
+    /// authorization checks that must read the tier without forcing a sync.
+    async fn compute_effective_tier(&self, user_id: &str)
+        -> Result<TenantTier, EffectiveTierError>;
 }
 
 pub struct StandardEffectiveTierService {
@@ -221,11 +227,23 @@ impl StandardEffectiveTierService {
             tier_sync,
         }
     }
+}
+
+#[async_trait]
+impl EffectiveTierService for StandardEffectiveTierService {
+    async fn recompute_for_user(&self, user_id: &str) -> Result<TenantTier, EffectiveTierError> {
+        let effective = self.compute_effective_tier(user_id).await?;
+        self.tier_sync.set_tier(user_id, effective).await?;
+        Ok(effective)
+    }
 
     /// Compute (but do not sync) the effective tier for `user_id` from the
     /// personal subscription + active colony memberships. Extracted as a pure
-    /// function for unit-testability.
-    async fn compute_effective(&self, user_id: &str) -> Result<TenantTier, EffectiveTierError> {
+    /// function for unit-testability and read-only authorization checks.
+    async fn compute_effective_tier(
+        &self,
+        user_id: &str,
+    ) -> Result<TenantTier, EffectiveTierError> {
         // 1. Personal tier: look up the per-user consumer tenant subscription.
         //    If none exists (free user) or the status is not Active/Trialing,
         //    default to Free.
@@ -268,15 +286,6 @@ impl StandardEffectiveTierService {
             }
         }
 
-        Ok(effective)
-    }
-}
-
-#[async_trait]
-impl EffectiveTierService for StandardEffectiveTierService {
-    async fn recompute_for_user(&self, user_id: &str) -> Result<TenantTier, EffectiveTierError> {
-        let effective = self.compute_effective(user_id).await?;
-        self.tier_sync.set_tier(user_id, effective).await?;
         Ok(effective)
     }
 

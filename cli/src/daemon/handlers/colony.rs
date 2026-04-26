@@ -187,6 +187,9 @@ fn map_service_error(err: TeamServiceError) -> axum::response::Response {
     let (status, code): (StatusCode, &str) = match &err {
         TeamServiceError::Unauthorized => (StatusCode::FORBIDDEN, "forbidden"),
         TeamServiceError::TierNotPermitted(_) => (StatusCode::FORBIDDEN, "tier_not_permitted"),
+        TeamServiceError::PersonalTierTooLow { .. } => {
+            (StatusCode::PAYMENT_REQUIRED, "personal_tier_too_low")
+        }
         TeamServiceError::SeatCapReached { .. } => (StatusCode::CONFLICT, "seat_cap_reached"),
         TeamServiceError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
         TeamServiceError::InvalidInvitation => (StatusCode::BAD_REQUEST, "invalid_invitation"),

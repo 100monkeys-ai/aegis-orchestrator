@@ -48,6 +48,13 @@ pub enum TeamServiceError {
     /// The caller's tier does not permit team creation (Free rejected).
     #[error("tier does not permit team creation: {0:?}")]
     TierNotPermitted(TenantTier),
+    /// The caller's *personal* tier does not meet the minimum required to
+    /// own a colony at the requested tier (ADR-111 §Tier Gating).
+    #[error("personal tier {personal:?} cannot own a colony at {requested:?}; upgrade to Business or Enterprise")]
+    PersonalTierTooLow {
+        personal: TenantTier,
+        requested: TenantTier,
+    },
     /// The team's seat cap for the current tier has been reached.
     #[error("seat cap reached for tier (limit={limit}, current={current})")]
     SeatCapReached { limit: u32, current: u32 },
@@ -301,6 +308,26 @@ impl StandardTeamService {
 #[async_trait]
 impl TeamService for StandardTeamService {
     async fn provision_team(&self, cmd: ProvisionTeamCommand) -> Result<Team, TeamServiceError> {
+        // ADR-111 §Tier Gating: the caller's personal effective tier must meet
+        // the colony-ownership floor. This is the authoritative gate; the UI
+        // hides ineligible options but the server is the source of truth.
+        if let Some(svc) = &self.effective_tier_service {
+            let personal = svc
+                .compute_effective_tier(&cmd.owner_user_id)
+                .await
+                .map_err(|e| {
+                    TeamServiceError::Repository(RepositoryError::Unknown(format!(
+                        "effective_tier: {e}"
+                    )))
+                })?;
+            if !personal.allows_colony() {
+                return Err(TeamServiceError::PersonalTierTooLow {
+                    personal,
+                    requested: cmd.tier,
+                });
+            }
+        }
+
         // Per ADR-111 (colony tier model): only Business and Enterprise may
         // own a colony. Free/Pro are personal-only; System is never a
         // user-facing tier.
@@ -990,5 +1017,81 @@ mod tests {
         assert_eq!(team.tier, TenantTier::Enterprise);
         assert_eq!(team.status, TeamStatus::Active);
         assert_eq!(team.tier.included_seats(), 10);
+    }
+
+    // ── ADR-111 §Tier Gating: personal-tier gate on provision ──────────────
+
+    use crate::application::effective_tier_service::{EffectiveTierError, EffectiveTierService};
+
+    /// Stub `EffectiveTierService` returning a fixed personal tier.
+    /// `recompute_*` are not exercised by `provision_team`.
+    struct StubPersonalTier(TenantTier);
+
+    #[async_trait]
+    impl EffectiveTierService for StubPersonalTier {
+        async fn recompute_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<TenantTier, EffectiveTierError> {
+            Ok(self.0)
+        }
+        async fn recompute_for_team(&self, _team_id: &TeamId) -> Result<(), EffectiveTierError> {
+            Ok(())
+        }
+        async fn compute_effective_tier(
+            &self,
+            _user_id: &str,
+        ) -> Result<TenantTier, EffectiveTierError> {
+            Ok(self.0)
+        }
+    }
+
+    fn build_service_with_personal(personal: TenantTier) -> StandardTeamService {
+        StandardTeamService::new(
+            Arc::new(MemTeamRepo::default()),
+            Arc::new(MemMembershipRepo::default()),
+            Arc::new(MemInvitationRepo),
+            Arc::new(MemTenantRepo::default()),
+            Arc::new(NoopBilling),
+            Arc::new(EventBus::with_default_capacity()),
+            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
+            Some(Arc::new(StubPersonalTier(personal))),
+        )
+    }
+
+    #[tokio::test]
+    async fn provision_team_rejects_when_personal_tier_below_business() {
+        let svc = build_service_with_personal(TenantTier::Free);
+        let err = svc.provision_team(cmd(TenantTier::Business)).await;
+        assert!(
+            matches!(
+                err,
+                Err(TeamServiceError::PersonalTierTooLow {
+                    personal: TenantTier::Free,
+                    requested: TenantTier::Business,
+                })
+            ),
+            "expected PersonalTierTooLow, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_team_allows_business_personal() {
+        let svc = build_service_with_personal(TenantTier::Business);
+        let team = svc
+            .provision_team(cmd(TenantTier::Business))
+            .await
+            .expect("business personal must allow business colony");
+        assert_eq!(team.tier, TenantTier::Business);
+    }
+
+    #[tokio::test]
+    async fn provision_team_allows_business_personal_for_enterprise_team() {
+        let svc = build_service_with_personal(TenantTier::Business);
+        let team = svc
+            .provision_team(cmd(TenantTier::Enterprise))
+            .await
+            .expect("business personal must allow enterprise colony");
+        assert_eq!(team.tier, TenantTier::Enterprise);
     }
 }

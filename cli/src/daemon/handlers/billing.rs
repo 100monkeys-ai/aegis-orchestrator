@@ -4228,6 +4228,12 @@ mod tests {
                 self.recomputed.lock().unwrap().push(*team_id);
                 Ok(())
             }
+            async fn compute_effective_tier(
+                &self,
+                _user_id: &str,
+            ) -> Result<TenantTier, EffectiveTierError> {
+                Ok(TenantTier::Free)
+            }
         }
 
         fn mk_active_business_team() -> Team {
