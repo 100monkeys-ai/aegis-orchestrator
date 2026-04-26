@@ -807,6 +807,7 @@ mod tests {
             workspace_volume_mount_path: None,
             workspace_remote_path: None,
             workflow_execution_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -910,6 +911,7 @@ mod tests {
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
                     workflow_execution_id: None,
+                    attachments: Vec::new(),
                 },
                 1,
                 Arc::new(TestObserver::default()),

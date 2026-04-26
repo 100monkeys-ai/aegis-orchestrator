@@ -34,7 +34,9 @@ async-stream = "0.3"
 
 # HTTP client for daemon delegation
 reqwest = { version = "0.13", features = ["json", "stream", "form"] }
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
+# Content-based MIME sniffing (ADR-113 attachment uploads).
+infer = "0.16"
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "migrate"] }
 
 # Serialization

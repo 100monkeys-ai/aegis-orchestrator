@@ -194,6 +194,7 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.system.config",
     "aegis.runtime.list",
     "aegis.execution.file",
+    "aegis.attachment.read",
 ];
 
 /// Canonical registry of all builtin tool dispatchers.
@@ -260,6 +261,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.system.config", "Returns the current node configuration."),
     ("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid."),
     ("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes."),
+    ("aegis.attachment.read", "Read the contents of a file attached to a chat message. Returns the file content (UTF-8 text or base64-encoded bytes for binary), MIME type, size, and SHA-256 digest. Tenant-scoped and read-only."),
 ];
 
 impl ToolRouter {
@@ -1339,6 +1341,20 @@ impl ToolRouter {
                     }
                 },
                 "required": ["execution_id", "path"]
+            }),
+            "aegis.attachment.read" => json!({
+                "type": "object",
+                "properties": {
+                    "volume_id": {
+                        "type": "string",
+                        "description": "UUID of the tenant-scoped volume containing the attachment."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "POSIX path of the attachment within the volume."
+                    }
+                },
+                "required": ["volume_id", "path"]
             }),
             _ => json!({ "type": "object" }),
         }

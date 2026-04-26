@@ -363,6 +363,21 @@ impl AegisRuntime for AegisRuntimeService {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+            attachments: req
+                .attachments
+                .iter()
+                .filter_map(|a| {
+                    let volume_uuid = uuid::Uuid::parse_str(&a.volume_id).ok()?;
+                    Some(crate::domain::execution::AttachmentRef {
+                        volume_id: crate::domain::shared_kernel::VolumeId(volume_uuid),
+                        path: a.path.clone(),
+                        name: a.name.clone(),
+                        mime_type: a.mime_type.clone(),
+                        size: u64::try_from(a.size).unwrap_or(0),
+                        sha256: a.sha256.clone(),
+                    })
+                })
+                .collect(),
         };
 
         // Channel for streaming events
@@ -2519,6 +2534,7 @@ mod tests {
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
+                attachments: Vec::new(),
             }))
             .await
             .expect("execute_agent should succeed");
@@ -2572,6 +2588,7 @@ mod tests {
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
                 workflow_execution_id: None,
+                attachments: Vec::new(),
             },
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
@@ -2605,6 +2622,7 @@ mod tests {
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
+                attachments: Vec::new(),
             }))
             .await
             .expect("execute_agent should succeed");

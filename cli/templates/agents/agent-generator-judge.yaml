@@ -74,6 +74,24 @@ spec:
         fields, give full `completeness` credit for input schema alignment.
       - Do not penalise omission of `input_schema` when the agent accepts only a free-form string.
 
+      ATTACHMENT DECLARATION AUDIT — when the dispatch carried `attachments` (ADR-113):
+      - If the input you are evaluating includes a non-empty `attachments` array (or the
+        `user_objective` / `validation_context` indicates the dispatch carried attachments),
+        the generated manifest MUST satisfy ALL THREE of the following:
+          (a) declare an `attachments` field in `spec.input_schema` of shape array of
+              objects with `volume_id`, `path`, `name`, `mime_type`, `size`, optional `sha256`;
+          (b) include `aegis.attachment.read` in `spec.tools`;
+          (c) set `spec.type: system`.
+      - If ANY of (a), (b), or (c) is missing, reduce the `correctness` score by at least
+        0.4 and note the specific missing element (e.g., "manifest received attachments at
+        dispatch but did not declare aegis.attachment.read in spec.tools"). A manifest that
+        fails any of these requirements is non-deployable for the dispatched workload and
+        must be rejected.
+      - If the dispatch carried NO attachments, the manifest SHOULD NOT include
+        `aegis.attachment.read` and SHOULD NOT set `spec.type: system` solely on this
+        basis — both are reserved for attachment-carrying dispatches. Penalise unjustified
+        inclusion of either with a `safety` score reduction of at least 0.2.
+
       AGENT REUSABILITY AUDIT — check the generated manifest name and description:
       - If the agent name or description is task-specific rather than capability-generic
         (e.g., "blog-post-about-cars-agent", "add-two-numbers-agent", "send-slack-to-dev-agent"),

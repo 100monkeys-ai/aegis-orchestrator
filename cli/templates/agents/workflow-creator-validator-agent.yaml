@@ -55,6 +55,15 @@ spec:
            Writing outside /workspace is not permitted and will cause runtime failure.
            When authoring or referencing agents that produce file artifacts, verify their
            volume and filesystem.write configuration uses /workspace/* paths.
+         - ATTACHMENT-AWARENESS (ADR-113): if the dispatch input includes a non-empty
+           `attachments` array, every agent referenced by a state that consumes those
+           attachments MUST: (a) declare an `attachments` field in its `spec.input_schema`
+           matching `{volume_id, path, name, mime_type, size, sha256?}`, (b) include
+           `aegis.attachment.read` in its `spec.tools`, and (c) set `spec.type: system`.
+           When `GENERATE_MISSING_AGENTS` invokes `agent-creator-agent` for an agent that
+           consumes attachments, propagate the dispatch `attachments` so the creator-agent
+           applies the same rule. Reject the workflow if any consuming agent fails these
+           requirements.
          - If the workflow accepts named or structured inputs from callers, declare
            `metadata.input_schema` as a JSON Schema `object` describing those inputs.
            Use `type: object`, `properties` (with `type` and `description` per field),

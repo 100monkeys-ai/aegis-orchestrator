@@ -54,6 +54,7 @@ impl ToolInvocationService {
             volume_id,
             language: serde_json::from_value(serde_json::json!(language)).unwrap_or_default(),
             timeout_seconds,
+            attachments: Vec::new(),
         };
 
         let lang = pipeline_input.language;

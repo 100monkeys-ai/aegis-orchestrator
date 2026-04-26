@@ -285,6 +285,7 @@ impl ValidationService {
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
                 workflow_execution_id: None,
+                attachments: Vec::new(),
             }
         } else {
             // No input_schema declared — pass content directly as a plain string.
@@ -295,6 +296,7 @@ impl ValidationService {
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
                 workflow_execution_id: None,
+                attachments: Vec::new(),
             }
         };
 
@@ -635,6 +637,7 @@ impl GradientValidator for SemanticAgentValidator {
             workspace_volume_mount_path: None,
             workspace_remote_path: None,
             workflow_execution_id: None,
+            attachments: Vec::new(),
         };
 
         // 3. Start child execution.
@@ -795,6 +798,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
                     workflow_execution_id: None,
+                    attachments: Vec::new(),
                 };
                 let exec_id = svc
                     .start_child_execution(jid, exec_input, parent_id)

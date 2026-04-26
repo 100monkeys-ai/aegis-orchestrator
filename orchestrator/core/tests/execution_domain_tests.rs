@@ -30,6 +30,7 @@ fn make_input(intent: &str) -> ExecutionInput {
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
         workflow_execution_id: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -41,6 +42,7 @@ fn make_input_with_payload(intent: &str, payload: serde_json::Value) -> Executio
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
         workflow_execution_id: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -841,6 +843,7 @@ fn execution_input_without_intent() {
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
         workflow_execution_id: None,
+        attachments: Vec::new(),
     };
     assert!(input.intent.is_none());
 }

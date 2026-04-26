@@ -565,6 +565,7 @@ impl ToolInvocationService {
                                 workspace_volume_mount_path: None,
                                 workspace_remote_path: None,
                                 workflow_execution_id: None,
+                                attachments: Vec::new(),
                             };
 
                             // Start the single iteration judge as child execution
@@ -1041,6 +1042,23 @@ impl ToolInvocationService {
                     ),
                     None => Some(Err(SealSessionError::InternalError(
                         "aegis.execution.file: file operations service not configured".to_string(),
+                    ))),
+                }
+            }
+            "aegis.attachment.read" => {
+                let tenant_id = match Self::resolve_tenant_arg(args) {
+                    Ok(id) => id,
+                    Err(e) => return Some(Err(e)),
+                };
+                match &self.file_operations_service {
+                    Some(svc) => Some(
+                        super::attachments::invoke_aegis_attachment_read_tool(
+                            svc, &tenant_id, args,
+                        )
+                        .await,
+                    ),
+                    None => Some(Err(SealSessionError::InternalError(
+                        "aegis.attachment.read: file operations service not configured".to_string(),
                     ))),
                 }
             }

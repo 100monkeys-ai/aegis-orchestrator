@@ -361,6 +361,48 @@ impl FileOperationsService {
     /// Looks up the volume by `VolumeOwnership::Execution { execution_id }`,
     /// verifies the volume belongs to the given tenant, sanitizes the path,
     /// and returns the file content.
+    /// Read a file from a tenant-scoped persistent user volume, used by the
+    /// `aegis.attachment.read` tool (ADR-113).
+    ///
+    /// Tenant isolation is enforced by the volume lookup: the call returns
+    /// `Unauthorized` when the volume's `tenant_id` does not match the caller's,
+    /// and `NotFound` when the volume does not exist or is non-persistent.
+    /// Path sanitization reuses the same `sanitize_and_resolve` pipeline as
+    /// every other read path.
+    pub async fn read_attachment_for_tenant(
+        &self,
+        volume_id: &VolumeId,
+        tenant_id: &crate::domain::tenant::TenantId,
+        path: &str,
+    ) -> Result<FileContent, FileOperationsError> {
+        use crate::domain::volume::VolumeOwnership;
+
+        let volume = self
+            .fsal
+            .volume_repository()
+            .find_by_id(*volume_id)
+            .await
+            .map_err(|e| FileOperationsError::Repository(e.to_string()))?
+            .ok_or_else(|| {
+                FileOperationsError::NotFound(format!("volume {} not found", volume_id.0))
+            })?;
+
+        // Tenant-isolation check.
+        if &volume.tenant_id != tenant_id {
+            return Err(FileOperationsError::Unauthorized);
+        }
+
+        // Attachments live in persistent user volumes only.
+        let owner = match &volume.ownership {
+            VolumeOwnership::Persistent { owner } => owner.clone(),
+            _ => return Err(FileOperationsError::Unauthorized),
+        };
+
+        // Delegate to the standard read_file path so sanitization and FSAL
+        // semantics are identical to `aegis.file.read`.
+        self.read_file(volume_id, &owner, path).await
+    }
+
     pub async fn read_file_for_execution(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
