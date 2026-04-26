@@ -78,7 +78,7 @@ impl ReapAttemptState {
 
 pub(crate) fn managed_container_reap_reason(
     container: &ManagedAgentContainer,
-    execution_status: Option<ExecutionStatus>,
+    execution_status: Option<&ExecutionStatus>,
 ) -> Option<&'static str> {
     if container.debug_retain {
         return None;
@@ -95,8 +95,8 @@ pub(crate) fn managed_container_reap_reason(
 
     match execution_status {
         None => Some("missing_execution_record"),
-        Some(ExecutionStatus::Running) if container.state.as_deref() == Some("running") => None,
-        Some(ExecutionStatus::Running) => Some("container_not_running"),
+        Some(&ExecutionStatus::Running) if container.state.as_deref() == Some("running") => None,
+        Some(&ExecutionStatus::Running) => Some("container_not_running"),
         Some(_) => Some("execution_not_running"),
     }
 }
@@ -159,7 +159,8 @@ pub(crate) async fn cleanup_orphaned_agent_containers(
             None => None,
         };
 
-        let Some(reason) = managed_container_reap_reason(&container, execution_status) else {
+        let Some(reason) = managed_container_reap_reason(&container, execution_status.as_ref())
+        else {
             // Container no longer eligible for reaping — clear any prior state
             // so a future regression starts from a clean slate.
             attempt_states.remove(&container.id);
@@ -279,7 +280,7 @@ mod tests {
             Some(ExecutionStatus::Cancelled),
         ] {
             assert_eq!(
-                managed_container_reap_reason(&container, status),
+                managed_container_reap_reason(&container, status.as_ref()),
                 None,
                 "expected None for state=stopping with status={:?}",
                 status
@@ -298,7 +299,7 @@ mod tests {
             Some(ExecutionStatus::Cancelled),
         ] {
             assert_eq!(
-                managed_container_reap_reason(&container, status),
+                managed_container_reap_reason(&container, status.as_ref()),
                 None,
                 "expected None for state=removing with status={:?}",
                 status
@@ -312,7 +313,7 @@ mod tests {
     fn reap_reason_still_fires_for_exited_container_with_terminal_execution() {
         let container = container_with_state(Some("exited"));
         assert_eq!(
-            managed_container_reap_reason(&container, Some(ExecutionStatus::Completed)),
+            managed_container_reap_reason(&container, Some(&ExecutionStatus::Completed)),
             Some("execution_not_running")
         );
     }
