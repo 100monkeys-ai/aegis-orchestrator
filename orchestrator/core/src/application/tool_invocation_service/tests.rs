@@ -3153,3 +3153,306 @@ async fn list_tools_does_not_duplicate_when_dispatchers_present() {
         "aegis.workflow.wait appeared {count} times, expected exactly 1"
     );
 }
+
+// ============================================================================
+// Regression tests: SEAL Tooling Gateway timeout decoupling.
+//
+// Production bug: orchestrator hangs after "SEAL envelope verified successfully"
+// when the SEAL Tooling Gateway is unresponsive. The pre-dispatch semantic
+// judge in `dispatch_tool_core` calls `get_available_tools_for_agent` →
+// `fetch_gateway_tools_grpc` → `list_tools(...).await` with no application-
+// level timeout, so a hung gateway prevents BUILT-IN `aegis.*` tools from
+// ever dispatching.
+//
+// Per ADR-053 / ADR-038 / BC-14, the SEAL Tooling Gateway is a SEPARATE
+// tooling layer — orchestrator built-ins must remain available regardless
+// of gateway health.
+// ============================================================================
+
+mod gateway_timeout_regression {
+    use super::*;
+    use crate::infrastructure::seal_gateway_proto::gateway_invocation_service_server::{
+        GatewayInvocationService as GrpcGatewayInvocationService, GatewayInvocationServiceServer,
+    };
+    use crate::infrastructure::seal_gateway_proto::{
+        ExploreApiRequest, ExploreApiResponse, InvokeCliRequest as PbInvokeCliRequest,
+        InvokeCliResponse, InvokeWorkflowRequest as PbInvokeWorkflowRequest,
+        InvokeWorkflowResponse, ListToolsRequest as PbListToolsRequest, ListToolsResponse,
+    };
+    use std::net::{SocketAddr, TcpListener as StdTcpListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::oneshot;
+
+    /// Stub SEAL gateway whose `list_tools` blocks forever; all other RPCs
+    /// likewise hang. Used to simulate the production hang condition.
+    struct HungGateway {
+        list_tools_observed: Arc<AtomicBool>,
+    }
+
+    #[tonic::async_trait]
+    impl GrpcGatewayInvocationService for HungGateway {
+        async fn invoke_workflow(
+            &self,
+            _req: tonic::Request<PbInvokeWorkflowRequest>,
+        ) -> Result<tonic::Response<InvokeWorkflowResponse>, tonic::Status> {
+            futures::future::pending::<()>().await;
+            unreachable!("hung gateway");
+        }
+        async fn invoke_cli(
+            &self,
+            _req: tonic::Request<PbInvokeCliRequest>,
+        ) -> Result<tonic::Response<InvokeCliResponse>, tonic::Status> {
+            futures::future::pending::<()>().await;
+            unreachable!("hung gateway");
+        }
+        async fn explore_api(
+            &self,
+            _req: tonic::Request<ExploreApiRequest>,
+        ) -> Result<tonic::Response<ExploreApiResponse>, tonic::Status> {
+            futures::future::pending::<()>().await;
+            unreachable!("hung gateway");
+        }
+        async fn list_tools(
+            &self,
+            _req: tonic::Request<PbListToolsRequest>,
+        ) -> Result<tonic::Response<ListToolsResponse>, tonic::Status> {
+            self.list_tools_observed.store(true, Ordering::SeqCst);
+            futures::future::pending::<()>().await;
+            unreachable!("hung gateway");
+        }
+    }
+
+    /// Stub SEAL gateway whose `list_tools` returns an error immediately.
+    struct ErroringGateway;
+
+    #[tonic::async_trait]
+    impl GrpcGatewayInvocationService for ErroringGateway {
+        async fn invoke_workflow(
+            &self,
+            _req: tonic::Request<PbInvokeWorkflowRequest>,
+        ) -> Result<tonic::Response<InvokeWorkflowResponse>, tonic::Status> {
+            Err(tonic::Status::internal("boom"))
+        }
+        async fn invoke_cli(
+            &self,
+            _req: tonic::Request<PbInvokeCliRequest>,
+        ) -> Result<tonic::Response<InvokeCliResponse>, tonic::Status> {
+            Err(tonic::Status::internal("boom"))
+        }
+        async fn explore_api(
+            &self,
+            _req: tonic::Request<ExploreApiRequest>,
+        ) -> Result<tonic::Response<ExploreApiResponse>, tonic::Status> {
+            Err(tonic::Status::internal("boom"))
+        }
+        async fn list_tools(
+            &self,
+            _req: tonic::Request<PbListToolsRequest>,
+        ) -> Result<tonic::Response<ListToolsResponse>, tonic::Status> {
+            Err(tonic::Status::internal("list_tools failed"))
+        }
+    }
+
+    /// Spawn a tonic server hosting `svc` on a random localhost port. Returns
+    /// the gateway URL and a shutdown signal sender.
+    async fn spawn_gateway<S>(svc: S) -> (String, oneshot::Sender<()>)
+    where
+        S: GrpcGatewayInvocationService,
+    {
+        // Use a std listener to discover a free port, then drop it and bind
+        // tonic to that address. (Avoids needing tokio-stream/net features.)
+        let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
+        drop(std_listener);
+        let url = format!("http://{addr}");
+
+        let (tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(GatewayInvocationServiceServer::new(svc))
+                .serve_with_shutdown(addr, async {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+
+        // Wait briefly for the server to be ready to accept connections.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(20))
+                .is_ok()
+            {
+                break;
+            }
+        }
+        (url, tx)
+    }
+
+    fn make_service(seal_gateway_url: Option<String>) -> ToolInvocationService {
+        let repo = Arc::new(InMemorySealSessionRepository::new());
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(
+            registry,
+            servers,
+            vec![BuiltinDispatcherConfig {
+                name: "fs.read".to_string(),
+                description: "Read files from the workspace".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "fs.read".to_string(),
+                    skip_judge: true,
+                }],
+                api_key: None,
+            }],
+        ));
+        let middleware = Arc::new(SealMiddleware::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+        ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            seal_gateway_url,
+        )
+    }
+
+    /// Regression: a hung gateway must NOT block enumeration.
+    /// `fetch_gateway_tools_grpc` returns Ok(empty) within ~6 seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_gateway_tools_grpc_returns_empty_when_gateway_hangs() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let (url, _shutdown) = spawn_gateway(HungGateway {
+            list_tools_observed: observed.clone(),
+        })
+        .await;
+        let service = make_service(Some(url));
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            service.fetch_gateway_tools_grpc(),
+        )
+        .await
+        .expect("fetch_gateway_tools_grpc must not hang past 8s");
+        let elapsed = start.elapsed();
+
+        let tools = result.expect("hang must downgrade to Ok(empty), not error");
+        assert!(
+            tools.is_empty(),
+            "expected empty tool list on gateway hang, got {} tools",
+            tools.len()
+        );
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "stub gateway should have received the list_tools call"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(7),
+            "gateway enumeration must respect the 5s list_tools timeout (took {:?})",
+            elapsed
+        );
+    }
+
+    /// Regression: an erroring gateway returns Ok(empty) — best-effort,
+    /// errors must NOT propagate from the enumeration path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_gateway_tools_grpc_returns_empty_when_gateway_errors() {
+        let (url, _shutdown) = spawn_gateway(ErroringGateway).await;
+        let service = make_service(Some(url));
+
+        let tools = service
+            .fetch_gateway_tools_grpc()
+            .await
+            .expect("erroring gateway must downgrade to Ok(empty)");
+        assert!(
+            tools.is_empty(),
+            "expected empty tool list on gateway error"
+        );
+    }
+
+    /// Regression: `get_available_tools` must succeed (returning the
+    /// locally-known built-in tools) even when the gateway hangs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_available_tools_returns_builtins_when_gateway_hangs() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let (url, _shutdown) = spawn_gateway(HungGateway {
+            list_tools_observed: observed.clone(),
+        })
+        .await;
+        let service = make_service(Some(url));
+
+        let start = std::time::Instant::now();
+        let tools = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            service.get_available_tools(),
+        )
+        .await
+        .expect("get_available_tools must not hang past 8s")
+        .expect("get_available_tools must succeed");
+        let elapsed = start.elapsed();
+
+        // The built-in `fs.read` from the dispatcher config above must be
+        // present even though the gateway hung.
+        assert!(
+            tools.iter().any(|t| t.name == "fs.read"),
+            "built-in fs.read must be present despite gateway hang; got {:?}",
+            tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(7),
+            "get_available_tools must respect the 5s gateway list_tools timeout (took {:?})",
+            elapsed
+        );
+    }
+
+    /// Regression: gateway invocation MUST fail fast with a clear error
+    /// rather than hang. The connect timeout (3s) bounds an unreachable
+    /// address; an in-flight call timeout (30s) bounds a hung server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invoke_seal_gateway_internal_grpc_times_out_on_unreachable_address() {
+        // RFC 5737 TEST-NET-1: guaranteed unroutable.
+        let url = "http://192.0.2.1:1".to_string();
+        let service = make_service(Some(url));
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            service.invoke_seal_gateway_internal_grpc(
+                crate::domain::execution::ExecutionId::new(),
+                "some.tool",
+                serde_json::json!({}),
+                Some("tenant"),
+                Some("token"),
+            ),
+        )
+        .await
+        .expect("invocation must not hang past 6s on unreachable address");
+
+        let err = result.expect_err("unreachable gateway must yield an error");
+        match err {
+            SealSessionError::InternalError(msg) => {
+                assert!(
+                    msg.contains("seal tooling gateway"),
+                    "error must clearly identify the gateway: {msg}"
+                );
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "connect timeout (3s) must bound the call"
+        );
+    }
+}
