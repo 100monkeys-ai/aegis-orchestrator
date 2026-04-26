@@ -221,7 +221,7 @@ impl VolumeRepository for TestVolumeRepository {
         Ok(0)
     }
 
-    async fn sum_size_by_owner(
+    async fn sum_allocated_size_by_owner(
         &self,
         _tenant_id: &TenantId,
         _owner_user_id: &str,

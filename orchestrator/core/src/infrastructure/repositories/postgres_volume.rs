@@ -228,6 +228,8 @@ impl VolumeRepository for PostgresVolumeRepository {
         tenant_id: &TenantId,
         owner_user_id: &str,
     ) -> Result<Vec<Volume>, RepositoryError> {
+        // Exclude `VolumeStatus::Deleted` — see ADR-079: hard-delete only,
+        // `Deleted` is a transient pipeline state and must never be user-visible.
         let rows = sqlx::query(
             r#"
             SELECT
@@ -237,6 +239,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             FROM volumes
             WHERE tenant_id = $1
               AND owner_user_id = $2
+              AND status #>> '{}' <> 'deleted'
             ORDER BY created_at DESC
             "#,
         )
@@ -264,6 +267,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             FROM volumes
             WHERE tenant_id = $1
               AND owner_user_id = $2
+              AND status #>> '{}' <> 'deleted'
             "#,
         )
         .bind(tenant_id.as_str())
@@ -276,7 +280,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         Ok(count as u32)
     }
 
-    async fn sum_size_by_owner(
+    async fn sum_allocated_size_by_owner(
         &self,
         tenant_id: &TenantId,
         owner_user_id: &str,
@@ -287,6 +291,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             FROM volumes
             WHERE tenant_id = $1
               AND owner_user_id = $2
+              AND status #>> '{}' <> 'deleted'
             "#,
         )
         .bind(tenant_id.as_str())

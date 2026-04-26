@@ -1374,6 +1374,7 @@ impl crate::domain::repository::VolumeRepository for InMemoryVolumeRepository {
             .values()
             .filter(|v| {
                 v.tenant_id == *tenant_id
+                    && v.status != crate::domain::volume::VolumeStatus::Deleted
                     && matches!(&v.ownership, crate::domain::volume::VolumeOwnership::Persistent { owner } if owner == owner_user_id)
             })
             .cloned()
@@ -1390,13 +1391,14 @@ impl crate::domain::repository::VolumeRepository for InMemoryVolumeRepository {
             .values()
             .filter(|v| {
                 v.tenant_id == *tenant_id
+                    && v.status != crate::domain::volume::VolumeStatus::Deleted
                     && matches!(&v.ownership, crate::domain::volume::VolumeOwnership::Persistent { owner } if owner == owner_user_id)
             })
             .count();
         Ok(count as u32)
     }
 
-    async fn sum_size_by_owner(
+    async fn sum_allocated_size_by_owner(
         &self,
         tenant_id: &crate::domain::volume::TenantId,
         owner_user_id: &str,
@@ -1406,6 +1408,7 @@ impl crate::domain::repository::VolumeRepository for InMemoryVolumeRepository {
             .values()
             .filter(|v| {
                 v.tenant_id == *tenant_id
+                    && v.status != crate::domain::volume::VolumeStatus::Deleted
                     && matches!(&v.ownership, crate::domain::volume::VolumeOwnership::Persistent { owner } if owner == owner_user_id)
             })
             .map(|v| v.size_limit_bytes)

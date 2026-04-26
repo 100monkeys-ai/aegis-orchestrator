@@ -429,22 +429,33 @@ pub trait VolumeRepository: Send + Sync {
     /// Delete volume by ID
     async fn delete(&self, id: VolumeId) -> Result<(), RepositoryError>;
 
-    /// Find all volumes owned by a specific user within a tenant
+    /// Find all volumes owned by a specific user within a tenant.
+    ///
+    /// Excludes volumes in `VolumeStatus::Deleted` — that status is a transient
+    /// artifact of the delete pipeline and must never appear in user-facing
+    /// queries (per ADR-079).
     async fn find_by_owner(
         &self,
         tenant_id: &TenantId,
         owner_user_id: &str,
     ) -> Result<Vec<Volume>, RepositoryError>;
 
-    /// Count volumes owned by a specific user within a tenant
+    /// Count volumes owned by a specific user within a tenant.
+    ///
+    /// Excludes volumes in `VolumeStatus::Deleted`, matching `find_by_owner`.
     async fn count_by_owner(
         &self,
         tenant_id: &TenantId,
         owner_user_id: &str,
     ) -> Result<u32, RepositoryError>;
 
-    /// Sum size_limit_bytes for all volumes owned by a specific user within a tenant
-    async fn sum_size_by_owner(
+    /// Sum allocated `size_limit_bytes` for all non-deleted volumes owned by a
+    /// specific user within a tenant.
+    ///
+    /// This is the *allocation* sum (used for pre-create quota checks against
+    /// the tier ceiling), NOT actual SeaweedFS consumption. For actual usage
+    /// see `VolumeService::get_volume_usage` (BC-7 storage abstraction).
+    async fn sum_allocated_size_by_owner(
         &self,
         tenant_id: &TenantId,
         owner_user_id: &str,

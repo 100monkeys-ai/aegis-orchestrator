@@ -968,6 +968,7 @@ mod tests {
                 .values()
                 .filter(|v| {
                     v.tenant_id == *tenant_id
+                        && v.status != crate::domain::volume::VolumeStatus::Deleted
                         && matches!(&v.ownership, VolumeOwnership::Persistent { owner } if owner == owner_user_id)
                 })
                 .cloned()
@@ -983,7 +984,7 @@ mod tests {
             Ok(volumes.len() as u32)
         }
 
-        async fn sum_size_by_owner(
+        async fn sum_allocated_size_by_owner(
             &self,
             tenant_id: &TenantId,
             owner_user_id: &str,
@@ -1045,7 +1046,7 @@ mod tests {
             Ok(0)
         }
 
-        async fn sum_size_by_owner(
+        async fn sum_allocated_size_by_owner(
             &self,
             _tenant_id: &TenantId,
             _owner_user_id: &str,

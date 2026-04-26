@@ -145,17 +145,19 @@ pub(crate) async fn list_volumes(
 
     state
         .user_volume_service
-        .list_volumes(&tenant_id, &owner)
+        .list_volumes_with_usage(&tenant_id, &owner)
         .await
         .map(|vols| {
             Json(
                 vols.into_iter()
-                    .map(|v| {
+                    .map(|vu| {
+                        let v = vu.volume;
                         serde_json::json!({
                             "id": v.id.to_string(),
                             "name": v.name,
                             "status": format!("{:?}", v.status),
                             "size_limit_bytes": v.size_limit_bytes,
+                            "used_bytes": vu.used_bytes,
                             "created_at": v.created_at,
                         })
                     })
