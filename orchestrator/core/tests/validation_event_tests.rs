@@ -350,6 +350,7 @@ async fn test_validation_event_streaming() {
                 None, // Use default consensus config
                 60,   // timeout_seconds
                 500,  // poll_interval_ms
+                &TenantId::system(),
             )
             .await
     });
