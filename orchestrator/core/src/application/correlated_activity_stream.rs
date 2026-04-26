@@ -537,6 +537,16 @@ fn event_message(event: &DomainEvent) -> String {
             model,
             ..
         }) => format!("LLM interaction on iteration {iteration_number} via {provider}/{model}"),
+        DomainEvent::Execution(ExecutionEvent::LlmCallFailed {
+            iteration_number,
+            provider,
+            model,
+            error_class,
+            message,
+            ..
+        }) => format!(
+            "LLM call failed on iteration {iteration_number} via {provider}/{model}: {error_class:?} - {message}"
+        ),
         DomainEvent::Execution(ExecutionEvent::InstanceSpawned {
             iteration_number,
             instance_id,

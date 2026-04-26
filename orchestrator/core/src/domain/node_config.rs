@@ -368,6 +368,13 @@ pub struct LLMSelection {
     /// Delay between retries in milliseconds
     #[serde(default = "default_retry_delay")]
     pub retry_delay_ms: u64,
+
+    /// Overall wall-clock budget in seconds for `generate_chat` / `generate`,
+    /// covering all retries plus a single fallback-provider attempt.
+    /// When this elapses the registry returns `LLMError::Network("upstream
+    /// timeout after Ns")`. Default: 30s.
+    #[serde(default = "default_llm_overall_timeout_secs")]
+    pub llm_overall_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1445,6 +1452,10 @@ fn default_retry_delay() -> u64 {
     1000
 }
 
+fn default_llm_overall_timeout_secs() -> u64 {
+    30
+}
+
 fn default_heartbeat() -> u64 {
     30
 }
@@ -1593,6 +1604,7 @@ impl Default for LLMSelection {
             fallback_provider: None,
             max_retries: 3,
             retry_delay_ms: 1000,
+            llm_overall_timeout_secs: 30,
         }
     }
 }

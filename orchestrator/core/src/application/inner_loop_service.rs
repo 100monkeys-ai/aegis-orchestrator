@@ -823,10 +823,10 @@ impl InnerLoopService {
                     .collect();
                 Ok(LlmOutput::ToolCalls(tool_calls))
             }
-            Err(LLMError::ServiceUnavailable(msg)) => {
-                Err(anyhow::anyhow!("LLM service unavailable: {msg}"))
-            }
-            Err(e) => Err(anyhow::anyhow!("LLM call failed: {e}")),
+            // Preserve the typed `LLMError` through `anyhow` so the dispatch
+            // gateway handler can downcast and map to a precise HTTP status
+            // and emit a structured `LlmCallFailed` execution event.
+            Err(e) => Err(anyhow::Error::new(e)),
         }
     }
 }

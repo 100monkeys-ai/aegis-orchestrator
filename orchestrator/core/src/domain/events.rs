@@ -436,6 +436,27 @@ pub enum ExecutionEvent {
         response: String,
         timestamp: DateTime<Utc>,
     },
+    /// An LLM call failed after retry/fallback policy was applied.
+    ///
+    /// Emitted by the dispatch gateway whenever the inner loop surfaces an
+    /// `LLMError` — both for non-retryable short-circuits (e.g. 401/403/404/400)
+    /// and for retries-exhausted/timeout conditions. Carries a structured
+    /// [`LlmErrorClass`] so downstream consumers (parent agents reading the
+    /// execution stream, operator UI, log indexers) can react to upstream
+    /// failure classes without parsing free-form error strings.
+    LlmCallFailed {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        iteration_number: u8,
+        provider: String,
+        model: String,
+        error_class: LlmErrorClass,
+        message: String,
+        attempts: u32,
+        elapsed_ms: u64,
+        fallback_attempted: bool,
+        timestamp: DateTime<Utc>,
+    },
     InstanceSpawned {
         execution_id: ExecutionId,
         agent_id: AgentId,
@@ -492,6 +513,41 @@ pub enum ExecutionEvent {
         handler_type: String,
         error: String,
     },
+}
+
+/// Structured classification of an LLM upstream failure.
+///
+/// Mirrors [`crate::domain::llm::LLMError`] variants in a serializable form
+/// suitable for the execution event stream. The `Timeout` variant has no
+/// direct `LLMError` analogue — it is emitted by the registry when the
+/// overall retry+fallback wall-clock budget is exceeded and the call is
+/// surfaced as `LLMError::Network("upstream timeout after Ns")`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmErrorClass {
+    Authentication,
+    RateLimit,
+    ModelNotFound,
+    InvalidInput,
+    ServiceUnavailable,
+    Network,
+    Provider,
+    Timeout,
+}
+
+impl From<&crate::domain::llm::LLMError> for LlmErrorClass {
+    fn from(e: &crate::domain::llm::LLMError) -> Self {
+        use crate::domain::llm::LLMError;
+        match e {
+            LLMError::Authentication(_) => LlmErrorClass::Authentication,
+            LLMError::RateLimit => LlmErrorClass::RateLimit,
+            LLMError::ModelNotFound(_) => LlmErrorClass::ModelNotFound,
+            LLMError::InvalidInput(_) => LlmErrorClass::InvalidInput,
+            LLMError::ServiceUnavailable(_) => LlmErrorClass::ServiceUnavailable,
+            LLMError::Network(_) => LlmErrorClass::Network,
+            LLMError::Provider(_) => LlmErrorClass::Provider,
+        }
+    }
 }
 
 /// Workflow FSM lifecycle events (BC-3 Workflow Orchestration Context).

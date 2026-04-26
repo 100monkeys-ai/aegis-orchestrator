@@ -1610,6 +1610,26 @@ fn convert_domain_event_to_proto(
                 failed_at: failed_at.to_rfc3339(),
             })),
         }),
+        // Surface LLM upstream failures on the streaming channel so parent
+        // agents see a clear, structured signal instead of a silent timeout.
+        DomainEvent::LlmCallFailed {
+            iteration_number,
+            error_class,
+            message,
+            timestamp,
+            ..
+        } => Some(ExecutionEvent {
+            event: Some(execution_event::Event::IterationFailed(IterationFailed {
+                execution_id: execution_id.to_string(),
+                iteration_number: iteration_number as u32,
+                error: Some(IterationError {
+                    error_type: format!("llm_{error_class:?}").to_lowercase(),
+                    message: message.clone(),
+                    stacktrace: String::new(),
+                }),
+                failed_at: timestamp.to_rfc3339(),
+            })),
+        }),
         _ => None, // Other events not relevant for streaming
     }
 }

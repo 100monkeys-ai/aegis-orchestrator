@@ -71,6 +71,23 @@ pub struct ProviderRegistry {
     alias_temperatures: HashMap<String, f32>,
     max_retries: u32,
     retry_delay_ms: u64,
+    /// Wall-clock budget for the full retry+fallback loop in `generate_chat` /
+    /// `generate`. On elapsed: return `LLMError::Network("upstream timeout
+    /// after Ns")`. Sourced from `LLMSelection::llm_overall_timeout_secs`.
+    llm_overall_timeout_secs: u64,
+}
+
+/// Returns true for `LLMError` variants that are deterministic upstream
+/// rejections — retrying or swapping to a fallback provider with the same
+/// credentials/region won't change the answer.
+fn is_non_retryable(e: &LLMError) -> bool {
+    matches!(
+        e,
+        LLMError::Authentication(_)
+            | LLMError::InvalidInput(_)
+            | LLMError::ModelNotFound(_)
+            | LLMError::ServiceUnavailable(_)
+    )
 }
 
 impl ProviderRegistry {
@@ -234,6 +251,7 @@ impl ProviderRegistry {
             alias_temperatures,
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
+            llm_overall_timeout_secs: config.spec.llm_selection.llm_overall_timeout_secs,
         })
     }
 
@@ -319,65 +337,99 @@ impl ProviderRegistry {
         info!("LLM inference: alias='{}', model='{}'", alias, model_name);
 
         let effective_options = self.apply_alias_options(alias, options);
-        let mut last_error = None;
 
-        for attempt in 0..self.max_retries {
-            match provider
-                .generate_chat(messages, tools, &effective_options)
-                .await
-            {
-                Ok(response) => {
-                    info!(
-                        "generate_chat successful: alias='{}', model='{}', attempt={}",
-                        alias,
-                        model_name,
-                        attempt + 1
-                    );
-                    return Ok(response);
-                }
-                Err(e) => {
-                    warn!(
-                        "generate_chat failed: alias='{}', attempt={}/{}: {:?}",
-                        alias,
-                        attempt + 1,
-                        self.max_retries,
-                        e
-                    );
+        let overall_budget = tokio::time::Duration::from_secs(self.llm_overall_timeout_secs.max(1));
 
-                    // Short-circuit: 503s won't recover with retries
-                    if matches!(e, LLMError::ServiceUnavailable(_)) {
-                        if let Some((fallback_model, fallback)) = &self.fallback_provider {
-                            info!(
-                                "Service unavailable, trying fallback provider (model='{}')",
-                                fallback_model
-                            );
-                            return fallback.generate_chat(messages, tools, options).await;
-                        }
-                        // No fallback — fail fast
-                        return Err(e);
+        let inner = async {
+            let mut last_error: Option<LLMError> = None;
+
+            for attempt in 0..self.max_retries {
+                match provider
+                    .generate_chat(messages, tools, &effective_options)
+                    .await
+                {
+                    Ok(response) => {
+                        info!(
+                            "generate_chat successful: alias='{}', model='{}', attempt={}",
+                            alias,
+                            model_name,
+                            attempt + 1
+                        );
+                        return Ok(response);
                     }
+                    Err(e) => {
+                        warn!(
+                            "generate_chat failed: alias='{}', attempt={}/{}: {:?}",
+                            alias,
+                            attempt + 1,
+                            self.max_retries,
+                            e
+                        );
 
-                    last_error = Some(e);
-
-                    if attempt == self.max_retries - 1 {
-                        if let Some((fallback_model, fallback)) = &self.fallback_provider {
-                            info!("Trying fallback provider (model='{}')", fallback_model);
-                            return fallback.generate_chat(messages, tools, options).await;
+                        // Short-circuit on deterministic upstream rejections — retrying with
+                        // the same credentials (or with the fallback that shares them) is futile.
+                        if is_non_retryable(&e) {
+                            if matches!(e, LLMError::ServiceUnavailable(_)) {
+                                if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                                    info!(
+                                        "Service unavailable, trying fallback provider (model='{}')",
+                                        fallback_model
+                                    );
+                                    match fallback.generate_chat(messages, tools, options).await {
+                                        Ok(r) => return Ok(r),
+                                        Err(fe) => {
+                                            // Fallback also short-circuits on non-retryable
+                                            // errors (likely the same root cause).
+                                            return Err(fe);
+                                        }
+                                    }
+                                }
+                            }
+                            return Err(e);
                         }
-                    }
 
-                    tokio::time::sleep(tokio::time::Duration::from_millis({
-                        let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
-                        self.retry_delay_ms
-                            .saturating_mul(2_u64.saturating_pow(capped_attempt))
-                            .min(MAX_BACKOFF_MS)
-                    }))
-                    .await;
+                        last_error = Some(e);
+
+                        if attempt == self.max_retries - 1 {
+                            if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                                info!("Trying fallback provider (model='{}')", fallback_model);
+                                match fallback.generate_chat(messages, tools, options).await {
+                                    Ok(r) => return Ok(r),
+                                    Err(fe) => {
+                                        if is_non_retryable(&fe) {
+                                            return Err(fe);
+                                        }
+                                        return Err(fe);
+                                    }
+                                }
+                            }
+                        }
+
+                        tokio::time::sleep(tokio::time::Duration::from_millis({
+                            let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
+                            self.retry_delay_ms
+                                .saturating_mul(2_u64.saturating_pow(capped_attempt))
+                                .min(MAX_BACKOFF_MS)
+                        }))
+                        .await;
+                    }
                 }
             }
-        }
 
-        Err(last_error.unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
+            Err(last_error.unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
+        };
+
+        match tokio::time::timeout(overall_budget, inner).await {
+            Ok(result) => result,
+            Err(_) => {
+                let secs = overall_budget.as_secs();
+                warn!(
+                    "generate_chat overall timeout: alias='{}', model='{}', budget={}s",
+                    alias, model_name, secs
+                );
+                Err(LLMError::Network(format!("upstream timeout after {secs}s")))
+            }
+        }
     }
 
     /// Generate text for the given model alias.
@@ -518,13 +570,332 @@ impl LLMProvider for ProviderRegistry {
     }
 }
 
+impl ProviderRegistry {
+    /// Test-only constructor that wires concrete primary + optional fallback
+    /// adapters without going through `from_config`. Used to inject mock
+    /// providers in retry-policy regression tests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        primary: Arc<dyn LLMProvider>,
+        fallback: Option<Arc<dyn LLMProvider>>,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        llm_overall_timeout_secs: u64,
+    ) -> Self {
+        let mut alias_map = HashMap::new();
+        alias_map.insert(
+            "default".to_string(),
+            ("test-model".to_string(), primary.clone()),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("primary".to_string(), primary);
+        let fallback_provider = fallback.map(|f| ("test-fallback-model".to_string(), f));
+
+        Self {
+            alias_map,
+            providers,
+            fallback_provider,
+            raw_api_keys: HashMap::new(),
+            alias_max_output_tokens: HashMap::new(),
+            alias_temperatures: HashMap::new(),
+            max_retries,
+            retry_delay_ms,
+            llm_overall_timeout_secs,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::llm::{ChatResponse, FinishReason, GenerationResponse, TokenUsage};
     use crate::domain::node_config::{
         LLMSelection, ManifestMetadata, ModelConfig, NodeConfigManifest, NodeConfigSpec,
         NodeIdentity, NodeType,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Programmable mock provider. Returns one of the queued errors per call,
+    /// or a success response when the queue is exhausted (configurable).
+    /// Records the number of `generate_chat` calls received.
+    struct MockProvider {
+        /// Queue of responses to return, in order. When empty, returns the
+        /// `default_response` if set, else `LLMError::Provider("queue empty")`.
+        queue: Mutex<Vec<Result<ChatResponse, LLMError>>>,
+        default_response: Mutex<Option<Result<ChatResponse, LLMError>>>,
+        calls: AtomicUsize,
+        /// When true, the mock panics if called — used to assert "this provider
+        /// must NOT be invoked" in fallback short-circuit tests.
+        panic_on_call: bool,
+        /// When true, every call blocks forever (used for overall-timeout test).
+        block_forever: bool,
+    }
+
+    impl MockProvider {
+        fn new() -> Self {
+            Self {
+                queue: Mutex::new(Vec::new()),
+                default_response: Mutex::new(None),
+                calls: AtomicUsize::new(0),
+                panic_on_call: false,
+                block_forever: false,
+            }
+        }
+
+        fn with_responses(responses: Vec<Result<ChatResponse, LLMError>>) -> Arc<Self> {
+            let m = Self::new();
+            *m.queue.lock().unwrap() = responses;
+            Arc::new(m)
+        }
+
+        fn panicking() -> Arc<Self> {
+            let mut m = Self::new();
+            m.panic_on_call = true;
+            Arc::new(m)
+        }
+
+        fn blocking() -> Arc<Self> {
+            let mut m = Self::new();
+            m.block_forever = true;
+            Arc::new(m)
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for MockProvider {
+        async fn generate(
+            &self,
+            _prompt: &str,
+            _options: &GenerationOptions,
+        ) -> Result<GenerationResponse, LLMError> {
+            unimplemented!("test mock: generate not used")
+        }
+
+        async fn generate_chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolSchema],
+            _options: &GenerationOptions,
+        ) -> Result<ChatResponse, LLMError> {
+            if self.panic_on_call {
+                panic!("MockProvider configured to fail test if invoked");
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_forever {
+                futures::future::pending::<()>().await;
+                unreachable!();
+            }
+            let mut q = self.queue.lock().unwrap();
+            if !q.is_empty() {
+                return q.remove(0);
+            }
+            drop(q);
+            if let Some(r) = self.default_response.lock().unwrap().as_ref() {
+                return match r {
+                    Ok(c) => Ok(c.clone()),
+                    Err(e) => Err(clone_llm_error(e)),
+                };
+            }
+            Err(LLMError::Provider("queue empty".into()))
+        }
+
+        async fn health_check(&self) -> Result<(), LLMError> {
+            Ok(())
+        }
+    }
+
+    fn clone_llm_error(e: &LLMError) -> LLMError {
+        match e {
+            LLMError::Network(s) => LLMError::Network(s.clone()),
+            LLMError::Authentication(s) => LLMError::Authentication(s.clone()),
+            LLMError::RateLimit => LLMError::RateLimit,
+            LLMError::ModelNotFound(s) => LLMError::ModelNotFound(s.clone()),
+            LLMError::Provider(s) => LLMError::Provider(s.clone()),
+            LLMError::InvalidInput(s) => LLMError::InvalidInput(s.clone()),
+            LLMError::ServiceUnavailable(s) => LLMError::ServiceUnavailable(s.clone()),
+        }
+    }
+
+    fn ok_response() -> ChatResponse {
+        ChatResponse::FinalText(GenerationResponse {
+            text: "ok".to_string(),
+            usage: TokenUsage::default(),
+            provider: "mock".to_string(),
+            model: "test-model".to_string(),
+            finish_reason: FinishReason::Stop,
+        })
+    }
+
+    fn make_registry(
+        primary: Arc<dyn LLMProvider>,
+        fallback: Option<Arc<dyn LLMProvider>>,
+        timeout_secs: u64,
+    ) -> ProviderRegistry {
+        ProviderRegistry::new_for_test(primary, fallback, 3, 1, timeout_secs)
+    }
+
+    #[tokio::test]
+    async fn auth_error_short_circuits() {
+        let primary = MockProvider::with_responses(vec![Err(LLMError::Authentication(
+            "403 forbidden".into(),
+        ))]);
+        let fallback = MockProvider::panicking();
+        let registry = make_registry(
+            primary.clone() as Arc<dyn LLMProvider>,
+            Some(fallback.clone() as Arc<dyn LLMProvider>),
+            30,
+        );
+
+        let start = std::time::Instant::now();
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(res, Err(LLMError::Authentication(_))));
+        assert_eq!(
+            primary.call_count(),
+            1,
+            "primary must be called exactly once"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "auth error must short-circuit fast (got {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_not_found_short_circuits() {
+        let primary = MockProvider::with_responses(vec![Err(LLMError::ModelNotFound(
+            "no-such-model".into(),
+        ))]);
+        let fallback = MockProvider::panicking();
+        let registry = make_registry(
+            primary.clone() as Arc<dyn LLMProvider>,
+            Some(fallback as Arc<dyn LLMProvider>),
+            30,
+        );
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert!(matches!(res, Err(LLMError::ModelNotFound(_))));
+        assert_eq!(primary.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_input_short_circuits() {
+        let primary =
+            MockProvider::with_responses(vec![Err(LLMError::InvalidInput("bad arg".into()))]);
+        let fallback = MockProvider::panicking();
+        let registry = make_registry(
+            primary.clone() as Arc<dyn LLMProvider>,
+            Some(fallback as Arc<dyn LLMProvider>),
+            30,
+        );
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert!(matches!(res, Err(LLMError::InvalidInput(_))));
+        assert_eq!(primary.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_error_retries_then_succeeds() {
+        let primary = MockProvider::with_responses(vec![
+            Err(LLMError::Provider("transient".into())),
+            Err(LLMError::Provider("transient".into())),
+            Ok(ok_response()),
+        ]);
+        let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert!(res.is_ok(), "expected success after retries: {res:?}");
+        assert_eq!(primary.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn network_error_overall_timeout_fires() {
+        let primary = MockProvider::blocking();
+        let registry = make_registry(primary as Arc<dyn LLMProvider>, None, 1);
+
+        let start = std::time::Instant::now();
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(&res, Err(LLMError::Network(msg)) if msg.contains("upstream timeout")),
+            "expected upstream timeout, got {res:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "must return within budget (got {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_short_circuits_on_auth() {
+        // Primary returns Authentication on every attempt; fallback would
+        // succeed if invoked, but must NOT be invoked.
+        let primary = MockProvider::with_responses(vec![Err(LLMError::Authentication(
+            "403 forbidden".into(),
+        ))]);
+        let fallback = MockProvider::panicking();
+        let registry = make_registry(
+            primary.clone() as Arc<dyn LLMProvider>,
+            Some(fallback as Arc<dyn LLMProvider>),
+            30,
+        );
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert!(matches!(res, Err(LLMError::Authentication(_))));
+        assert_eq!(primary.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn llm_error_class_maps_correctly() {
+        use crate::domain::events::LlmErrorClass;
+        assert_eq!(
+            LlmErrorClass::from(&LLMError::Authentication("x".into())),
+            LlmErrorClass::Authentication
+        );
+        assert_eq!(
+            LlmErrorClass::from(&LLMError::RateLimit),
+            LlmErrorClass::RateLimit
+        );
+        assert_eq!(
+            LlmErrorClass::from(&LLMError::ModelNotFound("m".into())),
+            LlmErrorClass::ModelNotFound
+        );
+        assert_eq!(
+            LlmErrorClass::from(&LLMError::InvalidInput("x".into())),
+            LlmErrorClass::InvalidInput
+        );
+        assert_eq!(
+            LlmErrorClass::from(&LLMError::ServiceUnavailable("x".into())),
+            LlmErrorClass::ServiceUnavailable
+        );
+        assert_eq!(
+            LlmErrorClass::from(&LLMError::Network("x".into())),
+            LlmErrorClass::Network
+        );
+        assert_eq!(
+            LlmErrorClass::from(&LLMError::Provider("x".into())),
+            LlmErrorClass::Provider
+        );
+    }
 
     #[test]
     fn test_registry_creation() {

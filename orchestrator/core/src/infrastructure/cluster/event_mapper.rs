@@ -199,6 +199,24 @@ pub fn domain_to_proto(event: DomainEvent) -> Option<ExecutionEvent> {
 
         // InstanceSpawned/InstanceTerminated, child execution events, and Validation
         // are not relevant for the cluster forwarding stream — skip them.
+        // LlmCallFailed surfaces upstream LLM failure class on the cluster
+        // stream; map to ExecutionFailed so remote subscribers see a clear
+        // failure signal instead of dropping the event silently.
+        DomainEvent::LlmCallFailed {
+            execution_id,
+            error_class,
+            message,
+            timestamp,
+            ..
+        } => Some(ExecutionEvent {
+            event: Some(execution_event::Event::ExecutionFailed(ExecutionFailed {
+                execution_id: execution_id.to_string(),
+                reason: format!("llm_call_failed[{error_class:?}]: {message}"),
+                total_iterations: 0,
+                failed_at: timestamp.to_rfc3339(),
+            })),
+        }),
+
         DomainEvent::InstanceSpawned { .. }
         | DomainEvent::InstanceTerminated { .. }
         | DomainEvent::ChildExecutionSpawned { .. }

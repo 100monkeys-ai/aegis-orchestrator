@@ -166,11 +166,76 @@ pub(crate) async fn dispatch_gateway_handler(
         }
         Err(e) => {
             tracing::error!("Inner loop generation failed: {}", e);
+
+            // If the underlying error is a typed `LLMError`, surface its
+            // class as both the HTTP status (so bootstrap.py / SDK callers
+            // can react) and a structured `LlmCallFailed` execution event
+            // (so parent agents reading the execution stream see the
+            // upstream failure class without parsing strings).
+            if let Some(llm_err) =
+                e.downcast_ref::<aegis_orchestrator_core::domain::llm::LLMError>()
+            {
+                if agent_id.0 != Uuid::nil() {
+                    if let (Some(exec_id), Some(model_alias)) = (exec_id_opt, model_opt.as_ref()) {
+                        let error_class =
+                            aegis_orchestrator_core::domain::events::LlmErrorClass::from(llm_err);
+                        let event = aegis_orchestrator_core::domain::events::ExecutionEvent::LlmCallFailed {
+                            execution_id: aegis_orchestrator_core::domain::execution::ExecutionId(
+                                exec_id,
+                            ),
+                            agent_id,
+                            iteration_number,
+                            provider: "orchestrator".to_string(),
+                            model: model_alias.clone(),
+                            error_class,
+                            message: llm_err.to_string(),
+                            // The registry owns retry/fallback bookkeeping and
+                            // does not surface counts back here. Encode "unknown"
+                            // as 0 — downstream consumers should treat 0 as N/A.
+                            attempts: 0,
+                            elapsed_ms: 0,
+                            fallback_attempted: false,
+                            timestamp: chrono::Utc::now(),
+                        };
+                        state.event_bus.publish_execution_event(event);
+                    }
+                }
+
+                let (status, tag) = llm_error_to_status(llm_err);
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "error": format!("{tag}: {llm_err}")
+                    })),
+                );
+            }
+
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         }
+    }
+}
+
+/// Map an `LLMError` variant to a precise HTTP status + a short tag suitable
+/// for inclusion in the JSON `error` body. Tags are stable identifiers that
+/// downstream consumers (bootstrap.py stderr, SDK clients, log indexers) can
+/// match against without parsing the upstream error message.
+fn llm_error_to_status(
+    e: &aegis_orchestrator_core::domain::llm::LLMError,
+) -> (StatusCode, &'static str) {
+    use aegis_orchestrator_core::domain::llm::LLMError;
+    match e {
+        LLMError::Authentication(_) => (StatusCode::BAD_GATEWAY, "upstream_authentication"),
+        LLMError::RateLimit => (StatusCode::TOO_MANY_REQUESTS, "upstream_rate_limit"),
+        LLMError::ModelNotFound(_) => (StatusCode::BAD_GATEWAY, "upstream_model_not_found"),
+        LLMError::InvalidInput(_) => (StatusCode::BAD_GATEWAY, "upstream_invalid_input"),
+        LLMError::ServiceUnavailable(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable")
+        }
+        LLMError::Network(_) => (StatusCode::BAD_GATEWAY, "upstream_network"),
+        LLMError::Provider(_) => (StatusCode::BAD_GATEWAY, "upstream_provider"),
     }
 }
 
@@ -252,5 +317,60 @@ pub(crate) async fn temporal_events_handler(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::llm::LLMError;
+
+    #[test]
+    fn llm_error_to_status_authentication() {
+        let (status, tag) = llm_error_to_status(&LLMError::Authentication("x".into()));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(tag, "upstream_authentication");
+    }
+
+    #[test]
+    fn llm_error_to_status_rate_limit() {
+        let (status, tag) = llm_error_to_status(&LLMError::RateLimit);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(tag, "upstream_rate_limit");
+    }
+
+    #[test]
+    fn llm_error_to_status_model_not_found() {
+        let (status, tag) = llm_error_to_status(&LLMError::ModelNotFound("x".into()));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(tag, "upstream_model_not_found");
+    }
+
+    #[test]
+    fn llm_error_to_status_invalid_input() {
+        let (status, tag) = llm_error_to_status(&LLMError::InvalidInput("x".into()));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(tag, "upstream_invalid_input");
+    }
+
+    #[test]
+    fn llm_error_to_status_service_unavailable() {
+        let (status, tag) = llm_error_to_status(&LLMError::ServiceUnavailable("x".into()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(tag, "upstream_unavailable");
+    }
+
+    #[test]
+    fn llm_error_to_status_network() {
+        let (status, tag) = llm_error_to_status(&LLMError::Network("x".into()));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(tag, "upstream_network");
+    }
+
+    #[test]
+    fn llm_error_to_status_provider() {
+        let (status, tag) = llm_error_to_status(&LLMError::Provider("x".into()));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(tag, "upstream_provider");
     }
 }
