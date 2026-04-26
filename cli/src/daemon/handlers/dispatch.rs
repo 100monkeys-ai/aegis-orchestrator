@@ -14,6 +14,8 @@ use aegis_orchestrator_core::application::execution::ExecutionService;
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
 
+use tracing::Instrument;
+
 use crate::daemon::state::AppState;
 
 pub(crate) async fn dispatch_gateway_handler(
@@ -44,14 +46,17 @@ pub(crate) async fn dispatch_gateway_handler(
 
     // Open a per-request span so every downstream tracing call (inner loop,
     // provider registry, HTTP adapter) carries `execution_id` + `iteration`.
-    let _span = tracing::info_span!(
+    // Use `Instrument` (not `.entered()`) so the resulting future stays `Send`
+    // and can be served by axum.
+    let span = tracing::info_span!(
         "dispatch_gateway",
         execution_id = exec_id_opt
             .map(|u| u.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         iteration = iteration_number,
-    )
-    .entered();
+    );
+
+    async move {
 
     tracing::info!(
         model_alias = model_opt.as_deref().unwrap_or("(none)"),
@@ -252,6 +257,10 @@ pub(crate) async fn dispatch_gateway_handler(
             )
         }
     }
+
+    }
+    .instrument(span)
+    .await
 }
 
 /// Map an `LLMError` variant to a precise HTTP status + a short tag suitable
