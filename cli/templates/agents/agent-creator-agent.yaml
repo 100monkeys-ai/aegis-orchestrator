@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: agent-creator-agent
-  version: "1.1.0"
+  version: "1.0.0"
   description: Creates valid Agent manifests and deploys them through orchestrator-native tooling.
   labels:
     role: worker
@@ -74,6 +74,28 @@ spec:
             (iii) Set `spec.type: system` so the agent is routed unconditionally to the
                   `aegis-system-agent-runtime` security context, which is the only context
                   that has `aegis.attachment.read` in its allowed-tools list.
+            (iv) The generated agent's `spec.task.instruction` MUST include a Handlebars
+                 block that renders the per-dispatch attachments at the GENERATED agent's
+                 runtime, so the agent knows which files to read on each invocation. Use this
+                 EXACT pattern (you may adapt the surrounding prose to the agent's role, but
+                 keep the Handlebars structure identical):
+
+                   {{#if attachments}}
+                   You have been dispatched with the following attached files.
+                   Use `aegis.attachment.read` on each to read its contents:
+                   {{#each attachments}}
+                   - name: {{this.name}} ({{this.mime_type}}, {{this.size}} bytes)
+                     volume_id: {{this.volume_id}}, path: {{this.path}}
+                   {{/each}}
+
+                   {{/if}}
+
+                 The Handlebars block above is hydrated by the temporal worker at the
+                 GENERATED agent's runtime with that dispatch's actual attachments. Do NOT
+                 inline specific file values (concrete volume_id UUIDs, hardcoded paths,
+                 filenames, or sha256 digests) into the manifest text — that would freeze a
+                 single dispatch's files into a reusable capability archetype, which is a
+                 policy violation and will be rejected by the judge.
           If the dispatch contains NO `attachments` (or the field is empty), do NOT add
           `aegis.attachment.read` and do NOT set `spec.type: system` — these are reserved for
           dispatches that explicitly carry file references.
@@ -260,10 +282,11 @@ spec:
       {{input}}
 
       {{#if attachments}}
-      Dispatch attachments — the user attached the following files. Apply step 3a (ATTACHMENT-AWARENESS) of the workflow above:
-      {{#each attachments}}
-      - volume_id: {{this.volume_id}}, path: {{this.path}}, name: {{this.name}}, mime_type: {{this.mime_type}}, size: {{this.size}}
-      {{/each}}
+      This dispatch carries file attachments. Apply step 3a (ATTACHMENT-AWARENESS) above.
+      The agent you generate MUST be a generic attachment-consumer per the rules in step 3a — do NOT
+      embed any specific file references (volume_id, path, name, sha256) into the manifest. The
+      dispatch-specific file refs flow separately at the generated agent's runtime via
+      `ExecutionInput.attachments` and the temporal worker's Handlebars hydration.
 
       {{/if}}
       Agent:

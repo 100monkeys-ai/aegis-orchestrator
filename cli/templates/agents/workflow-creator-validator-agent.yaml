@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-creator-validator-agent
-  version: "1.1.0"
+  version: "1.0.0"
   description: Creates workflow manifests and enforces strict deterministic + semantic validation before registration.
   labels:
     role: worker
@@ -59,11 +59,29 @@ spec:
            `attachments` array, every agent referenced by a state that consumes those
            attachments MUST: (a) declare an `attachments` field in its `spec.input_schema`
            matching `{volume_id, path, name, mime_type, size, sha256?}`, (b) include
-           `aegis.attachment.read` in its `spec.tools`, and (c) set `spec.type: system`.
-           When `GENERATE_MISSING_AGENTS` invokes `agent-creator-agent` for an agent that
-           consumes attachments, propagate the dispatch `attachments` so the creator-agent
-           applies the same rule. Reject the workflow if any consuming agent fails these
-           requirements.
+           `aegis.attachment.read` in its `spec.tools`, (c) set `spec.type: system`, and
+           (d) include in its `spec.task.instruction` a Handlebars block that renders the
+           per-dispatch attachments at the agent's runtime — never embed specific file
+           references (volume_id, path, name, sha256) into the manifest. The canonical
+           pattern is:
+
+             {{#if attachments}}
+             You have been dispatched with the following attached files.
+             Use `aegis.attachment.read` on each to read its contents:
+             {{#each attachments}}
+             - name: {{this.name}} ({{this.mime_type}}, {{this.size}} bytes)
+               volume_id: {{this.volume_id}}, path: {{this.path}}
+             {{/each}}
+
+             {{/if}}
+
+           The workflow's own `metadata.input_schema` MUST also declare an `attachments`
+           array so dispatch attachments propagate through to states. When
+           `GENERATE_MISSING_AGENTS` invokes `agent-creator-agent` for an agent that
+           consumes attachments, propagate the requirement (NOT the specific file values)
+           so the creator-agent applies the same rule. Reject the workflow if any consuming
+           agent fails these requirements or hardcodes specific file values into its
+           manifest.
          - If the workflow accepts named or structured inputs from callers, declare
            `metadata.input_schema` as a JSON Schema `object` describing those inputs.
            Use `type: object`, `properties` (with `type` and `description` per field),
@@ -130,10 +148,14 @@ spec:
       {{input}}
 
       {{#if attachments}}
-      Dispatch attachments — the user attached the following files. Any missing agent the planner generates that consumes these files MUST declare them per ADR-113 (input_schema.attachments, aegis.attachment.read tool, spec.type: system):
-      {{#each attachments}}
-      - volume_id: {{this.volume_id}}, path: {{this.path}}, name: {{this.name}}, mime_type: {{this.mime_type}}, size: {{this.size}}
-      {{/each}}
+      This dispatch carries file attachments. Apply the ATTACHMENT-AWARENESS (ADR-113) rule above.
+      The workflow's `metadata.input_schema` MUST declare an `attachments` array field so the
+      dispatch attachments propagate through to states. Every agent referenced by a state that
+      consumes those attachments MUST be a generic attachment-consumer (input_schema.attachments
+      field, `aegis.attachment.read` in tools, `spec.type: system`) — do NOT embed any specific
+      file references (volume_id, path, name, sha256) into the workflow manifest or any agent
+      manifest the planner causes to be generated. Dispatch-specific file refs flow at runtime
+      via `ExecutionInput.attachments` and Handlebars hydration.
 
       {{/if}}
       Agent:

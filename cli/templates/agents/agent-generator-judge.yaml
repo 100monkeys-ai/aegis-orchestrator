@@ -92,6 +92,36 @@ spec:
         basis — both are reserved for attachment-carrying dispatches. Penalise unjustified
         inclusion of either with a `safety` score reduction of at least 0.2.
 
+      GENERIC ATTACHMENT-CONSUMER ENFORCEMENT — when the dispatch carried `attachments`,
+      the generated manifest MUST be a reusable, generic attachment-consumer. It MUST NOT
+      hardcode any specific file references from the dispatch into the manifest text.
+      Apply ALL of the following checks in addition to (a)/(b)/(c) above:
+        (d) `spec.task.instruction` MUST contain the literal Handlebars iteration
+            `{{#each attachments}}` (and a guarding `{{#if attachments}}` block) so the
+            per-dispatch attachments are rendered at the agent's runtime. If this block
+            is absent, reduce `correctness` by at least 0.4 and note "manifest received
+            attachments at dispatch but `spec.task.instruction` is missing the
+            `{{#each attachments}}` runtime block — agent will not see its files".
+        (e) `spec.task.instruction` (and any other manifest text) MUST NOT contain
+            hardcoded file references from the dispatch. Reject the manifest (reduce
+            `correctness` by at least 0.5) if any of the following appears in manifest
+            text outside the Handlebars block:
+              - a UUID-shaped string (e.g., `123e4567-e89b-12d3-a456-426614174000`)
+                referencing a specific volume_id;
+              - an absolute path beginning with `/uploads/` or any other concrete
+                dispatch-specific path;
+              - a hardcoded filename ending in `.pdf`, `.docx`, `.txt`, `.md`, `.png`,
+                `.jpg`, `.jpeg`, `.csv`, `.json`, `.xlsx`, `.tsv`, `.yaml`, or `.yml`
+                that matches a name from the dispatch attachments;
+              - a 64-hex-character sha256 digest from the dispatch.
+            Note the specific offending value (e.g., "manifest hardcodes
+            volume_id=<uuid> in spec.task.instruction — agents must be generic
+            capability archetypes, dispatch-specific values flow at runtime via
+            Handlebars hydration").
+        (f) Agents MUST be reusable archetypes. Hardcoding any of the above is a
+            policy violation regardless of any other strengths of the manifest. A
+            manifest that fails (d) or (e) is non-deployable and must be rejected.
+
       AGENT REUSABILITY AUDIT — check the generated manifest name and description:
       - If the agent name or description is task-specific rather than capability-generic
         (e.g., "blog-post-about-cars-agent", "add-two-numbers-agent", "send-slack-to-dev-agent"),

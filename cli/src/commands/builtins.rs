@@ -512,23 +512,22 @@ mod tests {
         }
     }
 
-    /// Regression test for ADR-113 attachment-rendering bug.
+    /// Regression test for ADR-113 attachment-layering bug.
     ///
-    /// The agent-creator-agent template's instruction prose taught the LLM how to
-    /// handle dispatches that carry attachments, but the prompt_template never
-    /// rendered the `attachments` Handlebars variable. As a result, the LLM saw
-    /// the user's natural-language request and the rules-about-attachments, but
-    /// never saw the attachments themselves — every generated agent was generated
-    /// as if no files were attached, producing manifests with no
-    /// `aegis.attachment.read` tool, no `attachments` field in `input_schema`,
-    /// and no `spec.type: system`.
+    /// The three generation entry-point templates (agent-creator-agent,
+    /// workflow-creator-validator-agent, workflow-generator-planner-agent) must
+    /// signal **presence-only** that the dispatch carries attachments. They MUST
+    /// NOT iterate the per-file fields in their `spec.task.prompt_template` —
+    /// listing concrete `volume_id`/`path`/`name` values to the generator LLM
+    /// risks the LLM hardcoding those values into the manifests it produces, which
+    /// freezes a single dispatch's data into a reusable capability archetype.
     ///
-    /// Each of the three generation entry-point templates MUST surface dispatch
-    /// attachments to the LLM via a `{{#if attachments}} ... {{#each attachments}}`
-    /// Handlebars block in `spec.task.prompt_template`. This test asserts that
-    /// content is present so the regression cannot recur silently.
+    /// Per-file iteration belongs in the GENERATED agent's `spec.task.instruction`
+    /// — a Handlebars template the LLM writes into the new manifest, which the
+    /// temporal worker then hydrates at the generated agent's runtime with the
+    /// dispatch-specific attachments.
     #[test]
-    fn generation_templates_render_dispatch_attachments_in_prompt_template() {
+    fn generation_prompts_signal_attachments_presence_only() {
         let cases = [
             ("agent-creator-agent", AGENT_GENERATOR_AGENT_TEMPLATE),
             (
@@ -555,22 +554,71 @@ mod tests {
 
             assert!(
                 prompt_template.contains("{{#if attachments}}"),
-                "Builtin agent '{}' prompt_template must guard the attachments block with {{{{#if attachments}}}} so non-attachment dispatches don't render an empty section. ADR-113 regression.",
+                "Builtin agent '{}' prompt_template must guard the attachments block with {{{{#if attachments}}}} so the LLM is signalled when a dispatch carries attachments. ADR-113 regression.",
                 name
             );
             assert!(
-                prompt_template.contains("{{#each attachments}}"),
-                "Builtin agent '{}' prompt_template must iterate dispatch attachments with {{{{#each attachments}}}} so the LLM sees each file's volume_id/path/name/mime_type/size. ADR-113 regression.",
+                !prompt_template.contains("{{#each attachments}}"),
+                "Builtin agent '{}' prompt_template MUST NOT iterate dispatch attachments with {{{{#each attachments}}}} in the generation prompt — that risks the LLM hardcoding specific file refs into the generated manifest. The generation prompt is presence-only; per-file iteration belongs in the GENERATED agent's spec.task.instruction. ADR-113 regression.",
                 name
             );
+            for field in [
+                "{{this.volume_id}}",
+                "{{this.path}}",
+                "{{this.name}}",
+                "{{this.mime_type}}",
+                "{{this.size}}",
+            ] {
+                assert!(
+                    !prompt_template.contains(field),
+                    "Builtin agent '{}' prompt_template MUST NOT surface per-attachment field `{}` to the generator LLM — generation prompts are presence-only. ADR-113 regression.",
+                    name,
+                    field
+                );
+            }
+        }
+    }
+
+    /// Regression test for the canonical runtime-block teaching in
+    /// agent-creator-agent step 3a (sub-rule (iv)).
+    ///
+    /// Step 3a teaches the LLM what shape the GENERATED agent's
+    /// `spec.task.instruction` must take when the dispatch carries attachments.
+    /// The canonical Handlebars iteration block (`{{#each attachments}}` over
+    /// `name`/`mime_type`/`size`/`volume_id`/`path`) MUST appear as TEXT in step
+    /// 3a — instructions to the generator LLM about the template it should write
+    /// into the new manifest. It is NOT runtime Handlebars in the generation
+    /// prompt itself; it is verbatim string content the LLM is told to copy into
+    /// the manifest under construction.
+    #[test]
+    fn agent_creator_step_3a_embeds_canonical_runtime_attachments_block() {
+        let manifest: serde_yaml::Value = serde_yaml::from_str(AGENT_GENERATOR_AGENT_TEMPLATE)
+            .expect("agent-creator-agent yaml parses");
+        let instruction = manifest["spec"]["task"]["instruction"]
+            .as_str()
+            .expect("agent-creator-agent must expose spec.task.instruction");
+
+        // The canonical {{#each attachments}} block must appear as TEXT inside the
+        // instruction (i.e., the LLM is taught to embed this in generated manifests).
+        assert!(
+            instruction.contains("{{#each attachments}}"),
+            "agent-creator-agent step 3a must teach the LLM to embed `{{{{#each attachments}}}}` into the generated agent's spec.task.instruction so per-dispatch files render at runtime. ADR-113 regression."
+        );
+        assert!(
+            instruction.contains("{{#if attachments}}"),
+            "agent-creator-agent step 3a must teach the LLM to guard the runtime attachments block with `{{{{#if attachments}}}}`. ADR-113 regression."
+        );
+        for field in [
+            "{{this.name}}",
+            "{{this.mime_type}}",
+            "{{this.size}}",
+            "{{this.volume_id}}",
+            "{{this.path}}",
+        ] {
             assert!(
-                prompt_template.contains("{{this.volume_id}}")
-                    && prompt_template.contains("{{this.path}}")
-                    && prompt_template.contains("{{this.name}}")
-                    && prompt_template.contains("{{this.mime_type}}")
-                    && prompt_template.contains("{{this.size}}"),
-                "Builtin agent '{}' prompt_template must surface each attachment's volume_id, path, name, mime_type, and size fields to the LLM. ADR-113 regression.",
-                name
+                instruction.contains(field),
+                "agent-creator-agent step 3a must teach the LLM the canonical per-attachment field `{}` for the runtime block embedded in generated manifests. ADR-113 regression.",
+                field
             );
         }
     }
