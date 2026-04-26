@@ -1625,7 +1625,7 @@ fn convert_domain_event_to_proto(
                 error: Some(IterationError {
                     error_type: format!("llm_{error_class:?}").to_lowercase(),
                     message: message.clone(),
-                    stacktrace: String::new(),
+                    stacktrace: None,
                 }),
                 failed_at: timestamp.to_rfc3339(),
             })),

@@ -19,7 +19,7 @@ use crate::domain::dispatch::{
 };
 use crate::domain::execution::{ExecutionId, TrajectoryStep};
 use crate::domain::iam::UserIdentity;
-use crate::domain::llm::{ChatMessage, GenerationOptions, LLMError, ToolSchema};
+use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::llm::registry::{ApiKeySource, ProviderRegistry};
 
