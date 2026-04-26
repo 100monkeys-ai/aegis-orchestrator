@@ -285,6 +285,50 @@ pub enum RuntimeError {
     /// The Supervisor observed the cancellation token and terminated the running instance.
     #[error("Execution was cancelled")]
     Cancelled,
+    /// The container exists but the runtime cannot stop or remove it because the
+    /// agent process is wedged in an uninterruptible kernel state (typically a
+    /// hung FUSE mount or other D-state syscall). Manifests as Podman/Docker
+    /// returning HTTP 500 with body "given PID did not die within timeout".
+    /// The reaper consumes this variant to drive backoff and quarantine.
+    #[error("Container {container_id} could not be killed (engine: {engine}); agent process likely in D-state")]
+    Unkillable {
+        /// Container ID that the runtime failed to terminate.
+        container_id: String,
+        /// Engine kind that returned the failure, used to select the operator playbook.
+        engine: ContainerEngineKind,
+    },
+}
+
+/// Identifies which container engine the orchestrator is talking to.
+///
+/// Detected at startup from the engine's `/version` endpoint and threaded
+/// through label generation and error reporting so operators get the right
+/// diagnostic playbook (Podman → check FUSE daemon; Docker → generic D-state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerEngineKind {
+    /// Rootless or rootful Podman engine (production runtime per ADR-067).
+    Podman,
+    /// Docker engine (development/fallback).
+    Docker,
+    /// `/version` returned but the payload did not match either engine.
+    Unknown,
+}
+
+impl ContainerEngineKind {
+    /// Wire-label value emitted on the `aegis.runtime` container label.
+    pub fn label_value(self) -> &'static str {
+        match self {
+            ContainerEngineKind::Podman => "podman",
+            ContainerEngineKind::Docker => "docker",
+            ContainerEngineKind::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ContainerEngineKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label_value())
+    }
 }
 
 /// Current resource-usage snapshot for a running [`InstanceId`].

@@ -34,7 +34,8 @@
 
 use crate::domain::events::ImageManagementEvent;
 use crate::domain::runtime::{
-    AgentRuntime, InstanceId, InstanceStatus, RuntimeConfig, RuntimeError, TaskInput, TaskOutput,
+    AgentRuntime, ContainerEngineKind, InstanceId, InstanceStatus, RuntimeConfig, RuntimeError,
+    TaskInput, TaskOutput,
 };
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::image_manager::{
@@ -45,9 +46,9 @@ use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{ContainerCreateBody, Mount, MountTypeEnum};
 use bollard::query_parameters::{
-    CreateContainerOptions, ListContainersOptionsBuilder, PruneImagesOptions,
+    CreateContainerOptions, KillContainerOptions, ListContainersOptionsBuilder, PruneImagesOptions,
     RemoveContainerOptions, RemoveVolumeOptions, StartContainerOptions, StatsOptions,
-    UploadToContainerOptions,
+    StopContainerOptions, UploadToContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -85,7 +86,70 @@ const AEGIS_EXECUTION_ID_LABEL: &str = "aegis.execution_id";
 const AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL: &str = "aegis.keep_container_on_failure";
 const AEGIS_MANAGED_LABEL: &str = "aegis.managed";
 const AEGIS_RUNTIME_LABEL: &str = "aegis.runtime";
-const AEGIS_RUNTIME_KIND_DOCKER: &str = "docker";
+
+/// Detected container engine, including version reported by `/version`.
+///
+/// Production runtime is rootless Podman (ADR-067); Docker is the dev fallback.
+/// Detected once at startup in [`connect_container_runtime`] and stored on
+/// [`ContainerRuntime`] so that label generation, error mapping, and operator
+/// hints can branch on the real engine instead of guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerEngine {
+    Podman { version: String },
+    Docker { version: String },
+    Unknown,
+}
+
+impl ContainerEngine {
+    /// The engine kind that flows into labels, errors, and reaper bookkeeping.
+    pub fn kind(&self) -> ContainerEngineKind {
+        match self {
+            ContainerEngine::Podman { .. } => ContainerEngineKind::Podman,
+            ContainerEngine::Docker { .. } => ContainerEngineKind::Docker,
+            ContainerEngine::Unknown => ContainerEngineKind::Unknown,
+        }
+    }
+
+    /// Detect the engine from a parsed `/version` JSON payload.
+    ///
+    /// Podman's libpod-compat `/version` includes a `Components` array entry
+    /// whose `Name == "Podman Engine"`. Docker's `/version` does not advertise
+    /// such a component. Anything else (empty body, unrelated payload) falls
+    /// back to [`ContainerEngine::Unknown`] — we never guess.
+    pub fn detect_from_version_payload(payload: &serde_json::Value) -> Self {
+        let top_version = payload
+            .get("Version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(components) = payload.get("Components").and_then(|c| c.as_array()) {
+            for component in components {
+                let name = component
+                    .get("Name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default();
+                if name == "Podman Engine" {
+                    let version = component
+                        .get("Version")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or(top_version.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return ContainerEngine::Podman { version };
+                }
+            }
+        }
+
+        if let Some(version) = top_version {
+            // Docker's /version always returns a top-level Version string and
+            // does not advertise a "Podman Engine" component. If we got here
+            // with a version present and no Podman component matched, treat as Docker.
+            return ContainerEngine::Docker { version };
+        }
+
+        ContainerEngine::Unknown
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ManagedAgentContainer {
@@ -122,6 +186,11 @@ pub struct ContainerRuntime {
             tonic::transport::Channel,
         >,
     >,
+    /// Detected container engine (Podman, Docker, Unknown). Set once at
+    /// construction by querying the engine's `/version` endpoint and used to
+    /// stamp container labels, select the right operator hint on
+    /// [`RuntimeError::Unkillable`], and segment reaper bookkeeping.
+    engine: ContainerEngine,
     /// Active FUSE mount handles keyed by container ID (ADR-107).
     /// Handles are inserted in `spawn()` and removed in `terminate()`.
     /// Dropping a handle triggers FUSE_DESTROY + unmount on the host.
@@ -167,7 +236,7 @@ pub struct ContainerRuntimeConfig {
 }
 
 impl ContainerRuntime {
-    pub fn new(config: ContainerRuntimeConfig) -> Result<Self, RuntimeError> {
+    pub async fn new(config: ContainerRuntimeConfig) -> Result<Self, RuntimeError> {
         let ContainerRuntimeConfig {
             bootstrap_script,
             socket_path,
@@ -227,6 +296,27 @@ impl ContainerRuntime {
             docker.clone(),
             credential_resolver,
         ));
+
+        // Engine detection: ask /version once and persist the result. Any failure
+        // here is non-fatal — Unknown still lets the runtime function, it just
+        // means labels read "unknown" and the operator hints are generic. We do
+        // NOT default to Docker on failure because that would re-introduce the
+        // Podman-blind behavior that produced the reaper storm.
+        let engine = match docker.version().await {
+            Ok(version) => {
+                let payload = serde_json::to_value(&version).unwrap_or(serde_json::Value::Null);
+                ContainerEngine::detect_from_version_payload(&payload)
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Failed to query container engine /version; defaulting to Unknown"
+                );
+                ContainerEngine::Unknown
+            }
+        };
+        info!(engine = ?engine, "Container engine detected");
+
         Ok(Self {
             docker,
             bootstrap_script_path: bootstrap_path,
@@ -239,12 +329,79 @@ impl ContainerRuntime {
             bootstrap_paths: RwLock::new(HashMap::new()),
             image_manager,
             event_bus,
+            engine,
             fuse_daemon,
             fuse_mount_prefix,
             fuse_mount_client,
             fuse_mount_handles: RwLock::new(HashMap::new()),
             grpc_fuse_mounts: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Engine detected at startup; used by callers and tests that need to
+    /// reason about the live runtime kind.
+    pub fn engine(&self) -> &ContainerEngine {
+        &self.engine
+    }
+
+    /// Inspect a bollard error and, if it represents an un-killable container
+    /// (HTTP 500 with "did not die within timeout" in the body), return a
+    /// typed [`RuntimeError::Unkillable`] tagged with the live engine. Returns
+    /// `None` for any other error so the caller can fall back to its normal
+    /// error mapping. The Podman path also emits an INFO with the FUSE-check
+    /// hint so operators see the actionable next step exactly once per failure.
+    fn map_unkillable(
+        &self,
+        container_id: &str,
+        error: &bollard::errors::Error,
+    ) -> Option<RuntimeError> {
+        let unkillable = Self::is_unkillable_error(error)?;
+        if !unkillable {
+            return None;
+        }
+        let kind = self.engine.kind();
+        match kind {
+            ContainerEngineKind::Podman => {
+                info!(
+                    container_id = container_id,
+                    engine = %kind,
+                    "Container could not be killed; agent process likely wedged in a D-state syscall. \
+                     Check the FUSE daemon (systemctl --user status aegis-fuse-daemon) and \
+                     /proc/<pid>/stack for fuse_request_wait or similar."
+                );
+            }
+            ContainerEngineKind::Docker | ContainerEngineKind::Unknown => {
+                info!(
+                    container_id = container_id,
+                    engine = %kind,
+                    "Container could not be killed; agent process likely in uninterruptible sleep. \
+                     Check /proc/<pid>/stack and /proc/<pid>/wchan for the blocked syscall."
+                );
+            }
+        }
+        Some(RuntimeError::Unkillable {
+            container_id: container_id.to_string(),
+            engine: kind,
+        })
+    }
+
+    /// Pure classifier: returns `Some(true)` if a bollard error matches the
+    /// "did not die within timeout" 500 produced by libpod/dockerd when a
+    /// container PID is wedged. Returns `Some(false)` for other 500s and
+    /// `None` for non-server errors. Split out so it can be unit-tested
+    /// without spinning up a real engine.
+    pub(crate) fn is_unkillable_error(error: &bollard::errors::Error) -> Option<bool> {
+        if let bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message,
+        } = error
+        {
+            if *status_code == 500 && message.contains("did not die within timeout") {
+                return Some(true);
+            }
+            return Some(false);
+        }
+        None
     }
 
     /// Remove dangling (unused) Docker images to reclaim disk space (ADR-045).
@@ -267,33 +424,48 @@ impl ContainerRuntime {
     pub async fn list_managed_agent_containers(
         &self,
     ) -> Result<Vec<ManagedAgentContainer>, RuntimeError> {
-        let mut filters = std::collections::HashMap::new();
-        filters.insert(
-            "label".to_string(),
-            vec![
-                format!("{AEGIS_MANAGED_LABEL}=true"),
-                format!("{AEGIS_RUNTIME_LABEL}={AEGIS_RUNTIME_KIND_DOCKER}"),
-                format!("{AEGIS_CONTAINER_KIND_LABEL}={AEGIS_CONTAINER_KIND_AGENT}"),
-            ],
-        );
+        // Bollard's label filter ANDs multiple values for the same key, so to
+        // match either `aegis.runtime=podman` OR `aegis.runtime=docker` we
+        // issue two queries and dedupe by container id.
+        //
+        // TODO: drop the docker-label list call after one reaper-interval
+        // post-deploy. It exists solely to reap orphans created by the
+        // previous binary that always wrote `aegis.runtime=docker`.
+        let mut by_id: std::collections::HashMap<String, ManagedAgentContainer> =
+            std::collections::HashMap::new();
 
-        let containers = self
-            .docker
-            .list_containers(Some(
-                ListContainersOptionsBuilder::new()
-                    .all(true)
-                    .filters(&filters)
-                    .build(),
-            ))
-            .await
-            .map_err(|e| {
-                RuntimeError::SpawnFailed(format!("Failed to list managed containers: {e}"))
-            })?;
+        for runtime_label_value in [
+            ContainerEngineKind::Podman.label_value(),
+            ContainerEngineKind::Docker.label_value(),
+        ] {
+            let mut filters = std::collections::HashMap::new();
+            filters.insert(
+                "label".to_string(),
+                vec![
+                    format!("{AEGIS_MANAGED_LABEL}=true"),
+                    format!("{AEGIS_RUNTIME_LABEL}={runtime_label_value}"),
+                    format!("{AEGIS_CONTAINER_KIND_LABEL}={AEGIS_CONTAINER_KIND_AGENT}"),
+                ],
+            );
 
-        Ok(containers
-            .into_iter()
-            .filter_map(|container| {
-                let id = container.id?;
+            let containers = self
+                .docker
+                .list_containers(Some(
+                    ListContainersOptionsBuilder::new()
+                        .all(true)
+                        .filters(&filters)
+                        .build(),
+                ))
+                .await
+                .map_err(|e| {
+                    RuntimeError::SpawnFailed(format!("Failed to list managed containers: {e}"))
+                })?;
+
+            for container in containers {
+                let Some(id) = container.id else { continue };
+                if by_id.contains_key(&id) {
+                    continue;
+                }
                 let labels = container.labels.unwrap_or_default();
                 let execution_id = labels.get(AEGIS_EXECUTION_ID_LABEL).cloned();
                 let debug_retain = labels
@@ -302,14 +474,19 @@ impl ContainerRuntime {
                     .unwrap_or(false);
                 let state = container.state.map(|state| state.to_string());
 
-                Some(ManagedAgentContainer {
-                    id,
-                    execution_id,
-                    debug_retain,
-                    state,
-                })
-            })
-            .collect())
+                by_id.insert(
+                    id.clone(),
+                    ManagedAgentContainer {
+                        id,
+                        execution_id,
+                        debug_retain,
+                        state,
+                    },
+                );
+            }
+        }
+
+        Ok(by_id.into_values().collect())
     }
 
     /// Verify container runtime (Docker/Podman) is accessible
@@ -392,12 +569,15 @@ impl ContainerRuntime {
         lines.join("\n")
     }
 
-    fn managed_container_labels(config: &RuntimeConfig) -> HashMap<String, String> {
+    fn managed_container_labels(
+        config: &RuntimeConfig,
+        engine_kind: ContainerEngineKind,
+    ) -> HashMap<String, String> {
         HashMap::from([
             (AEGIS_MANAGED_LABEL.to_string(), "true".to_string()),
             (
                 AEGIS_RUNTIME_LABEL.to_string(),
-                AEGIS_RUNTIME_KIND_DOCKER.to_string(),
+                engine_kind.label_value().to_string(),
             ),
             (
                 AEGIS_CONTAINER_KIND_LABEL.to_string(),
@@ -944,7 +1124,7 @@ impl AgentRuntime for ContainerRuntime {
             attach_stderr: Some(true),
             cmd: Some(cmd),
             env: Some(env_vars),
-            labels: Some(Self::managed_container_labels(&config)),
+            labels: Some(Self::managed_container_labels(&config, self.engine.kind())),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -1198,11 +1378,6 @@ impl AgentRuntime for ContainerRuntime {
     }
 
     async fn terminate(&self, id: &InstanceId) -> Result<(), RuntimeError> {
-        let options = RemoveContainerOptions {
-            force: true,
-            ..Default::default()
-        };
-
         self.keep_container_on_failure
             .write()
             .await
@@ -1210,27 +1385,108 @@ impl AgentRuntime for ContainerRuntime {
 
         self.bootstrap_paths.write().await.remove(id.as_str());
 
-        // Inspect the container before removal to discover its named volumes
-        // so we can clean them up and prevent stale volume accumulation.
-        let volume_names: Vec<String> = self
-            .docker
-            .inspect_container(id.as_str(), None)
-            .await
-            .ok()
-            .and_then(|info| info.mounts)
-            .map(|mounts| {
-                mounts
-                    .iter()
-                    .filter_map(|m| m.name.clone())
-                    .filter(|name| name.starts_with("aegis-vol-"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Inspect first. If the engine is already in the middle of removing the
+        // container (state=removing|dead), a second remove call is what produces
+        // the recurring HTTP 500 storm — return Ok and let the in-flight removal
+        // complete. If inspection fails (e.g. 404), the container is already gone.
+        let inspect = self.docker.inspect_container(id.as_str(), None).await;
 
-        self.docker
+        let (volume_names, already_terminating) = match inspect {
+            Ok(info) => {
+                let state_status = info
+                    .state
+                    .as_ref()
+                    .and_then(|s| s.status)
+                    .map(|s| s.to_string());
+                let already = matches!(state_status.as_deref(), Some("removing") | Some("dead"));
+                let vols: Vec<String> = info
+                    .mounts
+                    .map(|mounts| {
+                        mounts
+                            .iter()
+                            .filter_map(|m| m.name.clone())
+                            .filter(|name| name.starts_with("aegis-vol-"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (vols, already)
+            }
+            Err(_) => (Vec::new(), false),
+        };
+
+        if already_terminating {
+            debug!(
+                container_id = id.as_str(),
+                "Container already in removing/dead state; skipping additional remove call"
+            );
+            return Ok(());
+        }
+
+        // Step 1: graceful stop with a 5s timeout (libpod honors `t` and gives
+        // conmon a clean SIGTERM grace window before escalating).
+        let stop_opts = StopContainerOptions {
+            t: Some(5),
+            signal: None,
+        };
+        if let Err(error) = self
+            .docker
+            .stop_container(id.as_str(), Some(stop_opts))
+            .await
+        {
+            if let Some(unkillable) = self.map_unkillable(id.as_str(), &error) {
+                return Err(unkillable);
+            }
+            // Stop can legitimately fail with 304 ("container already stopped")
+            // or 404 ("no such container"); fall through to kill+remove which
+            // will surface a real error if anything is genuinely wrong.
+            debug!(
+                container_id = id.as_str(),
+                error = %error,
+                "stop_container returned non-fatal error; continuing to kill+remove"
+            );
+        }
+
+        // Step 2: explicit SIGKILL. On Podman this is what triggers conmon to
+        // send SIGKILL through to the container PID; if the PID is wedged in a
+        // D-state syscall, libpod returns 500 "did not die within timeout".
+        let kill_opts = KillContainerOptions {
+            signal: "SIGKILL".to_string(),
+        };
+        if let Err(error) = self
+            .docker
+            .kill_container(id.as_str(), Some(kill_opts))
+            .await
+        {
+            if let Some(unkillable) = self.map_unkillable(id.as_str(), &error) {
+                return Err(unkillable);
+            }
+            // 409 "container not running" is expected if stop already ended it.
+            debug!(
+                container_id = id.as_str(),
+                error = %error,
+                "kill_container returned non-fatal error; continuing to remove"
+            );
+        }
+
+        // Step 3: remove with v=true to drop anonymous volumes (Podman supports
+        // the same flag). force=true is still required because the container
+        // may legitimately be in `created` or `exited` state at this point.
+        let options = RemoveContainerOptions {
+            force: true,
+            v: true,
+            ..Default::default()
+        };
+
+        if let Err(error) = self
+            .docker
             .remove_container(id.as_str(), Some(options))
             .await
-            .map_err(|e| RuntimeError::TerminationFailed(e.to_string()))?;
+        {
+            if let Some(unkillable) = self.map_unkillable(id.as_str(), &error) {
+                return Err(unkillable);
+            }
+            return Err(RuntimeError::TerminationFailed(error.to_string()));
+        }
 
         // Clean up named volumes after container removal to prevent stale
         // plain-local volumes from shadowing NFS driver options on next run.
@@ -1341,12 +1597,12 @@ impl AgentRuntime for ContainerRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerRuntime, AEGIS_CONTAINER_KIND_LABEL, AEGIS_EXECUTION_ID_LABEL,
+        ContainerEngine, ContainerRuntime, AEGIS_CONTAINER_KIND_LABEL, AEGIS_EXECUTION_ID_LABEL,
         AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL, AEGIS_MANAGED_LABEL, AEGIS_RUNTIME_LABEL,
     };
     use crate::domain::agent::{ExecutionStrategy, ImagePullPolicy};
     use crate::domain::execution::ExecutionId;
-    use crate::domain::runtime::{ResourceLimits, RuntimeConfig};
+    use crate::domain::runtime::{ContainerEngineKind, ResourceLimits, RuntimeConfig};
     use std::collections::HashMap;
 
     #[test]
@@ -1415,7 +1671,8 @@ mod tests {
             execution_id: ExecutionId::new(),
         };
 
-        let labels = ContainerRuntime::managed_container_labels(&config);
+        let labels =
+            ContainerRuntime::managed_container_labels(&config, ContainerEngineKind::Docker);
 
         assert_eq!(labels.get(AEGIS_MANAGED_LABEL), Some(&"true".to_string()));
         assert_eq!(labels.get(AEGIS_RUNTIME_LABEL), Some(&"docker".to_string()));
@@ -1475,6 +1732,180 @@ mod tests {
             .blocking_read()
             .get(&container_id)
             .is_none());
+    }
+
+    /// Regression: a libpod-shaped /version payload (Components array containing
+    /// "Podman Engine") must classify as Podman. Captured Podman 4.x payload.
+    #[test]
+    fn detect_engine_classifies_libpod_version_payload_as_podman() {
+        let payload = serde_json::json!({
+            "Platform": { "Name": "linux/amd64/fedora-39" },
+            "Components": [
+                {
+                    "Name": "Podman Engine",
+                    "Version": "4.9.4",
+                    "Details": {
+                        "APIVersion": "4.9.4",
+                        "Arch": "amd64",
+                        "BuildTime": "2024-04-26T00:00:00Z",
+                        "Experimental": "false",
+                        "GitCommit": "",
+                        "GoVersion": "go1.21.7",
+                        "KernelVersion": "6.6.0",
+                        "MinAPIVersion": "4.0.0",
+                        "Os": "linux"
+                    }
+                },
+                { "Name": "Conmon", "Version": "conmon version 2.1.10" },
+                { "Name": "OCI Runtime (crun)", "Version": "crun version 1.14.4" }
+            ],
+            "Version": "4.9.4",
+            "ApiVersion": "1.41",
+            "MinAPIVersion": "1.24",
+            "GitCommit": "",
+            "GoVersion": "go1.21.7",
+            "Os": "linux",
+            "Arch": "amd64",
+            "KernelVersion": "6.6.0",
+            "BuildTime": "2024-04-26T00:00:00Z"
+        });
+
+        let engine = ContainerEngine::detect_from_version_payload(&payload);
+        assert!(
+            matches!(engine, ContainerEngine::Podman { ref version } if version == "4.9.4"),
+            "expected Podman 4.9.4, got {engine:?}"
+        );
+        assert_eq!(engine.kind(), ContainerEngineKind::Podman);
+    }
+
+    /// Regression: a Docker-shaped /version payload (no Podman Engine component)
+    /// must classify as Docker.
+    #[test]
+    fn detect_engine_classifies_docker_version_payload_as_docker() {
+        let payload = serde_json::json!({
+            "Platform": { "Name": "Docker Engine - Community" },
+            "Components": [
+                { "Name": "Engine", "Version": "26.0.0" },
+                { "Name": "containerd", "Version": "1.6.28" },
+                { "Name": "runc", "Version": "1.1.12" }
+            ],
+            "Version": "26.0.0",
+            "ApiVersion": "1.45",
+            "MinAPIVersion": "1.24",
+            "GitCommit": "abcdef0",
+            "GoVersion": "go1.21.8",
+            "Os": "linux",
+            "Arch": "amd64",
+            "KernelVersion": "6.6.0",
+            "BuildTime": "2024-03-20T00:00:00Z"
+        });
+
+        let engine = ContainerEngine::detect_from_version_payload(&payload);
+        assert!(
+            matches!(engine, ContainerEngine::Docker { ref version } if version == "26.0.0"),
+            "expected Docker 26.0.0, got {engine:?}"
+        );
+        assert_eq!(engine.kind(), ContainerEngineKind::Docker);
+    }
+
+    /// Regression: an empty or unrelated payload must classify as Unknown.
+    /// Defaulting to Docker would re-introduce the Podman-blind labeling
+    /// that produced the original reaper storm.
+    #[test]
+    fn detect_engine_classifies_empty_or_garbage_payload_as_unknown() {
+        let empty = serde_json::json!({});
+        assert_eq!(
+            ContainerEngine::detect_from_version_payload(&empty),
+            ContainerEngine::Unknown
+        );
+
+        let garbage = serde_json::json!({ "completely": "unrelated", "payload": 42 });
+        assert_eq!(
+            ContainerEngine::detect_from_version_payload(&garbage),
+            ContainerEngine::Unknown
+        );
+    }
+
+    /// Regression: managed_container_labels must stamp `aegis.runtime=podman`
+    /// when the runtime is talking to Podman, so the reaper and observability
+    /// can distinguish engines without re-querying /version per container.
+    #[test]
+    fn managed_container_labels_emits_podman_runtime_when_engine_is_podman() {
+        let config = sample_runtime_config();
+        let labels =
+            ContainerRuntime::managed_container_labels(&config, ContainerEngineKind::Podman);
+        assert_eq!(labels.get(AEGIS_RUNTIME_LABEL), Some(&"podman".to_string()));
+        assert_eq!(labels.get(AEGIS_MANAGED_LABEL), Some(&"true".to_string()));
+        assert_eq!(
+            labels.get(AEGIS_CONTAINER_KIND_LABEL),
+            Some(&"agent".to_string())
+        );
+    }
+
+    /// Regression: same as above for Docker — proves the label is engine-derived,
+    /// not hardcoded.
+    #[test]
+    fn managed_container_labels_emits_docker_runtime_when_engine_is_docker() {
+        let config = sample_runtime_config();
+        let labels =
+            ContainerRuntime::managed_container_labels(&config, ContainerEngineKind::Docker);
+        assert_eq!(labels.get(AEGIS_RUNTIME_LABEL), Some(&"docker".to_string()));
+    }
+
+    /// Regression: a 500 response whose body matches "did not die within timeout"
+    /// must map to RuntimeError::Unkillable so the reaper can apply backoff and
+    /// quarantine. Other 500s must NOT match (they should fall through to the
+    /// generic TerminationFailed path).
+    #[test]
+    fn is_unkillable_error_matches_did_not_die_within_timeout_only() {
+        let unkillable = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "cannot remove container abc as it could not be stopped: \
+                      given PID did not die within timeout"
+                .to_string(),
+        };
+        assert_eq!(
+            ContainerRuntime::is_unkillable_error(&unkillable),
+            Some(true)
+        );
+
+        let unrelated_500 = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "internal server error: something else broke".to_string(),
+        };
+        assert_eq!(
+            ContainerRuntime::is_unkillable_error(&unrelated_500),
+            Some(false)
+        );
+
+        // Non-server errors (e.g. transport) should return None so the caller
+        // can apply its normal mapping.
+        let api_parse = bollard::errors::Error::APIVersionParseError {};
+        assert_eq!(ContainerRuntime::is_unkillable_error(&api_parse), None);
+    }
+
+    fn sample_runtime_config() -> RuntimeConfig {
+        RuntimeConfig {
+            language: "python".to_string(),
+            version: "3.12".to_string(),
+            isolation: "docker".to_string(),
+            env: HashMap::new(),
+            image_pull_policy: ImagePullPolicy::IfNotPresent,
+            resources: ResourceLimits {
+                cpu_millis: None,
+                memory_bytes: None,
+                disk_bytes: None,
+                timeout_seconds: None,
+            },
+            execution: ExecutionStrategy::default(),
+            volumes: Vec::new(),
+            container_uid: 1000,
+            container_gid: 1000,
+            keep_container_on_failure: false,
+            image: "python:3.12".to_string(),
+            bootstrap_path: None,
+            execution_id: ExecutionId::new(),
+        }
     }
 }
 // Private helper methods for ContainerRuntime (Docker/Podman)

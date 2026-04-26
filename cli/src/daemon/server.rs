@@ -804,6 +804,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             fuse_mount_prefix: fuse_mount_prefix.clone(),
             fuse_mount_client: fuse_mount_client.clone(),
         })
+        .await
         .context("Failed to initialize Docker runtime")?,
     );
 
@@ -829,6 +830,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         // First tick fires immediately — clean up any orphans left from a prior crash.
         let mut first_run = true;
+        // Per-container reaper bookkeeping: tracks consecutive Unkillable
+        // failures, the next-eligible attempt time, and the quarantine bit.
+        // Owned by this task — no synchronization needed.
+        let mut attempt_states: std::collections::HashMap<
+            String,
+            crate::daemon::container_helpers::ReapAttemptState,
+        > = std::collections::HashMap::new();
         loop {
             interval.tick().await;
             if first_run {
@@ -838,6 +846,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             match cleanup_orphaned_agent_containers(
                 agent_container_reaper_runtime.clone(),
                 agent_container_reaper_execution_repo.clone(),
+                &mut attempt_states,
             )
             .await
             {
