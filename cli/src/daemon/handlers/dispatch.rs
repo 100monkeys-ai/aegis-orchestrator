@@ -22,6 +22,8 @@ pub(crate) async fn dispatch_gateway_handler(
 ) -> impl IntoResponse {
     use aegis_orchestrator_core::domain::dispatch::{AgentMessage, OrchestratorMessage};
 
+    let started_at = std::time::Instant::now();
+
     let (exec_id_opt, iteration_number, prompt_opt, model_opt) = match &agent_msg {
         AgentMessage::Generate {
             execution_id,
@@ -39,6 +41,26 @@ pub(crate) async fn dispatch_gateway_handler(
             (Uuid::parse_str(execution_id).ok(), 0, None, None)
         }
     };
+
+    // Open a per-request span so every downstream tracing call (inner loop,
+    // provider registry, HTTP adapter) carries `execution_id` + `iteration`.
+    let _span = tracing::info_span!(
+        "dispatch_gateway",
+        execution_id = exec_id_opt
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        iteration = iteration_number,
+    )
+    .entered();
+
+    tracing::info!(
+        model_alias = model_opt.as_deref().unwrap_or("(none)"),
+        kind = match &agent_msg {
+            AgentMessage::Generate { .. } => "generate",
+            AgentMessage::DispatchResult { .. } => "dispatch_result",
+        },
+        "dispatch_gateway request received"
+    );
 
     // Resolve agent_id and initiating user identity from the execution record.
     let (agent_id, user_identity) = if let Some(exec_id) = exec_id_opt {
@@ -73,11 +95,25 @@ pub(crate) async fn dispatch_gateway_handler(
         )
     };
 
-    match state
+    let result = state
         .inner_loop_service
         .handle_agent_message_with_identity(agent_msg, user_identity, None)
-        .await
-    {
+        .await;
+
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    match &result {
+        Ok(OrchestratorMessage::Final { .. }) => {
+            tracing::info!(outcome = "final", elapsed_ms, "dispatch_gateway returning")
+        }
+        Ok(OrchestratorMessage::Dispatch { .. }) => tracing::info!(
+            outcome = "dispatch",
+            elapsed_ms,
+            "dispatch_gateway returning"
+        ),
+        Err(_) => tracing::info!(outcome = "error", elapsed_ms, "dispatch_gateway returning"),
+    }
+
+    match result {
         Ok(OrchestratorMessage::Final {
             content,
             tool_calls_executed,

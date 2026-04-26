@@ -376,7 +376,7 @@ pub trait WorkflowExecutionRepository: Send + Sync {
     async fn append_event(
         &self,
         execution_id: ExecutionId,
-        temporal_sequence_number: i64,
+        sequence_number: i64,
         event_type: String,
         payload: serde_json::Value,
         iteration_number: Option<u8>,

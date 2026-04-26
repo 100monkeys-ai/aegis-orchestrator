@@ -730,11 +730,52 @@ impl InnerLoopService {
             );
         }
 
-        match self
+        tracing::info!(
+            model_alias = %model_alias,
+            message_count = chat_messages.len(),
+            tool_schema_count = schemas.len(),
+            byok = is_byok,
+            "calling LLM provider"
+        );
+        let llm_started_at = std::time::Instant::now();
+
+        let llm_result = self
             .provider_registry
             .generate_chat(model_alias, &chat_messages, &schemas, &options)
-            .await
-        {
+            .await;
+
+        let llm_elapsed_ms = llm_started_at.elapsed().as_millis() as u64;
+        match &llm_result {
+            Ok(crate::domain::llm::ChatResponse::FinalText(r)) => {
+                tracing::info!(
+                    outcome = "ok",
+                    response_kind = "final_text",
+                    elapsed_ms = llm_elapsed_ms,
+                    tokens_in = r.usage.prompt_tokens,
+                    tokens_out = r.usage.completion_tokens,
+                    "LLM provider responded"
+                );
+            }
+            Ok(crate::domain::llm::ChatResponse::ToolCalls(calls)) => {
+                tracing::info!(
+                    outcome = "ok",
+                    response_kind = "tool_calls",
+                    elapsed_ms = llm_elapsed_ms,
+                    tool_call_count = calls.len(),
+                    "LLM provider responded"
+                );
+            }
+            Err(e) => {
+                tracing::info!(
+                    outcome = "error",
+                    elapsed_ms = llm_elapsed_ms,
+                    error = %e,
+                    "LLM provider responded"
+                );
+            }
+        }
+
+        match llm_result {
             Ok(crate::domain::llm::ChatResponse::FinalText(r)) => {
                 // Post-call rate limit: LlmToken (ADR-072)
                 // BYOK users are exempt — they consume their own provider quota.

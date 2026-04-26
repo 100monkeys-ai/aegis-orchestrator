@@ -621,7 +621,7 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
     async fn append_event(
         &self,
         execution_id: ExecutionId,
-        temporal_sequence_number: i64,
+        sequence_number: i64,
         event_type: String,
         payload: serde_json::Value,
         iteration_number: Option<u8>,
@@ -631,7 +631,7 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
             .entry(execution_id)
             .or_default()
             .push(WorkflowExecutionEventRecord {
-                sequence: temporal_sequence_number,
+                sequence: sequence_number,
                 event_type,
                 state_name: None,
                 iteration_number,

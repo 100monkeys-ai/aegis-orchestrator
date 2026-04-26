@@ -748,7 +748,7 @@ mod tests {
         async fn append_event(
             &self,
             _execution_id: ExecutionId,
-            _temporal_sequence_number: i64,
+            _sequence_number: i64,
             _event_type: String,
             _payload: Value,
             _iteration_number: Option<u8>,

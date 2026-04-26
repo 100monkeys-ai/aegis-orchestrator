@@ -204,6 +204,14 @@ impl LLMProvider for OpenAIAdapter {
 
         let url = format!("{}/chat/completions", self.endpoint.trim_end_matches('/'));
 
+        tracing::debug!(
+            provider = "openai",
+            model = %self.model,
+            endpoint_url = %url,
+            "LLM HTTP request"
+        );
+        let http_started_at = std::time::Instant::now();
+
         let response = self
             .client
             .post(&url)
@@ -214,9 +222,27 @@ impl LLMProvider for OpenAIAdapter {
             .await
             .map_err(|e| LLMError::Network(e.to_string()))?;
 
+        let http_elapsed_ms = http_started_at.elapsed().as_millis() as u64;
+        let status_code = response.status().as_u16();
+        tracing::info!(
+            provider = "openai",
+            model = %self.model,
+            status = status_code,
+            elapsed_ms = http_elapsed_ms,
+            "LLM HTTP response"
+        );
+
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
+            let excerpt: String = error_text.chars().take(512).collect();
+            tracing::warn!(
+                provider = "openai",
+                model = %self.model,
+                status = status.as_u16(),
+                body_excerpt = %excerpt,
+                "LLM upstream non-2xx"
+            );
             return Err(if status == 401 || status == 403 {
                 LLMError::Authentication(error_text)
             } else if status == 429 {
@@ -230,10 +256,26 @@ impl LLMProvider for OpenAIAdapter {
             });
         }
 
-        let oai_response: OpenAIResponse = response
-            .json()
+        let body_bytes = response
+            .bytes()
             .await
-            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
+            .map_err(|e| LLMError::Network(format!("Failed to read response body: {e}")))?;
+
+        let oai_response: OpenAIResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+            let excerpt: String = String::from_utf8_lossy(&body_bytes)
+                .chars()
+                .take(512)
+                .collect();
+            tracing::error!(
+                provider = "openai",
+                model = %self.model,
+                status = status_code,
+                body_excerpt = %excerpt,
+                parse_error = %e,
+                "LLM response parse failure"
+            );
+            LLMError::Provider(format!("Failed to parse response: {e}"))
+        })?;
 
         let choice = oai_response
             .choices

@@ -452,7 +452,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
     async fn append_event(
         &self,
         execution_id: ExecutionId,
-        temporal_sequence_number: i64,
+        sequence_number: i64,
         event_type: String,
         payload: serde_json::Value,
         iteration_number: Option<u8>,
@@ -462,14 +462,14 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         sqlx::query(
             r#"
             INSERT INTO execution_events (
-                execution_id, temporal_sequence_number, event_type, event_payload, iteration_number
+                execution_id, sequence_number, event_type, event_payload, iteration_number
             )
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (execution_id, temporal_sequence_number) DO NOTHING
+            ON CONFLICT (execution_id, sequence_number) DO NOTHING
             "#,
         )
         .bind(execution_id.0)
-        .bind(temporal_sequence_number)
+        .bind(sequence_number)
         .bind(event_type)
         .bind(payload)
         .bind(iteration_val)
@@ -506,11 +506,11 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT temporal_sequence_number, event_type, event_payload,
+            SELECT sequence_number, event_type, event_payload,
                    iteration_number, created_at
             FROM execution_events
             WHERE execution_id = $1
-            ORDER BY temporal_sequence_number ASC
+            ORDER BY sequence_number ASC
             LIMIT $2 OFFSET $3
             "#,
         )
@@ -524,7 +524,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         let records = rows
             .into_iter()
             .map(|row| {
-                let sequence: i64 = row.get("temporal_sequence_number");
+                let sequence: i64 = row.get("sequence_number");
                 let event_type: String = row.get("event_type");
                 let payload: serde_json::Value = row.get("event_payload");
                 let iteration_number: Option<i16> = row.get("iteration_number");

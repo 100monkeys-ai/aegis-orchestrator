@@ -16,7 +16,7 @@ use crate::domain::node_config::{
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::anthropic::AnthropicAdapter;
 use super::gemini::GeminiAdapter;
@@ -369,6 +369,12 @@ impl ProviderRegistry {
                         // Short-circuit on deterministic upstream rejections — retrying with
                         // the same credentials (or with the fallback that shares them) is futile.
                         if is_non_retryable(&e) {
+                            info!(
+                                "LLM call non-retryable; short-circuiting: alias='{}', attempts={}, error={:?}",
+                                alias,
+                                attempt + 1,
+                                e
+                            );
                             if matches!(e, LLMError::ServiceUnavailable(_)) {
                                 if let Some((fallback_model, fallback)) = &self.fallback_provider {
                                     info!(
@@ -405,13 +411,19 @@ impl ProviderRegistry {
                             }
                         }
 
-                        tokio::time::sleep(tokio::time::Duration::from_millis({
+                        let backoff_ms = {
                             let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
                             self.retry_delay_ms
                                 .saturating_mul(2_u64.saturating_pow(capped_attempt))
                                 .min(MAX_BACKOFF_MS)
-                        }))
-                        .await;
+                        };
+                        debug!(
+                            "LLM retry backoff: alias='{}', duration_ms={}, attempt={}",
+                            alias,
+                            backoff_ms,
+                            attempt + 1
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     }
                 }
             }

@@ -61,6 +61,7 @@ pub mod policy;
 pub mod ports;
 // pub mod workflow_engine; Removed during Temporal integration
 pub mod complete_workflow_execution;
+pub mod execution_event_persister;
 pub mod file_operations_service;
 pub mod git_clone_executor;
 pub mod git_repo_service;

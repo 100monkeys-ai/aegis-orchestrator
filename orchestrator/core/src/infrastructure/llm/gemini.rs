@@ -332,6 +332,14 @@ impl LLMProvider for GeminiAdapter {
             self.model
         );
 
+        tracing::debug!(
+            provider = "gemini",
+            model = %self.model,
+            endpoint_url = %url,
+            "LLM HTTP request"
+        );
+        let http_started_at = std::time::Instant::now();
+
         let response = self
             .client
             .post(&url)
@@ -342,9 +350,26 @@ impl LLMProvider for GeminiAdapter {
             .await
             .map_err(|e| LLMError::Network(e.to_string()))?;
 
+        let http_elapsed_ms = http_started_at.elapsed().as_millis() as u64;
+        tracing::info!(
+            provider = "gemini",
+            model = %self.model,
+            status = response.status().as_u16(),
+            elapsed_ms = http_elapsed_ms,
+            "LLM HTTP response"
+        );
+
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
+            let excerpt: String = error_text.chars().take(512).collect();
+            tracing::warn!(
+                provider = "gemini",
+                model = %self.model,
+                status = status.as_u16(),
+                body_excerpt = %excerpt,
+                "LLM upstream non-2xx"
+            );
             return Err(if status == 401 || status == 403 {
                 LLMError::Authentication(error_text)
             } else if status == 429 {
@@ -363,8 +388,21 @@ impl LLMProvider for GeminiAdapter {
             .await
             .map_err(|e| LLMError::Network(format!("Failed to read response body: {e}")))?;
 
-        let gr: GeminiGenerateContentResponse = serde_json::from_slice(&body_bytes)
-            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
+        let gr: GeminiGenerateContentResponse =
+            serde_json::from_slice(&body_bytes).map_err(|e| {
+                let excerpt: String = String::from_utf8_lossy(&body_bytes)
+                    .chars()
+                    .take(512)
+                    .collect();
+                tracing::error!(
+                    provider = "gemini",
+                    model = %self.model,
+                    body_excerpt = %excerpt,
+                    parse_error = %e,
+                    "LLM response parse failure"
+                );
+                LLMError::Provider(format!("Failed to parse response: {e}"))
+            })?;
 
         if gr.candidates.is_empty() {
             return Err(LLMError::Provider(

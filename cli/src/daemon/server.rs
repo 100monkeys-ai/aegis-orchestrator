@@ -722,6 +722,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let _persister_handle = storage_event_persister.start();
     info!("Storage Event Persister started (audit trail enabled)");
 
+    // Initialize Execution Event Persister so all in-process ExecutionEvents
+    // (Supervisor IterationStarted/Completed, dispatch LlmInteraction/Failed,
+    // etc.) land in the `execution_events` table — not just the events the
+    // Temporal listener writes. Without this, `aegis.task.logs` returns an
+    // empty `events` array for any non-Temporal execution.
+    let execution_event_persister = Arc::new(
+        aegis_orchestrator_core::application::execution_event_persister::ExecutionEventPersister::new(
+            workflow_execution_repo.clone(),
+            event_bus.clone(),
+        ),
+    );
+    let _execution_persister_handle = execution_event_persister.start();
+
     // Initialize NFS Server Gateway (ADR-036)
     info!("Initializing NFS Server Gateway...");
     let nfs_bind_port = config
