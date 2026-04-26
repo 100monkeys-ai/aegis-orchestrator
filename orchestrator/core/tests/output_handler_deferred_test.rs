@@ -114,8 +114,14 @@ impl ExecutionService for UnusedExecutionService {
         )
     }
 
-    async fn get_execution(&self, _id: ExecutionId) -> anyhow::Result<Execution> {
-        unreachable!("get_execution must not be called for deferred output handler variants")
+    async fn get_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<Execution> {
+        unreachable!(
+            "get_execution_for_tenant must not be called for deferred output handler variants"
+        )
     }
 
     async fn get_execution_unscoped(&self, _id: ExecutionId) -> anyhow::Result<Execution> {
@@ -124,8 +130,14 @@ impl ExecutionService for UnusedExecutionService {
         )
     }
 
-    async fn get_iterations(&self, _exec_id: ExecutionId) -> anyhow::Result<Vec<Iteration>> {
-        unreachable!("get_iterations must not be called for deferred output handler variants")
+    async fn get_iterations_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _exec_id: ExecutionId,
+    ) -> anyhow::Result<Vec<Iteration>> {
+        unreachable!(
+            "get_iterations_for_tenant must not be called for deferred output handler variants"
+        )
     }
 
     async fn cancel_execution(&self, _id: ExecutionId) -> anyhow::Result<()> {

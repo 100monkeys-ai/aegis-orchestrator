@@ -125,7 +125,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
         config: &OutputHandlerConfig,
         final_output: &str,
         parent_execution_id: Option<&ExecutionId>,
-        _tenant_id: &TenantId,
+        tenant_id: &TenantId,
         intent: Option<&str>,
     ) -> Result<Option<String>, OutputHandlerError> {
         let handler_type = config.handler_type_name();
@@ -157,6 +157,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
                 parent_execution_id.copied(),
                 *timeout_seconds,
                 intent,
+                tenant_id,
             )
             .await
             .map_err(OutputHandlerError::from),
@@ -234,6 +235,7 @@ async fn invoke_agent_handler(
     parent_execution_id: Option<ExecutionId>,
     timeout_seconds: Option<u64>,
     intent: Option<&str>,
+    tenant_id: &TenantId,
 ) -> anyhow::Result<Option<String>> {
     // Resolve the agent by name or ID. Use the system tenant so global agents are always
     // visible regardless of the execution's tenant context.
@@ -293,7 +295,9 @@ async fn invoke_agent_handler(
     let max_attempts = (timeout_secs * 1000) / poll_interval_ms;
 
     for _ in 0..max_attempts {
-        let exec = execution_service.get_execution(child_exec_id).await?;
+        let exec = execution_service
+            .get_execution_for_tenant(tenant_id, child_exec_id)
+            .await?;
         match exec.status {
             ExecutionStatus::Completed => {
                 let output = exec.iterations().last().and_then(|it| it.output.clone());

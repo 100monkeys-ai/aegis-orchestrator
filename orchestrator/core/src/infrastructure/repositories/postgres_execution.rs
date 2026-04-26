@@ -150,6 +150,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
         tenant_id: &TenantId,
         id: ExecutionId,
     ) -> Result<Option<Execution>, RepositoryError> {
+        tracing::debug!(
+            target: "execution_lookup",
+            tenant_id = %tenant_id,
+            execution_id = %id,
+            "fetching execution"
+        );
         let row = sqlx::query(
             r#"
             SELECT
@@ -165,7 +171,25 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "execution_lookup",
+                tenant_id = %tenant_id,
+                execution_id = %id,
+                error = %e,
+                "execution lookup error"
+            );
+            RepositoryError::Database(e.to_string())
+        })?;
+
+        if row.is_none() {
+            tracing::warn!(
+                target: "execution_lookup",
+                tenant_id = %tenant_id,
+                execution_id = %id,
+                "execution not found in tenant scope"
+            );
+        }
 
         if let Some(row) = row {
             let id: uuid::Uuid = row.get("id");

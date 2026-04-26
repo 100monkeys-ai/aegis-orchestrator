@@ -602,7 +602,7 @@ impl ToolInvocationService {
 
                                 let exec = self
                                     .execution_service
-                                    .get_execution(exec_id)
+                                    .get_execution_for_tenant(tenant_id, exec_id)
                                     .await
                                     .map_err(|e| {
                                         SealSessionError::InternalError(format!(

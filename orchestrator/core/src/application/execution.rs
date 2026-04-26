@@ -128,38 +128,48 @@ pub trait ExecutionService: Send + Sync {
         parent_execution_id: ExecutionId,
     ) -> Result<ExecutionId>;
 
-    /// Retrieve the current state of an execution by ID.
+    /// Retrieve the current state of an execution by tenant and ID.
+    ///
+    /// All caller-facing execution lookups MUST be tenant-scoped. There is no
+    /// `get_execution(id)` convenience that defaults to a consumer tenant —
+    /// pass the parent's `TenantId` explicitly. Cross-tenant reads are
+    /// impossible by construction.
     ///
     /// # Errors
     ///
-    /// Returns an error if the execution does not exist.
-    async fn get_execution(&self, id: ExecutionId) -> Result<Execution>;
-
-    /// Retrieve the current state of an execution by tenant and ID.
-    ///
-    /// Default implementation falls back to [`ExecutionService::get_execution`]
-    /// for callers that do not require tenant scoping.
+    /// Returns an error if the execution does not exist within the given tenant.
     async fn get_execution_for_tenant(
         &self,
-        _tenant_id: &TenantId,
+        tenant_id: &TenantId,
         id: ExecutionId,
-    ) -> Result<Execution> {
-        self.get_execution(id).await
-    }
+    ) -> Result<Execution>;
 
     /// Retrieve an execution by ID without a tenant filter.
     ///
-    /// Internal service-to-service use only. The caller holds a trusted orchestrator-
-    /// provisioned ExecutionId and must use the returned execution's `tenant_id` field
-    /// for all downstream tenant-scoped operations.
+    /// **Internal orchestrator-to-orchestrator use only.** The caller MUST
+    /// already hold a trusted, orchestrator-provisioned `ExecutionId` (never a
+    /// user-supplied ID). The returned `Execution` carries its own `tenant_id`
+    /// field which the caller MUST use for all downstream tenant-scoped
+    /// operations (saves, child spawns, validators, etc.).
+    ///
+    /// This exists for the narrow set of internal flows that mutate state on
+    /// an execution they themselves provisioned (LLM-interaction recording,
+    /// trajectory persistence, policy-violation tracking, parent lookup
+    /// during child spawn). It is **not** to be called from polling loops or
+    /// any caller that has the parent tenant in scope — use
+    /// [`ExecutionService::get_execution_for_tenant`] instead.
     async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution>;
 
-    /// Return all [`Iteration`]s for a given execution in order.
+    /// Return all [`Iteration`]s for a given tenant + execution in order.
     ///
     /// # Errors
     ///
-    /// Returns an error if the execution does not exist.
-    async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>>;
+    /// Returns an error if the execution does not exist within the given tenant.
+    async fn get_iterations_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        exec_id: ExecutionId,
+    ) -> Result<Vec<Iteration>>;
 
     /// Request cancellation of a running execution.
     ///
@@ -287,8 +297,12 @@ impl StandardExecutionService {
         let tenant = payload
             .get("tenant_id")
             .and_then(|v| v.as_str())
-            .or_else(|| payload.get("tenant").and_then(|v| v.as_str()))
-            .unwrap_or(crate::domain::tenant::CONSUMER_SLUG);
+            .ok_or_else(|| {
+                anyhow!(
+                    "Missing required `tenant_id` in execution payload. Every execution \
+                     must carry an explicit tenant — there is no default."
+                )
+            })?;
         TenantId::from_string(tenant).map_err(|e| anyhow!("Invalid tenant_id '{tenant}': {e}"))
     }
 
@@ -2991,11 +3005,6 @@ impl ExecutionService for StandardExecutionService {
         .await
     }
 
-    async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
-        self.get_execution_for_tenant(&TenantId::consumer(), id)
-            .await
-    }
-
     async fn get_execution_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -3011,9 +3020,12 @@ impl ExecutionService for StandardExecutionService {
             .ok_or_else(|| anyhow!("Execution not found"))
     }
 
-    async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {
-        self.get_iterations_for_tenant(&TenantId::consumer(), exec_id)
-            .await
+    async fn get_iterations_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        exec_id: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        StandardExecutionService::get_iterations_for_tenant(self, tenant_id, exec_id).await
     }
 
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {

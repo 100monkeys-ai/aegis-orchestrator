@@ -193,6 +193,12 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         tenant_id: &TenantId,
         id: ExecutionId,
     ) -> Result<Option<WorkflowExecution>, RepositoryError> {
+        tracing::debug!(
+            target: "execution_lookup",
+            tenant_id = %tenant_id,
+            workflow_execution_id = %id,
+            "fetching workflow execution"
+        );
         let row = sqlx::query(
             r#"
             SELECT
@@ -208,7 +214,25 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "execution_lookup",
+                tenant_id = %tenant_id,
+                workflow_execution_id = %id,
+                error = %e,
+                "workflow execution lookup error"
+            );
+            RepositoryError::Database(e.to_string())
+        })?;
+
+        if row.is_none() {
+            tracing::warn!(
+                target: "execution_lookup",
+                tenant_id = %tenant_id,
+                workflow_execution_id = %id,
+                "workflow execution not found in tenant scope"
+            );
+        }
 
         if let Some(row) = row {
             let id: uuid::Uuid = row.get("id");

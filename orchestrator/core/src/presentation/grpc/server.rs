@@ -600,9 +600,13 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ValidateRequest>,
     ) -> Result<Response<ValidateResponse>, Status> {
-        let _identity = self
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/ValidateWithJudges")
             .await?;
+        let tenant_id = match auth {
+            Some((_id, tid, _sg)) => tid,
+            None => Self::tenant_id_from_request(None, &request),
+        };
         let req = request.into_inner();
 
         // Parse judge agent IDs and preserve per-judge weights (ADR-017)
@@ -680,6 +684,7 @@ impl AegisRuntime for AegisRuntimeService {
                 consensus_config,
                 DEFAULT_VALIDATION_TIMEOUT_SECS, // 300 second timeout
                 DEFAULT_VALIDATION_POLL_INTERVAL_MS, // 1000ms poll interval
+                &tenant_id,
             )
             .await
         {
@@ -2287,10 +2292,6 @@ mod tests {
             ))
         }
 
-        async fn get_execution(&self, _id: ExecutionId) -> Result<Execution> {
-            Err(anyhow!("get_execution not used in grpc server tests"))
-        }
-
         async fn get_execution_unscoped(&self, _id: ExecutionId) -> Result<Execution> {
             Err(anyhow!(
                 "get_execution_unscoped not used in grpc server tests"
@@ -2314,11 +2315,14 @@ mod tests {
             }
         }
 
-        async fn get_iterations(
+        async fn get_iterations_for_tenant(
             &self,
+            _tenant_id: &TenantId,
             _exec_id: ExecutionId,
         ) -> Result<Vec<crate::domain::execution::Iteration>> {
-            Err(anyhow!("get_iterations not used in grpc server tests"))
+            Err(anyhow!(
+                "get_iterations_for_tenant not used in grpc server tests"
+            ))
         }
 
         async fn cancel_execution(&self, _id: ExecutionId) -> Result<()> {

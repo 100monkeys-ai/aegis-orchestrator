@@ -1339,6 +1339,7 @@ impl ToolInvocationService {
                 }),
                 90,
                 500,
+                &tenant_id,
             )
             .await
             .map_err(|e| {

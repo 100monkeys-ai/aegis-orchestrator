@@ -58,7 +58,11 @@ impl ExecutionService for MockExecutionService {
     ) -> anyhow::Result<ExecutionId> {
         Ok(execution_id)
     }
-    async fn get_execution(&self, _id: ExecutionId) -> anyhow::Result<Execution> {
+    async fn get_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<Execution> {
         // Return a completed execution so ValidationService can parse output
         let mut exec = Execution::new(
             AgentId::new(),
@@ -97,7 +101,11 @@ impl ExecutionService for MockExecutionService {
     async fn get_execution_unscoped(&self, _id: ExecutionId) -> anyhow::Result<Execution> {
         anyhow::bail!("MockExecutionService::get_execution_unscoped not exercised in this test")
     }
-    async fn get_iterations(&self, _exec_id: ExecutionId) -> anyhow::Result<Vec<Iteration>> {
+    async fn get_iterations_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _exec_id: ExecutionId,
+    ) -> anyhow::Result<Vec<Iteration>> {
         let output = r#"
 ```json
 {

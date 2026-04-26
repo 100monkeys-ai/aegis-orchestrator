@@ -353,7 +353,7 @@ impl StandardStimulusService {
 
         // Poll for completion (RouterAgent is a single-iteration agent)
         let result = self
-            .await_execution_output(exec_id)
+            .await_execution_output(tenant_id, exec_id)
             .await
             .map_err(|e| StimulusError::RouterAgentFailed(e.to_string()))?;
 
@@ -398,6 +398,7 @@ impl StandardStimulusService {
     /// Respects `self.classification_timeout`.
     async fn await_execution_output(
         &self,
+        tenant_id: &crate::domain::shared_kernel::TenantId,
         exec_id: crate::domain::execution::ExecutionId,
     ) -> anyhow::Result<String> {
         let deadline = tokio::time::Instant::now() + self.classification_timeout;
@@ -411,7 +412,10 @@ impl StandardStimulusService {
                 );
             }
 
-            let execution = self.execution_service.get_execution(exec_id).await?;
+            let execution = self
+                .execution_service
+                .get_execution_for_tenant(tenant_id, exec_id)
+                .await?;
 
             match execution.status {
                 ExecutionStatus::Completed => {
@@ -690,7 +694,11 @@ mod tests {
             anyhow::bail!("start_child_execution not used in stimulus tests")
         }
 
-        async fn get_execution(&self, _id: ExecutionId) -> Result<Execution> {
+        async fn get_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<Execution> {
             self.execution
                 .lock()
                 .unwrap()
@@ -706,11 +714,12 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("execution not configured"))
         }
 
-        async fn get_iterations(
+        async fn get_iterations_for_tenant(
             &self,
+            _tenant_id: &TenantId,
             _exec_id: ExecutionId,
         ) -> Result<Vec<crate::domain::execution::Iteration>> {
-            anyhow::bail!("get_iterations not used in stimulus tests")
+            anyhow::bail!("get_iterations_for_tenant not used in stimulus tests")
         }
 
         async fn cancel_execution(&self, _id: ExecutionId) -> Result<()> {

@@ -371,14 +371,18 @@ impl ExecutionService for TestExecutionService {
     ) -> Result<ExecutionId> {
         anyhow::bail!("TestExecutionService::start_child_execution not exercised in this test")
     }
-    async fn get_execution(&self, _: ExecutionId) -> Result<Execution> {
-        anyhow::bail!("TestExecutionService::get_execution not exercised in this test")
+    async fn get_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("TestExecutionService::get_execution_for_tenant not exercised in this test")
     }
     async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
         anyhow::bail!("TestExecutionService::get_execution_unscoped not exercised in this test")
     }
-    async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
-        anyhow::bail!("TestExecutionService::get_iterations not exercised in this test")
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!("TestExecutionService::get_iterations_for_tenant not exercised in this test")
     }
     async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
         anyhow::bail!("TestExecutionService::cancel_execution not exercised in this test")
@@ -455,7 +459,7 @@ impl ExecutionService for LogsTestExecutionService {
         anyhow::bail!("LogsTestExecutionService::start_child_execution not exercised in this test")
     }
 
-    async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
+    async fn get_execution_for_tenant(&self, _: &TenantId, id: ExecutionId) -> Result<Execution> {
         if self.execution.id == id {
             Ok(self.execution.clone())
         } else {
@@ -471,8 +475,14 @@ impl ExecutionService for LogsTestExecutionService {
         }
     }
 
-    async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
-        anyhow::bail!("LogsTestExecutionService::get_iterations not exercised in this test")
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!(
+            "LogsTestExecutionService::get_iterations_for_tenant not exercised in this test"
+        )
     }
 
     async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
@@ -2855,7 +2865,11 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
             anyhow::bail!("not exercised")
         }
 
-        async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
+        async fn get_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            id: ExecutionId,
+        ) -> Result<Execution> {
             if self.execution.id == id {
                 Ok(self.execution.clone())
             } else {
@@ -2871,7 +2885,11 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
             }
         }
 
-        async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
+        async fn get_iterations_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Vec<Iteration>> {
             anyhow::bail!("not exercised")
         }
 

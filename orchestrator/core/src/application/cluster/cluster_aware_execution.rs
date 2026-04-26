@@ -280,10 +280,6 @@ impl ExecutionService for ClusterAwareExecutionService {
             .await
     }
 
-    async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
-        self.inner.get_execution(id).await
-    }
-
     async fn get_execution_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -296,8 +292,14 @@ impl ExecutionService for ClusterAwareExecutionService {
         self.inner.get_execution_unscoped(id).await
     }
 
-    async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {
-        self.inner.get_iterations(exec_id).await
+    async fn get_iterations_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        exec_id: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        self.inner
+            .get_iterations_for_tenant(tenant_id, exec_id)
+            .await
     }
 
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {

@@ -105,6 +105,7 @@ impl ValidationService {
         config: Option<ConsensusConfig>,
         timeout_seconds: u64,
         poll_interval_ms: u64,
+        tenant_id: &TenantId,
     ) -> Result<MultiJudgeConsensus> {
         if judges.is_empty() {
             return Err(anyhow!("No judges provided for validation"));
@@ -136,6 +137,7 @@ impl ValidationService {
             let timeout = timeout_seconds;
             let poll_interval = poll_interval_ms;
             let parent_id = execution_id;
+            let tenant = tenant_id.clone();
 
             futures.push(tokio::spawn(async move {
                 match Self::run_judge(
@@ -144,6 +146,7 @@ impl ValidationService {
                     judge,
                     req,
                     parent_id,
+                    tenant,
                     timeout,
                     poll_interval,
                 )
@@ -211,12 +214,14 @@ impl ValidationService {
         Ok(consensus)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_judge(
         service: Arc<dyn ExecutionService>,
         lifecycle: Arc<dyn AgentLifecycleService>,
         judge_id: AgentId,
         request: ValidationRequest,
         parent_execution_id: ExecutionId,
+        tenant_id: TenantId,
         timeout_seconds: u64,
         poll_interval_ms: u64,
     ) -> Result<(AgentId, GradientResult)> {
@@ -309,7 +314,9 @@ impl ValidationService {
                 ));
             }
 
-            let exec = service.get_execution(exec_id).await?;
+            let exec = service
+                .get_execution_for_tenant(&tenant_id, exec_id)
+                .await?;
             match exec.status {
                 ExecutionStatus::Completed => {
                     let last_iter = exec
@@ -594,7 +601,7 @@ impl GradientValidator for SemanticAgentValidator {
         let tool_audit_history = ctx.tool_trajectory.clone();
         let current_iter = self
             .execution_service
-            .get_execution(self.parent_execution_id)
+            .get_execution_for_tenant(&self.tenant_id, self.parent_execution_id)
             .await
             .ok()
             .and_then(|execution| execution.current_iteration().cloned());
@@ -647,7 +654,10 @@ impl GradientValidator for SemanticAgentValidator {
                     self.timeout_seconds
                 ));
             }
-            let exec = self.execution_service.get_execution(exec_id).await?;
+            let exec = self
+                .execution_service
+                .get_execution_for_tenant(&self.tenant_id, exec_id)
+                .await?;
             match exec.status {
                 ExecutionStatus::Completed => {
                     let last_iter = exec
@@ -775,6 +785,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
             let parent_id = self.parent_execution_id;
             let timeout = self.timeout_seconds;
             let poll_interval = self.poll_interval_ms;
+            let tenant = self.tenant_id.clone();
 
             futures.push(tokio::spawn(async move {
                 let exec_input = ExecutionInput {
@@ -797,7 +808,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                             "Judge timed out after {timeout} seconds"
                         ));
                     }
-                    let exec = svc.get_execution(exec_id).await?;
+                    let exec = svc.get_execution_for_tenant(&tenant, exec_id).await?;
                     match exec.status {
                         ExecutionStatus::Completed => {
                             let last_iter = exec
