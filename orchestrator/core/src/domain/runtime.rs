@@ -281,6 +281,28 @@ pub enum RuntimeError {
         /// Wall-clock budget in seconds that elapsed before timeout.
         timeout_secs: u64,
     },
+    /// The host-side FUSE daemon's `Mount` RPC did not return within
+    /// `FUSE_MOUNT_TIMEOUT_SECS`. Surfaces a wedged FUSE daemon as a fast,
+    /// typed failure rather than an unbounded silent hang in spawn().
+    #[error("FUSE Mount RPC for execution {execution_id} volume {volume_id} timed out after {timeout_secs} seconds")]
+    FuseMountTimeout {
+        /// Execution whose volume mount stalled.
+        execution_id: String,
+        /// Volume identifier the daemon was asked to mount.
+        volume_id: String,
+        /// Wall-clock budget in seconds that elapsed before timeout.
+        timeout_secs: u64,
+    },
+    /// The pre-spawn FUSE daemon `Health` probe reported the daemon as
+    /// unhealthy (or did not respond within the probe budget). Surfaces a
+    /// degraded daemon to the iteration error path before any Mount RPC is
+    /// issued, so the user run fails fast with a diagnostic error class.
+    #[error("FUSE daemon reported unhealthy: {reason}")]
+    FuseDaemonUnhealthy {
+        /// Human-readable reason — typically degraded mount counts or a probe
+        /// timeout reported by the orchestrator-side health check.
+        reason: String,
+    },
     /// The execution was cancelled via [`crate::application::execution::ExecutionService::cancel_execution`].
     /// The Supervisor observed the cancellation token and terminated the running instance.
     #[error("Execution was cancelled")]

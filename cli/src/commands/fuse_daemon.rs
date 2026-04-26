@@ -26,10 +26,11 @@ use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_ser
     FuseMountService, FuseMountServiceServer,
 };
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::{
-    FuseMountRequest, FuseMountResponse, FuseUnmountRequest, FuseUnmountResponse,
+    FuseHealthRequest, FuseHealthResponse, FuseMountRequest, FuseMountResponse, FuseUnmountRequest,
+    FuseUnmountResponse,
 };
 use aegis_orchestrator_core::infrastructure::fuse::daemon::{
-    FuseFsalDaemon, FuseMountHandle, FuseVolumeContext,
+    DegradedMountRegistry, FuseFsalDaemon, FuseMountHandle, FuseVolumeContext,
 };
 use aegis_orchestrator_core::infrastructure::fuse::grpc_backend::GrpcFsalBackend;
 
@@ -52,9 +53,6 @@ pub enum FuseDaemonCommand {
         listen_addr: String,
     },
 
-    /// Stop a running FUSE daemon
-    Stop,
-
     /// Check FUSE daemon status
     Status,
 }
@@ -68,6 +66,9 @@ struct FuseMountServiceImpl {
     daemon: Arc<FuseFsalDaemon>,
     mount_prefix: String,
     handles: MountHandleMap,
+    /// Daemon-wide degraded-mount registry, shared with the in-process
+    /// `FuseFsalDaemon` instance. Read by the `Health` RPC.
+    degraded_registry: DegradedMountRegistry,
 }
 
 fn mount_key(execution_id: &str, volume_id: &str) -> String {
@@ -229,6 +230,100 @@ impl FuseMountService for FuseMountServiceImpl {
 
         Ok(Response::new(FuseUnmountResponse { unmounted }))
     }
+
+    async fn health(
+        &self,
+        _request: Request<FuseHealthRequest>,
+    ) -> Result<Response<FuseHealthResponse>, Status> {
+        // Pure registry reads — must return in microseconds. NEVER block on
+        // I/O here; this RPC is the orchestrator's pre-spawn liveness probe.
+        let handles = self.handles.read().await;
+        let degraded = self.degraded_registry.read().await;
+
+        let active_mount_count = handles.len() as u64;
+        let degraded_mount_count = degraded.len() as u64;
+        let oldest_mount_age_secs = handles
+            .values()
+            .map(|h| h.created_at().elapsed().as_secs())
+            .max()
+            .unwrap_or(0);
+        let healthy = degraded_mount_count == 0;
+
+        Ok(Response::new(FuseHealthResponse {
+            healthy,
+            active_mount_count,
+            degraded_mount_count,
+            oldest_mount_age_secs,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }))
+    }
+}
+
+/// Lazy-unmount every active FUSE mount in the handle map. Used by the
+/// SIGTERM handler so that restarting the daemon (`make install-cli`,
+/// systemd, or operator-initiated) always releases kernel mount state —
+/// preventing the orphan-D-state class of incidents this commit fixes.
+///
+/// Extracted as a free `pub(crate)` function so it can be unit-tested
+/// without spawning a full gRPC server + signal-handling stack.
+pub(crate) async fn shutdown_lazy_unmount(handles: MountHandleMap) -> Vec<(String, bool)> {
+    let mountpoints: Vec<String> = {
+        let guard = handles.read().await;
+        guard.values().map(|h| h.mountpoint().to_string()).collect()
+    };
+
+    let mut results = Vec::with_capacity(mountpoints.len());
+    for path in &mountpoints {
+        // Try fusermount -uz first (the standard FUSE umount path), fall back
+        // to umount -l. Either flavour performs a lazy unmount: the mount is
+        // detached from the filesystem hierarchy immediately and references
+        // are cleaned up when they drop. This is the failure mode that fixes
+        // the orphan-PID incident.
+        let ok = match std::process::Command::new("fusermount")
+            .args(["-uz", path])
+            .output()
+        {
+            Ok(out) if out.status.success() => true,
+            _ => std::process::Command::new("umount")
+                .args(["-l", path])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false),
+        };
+        info!(
+            target: "fuse_health",
+            path = %path,
+            success = ok,
+            "lazy-unmounted FUSE mount during shutdown"
+        );
+        results.push((path.clone(), ok));
+    }
+
+    // Drop the handle map (which triggers per-handle Drop -> fuser session
+    // destroy on what's left).
+    handles.write().await.clear();
+    results
+}
+
+/// Awaits SIGTERM or SIGINT (whichever arrives first), then returns. Used by
+/// the gRPC server's `serve_with_shutdown` so we can run cleanup on a clean
+/// signal instead of relying on Drop-on-process-exit.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut intr = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => info!("FUSE daemon received SIGTERM"),
+            _ = intr.recv() => info!("FUSE daemon received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("FUSE daemon received Ctrl-C");
+    }
 }
 
 pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -> Result<()> {
@@ -291,10 +386,15 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
 
             let handles: MountHandleMap = Arc::new(RwLock::new(HashMap::new()));
 
+            // Share the daemon's degraded registry with the gRPC service so
+            // the Health RPC can report `degraded_mount_count`.
+            let degraded_registry = daemon.degraded_registry();
+
             let service = FuseMountServiceImpl {
                 daemon,
                 mount_prefix: mount_prefix.clone(),
                 handles: handles.clone(),
+                degraded_registry: degraded_registry.clone(),
             };
 
             // Spawn periodic mount reaper — cleans up orphaned FUSE mount
@@ -331,25 +431,55 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
                 }
             });
 
+            // Periodic FUSE daemon heartbeat. Wedge events become visible in
+            // real time: a wedged daemon stops emitting these so Loki can
+            // alert without us having to add a Prometheus scrape path.
+            let heartbeat_handles = handles.clone();
+            let heartbeat_registry = degraded_registry.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    let mounts_guard = heartbeat_handles.read().await;
+                    let degraded_count = heartbeat_registry.read().await.len();
+                    let oldest_mount_age_secs = mounts_guard
+                        .values()
+                        .map(|h| h.created_at().elapsed().as_secs())
+                        .max()
+                        .unwrap_or(0);
+                    info!(
+                        target: "fuse_health",
+                        active_mount_count = mounts_guard.len(),
+                        degraded_mount_count = degraded_count,
+                        oldest_mount_age_secs = oldest_mount_age_secs,
+                        "fuse daemon heartbeat"
+                    );
+                }
+            });
+
             println!(
                 "{}",
                 format!("AEGIS FUSE daemon listening on {listen_addr}").green()
             );
 
-            Server::builder()
+            // Run gRPC server until SIGTERM/SIGINT, then lazy-unmount every
+            // active mount before exiting so the kernel never holds dangling
+            // FUSE mounts after a daemon restart.
+            let shutdown_handles = handles.clone();
+            let server_result = Server::builder()
                 .add_service(FuseMountServiceServer::new(service))
-                .serve(addr)
-                .await
-                .context("FUSE daemon gRPC server failed")?;
+                .serve_with_shutdown(addr, shutdown_signal())
+                .await;
 
-            Ok(())
-        }
-        FuseDaemonCommand::Stop => {
-            // TODO: Implement graceful shutdown via PID file or signal
-            eprintln!(
-                "{}",
-                "FUSE daemon stop not yet implemented — use SIGTERM".yellow()
+            info!("FUSE daemon shutting down; lazy-unmounting all active mounts");
+            let unmount_results = shutdown_lazy_unmount(shutdown_handles).await;
+            info!(
+                count = unmount_results.len(),
+                "FUSE daemon shutdown lazy-unmount complete"
             );
+
+            server_result.context("FUSE daemon gRPC server failed")?;
+
             Ok(())
         }
         FuseDaemonCommand::Status => {
@@ -362,7 +492,10 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
 
 #[cfg(test)]
 mod tests {
-    use super::mount_key;
+    use super::{mount_key, shutdown_lazy_unmount, MountHandleMap};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     /// Regression: wildcard unmount must correctly identify all mount keys
     /// matching a given volume_id, regardless of execution_id. Before this fix,
@@ -419,6 +552,25 @@ mod tests {
             key_1,
             mount_key(exec_1, volume_id),
             "same inputs must produce identical keys"
+        );
+    }
+
+    /// Regression: `shutdown_lazy_unmount` on an empty handle map must
+    /// return cleanly (zero iterations, empty result vec) without
+    /// invoking any external commands. This validates the happy-path
+    /// branch the SIGTERM handler hits when no mounts are active.
+    #[tokio::test]
+    async fn shutdown_lazy_unmount_empty_map_succeeds() {
+        let handles: MountHandleMap = Arc::new(RwLock::new(HashMap::new()));
+        let results = shutdown_lazy_unmount(handles.clone()).await;
+        assert!(
+            results.is_empty(),
+            "empty handle map must produce zero unmount results"
+        );
+        assert_eq!(
+            handles.read().await.len(),
+            0,
+            "handle map must remain empty after shutdown"
         );
     }
 }

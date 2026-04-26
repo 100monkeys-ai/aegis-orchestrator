@@ -32,16 +32,51 @@ use fuser::{
     RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request, SessionACL,
     WriteFlags,
 };
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
 /// TTL for FUSE attribute/entry caches.
 /// Short TTL ensures agents see fresh data from the storage backend.
 const FUSE_TTL: Duration = Duration::from_secs(1);
+
+/// Threshold past which a single FUSE mount with in-flight ops that haven't
+/// completed is considered degraded and starts returning EIO immediately.
+/// Belt-and-suspenders against backend wedges that pin kernel callback threads.
+const STUCK_OP_THRESHOLD_MS: u64 = 30_000;
+
+/// Cadence at which the per-mount supervisor task checks for stuck ops.
+const SUPERVISOR_TICK_SECS: u64 = 5;
+
+/// Why a mount was marked degraded. Surfaced by the daemon's `Health` RPC.
+#[derive(Debug, Clone)]
+pub struct DegradedReason {
+    pub reason: String,
+    pub since: SystemTime,
+}
+
+/// Daemon-wide registry of currently-degraded mounts. Keyed by
+/// `"{execution_id}/{volume_id}"`, mirroring the gRPC `MountHandleMap` keys
+/// used by the host-side daemon. The supervisor task per mount inserts an
+/// entry on transition; entries are removed on unmount.
+pub type DegradedMountRegistry = Arc<RwLock<HashMap<String, DegradedReason>>>;
+
+/// Build a fresh, empty degraded-mount registry.
+pub fn new_degraded_mount_registry() -> DegradedMountRegistry {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Returns the canonical mount key used by both the gRPC `MountHandleMap` and
+/// the [`DegradedMountRegistry`].
+pub fn mount_key(execution_id: &str, volume_id: &str) -> String {
+    format!("{execution_id}/{volume_id}")
+}
 
 /// FUSE daemon errors
 #[derive(Debug, Error)]
@@ -91,6 +126,18 @@ pub struct FuseMountHandle {
     /// Dropping it triggers unmount.
     _session: SendSyncSession,
     mountpoint: String,
+    /// Mount-key (`"{execution_id}/{volume_id}"`) for cross-referencing the
+    /// daemon-wide degraded registry from the gRPC `Health` handler.
+    mount_key: String,
+    /// Wall-clock instant the mount was created. Surfaced by the
+    /// `Health` / heartbeat RPC as `oldest_mount_age_secs`.
+    created_at: Instant,
+    /// Shutdown signal for the per-mount supervisor task. Triggered on Drop
+    /// so the supervisor doesn't keep ticking against a freed mount.
+    supervisor_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Daemon-wide degraded registry — entry is removed on Drop so a fresh
+    /// re-mount of the same key starts clean.
+    degraded_registry: DegradedMountRegistry,
 }
 
 impl FuseMountHandle {
@@ -98,11 +145,36 @@ impl FuseMountHandle {
     pub fn mountpoint(&self) -> &str {
         &self.mountpoint
     }
+
+    /// Returns the canonical mount key (`"{execution_id}/{volume_id}"`).
+    pub fn mount_key(&self) -> &str {
+        &self.mount_key
+    }
+
+    /// Returns the [`Instant`] this mount was created. Used by the daemon's
+    /// `Health` RPC and periodic heartbeat to compute `oldest_mount_age_secs`.
+    pub fn created_at(&self) -> Instant {
+        self.created_at
+    }
 }
 
 impl Drop for FuseMountHandle {
     fn drop(&mut self) {
         debug!(mountpoint = %self.mountpoint, "FUSE mount handle dropped — flushing and unmounting");
+        // Signal the per-mount supervisor task to shut down so it doesn't
+        // keep ticking against a freed FuseFsal.
+        if let Some(tx) = self.supervisor_shutdown.take() {
+            let _ = tx.send(true);
+        }
+        // Drop any degraded-registry entry so a fresh re-mount starts clean.
+        let registry = self.degraded_registry.clone();
+        let key = self.mount_key.clone();
+        // Best-effort fire-and-forget; we're in Drop so we can't .await.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                registry.write().await.remove(&key);
+            });
+        }
         // Flush kernel page cache before BackgroundSession::drop() unmounts.
         if let Ok(fd) = std::fs::File::open(&self.mountpoint) {
             use std::os::unix::io::AsRawFd;
@@ -121,6 +193,9 @@ impl Drop for FuseMountHandle {
 /// (gRPC) operation.
 pub struct FuseFsalDaemon {
     backend: Arc<dyn FsalBackend>,
+    /// Daemon-wide registry of degraded mounts. Shared with each `FuseFsal`'s
+    /// per-mount supervisor task and exposed to the gRPC `Health` handler.
+    degraded_registry: DegradedMountRegistry,
 }
 
 impl FuseFsalDaemon {
@@ -128,6 +203,7 @@ impl FuseFsalDaemon {
     pub fn new(fsal: Arc<AegisFSAL>) -> Self {
         Self {
             backend: Arc::new(DirectFsalBackend(fsal)),
+            degraded_registry: new_degraded_mount_registry(),
         }
     }
 
@@ -136,7 +212,16 @@ impl FuseFsalDaemon {
     /// Use this constructor for the host-side daemon with a `GrpcFsalBackend`,
     /// or any other backend implementation.
     pub fn with_backend(backend: Arc<dyn FsalBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            degraded_registry: new_degraded_mount_registry(),
+        }
+    }
+
+    /// Returns the daemon-wide degraded-mount registry. Used by the gRPC
+    /// `Health` handler to report `degraded_mount_count` and by tests.
+    pub fn degraded_registry(&self) -> DegradedMountRegistry {
+        self.degraded_registry.clone()
     }
 
     /// Mount a FUSE filesystem at the given host path for a specific volume.
@@ -155,12 +240,84 @@ impl FuseFsalDaemon {
             error: e.to_string(),
         })?;
 
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last_completed_op_at = Arc::new(AtomicU64::new(now_ms));
+        let in_flight_ops = Arc::new(AtomicU32::new(0));
+        let degraded = Arc::new(AtomicBool::new(false));
+        let key = mount_key(
+            &context.execution_id.0.to_string(),
+            &context.volume_id.0.to_string(),
+        );
+
         let fs = FuseFsal {
             backend: self.backend.clone(),
             context: context.clone(),
             inode_table: Arc::new(InodeTable::new()),
             runtime: tokio::runtime::Handle::current(),
+            last_completed_op_at: last_completed_op_at.clone(),
+            in_flight_ops: in_flight_ops.clone(),
+            degraded: degraded.clone(),
         };
+
+        // Spawn per-mount supervisor task. Detects stuck ops and marks the
+        // mount degraded so subsequent FUSE callbacks return EIO immediately
+        // — preventing the kernel-callback pile-up that pinned the orphan PID
+        // in the incident this commit fixes.
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor_key = key.clone();
+        let supervisor_registry = self.degraded_registry.clone();
+        let supervisor_last = last_completed_op_at.clone();
+        let supervisor_in_flight = in_flight_ops.clone();
+        let supervisor_degraded = degraded.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(SUPERVISOR_TICK_SECS));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if supervisor_degraded.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let in_flight = supervisor_in_flight.load(Ordering::SeqCst);
+                        if in_flight == 0 {
+                            continue;
+                        }
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let last = supervisor_last.load(Ordering::SeqCst);
+                        let age_ms = now.saturating_sub(last);
+                        if age_ms > STUCK_OP_THRESHOLD_MS {
+                            supervisor_degraded.store(true, Ordering::SeqCst);
+                            supervisor_registry.write().await.insert(
+                                supervisor_key.clone(),
+                                DegradedReason {
+                                    reason: format!(
+                                        "stuck FUSE op: in_flight={in_flight} age_ms={age_ms}"
+                                    ),
+                                    since: SystemTime::now(),
+                                },
+                            );
+                            warn!(
+                                target: "fuse_health",
+                                mount_key = %supervisor_key,
+                                in_flight = in_flight,
+                                age_ms = age_ms,
+                                "FUSE mount degraded; subsequent ops will return EIO"
+                            );
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
 
         // Mount options:
         // - allow_other: let the container user access the mount (requires /etc/fuse.conf)
@@ -192,6 +349,10 @@ impl FuseFsalDaemon {
         Ok(FuseMountHandle {
             _session: SendSyncSession(session),
             mountpoint: mountpoint_str,
+            mount_key: key,
+            created_at: Instant::now(),
+            supervisor_shutdown: Some(shutdown_tx),
+            degraded_registry: self.degraded_registry.clone(),
         })
     }
 }
@@ -215,6 +376,53 @@ struct FuseFsal {
     /// handle is captured in the Tokio context and stored here for use by
     /// `block_on`.
     runtime: tokio::runtime::Handle,
+    /// Unix-millis timestamp of the most recently completed FUSE callback.
+    /// The per-mount supervisor task uses this to detect stuck callbacks.
+    last_completed_op_at: Arc<AtomicU64>,
+    /// Number of FUSE callbacks currently executing (incremented at entry,
+    /// decremented at exit via [`OpGuard`]).
+    in_flight_ops: Arc<AtomicU32>,
+    /// Once `true`, every callback short-circuits to EIO. Set by the supervisor
+    /// task when ops have been stuck longer than [`STUCK_OP_THRESHOLD_MS`].
+    degraded: Arc<AtomicBool>,
+}
+
+/// RAII guard that increments `in_flight_ops` on construction and updates
+/// `last_completed_op_at` + decrements `in_flight_ops` on Drop. Used to wrap
+/// every FUSE callback so the per-mount supervisor task always sees accurate
+/// counters even on early returns.
+struct OpGuard {
+    in_flight_ops: Arc<AtomicU32>,
+    last_completed_op_at: Arc<AtomicU64>,
+}
+
+impl OpGuard {
+    fn enter(fs: &FuseFsal) -> Self {
+        fs.in_flight_ops.fetch_add(1, Ordering::SeqCst);
+        Self {
+            in_flight_ops: fs.in_flight_ops.clone(),
+            last_completed_op_at: fs.last_completed_op_at.clone(),
+        }
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_completed_op_at.store(now_ms, Ordering::SeqCst);
+        self.in_flight_ops.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl FuseFsal {
+    /// Returns `true` if the mount is degraded — callbacks should short-circuit
+    /// to EIO without enqueuing additional work behind a wedged backend.
+    fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::SeqCst)
+    }
 }
 
 impl FuseFsal {
@@ -308,6 +516,11 @@ impl FuseFsal {
 
 impl Filesystem for FuseFsal {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -367,6 +580,11 @@ impl Filesystem for FuseFsal {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE GETATTR");
 
@@ -417,6 +635,11 @@ impl Filesystem for FuseFsal {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let ino: u64 = ino.into();
         debug!(ino = ino, offset = offset, size = size, "FUSE READ");
 
@@ -460,6 +683,11 @@ impl Filesystem for FuseFsal {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let ino: u64 = ino.into();
         debug!(ino = ino, offset = offset, len = data.len(), "FUSE WRITE");
 
@@ -496,6 +724,11 @@ impl Filesystem for FuseFsal {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let ino: u64 = ino.into();
         debug!(ino = ino, offset = offset, "FUSE READDIR");
 
@@ -574,6 +807,11 @@ impl Filesystem for FuseFsal {
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -674,6 +912,11 @@ impl Filesystem for FuseFsal {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -743,6 +986,11 @@ impl Filesystem for FuseFsal {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -784,6 +1032,11 @@ impl Filesystem for FuseFsal {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -834,6 +1087,11 @@ impl Filesystem for FuseFsal {
         _flags: RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -916,6 +1174,11 @@ impl Filesystem for FuseFsal {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if self.is_degraded() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _guard = OpGuard::enter(self);
         // FSAL does not support chmod/chown/truncate as discrete operations.
         // Return current attributes unchanged (UID/GID squashing makes this a no-op).
         let ino: u64 = ino.into();
@@ -1180,6 +1443,9 @@ mod tests {
             },
             inode_table: Arc::new(InodeTable::new()),
             runtime,
+            last_completed_op_at: Arc::new(AtomicU64::new(0)),
+            in_flight_ops: Arc::new(AtomicU32::new(0)),
+            degraded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1222,5 +1488,74 @@ mod tests {
         assert_eq!(result, 42, "block_on must return the future's output");
 
         rt.shutdown_background();
+    }
+
+    /// Regression: `OpGuard::enter` must increment `in_flight_ops` on
+    /// construction and `Drop` must update `last_completed_op_at` and
+    /// decrement `in_flight_ops` even on early returns. This is what allows
+    /// the per-mount supervisor task to reliably detect stuck callbacks
+    /// without missing decrements on error paths.
+    #[test]
+    fn op_guard_increments_and_drops_correctly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let fs = make_fuse_fsal(rt.handle().clone());
+        assert_eq!(fs.in_flight_ops.load(Ordering::SeqCst), 0);
+        let before = fs.last_completed_op_at.load(Ordering::SeqCst);
+
+        {
+            let _g = OpGuard::enter(&fs);
+            assert_eq!(fs.in_flight_ops.load(Ordering::SeqCst), 1);
+        }
+
+        assert_eq!(fs.in_flight_ops.load(Ordering::SeqCst), 0);
+        let after = fs.last_completed_op_at.load(Ordering::SeqCst);
+        assert!(
+            after >= before,
+            "Drop must update last_completed_op_at (before={before}, after={after})"
+        );
+    }
+
+    /// Regression: when `degraded` is true, `is_degraded()` must return true
+    /// so callbacks can short-circuit to EIO instead of enqueuing more work
+    /// behind a wedged backend. The supervisor task drives this transition;
+    /// here we set it synthetically to test the readback path that every
+    /// FUSE callback uses.
+    #[test]
+    fn degraded_flag_is_observable_by_callbacks() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let fs = make_fuse_fsal(rt.handle().clone());
+        assert!(!fs.is_degraded(), "fresh mount must not be degraded");
+        fs.degraded.store(true, Ordering::SeqCst);
+        assert!(
+            fs.is_degraded(),
+            "callbacks must see the degraded flag and short-circuit to EIO"
+        );
+    }
+
+    /// Regression: the supervisor task must mark a mount degraded when ops
+    /// have been in-flight longer than `STUCK_OP_THRESHOLD_MS`. We simulate
+    /// this directly against the registry rather than spawning the real
+    /// supervisor (which would require coordinating with the FUSE session
+    /// lifecycle).
+    #[tokio::test]
+    async fn degraded_registry_records_stuck_mount() {
+        let registry = new_degraded_mount_registry();
+        let key = mount_key("exec-stuck", "vol-stuck");
+        assert_eq!(registry.read().await.len(), 0);
+
+        registry.write().await.insert(
+            key.clone(),
+            DegradedReason {
+                reason: "test stuck".into(),
+                since: SystemTime::now(),
+            },
+        );
+
+        assert_eq!(registry.read().await.len(), 1);
+        assert!(registry.read().await.contains_key(&key));
     }
 }

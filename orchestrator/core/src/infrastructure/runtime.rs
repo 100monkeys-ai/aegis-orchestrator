@@ -87,6 +87,61 @@ const AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL: &str = "aegis.keep_container_on_fai
 const AEGIS_MANAGED_LABEL: &str = "aegis.managed";
 const AEGIS_RUNTIME_LABEL: &str = "aegis.runtime";
 
+/// Wall-clock budget for the host-side FUSE daemon's `Mount` RPC. A wedged
+/// daemon is surfaced as [`RuntimeError::FuseMountTimeout`] after this many
+/// seconds rather than blocking the spawn path indefinitely (belt-and-suspenders
+/// against the orphan-D-state class of incidents).
+pub(crate) const FUSE_MOUNT_TIMEOUT_SECS: u64 = 30;
+
+/// Wall-clock budget for the host-side FUSE daemon's `Unmount` RPC. Slightly
+/// more generous than the previous 5s value so a momentarily-slow daemon
+/// doesn't trip a false leak alarm. Unmount timeouts are non-fatal — they log
+/// `error!(target: "fuse_health", step = "unmount_timeout")` and continue.
+pub(crate) const FUSE_UNMOUNT_TIMEOUT_SECS: u64 = 10;
+
+/// Wall-clock budget for the pre-spawn `Health` probe. Tight by design — the
+/// probe is a pure registry read on the daemon side and must return in
+/// microseconds; a 2s ceiling means a wedged daemon is detected fast.
+pub(crate) const FUSE_HEALTH_TIMEOUT_SECS: u64 = 2;
+
+/// Wrap a FUSE Mount call in [`FUSE_MOUNT_TIMEOUT_SECS`] and map the
+/// elapsed-deadline branch to [`RuntimeError::FuseMountTimeout`].
+///
+/// Extracted as a free function so the timeout semantics can be unit-tested
+/// without stubbing the full `FuseMountServiceClient` — same fallback pattern
+/// as `run_pull_with_timeout` for image pulls.
+pub(crate) async fn run_fuse_mount_with_timeout<F, T>(
+    execution_id: &str,
+    volume_id: &str,
+    timeout_secs: u64,
+    fut: F,
+) -> Result<T, RuntimeError>
+where
+    F: std::future::Future<Output = Result<T, tonic::Status>>,
+{
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(status)) => Err(RuntimeError::SpawnFailed(format!(
+            "FUSE Mount RPC failed for execution {execution_id} volume {volume_id}: {status}"
+        ))),
+        Err(_elapsed) => {
+            error!(
+                target: "runtime_spawn",
+                step = "fuse_mount_timeout",
+                execution_id = %execution_id,
+                volume_id = %volume_id,
+                timeout_secs = timeout_secs,
+                "FUSE daemon Mount RPC timed out — daemon likely wedged"
+            );
+            Err(RuntimeError::FuseMountTimeout {
+                execution_id: execution_id.to_string(),
+                volume_id: volume_id.to_string(),
+                timeout_secs,
+            })
+        }
+    }
+}
+
 /// Detected container engine, including version reported by `/version`.
 ///
 /// Production runtime is rootless Podman (ADR-067); Docker is the dev fallback.
@@ -840,6 +895,94 @@ impl AgentRuntime for ContainerRuntime {
                 // unmount on the remote FUSE daemon after the container exits.
                 let mut pending_grpc_fuse_pairs: Vec<(String, String)> = Vec::new();
 
+                // Pre-spawn FUSE daemon health probe (belt-and-suspenders).
+                // Fails fast with FuseDaemonUnhealthy before the first Mount
+                // RPC if the daemon is degraded or unreachable. Gracefully
+                // tolerates daemons that don't yet implement Health (older
+                // builds): NotFound / Unimplemented are treated as "skip
+                // probe, proceed with the 30s mount timeout below".
+                info!(
+                    target: "fuse_health",
+                    step = "health_probe",
+                    execution_id = %config.execution_id,
+                    "checking FUSE daemon health pre-mount"
+                );
+                let health_req = crate::infrastructure::aegis_runtime_proto::FuseHealthRequest {};
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(FUSE_HEALTH_TIMEOUT_SECS),
+                    client.health(health_req),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => {
+                        let h = resp.into_inner();
+                        if !h.healthy {
+                            error!(
+                                target: "fuse_health",
+                                step = "daemon_unhealthy",
+                                active_mounts = h.active_mount_count,
+                                degraded_mounts = h.degraded_mount_count,
+                                "FUSE daemon reported unhealthy"
+                            );
+                            return Err(RuntimeError::FuseDaemonUnhealthy {
+                                reason: format!(
+                                    "active={} degraded={} oldest_age_secs={}",
+                                    h.active_mount_count,
+                                    h.degraded_mount_count,
+                                    h.oldest_mount_age_secs
+                                ),
+                            });
+                        }
+                        info!(
+                            target: "fuse_health",
+                            step = "daemon_healthy",
+                            active_mounts = h.active_mount_count,
+                            degraded_mounts = h.degraded_mount_count,
+                            oldest_mount_age_secs = h.oldest_mount_age_secs,
+                            version = %h.version,
+                            "FUSE daemon healthy"
+                        );
+                    }
+                    Ok(Err(status))
+                        if matches!(
+                            status.code(),
+                            tonic::Code::Unimplemented | tonic::Code::NotFound
+                        ) =>
+                    {
+                        // Daemon predates the Health RPC. Skip probe and rely
+                        // on the per-Mount 30s timeout below.
+                        debug!(
+                            target: "fuse_health",
+                            step = "health_probe_unsupported",
+                            "FUSE daemon does not implement Health RPC; relying on Mount timeout"
+                        );
+                    }
+                    Ok(Err(status)) => {
+                        error!(
+                            target: "fuse_health",
+                            step = "daemon_unhealthy",
+                            error = %status,
+                            "FUSE daemon Health RPC errored"
+                        );
+                        return Err(RuntimeError::FuseDaemonUnhealthy {
+                            reason: format!("Health RPC error: {status}"),
+                        });
+                    }
+                    Err(_elapsed) => {
+                        error!(
+                            target: "fuse_health",
+                            step = "daemon_unhealthy",
+                            timeout_secs = FUSE_HEALTH_TIMEOUT_SECS,
+                            "FUSE daemon Health RPC timed out"
+                        );
+                        return Err(RuntimeError::FuseDaemonUnhealthy {
+                            reason: format!(
+                                "Health probe timed out after {FUSE_HEALTH_TIMEOUT_SECS}s"
+                            ),
+                        });
+                    }
+                }
+
                 for volume_mount in &config.volumes {
                     let container_path = volume_mount.mount_point.display().to_string();
                     let is_read_only = matches!(
@@ -862,9 +1005,36 @@ impl AgentRuntime for ContainerRuntime {
                         workflow_execution_id: String::new(),
                     };
 
-                    match client.mount(grpc_req).await {
+                    let exec_id_str = config.execution_id.0.to_string();
+                    let vid = volume_mount.volume_id.0.to_string();
+                    info!(
+                        target: "runtime_spawn",
+                        step = "fuse_mount_begin",
+                        execution_id = %exec_id_str,
+                        volume_id = %vid,
+                        "issuing FUSE Mount RPC"
+                    );
+                    let mount_started = std::time::Instant::now();
+                    let mount_call = client.mount(grpc_req);
+                    match run_fuse_mount_with_timeout(
+                        &exec_id_str,
+                        &vid,
+                        FUSE_MOUNT_TIMEOUT_SECS,
+                        async move { mount_call.await.map(|resp| resp.into_inner()) },
+                    )
+                    .await
+                    {
                         Ok(resp) => {
-                            let mountpoint = resp.into_inner().mountpoint;
+                            let elapsed_ms = mount_started.elapsed().as_millis() as u64;
+                            info!(
+                                target: "runtime_spawn",
+                                step = "fuse_mount_complete",
+                                execution_id = %exec_id_str,
+                                volume_id = %vid,
+                                elapsed_ms = elapsed_ms,
+                                "FUSE Mount RPC complete"
+                            );
+                            let mountpoint = resp.mountpoint;
                             debug!(
                                 volume_id = %volume_mount.volume_id,
                                 mountpoint = %mountpoint,
@@ -882,6 +1052,21 @@ impl AgentRuntime for ContainerRuntime {
                                 typ: Some(MountTypeEnum::BIND),
                                 read_only: Some(is_read_only),
                                 ..Default::default()
+                            });
+                        }
+                        Err(RuntimeError::FuseMountTimeout {
+                            execution_id,
+                            volume_id,
+                            timeout_secs,
+                        }) => {
+                            // Surface as a fast typed failure so the iteration
+                            // error path classifies it correctly. A wedged
+                            // FUSE daemon must NOT silently degrade the run
+                            // by quietly omitting the volume.
+                            return Err(RuntimeError::FuseMountTimeout {
+                                execution_id,
+                                volume_id,
+                                timeout_secs,
                             });
                         }
                         Err(e) => {
@@ -1527,18 +1712,22 @@ impl AgentRuntime for ContainerRuntime {
                             volume_id: volume_id.clone(),
                             execution_id: execution_id.clone(),
                         };
+                    let unmount_started = std::time::Instant::now();
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(FUSE_UNMOUNT_TIMEOUT_SECS),
                         client.unmount(unmount_req),
                     )
                     .await
                     {
                         Err(_elapsed) => {
-                            warn!(
-                                volume_id = %volume_id,
+                            error!(
+                                target: "fuse_health",
+                                step = "unmount_timeout",
                                 execution_id = %execution_id,
+                                volume_id = %volume_id,
                                 container_id = id.as_str(),
-                                "gRPC FUSE unmount timed out after 5s — mount may linger"
+                                timeout_secs = FUSE_UNMOUNT_TIMEOUT_SECS,
+                                "FUSE unmount RPC timed out — mount may be leaked"
                             );
                         }
                         Ok(Err(e)) => {
@@ -1551,11 +1740,14 @@ impl AgentRuntime for ContainerRuntime {
                             );
                         }
                         Ok(Ok(_)) => {
-                            debug!(
-                                volume_id = %volume_id,
+                            info!(
+                                target: "fuse_health",
+                                step = "unmount_complete",
                                 execution_id = %execution_id,
+                                volume_id = %volume_id,
                                 container_id = id.as_str(),
-                                "gRPC FUSE unmount succeeded for agent container"
+                                elapsed_ms = unmount_started.elapsed().as_millis() as u64,
+                                "FUSE unmount complete"
                             );
                         }
                     }
@@ -1905,6 +2097,71 @@ mod tests {
             image: "python:3.12".to_string(),
             bootstrap_path: None,
             execution_id: ExecutionId::new(),
+        }
+    }
+
+    /// Regression: a `client.mount()` call that never completes must be
+    /// surfaced as `RuntimeError::FuseMountTimeout` within the configured
+    /// budget — not hang the spawn path indefinitely. Mirrors the
+    /// `run_pull_with_timeout` test pattern from the image-pull fix.
+    #[tokio::test(start_paused = true)]
+    async fn fuse_mount_timeout_returns_typed_error() {
+        use crate::domain::runtime::RuntimeError;
+        use crate::infrastructure::runtime::run_fuse_mount_with_timeout;
+        use std::future::pending;
+
+        // 1s budget for fast test runs. Real prod uses 30s.
+        let res: Result<(), RuntimeError> =
+            run_fuse_mount_with_timeout("exec-1", "vol-1", 1, async {
+                // Simulates a wedged daemon: never returns.
+                let _: () = pending().await;
+                Ok::<(), tonic::Status>(())
+            })
+            .await;
+
+        match res {
+            Err(RuntimeError::FuseMountTimeout {
+                execution_id,
+                volume_id,
+                timeout_secs,
+            }) => {
+                assert_eq!(execution_id, "exec-1");
+                assert_eq!(volume_id, "vol-1");
+                assert_eq!(timeout_secs, 1);
+            }
+            other => panic!("expected FuseMountTimeout, got {other:?}"),
+        }
+    }
+
+    /// Regression: a successful future returned by the inner client must
+    /// pass through `run_fuse_mount_with_timeout` untouched.
+    #[tokio::test(start_paused = true)]
+    async fn fuse_mount_timeout_passes_through_success() {
+        use crate::infrastructure::runtime::run_fuse_mount_with_timeout;
+
+        let res: Result<u32, _> =
+            run_fuse_mount_with_timeout("e", "v", 30, async { Ok::<u32, tonic::Status>(42) }).await;
+        assert_eq!(res.expect("ok"), 42);
+    }
+
+    /// Regression: a `tonic::Status` error returned by the inner client must
+    /// be mapped to `RuntimeError::SpawnFailed` (not silently dropped).
+    #[tokio::test(start_paused = true)]
+    async fn fuse_mount_timeout_maps_inner_status_error() {
+        use crate::domain::runtime::RuntimeError;
+        use crate::infrastructure::runtime::run_fuse_mount_with_timeout;
+
+        let res: Result<(), RuntimeError> = run_fuse_mount_with_timeout("e", "v", 30, async {
+            Err::<(), _>(tonic::Status::internal("daemon exploded"))
+        })
+        .await;
+
+        match res {
+            Err(RuntimeError::SpawnFailed(msg)) => {
+                assert!(msg.contains("daemon exploded"), "msg={msg}");
+                assert!(msg.contains("vol"), "msg={msg}");
+            }
+            other => panic!("expected SpawnFailed, got {other:?}"),
         }
     }
 }
