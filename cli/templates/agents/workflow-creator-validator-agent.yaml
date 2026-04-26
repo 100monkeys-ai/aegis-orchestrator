@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-creator-validator-agent
-  version: "1.0.0"
+  version: "1.1.0"
   description: Creates workflow manifests and enforces strict deterministic + semantic validation before registration.
   labels:
     role: worker
@@ -129,6 +129,13 @@ spec:
       User request:
       {{input}}
 
+      {{#if attachments}}
+      Dispatch attachments — the user attached the following files. Any missing agent the planner generates that consumes these files MUST declare them per ADR-113 (input_schema.attachments, aegis.attachment.read tool, spec.type: system):
+      {{#each attachments}}
+      - volume_id: {{this.volume_id}}, path: {{this.path}}, name: {{this.name}}, mime_type: {{this.mime_type}}, size: {{this.size}}
+      {{/each}}
+
+      {{/if}}
       Agent:
 
   execution:

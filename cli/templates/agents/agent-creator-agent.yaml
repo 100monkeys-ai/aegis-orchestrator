@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: agent-creator-agent
-  version: "1.0.0"
+  version: "1.1.0"
   description: Creates valid Agent manifests and deploys them through orchestrator-native tooling.
   labels:
     role: worker
@@ -259,6 +259,13 @@ spec:
       User request:
       {{input}}
 
+      {{#if attachments}}
+      Dispatch attachments — the user attached the following files. Apply step 3a (ATTACHMENT-AWARENESS) of the workflow above:
+      {{#each attachments}}
+      - volume_id: {{this.volume_id}}, path: {{this.path}}, name: {{this.name}}, mime_type: {{this.mime_type}}, size: {{this.size}}
+      {{/each}}
+
+      {{/if}}
       Agent:
 
   execution:

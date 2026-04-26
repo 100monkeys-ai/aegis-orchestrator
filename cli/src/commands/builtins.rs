@@ -512,6 +512,69 @@ mod tests {
         }
     }
 
+    /// Regression test for ADR-113 attachment-rendering bug.
+    ///
+    /// The agent-creator-agent template's instruction prose taught the LLM how to
+    /// handle dispatches that carry attachments, but the prompt_template never
+    /// rendered the `attachments` Handlebars variable. As a result, the LLM saw
+    /// the user's natural-language request and the rules-about-attachments, but
+    /// never saw the attachments themselves — every generated agent was generated
+    /// as if no files were attached, producing manifests with no
+    /// `aegis.attachment.read` tool, no `attachments` field in `input_schema`,
+    /// and no `spec.type: system`.
+    ///
+    /// Each of the three generation entry-point templates MUST surface dispatch
+    /// attachments to the LLM via a `{{#if attachments}} ... {{#each attachments}}`
+    /// Handlebars block in `spec.task.prompt_template`. This test asserts that
+    /// content is present so the regression cannot recur silently.
+    #[test]
+    fn generation_templates_render_dispatch_attachments_in_prompt_template() {
+        let cases = [
+            ("agent-creator-agent", AGENT_GENERATOR_AGENT_TEMPLATE),
+            (
+                "workflow-creator-validator-agent",
+                WORKFLOW_CREATOR_AGENT_TEMPLATE,
+            ),
+            (
+                "workflow-generator-planner-agent",
+                WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
+            ),
+        ];
+
+        for (name, yaml) in cases {
+            let manifest: serde_yaml::Value = serde_yaml::from_str(yaml)
+                .unwrap_or_else(|e| panic!("Failed to parse builtin agent '{}': {}", name, e));
+            let prompt_template = manifest["spec"]["task"]["prompt_template"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Builtin agent '{}' must expose spec.task.prompt_template as a string",
+                        name
+                    )
+                });
+
+            assert!(
+                prompt_template.contains("{{#if attachments}}"),
+                "Builtin agent '{}' prompt_template must guard the attachments block with {{{{#if attachments}}}} so non-attachment dispatches don't render an empty section. ADR-113 regression.",
+                name
+            );
+            assert!(
+                prompt_template.contains("{{#each attachments}}"),
+                "Builtin agent '{}' prompt_template must iterate dispatch attachments with {{{{#each attachments}}}} so the LLM sees each file's volume_id/path/name/mime_type/size. ADR-113 regression.",
+                name
+            );
+            assert!(
+                prompt_template.contains("{{this.volume_id}}")
+                    && prompt_template.contains("{{this.path}}")
+                    && prompt_template.contains("{{this.name}}")
+                    && prompt_template.contains("{{this.mime_type}}")
+                    && prompt_template.contains("{{this.size}}"),
+                "Builtin agent '{}' prompt_template must surface each attachment's volume_id, path, name, mime_type, and size fields to the LLM. ADR-113 regression.",
+                name
+            );
+        }
+    }
+
     #[test]
     fn generated_root_uses_config_parent_directory() {
         let config_path = std::path::PathBuf::from("/tmp/custom-stack/aegis-config.yaml");

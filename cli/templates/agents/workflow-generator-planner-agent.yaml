@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-generator-planner-agent
-  version: "1.0.0"
+  version: "1.1.0"
   description: Plans workflow composition by discovering existing agents and identifying missing agent capabilities.
   labels:
     role: worker
@@ -94,6 +94,13 @@ spec:
       Workflow request:
       {{input}}
 
+      {{#if attachments}}
+      Dispatch attachments — the user attached the following files. Plan agents that handle them per ADR-113: any missing agent that consumes these files must be planned to declare an `attachments` field in input_schema, include `aegis.attachment.read` in tools, and set `spec.type: system`:
+      {{#each attachments}}
+      - volume_id: {{this.volume_id}}, path: {{this.path}}, name: {{this.name}}, mime_type: {{this.mime_type}}, size: {{this.size}}
+      {{/each}}
+
+      {{/if}}
       Planner:
 
   execution:
