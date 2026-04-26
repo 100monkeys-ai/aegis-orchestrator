@@ -1,0 +1,1 @@
+ALTER TABLE execution_events DROP CONSTRAINT execution_events_execution_id_fkey;

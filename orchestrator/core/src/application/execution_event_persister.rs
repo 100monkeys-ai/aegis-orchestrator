@@ -518,4 +518,45 @@ mod tests {
             "persister should still be running after lag"
         );
     }
+
+    /// Regression test for the FK-violation bug: events whose `ExecutionId` is
+    /// rooted in the `executions` table (direct `aegis.task.execute`) — not
+    /// `workflow_executions` — were rejected by the
+    /// `execution_events_execution_id_fkey` FK and silently dropped, leaving
+    /// `aegis.task.logs` returning empty events.
+    ///
+    /// The persister itself is correct; the FK is dropped in migration
+    /// `028_execution_events_drop_fk.sql`. This test asserts the persister
+    /// happily forwards a fresh, unknown UUID to `append_event` — exactly the
+    /// path that the FK used to reject on the real DB.
+    #[tokio::test]
+    async fn persister_writes_event_for_executions_rooted_id() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repo = Arc::new(RecordingRepo::new());
+        let persister = Arc::new(ExecutionEventPersister::new(
+            repo.clone(),
+            event_bus.clone(),
+        ));
+        let _h = persister.start();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // A fresh random UUID. Under the old schema the FK to
+        // workflow_executions(id) would reject this on the real DB. Migration
+        // 028 drops that FK; this test pins the persister contract on the
+        // application side.
+        let exec_id = ExecutionId::new();
+        event_bus.publish_execution_event(iteration_started(exec_id, 1));
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        let events = repo.events.read().await.clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected 1 persisted event, got {events:?}"
+        );
+        assert_eq!(events[0].0, exec_id);
+        assert_eq!(events[0].2, "IterationStarted");
+    }
 }

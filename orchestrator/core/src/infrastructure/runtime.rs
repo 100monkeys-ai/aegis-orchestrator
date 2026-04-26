@@ -1038,24 +1038,32 @@ impl AgentRuntime for ContainerRuntime {
             while let Some(msg) = output.next().await {
                 match msg {
                     Ok(LogOutput::StdOut { message }) => {
-                        let content = String::from_utf8_lossy(&message).to_string();
-                        debug!(
-                            container_id = container_id,
-                            stream = "stdout",
-                            "{}",
-                            Self::format_bootstrap_stdout_for_log(&content)
-                        );
-                        stdout_logs.push(content);
+                        let content = String::from_utf8_lossy(&message);
+                        for line in content.lines() {
+                            if !line.trim().is_empty() {
+                                tracing::info!(
+                                    target: "child_runtime",
+                                    container_id = container_id,
+                                    stream = "stdout",
+                                    "{line}"
+                                );
+                            }
+                        }
+                        stdout_logs.push(content.to_string());
                     }
                     Ok(LogOutput::StdErr { message }) => {
-                        let content = String::from_utf8_lossy(&message).to_string();
-                        warn!(
-                            container_id = container_id,
-                            stream = "stderr",
-                            "Bootstrap stderr: {}",
-                            content
-                        );
-                        stderr_logs.push(content);
+                        let content = String::from_utf8_lossy(&message);
+                        for line in content.lines() {
+                            if !line.trim().is_empty() {
+                                tracing::warn!(
+                                    target: "child_runtime",
+                                    container_id = container_id,
+                                    stream = "stderr",
+                                    "{line}"
+                                );
+                            }
+                        }
+                        stderr_logs.push(content.to_string());
                     }
                     _ => {}
                 }
