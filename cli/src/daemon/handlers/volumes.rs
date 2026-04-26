@@ -334,7 +334,7 @@ const CHAT_ATTACHMENTS_VOLUME_NAME: &str = "chat-attachments";
 /// Default size budget for the lazy-provisioned `chat-attachments` volume.
 /// The volume itself counts against the user's tier; this is the per-volume
 /// allocation.
-const CHAT_ATTACHMENTS_DEFAULT_SIZE_BYTES: u64 = 1 * 1024 * 1024 * 1024;
+const CHAT_ATTACHMENTS_DEFAULT_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Reject paths containing `..`, absolute prefixes, or control characters.
 /// Path-sanitization downstream is the source of truth, but we fail fast at
