@@ -1399,10 +1399,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tenant_from_payload_defaults_to_consumer_when_missing() {
+    fn resolve_tenant_from_payload_errors_when_missing() {
+        // Per ADR-097: every execution must carry an explicit tenant_id.
+        // No defaulting to zaru-consumer (or any other slug) is permitted.
         let payload = serde_json::json!({ "task": "run" });
-        let tenant = StandardExecutionService::resolve_tenant_from_payload(&payload).unwrap();
-        assert_eq!(tenant, CoreTenantId::consumer());
+        let err = StandardExecutionService::resolve_tenant_from_payload(&payload)
+            .expect_err("missing tenant_id must be an error, not a default");
+        assert!(
+            err.to_string().contains("tenant_id"),
+            "error should mention the missing field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_tenant_from_payload_rejects_legacy_tenant_alias() {
+        // The legacy `tenant` key is not accepted; only canonical `tenant_id`.
+        let payload = serde_json::json!({ "tenant": "acme-corp" });
+        let err = StandardExecutionService::resolve_tenant_from_payload(&payload)
+            .expect_err("legacy `tenant` alias must be rejected");
+        assert!(
+            err.to_string().contains("tenant_id"),
+            "error should mention the canonical field name, got: {err}"
+        );
     }
 
     #[tokio::test]
