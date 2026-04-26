@@ -4,8 +4,9 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, Query, State};
-use axum::http::StatusCode;
+use axum::body::to_bytes;
+use axum::extract::{Extension, FromRequest, Path, Query, Request, State};
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use sha2::Digest;
@@ -428,22 +429,39 @@ async fn resolve_or_provision_upload_volume(
         .map_err(user_volume_error_response)
 }
 
+/// Maximum upload body size accepted by this handler before any per-tier
+/// quota check. Set above the largest tier limit so the in-handler check is
+/// the source of truth; this is just a hard ceiling against accidental DoS.
+const UPLOAD_BODY_HARD_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+
 /// POST /v1/volumes/:id/files/upload (ADR-079, ADR-113)
 ///
-/// Accepts either a `multipart/form-data` body (preferred — used by the Zaru
-/// chat client) or a raw byte body. The destination path is taken from the
-/// `path` query parameter (relative, no `..`, no control chars). MIME type is
-/// content-sniffed, never trusted from the client. The `:id` segment may be a
-/// volume UUID or the reserved literal `chat-attachments`, in which case the
-/// volume is lazy-provisioned on first upload per ADR-113.
+/// Accepts either a `multipart/form-data` body (used by the Python and
+/// TypeScript SDK uploaders) or a raw byte body whose `Content-Type` is the
+/// file's own MIME type (used by the Zaru chat proxy, which streams
+/// `request.body` directly). Dispatch is keyed on the request's
+/// `Content-Type` header.
+///
+/// The destination path is taken from the `path` query parameter (relative,
+/// no `..`, no control chars). MIME type is content-sniffed, never trusted
+/// from the client. The `:id` segment may be a volume UUID or the reserved
+/// literal `chat-attachments`, in which case the volume is lazy-provisioned
+/// on first upload per ADR-113.
+///
+/// # Why a single `Request` extractor
+///
+/// Axum's `Handler` trait permits at most one body-consuming extractor, and
+/// it must be the last argument. `Multipart` and `Bytes` are both
+/// body-consuming `FromRequest` extractors, so a handler signature with both
+/// (even with `Option<Multipart>`) cannot satisfy `Handler<_, _>`. We take a
+/// single `Request` and branch on `Content-Type` internally.
 pub(crate) async fn upload_file(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(id_or_name): Path<String>,
     Query(params): Query<FilePathQuery>,
-    multipart: Option<axum::extract::Multipart>,
-    body: axum::body::Bytes,
+    request: Request,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
     let identity_ref = identity.as_ref().map(|e| &e.0);
@@ -456,10 +474,26 @@ pub(crate) async fn upload_file(
     let vol_id =
         resolve_or_provision_upload_volume(&state, &id_or_name, tenant_id, &owner, &tier).await?;
 
-    // Read the file body. Multipart streaming is preferred; fall back to raw
-    // bytes when the content type is not multipart (the SDK clients use raw
-    // PUT-style uploads).
-    let (data, supplied_name) = if let Some(mut mp) = multipart {
+    let is_multipart = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("multipart/")
+        })
+        .unwrap_or(false);
+
+    let (data, supplied_name) = if is_multipart {
+        let mut mp = axum::extract::Multipart::from_request(request, &())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("multipart init error: {e}")})),
+                )
+            })?;
         let mut found: Option<(Vec<u8>, Option<String>)> = None;
         loop {
             let field_res = mp.next_field().await;
@@ -474,8 +508,8 @@ pub(crate) async fn upload_file(
                 }
             };
             // Only the first file field is honoured; additional fields are
-            // dropped with a debug-level skip rather than failing the upload,
-            // since browsers may include hidden CSRF/metadata fields.
+            // dropped rather than failing the upload, since browsers may
+            // include hidden CSRF/metadata fields.
             let file_name = field.file_name().map(|s| s.to_string());
             let bytes = field.bytes().await.map_err(|e| {
                 (
@@ -497,7 +531,16 @@ pub(crate) async fn upload_file(
             }
         }
     } else {
-        (body.to_vec(), None)
+        let body = request.into_body();
+        let bytes = to_bytes(body, UPLOAD_BODY_HARD_LIMIT_BYTES)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({"error": format!("body read error: {e}")})),
+                )
+            })?;
+        (bytes.to_vec(), None)
     };
 
     let mime_type = sniff_upload_mime(&data);
@@ -657,5 +700,29 @@ mod tests {
         // Plain ASCII without magic bytes => fallback.
         let ascii = b"hello world";
         assert_eq!(sniff_upload_mime(ascii), "application/octet-stream");
+    }
+
+    /// Regression test for the ADR-113 upload handler signature.
+    ///
+    /// An earlier revision of `upload_file` declared two body-consuming
+    /// extractors — `Option<Multipart>` and `axum::body::Bytes` — in the same
+    /// signature. Axum's `Handler` trait can only be derived for functions
+    /// with at most one body extractor (and it must be the last argument), so
+    /// CI failed with `the trait bound ... : Handler<_, _> is not satisfied`
+    /// at the route registration site.
+    ///
+    /// This test wires `upload_file` into a `Router<Arc<AppState>>` exactly
+    /// as the production router does. If anyone re-introduces a second
+    /// body-consuming extractor on `upload_file`, this file will fail to
+    /// compile — the build break is the regression signal.
+    ///
+    /// The test is `#[allow(dead_code)]` because we only need it to compile;
+    /// invoking the route would require constructing a full `AppState`.
+    #[allow(dead_code)]
+    fn upload_file_is_a_valid_axum_handler() -> axum::Router<Arc<AppState>> {
+        axum::Router::new().route(
+            "/v1/volumes/{id}/files/upload",
+            axum::routing::post(upload_file),
+        )
     }
 }
