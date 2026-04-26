@@ -3478,3 +3478,59 @@ mod gateway_timeout_regression {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression: IntentExecutionInput schema (ADR-087 + ADR-113 boundary).
+//
+// ADR-113 added an `attachments` field to `domain::execution::ExecutionInput`.
+// A pattern-match pass during the ADR-113 implementation accidentally inserted
+// `attachments: Vec::new()` into the `IntentExecutionInput` literal in
+// tool_invocation_service/execute.rs as well, breaking the build.
+//
+// `IntentExecutionInput` (in `domain::workflow`) is the input schema for the
+// intent-to-execution pipeline (ADR-087) — it is pipeline-shaped, not
+// agent-input-shaped, and MUST NOT carry an `attachments` field.
+//
+// The test below constructs an `IntentExecutionInput`, serializes it, and
+// asserts the JSON object's key set is exactly the ADR-087 schema. If anyone
+// re-introduces a stray `attachments` field on this struct, this test fails
+// (and the offending construction site fails to compile).
+// ---------------------------------------------------------------------------
+#[test]
+fn intent_execution_input_schema_has_no_attachments_field() {
+    let pipeline_input = crate::domain::workflow::IntentExecutionInput {
+        intent: "compute fibonacci(10)".to_string(),
+        inputs: serde_json::json!({"n": 10}),
+        volume_id: None,
+        language: crate::domain::workflow::ExecutionLanguage::Python,
+        timeout_seconds: Some(30),
+    };
+
+    let value =
+        serde_json::to_value(&pipeline_input).expect("IntentExecutionInput must serialize cleanly");
+    let obj = value
+        .as_object()
+        .expect("IntentExecutionInput must serialize as a JSON object");
+
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    assert_eq!(
+        keys,
+        vec![
+            "inputs",
+            "intent",
+            "language",
+            "timeout_seconds",
+            "volume_id"
+        ],
+        "IntentExecutionInput schema drift — attachments belongs on \
+         domain::execution::ExecutionInput, NOT on IntentExecutionInput"
+    );
+
+    assert!(
+        !obj.contains_key("attachments"),
+        "IntentExecutionInput must not have an `attachments` field; it is \
+         pipeline-shaped (ADR-087), not agent-input-shaped (ADR-113)"
+    );
+}
