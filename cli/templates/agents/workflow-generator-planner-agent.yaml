@@ -112,15 +112,15 @@ spec:
       {{input}}
 
       {{#if attachments}}
-      This dispatch carries file attachments. Plan attachment-aware agents per ADR-113:
-      any missing agent that consumes attachments must be planned as a generic
-      attachment-consumer (input_schema.attachments field, `aegis.attachment.read` in tools,
-      `spec.type: system`, and a `{{#each attachments}}` Handlebars block in
-      `spec.task.instruction` to render runtime files). Your planner output MUST describe
-      these requirements as rules — do NOT include any specific file references (volume_id,
-      path, name, sha256) in `generation_prompts` or anywhere else in the planner output.
-      The dispatch-specific file refs flow at the generated agent's runtime via
-      `ExecutionInput.attachments` and the temporal worker's Handlebars hydration.
+      This dispatch carries file attachments. Apply the ATTACHMENT-AWARENESS rule above
+      when planning missing agents: every `generation_prompt` for a missing agent that
+      consumes those attachments must instruct the agent-creator-agent to produce a
+      generic attachment-consumer manifest per step 3a referenced from agent-creator-agent.
+      The agents you plan MUST be generic, reusable capability archetypes — do NOT embed
+      any specific file references (volume_id, path, name, sha256) into the planner output
+      or into any `generation_prompt`. The dispatch-specific file refs flow separately at
+      the generated agent's runtime via `ExecutionInput.attachments` and the temporal
+      worker's Handlebars hydration.
 
       {{/if}}
       Planner:
