@@ -2849,7 +2849,7 @@ mod tests {
         };
 
         assert_eq!(
-            managed_container_reap_reason(&container, Some(ExecutionStatus::Running)),
+            managed_container_reap_reason(&container, Some(&ExecutionStatus::Running)),
             None
         );
     }
@@ -2864,7 +2864,7 @@ mod tests {
         };
 
         assert_eq!(
-            managed_container_reap_reason(&container, Some(ExecutionStatus::Running)),
+            managed_container_reap_reason(&container, Some(&ExecutionStatus::Running)),
             None
         );
     }
@@ -2885,11 +2885,11 @@ mod tests {
         };
 
         assert_eq!(
-            managed_container_reap_reason(&running_container, Some(ExecutionStatus::Completed)),
+            managed_container_reap_reason(&running_container, Some(&ExecutionStatus::Completed)),
             Some("execution_not_running")
         );
         assert_eq!(
-            managed_container_reap_reason(&exited_container, Some(ExecutionStatus::Running)),
+            managed_container_reap_reason(&exited_container, Some(&ExecutionStatus::Running)),
             Some("container_not_running")
         );
         assert_eq!(
