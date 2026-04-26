@@ -331,10 +331,12 @@ pub(crate) async fn download_file(
 /// counts against the user's `ZaruTier` storage quota like any other volume.
 const CHAT_ATTACHMENTS_VOLUME_NAME: &str = "chat-attachments";
 
-/// Default size budget for the lazy-provisioned `chat-attachments` volume.
-/// The volume itself counts against the user's tier; this is the per-volume
-/// allocation.
-const CHAT_ATTACHMENTS_DEFAULT_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Hard ceiling for the lazy-provisioned `chat-attachments` volume on tiers
+/// whose `total_storage_bytes` is unbounded (Enterprise = `u64::MAX`). A raw
+/// `u64::MAX` allocation is nonsensical at the storage layer; clamp to a
+/// sensible per-volume default that still leaves room for additional volumes
+/// within the same tier budget.
+const CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Reject paths containing `..`, absolute prefixes, or control characters.
 /// Path-sanitization downstream is the source of truth, but we fail fast at
@@ -414,11 +416,25 @@ async fn resolve_or_provision_upload_volume(
         return Ok(v.id);
     }
 
+    // Tier-aware sizing: respect the caller's `total_storage_bytes` budget
+    // so the very first upload doesn't trip `StorageQuotaExceeded` on Free
+    // (500 MiB tier ceiling) by requesting more than the tier allows. An
+    // unrecognized tier fails closed (403) rather than falling back to a
+    // hardcoded ceiling — same posture as `resolve_max_file_size_bytes`.
+    let size_limit_bytes = chat_attachments_volume_size_for_tier(tier).ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "no chat-attachments volume size configured for caller tier"
+            })),
+        )
+    })?;
+
     let cmd = CreateUserVolumeCommand {
         tenant_id,
         owner_user_id: owner.to_string(),
         label: CHAT_ATTACHMENTS_VOLUME_NAME.to_string(),
-        size_limit_bytes: CHAT_ATTACHMENTS_DEFAULT_SIZE_BYTES,
+        size_limit_bytes,
         zaru_tier: tier.clone(),
     };
     state
@@ -464,6 +480,38 @@ fn resolve_max_file_size_bytes(tier: &ZaruTier) -> Option<u64> {
         .limits
         .get(tier)
         .map(|l| l.max_file_size_bytes)
+}
+
+/// Resolve the size to allocate for a lazy-provisioned `chat-attachments`
+/// volume from the caller's tier. The volume's allocation must fit under the
+/// tier's `total_storage_bytes` budget; otherwise `UserVolumeService::create_volume`
+/// rejects the request with `StorageQuotaExceeded` even for an empty volume.
+///
+/// We allocate the full tier `total_storage_bytes` so the user gets as much
+/// chat-attachment headroom as their tier permits without exceeding it.
+/// (Free users can still create one extra volume because `max_volumes >= 2`,
+/// but that volume will compete with chat-attachments for the storage
+/// budget — a deliberate trade chosen over fragmenting the budget across
+/// volumes the user may never create.)
+///
+/// Unbounded tiers (Enterprise = `u64::MAX`) are clamped to
+/// `CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES` because a raw `u64::MAX` is
+/// nonsensical at the storage backend.
+///
+/// Returns `None` for an unrecognized tier so callers fail closed rather than
+/// admitting the volume creation under an unbounded cap, mirroring
+/// `resolve_max_file_size_bytes`.
+fn chat_attachments_volume_size_for_tier(tier: &ZaruTier) -> Option<u64> {
+    aegis_orchestrator_core::domain::volume::StorageTierLimits::default()
+        .limits
+        .get(tier)
+        .map(|l| {
+            if l.total_storage_bytes == u64::MAX {
+                CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES
+            } else {
+                l.total_storage_bytes
+            }
+        })
 }
 
 /// Cast a per-tier byte cap into the `usize` accepted by `to_bytes`,
@@ -928,5 +976,153 @@ mod tests {
         let oversize: u64 = 60 * 1024 * 1024;
         assert!(oversize > free_cap, "60 MiB > 50 MiB Free cap (rejected)");
         assert!(oversize <= pro_cap, "60 MiB <= 500 MiB Pro cap (accepted)");
+    }
+
+    // ========================================================================
+    // ADR-113 regression: chat-attachments lazy-provision must respect tier
+    // ========================================================================
+
+    /// The lazy-provision branch of `resolve_or_provision_upload_volume` used
+    /// a hardcoded 1 GiB allocation regardless of caller tier. For Free users
+    /// (`total_storage_bytes = 500 MiB`) this exceeded the tier ceiling so the
+    /// very first upload — even an 89.8 KB PDF — failed with
+    /// `StorageQuotaExceeded` before any byte of the file was inspected.
+    ///
+    /// `chat_attachments_volume_size_for_tier` MUST return a size that fits
+    /// under the tier's `total_storage_bytes`. Specifically: for an empty
+    /// owner the volume creation precondition
+    /// `allocated_bytes + size_limit_bytes <= total_storage_bytes` must hold.
+    #[test]
+    fn chat_attachments_size_fits_within_free_tier_budget() {
+        let limits = aegis_orchestrator_core::domain::volume::StorageTierLimits::default();
+        let free_total = limits
+            .limits
+            .get(&ZaruTier::Free)
+            .expect("Free tier limit present")
+            .total_storage_bytes;
+
+        let allocation = chat_attachments_volume_size_for_tier(&ZaruTier::Free)
+            .expect("Free tier produces a chat-attachments allocation");
+
+        // The bug: a 1 GiB hardcoded allocation > 500 MiB Free ceiling.
+        // The fix: allocation MUST fit within the tier total.
+        assert!(
+            allocation <= free_total,
+            "chat-attachments allocation ({allocation}) must not exceed Free total_storage_bytes ({free_total})"
+        );
+    }
+
+    /// Pro tier (10 GiB total) similarly must produce an allocation that fits.
+    #[test]
+    fn chat_attachments_size_fits_within_pro_tier_budget() {
+        let limits = aegis_orchestrator_core::domain::volume::StorageTierLimits::default();
+        let pro_total = limits
+            .limits
+            .get(&ZaruTier::Pro)
+            .expect("Pro tier limit present")
+            .total_storage_bytes;
+
+        let allocation = chat_attachments_volume_size_for_tier(&ZaruTier::Pro)
+            .expect("Pro tier produces a chat-attachments allocation");
+
+        assert!(
+            allocation <= pro_total,
+            "chat-attachments allocation ({allocation}) must not exceed Pro total_storage_bytes ({pro_total})"
+        );
+    }
+
+    /// Business tier (100 GiB) — same invariant.
+    #[test]
+    fn chat_attachments_size_fits_within_business_tier_budget() {
+        let limits = aegis_orchestrator_core::domain::volume::StorageTierLimits::default();
+        let biz_total = limits
+            .limits
+            .get(&ZaruTier::Business)
+            .expect("Business tier limit present")
+            .total_storage_bytes;
+
+        let allocation = chat_attachments_volume_size_for_tier(&ZaruTier::Business)
+            .expect("Business tier produces a chat-attachments allocation");
+
+        assert!(
+            allocation <= biz_total,
+            "chat-attachments allocation ({allocation}) must not exceed Business total_storage_bytes ({biz_total})"
+        );
+    }
+
+    /// Enterprise tier has `total_storage_bytes = u64::MAX`. A literal `u64::MAX`
+    /// allocation is nonsensical at the storage backend, so the helper MUST
+    /// clamp to a sane finite value.
+    #[test]
+    fn chat_attachments_size_for_enterprise_is_finite() {
+        let allocation = chat_attachments_volume_size_for_tier(&ZaruTier::Enterprise)
+            .expect("Enterprise tier produces a chat-attachments allocation");
+
+        assert!(
+            allocation < u64::MAX,
+            "Enterprise allocation ({allocation}) must be clamped below u64::MAX"
+        );
+        assert!(
+            allocation >= 1024 * 1024 * 1024,
+            "Enterprise clamp ({allocation}) should still be at least 1 GiB to be useful"
+        );
+    }
+
+    /// The exact case from the live bug: a Free-tier caller's first upload of
+    /// an 89.8 KB file. The chat-attachments lazy-provision request size MUST
+    /// satisfy `UserVolumeService::create_volume`'s precondition
+    /// `allocated_bytes + size_limit_bytes <= total_storage_bytes` when there
+    /// are no pre-existing volumes (`allocated_bytes = 0`). Before the fix the
+    /// helper returned 1 GiB and this inequality was violated for Free users,
+    /// producing the `{"error":"storage quota exceeded ..."}` response on
+    /// upload of any file size.
+    #[test]
+    fn free_tier_first_upload_does_not_trip_storage_quota() {
+        let limits = aegis_orchestrator_core::domain::volume::StorageTierLimits::default();
+        let free_total = limits
+            .limits
+            .get(&ZaruTier::Free)
+            .expect("Free tier limit present")
+            .total_storage_bytes;
+
+        // Empty owner: no volumes yet, so allocated_bytes = 0.
+        let allocated_bytes: u64 = 0;
+        let size_limit_bytes = chat_attachments_volume_size_for_tier(&ZaruTier::Free)
+            .expect("Free tier produces an allocation");
+
+        // The exact precondition from
+        // UserVolumeService::create_volume (user_volume_service.rs):
+        //   allocated_bytes.saturating_add(size_limit_bytes) > total_storage_bytes
+        //     => StorageQuotaExceeded
+        let would_exceed = allocated_bytes.saturating_add(size_limit_bytes) > free_total;
+        assert!(
+            !would_exceed,
+            "Free-tier first upload (89.8 KB or any size) would trip StorageQuotaExceeded: \
+             allocated={allocated_bytes} + size_limit={size_limit_bytes} > total={free_total}"
+        );
+    }
+
+    /// An unrecognized tier MUST fail closed (return `None`) so the upload
+    /// handler can produce a 403 rather than admitting the volume creation
+    /// under an unbounded ceiling. Mirrors the `resolve_max_file_size_bytes`
+    /// posture introduced for the per-file cap.
+    ///
+    /// We can't construct a synthetic `ZaruTier` variant without ecosystem
+    /// changes, so we instead document the contract by asserting that all
+    /// known tiers DO resolve — a future tier added without a corresponding
+    /// `StorageTierLimits` entry would silently fail this test.
+    #[test]
+    fn chat_attachments_size_resolves_for_every_known_tier() {
+        for tier in [
+            ZaruTier::Free,
+            ZaruTier::Pro,
+            ZaruTier::Business,
+            ZaruTier::Enterprise,
+        ] {
+            assert!(
+                chat_attachments_volume_size_for_tier(&tier).is_some(),
+                "tier {tier:?} must have a chat-attachments allocation"
+            );
+        }
     }
 }
