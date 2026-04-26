@@ -895,6 +895,7 @@ impl AgentRuntime for ContainerRuntime {
         };
 
         // Create the container
+        info!(target: "runtime_spawn", step = "create_container", "creating container");
         let res = self
             .docker
             .create_container(Some(options), container_config)
@@ -902,6 +903,7 @@ impl AgentRuntime for ContainerRuntime {
             .map_err(|e| RuntimeError::SpawnFailed(e.to_string()))?;
 
         let id = res.id;
+        info!(target: "runtime_spawn", step = "container_created", container_id = %id);
 
         // Store FUSE mount handles keyed by container ID (ADR-107).
         // Handles are dropped in terminate() after the container is removed,
@@ -928,6 +930,7 @@ impl AgentRuntime for ContainerRuntime {
             .await
             .insert(id.clone(), config.keep_container_on_failure);
 
+        info!(target: "runtime_spawn", step = "start_container", container_id = %id);
         if let Err(e) = self
             .docker
             .start_container(&id, None::<StartContainerOptions>)
@@ -938,6 +941,7 @@ impl AgentRuntime for ContainerRuntime {
                 "Failed to start container: {e}"
             )));
         }
+        info!(target: "runtime_spawn", step = "container_started", container_id = %id);
 
         info!("Spawned agent container: {}", id);
 
@@ -960,10 +964,12 @@ impl AgentRuntime for ContainerRuntime {
                 container_id = &id,
                 "Copying bootstrap script into container"
             );
+            info!(target: "runtime_spawn", step = "copy_bootstrap_begin", container_id = %id);
             if let Err(error) = self.copy_bootstrap_to_container(&id).await {
                 self.cleanup_spawned_container(&id).await;
                 return Err(error);
             }
+            info!(target: "runtime_spawn", step = "copy_bootstrap_complete", container_id = %id);
         }
 
         Ok(InstanceId::new(id))
@@ -1009,6 +1015,7 @@ impl AgentRuntime for ContainerRuntime {
             "Exec command: python <bootstrap_path> <prompt>"
         );
 
+        info!(target: "runtime_spawn", step = "exec_create", container_id = %container_id);
         let exec = self
             .docker
             .create_exec(container_id, exec_config)
@@ -1020,6 +1027,7 @@ impl AgentRuntime for ContainerRuntime {
             ..Default::default()
         };
 
+        info!(target: "runtime_spawn", step = "exec_start", container_id = %container_id);
         let res = self
             .docker
             .start_exec(&exec.id, Some(start_opts))
@@ -1035,6 +1043,7 @@ impl AgentRuntime for ContainerRuntime {
         );
 
         if let StartExecResults::Attached { mut output, .. } = res {
+            info!(target: "runtime_spawn", step = "stream_attached", container_id = %container_id, "awaiting first output chunk");
             while let Some(msg) = output.next().await {
                 match msg {
                     Ok(LogOutput::StdOut { message }) => {
@@ -1430,6 +1439,7 @@ impl ContainerRuntime {
             ..Default::default()
         };
 
+        info!(target: "runtime_spawn", sub_step = "create_exec", container_id = %container_id);
         let check_exec = self
             .docker
             .create_exec(container_id, check_exists)
@@ -1444,12 +1454,14 @@ impl ContainerRuntime {
         };
 
         // Execute the test command
+        info!(target: "runtime_spawn", sub_step = "start_exec", container_id = %container_id);
         let _ = self
             .docker
             .start_exec(&check_exec.id, Some(start_opts))
             .await;
 
         // Check exit code - 0 means file exists, non-zero means it doesn't
+        info!(target: "runtime_spawn", sub_step = "inspect_exec", container_id = %container_id);
         let check_inspect = self
             .docker
             .inspect_exec(&check_exec.id)
@@ -1506,6 +1518,7 @@ impl ContainerRuntime {
             ..Default::default()
         };
 
+        info!(target: "runtime_spawn", sub_step = "upload_to_container", container_id = %container_id);
         self.docker
             .upload_to_container(
                 container_id,

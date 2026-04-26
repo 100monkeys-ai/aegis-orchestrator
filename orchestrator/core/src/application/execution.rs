@@ -1455,6 +1455,166 @@ mod tests {
             "expected cross-tenant error, got: {err}"
         );
     }
+
+    fn make_parent_execution_with_tenant(agent_id: AgentId, tenant_slug: &str) -> Execution {
+        Execution::new(
+            agent_id,
+            ExecutionInput {
+                intent: Some("parent".to_string()),
+                input: serde_json::json!({ "tenant_id": tenant_slug }),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        )
+    }
+
+    async fn build_child_spawn_service(
+        tenant: &CoreTenantId,
+        parent_agent: &Agent,
+        child_agent: &Agent,
+        parent_execution: &Execution,
+    ) -> (StandardExecutionService, Arc<dyn ExecutionRepository>) {
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(tenant, parent_agent)
+            .await
+            .unwrap();
+        agent_repo
+            .save_for_tenant(tenant, child_agent)
+            .await
+            .unwrap();
+
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        execution_repo
+            .save_for_tenant(tenant, parent_execution)
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let volume_service = Arc::new(TestVolumeService {
+            volumes: HashMap::new(),
+        });
+
+        let service = StandardExecutionService::new(
+            agent_repo,
+            volume_service,
+            supervisor,
+            execution_repo.clone(),
+            event_bus,
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+
+        (service, execution_repo)
+    }
+
+    #[tokio::test]
+    async fn start_child_execution_inherits_parent_tenant_when_child_input_omits_it() {
+        let tenant = CoreTenantId::from_string("u-abc123").unwrap();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("child-worker", None, None);
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "u-abc123");
+
+        let (service, execution_repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+
+        let child_id = service
+            .start_child_execution(
+                child_agent.id,
+                ExecutionInput {
+                    intent: Some("child-task".to_string()),
+                    input: serde_json::json!({ "task": "do-thing" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                },
+                parent_execution.id,
+            )
+            .await
+            .expect("child spawn should inherit parent tenant");
+
+        let child = execution_repo
+            .find_by_id_for_tenant(&tenant, child_id)
+            .await
+            .unwrap()
+            .expect("child execution should be persisted under inherited tenant");
+
+        let stored_tenant = child.input.input.get("tenant_id").and_then(|v| v.as_str());
+        assert_eq!(
+            stored_tenant,
+            Some("u-abc123"),
+            "child input should have tenant_id injected from parent; got {stored_tenant:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_child_execution_accepts_explicit_matching_child_tenant() {
+        let tenant = CoreTenantId::from_string("u-abc123").unwrap();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("child-worker", None, None);
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "u-abc123");
+
+        let (service, _repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+
+        service
+            .start_child_execution(
+                child_agent.id,
+                ExecutionInput {
+                    intent: Some("child-task".to_string()),
+                    input: serde_json::json!({ "tenant_id": "u-abc123" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                },
+                parent_execution.id,
+            )
+            .await
+            .expect("matching explicit child tenant should be accepted");
+    }
+
+    #[tokio::test]
+    async fn start_child_execution_rejects_explicit_mismatched_child_tenant() {
+        let tenant = CoreTenantId::from_string("u-abc123").unwrap();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("child-worker", None, None);
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "u-abc123");
+
+        let (service, _repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+
+        let err = service
+            .start_child_execution(
+                child_agent.id,
+                ExecutionInput {
+                    intent: Some("child-task".to_string()),
+                    input: serde_json::json!({ "tenant_id": "u-xyz789" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                },
+                parent_execution.id,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Cross-tenant spawn forbidden"),
+            "expected cross-tenant error, got: {err}"
+        );
+    }
 }
 
 struct ExecutionMonitor {
@@ -2899,7 +3059,7 @@ impl ExecutionService for StandardExecutionService {
     async fn start_child_execution(
         &self,
         agent_id: AgentId,
-        input: ExecutionInput,
+        mut input: ExecutionInput,
         parent_execution_id: ExecutionId,
     ) -> Result<ExecutionId> {
         // 1. Fetch parent to validate hierarchy depth and build child hierarchy.
@@ -2911,17 +3071,41 @@ impl ExecutionService for StandardExecutionService {
             .await?
             .ok_or_else(|| anyhow!("Parent execution {parent_execution_id} not found"))?;
         let parent_tenant_id = Self::resolve_tenant_from_input(&parent.input)?;
-        let child_tenant_id = Self::resolve_tenant_from_input(&input)?;
 
         // Cross-tenant spawn check (ADR-056 Phase 3): child executions must
-        // belong to the same tenant as their parent.
-        if parent_tenant_id != child_tenant_id {
-            return Err(anyhow!(
-                "Cross-tenant spawn forbidden: parent tenant '{}' != child tenant '{}'",
-                parent_tenant_id.as_str(),
-                child_tenant_id.as_str()
-            ));
+        // belong to the same tenant as their parent. Per ADR-097, child
+        // executions inherit the parent's per-user tenant when not explicitly
+        // set; only an *explicit* mismatched tenant on the child is a
+        // rejection. Falling back to the consumer-slug default and then
+        // comparing would mis-fire for parents in per-user tenants.
+        let child_explicit_tenant = input
+            .input
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| input.input.get("tenant").and_then(|v| v.as_str()))
+            .map(str::to_owned);
+
+        if let Some(child_str) = child_explicit_tenant {
+            let child_tenant_id = TenantId::from_string(&child_str)
+                .map_err(|e| anyhow!("Invalid child tenant '{child_str}': {e}"))?;
+            if parent_tenant_id != child_tenant_id {
+                return Err(anyhow!(
+                    "Cross-tenant spawn forbidden: parent tenant '{}' != child tenant '{}'",
+                    parent_tenant_id.as_str(),
+                    child_tenant_id.as_str()
+                ));
+            }
         }
+
+        // Inherit parent's tenant by writing it onto the child input before
+        // downstream runtime config building reads it.
+        if let JsonValue::Object(map) = &mut input.input {
+            map.insert(
+                "tenant_id".to_string(),
+                JsonValue::String(parent_tenant_id.as_str().to_string()),
+            );
+        }
+
         let tenant_id = parent_tenant_id;
 
         if !parent.can_spawn_child() {
