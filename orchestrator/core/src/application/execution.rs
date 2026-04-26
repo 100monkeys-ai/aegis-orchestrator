@@ -84,7 +84,8 @@ pub trait ExecutionService: Send + Sync {
     /// Start a new agent execution for `agent_id` with the given `input`.
     ///
     /// Spawns asynchronously; the returned [`ExecutionId`] can be polled via
-    /// [`ExecutionService::get_execution`] or streamed via [`ExecutionService::stream_execution`].
+    /// [`ExecutionService::get_execution_for_tenant`] or streamed via
+    /// [`ExecutionService::stream_execution`].
     ///
     /// # Errors
     ///
