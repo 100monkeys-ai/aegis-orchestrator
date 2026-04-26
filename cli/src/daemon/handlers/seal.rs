@@ -4,12 +4,13 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 
 use aegis_orchestrator_core::application::execution::ExecutionService;
+use aegis_orchestrator_core::domain::iam::{RealmKind, UserIdentity};
 use aegis_orchestrator_core::domain::shared_kernel::ExecutionId;
 
 use crate::daemon::state::AppState;
@@ -46,6 +47,7 @@ pub(crate) struct SealToolsQuery {
 
 pub(crate) async fn attest_seal_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Json(request): Json<HttpAttestationRequest>,
 ) -> impl IntoResponse {
     let tenant_id =
@@ -70,6 +72,15 @@ pub(crate) async fn attest_seal_handler(
             aegis_orchestrator_core::domain::tenant::TenantId::consumer()
         };
 
+    // Derive the realm classification from the authenticated `UserIdentity`
+    // (set by the auth middleware after JWT validation). When no identity is
+    // available (unauthenticated path or test harness), fall back to Consumer
+    // since the HTTP attest endpoint is the Zaru consumer entry point.
+    let realm = identity
+        .as_ref()
+        .map(|Extension(id)| id.realm_kind())
+        .unwrap_or(RealmKind::Consumer);
+
     let internal_req =
         aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {
             agent_id: request.agent_id.clone(),
@@ -82,6 +93,7 @@ pub(crate) async fn attest_seal_handler(
             workload_id: request.workload_id.clone(),
             zaru_tier: request.zaru_tier.clone(),
             tenant_id,
+            realm,
             task_summary: request.task_summary.clone(),
         };
 

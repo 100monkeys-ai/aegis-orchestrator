@@ -19,6 +19,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::domain::iam::RealmKind;
 use crate::domain::tenant::TenantId;
 
 /// The agent's initial attestation message sent to the orchestrator.
@@ -60,10 +61,16 @@ pub struct AttestationRequest {
     pub zaru_tier: Option<String>,
     /// Tenant identity of the requesting principal (ADR-056).
     ///
-    /// Used to enforce SecurityContext name ownership: `zaru-*` contexts require
-    /// a consumer tenant, `tenant-{slug}-*` contexts require the matching
-    /// enterprise tenant, and `aegis-system-*` contexts require the system tenant.
+    /// Used to enforce SecurityContext name ownership for `tenant-{slug}-*`
+    /// contexts where the slug is encoded in the context name. For `zaru-*` and
+    /// `aegis-system-*` contexts, ownership is keyed off `realm` instead since
+    /// per ADR-097 consumer principals carry per-user `u-{sub}` tenant slugs.
     pub tenant_id: TenantId,
+    /// OIDC realm classification of the requesting principal (ADR-056, ADR-097).
+    ///
+    /// This is the authoritative signal for `zaru-*` and `aegis-system-*`
+    /// SecurityContext ownership, decoupled from the `tenant_id` slug.
+    pub realm: RealmKind,
     /// Optional human-readable summary of the task this execution is performing.
     ///
     /// Embedded as the `task_summary` JWT claim in the issued `SecurityToken`.

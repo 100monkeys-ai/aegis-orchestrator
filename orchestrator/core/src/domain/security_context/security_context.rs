@@ -33,6 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::capability::Capability;
+use crate::domain::iam::RealmKind;
 use crate::domain::tenant::TenantId;
 
 /// Describes why a tool invocation was rejected by security policy evaluation.
@@ -269,40 +270,59 @@ impl SecurityContext {
         })
     }
 
-    /// Validate that the given tenant is allowed to use this SecurityContext (ADR-056).
+    /// Validate that the given principal is allowed to use this SecurityContext (ADR-056).
     ///
     /// SecurityContext names must follow tenant-namespaced conventions:
-    /// - `zaru-*` — only for consumer realm principals (`zaru-consumer` tenant)
+    /// - `zaru-*` — only for consumer realm principals (any per-user tenant in the consumer realm, ADR-097)
     /// - `tenant-{slug}-*` — only for the matching enterprise tenant
     /// - `aegis-system-*` — only for system realm principals
     /// - Legacy bare names (no recognised prefix) are rejected outright.
     ///
+    /// The `realm` parameter classifies the authenticated principal's OIDC realm
+    /// and is the authoritative signal for the `zaru-*` and `aegis-system-*`
+    /// prefixes. The `tenant_id` is still used for the `tenant-{slug}-*` prefix
+    /// because the slug is encoded in the context name itself.
+    ///
     /// # Errors
     ///
     /// Returns a human-readable error string describing the ownership violation.
-    pub fn validate_tenant_ownership(&self, tenant_id: &TenantId) -> Result<(), String> {
-        validate_context_ownership(&self.name, tenant_id)
+    pub fn validate_tenant_ownership(
+        &self,
+        tenant_id: &TenantId,
+        realm: &RealmKind,
+    ) -> Result<(), String> {
+        validate_context_ownership(&self.name, tenant_id, realm)
     }
 }
 
-/// Validate that a SecurityContext name is owned by the given tenant (ADR-056).
+/// Validate that a SecurityContext name is owned by the requesting principal (ADR-056).
 ///
 /// This is a free function so it can be called before the `SecurityContext` is
 /// loaded from the repository (e.g. to fail fast on obviously-wrong names).
 ///
 /// # Rules
 ///
-/// 1. `zaru-*` → requires `tenant_id.is_consumer()`
-/// 2. `tenant-{slug}-*` → requires context name starts with `tenant-{tenant_id}-`
-/// 3. `aegis-system-*` → requires `tenant_id.is_system()`
-/// 4. Any other prefix → rejected as a legacy bare name
-pub fn validate_context_ownership(context_name: &str, tenant_id: &TenantId) -> Result<(), String> {
+/// 1. `zaru-*` → requires `realm == RealmKind::Consumer`. Per ADR-056 these
+///    tier contexts are global and orthogonal to the per-user tenant slug
+///    introduced by ADR-097, so the predicate is realm membership rather than
+///    a literal tenant slug match.
+/// 2. `tenant-{slug}-*` → requires context name starts with `tenant-{tenant_id}-`.
+///    The slug is encoded in the name; matching against `tenant_id` is the
+///    correct check regardless of realm classification.
+/// 3. `aegis-system-*` → requires `realm == RealmKind::System`.
+/// 4. Any other prefix → rejected as a legacy bare name.
+pub fn validate_context_ownership(
+    context_name: &str,
+    tenant_id: &TenantId,
+    realm: &RealmKind,
+) -> Result<(), String> {
     if context_name.starts_with("zaru-") {
-        if !tenant_id.is_consumer() {
+        if !matches!(realm, RealmKind::Consumer) {
             return Err(format!(
                 "SecurityContext '{}' uses the 'zaru-' prefix which is reserved for consumer \
-                 realm principals, but the requesting tenant is '{}'",
+                 realm principals, but the requesting principal is in realm '{:?}' (tenant '{}')",
                 context_name,
+                realm,
                 tenant_id.as_str()
             ));
         }
@@ -324,11 +344,12 @@ pub fn validate_context_ownership(context_name: &str, tenant_id: &TenantId) -> R
     }
 
     if context_name.starts_with("aegis-system-") {
-        if !tenant_id.is_system() {
+        if !matches!(realm, RealmKind::System) {
             return Err(format!(
                 "SecurityContext '{}' uses the 'aegis-system-' prefix which is reserved for \
-                 system realm principals, but the requesting tenant is '{}'",
+                 system realm principals, but the requesting principal is in realm '{:?}' (tenant '{}')",
                 context_name,
+                realm,
                 tenant_id.as_str()
             ));
         }
@@ -425,41 +446,88 @@ mod tests {
     #[test]
     fn test_validate_context_ownership_zaru_consumer() {
         let tenant = TenantId::consumer();
-        assert!(validate_context_ownership("zaru-free", &tenant).is_ok());
-        assert!(validate_context_ownership("zaru-pro", &tenant).is_ok());
+        assert!(validate_context_ownership("zaru-free", &tenant, &RealmKind::Consumer).is_ok());
+        assert!(validate_context_ownership("zaru-pro", &tenant, &RealmKind::Consumer).is_ok());
     }
 
     #[test]
-    fn test_validate_context_ownership_zaru_rejects_non_consumer() {
+    fn test_validate_context_ownership_zaru_per_user_consumer_tenant() {
+        // Regression: ADR-097 per-user tenant slugs (`u-{sub}`) must be accepted
+        // for `zaru-*` SecurityContexts as long as the principal authenticated
+        // against the consumer realm. Tier contexts are realm-scoped, not
+        // tenant-slug-scoped (ADR-056).
+        let per_user_tenant = TenantId::new("u-d7f8170035d349b6b237c391ccc19035").unwrap();
+        assert!(
+            validate_context_ownership("zaru-pro", &per_user_tenant, &RealmKind::Consumer).is_ok()
+        );
+        assert!(
+            validate_context_ownership("zaru-free", &per_user_tenant, &RealmKind::Consumer).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_context_ownership_zaru_rejected_for_non_consumer_realm() {
+        // Same per-user tenant slug shape, but principal authenticated against
+        // a non-consumer realm — must still be rejected.
+        let per_user_tenant = TenantId::new("u-d7f8170035d349b6b237c391ccc19035").unwrap();
+        let realm = RealmKind::Tenant {
+            slug: "acme-corp".to_string(),
+        };
+        assert!(validate_context_ownership("zaru-pro", &per_user_tenant, &realm).is_err());
+
         let tenant = TenantId::system();
-        assert!(validate_context_ownership("zaru-free", &tenant).is_err());
+        assert!(validate_context_ownership("zaru-free", &tenant, &RealmKind::System).is_err());
         let enterprise = TenantId::from_realm_slug("acme").unwrap();
-        assert!(validate_context_ownership("zaru-pro", &enterprise).is_err());
+        let tenant_realm = RealmKind::Tenant {
+            slug: "acme".to_string(),
+        };
+        assert!(validate_context_ownership("zaru-pro", &enterprise, &tenant_realm).is_err());
     }
 
     #[test]
     fn test_validate_context_ownership_tenant_prefix_matching() {
         let tenant = TenantId::from_realm_slug("acme-corp").unwrap();
-        assert!(validate_context_ownership("tenant-acme-corp-research", &tenant).is_ok());
-        assert!(validate_context_ownership("tenant-acme-corp-deploy", &tenant).is_ok());
+        let realm = RealmKind::Tenant {
+            slug: "acme-corp".to_string(),
+        };
+        assert!(validate_context_ownership("tenant-acme-corp-research", &tenant, &realm).is_ok());
+        assert!(validate_context_ownership("tenant-acme-corp-deploy", &tenant, &realm).is_ok());
         // Wrong tenant
         let other = TenantId::from_realm_slug("other-corp").unwrap();
-        assert!(validate_context_ownership("tenant-acme-corp-research", &other).is_err());
+        let other_realm = RealmKind::Tenant {
+            slug: "other-corp".to_string(),
+        };
+        assert!(
+            validate_context_ownership("tenant-acme-corp-research", &other, &other_realm).is_err()
+        );
     }
 
     #[test]
     fn test_validate_context_ownership_aegis_system() {
         let system = TenantId::system();
-        assert!(validate_context_ownership("aegis-system-internal", &system).is_ok());
+        assert!(
+            validate_context_ownership("aegis-system-internal", &system, &RealmKind::System)
+                .is_ok()
+        );
         let consumer = TenantId::consumer();
-        assert!(validate_context_ownership("aegis-system-internal", &consumer).is_err());
+        assert!(validate_context_ownership(
+            "aegis-system-internal",
+            &consumer,
+            &RealmKind::Consumer
+        )
+        .is_err());
     }
 
     #[test]
     fn test_validate_context_ownership_rejects_legacy_bare_names() {
         let consumer = TenantId::consumer();
-        assert!(validate_context_ownership("research-safe", &consumer).is_err());
-        assert!(validate_context_ownership("coder-unrestricted", &consumer).is_err());
+        assert!(
+            validate_context_ownership("research-safe", &consumer, &RealmKind::Consumer).is_err()
+        );
+        assert!(
+            validate_context_ownership("coder-unrestricted", &consumer, &RealmKind::Consumer)
+                .is_err()
+        );
     }
 
     #[test]

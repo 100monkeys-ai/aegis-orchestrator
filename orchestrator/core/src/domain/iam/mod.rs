@@ -124,6 +124,23 @@ impl UserIdentity {
             | IdentityKind::TenantUser { .. } => "aegis-system-operator".to_string(),
         }
     }
+
+    /// Classify this identity's OIDC realm.
+    ///
+    /// Derived from `identity_kind` rather than `realm_slug` so that the
+    /// returned `RealmKind` matches the strongly-typed classification produced
+    /// by the IAM service when it validated the JWT.
+    pub fn realm_kind(&self) -> RealmKind {
+        match &self.identity_kind {
+            IdentityKind::ConsumerUser { .. } => RealmKind::Consumer,
+            IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => {
+                RealmKind::System
+            }
+            IdentityKind::TenantUser { tenant_slug } => RealmKind::Tenant {
+                slug: tenant_slug.clone(),
+            },
+        }
+    }
 }
 
 /// Classification of the authenticated entity.

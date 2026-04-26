@@ -18,6 +18,7 @@
 use chrono::Utc;
 use serde_json::json;
 
+use aegis_orchestrator_core::domain::iam::RealmKind;
 use aegis_orchestrator_core::domain::seal_session::{
     EnvelopeVerifier, SealSession, SealSessionError, SessionStatus,
 };
@@ -448,49 +449,78 @@ fn capability_allows_rejects_wrong_tool() {
 fn tenant_ownership_zaru_prefix_for_consumer() {
     let consumer = TenantId::consumer();
     let ctx = make_context("zaru-free", vec![wildcard_capability()], vec![]);
-    assert!(ctx.validate_tenant_ownership(&consumer).is_ok());
+    assert!(ctx
+        .validate_tenant_ownership(&consumer, &RealmKind::Consumer)
+        .is_ok());
+}
+
+#[test]
+fn tenant_ownership_zaru_prefix_for_per_user_consumer_tenant() {
+    // Regression: ADR-097 per-user tenant slugs (`u-{sub}`) must be accepted
+    // for `zaru-*` SecurityContexts when the principal authenticated against
+    // the consumer realm. Tier contexts are realm-scoped (ADR-056).
+    let per_user = TenantId::new("u-d7f8170035d349b6b237c391ccc19035").unwrap();
+    let ctx = make_context("zaru-pro", vec![wildcard_capability()], vec![]);
+    assert!(ctx
+        .validate_tenant_ownership(&per_user, &RealmKind::Consumer)
+        .is_ok());
 }
 
 #[test]
 fn tenant_ownership_zaru_prefix_rejected_for_enterprise() {
     let enterprise = TenantId::from_realm_slug("acme").unwrap();
     let ctx = make_context("zaru-pro", vec![], vec![]);
-    assert!(ctx.validate_tenant_ownership(&enterprise).is_err());
+    let realm = RealmKind::Tenant {
+        slug: "acme".to_string(),
+    };
+    assert!(ctx.validate_tenant_ownership(&enterprise, &realm).is_err());
 }
 
 #[test]
 fn tenant_ownership_zaru_prefix_rejected_for_system() {
     let system = TenantId::system();
     let ctx = make_context("zaru-free", vec![], vec![]);
-    assert!(ctx.validate_tenant_ownership(&system).is_err());
+    assert!(ctx
+        .validate_tenant_ownership(&system, &RealmKind::System)
+        .is_err());
 }
 
 #[test]
 fn tenant_ownership_tenant_prefix_matches_slug() {
     let tenant = TenantId::from_realm_slug("acme-corp").unwrap();
     let ctx = make_context("tenant-acme-corp-research", vec![], vec![]);
-    assert!(ctx.validate_tenant_ownership(&tenant).is_ok());
+    let realm = RealmKind::Tenant {
+        slug: "acme-corp".to_string(),
+    };
+    assert!(ctx.validate_tenant_ownership(&tenant, &realm).is_ok());
 }
 
 #[test]
 fn tenant_ownership_tenant_prefix_rejects_wrong_slug() {
     let tenant = TenantId::from_realm_slug("acme-corp").unwrap();
     let ctx = make_context("tenant-other-corp-research", vec![], vec![]);
-    assert!(ctx.validate_tenant_ownership(&tenant).is_err());
+    let realm = RealmKind::Tenant {
+        slug: "acme-corp".to_string(),
+    };
+    assert!(ctx.validate_tenant_ownership(&tenant, &realm).is_err());
 }
 
 #[test]
 fn tenant_ownership_aegis_system_prefix_for_system() {
     let system = TenantId::system();
     let ctx = make_context("aegis-system-internal", vec![], vec![]);
-    assert!(ctx.validate_tenant_ownership(&system).is_ok());
+    assert!(ctx
+        .validate_tenant_ownership(&system, &RealmKind::System)
+        .is_ok());
 }
 
 #[test]
 fn tenant_ownership_aegis_system_prefix_rejected_for_consumer() {
     let consumer = TenantId::consumer();
     let ctx = make_context("aegis-system-core", vec![], vec![]);
-    assert!(ctx.validate_tenant_ownership(&consumer).is_err());
+    assert!(ctx
+        .validate_tenant_ownership(&consumer, &RealmKind::Consumer)
+        .is_err());
 }
 
 #[test]
@@ -499,11 +529,20 @@ fn tenant_ownership_bare_name_rejected_for_all() {
     let consumer = TenantId::consumer();
     let system = TenantId::system();
     let enterprise = TenantId::from_realm_slug("acme").unwrap();
+    let enterprise_realm = RealmKind::Tenant {
+        slug: "acme".to_string(),
+    };
 
     let ctx = make_context("research-safe", vec![], vec![]);
-    assert!(ctx.validate_tenant_ownership(&consumer).is_err());
-    assert!(ctx.validate_tenant_ownership(&system).is_err());
-    assert!(ctx.validate_tenant_ownership(&enterprise).is_err());
+    assert!(ctx
+        .validate_tenant_ownership(&consumer, &RealmKind::Consumer)
+        .is_err());
+    assert!(ctx
+        .validate_tenant_ownership(&system, &RealmKind::System)
+        .is_err());
+    assert!(ctx
+        .validate_tenant_ownership(&enterprise, &enterprise_realm)
+        .is_err());
 }
 
 // ============================================================================

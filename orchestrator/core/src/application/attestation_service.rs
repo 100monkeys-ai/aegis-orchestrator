@@ -196,14 +196,17 @@ impl AttestationServiceImpl {
         let context_name = self.resolve_security_context_name(&request)?;
 
         // 1b. Enforce tenant ownership of the SecurityContext name (ADR-056 Phase 5).
-        validate_context_ownership(&context_name, &request.tenant_id).map_err(|msg| {
-            tracing::warn!(
-                context_name = %context_name,
-                tenant_id = %request.tenant_id,
-                "SecurityContext ownership violation: {msg}"
-            );
-            anyhow::anyhow!("SecurityContext ownership violation: {msg}")
-        })?;
+        validate_context_ownership(&context_name, &request.tenant_id, &request.realm).map_err(
+            |msg| {
+                tracing::warn!(
+                    context_name = %context_name,
+                    tenant_id = %request.tenant_id,
+                    realm = ?request.realm,
+                    "SecurityContext ownership violation: {msg}"
+                );
+                anyhow::anyhow!("SecurityContext ownership violation: {msg}")
+            },
+        )?;
 
         let security_context = self
             .security_context_repo
@@ -438,6 +441,7 @@ impl SecurityTokenIssuerPort for SecurityTokenIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::iam::RealmKind;
     use crate::domain::security_context::capability::Capability;
     use crate::domain::security_context::{SecurityContext, SecurityContextMetadata};
     use crate::domain::tenant::TenantId;
@@ -506,6 +510,7 @@ mod tests {
                 workload_id: Some("zaru-session-42".to_string()),
                 zaru_tier: Some("pro".to_string()),
                 tenant_id: TenantId::consumer(),
+                realm: RealmKind::Consumer,
                 task_summary: None,
             })
             .await
@@ -549,6 +554,7 @@ mod tests {
                 workload_id: Some("zaru-session-99".to_string()),
                 zaru_tier: Some("enterprise".to_string()),
                 tenant_id: TenantId::consumer(),
+                realm: RealmKind::Consumer,
                 task_summary: None,
             })
             .await;
@@ -581,6 +587,7 @@ mod tests {
                 workload_id: None,
                 zaru_tier: None,
                 tenant_id: TenantId::system(),
+                realm: RealmKind::System,
                 task_summary: None,
             })
             .await;
@@ -618,6 +625,7 @@ mod tests {
                 workload_id: None,
                 zaru_tier: None,
                 tenant_id: TenantId::consumer(),
+                realm: RealmKind::Consumer,
                 task_summary: None,
             })
             .await;
@@ -657,6 +665,9 @@ mod tests {
                 workload_id: None,
                 zaru_tier: None,
                 tenant_id: wrong_tenant,
+                realm: RealmKind::Tenant {
+                    slug: "other-corp".to_string(),
+                },
                 task_summary: None,
             })
             .await;
@@ -696,6 +707,9 @@ mod tests {
                 workload_id: None,
                 zaru_tier: None,
                 tenant_id: correct_tenant,
+                realm: RealmKind::Tenant {
+                    slug: "acme-corp".to_string(),
+                },
                 task_summary: None,
             })
             .await;
