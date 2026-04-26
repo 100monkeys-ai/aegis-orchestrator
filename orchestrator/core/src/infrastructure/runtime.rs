@@ -1086,6 +1086,15 @@ impl AgentRuntime for ContainerRuntime {
             "Bootstrap execution completed"
         );
 
+        if exit_code == 0 && !stdout_logs.is_empty() {
+            let combined = stdout_logs.join("");
+            info!(
+                container_id = container_id,
+                "{}",
+                Self::format_bootstrap_stdout_for_log(&combined)
+            );
+        }
+
         // Check exit code and return error if bootstrap failed
         let keep_on_failure = self
             .keep_container_on_failure
