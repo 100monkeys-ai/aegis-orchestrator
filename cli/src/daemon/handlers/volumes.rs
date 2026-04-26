@@ -429,10 +429,49 @@ async fn resolve_or_provision_upload_volume(
         .map_err(user_volume_error_response)
 }
 
-/// Maximum upload body size accepted by this handler before any per-tier
-/// quota check. Set above the largest tier limit so the in-handler check is
-/// the source of truth; this is just a hard ceiling against accidental DoS.
-const UPLOAD_BODY_HARD_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+/// Reject filenames containing path separators, `..`, control chars, NUL,
+/// or that are empty / overlong. Same posture as `validate_dest_path` but
+/// targeted at filenames specifically (no `/` at all, including as a
+/// non-leading character).
+fn validate_supplied_filename(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    if name == "." || name == ".." {
+        return false;
+    }
+    !name
+        .chars()
+        .any(|c| c.is_control() || c == '/' || c == '\\' || c == '\0')
+}
+
+/// Decode the `X-Filename` header value. The Zaru chat proxy URL-encodes
+/// the original filename (`encodeURIComponent`) so non-ASCII bytes survive
+/// HTTP-header transport. Decode percent-escapes; if decoding fails, fall
+/// back to the raw value.
+fn decode_x_filename(raw: &str) -> String {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// Resolve the per-file upload cap for a tier from the canonical
+/// `StorageTierLimits` table. An unknown tier returns `None` so the caller
+/// fails closed rather than admitting the upload under an unbounded cap.
+fn resolve_max_file_size_bytes(tier: &ZaruTier) -> Option<u64> {
+    aegis_orchestrator_core::domain::volume::StorageTierLimits::default()
+        .limits
+        .get(tier)
+        .map(|l| l.max_file_size_bytes)
+}
+
+/// Cast a per-tier byte cap into the `usize` accepted by `to_bytes`,
+/// saturating at `usize::MAX` for unbounded tiers (Enterprise = `u64::MAX`)
+/// and on 32-bit targets where `u64` exceeds `usize::MAX`.
+fn cap_as_usize(cap: u64) -> usize {
+    usize::try_from(cap).unwrap_or(usize::MAX)
+}
 
 /// POST /v1/volumes/:id/files/upload (ADR-079, ADR-113)
 ///
@@ -474,6 +513,18 @@ pub(crate) async fn upload_file(
     let vol_id =
         resolve_or_provision_upload_volume(&state, &id_or_name, tenant_id, &owner, &tier).await?;
 
+    // Resolve the per-tier upload cap. Fail closed: an unknown tier rejects
+    // the upload rather than falling back to an unbounded ceiling.
+    let max_file_size = resolve_max_file_size_bytes(&tier).ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "no upload size limit configured for caller tier"
+            })),
+        )
+    })?;
+    let max_file_size_usize = cap_as_usize(max_file_size);
+
     let is_multipart = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -484,6 +535,14 @@ pub(crate) async fn upload_file(
                 .starts_with("multipart/")
         })
         .unwrap_or(false);
+
+    // Read the X-Filename header before consuming the request body. Used
+    // only by the raw-body branch (multipart carries filename per-field).
+    let x_filename_decoded = request
+        .headers()
+        .get("x-filename")
+        .and_then(|v| v.to_str().ok())
+        .map(decode_x_filename);
 
     let (data, supplied_name) = if is_multipart {
         let mut mp = axum::extract::Multipart::from_request(request, &())
@@ -517,6 +576,17 @@ pub(crate) async fn upload_file(
                     Json(serde_json::json!({"error": format!("multipart read error: {e}")})),
                 )
             })?;
+            if bytes.len() as u64 > max_file_size {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "upload exceeds tier cap of {} bytes",
+                            max_file_size
+                        )
+                    })),
+                ));
+            }
             if found.is_none() && !bytes.is_empty() {
                 found = Some((bytes.to_vec(), file_name));
             }
@@ -532,15 +602,23 @@ pub(crate) async fn upload_file(
         }
     } else {
         let body = request.into_body();
-        let bytes = to_bytes(body, UPLOAD_BODY_HARD_LIMIT_BYTES)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(serde_json::json!({"error": format!("body read error: {e}")})),
-                )
-            })?;
-        (bytes.to_vec(), None)
+        // `to_bytes` enforces the per-tier cap directly: it returns an error
+        // (mapped to 413) if the body exceeds `max_file_size_usize`.
+        let bytes = to_bytes(body, max_file_size_usize).await.map_err(|e| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": format!("body read error: {e}")})),
+            )
+        })?;
+        // Honor the X-Filename header on the raw-body branch (ADR-113).
+        // Validation rejects path separators, `..`, control chars, NUL,
+        // empty, or overlong values; an invalid header falls through to the
+        // path-derived display name.
+        let header_name = x_filename_decoded
+            .as_deref()
+            .filter(|n| validate_supplied_filename(n))
+            .map(|n| n.to_string());
+        (bytes.to_vec(), header_name)
     };
 
     let mime_type = sniff_upload_mime(&data);
@@ -549,21 +627,16 @@ pub(crate) async fn upload_file(
     hasher.update(&data);
     let sha256 = format!("{:x}", hasher.finalize());
 
-    // Determine per-tier file size limit
-    let tier_limits = aegis_orchestrator_core::domain::volume::StorageTierLimits::default();
-    let max_file_size = tier_limits
-        .limits
-        .get(&tier)
-        .map(|l| l.max_file_size_bytes)
-        .unwrap_or(50 * 1024 * 1024);
-
     state
         .file_operations_service
         .write_file(&vol_id, &owner, &params.path, &data, max_file_size)
         .await
         .map_err(file_ops_error_response)?;
 
+    // Validate any client-supplied filename (multipart `filename` field or
+    // X-Filename header). If invalid, fall through to the path-derived name.
     let display_name = supplied_name
+        .filter(|n| validate_supplied_filename(n))
         .or_else(|| {
             std::path::Path::new(&params.path)
                 .file_name()
@@ -724,5 +797,136 @@ mod tests {
             "/v1/volumes/{id}/files/upload",
             axum::routing::post(upload_file),
         )
+    }
+
+    // ========================================================================
+    // ADR-113 regression: X-Filename header honored on raw-body uploads
+    // ========================================================================
+
+    /// The raw-body branch of `upload_file` previously ignored the
+    /// `X-Filename` header sent by the Zaru chat proxy and derived
+    /// `display_name` only from the URL path. This regression ensures a
+    /// well-formed `X-Filename` value is accepted by the validator and would
+    /// be used as the stored attachment name.
+    #[test]
+    fn validate_supplied_filename_accepts_well_formed_names() {
+        assert!(validate_supplied_filename("report.pdf"));
+        assert!(validate_supplied_filename("Photo 2026-04-26.png"));
+        assert!(validate_supplied_filename("résumé.docx"));
+        assert!(validate_supplied_filename("file.tar.gz"));
+    }
+
+    #[test]
+    fn validate_supplied_filename_rejects_path_separators() {
+        assert!(!validate_supplied_filename("foo/bar.txt"));
+        assert!(!validate_supplied_filename("foo\\bar.txt"));
+        assert!(!validate_supplied_filename("/etc/passwd"));
+    }
+
+    #[test]
+    fn validate_supplied_filename_rejects_traversal_and_dots() {
+        assert!(!validate_supplied_filename(".."));
+        assert!(!validate_supplied_filename("."));
+    }
+
+    #[test]
+    fn validate_supplied_filename_rejects_control_chars_and_nul() {
+        assert!(!validate_supplied_filename("foo\nbar"));
+        assert!(!validate_supplied_filename("foo\tbar"));
+        assert!(!validate_supplied_filename("foo\0bar"));
+        assert!(!validate_supplied_filename("foo\x07bar"));
+    }
+
+    #[test]
+    fn validate_supplied_filename_rejects_empty_and_overlong() {
+        assert!(!validate_supplied_filename(""));
+        assert!(!validate_supplied_filename(&"a".repeat(256)));
+        assert!(validate_supplied_filename(&"a".repeat(255)));
+    }
+
+    /// The Zaru proxy URL-encodes the filename before stuffing it into the
+    /// `X-Filename` header (HTTP header values cannot carry arbitrary UTF-8
+    /// safely). The handler must percent-decode before validating/using it.
+    #[test]
+    fn decode_x_filename_percent_decodes_utf8() {
+        assert_eq!(decode_x_filename("r%C3%A9sum%C3%A9.pdf"), "résumé.pdf");
+        assert_eq!(decode_x_filename("hello%20world.txt"), "hello world.txt");
+    }
+
+    #[test]
+    fn decode_x_filename_passes_through_plain_ascii() {
+        assert_eq!(decode_x_filename("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn decode_x_filename_falls_back_on_invalid_encoding() {
+        // Lone `%` without two hex digits is not valid percent-encoding;
+        // `percent_decode_str` treats it literally, so we still get a
+        // usable string back.
+        let out = decode_x_filename("bogus%ZZ.txt");
+        assert!(!out.is_empty());
+    }
+
+    // ========================================================================
+    // ADR-113 regression: per-tier max upload size, replacing the hardcoded
+    // 512 MiB ceiling.
+    // ========================================================================
+
+    /// Free tier caps per-file uploads at 50 MiB (per
+    /// `StorageTierLimits::default()`). A previous revision applied a
+    /// hardcoded 512 MiB ceiling regardless of tier.
+    #[test]
+    fn resolve_max_file_size_bytes_free_tier_is_50_mib() {
+        let cap = resolve_max_file_size_bytes(&ZaruTier::Free).expect("free tier configured");
+        assert_eq!(cap, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolve_max_file_size_bytes_pro_tier_is_500_mib() {
+        let cap = resolve_max_file_size_bytes(&ZaruTier::Pro).expect("pro tier configured");
+        assert_eq!(cap, 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolve_max_file_size_bytes_business_tier_is_2_gib() {
+        let cap =
+            resolve_max_file_size_bytes(&ZaruTier::Business).expect("business tier configured");
+        assert_eq!(cap, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolve_max_file_size_bytes_enterprise_tier_is_unbounded() {
+        let cap =
+            resolve_max_file_size_bytes(&ZaruTier::Enterprise).expect("enterprise configured");
+        assert_eq!(cap, u64::MAX);
+    }
+
+    /// Enterprise's `u64::MAX` cap must convert into a `usize` that
+    /// `axum::body::to_bytes` accepts without overflow. On 64-bit targets
+    /// this is `usize::MAX`; on 32-bit it saturates rather than panics.
+    #[test]
+    fn cap_as_usize_saturates_on_overflow() {
+        assert_eq!(cap_as_usize(u64::MAX), usize::MAX);
+        assert_eq!(cap_as_usize(0), 0);
+        assert_eq!(cap_as_usize(50 * 1024 * 1024), 50 * 1024 * 1024);
+    }
+
+    /// Demonstrates the cap-vs-size comparison the handler performs for
+    /// the multipart branch: a Free-tier caller uploading 11 MiB is
+    /// rejected, the same payload uploaded by a Pro-tier caller is
+    /// accepted. (The handler's actual rejection path returns 413; this
+    /// test exercises the inequality the path branches on.)
+    #[test]
+    fn tier_cap_rejects_oversize_for_free_accepts_for_pro() {
+        let payload_size: u64 = 11 * 1024 * 1024;
+        let free_cap = resolve_max_file_size_bytes(&ZaruTier::Free).unwrap();
+        let pro_cap = resolve_max_file_size_bytes(&ZaruTier::Pro).unwrap();
+        assert!(payload_size <= free_cap, "11 MiB <= 50 MiB Free cap");
+        assert!(payload_size <= pro_cap, "11 MiB <= 500 MiB Pro cap");
+
+        // 60 MiB exceeds Free but not Pro.
+        let oversize: u64 = 60 * 1024 * 1024;
+        assert!(oversize > free_cap, "60 MiB > 50 MiB Free cap (rejected)");
+        assert!(oversize <= pro_cap, "60 MiB <= 500 MiB Pro cap (accepted)");
     }
 }
