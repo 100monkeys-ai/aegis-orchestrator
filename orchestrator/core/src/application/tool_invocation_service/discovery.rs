@@ -12,9 +12,15 @@ use super::*;
 impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_search_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         security_context: &crate::domain::security_context::SecurityContext,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: enforce tenant scope BEFORE consulting infrastructure so a
+        // cross-tenant request is rejected even when discovery is not
+        // configured on this node.
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
+
         let discovery = self.discovery_service.as_ref().ok_or_else(|| {
             SealSessionError::InternalError(
                 "Discovery service not configured — this is an enterprise feature. \
@@ -22,8 +28,6 @@ impl ToolInvocationService {
                     .into(),
             )
         })?;
-
-        let tenant_id = Self::resolve_tenant_arg(args)?;
 
         let query_text = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::InvalidArguments(
@@ -107,9 +111,15 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_search_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         security_context: &crate::domain::security_context::SecurityContext,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: enforce tenant scope BEFORE consulting infrastructure so a
+        // cross-tenant request is rejected even when discovery is not
+        // configured on this node.
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
+
         let discovery = self.discovery_service.as_ref().ok_or_else(|| {
             SealSessionError::InternalError(
                 "Discovery service not configured — this is an enterprise feature. \
@@ -117,8 +127,6 @@ impl ToolInvocationService {
                     .into(),
             )
         })?;
-
-        let tenant_id = Self::resolve_tenant_arg(args)?;
 
         let query_text = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::InvalidArguments(

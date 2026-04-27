@@ -121,6 +121,13 @@ pub enum SealSessionError {
     NotFound(String),
     /// A required configuration value is missing or invalid.
     ConfigurationError(String),
+    /// A tool argument supplied a `tenant_id` that does not match the
+    /// authenticated caller's tenant, and the identity is not permitted to
+    /// delegate to other tenants. ADR-097, ADR-100.
+    TenantMismatch {
+        authenticated: String,
+        requested: String,
+    },
 }
 
 impl std::fmt::Display for SealSessionError {
@@ -139,6 +146,13 @@ impl std::fmt::Display for SealSessionError {
             Self::InvalidArguments(msg) => write!(f, "Invalid tool arguments: {msg}"),
             Self::NotFound(msg) => write!(f, "Not found: {msg}"),
             Self::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
+            Self::TenantMismatch {
+                authenticated,
+                requested,
+            } => write!(
+                f,
+                "Tenant mismatch: caller is authenticated as tenant '{authenticated}' but requested operation on tenant '{requested}'"
+            ),
         }
     }
 }

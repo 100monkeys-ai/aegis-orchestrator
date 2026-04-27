@@ -1,17 +1,62 @@
 use super::*;
+use crate::domain::iam::TenantScope;
 
 #[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
-    pub(super) fn resolve_tenant_arg(args: &Value) -> Result<TenantId, SealSessionError> {
-        let tenant = args
+    /// Bind the `tenant_id` argument of an `aegis.*` tool call to the
+    /// authenticated caller's tenant per [`TenantScope`].
+    ///
+    /// Semantics (ADR-097, ADR-100):
+    /// 1. If `args.tenant_id` (or legacy `args.tenant`) is **absent**,
+    ///    inject `scope.authenticated_tenant` and return it.
+    /// 2. If present and equal to `scope.authenticated_tenant`, accept
+    ///    the value and return it.
+    /// 3. If present and **different**, reject with
+    ///    [`SealSessionError::TenantMismatch`] — **except** when the
+    ///    caller is a `ServiceAccount`, which may delegate per ADR-100.
+    ///
+    /// On acceptance, the canonical `tenant_id` is also written back into
+    /// `args` (overwriting any legacy `tenant` key normalization) so that
+    /// downstream handlers see a single, authoritative value.
+    pub(super) fn enforce_tenant_arg(
+        args: &mut Value,
+        scope: &TenantScope,
+    ) -> Result<TenantId, SealSessionError> {
+        let supplied = args
             .get("tenant_id")
             .and_then(|v| v.as_str())
             .or_else(|| args.get("tenant").and_then(|v| v.as_str()))
-            .unwrap_or(crate::domain::tenant::CONSUMER_SLUG);
+            .map(|s| s.to_string());
 
-        TenantId::from_string(tenant).map_err(|e| {
-            SealSessionError::InvalidArguments(format!("invalid tenant identifier '{tenant}': {e}"))
-        })
+        let resolved = match supplied {
+            None => scope.authenticated_tenant.clone(),
+            Some(raw) => {
+                let parsed = TenantId::from_string(&raw).map_err(|e| {
+                    SealSessionError::InvalidArguments(format!(
+                        "invalid tenant identifier '{raw}': {e}"
+                    ))
+                })?;
+                if parsed == scope.authenticated_tenant {
+                    parsed
+                } else if scope.may_delegate() {
+                    parsed
+                } else {
+                    return Err(SealSessionError::TenantMismatch {
+                        authenticated: scope.authenticated_tenant.as_str().to_string(),
+                        requested: parsed.as_str().to_string(),
+                    });
+                }
+            }
+        };
+
+        if let Value::Object(map) = args {
+            map.insert(
+                "tenant_id".to_string(),
+                Value::String(resolved.as_str().to_string()),
+            );
+        }
+
+        Ok(resolved)
     }
 
     pub fn new(
@@ -263,12 +308,26 @@ impl ToolInvocationService {
                 },
             });
 
-        // 6. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
+        // 6. Build the authoritative TenantScope for this dispatch from the
+        //    SEAL session's tenant + the reconstructed identity kind.
+        let scope_identity_kind = seal_caller_identity
+            .as_ref()
+            .map(|id| id.identity_kind.clone())
+            .unwrap_or_else(|| crate::domain::iam::IdentityKind::ConsumerUser {
+                zaru_tier: crate::domain::iam::ZaruTier::from_security_context_name(
+                    &security_context.name,
+                )
+                .unwrap_or(crate::domain::iam::ZaruTier::Free),
+                tenant_id: tenant_id.clone(),
+            });
+        let tenant_scope = TenantScope::new(tenant_id.clone(), scope_identity_kind);
+
+        // 7. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
         let result = self
             .dispatch_tool_core(
                 &agent_id,
                 execution_id,
-                &tenant_id,
+                &tenant_scope,
                 &security_context,
                 tool_name,
                 args,
@@ -350,11 +409,22 @@ impl ToolInvocationService {
                 ))
             })?;
 
+        // Build the authoritative TenantScope for this internal dispatch from
+        // the parent execution's tenant + the reconstructed caller identity.
+        let scope_identity_kind = caller_identity
+            .as_ref()
+            .map(|id| id.identity_kind.clone())
+            .unwrap_or_else(|| crate::domain::iam::IdentityKind::ConsumerUser {
+                zaru_tier: crate::domain::iam::ZaruTier::Free,
+                tenant_id: tenant_id.clone(),
+            });
+        let tenant_scope = TenantScope::new(tenant_id.clone(), scope_identity_kind);
+
         // 2. Delegate to unified dispatch core.
         self.dispatch_tool_core(
             agent_id,
             execution_id,
-            &tenant_id,
+            &tenant_scope,
             &security_context,
             tool_name,
             args,
@@ -379,7 +449,7 @@ impl ToolInvocationService {
         &self,
         agent_id: &AgentId,
         execution_id: crate::domain::execution::ExecutionId,
-        tenant_id: &TenantId,
+        tenant_scope: &TenantScope,
         security_context: &crate::domain::security_context::SecurityContext,
         tool_name: String,
         args: Value,
@@ -387,6 +457,10 @@ impl ToolInvocationService {
         tool_audit_history: Vec<TrajectoryStep>,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // Convenience binding for code paths that only need the authenticated
+        // tenant — agent lookups, judge spawning, gateway forwarding, etc.
+        // All `aegis.*` arg-bearing tool dispatch goes through `enforce_tenant_arg`.
+        let tenant_id = &tenant_scope.authenticated_tenant;
         let invocation_id = ToolInvocationId::new();
         let started_at = Instant::now();
         self.publish_invocation_requested(
@@ -709,24 +783,25 @@ impl ToolInvocationService {
             ),
         };
 
-        // Inject session tenant_id into args so aegis.* tools resolve the
-        // correct tenant instead of falling back to CONSUMER_SLUG.
-        if let Value::Object(ref mut map) = args {
-            map.entry("tenant_id")
-                .or_insert_with(|| Value::String(tenant_id.to_string()));
-        }
+        // Tenant arg injection / enforcement happens per-handler via
+        // `Self::enforce_tenant_arg(&mut args, tenant_scope)` so that any
+        // caller-supplied `tenant_id` mismatching the authenticated scope is
+        // rejected (ADR-097) instead of silently honored. The previous
+        // `entry().or_insert_with(...)` shortcut was a leak: it accepted any
+        // caller-supplied value without comparing it to the session tenant.
 
         // Built-in orchestrator aegis.* tool dispatch chain.
         let aegis_result = self
             .try_dispatch_aegis_tool(
                 &tool_name,
-                &args,
+                &mut args,
                 execution_id,
                 *agent_id,
                 iteration_number,
                 &tool_audit_history,
                 security_context,
                 caller_identity,
+                tenant_scope,
             )
             .await;
         if let Some(result) = aegis_result {
@@ -890,56 +965,99 @@ impl ToolInvocationService {
     async fn try_dispatch_aegis_tool(
         &self,
         tool_name: &str,
-        args: &Value,
+        args: &mut Value,
         execution_id: crate::domain::execution::ExecutionId,
         agent_id: AgentId,
         iteration_number: u8,
         tool_audit_history: &[TrajectoryStep],
         security_context: &crate::domain::security_context::SecurityContext,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        tenant_scope: &TenantScope,
     ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
         match tool_name {
-            "aegis.agent.create" => Some(self.invoke_aegis_agent_create_tool(args).await),
-            "aegis.agent.update" => Some(self.invoke_aegis_agent_update_tool(args).await),
-            "aegis.agent.delete" => Some(self.invoke_aegis_agent_delete_tool(args).await),
-            "aegis.agent.generate" => Some(
-                self.invoke_aegis_agent_generate_tool(args, security_context, caller_identity)
+            "aegis.agent.create" => Some(
+                self.invoke_aegis_agent_create_tool(args, tenant_scope)
                     .await,
             ),
-            "aegis.agent.export" => Some(self.invoke_aegis_agent_export_tool(args).await),
-            "aegis.agent.list" => Some(self.invoke_aegis_agent_list_tool(args).await),
+            "aegis.agent.update" => Some(
+                self.invoke_aegis_agent_update_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.agent.delete" => Some(
+                self.invoke_aegis_agent_delete_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.agent.generate" => Some(
+                self.invoke_aegis_agent_generate_tool(
+                    args,
+                    security_context,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
+            ),
+            "aegis.agent.export" => Some(
+                self.invoke_aegis_agent_export_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.agent.list" => Some(self.invoke_aegis_agent_list_tool(args, tenant_scope).await),
             "aegis.agent.logs" => Some(self.invoke_aegis_agent_logs_tool(args).await),
-            "aegis.workflow.delete" => Some(self.invoke_aegis_workflow_delete_tool(args).await),
+            "aegis.workflow.delete" => Some(
+                self.invoke_aegis_workflow_delete_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.workflow.validate" => Some(self.invoke_aegis_workflow_validate_tool(args).await),
             "aegis.workflow.run" => Some(
-                self.invoke_aegis_workflow_run_tool(args, security_context, caller_identity)
+                self.invoke_aegis_workflow_run_tool(
+                    args,
+                    security_context,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
+            ),
+            "aegis.workflow.executions.list" => Some(
+                self.invoke_aegis_workflow_execution_list_tool(args, tenant_scope)
                     .await,
             ),
-            "aegis.workflow.executions.list" => {
-                Some(self.invoke_aegis_workflow_execution_list_tool(args).await)
-            }
-            "aegis.workflow.executions.get" => {
-                Some(self.invoke_aegis_workflow_execution_get_tool(args).await)
-            }
+            "aegis.workflow.executions.get" => Some(
+                self.invoke_aegis_workflow_execution_get_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.workflow.status" => Some(self.invoke_aegis_workflow_status_tool(args).await),
-            "aegis.workflow.generate" => Some(self.invoke_aegis_workflow_generate_tool(args).await),
-            "aegis.workflow.logs" => Some(self.invoke_aegis_workflow_logs_tool(args).await),
-            "aegis.workflow.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
+            "aegis.workflow.generate" => Some(
+                self.invoke_aegis_workflow_generate_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.workflow.logs" => Some(
+                self.invoke_aegis_workflow_logs_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.workflow.wait" => Some(
+                self.invoke_aegis_workflow_wait_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.workflow.cancel" => Some(self.invoke_aegis_workflow_cancel_tool(args).await),
             "aegis.workflow.signal" => Some(self.invoke_aegis_workflow_signal_tool(args).await),
             "aegis.workflow.remove" => Some(self.invoke_aegis_workflow_remove_tool(args).await),
-            "aegis.workflow.list" => Some(self.invoke_aegis_workflow_list_tool(args).await),
+            "aegis.workflow.list" => Some(
+                self.invoke_aegis_workflow_list_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.workflow.promote" => Some(
-                self.invoke_aegis_workflow_promote_tool(args, security_context)
+                self.invoke_aegis_workflow_promote_tool(args, security_context, tenant_scope)
                     .await,
             ),
             "aegis.workflow.demote" => Some(
-                self.invoke_aegis_workflow_demote_tool(args, security_context)
+                self.invoke_aegis_workflow_demote_tool(args, security_context, tenant_scope)
                     .await,
             ),
-            "aegis.workflow.export" => Some(self.invoke_aegis_workflow_export_tool(args).await),
+            "aegis.workflow.export" => Some(
+                self.invoke_aegis_workflow_export_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.workflow.update" => Some(
-                self.invoke_aegis_workflow_update_tool(args, execution_id, agent_id)
+                self.invoke_aegis_workflow_update_tool(args, execution_id, agent_id, tenant_scope)
                     .await,
             ),
             "aegis.workflow.create" => Some(
@@ -949,19 +1067,25 @@ impl ToolInvocationService {
                     agent_id,
                     iteration_number,
                     tool_audit_history,
+                    tenant_scope,
                 )
                 .await,
             ),
             "aegis.task.execute" => Some(
-                self.invoke_aegis_task_execute_tool(args, security_context, caller_identity)
-                    .await,
+                self.invoke_aegis_task_execute_tool(
+                    args,
+                    security_context,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
             ),
             "aegis.task.status" => Some(self.invoke_aegis_task_status_tool(args).await),
             "aegis.task.wait" | "aegis.agent.wait" => {
                 Some(self.invoke_aegis_task_wait_tool(args).await)
             }
             "aegis.task.logs" => Some(self.invoke_aegis_task_logs_tool(args).await),
-            "aegis.task.list" => Some(self.invoke_aegis_task_list_tool(args).await),
+            "aegis.task.list" => Some(self.invoke_aegis_task_list_tool(args, tenant_scope).await),
             "aegis.task.cancel" => Some(self.invoke_aegis_task_cancel_tool(args).await),
             "aegis.task.remove" => Some(self.invoke_aegis_task_remove_tool(args).await),
             "aegis.system.info" => Some(self.invoke_aegis_system_info_tool().await),
@@ -971,19 +1095,25 @@ impl ToolInvocationService {
                 Some(self.invoke_aegis_tools_search(args, security_context).await)
             }
             "aegis.agent.search" => Some(
-                self.invoke_aegis_agent_search_tool(args, security_context)
+                self.invoke_aegis_agent_search_tool(args, security_context, tenant_scope)
                     .await,
             ),
             "aegis.workflow.search" => Some(
-                self.invoke_aegis_workflow_search_tool(args, security_context)
+                self.invoke_aegis_workflow_search_tool(args, security_context, tenant_scope)
                     .await,
             ),
             "aegis.execute.intent" => Some(
-                self.invoke_aegis_execute_intent_tool(args, security_context)
+                self.invoke_aegis_execute_intent_tool(args, security_context, tenant_scope)
                     .await,
             ),
-            "aegis.execute.status" => Some(self.invoke_aegis_execute_status_tool(args).await),
-            "aegis.execute.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
+            "aegis.execute.status" => Some(
+                self.invoke_aegis_execute_status_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.execute.wait" => Some(
+                self.invoke_aegis_workflow_wait_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.runtime.list" => Some(self.invoke_aegis_runtime_list_tool(args).await),
 
             // ── File operations (aegis.file.*) ─────────────────────────
@@ -994,40 +1124,80 @@ impl ToolInvocationService {
             "aegis.file.mkdir" => Some(self.invoke_aegis_file_mkdir(args, caller_identity).await),
 
             // ── Volume operations (aegis.volume.*) ─────────────────────
-            "aegis.volume.create" => {
-                Some(self.invoke_aegis_volume_create(args, caller_identity).await)
-            }
+            "aegis.volume.create" => Some(
+                self.invoke_aegis_volume_create(args, caller_identity, tenant_scope)
+                    .await,
+            ),
             "aegis.volume.delete" => {
                 Some(self.invoke_aegis_volume_delete(args, caller_identity).await)
             }
-            "aegis.volume.list" => Some(self.invoke_aegis_volume_list(args, caller_identity).await),
-            "aegis.volume.quota" => {
-                Some(self.invoke_aegis_volume_quota(args, caller_identity).await)
-            }
+            "aegis.volume.list" => Some(
+                self.invoke_aegis_volume_list(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.volume.quota" => Some(
+                self.invoke_aegis_volume_quota(args, caller_identity, tenant_scope)
+                    .await,
+            ),
 
-            // ── Git operations (aegis.git.*) ──────────────────��────────
-            "aegis.git.clone" => Some(self.invoke_aegis_git_clone(args, caller_identity).await),
-            "aegis.git.commit" => Some(self.invoke_aegis_git_commit(args, caller_identity).await),
-            "aegis.git.delete" => Some(self.invoke_aegis_git_delete(args, caller_identity).await),
-            "aegis.git.diff" => Some(self.invoke_aegis_git_diff(args, caller_identity).await),
-            "aegis.git.list" => Some(self.invoke_aegis_git_list(args, caller_identity).await),
-            "aegis.git.push" => Some(self.invoke_aegis_git_push(args, caller_identity).await),
-            "aegis.git.refresh" => Some(self.invoke_aegis_git_refresh(args, caller_identity).await),
-            "aegis.git.status" => Some(self.invoke_aegis_git_status(args, caller_identity).await),
+            // ── Git operations (aegis.git.*) ───────────────────────────
+            "aegis.git.clone" => Some(
+                self.invoke_aegis_git_clone(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.git.commit" => Some(
+                self.invoke_aegis_git_commit(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.git.delete" => Some(
+                self.invoke_aegis_git_delete(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.git.diff" => Some(
+                self.invoke_aegis_git_diff(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.git.list" => Some(
+                self.invoke_aegis_git_list(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.git.push" => Some(
+                self.invoke_aegis_git_push(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.git.refresh" => Some(
+                self.invoke_aegis_git_refresh(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.git.status" => Some(
+                self.invoke_aegis_git_status(args, caller_identity, tenant_scope)
+                    .await,
+            ),
 
             // ── Script operations (aegis.script.*) ─────────────────────
-            "aegis.script.delete" => {
-                Some(self.invoke_aegis_script_delete(args, caller_identity).await)
-            }
-            "aegis.script.get" => Some(self.invoke_aegis_script_get(args, caller_identity).await),
-            "aegis.script.list" => Some(self.invoke_aegis_script_list(args, caller_identity).await),
-            "aegis.script.save" => Some(self.invoke_aegis_script_save(args, caller_identity).await),
-            "aegis.script.update" => {
-                Some(self.invoke_aegis_script_update(args, caller_identity).await)
-            }
+            "aegis.script.delete" => Some(
+                self.invoke_aegis_script_delete(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.script.get" => Some(
+                self.invoke_aegis_script_get(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.script.list" => Some(
+                self.invoke_aegis_script_list(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.script.save" => Some(
+                self.invoke_aegis_script_save(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.script.update" => Some(
+                self.invoke_aegis_script_update(args, caller_identity, tenant_scope)
+                    .await,
+            ),
 
             "aegis.execution.file" => {
-                let tenant_id = match Self::resolve_tenant_arg(args) {
+                let tenant_id = match Self::enforce_tenant_arg(args, tenant_scope) {
                     Ok(id) => id,
                     Err(e) => return Some(Err(e)),
                 };
@@ -1046,7 +1216,7 @@ impl ToolInvocationService {
                 }
             }
             "aegis.attachment.read" => {
-                let tenant_id = match Self::resolve_tenant_arg(args) {
+                let tenant_id = match Self::enforce_tenant_arg(args, tenant_scope) {
                     Ok(id) => id,
                     Err(e) => return Some(Err(e)),
                 };
