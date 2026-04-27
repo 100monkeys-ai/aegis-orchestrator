@@ -12,6 +12,7 @@ impl ToolInvocationService {
         let agent_ref = args
             .get("agent_id")
             .and_then(|v| v.as_str())
+            .map(str::to_string)
             .ok_or_else(|| {
                 SealSessionError::SignatureVerificationFailed(
                     "aegis.task.execute requires 'agent_id' string".to_string(),
@@ -23,7 +24,10 @@ impl ToolInvocationService {
             .get("intent")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let version = args.get("version").and_then(|v| v.as_str());
+        let version = args
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         // ADR-113: parse attachments from the SEAL JSON-RPC tool call args so
         // they reach `ExecutionInput.attachments` and get merged into
@@ -38,7 +42,7 @@ impl ToolInvocationService {
                 .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));
         }
 
-        let agent_id = if let Ok(uuid) = uuid::Uuid::parse_str(agent_ref) {
+        let agent_id = if let Ok(uuid) = uuid::Uuid::parse_str(&agent_ref) {
             if version.is_some() {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.task.execute",
@@ -49,7 +53,7 @@ impl ToolInvocationService {
         } else if let Some(ver) = version {
             match self
                 .agent_lifecycle
-                .lookup_agent_for_tenant_with_version(&tenant_id, agent_ref, ver)
+                .lookup_agent_for_tenant_with_version(&tenant_id, &agent_ref, &ver)
                 .await
             {
                 Ok(Some(id)) => id,
@@ -69,7 +73,7 @@ impl ToolInvocationService {
         } else {
             match self
                 .agent_lifecycle
-                .lookup_agent_visible_for_tenant(&tenant_id, agent_ref)
+                .lookup_agent_visible_for_tenant(&tenant_id, &agent_ref)
                 .await
             {
                 Ok(Some(id)) => id,

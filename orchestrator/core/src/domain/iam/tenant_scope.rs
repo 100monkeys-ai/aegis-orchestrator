@@ -6,7 +6,7 @@
 //! parent execution together with the caller's `IdentityKind`. It is constructed
 //! once at the dispatch boundary and threaded through every `aegis.*` tool
 //! handler. Tool handlers MUST NOT read `tenant_id` from raw arguments —
-//! they MUST call [`crate::application::tool_invocation_service::ToolInvocationService::enforce_tenant_arg`]
+//! they MUST call `ToolInvocationService::enforce_tenant_arg`
 //! against the `TenantScope` to either inject the authenticated tenant
 //! (when absent) or reject a mismatched caller-supplied value.
 //!

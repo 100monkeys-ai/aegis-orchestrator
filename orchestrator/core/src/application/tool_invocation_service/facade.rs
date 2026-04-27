@@ -1024,7 +1024,10 @@ impl ToolInvocationService {
                 self.invoke_aegis_workflow_execution_get_tool(args, tenant_scope)
                     .await,
             ),
-            "aegis.workflow.status" => Some(self.invoke_aegis_workflow_status_tool(args).await),
+            "aegis.workflow.status" => Some(
+                self.invoke_aegis_workflow_status_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.workflow.generate" => Some(
                 self.invoke_aegis_workflow_generate_tool(args, tenant_scope)
                     .await,
