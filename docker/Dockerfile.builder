@@ -2,7 +2,7 @@
 # Ubuntu 22.04 for glibc 2.35 compatibility.
 # Cached by docker/build-push-action with GHA cache.
 
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 

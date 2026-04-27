@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Builder
 # ---------------------------------------------------------------------------
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -52,7 +52,7 @@ RUN cd aegis-orchestrator && cargo build --release --bin aegis --locked
 # ---------------------------------------------------------------------------
 # Stage 2 — Runtime
 # ---------------------------------------------------------------------------
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:24.04 AS runtime
 
 # Install runtime dependencies (rustls -- no libssl needed)
 RUN apt-get update && apt-get install -y \
