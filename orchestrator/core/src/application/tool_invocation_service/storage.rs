@@ -205,11 +205,11 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.volume.create", "user volume service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let label = require_str(args, "label")?;
         let size_limit_bytes = require_i64(args, "size_limit_bytes")? as u64;
         let owner = user_sub(caller);
         let tier = user_tier(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let cmd = crate::application::volume_manager::CreateUserVolumeCommand {
             tenant_id,
@@ -326,11 +326,11 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.git.clone", "git repo service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let repo_url = require_str(args, "repo_url")?;
         let label = require_str(args, "label")?;
         let owner = user_sub(caller);
         let tier = user_tier(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let credential_binding_id = args
             .get("credential_binding_id")
@@ -428,9 +428,9 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.git.status", "git repo service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         let binding = svc
@@ -451,9 +451,9 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.git.refresh", "git repo service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         svc.refresh_repo(&bid, &tenant_id, &owner)
@@ -473,9 +473,9 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.git.delete", "git repo service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         svc.delete_binding(&bid, &tenant_id, &owner)
@@ -495,10 +495,10 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.git.commit", "git repo service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let binding_id = require_str(args, "binding_id")?;
         let message = require_str(args, "message")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
         let (author_name, author_email) = commit_author(caller);
 
@@ -527,9 +527,9 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.git.push", "git repo service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         let remote = args.get("remote").and_then(|v| v.as_str());
@@ -552,9 +552,9 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.git.diff", "git repo service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         let staged = args
@@ -584,6 +584,7 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.script.save", "script service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = require_str(args, "name")?;
         let code = require_str(args, "code")?;
         let description = args
@@ -602,7 +603,6 @@ impl ToolInvocationService {
             .unwrap_or_default();
         let owner = user_sub(caller);
         let tier = user_tier(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let cmd = crate::application::script_service::CreateScriptCommand {
             tenant_id,
@@ -653,9 +653,9 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.script.get", "script service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let id = require_str(args, "id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let script_id = parse_script_id(id)?;
 
         let script = svc
@@ -696,6 +696,7 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.script.update", "script service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let id = require_str(args, "id")?;
         let name = require_str(args, "name")?;
         let code = require_str(args, "code")?;
@@ -714,7 +715,6 @@ impl ToolInvocationService {
             })
             .unwrap_or_default();
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let script_id = parse_script_id(id)?;
 
         let cmd = crate::application::script_service::UpdateScriptCommand {
@@ -742,9 +742,9 @@ impl ToolInvocationService {
             Some(s) => s,
             None => return not_configured("aegis.script.delete", "script service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let id = require_str(args, "id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let script_id = parse_script_id(id)?;
 
         svc.delete(&script_id, &tenant_id, &owner)

@@ -1499,10 +1499,11 @@ async fn workflow_execution_tools_list_and_get() {
     );
     assert_eq!(get_payload["execution"]["blackboard"]["priority"], "high");
 
+    let mut status_args = serde_json::json!({
+        "execution_id": execution.id.to_string(),
+    });
     let status_result = service
-        .invoke_aegis_workflow_status_tool(&serde_json::json!({
-            "execution_id": execution.id.to_string(),
-        }))
+        .invoke_aegis_workflow_status_tool(&mut status_args, &test_tenant_scope())
         .await
         .expect("workflow status should return a result");
     let ToolInvocationResult::Direct(status_payload) = status_result else {

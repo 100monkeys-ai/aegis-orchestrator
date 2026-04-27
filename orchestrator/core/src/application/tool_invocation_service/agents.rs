@@ -10,6 +10,7 @@ impl ToolInvocationService {
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
+            .map(str::to_string)
             .ok_or_else(|| {
                 SealSessionError::SignatureVerificationFailed(
                     "aegis.agent.create requires 'manifest_yaml' string".to_string(),
@@ -18,7 +19,7 @@ impl ToolInvocationService {
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
-        let manifest = match AgentManifestParser::parse_yaml(manifest_yaml) {
+        let manifest = match AgentManifestParser::parse_yaml(&manifest_yaml) {
             Ok(m) => m,
             Err(e) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -83,7 +84,7 @@ impl ToolInvocationService {
                         "agents",
                         &manifest.metadata.name,
                         &manifest.metadata.version,
-                        manifest_yaml,
+                        &manifest_yaml,
                     )
                     .map_err(|e| {
                         SealSessionError::SignatureVerificationFailed(format!(
@@ -175,6 +176,7 @@ impl ToolInvocationService {
         let agent_id_str = args
             .get("agent_id")
             .and_then(|v| v.as_str())
+            .map(str::to_string)
             .ok_or_else(|| {
                 SealSessionError::SignatureVerificationFailed(
                     "aegis.agent.delete requires 'agent_id' string".to_string(),
@@ -183,7 +185,7 @@ impl ToolInvocationService {
 
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let agent_id =
-            crate::domain::agent::AgentId(uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
+            crate::domain::agent::AgentId(uuid::Uuid::parse_str(&agent_id_str).map_err(|e| {
                 SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}"))
             })?);
 

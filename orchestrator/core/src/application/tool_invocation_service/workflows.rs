@@ -358,9 +358,12 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_status_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let result = self.invoke_aegis_workflow_execution_get_tool(args).await?;
+        let result = self
+            .invoke_aegis_workflow_execution_get_tool(args, scope)
+            .await?;
         Ok(match result {
             ToolInvocationResult::Direct(payload) => {
                 let mut payload = payload;
@@ -530,6 +533,7 @@ impl ToolInvocationService {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
+            .map(str::to_string)
             .ok_or_else(|| {
                 SealSessionError::InvalidArguments(
                     "aegis.workflow.logs requires 'execution_id' string".to_string(),
@@ -537,7 +541,7 @@ impl ToolInvocationService {
             })?;
 
         let exec_id = crate::domain::execution::ExecutionId(
-            uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
+            uuid::Uuid::parse_str(&exec_id_str).map_err(|e| {
                 SealSessionError::InvalidArguments(format!(
                     "aegis.workflow.logs: invalid execution_id UUID: {e}"
                 ))
@@ -1188,6 +1192,7 @@ impl ToolInvocationService {
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
+            .map(str::to_string)
             .ok_or_else(|| {
                 SealSessionError::SignatureVerificationFailed(
                     "aegis.workflow.create requires 'manifest_yaml' string".to_string(),
@@ -1213,7 +1218,7 @@ impl ToolInvocationService {
 
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
-        let workflow = match WorkflowParser::parse_yaml(manifest_yaml) {
+        let workflow = match WorkflowParser::parse_yaml(&manifest_yaml) {
             Ok(w) => w,
             Err(e) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -1383,7 +1388,7 @@ impl ToolInvocationService {
         }
 
         match register_workflow_use_case
-            .register_workflow(manifest_yaml, force)
+            .register_workflow(&manifest_yaml, force)
             .await
         {
             Ok(registered) => {
@@ -1392,7 +1397,7 @@ impl ToolInvocationService {
                         "workflows",
                         &registered.name,
                         &registered.version,
-                        manifest_yaml,
+                        &manifest_yaml,
                     )
                     .map_err(|e| {
                         SealSessionError::SignatureVerificationFailed(format!(

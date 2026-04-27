@@ -14,6 +14,7 @@ impl ToolInvocationService {
         security_context: &crate::domain::security_context::SecurityContext,
         _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let intent = args.get("intent").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::InvalidArguments(
                 "aegis.execute.intent requires 'intent' string".to_string(),
@@ -73,8 +74,6 @@ impl ToolInvocationService {
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         // Build IntentExecutionInput and serialize as workflow input
         let pipeline_input = crate::domain::workflow::IntentExecutionInput {
@@ -179,6 +178,7 @@ impl ToolInvocationService {
         args: &mut Value,
         _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let execution_id_str = args
             .get("pipeline_execution_id")
             .and_then(|v| v.as_str())
@@ -188,7 +188,6 @@ impl ToolInvocationService {
                 )
             })?;
 
-        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let execution_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(execution_id_str).map_err(|error| {
                 SealSessionError::InvalidArguments(format!(
