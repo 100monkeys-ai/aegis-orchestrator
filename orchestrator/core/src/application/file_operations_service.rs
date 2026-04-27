@@ -42,6 +42,22 @@ pub struct FileAttributes {
     pub modified_at: Option<DateTime<Utc>>,
 }
 
+/// File metadata for an attachment-shaped stat (ADR-113).
+///
+/// Returned by [`FileOperationsService::stat_attachment_for_user`] to back
+/// the CLI's `--attachment <volume_id:path>` shorthand: the CLI issues this
+/// stat per shorthand flag and constructs a full `AttachmentRef` from the
+/// result. The fields mirror `AttachmentRef` minus `volume_id` / `path`,
+/// which the caller already holds.
+#[derive(Debug, serde::Serialize)]
+pub struct AttachmentStat {
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -353,6 +369,47 @@ impl FileOperationsService {
                     .single()
                     .unwrap_or_else(Utc::now),
             ),
+        })
+    }
+
+    /// Stat a file as an attachment candidate (ADR-113).
+    ///
+    /// Authorizes by user (same path as `read_file`), reads the file's full
+    /// contents to content-sniff its MIME type and compute a SHA-256 digest,
+    /// and returns the size + display name. Backs the CLI's
+    /// `--attachment <volume_id:path>` shorthand: the CLI issues one of these
+    /// stats per flag and constructs a full `AttachmentRef` from the result.
+    ///
+    /// MIME sniffing reuses the same `infer::get` pattern as the upload
+    /// handler, so the resulting AttachmentRef's `mime_type` is byte-accurate
+    /// rather than extension-derived. Falls back to
+    /// `application/octet-stream` for content `infer` cannot classify.
+    pub async fn stat_attachment_for_user(
+        &self,
+        volume_id: &VolumeId,
+        owner: &str,
+        path: &str,
+    ) -> Result<AttachmentStat, FileOperationsError> {
+        let content = self.read_file(volume_id, owner, path).await?;
+        let size = content.data.len() as u64;
+        let mime_type = infer::get(&content.data)
+            .map(|k| k.mime_type().to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let sha256 = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&content.data);
+            Some(format!("{:x}", hasher.finalize()))
+        };
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        Ok(AttachmentStat {
+            name,
+            mime_type,
+            size,
+            sha256,
         })
     }
 

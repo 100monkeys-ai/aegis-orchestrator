@@ -46,6 +46,7 @@ mod auth;
 mod commands;
 mod daemon;
 mod output;
+mod util;
 
 use commands::auth::AuthCommand;
 use commands::{

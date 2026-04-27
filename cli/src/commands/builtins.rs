@@ -754,6 +754,42 @@ mod tests {
         }
     }
 
+    /// Regression test for Surface 4 of the ADR-113 first-class-attachments
+    /// reframe. The agent-creator-agent prompt MUST enumerate the three
+    /// canonical dispatch fields — `intent`, `input`, and `attachments` —
+    /// as PEER fields in a structural list, not with `attachments` shoved
+    /// into a special-case sub-clause. The reframe also drops the literal
+    /// "ATTACHMENT-AWARENESS" heading so the rules read as standard
+    /// input-handling guidance.
+    #[test]
+    fn agent_creator_step_3_enumerates_dispatch_fields_as_peers() {
+        let manifest: serde_yaml::Value = serde_yaml::from_str(AGENT_GENERATOR_AGENT_TEMPLATE)
+            .expect("agent-creator-agent yaml parses");
+        let instruction = manifest["spec"]["task"]["instruction"]
+            .as_str()
+            .expect("agent-creator-agent must expose spec.task.instruction");
+
+        // The old framing called this section "ATTACHMENT-AWARENESS". The
+        // reframe drops that heading; its presence means we kept the old
+        // single-purpose framing.
+        assert!(
+            !instruction.contains("ATTACHMENT-AWARENESS"),
+            "agent-creator-agent step 3 must not use the 'ATTACHMENT-AWARENESS' heading anymore — attachments is one of the standard dispatch fields, not a special case. Surface 4 reframe regression."
+        );
+
+        // The new framing must enumerate intent, input, AND attachments as
+        // peer fields. Each must appear as its own bulleted/structural item
+        // (not just attachments referenced in a sub-clause). We assert each
+        // appears as a backticked field name on its own list line.
+        for marker in ["- `intent`", "- `input`", "- `attachments`"] {
+            assert!(
+                instruction.contains(marker),
+                "agent-creator-agent step 3 must enumerate '{}' as a peer dispatch field in a structural list. Surface 4 reframe regression.",
+                marker
+            );
+        }
+    }
+
     /// Regression test for the agent-generator-judge under the corrected
     /// ADR-113 design. The judge MUST require generated manifests to
     /// reference `input.attachments` in prose AND MUST reject Handlebars

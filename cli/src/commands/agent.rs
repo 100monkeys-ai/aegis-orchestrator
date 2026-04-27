@@ -96,6 +96,18 @@ pub enum AgentCommand {
         #[arg(long = "param", short = 'p', value_name = "KEY=VALUE")]
         params: Vec<String>,
 
+        /// Structured attachments as a JSON array, inline or `@file.json`
+        /// (ADR-113). Mutually exclusive with `--attachment`.
+        #[arg(long, value_name = "JSON", conflicts_with = "attachment")]
+        attachments: Option<String>,
+
+        /// Convenience shorthand: `volume_id:path`. Repeatable. The CLI
+        /// stats each file via the orchestrator's volume metadata API to
+        /// produce a full AttachmentRef. Mutually exclusive with
+        /// `--attachments`.
+        #[arg(long = "attachment", value_name = "VOLUME_ID:PATH")]
+        attachment: Vec<String>,
+
         /// Target a specific agent version
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
@@ -181,6 +193,8 @@ pub async fn handle_command(
             intent,
             input,
             params,
+            attachments,
+            attachment,
             version,
             follow,
             wait,
@@ -190,6 +204,8 @@ pub async fn handle_command(
                 intent,
                 input,
                 params,
+                attachments,
+                attachment,
                 version,
                 follow,
                 wait,
@@ -458,6 +474,8 @@ async fn run_agent(
     intent: Option<String>,
     input_json: Option<String>,
     params: Vec<String>,
+    attachments_json: Option<String>,
+    attachment_shorthand: Vec<String>,
     version: Option<String>,
     follow: bool,
     wait: bool,
@@ -513,6 +531,13 @@ async fn run_agent(
         println!();
     }
 
+    let attachment_refs = crate::util::attachments::collect_attachments(
+        &client,
+        attachments_json,
+        attachment_shorthand,
+    )
+    .await?;
+
     let execution_id = client
         .execute_agent(
             agent_id,
@@ -520,6 +545,7 @@ async fn run_agent(
             intent.clone(),
             None,
             version.as_deref(),
+            attachment_refs,
         )
         .await
         .context("Failed to start agent execution")?;
@@ -619,6 +645,7 @@ async fn generate_agent(
             None,
             None,
             None,
+            Vec::new(),
         )
         .await
         .context("Failed to start agent generation execution")?;

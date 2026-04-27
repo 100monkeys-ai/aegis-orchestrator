@@ -318,6 +318,7 @@ pub(crate) fn create_router(
             "/v1/volumes/{id}/files/download",
             get(volumes::download_file),
         )
+        .route("/v1/volumes/{id}/files/stat", get(volumes::stat_file))
         .route("/v1/volumes/{id}/files/upload", post(volumes::upload_file))
         .route("/v1/volumes/{id}/files/mkdir", post(volumes::mkdir))
         .route("/v1/volumes/{id}/files/move", post(volumes::move_path))
