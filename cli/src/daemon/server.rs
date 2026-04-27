@@ -2643,14 +2643,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                         Ok(true) => {
                                             info!(
                                                 "Built-in agent '{}' v{} already up to date",
-                                                name, manifest.metadata.version
+                                                name,
+                                                manifest.metadata.version.as_deref().unwrap_or("?")
                                             );
                                             false
                                         }
                                         Ok(false) => {
                                             info!(
                                                 "Built-in agent '{}' v{} content drift detected — overwriting",
-                                                name, manifest.metadata.version
+                                                name,
+                                                manifest.metadata.version.as_deref().unwrap_or("?")
                                             );
                                             true
                                         }
@@ -2717,14 +2719,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         Ok(true) => {
                             info!(
                                 "Built-in workflow '{}' v{} already up to date",
-                                wf_name, workflow.metadata.version
+                                wf_name,
+                                workflow.metadata.version.as_deref().unwrap_or("?")
                             );
                             false
                         }
                         Ok(false) => {
                             info!(
                                 "Built-in workflow '{}' v{} content drift detected — overwriting",
-                                wf_name, workflow.metadata.version
+                                wf_name,
+                                workflow.metadata.version.as_deref().unwrap_or("?")
                             );
                             true
                         }

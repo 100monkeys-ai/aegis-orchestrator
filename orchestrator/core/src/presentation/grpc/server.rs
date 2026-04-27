@@ -2713,7 +2713,7 @@ mod tests {
                     name: "foo.txt".to_string(),
                     mime_type: "text/plain".to_string(),
                     size: -1,
-                    sha256: String::new(),
+                    sha256: None,
                 }],
             }))
             .await;
