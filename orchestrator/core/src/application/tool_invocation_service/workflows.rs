@@ -279,6 +279,13 @@ impl ToolInvocationService {
                             "current_state": execution.current_state.as_str(),
                             "started_at": execution.started_at,
                             "last_transition_at": execution.last_transition_at,
+                            "summary": super::summary::summarize_intent(
+                                &execution
+                                    .input
+                                    .get("intent")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned),
+                            ),
                         })
                     })
                     .collect();

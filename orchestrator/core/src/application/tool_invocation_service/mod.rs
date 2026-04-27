@@ -11,6 +11,7 @@ mod facade;
 mod gateway;
 mod runtime;
 mod storage;
+mod summary;
 mod system;
 mod tasks;
 #[cfg(test)]
