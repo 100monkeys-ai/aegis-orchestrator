@@ -753,6 +753,22 @@ impl ToolRouter {
                     "input": {
                         "type": "string",
                         "description": "Natural-language intent for the agent to create."
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                        "items": {
+                            "type": "object",
+                            "required": ["volume_id", "path", "name", "mime_type", "size"],
+                            "properties": {
+                                "volume_id": { "type": "string" },
+                                "path":      { "type": "string" },
+                                "name":      { "type": "string" },
+                                "mime_type": { "type": "string" },
+                                "size":      { "type": "integer" },
+                                "sha256":    { "type": "string" }
+                            }
+                        }
                     }
                 },
                 "required": ["input"]
@@ -1051,6 +1067,22 @@ impl ToolRouter {
                     "tenant_id": {
                         "type": "string",
                         "description": "Optional tenant identifier. Defaults to the local tenant."
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                        "items": {
+                            "type": "object",
+                            "required": ["volume_id", "path", "name", "mime_type", "size"],
+                            "properties": {
+                                "volume_id": { "type": "string" },
+                                "path":      { "type": "string" },
+                                "name":      { "type": "string" },
+                                "mime_type": { "type": "string" },
+                                "size":      { "type": "integer" },
+                                "sha256":    { "type": "string" }
+                            }
+                        }
                     }
                 },
                 "required": ["intent"]
@@ -1105,6 +1137,22 @@ impl ToolRouter {
                     "version": {
                         "type": "string",
                         "description": "Optional semantic version of the agent to execute. When omitted, the latest deployed version is used."
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                        "items": {
+                            "type": "object",
+                            "required": ["volume_id", "path", "name", "mime_type", "size"],
+                            "properties": {
+                                "volume_id": { "type": "string" },
+                                "path":      { "type": "string" },
+                                "name":      { "type": "string" },
+                                "mime_type": { "type": "string" },
+                                "size":      { "type": "integer" },
+                                "sha256":    { "type": "string" }
+                            }
+                        }
                     }
                 },
                 "required": ["agent_id"]
@@ -2012,5 +2060,120 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool.name == "aegis.workflow.remove"));
+    }
+
+    /// Regression: the three attachment-capable MCP tools must declare
+    /// `attachments` as a top-level optional array in their input schemas
+    /// so clients listing tools via `tools/list` can discover the field
+    /// (ADR-113). Verified via serde_json Value traversal — not substring
+    /// matching — so the structural shape is enforced.
+    fn assert_attachments_property_shape(schema: &Value, tool_name: &str) {
+        let attachments = &schema["properties"]["attachments"];
+        assert!(
+            attachments.is_object(),
+            "{tool_name}: expected top-level `attachments` property of type object"
+        );
+        assert_eq!(
+            attachments["type"].as_str(),
+            Some("array"),
+            "{tool_name}: attachments must be an array"
+        );
+
+        let items = &attachments["items"];
+        assert!(
+            items.is_object(),
+            "{tool_name}: attachments.items must be an object schema"
+        );
+        assert_eq!(
+            items["type"].as_str(),
+            Some("object"),
+            "{tool_name}: attachments.items.type must be 'object'"
+        );
+
+        let required = items["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool_name}: attachments.items.required must be an array"));
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        for field in ["volume_id", "path", "name", "mime_type", "size"] {
+            assert!(
+                required_names.contains(&field),
+                "{tool_name}: attachments.items.required must include `{field}`, got {required_names:?}"
+            );
+        }
+
+        let item_props = &items["properties"];
+        assert!(
+            item_props.is_object(),
+            "{tool_name}: attachments.items.properties must be an object"
+        );
+        for (field, expected_type) in [
+            ("volume_id", "string"),
+            ("path", "string"),
+            ("name", "string"),
+            ("mime_type", "string"),
+            ("size", "integer"),
+            ("sha256", "string"),
+        ] {
+            assert_eq!(
+                item_props[field]["type"].as_str(),
+                Some(expected_type),
+                "{tool_name}: attachments.items.properties.{field} must be of type `{expected_type}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attachment_capable_tool_schemas_declare_attachments() {
+        let registry = Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(RwLock::new(HashMap::new()));
+
+        let builtins = vec![
+            BuiltinDispatcherConfig {
+                name: "aegis.task.execute".to_string(),
+                description: "Starts a new agent execution (task)".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.task.execute".to_string(),
+                    skip_judge: true,
+                }],
+                api_key: None,
+            },
+            BuiltinDispatcherConfig {
+                name: "aegis.agent.generate".to_string(),
+                description: "Generates an Agent manifest from a natural-language intent."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.agent.generate".to_string(),
+                    skip_judge: true,
+                }],
+                api_key: None,
+            },
+            BuiltinDispatcherConfig {
+                name: "aegis.execute.intent".to_string(),
+                description: "Intent-to-execution pipeline".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.execute.intent".to_string(),
+                    skip_judge: true,
+                }],
+                api_key: None,
+            },
+        ];
+
+        let router = ToolRouter::new(registry, servers, builtins);
+        let tools = router.list_tools().await.unwrap();
+
+        for tool_name in [
+            "aegis.task.execute",
+            "aegis.agent.generate",
+            "aegis.execute.intent",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == tool_name)
+                .unwrap_or_else(|| panic!("expected `{tool_name}` to be advertised"));
+            assert_attachments_property_shape(&tool.input_schema, tool_name);
+        }
     }
 }
