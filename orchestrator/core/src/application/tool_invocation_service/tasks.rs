@@ -346,7 +346,8 @@ impl ToolInvocationService {
                             "id": e.id.0.to_string(),
                             "agent_id": e.agent_id.0.to_string(),
                             "status": format!("{:?}", e.status).to_lowercase(),
-                            "started_at": e.started_at
+                            "started_at": e.started_at,
+                            "summary": super::summary::summarize_intent(&e.input.intent),
                         })
                     })
                     .collect();

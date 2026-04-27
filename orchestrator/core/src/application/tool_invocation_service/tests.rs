@@ -4063,3 +4063,305 @@ async fn aegis_workflow_search_rejects_cross_tenant_args() {
         "expected TenantMismatch, got {err:?}"
     );
 }
+
+// =============================================================================
+// Regression coverage: list responses surface a derived `summary` from intent.
+// =============================================================================
+
+/// `ExecutionService` stub that returns a fixed list from `list_executions`.
+struct CannedListExecutionService {
+    executions: Vec<Execution>,
+}
+
+#[async_trait]
+impl ExecutionService for CannedListExecutionService {
+    async fn start_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        Ok(execution_id)
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+        Ok(self.executions.clone())
+    }
+    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+}
+
+fn build_task_list_service_with_executions(executions: Vec<Execution>) -> ToolInvocationService {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(CannedListExecutionService { executions }),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+}
+
+fn make_task_execution_with_intent(intent: Option<String>) -> Execution {
+    Execution::new(
+        AgentId::new(),
+        ExecutionInput {
+            intent,
+            input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        },
+        3,
+        "aegis-system-operator".to_string(),
+    )
+}
+
+async fn invoke_task_list(service: &ToolInvocationService) -> Value {
+    let mut args = serde_json::json!({});
+    let result = service
+        .invoke_aegis_task_list_tool(&mut args, &test_tenant_scope())
+        .await
+        .expect("task list should return a result");
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    payload
+}
+
+#[tokio::test]
+async fn aegis_task_list_emits_summary_from_intent() {
+    let exec =
+        make_task_execution_with_intent(Some("Generate a Satisfactory beginner guide".to_string()));
+    let service = build_task_list_service_with_executions(vec![exec]);
+    let payload = invoke_task_list(&service).await;
+    assert_eq!(payload["tool"], "aegis.task.list");
+    assert_eq!(payload["count"], 1);
+    assert_eq!(
+        payload["executions"][0]["summary"],
+        "Generate a Satisfactory beginner guide"
+    );
+}
+
+#[tokio::test]
+async fn aegis_task_list_emits_null_summary_when_intent_missing() {
+    let exec = make_task_execution_with_intent(None);
+    let service = build_task_list_service_with_executions(vec![exec]);
+    let payload = invoke_task_list(&service).await;
+    let summary = &payload["executions"][0]["summary"];
+    assert!(
+        summary.is_null(),
+        "summary must serialize as Value::Null when intent is missing, got {summary:?}"
+    );
+    assert!(
+        payload["executions"][0]
+            .as_object()
+            .expect("execution entry is an object")
+            .contains_key("summary"),
+        "summary key must be present in the response item"
+    );
+}
+
+#[tokio::test]
+async fn aegis_task_list_truncates_long_intent_to_160_chars() {
+    let long_intent: String = "a".repeat(500);
+    let exec = make_task_execution_with_intent(Some(long_intent));
+    let service = build_task_list_service_with_executions(vec![exec]);
+    let payload = invoke_task_list(&service).await;
+    let summary = payload["executions"][0]["summary"]
+        .as_str()
+        .expect("summary should be a string");
+    assert_eq!(
+        summary.chars().count(),
+        161,
+        "summary char count should be 160 source chars + trailing ellipsis"
+    );
+    assert!(
+        summary.ends_with('…'),
+        "truncated summary must end with the ellipsis marker"
+    );
+}
+
+#[tokio::test]
+async fn aegis_task_list_collapses_whitespace_in_summary() {
+    let exec = make_task_execution_with_intent(Some("  hello\n\n  world\t  ".to_string()));
+    let service = build_task_list_service_with_executions(vec![exec]);
+    let payload = invoke_task_list(&service).await;
+    assert_eq!(payload["executions"][0]["summary"], "hello world");
+}
+
+async fn build_workflow_list_service_with_input(
+    input_params: serde_json::Value,
+) -> (ToolInvocationService, crate::domain::workflow::WorkflowId) {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+    let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+    let tenant_id = TenantId::default();
+    let workflow = build_test_workflow("summary-list");
+    workflow_repo
+        .save_for_tenant(&tenant_id, &workflow)
+        .await
+        .expect("workflow should save");
+
+    let workflow_id = workflow.id;
+    let execution = crate::domain::workflow::WorkflowExecution::new(
+        &workflow,
+        ExecutionId::new(),
+        input_params,
+    );
+    workflow_execution_repo
+        .save_for_tenant(&tenant_id, &execution)
+        .await
+        .expect("workflow execution should save");
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_repository(workflow_repo)
+    .with_workflow_execution_repo(workflow_execution_repo);
+
+    (service, workflow_id)
+}
+
+#[tokio::test]
+async fn aegis_workflow_execution_list_emits_summary_from_input_intent() {
+    let (service, workflow_id) = build_workflow_list_service_with_input(
+        serde_json::json!({"intent": "Plan factory layout"}),
+    )
+    .await;
+
+    let mut args = serde_json::json!({ "workflow_id": workflow_id.to_string() });
+    let result = service
+        .invoke_aegis_workflow_execution_list_tool(&mut args, &test_tenant_scope())
+        .await
+        .expect("workflow execution list should return a result");
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct list payload");
+    };
+    assert_eq!(payload["tool"], "aegis.workflow.executions.list");
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["executions"][0]["summary"], "Plan factory layout");
+}
+
+#[tokio::test]
+async fn aegis_workflow_execution_list_emits_null_summary_when_input_has_no_intent() {
+    let (service, workflow_id) =
+        build_workflow_list_service_with_input(serde_json::json!({"task": "demo"})).await;
+
+    let mut args = serde_json::json!({ "workflow_id": workflow_id.to_string() });
+    let result = service
+        .invoke_aegis_workflow_execution_list_tool(&mut args, &test_tenant_scope())
+        .await
+        .expect("workflow execution list should return a result");
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct list payload");
+    };
+    assert_eq!(payload["count"], 1);
+    let summary = &payload["executions"][0]["summary"];
+    assert!(
+        summary.is_null(),
+        "summary must serialize as Value::Null when input has no intent, got {summary:?}"
+    );
+    assert!(
+        payload["executions"][0]
+            .as_object()
+            .expect("execution entry is an object")
+            .contains_key("summary"),
+        "summary key must be present in the response item"
+    );
+}
