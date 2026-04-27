@@ -36,9 +36,7 @@ impl ToolInvocationService {
                         "invalid tenant identifier '{raw}': {e}"
                     ))
                 })?;
-                if parsed == scope.authenticated_tenant {
-                    parsed
-                } else if scope.may_delegate() {
+                if parsed == scope.authenticated_tenant || scope.may_delegate() {
                     parsed
                 } else {
                     return Err(SealSessionError::TenantMismatch {
