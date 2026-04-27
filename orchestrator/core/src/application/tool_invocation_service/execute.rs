@@ -10,8 +10,9 @@ impl ToolInvocationService {
     /// Handle `aegis.execute.intent` — start the intent-to-execution pipeline.
     pub(super) async fn invoke_aegis_execute_intent_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         security_context: &crate::domain::security_context::SecurityContext,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let intent = args.get("intent").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::InvalidArguments(
@@ -73,7 +74,7 @@ impl ToolInvocationService {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         // Build IntentExecutionInput and serialize as workflow input
         let pipeline_input = crate::domain::workflow::IntentExecutionInput {
@@ -175,7 +176,8 @@ impl ToolInvocationService {
     /// Handle `aegis.execute.status` — check pipeline execution status.
     pub(super) async fn invoke_aegis_execute_status_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let execution_id_str = args
             .get("pipeline_execution_id")
@@ -186,7 +188,7 @@ impl ToolInvocationService {
                 )
             })?;
 
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let execution_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(execution_id_str).map_err(|error| {
                 SealSessionError::InvalidArguments(format!(

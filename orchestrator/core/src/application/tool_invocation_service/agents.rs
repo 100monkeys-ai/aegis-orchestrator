@@ -4,7 +4,8 @@ use super::*;
 impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_create_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let manifest_yaml = args
             .get("manifest_yaml")
@@ -15,7 +16,7 @@ impl ToolInvocationService {
                 )
             })?;
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let manifest = match AgentManifestParser::parse_yaml(manifest_yaml) {
             Ok(m) => m,
@@ -131,9 +132,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_agent_list_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let agents = self
             .agent_lifecycle
             .list_agents_visible_for_tenant(&tenant_id)
@@ -167,7 +169,8 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_agent_delete_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let agent_id_str = args
             .get("agent_id")
@@ -178,7 +181,7 @@ impl ToolInvocationService {
                 )
             })?;
 
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let agent_id =
             crate::domain::agent::AgentId(uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
                 SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}"))
@@ -204,9 +207,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_agent_generate_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         _security_context: &crate::domain::security_context::SecurityContext,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let raw_input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
 
@@ -215,7 +219,7 @@ impl ToolInvocationService {
         // `input.attachments` by `prepare_execution_input` downstream.
         let attachments = parse_attachments(args)?;
 
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         // Normalize: if the caller passed a plain string, wrap it as { "input": <str> }.
         // Then inject tenant_id using the same pattern as invoke_aegis_task_execute_tool.
@@ -275,9 +279,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_agent_update_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
@@ -432,9 +437,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_agent_export_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
                 "aegis.agent.export requires 'name' string".to_string(),

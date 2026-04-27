@@ -26,7 +26,9 @@
 //!   OIDC is for human and service-account identities only.
 
 pub mod delegation;
+pub mod tenant_scope;
 pub use delegation::resolve_effective_tenant;
+pub use tenant_scope::TenantScope;
 
 use crate::domain::tenant::TenantId;
 use async_trait::async_trait;

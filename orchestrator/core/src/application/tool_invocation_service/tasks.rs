@@ -4,9 +4,10 @@ use super::*;
 impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_execute_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         _security_context: &crate::domain::security_context::SecurityContext,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let agent_ref = args
             .get("agent_id")
@@ -31,7 +32,7 @@ impl ToolInvocationService {
 
         // Resolve and inject the caller's tenant_id into the payload so that
         // start_execution (and any cluster forwarding) picks up the correct tenant.
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         if let Some(map) = input.as_object_mut() {
             map.entry("tenant_id")
                 .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));
@@ -310,8 +311,16 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_task_list_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution data is touched. The underlying
+        // list_executions query is currently unscoped at the repository layer,
+        // but consumer-tier callers cannot delegate so the rejection happens
+        // here regardless.
+        let _tenant_id = Self::enforce_tenant_arg(args, _scope)?;
+
         let agent_id = args
             .get("agent_id")
             .and_then(|v| v.as_str())

@@ -40,6 +40,19 @@ fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
     (fsal, registry)
 }
 
+/// Build a permissive default `TenantScope` for tests. Tests that need to
+/// exercise tenant-mismatch behavior construct their own scope inline. The
+/// `ServiceAccount` identity_kind allows tests that previously passed
+/// `tenant_id` in args to keep doing so without triggering `TenantMismatch`.
+fn test_tenant_scope() -> crate::domain::iam::TenantScope {
+    crate::domain::iam::TenantScope::new(
+        TenantId::default(),
+        crate::domain::iam::IdentityKind::ServiceAccount {
+            client_id: "aegis-test".to_string(),
+        },
+    )
+}
+
 fn make_fake_token(agent_id: AgentId) -> String {
     use base64::Engine;
     let claims = serde_json::json!({"agent_id": agent_id.0.to_string()});
@@ -948,13 +961,15 @@ async fn workflow_update_tool_returns_failure_with_deterministic_validation_deta
         None,
     );
 
+    let mut update_args = serde_json::json!({
+        "manifest_yaml": cyclic_workflow_manifest_yaml("cycle-update"),
+    });
     let result = service
         .invoke_aegis_workflow_update_tool(
-            &serde_json::json!({
-                "manifest_yaml": cyclic_workflow_manifest_yaml("cycle-update"),
-            }),
+            &mut update_args,
             ExecutionId::new(),
             AgentId::new(),
+            &test_tenant_scope(),
         )
         .await
         .expect("workflow update should return a result");
@@ -1048,12 +1063,10 @@ async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_succe
         None,
     );
 
-    let result = service
-        .invoke_aegis_workflow_create_tool(
-            &serde_json::json!({
-                "manifest_yaml": thresholded_validator_manifest_yaml(
-                    "ambiguous-threshold-routing",
-                    r#"        - condition: score_and_confidence_above
+    let mut create_args = serde_json::json!({
+        "manifest_yaml": thresholded_validator_manifest_yaml(
+            "ambiguous-threshold-routing",
+            r#"        - condition: score_and_confidence_above
           threshold: 0.8
           target: SUCCESS
         - condition: score_above
@@ -1063,12 +1076,16 @@ async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_succe
           target: VALIDATION_FAILED
         - condition: on_failure
           target: VALIDATION_ERROR"#
-                ),
-            }),
+        ),
+    });
+    let result = service
+        .invoke_aegis_workflow_create_tool(
+            &mut create_args,
             ExecutionId::new(),
             AgentId::new(),
             1,
             &[],
+            &test_tenant_scope(),
         )
         .await
         .expect("workflow create should return a result");
@@ -1365,15 +1382,17 @@ async fn workflow_run_tool_forwards_blackboard() {
         },
     };
 
+    let mut run_args = serde_json::json!({
+        "name": "run-me",
+        "input": { "job": "demo" },
+        "blackboard": { "priority": "high" },
+    });
     let result = service
         .invoke_aegis_workflow_run_tool(
-            &serde_json::json!({
-                "name": "run-me",
-                "input": { "job": "demo" },
-                "blackboard": { "priority": "high" },
-            }),
+            &mut run_args,
             &operator_context,
             None,
+            &test_tenant_scope(),
         )
         .await
         .expect("workflow run should return a result");
@@ -1446,10 +1465,11 @@ async fn workflow_execution_tools_list_and_get() {
     .with_workflow_repository(workflow_repo)
     .with_workflow_execution_repo(workflow_execution_repo);
 
+    let mut list_args = serde_json::json!({
+        "workflow_id": workflow.id.to_string(),
+    });
     let list_result = service
-        .invoke_aegis_workflow_execution_list_tool(&serde_json::json!({
-            "workflow_id": workflow.id.to_string(),
-        }))
+        .invoke_aegis_workflow_execution_list_tool(&mut list_args, &test_tenant_scope())
         .await
         .expect("workflow execution list should return a result");
     let ToolInvocationResult::Direct(list_payload) = list_result else {
@@ -1462,10 +1482,11 @@ async fn workflow_execution_tools_list_and_get() {
         execution.id.to_string()
     );
 
+    let mut get_args = serde_json::json!({
+        "execution_id": execution.id.to_string(),
+    });
     let get_result = service
-        .invoke_aegis_workflow_execution_get_tool(&serde_json::json!({
-            "execution_id": execution.id.to_string(),
-        }))
+        .invoke_aegis_workflow_execution_get_tool(&mut get_args, &test_tenant_scope())
         .await
         .expect("workflow execution get should return a result");
     let ToolInvocationResult::Direct(get_payload) = get_result else {
@@ -2430,16 +2451,13 @@ async fn task_execute_with_version_on_name_lookup_uses_versioned_resolution() {
             version: 1,
         },
     };
+    let mut exec_args = serde_json::json!({
+        "agent_id": "my-agent",
+        "version": "2.0.0",
+        "input": { "task": "hello" },
+    });
     let result = service
-        .invoke_aegis_task_execute_tool(
-            &serde_json::json!({
-                "agent_id": "my-agent",
-                "version": "2.0.0",
-                "input": { "task": "hello" },
-            }),
-            &context,
-            None,
-        )
+        .invoke_aegis_task_execute_tool(&mut exec_args, &context, None, &test_tenant_scope())
         .await
         .expect("should return a direct result");
 
@@ -2472,16 +2490,13 @@ async fn task_execute_with_version_on_name_lookup_returns_not_found_for_wrong_ve
             version: 1,
         },
     };
+    let mut exec_args = serde_json::json!({
+        "agent_id": "my-agent",
+        "version": "9.9.9",
+        "input": {},
+    });
     let result = service
-        .invoke_aegis_task_execute_tool(
-            &serde_json::json!({
-                "agent_id": "my-agent",
-                "version": "9.9.9",
-                "input": {},
-            }),
-            &context,
-            None,
-        )
+        .invoke_aegis_task_execute_tool(&mut exec_args, &context, None, &test_tenant_scope())
         .await
         .expect("should return a direct result");
 
@@ -2513,16 +2528,13 @@ async fn task_execute_with_version_on_uuid_returns_error() {
             version: 1,
         },
     };
+    let mut exec_args = serde_json::json!({
+        "agent_id": agent_id.0.to_string(),
+        "version": "1.0.0",
+        "input": {},
+    });
     let result = service
-        .invoke_aegis_task_execute_tool(
-            &serde_json::json!({
-                "agent_id": agent_id.0.to_string(),
-                "version": "1.0.0",
-                "input": {},
-            }),
-            &context,
-            None,
-        )
+        .invoke_aegis_task_execute_tool(&mut exec_args, &context, None, &test_tenant_scope())
         .await
         .expect("should return a direct result");
 
@@ -2591,15 +2603,17 @@ async fn workflow_run_with_version_passes_version_through() {
         },
     };
 
+    let mut run_args = serde_json::json!({
+        "name": "my-workflow",
+        "version": "3.1.0",
+        "input": { "task": "demo" },
+    });
     let result = service
         .invoke_aegis_workflow_run_tool(
-            &serde_json::json!({
-                "name": "my-workflow",
-                "version": "3.1.0",
-                "input": { "task": "demo" },
-            }),
+            &mut run_args,
             &operator_context,
             None,
+            &test_tenant_scope(),
         )
         .await
         .expect("workflow run should return a result");
@@ -2668,14 +2682,12 @@ async fn test_free_tier_volume_id_rejected() {
     let service = make_execute_intent_service();
     let free_ctx = make_security_context("zaru-free");
 
+    let mut intent_args = serde_json::json!({
+        "intent": "run something",
+        "volume_id": "vol-abc123",
+    });
     let result = service
-        .invoke_aegis_execute_intent_tool(
-            &serde_json::json!({
-                "intent": "run something",
-                "volume_id": "vol-abc123",
-            }),
-            &free_ctx,
-        )
+        .invoke_aegis_execute_intent_tool(&mut intent_args, &free_ctx, &test_tenant_scope())
         .await;
 
     assert!(
@@ -2692,13 +2704,11 @@ async fn test_free_tier_no_volume_id_allowed() {
     let service = make_execute_intent_service();
     let free_ctx = make_security_context("zaru-free");
 
+    let mut intent_args = serde_json::json!({
+        "intent": "run something",
+    });
     let result = service
-        .invoke_aegis_execute_intent_tool(
-            &serde_json::json!({
-                "intent": "run something",
-            }),
-            &free_ctx,
-        )
+        .invoke_aegis_execute_intent_tool(&mut intent_args, &free_ctx, &test_tenant_scope())
         .await;
 
     // The tier check passes; the call falls through to the unconfigured use-case
@@ -2722,14 +2732,12 @@ async fn test_paid_tier_volume_id_allowed() {
     let service = make_execute_intent_service();
     let pro_ctx = make_security_context("zaru-pro");
 
+    let mut intent_args = serde_json::json!({
+        "intent": "run something",
+        "volume_id": "vol-abc123",
+    });
     let result = service
-        .invoke_aegis_execute_intent_tool(
-            &serde_json::json!({
-                "intent": "run something",
-                "volume_id": "vol-abc123",
-            }),
-            &pro_ctx,
-        )
+        .invoke_aegis_execute_intent_tool(&mut intent_args, &pro_ctx, &test_tenant_scope())
         .await;
 
     // The tier check passes; the call falls through to the unconfigured use-case
@@ -3706,7 +3714,7 @@ async fn task_execute_seal_invoke_carries_attachments_into_execution_input() {
     let volume_id = uuid::Uuid::new_v4();
 
     // SEAL JSON-RPC tool call payload — exactly the shape the MCP server forwards.
-    let args = serde_json::json!({
+    let mut args = serde_json::json!({
         "agent_id": "doc-summarizer",
         "intent": "summarize the attached document",
         "input": {},
@@ -3722,7 +3730,7 @@ async fn task_execute_seal_invoke_carries_attachments_into_execution_input() {
     });
 
     let result = service
-        .invoke_aegis_task_execute_tool(&args, &context, None)
+        .invoke_aegis_task_execute_tool(&mut args, &context, None, &test_tenant_scope())
         .await
         .expect("tool invocation should succeed");
     let ToolInvocationResult::Direct(payload) = result else {
@@ -3760,7 +3768,7 @@ async fn agent_generate_seal_invoke_carries_attachments_into_execution_input() {
     let context = empty_security_context();
     let volume_id = uuid::Uuid::new_v4();
 
-    let args = serde_json::json!({
+    let mut args = serde_json::json!({
         "input": "build me a bot",
         "attachments": [
             {
@@ -3774,7 +3782,7 @@ async fn agent_generate_seal_invoke_carries_attachments_into_execution_input() {
     });
 
     let result = service
-        .invoke_aegis_agent_generate_tool(&args, &context, None)
+        .invoke_aegis_agent_generate_tool(&mut args, &context, None, &test_tenant_scope())
         .await
         .expect("tool invocation should succeed");
     let ToolInvocationResult::Direct(payload) = result else {
@@ -3804,7 +3812,7 @@ async fn task_execute_seal_invoke_rejects_malformed_attachments() {
     let context = empty_security_context();
 
     // attachments is the wrong shape (object instead of array).
-    let args = serde_json::json!({
+    let mut args = serde_json::json!({
         "agent_id": "doc-summarizer",
         "intent": "x",
         "input": {},
@@ -3812,10 +3820,245 @@ async fn task_execute_seal_invoke_rejects_malformed_attachments() {
     });
 
     let err = service
-        .invoke_aegis_task_execute_tool(&args, &context, None)
+        .invoke_aegis_task_execute_tool(&mut args, &context, None, &test_tenant_scope())
         .await
         .expect_err("malformed attachments must surface as an error");
 
     let msg = err.to_string();
     assert!(msg.contains("attachments"), "msg={msg}");
+}
+
+// =============================================================================
+// Regression tests — ADR-097 tenant scope enforcement on aegis.* tool dispatch.
+//
+// Each test below corresponds to the leak documented in
+// `plans/it-appears-that-the-indexed-steele.md` §1: caller-supplied
+// `tenant_id` arguments were trusted by handlers without comparison to the
+// authenticated `TenantScope`. After the fix, handlers reject any non-matching
+// tenant supplied in args (`SealSessionError::TenantMismatch`) unless the
+// caller is a `ServiceAccount` (ADR-100 delegation).
+// =============================================================================
+
+/// Build a minimal service whose `list_agents_visible_for_tenant` returns an
+/// empty list — sufficient to exercise the tenant-scope guard before the
+/// repository call fires.
+fn build_minimal_tool_invocation_service() -> ToolInvocationService {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+}
+
+fn consumer_tenant_scope(tenant: TenantId) -> crate::domain::iam::TenantScope {
+    crate::domain::iam::TenantScope::new(
+        tenant.clone(),
+        crate::domain::iam::IdentityKind::ConsumerUser {
+            zaru_tier: crate::domain::iam::ZaruTier::Free,
+            tenant_id: tenant,
+        },
+    )
+}
+
+fn service_account_scope(tenant: TenantId) -> crate::domain::iam::TenantScope {
+    crate::domain::iam::TenantScope::new(
+        tenant,
+        crate::domain::iam::IdentityKind::ServiceAccount {
+            client_id: "aegis-temporal-worker".to_string(),
+        },
+    )
+}
+
+#[tokio::test]
+async fn aegis_agent_list_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({ "tenant_id": "u-other-user-sub" });
+
+    let err = service
+        .invoke_aegis_agent_list_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_agent_list_defaults_to_session_tenant() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a.clone());
+    let mut args = serde_json::json!({});
+
+    let result = service
+        .invoke_aegis_agent_list_tool(&mut args, &scope)
+        .await
+        .expect("absent tenant_id must be injected, not rejected");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.agent.list");
+    // After enforcement the canonical tenant_id must appear on args.
+    assert_eq!(args["tenant_id"], serde_json::json!(tenant_a.as_str()));
+}
+
+#[tokio::test]
+async fn service_account_may_delegate_via_args() {
+    let service = build_minimal_tool_invocation_service();
+    let scope = service_account_scope(TenantId::system());
+    let delegated = TenantId::for_consumer_user("delegated-user").unwrap();
+    let mut args = serde_json::json!({ "tenant_id": delegated.as_str() });
+
+    let result = service
+        .invoke_aegis_agent_list_tool(&mut args, &scope)
+        .await
+        .expect("service account delegation must succeed (ADR-100)");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.agent.list");
+    assert_eq!(args["tenant_id"], serde_json::json!(delegated.as_str()));
+}
+
+#[tokio::test]
+async fn aegis_workflow_list_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({ "tenant_id": "u-other-user-sub" });
+
+    let err = service
+        .invoke_aegis_workflow_list_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_task_list_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({ "tenant_id": "u-other-user-sub" });
+
+    let err = service
+        .invoke_aegis_task_list_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_execute_status_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({
+        "pipeline_execution_id": uuid::Uuid::new_v4().to_string(),
+        "tenant_id": "u-other-user-sub",
+    });
+
+    let err = service
+        .invoke_aegis_execute_status_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_agent_search_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let context = SecurityContext {
+        name: "zaru-free".to_string(),
+        description: String::new(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+    let mut args = serde_json::json!({
+        "query": "anything",
+        "tenant_id": "u-other-user-sub",
+    });
+
+    let err = service
+        .invoke_aegis_agent_search_tool(&mut args, &context, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_workflow_search_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let context = SecurityContext {
+        name: "zaru-free".to_string(),
+        description: String::new(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+    let mut args = serde_json::json!({
+        "query": "anything",
+        "tenant_id": "u-other-user-sub",
+    });
+
+    let err = service
+        .invoke_aegis_workflow_search_tool(&mut args, &context, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
 }

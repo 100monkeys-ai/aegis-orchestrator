@@ -38,9 +38,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_delete_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.delete requires 'name' string".to_string(),
@@ -140,11 +141,12 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_run_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         _security_context: &crate::domain::security_context::SecurityContext,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.run requires 'name' string".to_string(),
@@ -202,9 +204,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_execution_list_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let limit: usize = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -297,9 +300,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_execution_get_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let execution_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -374,9 +378,10 @@ impl ToolInvocationService {
     /// Handle `aegis.workflow.wait` — block until a workflow execution reaches a terminal state.
     pub(super) async fn invoke_aegis_workflow_wait_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let execution_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -471,9 +476,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_generate_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.generate requires 'input' string".to_string(),
@@ -518,7 +524,8 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_logs_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
@@ -558,7 +565,7 @@ impl ToolInvocationService {
             }
         };
 
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let execution = match repo.find_by_id_for_tenant(&tenant_id, exec_id).await {
             Ok(Some(e)) => e,
             Ok(None) => {
@@ -748,9 +755,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_list_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let repo = match &self.workflow_repository {
             Some(repo) => repo,
             None => {
@@ -806,10 +814,11 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_promote_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         security_context: &crate::domain::security_context::SecurityContext,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.promote requires 'name' string".to_string(),
@@ -896,10 +905,11 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_demote_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         security_context: &crate::domain::security_context::SecurityContext,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.demote requires 'name' string".to_string(),
@@ -986,9 +996,10 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_export_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.export requires 'name' string".to_string(),
@@ -1043,11 +1054,12 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_update_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         _execution_id: crate::domain::execution::ExecutionId,
         _agent_id: AgentId,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
@@ -1166,11 +1178,12 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_create_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
         execution_id: crate::domain::execution::ExecutionId,
         agent_id: AgentId,
         iteration_number: u8,
         tool_audit_history: &[TrajectoryStep],
+        _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let manifest_yaml = args
             .get("manifest_yaml")
@@ -1198,7 +1211,7 @@ impl ToolInvocationService {
 
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let workflow = match WorkflowParser::parse_yaml(manifest_yaml) {
             Ok(w) => w,

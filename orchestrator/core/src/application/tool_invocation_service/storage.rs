@@ -197,8 +197,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_volume_create(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.user_volume_service {
             Some(s) => s,
@@ -208,7 +209,7 @@ impl ToolInvocationService {
         let size_limit_bytes = require_i64(args, "size_limit_bytes")? as u64;
         let owner = user_sub(caller);
         let tier = user_tier(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let cmd = crate::application::volume_manager::CreateUserVolumeCommand {
             tenant_id,
@@ -231,15 +232,16 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_volume_list(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.user_volume_service {
             Some(s) => s,
             None => return not_configured("aegis.volume.list", "user volume service"),
         };
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let vols = svc
             .list_volumes(&tenant_id, &owner)
@@ -284,8 +286,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_volume_quota(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.user_volume_service {
             Some(s) => s,
@@ -293,7 +296,7 @@ impl ToolInvocationService {
         };
         let owner = user_sub(caller);
         let tier = user_tier(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let usage = svc
             .get_quota_usage(&tenant_id, &owner, &tier)
@@ -315,8 +318,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_clone(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
@@ -326,7 +330,7 @@ impl ToolInvocationService {
         let label = require_str(args, "label")?;
         let owner = user_sub(caller);
         let tier = user_tier(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let credential_binding_id = args
             .get("credential_binding_id")
@@ -394,15 +398,16 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_list(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
             None => return not_configured("aegis.git.list", "git repo service"),
         };
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let bindings = svc
             .list_bindings(&tenant_id, &owner)
@@ -415,8 +420,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_status(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
@@ -424,7 +430,7 @@ impl ToolInvocationService {
         };
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         let binding = svc
@@ -437,8 +443,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_refresh(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
@@ -446,7 +453,7 @@ impl ToolInvocationService {
         };
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         svc.refresh_repo(&bid, &tenant_id, &owner)
@@ -458,8 +465,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_delete(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
@@ -467,7 +475,7 @@ impl ToolInvocationService {
         };
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         svc.delete_binding(&bid, &tenant_id, &owner)
@@ -479,8 +487,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_commit(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
@@ -489,7 +498,7 @@ impl ToolInvocationService {
         let binding_id = require_str(args, "binding_id")?;
         let message = require_str(args, "message")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
         let (author_name, author_email) = commit_author(caller);
 
@@ -510,8 +519,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_push(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
@@ -519,7 +529,7 @@ impl ToolInvocationService {
         };
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         let remote = args.get("remote").and_then(|v| v.as_str());
@@ -534,8 +544,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_git_diff(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
@@ -543,7 +554,7 @@ impl ToolInvocationService {
         };
         let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let bid = parse_binding_id(binding_id)?;
 
         let staged = args
@@ -565,8 +576,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_script_save(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.script_service {
             Some(s) => s,
@@ -590,7 +602,7 @@ impl ToolInvocationService {
             .unwrap_or_default();
         let owner = user_sub(caller);
         let tier = user_tier(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let cmd = crate::application::script_service::CreateScriptCommand {
             tenant_id,
@@ -608,15 +620,16 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_script_list(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.script_service {
             Some(s) => s,
             None => return not_configured("aegis.script.list", "script service"),
         };
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
         let tag = args.get("tag").and_then(|v| v.as_str());
         let query = args.get("q").and_then(|v| v.as_str());
@@ -632,8 +645,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_script_get(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.script_service {
             Some(s) => s,
@@ -641,7 +655,7 @@ impl ToolInvocationService {
         };
         let id = require_str(args, "id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let script_id = parse_script_id(id)?;
 
         let script = svc
@@ -674,8 +688,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_script_update(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.script_service {
             Some(s) => s,
@@ -699,7 +714,7 @@ impl ToolInvocationService {
             })
             .unwrap_or_default();
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let script_id = parse_script_id(id)?;
 
         let cmd = crate::application::script_service::UpdateScriptCommand {
@@ -719,8 +734,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_script_delete(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        _scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.script_service {
             Some(s) => s,
@@ -728,7 +744,7 @@ impl ToolInvocationService {
         };
         let id = require_str(args, "id")?;
         let owner = user_sub(caller);
-        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let script_id = parse_script_id(id)?;
 
         svc.delete(&script_id, &tenant_id, &owner)
