@@ -1,3 +1,4 @@
+use super::attachment_args::parse_attachments;
 use super::*;
 
 impl ToolInvocationService {
@@ -22,6 +23,11 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .map(String::from);
         let version = args.get("version").and_then(|v| v.as_str());
+
+        // ADR-113: parse attachments from the SEAL JSON-RPC tool call args so
+        // they reach `ExecutionInput.attachments` and get merged into
+        // `input.attachments` by `prepare_execution_input` downstream.
+        let attachments = parse_attachments(args)?;
 
         // Resolve and inject the caller's tenant_id into the payload so that
         // start_execution (and any cluster forwarding) picks up the correct tenant.
@@ -86,7 +92,7 @@ impl ToolInvocationService {
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
                     workflow_execution_id: None,
-                    attachments: Vec::new(),
+                    attachments,
                 },
                 "aegis-system-agent-runtime".to_string(),
                 caller_identity,

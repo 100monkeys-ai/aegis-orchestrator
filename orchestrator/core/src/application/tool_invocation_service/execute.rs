@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Intent-to-execution pipeline tool handlers (ADR-087).
 
+use super::attachment_args::parse_attachments;
 use super::*;
 use std::time::Instant;
 
@@ -18,7 +19,34 @@ impl ToolInvocationService {
             )
         })?;
 
-        let inputs = args.get("inputs").cloned().unwrap_or(serde_json::json!({}));
+        let mut inputs = args.get("inputs").cloned().unwrap_or(serde_json::json!({}));
+
+        // ADR-113: route attachments from the SEAL JSON-RPC tool call args into
+        // the workflow `inputs` JSON under the canonical `attachments` key so
+        // any agent spawned by the resulting workflow execution sees them at
+        // `input.attachments` — the same convention applied by
+        // `prepare_execution_input` for direct agent dispatches.
+        let attachments = parse_attachments(args)?;
+        if !attachments.is_empty() {
+            let attachments_json = serde_json::to_value(&attachments).map_err(|e| {
+                SealSessionError::InternalError(format!(
+                    "Failed to serialize attachments for intent pipeline: {e}"
+                ))
+            })?;
+            match inputs.as_object_mut() {
+                Some(obj) => {
+                    obj.insert("attachments".to_string(), attachments_json);
+                }
+                None => {
+                    let original = std::mem::replace(&mut inputs, serde_json::Value::Null);
+                    let mut wrapper = serde_json::Map::new();
+                    wrapper.insert("value".to_string(), original);
+                    wrapper.insert("attachments".to_string(), attachments_json);
+                    inputs = serde_json::Value::Object(wrapper);
+                }
+            }
+        }
+
         let volume_id = args
             .get("volume_id")
             .and_then(|v| v.as_str())

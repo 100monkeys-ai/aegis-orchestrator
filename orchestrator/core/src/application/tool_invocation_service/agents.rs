@@ -1,3 +1,4 @@
+use super::attachment_args::parse_attachments;
 use super::*;
 
 impl ToolInvocationService {
@@ -209,6 +210,11 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let raw_input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
 
+        // ADR-113: parse attachments from the SEAL JSON-RPC tool call args so
+        // they reach `ExecutionInput.attachments` and get merged into
+        // `input.attachments` by `prepare_execution_input` downstream.
+        let attachments = parse_attachments(args)?;
+
         let tenant_id = Self::resolve_tenant_arg(args)?;
 
         // Normalize: if the caller passed a plain string, wrap it as { "input": <str> }.
@@ -248,7 +254,7 @@ impl ToolInvocationService {
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
                     workflow_execution_id: None,
-                    attachments: Vec::new(),
+                    attachments,
                 },
                 "aegis-system-agent-runtime".to_string(),
                 caller_identity,

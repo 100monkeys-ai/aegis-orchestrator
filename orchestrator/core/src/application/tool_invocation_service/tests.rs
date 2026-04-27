@@ -3534,3 +3534,288 @@ fn intent_execution_input_schema_has_no_attachments_field() {
          pipeline-shaped (ADR-087), not agent-input-shaped (ADR-113)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: ADR-113 attachment routing on the SEAL JSON-RPC invoke path.
+//
+// Before this fix, `aegis.task.execute` and `aegis.agent.generate` invoked
+// via SEAL JSON-RPC dropped any `attachments` array on the floor: the tool
+// handlers built `ExecutionInput { attachments: Vec::new(), .. }` regardless
+// of what the caller supplied. The merge in
+// `StandardExecutionService::prepare_execution_input` only sees what the
+// handler passed, so `input.attachments` was never populated for SEAL
+// dispatches and agents read an empty attachments list. Confirmed in the
+// wild via execution 15c95da4-... — `document-summarizer-agent` responded
+// "I was not provided with a document to summarize" because attachments
+// never reached the agent's prompt context.
+//
+// The fix routes both handlers (and `aegis.execute.intent`) through a
+// shared `parse_attachments` helper that deserializes the JSON into typed
+// `Vec<AttachmentRef>` so the existing downstream merge does its job.
+// ---------------------------------------------------------------------------
+
+/// Capturing `ExecutionService` that records the `ExecutionInput` passed to
+/// `start_execution` so a test can assert the SEAL handler propagated
+/// attachments onto the dispatched input.
+struct AttachmentsCapturingExecutionService {
+    captured_input: Arc<std::sync::Mutex<Option<ExecutionInput>>>,
+}
+
+#[async_trait]
+impl ExecutionService for AttachmentsCapturingExecutionService {
+    async fn start_execution(
+        &self,
+        _: AgentId,
+        input: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        *self.captured_input.lock().unwrap() = Some(input);
+        Ok(ExecutionId::new())
+    }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        Ok(execution_id)
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+}
+
+fn build_attachments_capturing_service(
+    agent_name: &str,
+    agent_id: AgentId,
+) -> (
+    ToolInvocationService,
+    Arc<std::sync::Mutex<Option<ExecutionInput>>>,
+) {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let exec_service = Arc::new(AttachmentsCapturingExecutionService {
+        captured_input: Arc::clone(&captured),
+    });
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(VersionAwareAgentLifecycleService {
+            agent_name: agent_name.to_string(),
+            agent_version: "1.0.0".to_string(),
+            agent_id,
+        }),
+        exec_service,
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+    (service, captured)
+}
+
+fn empty_security_context() -> SecurityContext {
+    SecurityContext {
+        name: "test".to_string(),
+        description: String::new(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    }
+}
+
+#[tokio::test]
+async fn task_execute_seal_invoke_carries_attachments_into_execution_input() {
+    let agent_id = AgentId::new();
+    let (service, captured) = build_attachments_capturing_service("doc-summarizer", agent_id);
+    let context = empty_security_context();
+    let volume_id = uuid::Uuid::new_v4();
+
+    // SEAL JSON-RPC tool call payload — exactly the shape the MCP server forwards.
+    let args = serde_json::json!({
+        "agent_id": "doc-summarizer",
+        "intent": "summarize the attached document",
+        "input": {},
+        "attachments": [
+            {
+                "volume_id": volume_id.to_string(),
+                "path": "/uploads/doc.txt",
+                "name": "doc.txt",
+                "mime_type": "text/plain",
+                "size": 123,
+            }
+        ],
+    });
+
+    let result = service
+        .invoke_aegis_task_execute_tool(&args, &context, None)
+        .await
+        .expect("tool invocation should succeed");
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.task.execute");
+    assert!(
+        payload.get("execution_id").is_some(),
+        "expected execution_id (capturing harness returns Ok); got: {payload}"
+    );
+
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("start_execution must be called");
+
+    // Typed `attachments` carried through onto `ExecutionInput`.
+    assert_eq!(
+        captured.attachments.len(),
+        1,
+        "attachments should be carried"
+    );
+    assert_eq!(captured.attachments[0].volume_id.0, volume_id);
+    assert_eq!(captured.attachments[0].path, "/uploads/doc.txt");
+    assert_eq!(captured.attachments[0].name, "doc.txt");
+    assert_eq!(captured.attachments[0].mime_type, "text/plain");
+    assert_eq!(captured.attachments[0].size, 123);
+}
+
+#[tokio::test]
+async fn agent_generate_seal_invoke_carries_attachments_into_execution_input() {
+    let agent_id = AgentId::new();
+    let (service, captured) = build_attachments_capturing_service("agent-creator-agent", agent_id);
+    let context = empty_security_context();
+    let volume_id = uuid::Uuid::new_v4();
+
+    let args = serde_json::json!({
+        "input": "build me a bot",
+        "attachments": [
+            {
+                "volume_id": volume_id.to_string(),
+                "path": "/uploads/spec.md",
+                "name": "spec.md",
+                "mime_type": "text/markdown",
+                "size": 99,
+            }
+        ],
+    });
+
+    let result = service
+        .invoke_aegis_agent_generate_tool(&args, &context, None)
+        .await
+        .expect("tool invocation should succeed");
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.agent.generate");
+    assert!(
+        payload.get("execution_id").is_some(),
+        "expected execution_id; got: {payload}"
+    );
+
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("start_execution must be called");
+
+    assert_eq!(captured.attachments.len(), 1);
+    assert_eq!(captured.attachments[0].volume_id.0, volume_id);
+    assert_eq!(captured.attachments[0].path, "/uploads/spec.md");
+}
+
+#[tokio::test]
+async fn task_execute_seal_invoke_rejects_malformed_attachments() {
+    let agent_id = AgentId::new();
+    let (service, _captured) = build_attachments_capturing_service("doc-summarizer", agent_id);
+    let context = empty_security_context();
+
+    // attachments is the wrong shape (object instead of array).
+    let args = serde_json::json!({
+        "agent_id": "doc-summarizer",
+        "intent": "x",
+        "input": {},
+        "attachments": {"not": "an array"},
+    });
+
+    let err = service
+        .invoke_aegis_task_execute_tool(&args, &context, None)
+        .await
+        .expect_err("malformed attachments must surface as an error");
+
+    let msg = err.to_string();
+    assert!(msg.contains("attachments"), "msg={msg}");
+}
