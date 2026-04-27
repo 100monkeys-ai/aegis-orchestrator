@@ -2,7 +2,7 @@
 # This builds the Rust gRPC server that provides ExecutionService, ValidationService, etc.
 
 # Stage 1: Build the Rust binary
-FROM rust:1.94 AS builder
+FROM rust:1.95 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
