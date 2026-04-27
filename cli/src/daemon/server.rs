@@ -2609,23 +2609,84 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let system_tenant = aegis_orchestrator_core::domain::tenant::TenantId::system();
         for (name, yaml) in builtins::BUILTIN_AGENTS {
             match serde_yaml::from_str::<aegis_orchestrator_sdk::AgentManifest>(yaml) {
                 Ok(manifest) => {
-                    let already_exists = agent_service
-                        .lookup_agent(&manifest.metadata.name)
+                    // Determine whether the built-in needs to be (re)deployed.
+                    // The version-collision gate that the LLM agent.create path
+                    // uses is wrong for platform built-ins: built-ins are
+                    // shipped as `include_str!()` template bytes, and the
+                    // correct invariant is that the deployed manifest must
+                    // match the embedded template byte-for-byte (after
+                    // canonical normalisation). `metadata.version` is a human
+                    // change-marker, not a CI gate.
+                    let existing_id = agent_service
+                        .lookup_agent_for_tenant(&system_tenant, &manifest.metadata.name)
                         .await
                         .ok()
-                        .flatten()
-                        .is_some();
-                    if already_exists && !force_builtins {
-                        info!("Built-in agent '{}' already registered, skipping", name);
+                        .flatten();
+
+                    let needs_deploy = if force_builtins {
+                        // Operator escape hatch: always overwrite.
+                        true
                     } else {
+                        match existing_id {
+                            None => true, // not deployed → install
+                            Some(id) => match agent_service
+                                .get_agent_for_tenant(&system_tenant, id)
+                                .await
+                            {
+                                Ok(deployed) => {
+                                    match builtins::agent_manifest_matches(&deployed.manifest, yaml)
+                                    {
+                                        Ok(true) => {
+                                            info!(
+                                                "Built-in agent '{}' v{} already up to date",
+                                                name, manifest.metadata.version
+                                            );
+                                            false
+                                        }
+                                        Ok(false) => {
+                                            info!(
+                                                "Built-in agent '{}' v{} content drift detected — overwriting",
+                                                name, manifest.metadata.version
+                                            );
+                                            true
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to compare built-in agent '{}' against deployed: {}; \
+                                                 falling back to overwrite",
+                                                name, e
+                                            );
+                                            true
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to fetch deployed built-in agent '{}' for drift \
+                                         comparison: {}; falling back to overwrite",
+                                        name, e
+                                    );
+                                    true
+                                }
+                            },
+                        }
+                    };
+
+                    if needs_deploy {
+                        // `force = true` here is required so the underlying
+                        // version-collision check in the LLM agent.create path
+                        // does not reject the same metadata.version with new
+                        // content. This is the platform-side overwrite, not a
+                        // user-driven one.
                         match agent_service
                             .deploy_agent_for_tenant(
-                                &aegis_orchestrator_core::domain::tenant::TenantId::system(),
+                                &system_tenant,
                                 manifest,
-                                force_builtins,
+                                true,
                                 aegis_orchestrator_core::domain::agent::AgentScope::Global,
                                 None,
                             )
@@ -2641,24 +2702,50 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
 
         for (wf_name, wf_template) in builtins::BUILTIN_WORKFLOWS {
-            let system_tenant = aegis_orchestrator_core::domain::tenant::TenantId::system();
-            let already_exists = workflow_repo
+            let deployed = workflow_repo
                 .find_by_name_for_tenant(&system_tenant, wf_name)
                 .await
                 .ok()
-                .flatten()
-                .is_some();
-            if already_exists && !force_builtins {
-                info!(
-                    "Built-in workflow '{}' already registered, skipping",
-                    wf_name
-                );
+                .flatten();
+
+            let needs_deploy = if force_builtins {
+                true
             } else {
+                match deployed.as_ref() {
+                    None => true,
+                    Some(workflow) => match builtins::workflow_matches(workflow, wf_template) {
+                        Ok(true) => {
+                            info!(
+                                "Built-in workflow '{}' v{} already up to date",
+                                wf_name, workflow.metadata.version
+                            );
+                            false
+                        }
+                        Ok(false) => {
+                            info!(
+                                "Built-in workflow '{}' v{} content drift detected — overwriting",
+                                wf_name, workflow.metadata.version
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to compare built-in workflow '{}' against deployed: {}; \
+                                 falling back to overwrite",
+                                wf_name, e
+                            );
+                            true
+                        }
+                    },
+                }
+            };
+
+            if needs_deploy {
                 match register_workflow_use_case
                     .register_workflow_for_tenant(
                         &system_tenant,
                         wf_template,
-                        force_builtins,
+                        true,
                         aegis_orchestrator_core::domain::workflow::WorkflowScope::Global,
                     )
                     .await
