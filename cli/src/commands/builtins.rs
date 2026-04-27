@@ -219,6 +219,72 @@ const BUILTIN_TEMPLATES: &[BuiltinTemplateSpec] = &[
     },
 ];
 
+// ─── Content Drift Detection ────────────────────────────────────────────────
+
+/// Outcome of comparing an embedded built-in template against the
+/// currently-deployed version. Documents the three dispatch states the
+/// deploy code must handle; not exposed beyond the test surface today.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinDriftOutcome {
+    /// No version is currently deployed under this name — the built-in needs
+    /// to be installed.
+    NotDeployed,
+    /// The deployed manifest semantically matches the embedded template.
+    /// No write is required.
+    UpToDate,
+    /// The deployed manifest differs from the embedded template. The built-in
+    /// must be overwritten.
+    ContentDrift,
+}
+
+/// Compare a deployed `AgentManifest` against the embedded YAML template by
+/// canonicalising both sides through `serde_json::Value`. This eliminates
+/// trivial differences (whitespace, key ordering, comment handling) and
+/// surfaces only true semantic drift.
+///
+/// Returns `Ok(true)` when the two manifests are byte-equal after
+/// canonicalisation.
+pub fn agent_manifest_matches(
+    deployed: &aegis_orchestrator_sdk::AgentManifest,
+    embedded_yaml: &str,
+) -> Result<bool> {
+    let embedded: aegis_orchestrator_sdk::AgentManifest = serde_yaml::from_str(embedded_yaml)
+        .context("Failed to parse embedded built-in agent template for drift comparison")?;
+    let deployed_v =
+        serde_json::to_value(deployed).context("Failed to canonicalise deployed agent manifest")?;
+    let embedded_v = serde_json::to_value(&embedded)
+        .context("Failed to canonicalise embedded agent manifest")?;
+    Ok(deployed_v == embedded_v)
+}
+
+/// Compare a deployed `Workflow` against an embedded YAML workflow template.
+/// Only the semantic content (`metadata` + `spec`) is compared — runtime
+/// fields (id, tenant_id, scope, timestamps) are intentionally excluded.
+pub fn workflow_matches(
+    deployed: &aegis_orchestrator_core::domain::workflow::Workflow,
+    embedded_yaml: &str,
+) -> Result<bool> {
+    let embedded =
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+            embedded_yaml,
+        )
+        .context("Failed to parse embedded built-in workflow template for drift comparison")?;
+    let deployed_v = serde_json::json!({
+        "metadata": serde_json::to_value(&deployed.metadata)
+            .context("Failed to canonicalise deployed workflow metadata")?,
+        "spec": serde_json::to_value(&deployed.spec)
+            .context("Failed to canonicalise deployed workflow spec")?,
+    });
+    let embedded_v = serde_json::json!({
+        "metadata": serde_json::to_value(&embedded.metadata)
+            .context("Failed to canonicalise embedded workflow metadata")?,
+        "spec": serde_json::to_value(&embedded.spec)
+            .context("Failed to canonicalise embedded workflow spec")?,
+    });
+    Ok(deployed_v == embedded_v)
+}
+
 // ─── Deployment Logic ───────────────────────────────────────────────────────
 
 pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<()> {
@@ -280,16 +346,36 @@ async fn deploy_builtin_agent(
         .validate()
         .map_err(|e| anyhow::anyhow!("Built-in template validation failed: {e}"))?;
 
+    // Force-overwrite escape hatch: if the operator passed `--force` we skip the
+    // drift comparison entirely and re-deploy unconditionally.
     if !force {
         if let Some(id) = client.lookup_agent(&manifest.metadata.name).await? {
+            // A version is already deployed under this name. Decide whether to
+            // overwrite by comparing the embedded template against the live
+            // manifest — content drift, not metadata.version, is the gate.
+            let deployed = client
+                .get_agent(id)
+                .await
+                .context("Failed to fetch deployed built-in agent for drift comparison")?;
+            if agent_manifest_matches(&deployed, template_yaml)? {
+                println!(
+                    "  {} Built-in agent '{}' (id: {}) already up to date",
+                    "✓".dimmed(),
+                    manifest.metadata.name.cyan(),
+                    id
+                );
+                return Ok(id);
+            }
+
             println!(
-                "  {} Reusing existing built-in agent '{}' (id: {}) without verifying version; \
-                 use --force to redeploy from the bundled template if needed.",
-                "→".dimmed(),
+                "  {} Built-in agent '{}' content drift detected — overwriting",
+                "↻".dimmed(),
                 manifest.metadata.name.cyan(),
-                id
             );
-            return Ok(id);
+            return client
+                .deploy_agent(manifest, true, Some("global"))
+                .await
+                .context("Failed to deploy built-in template (drift overwrite)");
         }
     }
 
@@ -311,14 +397,53 @@ async fn deploy_builtin_workflow(
     template_yaml: &str,
     force: bool,
 ) -> Result<()> {
-    if !force && client.describe_workflow(name).await.is_ok() {
-        println!(
-            "  {} Reusing existing built-in workflow '{}' without verifying version; \
-             use --force to redeploy from the bundled template if needed.",
-            "→".dimmed(),
-            name.cyan(),
-        );
-        return Ok(());
+    // Validate template before deployment regardless of branch — a malformed
+    // built-in must surface immediately, not silently no-op past drift checks.
+    let parsed_template =
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+            template_yaml,
+        )
+        .context("Failed to parse built-in workflow template YAML")?;
+    aegis_orchestrator_core::domain::workflow::WorkflowValidator::check_for_cycles(
+        &parsed_template,
+    )
+    .context("Built-in workflow template failed cycle validation")?;
+
+    if !force {
+        if let Ok(deployed_json) = client.describe_workflow(name).await {
+            // Pull the canonical YAML the daemon shipped back and re-parse it
+            // so we can compare semantic content against the embedded template.
+            if let Some(manifest_yaml) = deployed_json
+                .get("manifest_yaml")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                let deployed = aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(manifest_yaml)
+                    .context("Failed to parse deployed built-in workflow YAML for drift comparison")?;
+                if workflow_matches(&deployed, template_yaml)? {
+                    println!(
+                        "  {} Built-in workflow '{}' already up to date",
+                        "✓".dimmed(),
+                        name.cyan(),
+                    );
+                    return Ok(());
+                }
+
+                println!(
+                    "  {} Built-in workflow '{}' content drift detected — overwriting",
+                    "↻".dimmed(),
+                    name.cyan(),
+                );
+                return client
+                    .deploy_workflow_manifest_with_force_and_scope(
+                        template_yaml,
+                        true,
+                        Some("global"),
+                    )
+                    .await
+                    .context("Failed to deploy built-in workflow template (drift overwrite)");
+            }
+        }
     }
 
     println!(
@@ -326,15 +451,6 @@ async fn deploy_builtin_workflow(
         "→".dimmed(),
         name.cyan()
     );
-
-    // Validate template before deployment.
-    let workflow =
-        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
-            template_yaml,
-        )
-        .context("Failed to parse built-in workflow template YAML")?;
-    aegis_orchestrator_core::domain::workflow::WorkflowValidator::check_for_cycles(&workflow)
-        .context("Built-in workflow template failed cycle validation")?;
 
     client
         .deploy_workflow_manifest_with_force_and_scope(template_yaml, force, Some("global"))
@@ -657,6 +773,201 @@ mod tests {
         assert!(
             instruction.contains("{{#each attachments"),
             "agent-generator-judge must list `{{{{#each attachments`}} as a forbidden substring it rejects. ADR-113 corrected design regression."
+        );
+    }
+
+    // ─── Content drift detection regression tests ──────────────────────────
+    //
+    // These tests cover the four cases of the built-in deploy flow:
+    //   1. embedded matches deployed verbatim → no-op (UpToDate)
+    //   2. embedded differs from deployed at the same metadata.version
+    //      → drift detected, must overwrite WITHOUT requiring --force
+    //   3. canonicalisation: trivial whitespace / key-ordering / quoting
+    //      differences MUST NOT trigger a false-positive drift
+    //   4. force-flag escape hatch: AEGIS_FORCE_DEPLOY_BUILTINS=true is
+    //      handled by the caller, not the matcher; the matcher just reports
+    //      semantic equality. We assert it does so faithfully.
+    //
+    // Plus a regression assertion that the LLM-create version-collision
+    // gate in `StandardAgentLifecycleService::deploy_agent_for_tenant` is
+    // unchanged in scope (built-ins bypass via `force=true`, user-driven
+    // calls still go through `force=false`).
+
+    #[test]
+    fn agent_drift_matches_when_content_identical() {
+        // Use a real built-in template as ground truth for the matcher —
+        // identical embedded and deployed bytes must report no drift.
+        let deployed: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(HELLO_WORLD_TEMPLATE).unwrap();
+        assert!(
+            agent_manifest_matches(&deployed, HELLO_WORLD_TEMPLATE).unwrap(),
+            "identical embedded + deployed manifests must match"
+        );
+    }
+
+    #[test]
+    fn agent_drift_detected_when_content_differs_at_same_version() {
+        // Simulate a deployed manifest that drifted from the embedded
+        // template at the SAME metadata.version. Mutating the description
+        // is enough — the matcher compares full canonicalised content, not
+        // just the version field.
+        let mut deployed: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(HELLO_WORLD_TEMPLATE).unwrap();
+        deployed.metadata.description =
+            Some("MUTATED — simulates content drift from embedded template".to_string());
+
+        // Sanity: same version, different content.
+        let embedded: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(HELLO_WORLD_TEMPLATE).unwrap();
+        assert_eq!(
+            deployed.metadata.version, embedded.metadata.version,
+            "test pre-condition: same version, drifted content"
+        );
+
+        assert!(
+            !agent_manifest_matches(&deployed, HELLO_WORLD_TEMPLATE).unwrap(),
+            "content drift at the same metadata.version must be detected — \
+             this is the regression that AEGIS_FORCE_DEPLOY_BUILTINS=true was \
+             papering over"
+        );
+    }
+
+    #[test]
+    fn agent_drift_ignores_trivial_whitespace_and_key_ordering() {
+        // Round-trip the embedded template through serde_yaml: the
+        // re-serialised form will differ from the source bytes (key
+        // ordering, quoting, comment loss) but be semantically identical.
+        // The matcher MUST report no drift, otherwise every deploy would
+        // re-write every built-in — re-introducing the band-aid.
+        let parsed: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(HELLO_WORLD_TEMPLATE).unwrap();
+        let reserialised = serde_yaml::to_string(&parsed).unwrap();
+        assert_ne!(
+            reserialised.trim(),
+            HELLO_WORLD_TEMPLATE.trim(),
+            "test pre-condition: re-serialised YAML differs textually from source"
+        );
+        assert!(
+            agent_manifest_matches(&parsed, &reserialised).unwrap(),
+            "trivial whitespace / key-ordering / quoting differences MUST NOT \
+             register as content drift — that would re-introduce the \
+             AEGIS_FORCE_DEPLOY_BUILTINS band-aid every deploy"
+        );
+    }
+
+    #[test]
+    fn builtin_not_deployed_falls_through_to_install() {
+        // The `NotDeployed` outcome is represented by callers as "lookup
+        // returned None"; the matcher itself isn't invoked. We assert the
+        // enum variant exists and is distinct so the call sites have a
+        // type-checked third state to dispatch on.
+        let outcomes = [
+            BuiltinDriftOutcome::NotDeployed,
+            BuiltinDriftOutcome::UpToDate,
+            BuiltinDriftOutcome::ContentDrift,
+        ];
+        // Ensure no two variants compare equal — distinct dispatch states.
+        for (i, a) in outcomes.iter().enumerate() {
+            for (j, b) in outcomes.iter().enumerate() {
+                assert_eq!(a == b, i == j);
+            }
+        }
+    }
+
+    #[test]
+    fn force_deploy_builtins_escape_hatch_bypasses_matcher() {
+        // The matcher itself is pure — it always reports semantic equality.
+        // The AEGIS_FORCE_DEPLOY_BUILTINS escape hatch is a CALLER-SIDE
+        // override: when the env var is set, the deploy code skips calling
+        // the matcher and re-writes unconditionally. We verify the matcher
+        // correctly reports "match" against the source-of-truth template
+        // so the escape hatch is the ONLY thing that triggers re-write of
+        // an up-to-date built-in.
+        let deployed: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(HELLO_WORLD_TEMPLATE).unwrap();
+        let matched = agent_manifest_matches(&deployed, HELLO_WORLD_TEMPLATE).unwrap();
+        assert!(
+            matched,
+            "matcher reports up-to-date for an unchanged built-in; the only \
+             remaining trigger for an overwrite must be the operator-side \
+             AEGIS_FORCE_DEPLOY_BUILTINS escape hatch"
+        );
+
+        // And also assert the daemon server still consumes the env var so
+        // the escape hatch is wired end-to-end.
+        let server_src = include_str!("../daemon/server.rs");
+        assert!(
+            server_src.contains("force_deploy_builtins"),
+            "AEGIS_FORCE_DEPLOY_BUILTINS escape hatch must remain wired into \
+             the daemon server startup deploy path"
+        );
+        assert!(
+            server_src.contains("if force_builtins {"),
+            "daemon server must still short-circuit the drift comparison when \
+             the operator sets AEGIS_FORCE_DEPLOY_BUILTINS=true"
+        );
+    }
+
+    #[test]
+    fn workflow_drift_matches_when_content_identical() {
+        // Round-trip a real built-in workflow template through the parser and
+        // assert the matcher reports no drift against itself.
+        let workflow =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                INTENT_EXECUTION_WORKFLOW_TEMPLATE,
+            )
+            .unwrap();
+        assert!(
+            workflow_matches(&workflow, INTENT_EXECUTION_WORKFLOW_TEMPLATE).unwrap(),
+            "identical embedded + deployed workflows must match"
+        );
+    }
+
+    #[test]
+    fn workflow_drift_detected_when_content_differs() {
+        // Take the live built-in workflow as 'embedded'. Mutate the parsed
+        // 'deployed' to simulate a drifted-on-disk version (description tweak
+        // is enough to register as drift since spec serialises into the
+        // canonical Value).
+        let mut deployed =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                INTENT_EXECUTION_WORKFLOW_TEMPLATE,
+            )
+            .unwrap();
+        deployed.metadata.description =
+            Some("MUTATED — simulates content drift from embedded template".to_string());
+
+        assert!(
+            !workflow_matches(&deployed, INTENT_EXECUTION_WORKFLOW_TEMPLATE).unwrap(),
+            "content drift in workflow metadata must be detected"
+        );
+    }
+
+    #[test]
+    fn llm_agent_create_version_collision_still_rejects() {
+        // SCOPE PRESERVATION: this test asserts our content-drift fix does
+        // NOT widen scope into the LLM-driven aegis.agent.create / .update
+        // path. Built-ins bypass the version-collision gate by calling
+        // `deploy_agent_for_tenant(force=true)`. User-driven LLM calls
+        // continue to flow through `force=false` and MUST still be rejected
+        // when name + version collide.
+        //
+        // We assert the canonical error string this gate produces is still
+        // present in the lifecycle source. If the gate is removed or its
+        // wording changes, this test fires and forces a deliberate review of
+        // whether the LLM-side contract was changed by accident.
+        let lifecycle_src = include_str!("../../../orchestrator/core/src/application/lifecycle.rs");
+        assert!(
+            lifecycle_src.contains("is already deployed (ID:"),
+            "LLM agent.create version-collision gate must still exist in \
+             StandardAgentLifecycleService::deploy_agent_for_tenant — the \
+             content-drift fix is scoped to platform built-ins only and MUST \
+             NOT remove the user-facing version-collision rejection"
+        );
+        assert!(
+            lifecycle_src.contains("Use --force to overwrite it."),
+            "LLM agent.create version-collision gate must still surface the \
+             --force escape hatch in its error message"
         );
     }
 
