@@ -363,21 +363,29 @@ impl AegisRuntime for AegisRuntimeService {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| uuid::Uuid::parse_str(s).ok()),
-            attachments: req
-                .attachments
-                .iter()
-                .filter_map(|a| {
-                    let volume_uuid = uuid::Uuid::parse_str(&a.volume_id).ok()?;
-                    Some(crate::domain::execution::AttachmentRef {
+            attachments: {
+                let mut refs = Vec::with_capacity(req.attachments.len());
+                for a in &req.attachments {
+                    // Skip attachments with malformed volume_id (defensive: pre-existing
+                    // behavior preserved). Reject negative size loudly — silent
+                    // coercion to 0 hides client bugs.
+                    let Ok(volume_uuid) = uuid::Uuid::parse_str(&a.volume_id) else {
+                        continue;
+                    };
+                    let size = u64::try_from(a.size).map_err(|_| {
+                        Status::invalid_argument("AttachmentRef.size must be non-negative")
+                    })?;
+                    refs.push(crate::domain::execution::AttachmentRef {
                         volume_id: crate::domain::shared_kernel::VolumeId(volume_uuid),
                         path: a.path.clone(),
                         name: a.name.clone(),
                         mime_type: a.mime_type.clone(),
-                        size: u64::try_from(a.size).unwrap_or(0),
+                        size,
                         sha256: a.sha256.clone(),
-                    })
-                })
-                .collect(),
+                    });
+                }
+                refs
+            },
         };
 
         // Channel for streaming events
@@ -2665,6 +2673,57 @@ mod tests {
         assert!(
             end.is_none(),
             "stream should terminate after fallback terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_agent_rejects_negative_attachment_size() {
+        // Regression: previously the proto-to-domain mapping silently coerced
+        // negative AttachmentRef.size values to 0 via `u64::try_from(...).unwrap_or(0)`.
+        // Negative sizes from buggy or malicious clients must now fail loudly
+        // with InvalidArgument.
+        let execution_id = ExecutionId::new();
+        let agent_id = AgentId::new();
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id,
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service);
+
+        let result = service
+            .execute_agent(Request::new(ExecuteAgentRequest {
+                agent_id: agent_id.0.to_string(),
+                input: "do something".to_string(),
+                context_json: String::new(),
+                parent_execution_id: None,
+                workflow_execution_id: None,
+                security_policy: None,
+                tenant_id: String::new(),
+                security_context_name: Some("aegis-system-operator".to_string()),
+                intent: None,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                attachments: vec![AttachmentRef {
+                    volume_id: uuid::Uuid::new_v4().to_string(),
+                    path: "foo.txt".to_string(),
+                    name: "foo.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    size: -1,
+                    sha256: String::new(),
+                }],
+            }))
+            .await;
+
+        let status = result.expect_err("negative attachment size must error");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("non-negative"),
+            "error message should mention non-negative: {}",
+            status.message()
         );
     }
 
