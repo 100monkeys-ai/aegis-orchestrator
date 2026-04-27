@@ -74,28 +74,30 @@ spec:
             (iii) Set `spec.type: system` so the agent is routed unconditionally to the
                   `aegis-system-agent-runtime` security context, which is the only context
                   that has `aegis.attachment.read` in its allowed-tools list.
-            (iv) The generated agent's `spec.task.instruction` MUST include a Handlebars
-                 block that renders the per-dispatch attachments at the GENERATED agent's
-                 runtime, so the agent knows which files to read on each invocation. Use this
-                 EXACT pattern (you may adapt the surrounding prose to the agent's role, but
-                 keep the Handlebars structure identical):
+          The dispatch's attachments are merged into the JSON `input` field at execution time:
+          the orchestrator merges `ExecutionInput.attachments` into `input.attachments` BEFORE
+          the prompt template renders. The generated agent's `spec.task.instruction` MUST
+          reference `input.attachments` in PROSE — describing what the agent does with the
+          array — and MUST NOT template it with Handlebars. Agent instructions are NOT
+          Handlebars-rendered at runtime; the LLM reads `input.attachments` directly from the
+          JSON input data substituted into the prompt's `{{input}}` placeholder.
 
-                   {{#if attachments}}
-                   You have been dispatched with the following attached files.
-                   Use `aegis.attachment.read` on each to read its contents:
-                   {{#each attachments}}
-                   - name: {{this.name}} ({{this.mime_type}}, {{this.size}} bytes)
-                     volume_id: {{this.volume_id}}, path: {{this.path}}
-                   {{/each}}
+          Example acceptable instruction text:
+            "You are a document analyzer. The user's request is in `{{intent}}`. The dispatched
+             files are listed in `input.attachments` — an array of `{volume_id, path, name,
+             mime_type, size}` objects. For each attachment, call
+             `aegis.attachment.read({volume_id, path})` to fetch its contents, then
+             [task-specific behavior]."
 
-                   {{/if}}
-
-                 The Handlebars block above is hydrated by the temporal worker at the
-                 GENERATED agent's runtime with that dispatch's actual attachments. Do NOT
-                 inline specific file values (concrete volume_id UUIDs, hardcoded paths,
-                 filenames, or sha256 digests) into the manifest text — that would freeze a
-                 single dispatch's files into a reusable capability archetype, which is a
-                 policy violation and will be rejected by the judge.
+          Do NOT include any Handlebars expressions like `{{#each attachments}}`,
+          `{{#if attachments}}`, `{{this.name}}`, `{{this.volume_id}}`, `{{this.path}}`, or
+          similar inside the generated agent's `spec.task.instruction`. They will not be
+          evaluated and will appear as literal text to the agent's LLM, confusing it.
+          Reference `input.attachments` in prose instead. Likewise, do NOT inline specific
+          file values (concrete volume_id UUIDs, hardcoded paths, filenames, or sha256
+          digests) into the manifest text — that would freeze a single dispatch's files into
+          a reusable capability archetype, which is a policy violation and will be rejected
+          by the judge.
           If the dispatch contains NO `attachments` (or the field is empty), do NOT add
           `aegis.attachment.read` and do NOT set `spec.type: system` — these are reserved for
           dispatches that explicitly carry file references.
@@ -286,7 +288,8 @@ spec:
       The agent you generate MUST be a generic attachment-consumer per the rules in step 3a — do NOT
       embed any specific file references (volume_id, path, name, sha256) into the manifest. The
       dispatch-specific file refs flow separately at the generated agent's runtime via
-      `ExecutionInput.attachments` and the temporal worker's Handlebars hydration.
+      `ExecutionInput.attachments`, which the orchestrator merges into `input.attachments`
+      before the prompt template renders.
 
       {{/if}}
       Agent:

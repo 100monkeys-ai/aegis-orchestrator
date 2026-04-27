@@ -96,16 +96,33 @@ spec:
       the generated manifest MUST be a reusable, generic attachment-consumer. It MUST NOT
       hardcode any specific file references from the dispatch into the manifest text.
       Apply ALL of the following checks in addition to (a)/(b)/(c) above:
-        (d) `spec.task.instruction` MUST contain the literal Handlebars iteration
-            `{{#each attachments}}` (and a guarding `{{#if attachments}}` block) so the
-            per-dispatch attachments are rendered at the agent's runtime. If this block
-            is absent, reduce `correctness` by at least 0.4 and note "manifest received
-            attachments at dispatch but `spec.task.instruction` is missing the
-            `{{#each attachments}}` runtime block — agent will not see its files".
-        (e) `spec.task.instruction` (and any other manifest text) MUST NOT contain
+        (d) `spec.task.instruction` MUST reference `input.attachments` in PROSE so the
+            generated agent's LLM is told where to find its dispatched files. The
+            orchestrator merges `ExecutionInput.attachments` into `input.attachments`
+            before the prompt template renders, so `input.attachments` is the canonical
+            address. Acceptable wording includes any phrase containing the substring
+            `input.attachments` (e.g., "the dispatched files are in `input.attachments`",
+            "iterate `input.attachments`"). If `spec.task.instruction` does NOT contain
+            the substring `input.attachments`, reduce `correctness` by at least 0.4 and
+            note "manifest received attachments at dispatch but `spec.task.instruction`
+            does not reference `input.attachments` — agent will not know where its files
+            are".
+        (e) `spec.task.instruction` MUST NOT contain Handlebars expressions referring to
+            attachments. Specifically reject any of the following substrings:
+              `{{#each attachments`, `{{#if attachments`, `{{this.volume_id`,
+              `{{this.path`, `{{this.name`, `{{this.mime_type`, `{{this.size`,
+              `{{attachments`.
+            Agent instructions are NOT Handlebars-rendered at runtime, so these would
+            appear as literal text to the generated agent's LLM and confuse it. If any
+            of these substrings appears in `spec.task.instruction`, reduce `correctness`
+            by at least 0.4 and note "manifest contains Handlebars expression
+            `<offending substring>` in spec.task.instruction — agent instructions are
+            not Handlebars-rendered at runtime; reference `input.attachments` in prose
+            instead".
+        (f) `spec.task.instruction` (and any other manifest text) MUST NOT contain
             hardcoded file references from the dispatch. Reject the manifest (reduce
             `correctness` by at least 0.5) if any of the following appears in manifest
-            text outside the Handlebars block:
+            text:
               - a UUID-shaped string (e.g., `123e4567-e89b-12d3-a456-426614174000`)
                 referencing a specific volume_id;
               - an absolute path beginning with `/uploads/` or any other concrete
@@ -117,10 +134,10 @@ spec:
             Note the specific offending value (e.g., "manifest hardcodes
             volume_id=<uuid> in spec.task.instruction — agents must be generic
             capability archetypes, dispatch-specific values flow at runtime via
-            Handlebars hydration").
-        (f) Agents MUST be reusable archetypes. Hardcoding any of the above is a
+            `input.attachments`").
+        (g) Agents MUST be reusable archetypes. Hardcoding any of the above is a
             policy violation regardless of any other strengths of the manifest. A
-            manifest that fails (d) or (e) is non-deployable and must be rejected.
+            manifest that fails (d), (e), or (f) is non-deployable and must be rejected.
 
       AGENT REUSABILITY AUDIT — check the generated manifest name and description:
       - If the agent name or description is task-specific rather than capability-generic

@@ -60,23 +60,23 @@ spec:
            attachments MUST: (a) declare an `attachments` field in its `spec.input_schema`
            matching `{volume_id, path, name, mime_type, size, sha256?}`, (b) include
            `aegis.attachment.read` in its `spec.tools`, (c) set `spec.type: system`, and
-           (d) include in its `spec.task.instruction` a Handlebars block that renders the
-           per-dispatch attachments at the agent's runtime — never embed specific file
-           references (volume_id, path, name, sha256) into the manifest. The canonical
-           pattern is:
+           (d) reference `input.attachments` in its `spec.task.instruction` in PROSE —
+           describing what the agent does with the array — never via Handlebars
+           iteration. The orchestrator merges `ExecutionInput.attachments` into the JSON
+           `input` field BEFORE the prompt template renders, so the agent's LLM sees
+           `input.attachments` as part of its substituted input data. Agent instructions
+           are NOT Handlebars-rendered at runtime, so any `{{#each attachments}}`,
+           `{{#if attachments}}`, `{{this.volume_id}}`, etc. would appear as literal text
+           and confuse the LLM. Example acceptable instruction text:
 
-             {{#if attachments}}
-             You have been dispatched with the following attached files.
-             Use `aegis.attachment.read` on each to read its contents:
-             {{#each attachments}}
-             - name: {{this.name}} ({{this.mime_type}}, {{this.size}} bytes)
-               volume_id: {{this.volume_id}}, path: {{this.path}}
-             {{/each}}
+             "You are a document analyzer. The dispatched files are listed in
+              `input.attachments` — an array of `{volume_id, path, name, mime_type, size}`
+              objects. For each attachment, call `aegis.attachment.read({volume_id, path})`
+              to fetch its contents, then [task-specific behavior]."
 
-             {{/if}}
-
-           The workflow's own `metadata.input_schema` MUST also declare an `attachments`
-           array so dispatch attachments propagate through to states. When
+           Never embed specific file references (volume_id, path, name, sha256) into the
+           manifest. The workflow's own `metadata.input_schema` MUST also declare an
+           `attachments` array so dispatch attachments propagate through to states. When
            `GENERATE_MISSING_AGENTS` invokes `agent-creator-agent` for an agent that
            consumes attachments, propagate the requirement (NOT the specific file values)
            so the creator-agent applies the same rule. Reject the workflow if any consuming
@@ -155,7 +155,8 @@ spec:
       field, `aegis.attachment.read` in tools, `spec.type: system`) — do NOT embed any specific
       file references (volume_id, path, name, sha256) into the workflow manifest or any agent
       manifest the planner causes to be generated. Dispatch-specific file refs flow at runtime
-      via `ExecutionInput.attachments` and Handlebars hydration.
+      via `ExecutionInput.attachments`, which the orchestrator merges into `input.attachments`
+      before the prompt template renders.
 
       {{/if}}
       Agent:

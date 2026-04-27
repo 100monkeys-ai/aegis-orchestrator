@@ -579,48 +579,85 @@ mod tests {
         }
     }
 
-    /// Regression test for the canonical runtime-block teaching in
-    /// agent-creator-agent step 3a (sub-rule (iv)).
+    /// Regression test for the corrected ADR-113 attachment-handling design.
     ///
-    /// Step 3a teaches the LLM what shape the GENERATED agent's
-    /// `spec.task.instruction` must take when the dispatch carries attachments.
-    /// The canonical Handlebars iteration block (`{{#each attachments}}` over
-    /// `name`/`mime_type`/`size`/`volume_id`/`path`) MUST appear as TEXT in step
-    /// 3a — instructions to the generator LLM about the template it should write
-    /// into the new manifest. It is NOT runtime Handlebars in the generation
-    /// prompt itself; it is verbatim string content the LLM is told to copy into
-    /// the manifest under construction.
+    /// Agent instructions are NOT Handlebars-rendered at runtime, so the
+    /// generation prompts MUST NOT teach the agent-creator-agent (or the two
+    /// workflow generation agents) to embed `{{#each attachments}}` /
+    /// `{{#if attachments}}` blocks in the generated `spec.task.instruction`.
+    /// The orchestrator merges `ExecutionInput.attachments` into the JSON
+    /// `input` field before prompt rendering, so the generated agent's LLM
+    /// reads `input.attachments` directly. Generation prompts MUST instead
+    /// teach the LLM to reference `input.attachments` in PROSE.
     #[test]
-    fn agent_creator_step_3a_embeds_canonical_runtime_attachments_block() {
-        let manifest: serde_yaml::Value = serde_yaml::from_str(AGENT_GENERATOR_AGENT_TEMPLATE)
-            .expect("agent-creator-agent yaml parses");
-        let instruction = manifest["spec"]["task"]["instruction"]
-            .as_str()
-            .expect("agent-creator-agent must expose spec.task.instruction");
+    fn agent_creator_step_3a_does_not_teach_handlebars_iteration_in_generated_instructions() {
+        let cases = [
+            ("agent-creator-agent", AGENT_GENERATOR_AGENT_TEMPLATE),
+            (
+                "workflow-creator-validator-agent",
+                WORKFLOW_CREATOR_AGENT_TEMPLATE,
+            ),
+            (
+                "workflow-generator-planner-agent",
+                WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
+            ),
+        ];
 
-        // The canonical {{#each attachments}} block must appear as TEXT inside the
-        // instruction (i.e., the LLM is taught to embed this in generated manifests).
-        assert!(
-            instruction.contains("{{#each attachments}}"),
-            "agent-creator-agent step 3a must teach the LLM to embed `{{{{#each attachments}}}}` into the generated agent's spec.task.instruction so per-dispatch files render at runtime. ADR-113 regression."
-        );
-        assert!(
-            instruction.contains("{{#if attachments}}"),
-            "agent-creator-agent step 3a must teach the LLM to guard the runtime attachments block with `{{{{#if attachments}}}}`. ADR-113 regression."
-        );
-        for field in [
-            "{{this.name}}",
-            "{{this.mime_type}}",
-            "{{this.size}}",
-            "{{this.volume_id}}",
-            "{{this.path}}",
-        ] {
+        for (name, yaml) in cases {
+            let manifest: serde_yaml::Value = serde_yaml::from_str(yaml)
+                .unwrap_or_else(|e| panic!("{} yaml parses: {}", name, e));
+            let instruction = manifest["spec"]["task"]["instruction"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{} must expose spec.task.instruction", name));
+
+            // The old canonical teaching contained the literal phrase
+            // "Use `aegis.attachment.read` on each to read its contents:"
+            // immediately followed by `{{#each attachments}}`. Its presence
+            // would mean we kept the broken design.
             assert!(
-                instruction.contains(field),
-                "agent-creator-agent step 3a must teach the LLM the canonical per-attachment field `{}` for the runtime block embedded in generated manifests. ADR-113 regression.",
-                field
+                !instruction.contains("on each to read its contents:"),
+                "{} spec.task.instruction still embeds the broken canonical attachments-iteration teaching block — agent instructions are not Handlebars-rendered at runtime; teach the LLM to reference `input.attachments` in prose instead. ADR-113 corrected design regression.",
+                name
+            );
+            // The corrected teaching MUST surface `input.attachments` as the
+            // canonical address the generated agent's LLM should read.
+            assert!(
+                instruction.contains("input.attachments"),
+                "{} spec.task.instruction MUST teach the LLM to reference `input.attachments` in prose so the generated agent reads its dispatched files from the merged JSON input. ADR-113 corrected design regression.",
+                name
+            );
+            // The full body of the broken canonical block also included
+            // `volume_id: {{this.volume_id}}, path: {{this.path}}` as a list
+            // item template. Reject that exact composite — its presence is
+            // unambiguous evidence of the old design.
+            assert!(
+                !instruction.contains("volume_id: {{this.volume_id}}"),
+                "{} spec.task.instruction still embeds the broken canonical iteration list — agent instructions are not Handlebars-rendered at runtime. ADR-113 corrected design regression.",
+                name
             );
         }
+    }
+
+    /// Regression test for the agent-generator-judge under the corrected
+    /// ADR-113 design. The judge MUST require generated manifests to
+    /// reference `input.attachments` in prose AND MUST reject Handlebars
+    /// iteration blocks in `spec.task.instruction`.
+    #[test]
+    fn agent_generator_judge_requires_input_attachments_prose_and_rejects_handlebars() {
+        let manifest: serde_yaml::Value = serde_yaml::from_str(AGENT_GENERATOR_JUDGE_TEMPLATE)
+            .expect("agent-generator-judge yaml parses");
+        let instruction = manifest["spec"]["task"]["instruction"]
+            .as_str()
+            .expect("agent-generator-judge must expose spec.task.instruction");
+
+        assert!(
+            instruction.contains("input.attachments"),
+            "agent-generator-judge must check that generated manifests reference `input.attachments` in prose. ADR-113 corrected design regression."
+        );
+        assert!(
+            instruction.contains("{{#each attachments"),
+            "agent-generator-judge must list `{{{{#each attachments`}} as a forbidden substring it rejects. ADR-113 corrected design regression."
+        );
     }
 
     #[test]

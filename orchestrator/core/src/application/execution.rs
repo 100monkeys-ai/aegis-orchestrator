@@ -1429,6 +1429,180 @@ mod tests {
         );
     }
 
+    /// Helper: build a minimal `StandardExecutionService` for unit-testing
+    /// pure helpers like `prepare_execution_input`.
+    fn make_test_service() -> StandardExecutionService {
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime));
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let volume_service = Arc::new(TestVolumeService {
+            volumes: HashMap::new(),
+        });
+        StandardExecutionService::new(
+            agent_repo,
+            volume_service,
+            supervisor,
+            execution_repo,
+            event_bus,
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        )
+    }
+
+    /// ADR-113 regression: dispatch attachments must be merged into the
+    /// JSON `input` object before the prompt template renders, so the
+    /// generated agent's LLM sees `input.attachments` as part of its
+    /// substituted input data. Agent instructions are NOT Handlebars-
+    /// rendered at runtime — routing attachments through `input` is the
+    /// only mechanism that makes them visible to the LLM.
+    #[test]
+    fn prepare_execution_input_merges_attachments_into_input_object() {
+        let service = make_test_service();
+        // Agent with a prompt template that surfaces the input JSON verbatim
+        // so the test can inspect the merged shape.
+        let mut agent = make_agent("attachments-consumer", None, None);
+        if let Some(task) = agent.manifest.spec.task.as_mut() {
+            task.prompt_template = Some("INPUT={{input}}".to_string());
+            task.instruction = Some("you are a thing".to_string());
+        }
+
+        let attachment = crate::domain::execution::AttachmentRef {
+            volume_id: crate::domain::shared_kernel::VolumeId::new(),
+            path: "/uploads/sample.pdf".to_string(),
+            name: "sample.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            size: 4096,
+            sha256: None,
+        };
+
+        let input = ExecutionInput {
+            intent: None,
+            input: serde_json::json!({
+                "tenant_id": "zaru-consumer",
+                "task": "summarize"
+            }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: vec![attachment.clone()],
+        };
+
+        let prepared = service.prepare_execution_input(input, &agent).unwrap();
+        let rendered = prepared
+            .intent
+            .as_deref()
+            .expect("rendered prompt is stored on intent");
+
+        // The input JSON substituted into the prompt MUST contain the
+        // merged attachments alongside the original keys.
+        assert!(
+            rendered.contains("\"attachments\""),
+            "rendered prompt must include merged attachments key: {rendered}"
+        );
+        assert!(
+            rendered.contains("sample.pdf"),
+            "rendered prompt must include attachment name: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"tenant_id\""),
+            "rendered prompt must preserve original input keys: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"task\""),
+            "rendered prompt must preserve original input keys: {rendered}"
+        );
+        assert!(
+            rendered.contains("application/pdf"),
+            "rendered prompt must include attachment mime_type: {rendered}"
+        );
+    }
+
+    /// ADR-113: When the dispatch carries no attachments, the input JSON
+    /// must NOT have an `attachments` key spuriously injected.
+    #[test]
+    fn prepare_execution_input_leaves_input_unchanged_when_no_attachments() {
+        let service = make_test_service();
+        let mut agent = make_agent("no-attachments", None, None);
+        if let Some(task) = agent.manifest.spec.task.as_mut() {
+            task.prompt_template = Some("INPUT={{input}}".to_string());
+            task.instruction = Some("hi".to_string());
+        }
+
+        let input = ExecutionInput {
+            intent: None,
+            input: serde_json::json!({ "tenant_id": "zaru-consumer", "k": "v" }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+
+        let prepared = service.prepare_execution_input(input, &agent).unwrap();
+        let rendered = prepared.intent.as_deref().unwrap();
+        assert!(
+            !rendered.contains("\"attachments\""),
+            "no-attachments dispatch must not inject `attachments` key: {rendered}"
+        );
+    }
+
+    /// ADR-113: scalar-input policy. When the caller supplies a scalar
+    /// `input` (e.g., a bare string) AND the dispatch carries attachments,
+    /// the original scalar is preserved under `value` and `attachments`
+    /// becomes a sibling, so `input.attachments` is addressable.
+    #[test]
+    fn prepare_execution_input_wraps_scalar_input_when_attachments_present() {
+        let service = make_test_service();
+        let mut agent = make_agent("scalar-input", None, None);
+        if let Some(task) = agent.manifest.spec.task.as_mut() {
+            task.prompt_template = Some("INPUT={{input}}".to_string());
+            task.instruction = Some("hi".to_string());
+        }
+
+        let attachment = crate::domain::execution::AttachmentRef {
+            volume_id: crate::domain::shared_kernel::VolumeId::new(),
+            path: "/uploads/notes.txt".to_string(),
+            name: "notes.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 12,
+            sha256: None,
+        };
+
+        // Scalar string, wrapped in {"input": ...} so extract_user_input pulls
+        // the scalar back out — that's the path that triggers the wrap policy.
+        let input = ExecutionInput {
+            intent: None,
+            input: serde_json::json!({ "input": "summarize this" }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: vec![attachment],
+        };
+
+        let prepared = service.prepare_execution_input(input, &agent).unwrap();
+        let rendered = prepared.intent.as_deref().unwrap();
+        assert!(
+            rendered.contains("\"value\""),
+            "scalar input must be preserved under `value` key: {rendered}"
+        );
+        assert!(
+            rendered.contains("summarize this"),
+            "scalar input value must be preserved verbatim: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"attachments\""),
+            "attachments must be merged as sibling of `value`: {rendered}"
+        );
+        assert!(
+            rendered.contains("notes.txt"),
+            "attachment fields must be visible: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn cross_tenant_child_spawn_is_rejected() {
         let tenant_id = CoreTenantId::consumer();
@@ -2011,7 +2185,38 @@ impl StandardExecutionService {
                 .map(|s| s.as_str())
                 .unwrap_or("");
 
-            let user_input = user_input_result?;
+            let mut user_input = user_input_result?;
+
+            // ADR-113: Surface dispatch attachments inside the input JSON so the
+            // agent's LLM can reference `input.attachments` directly. Agent
+            // instructions are NOT Handlebars-rendered at runtime, so we route
+            // the data through the JSON input field. The rendered prompt then
+            // contains `{{input}}` substituted with a JSON object that includes
+            // an `attachments` array.
+            if !input.attachments.is_empty() {
+                let attachments_json = serde_json::to_value(&input.attachments).map_err(|e| {
+                    ExecutionError::InvalidExecutionInput(format!(
+                        "failed to serialize attachments: {e}"
+                    ))
+                })?;
+                match &mut user_input {
+                    serde_json::Value::Object(obj) => {
+                        obj.insert("attachments".to_string(), attachments_json);
+                    }
+                    other => {
+                        // Non-object input (scalar string, array, etc.): wrap
+                        // into an object preserving the original under `value`
+                        // and adding `attachments` as a sibling. This keeps the
+                        // attachments addressable as `input.attachments` in
+                        // template contexts.
+                        let original = std::mem::replace(other, serde_json::Value::Null);
+                        let mut wrapper = serde_json::Map::new();
+                        wrapper.insert("value".to_string(), original);
+                        wrapper.insert("attachments".to_string(), attachments_json);
+                        user_input = serde_json::Value::Object(wrapper);
+                    }
+                }
+            }
 
             // Build PromptContext with intent as a first-class template variable.
             // The template controls layout — no hardcoded prepend logic.
