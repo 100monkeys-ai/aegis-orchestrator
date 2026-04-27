@@ -43,6 +43,18 @@ pub enum TaskCommand {
         #[arg(long, value_name = "DICT")]
         context: Option<String>,
 
+        /// Structured attachments as a JSON array, inline or `@file.json`
+        /// (ADR-113). Mutually exclusive with `--attachment`.
+        #[arg(long, value_name = "JSON", conflicts_with = "attachment")]
+        attachments: Option<String>,
+
+        /// Convenience shorthand: `volume_id:path`. Repeatable. The CLI
+        /// stats each file via the orchestrator's volume metadata API to
+        /// produce a full AttachmentRef. Mutually exclusive with
+        /// `--attachments`.
+        #[arg(long = "attachment", value_name = "VOLUME_ID:PATH")]
+        attachment: Vec<String>,
+
         /// Target a specific agent version (default: latest)
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
@@ -173,6 +185,8 @@ async fn handle_command_daemon(
             input,
             intent,
             context,
+            attachments,
+            attachment,
             version,
             wait,
             follow,
@@ -182,6 +196,8 @@ async fn handle_command_daemon(
                 input,
                 intent,
                 context,
+                attachments,
+                attachment,
                 version,
                 wait,
                 follow,
@@ -225,6 +241,8 @@ async fn execute_daemon(
     input: Option<String>,
     intent: Option<String>,
     context: Option<String>,
+    attachments: Option<String>,
+    attachment_shorthand: Vec<String>,
     version: Option<String>,
     wait: bool,
     follow: bool,
@@ -267,6 +285,9 @@ async fn execute_daemon(
     // Parse input
     let input_data = parse_input(input).await?;
     let context_overrides = parse_object_input(context, "context override").await?;
+    let attachment_refs =
+        crate::util::attachments::collect_attachments(&client, attachments, attachment_shorthand)
+            .await?;
 
     if output_format.is_structured() && follow {
         return structured_output_unsupported("aegis task execute --follow", output_format);
@@ -283,6 +304,7 @@ async fn execute_daemon(
             intent,
             context_overrides,
             version.as_deref(),
+            attachment_refs,
         )
         .await?;
 

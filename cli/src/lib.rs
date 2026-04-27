@@ -11,3 +11,4 @@ pub mod auth;
 pub mod commands;
 pub mod daemon;
 pub mod output;
+pub mod util;

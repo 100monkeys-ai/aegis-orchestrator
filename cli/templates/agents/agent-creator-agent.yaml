@@ -49,43 +49,68 @@ spec:
          to discover which MCP tools are available on the platform. Use the results to inform
          which tool names to include in the generated manifest's `spec.tools` section. Only
          reference tool names that appear in search results or are otherwise known to exist.
-      3a. ATTACHMENT-AWARENESS — if the dispatch input you receive contains a non-empty
-          `attachments` array (each entry of shape `{volume_id, path, name, mime_type, size}`,
-          optionally `sha256`), the agent you generate MUST be configured to receive and read
-          those files. Specifically:
-            (i)  Declare an `attachments` field in `spec.input_schema` of shape:
-                   attachments:
-                     type: array
-                     description: Files attached to this dispatch (ADR-113).
-                     items:
-                       type: object
-                       required: [volume_id, path, name, mime_type, size]
-                       properties:
-                         volume_id: { type: string }
-                         path:      { type: string }
-                         name:      { type: string }
-                         mime_type: { type: string }
-                         size:      { type: integer }
-                         sha256:    { type: string }
-                 The `attachments` field is OPTIONAL at the schema level (do not list it in
-                 `required`) so the same agent can be reused for non-attachment dispatches.
-            (ii) Include `aegis.attachment.read` in `spec.tools` so the generated agent can
-                 read each attachment via `(volume_id, path)`.
-            (iii) Set `spec.type: system` so the agent is routed unconditionally to the
-                  `aegis-system-agent-runtime` security context, which is the only context
-                  that has `aegis.attachment.read` in its allowed-tools list.
-          The dispatch's attachments are merged into the JSON `input` field at execution time:
-          the orchestrator merges `ExecutionInput.attachments` into `input.attachments` BEFORE
-          the prompt template renders. The generated agent's `spec.task.instruction` MUST
-          reference `input.attachments` in PROSE — describing what the agent does with the
-          array — and MUST NOT template it with Handlebars. Agent instructions are NOT
-          Handlebars-rendered at runtime; the LLM reads `input.attachments` directly from the
-          JSON input data substituted into the prompt's `{{input}}` placeholder.
+      3a. DISPATCH INPUT FIELDS — every agent dispatch carries three peer fields, and the
+          generated agent's `spec.input_schema` and `spec.task.instruction` must handle each
+          one consistently. The fields are NOT special cases of one another; they are
+          coequal channels and the manifest you generate must reflect that.
+
+          - `intent` — natural-language steering string. The generated agent's
+            `spec.task.instruction` SHOULD reference `{{intent}}` in prose so the LLM reads
+            the per-dispatch task verbatim. Do NOT declare `intent` in `spec.input_schema`
+            (it is delivered out-of-band as the prompt's `{{intent}}` placeholder, not as a
+            structured input field).
+
+          - `input` — structured JSON payload (object, string, or array). If the agent
+            accepts named or structured fields at execution time, declare them under
+            `spec.input_schema` as a JSON Schema `object` with `properties` and `required`.
+            Omit `input_schema` entirely when the agent only accepts a free-form string via
+            `{{input}}` with no named fields. The generated agent's `spec.task.instruction`
+            references the structured fields by name (e.g. `input.user_id`,
+            `input.threshold`) in prose — never via Handlebars iteration.
+
+          - `attachments` — structured array of `{volume_id, path, name, mime_type, size}`
+            file references (each entry may also carry an optional `sha256`). When the
+            dispatch input you receive contains a non-empty `attachments` array, the agent
+            you generate MUST be configured to receive and read those files. Specifically:
+
+              (i)  Declare an `attachments` field in `spec.input_schema` of shape:
+                     attachments:
+                       type: array
+                       description: Files attached to this dispatch (ADR-113).
+                       items:
+                         type: object
+                         required: [volume_id, path, name, mime_type, size]
+                         properties:
+                           volume_id: { type: string }
+                           path:      { type: string }
+                           name:      { type: string }
+                           mime_type: { type: string }
+                           size:      { type: integer }
+                           sha256:    { type: string }
+                   The `attachments` field is OPTIONAL at the schema level (do not list it
+                   in `required`) so the same agent can be reused for non-attachment
+                   dispatches.
+
+              (ii) Include `aegis.attachment.read` in `spec.tools` so the generated agent
+                   can read each attachment via `(volume_id, path)`.
+
+              (iii) Set `spec.type: system` so the agent is routed unconditionally to the
+                    `aegis-system-agent-runtime` security context, which is the only
+                    context that has `aegis.attachment.read` in its allowed-tools list.
+
+          The dispatch's `attachments` are merged into the JSON `input` field at execution
+          time: the orchestrator merges `ExecutionInput.attachments` into
+          `input.attachments` BEFORE the prompt template renders. The generated agent's
+          `spec.task.instruction` MUST reference `input.attachments` in PROSE — describing
+          what the agent does with the array — and MUST NOT template it with Handlebars.
+          Agent instructions are NOT Handlebars-rendered at runtime; the LLM reads
+          `input.attachments` directly from the JSON input data substituted into the
+          prompt's `{{input}}` placeholder.
 
           Example acceptable instruction text:
-            "You are a document analyzer. The user's request is in `{{intent}}`. The dispatched
-             files are listed in `input.attachments` — an array of `{volume_id, path, name,
-             mime_type, size}` objects. For each attachment, call
+            "You are a document analyzer. The user's request is in `{{intent}}`. The
+             dispatched files are listed in `input.attachments` — an array of
+             `{volume_id, path, name, mime_type, size}` objects. For each attachment, call
              `aegis.attachment.read({volume_id, path})` to fetch its contents, then
              [task-specific behavior]."
 

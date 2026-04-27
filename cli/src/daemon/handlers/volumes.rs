@@ -297,6 +297,34 @@ pub(crate) async fn list_files(
         .map_err(file_ops_error_response)
 }
 
+/// GET /v1/volumes/:id/files/stat (ADR-113)
+///
+/// Returns content-sniffed metadata for a single file in the form
+/// `{ name, mime_type, size, sha256 }`. Backs the CLI's
+/// `--attachment <volume_id:path>` shorthand: the CLI issues this stat per
+/// flag and assembles a full `AttachmentRef` from the response. MIME type is
+/// content-sniffed via `infer`, never derived from the path or trusted from
+/// the client, mirroring the upload handler's policy.
+pub(crate) async fn stat_file(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<FilePathQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    scope_guard.require("volume:read")?;
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let owner = user_sub(identity_ref);
+    let vol_id = VolumeId(id);
+
+    state
+        .file_operations_service
+        .stat_attachment_for_user(&vol_id, &owner, &params.path)
+        .await
+        .map(|attrs| Json(serde_json::to_value(attrs).unwrap_or(serde_json::json!({}))))
+        .map_err(file_ops_error_response)
+}
+
 /// GET /v1/volumes/:id/files/download
 pub(crate) async fn download_file(
     State(state): State<Arc<AppState>>,

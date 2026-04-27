@@ -42,6 +42,10 @@ pub(crate) struct ExecuteRequest {
     intent: Option<String>,
     #[serde(default)]
     context_overrides: Option<serde_json::Value>,
+    /// Structured attachments (ADR-113). Carried into `ExecutionInput.attachments`
+    /// verbatim so the dispatch path matches the SEAL JSON-RPC invoke shape.
+    #[serde(default)]
+    attachments: Vec<aegis_orchestrator_core::domain::execution::AttachmentRef>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -148,7 +152,7 @@ pub(crate) async fn execute_agent_handler(
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
         workflow_execution_id: None,
-        attachments: Vec::new(),
+        attachments: request.attachments,
     };
 
     // ADR-083: derive security context from authenticated identity

@@ -121,6 +121,7 @@ impl DaemonClient {
         intent: Option<String>,
         context_overrides: Option<serde_json::Value>,
         version: Option<&str>,
+        attachments: Vec<aegis_orchestrator_core::domain::execution::AttachmentRef>,
     ) -> Result<Uuid> {
         #[derive(Serialize)]
         struct ExecuteRequest {
@@ -129,6 +130,8 @@ impl DaemonClient {
             intent: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             context_overrides: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            attachments: Vec<aegis_orchestrator_core::domain::execution::AttachmentRef>,
         }
 
         let mut url = format!("{}/v1/agents/{}/execute", self.base_url, agent_id);
@@ -142,6 +145,7 @@ impl DaemonClient {
                 input,
                 intent,
                 context_overrides,
+                attachments,
             })
             .send()
             .await
@@ -699,6 +703,41 @@ impl DaemonClient {
         }
         Ok(())
     }
+
+    /// Stat a single file in a volume to get attachment-shaped metadata
+    /// (`name`, `mime_type`, `size`, `sha256`). Backs the CLI's
+    /// `--attachment <volume_id:path>` shorthand resolver.
+    pub async fn stat_attachment_file(
+        &self,
+        volume_id: Uuid,
+        path: &str,
+    ) -> Result<AttachmentStatResponse> {
+        let url = format!("{}/v1/volumes/{}/files/stat", self.base_url, volume_id);
+        let response = self
+            .request(reqwest::Method::GET, url)
+            .query(&[("path", path)])
+            .send()
+            .await
+            .context("Failed to stat attachment file")?;
+        let status = response.status();
+        if !status.is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to stat {volume_id}:{path}: {status} {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse stat response")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AttachmentStatResponse {
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
