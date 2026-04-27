@@ -2643,16 +2643,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                         Ok(true) => {
                                             info!(
                                                 "Built-in agent '{}' v{} already up to date",
-                                                name,
-                                                manifest.metadata.version.as_deref().unwrap_or("?")
+                                                name, manifest.metadata.version
                                             );
                                             false
                                         }
                                         Ok(false) => {
                                             info!(
                                                 "Built-in agent '{}' v{} content drift detected — overwriting",
-                                                name,
-                                                manifest.metadata.version.as_deref().unwrap_or("?")
+                                                name, manifest.metadata.version
                                             );
                                             true
                                         }
