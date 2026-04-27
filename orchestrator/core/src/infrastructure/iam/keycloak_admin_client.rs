@@ -82,9 +82,22 @@ fn build_set_attribute_body(
     attribute: &str,
     value: &str,
 ) -> serde_json::Value {
+    build_set_multivalue_body(user, attribute, &[value.to_string()])
+}
+
+/// Multi-valued variant of [`build_set_attribute_body`]. Keycloak stores user
+/// attributes as `Map<String, List<String>>`, so a multi-valued attribute is
+/// expressed by passing the full list. An empty `values` slice clears the
+/// attribute (Keycloak preserves the key with an empty list, which the
+/// upstream MCP middleware treats as "no memberships").
+fn build_set_multivalue_body(
+    user: &KeycloakUser,
+    attribute: &str,
+    values: &[String],
+) -> serde_json::Value {
     let mut attrs: std::collections::HashMap<String, Vec<String>> =
         user.attributes.clone().unwrap_or_default();
-    attrs.insert(attribute.to_string(), vec![value.to_string()]);
+    attrs.insert(attribute.to_string(), values.to_vec());
 
     serde_json::json!({
         "id": user.id,
@@ -238,6 +251,57 @@ impl KeycloakAdminClient {
             return Err(KeycloakAdminError::AttributeError { status, body });
         }
 
+        Ok(())
+    }
+
+    /// Set the multi-valued `team_memberships` user attribute.
+    ///
+    /// The upstream MCP middleware reads this list of `t-{uuid}` tenant slugs
+    /// off the JWT to decide whether the caller may transact against a team
+    /// tenant; missing values cause a fail-closed 403. Mirrors
+    /// [`set_user_attribute`](Self::set_user_attribute) but writes a
+    /// multi-valued list instead of a single value, which Keycloak's user
+    /// attributes natively support.
+    ///
+    /// Passing an empty `tenants` slice clears the attribute (the user is no
+    /// longer a member of any team).
+    pub async fn set_user_team_memberships(
+        &self,
+        realm: &str,
+        user_id: &str,
+        tenants: &[String],
+    ) -> Result<(), KeycloakAdminError> {
+        let user = match self.get_user(realm, user_id).await? {
+            Some(u) => u,
+            None => {
+                // User not found in this realm — nothing to stamp. Caller
+                // (TeamService / backfill) decides whether this is a drift
+                // condition; we return Ok to keep behaviour consistent with
+                // the tier-sync soft-heal path.
+                return Ok(());
+            }
+        };
+
+        let token = self.get_admin_token().await?;
+        let url = format!(
+            "{}/admin/realms/{}/users/{}",
+            self.config.host, realm, user.id
+        );
+        let body = build_set_multivalue_body(&user, "team_memberships", tenants);
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(KeycloakAdminError::AttributeError { status, body });
+        }
         Ok(())
     }
 
@@ -962,6 +1026,61 @@ mod tests {
         assert_eq!(body["id"], "user-456");
         assert_eq!(body["enabled"], true);
         assert_eq!(body["attributes"]["zaru_tier"][0], "business");
+    }
+
+    /// The multi-valued attribute body preserves all supplied values verbatim
+    /// and does not collapse the list to a single element.
+    #[test]
+    fn set_multivalue_body_preserves_full_list() {
+        let user = KeycloakUser {
+            id: "user-multi".to_string(),
+            email: Some("multi@example.com".to_string()),
+            first_name: None,
+            last_name: None,
+            created_timestamp: 0,
+            attributes: None,
+        };
+
+        let tenants = vec![
+            "t-11111111-2222-3333-4444-555555555555".to_string(),
+            "t-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        ];
+        let body = build_set_multivalue_body(&user, "team_memberships", &tenants);
+
+        let arr = body["attributes"]["team_memberships"]
+            .as_array()
+            .expect("team_memberships must serialize as a JSON array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], tenants[0]);
+        assert_eq!(arr[1], tenants[1]);
+    }
+
+    /// An empty tenants slice clears the attribute by writing an empty list,
+    /// rather than dropping the key entirely. This matches Keycloak's
+    /// `Map<String, List<String>>` storage model and the MCP middleware's
+    /// "no memberships" semantics.
+    #[test]
+    fn set_multivalue_body_empty_list_clears_attribute() {
+        let mut existing = std::collections::HashMap::new();
+        existing.insert(
+            "team_memberships".to_string(),
+            vec!["t-old".to_string(), "t-older".to_string()],
+        );
+
+        let user = KeycloakUser {
+            id: "user-clear".to_string(),
+            email: Some("clear@example.com".to_string()),
+            first_name: None,
+            last_name: None,
+            created_timestamp: 0,
+            attributes: Some(existing),
+        };
+
+        let body = build_set_multivalue_body(&user, "team_memberships", &[]);
+        let arr = body["attributes"]["team_memberships"]
+            .as_array()
+            .expect("attribute key must remain present with an empty list");
+        assert!(arr.is_empty());
     }
 
     /// A new value for an existing attribute key overwrites the old one.

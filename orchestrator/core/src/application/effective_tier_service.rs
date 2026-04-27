@@ -439,6 +439,26 @@ mod tests {
                 .filter(|m| m.status == MembershipStatus::Active)
                 .collect())
         }
+        async fn find_active_team_tenants_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<String>, RepositoryError> {
+            Ok(self
+                .by_user
+                .lock()
+                .unwrap()
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.status == MembershipStatus::Active)
+                .map(|m| {
+                    crate::domain::team::TeamSlug::new(m.team_id)
+                        .as_str()
+                        .to_string()
+                })
+                .collect())
+        }
         async fn is_active_member(
             &self,
             _user_id: &str,

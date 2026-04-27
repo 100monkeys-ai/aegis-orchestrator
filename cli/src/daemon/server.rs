@@ -1995,6 +1995,23 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     aegis_orchestrator_core::domain::node_config::resolve_env_value(k).ok()
                 })
                 .map(|s| s.into_bytes());
+            // `team_memberships` JWT-claim sync port. Stamps the multivalued
+            // Keycloak attribute every time a membership mutation lands;
+            // disabled (None) when keycloak_admin is unavailable, in which
+            // case the upstream MCP middleware will fail-closed until the
+            // next backfill run.
+            let team_memberships_sync: Option<Arc<dyn aegis_orchestrator_core::application::team_service::TeamMembershipsSyncPort>> =
+                colony_keycloak_admin.as_ref().map(|kc| {
+                    Arc::new(
+                        aegis_orchestrator_core::application::team_service::KeycloakTeamMembershipsSyncPort::new(
+                            kc.clone(),
+                        ),
+                    )
+                        as Arc<
+                            dyn aegis_orchestrator_core::application::team_service::TeamMembershipsSyncPort,
+                        >
+                });
+
             Some(Arc::new(
                 aegis_orchestrator_core::application::team_service::StandardTeamService::new(
                     team_repo.clone(),
@@ -2005,6 +2022,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     event_bus.clone(),
                     hmac_key,
                     effective_tier_service.clone(),
+                    team_memberships_sync,
                 ),
             )
                 as Arc<
@@ -2013,6 +2031,73 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
         _ => None,
     };
+
+    // Backfill loop for the `team_memberships` Keycloak attribute (one-shot,
+    // gated by AEGIS_BACKFILL_TEAM_MEMBERSHIPS=true). Closes the gap where
+    // already-joined users have no claim until they next mutate a membership,
+    // which would cause the upstream MCP middleware to fail-closed for the
+    // entire installed base on first deploy. Spawned in the background so
+    // startup does not block on Keycloak round-trips.
+    if std::env::var("AEGIS_BACKFILL_TEAM_MEMBERSHIPS")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+    {
+        if let (Some(kc), Some(membership_repo)) =
+            (colony_keycloak_admin.as_ref(), membership_repo_opt.as_ref())
+        {
+            let kc = kc.clone();
+            let membership_repo = membership_repo.clone();
+            tokio::spawn(async move {
+                let realm = "zaru-consumer";
+                info!("team_memberships backfill: starting (AEGIS_BACKFILL_TEAM_MEMBERSHIPS=true)");
+                let users = match kc.list_realm_users(realm).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::error!(error = %e, realm, "team_memberships backfill: list_realm_users failed");
+                        return;
+                    }
+                };
+                let total = users.len();
+                let mut stamped = 0usize;
+                let mut failed = 0usize;
+                for u in users {
+                    let tenants = match membership_repo
+                        .find_active_team_tenants_for_user(&u.id)
+                        .await
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                user_id = %u.id,
+                                "team_memberships backfill: repo lookup failed"
+                            );
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    if let Err(e) = kc.set_user_team_memberships(realm, &u.id, &tenants).await {
+                        tracing::warn!(
+                            error = %e,
+                            user_id = %u.id,
+                            "team_memberships backfill: stamp failed"
+                        );
+                        failed += 1;
+                    } else {
+                        stamped += 1;
+                    }
+                }
+                info!(
+                    total,
+                    stamped, failed, "team_memberships backfill: complete"
+                );
+            });
+        } else {
+            tracing::warn!(
+                "AEGIS_BACKFILL_TEAM_MEMBERSHIPS=true but keycloak_admin or membership_repo not wired; skipping backfill"
+            );
+        }
+    }
 
     let app_state = AppState {
         agent_service: agent_service.clone(),

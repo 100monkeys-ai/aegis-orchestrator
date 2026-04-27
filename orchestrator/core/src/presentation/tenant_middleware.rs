@@ -542,6 +542,23 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn find_active_team_tenants_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<String>, RepositoryError> {
+            Ok(self
+                .memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.user_id == user_id && m.status == MembershipStatus::Active)
+                .map(|m| {
+                    crate::domain::team::TeamSlug::new(m.team_id)
+                        .as_str()
+                        .to_string()
+                })
+                .collect())
+        }
         async fn is_active_member(
             &self,
             user_id: &str,

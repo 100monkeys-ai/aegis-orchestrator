@@ -286,6 +286,33 @@ impl MembershipRepository for PgMembershipRepository {
         rows.iter().map(row_to_membership).collect()
     }
 
+    async fn find_active_team_tenants_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, RepositoryError> {
+        // JOIN teams ↔ team_memberships and project the t-{uuid} tenant slug
+        // for every active membership. This is the source list for the
+        // `team_memberships` Keycloak attribute / JWT claim consumed by the
+        // upstream MCP middleware.
+        let rows = sqlx::query(
+            "SELECT t.tenant_id AS tenant_id \
+             FROM team_memberships m \
+             JOIN teams t ON t.id = m.team_id \
+             WHERE m.user_id = $1 AND m.status = 'active'",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let tenant_id: String = row.get("tenant_id");
+            out.push(tenant_id);
+        }
+        Ok(out)
+    }
+
     async fn is_active_member(
         &self,
         user_id: &str,

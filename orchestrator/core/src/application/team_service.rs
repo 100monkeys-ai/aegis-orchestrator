@@ -34,6 +34,7 @@ use crate::domain::team::{
 };
 use crate::domain::tenancy::{Tenant, TenantTier};
 use crate::infrastructure::event_bus::EventBus;
+use crate::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -216,6 +217,70 @@ pub trait TeamService: Send + Sync {
 }
 
 // ============================================================================
+// TeamMembershipsSyncPort — write the `team_memberships` Keycloak attribute
+// ============================================================================
+
+/// Port that stamps the multi-valued `team_memberships` attribute on a
+/// Keycloak user. The attribute carries the list of `t-{uuid}` tenant slugs
+/// the user is currently an active member of; the upstream MCP middleware
+/// reads it off the JWT to authorize team-tenant tool calls and fails closed
+/// with 403 when an entry is missing.
+///
+/// Production wiring is [`KeycloakTeamMembershipsSyncPort`]; tests provide an
+/// in-memory recorder.
+#[async_trait]
+pub trait TeamMembershipsSyncPort: Send + Sync {
+    /// Replace the user's `team_memberships` attribute with `tenants`.
+    /// An empty slice clears the attribute (no active memberships).
+    /// Implementations MUST be idempotent.
+    async fn set_team_memberships(
+        &self,
+        user_id: &str,
+        tenants: &[String],
+    ) -> Result<(), TeamServiceError>;
+}
+
+/// Keycloak-backed implementation that writes the attribute in the shared
+/// `zaru-consumer` realm. Enterprise team realms are out of scope for this
+/// port: the MCP middleware authorizes against the consumer JWT.
+pub struct KeycloakTeamMembershipsSyncPort {
+    keycloak_admin: Arc<KeycloakAdminClient>,
+    realm: String,
+}
+
+impl KeycloakTeamMembershipsSyncPort {
+    pub fn new(keycloak_admin: Arc<KeycloakAdminClient>) -> Self {
+        Self {
+            keycloak_admin,
+            realm: "zaru-consumer".to_string(),
+        }
+    }
+
+    pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
+        self.realm = realm.into();
+        self
+    }
+}
+
+#[async_trait]
+impl TeamMembershipsSyncPort for KeycloakTeamMembershipsSyncPort {
+    async fn set_team_memberships(
+        &self,
+        user_id: &str,
+        tenants: &[String],
+    ) -> Result<(), TeamServiceError> {
+        self.keycloak_admin
+            .set_user_team_memberships(&self.realm, user_id, tenants)
+            .await
+            .map_err(|e| {
+                TeamServiceError::Repository(RepositoryError::Unknown(format!(
+                    "set_user_team_memberships: {e}"
+                )))
+            })
+    }
+}
+
+// ============================================================================
 // Standard Implementation
 // ============================================================================
 
@@ -236,6 +301,12 @@ pub struct StandardTeamService {
     /// the affected user. Optional so the service works in environments
     /// without Keycloak wired (e.g. tests).
     effective_tier_service: Option<Arc<dyn EffectiveTierService>>,
+    /// `team_memberships` JWT claim synchronizer. When set, every membership
+    /// mutation (provision_team / accept_invitation / revoke_membership)
+    /// recomputes the affected user's active team-tenant slug list and
+    /// stamps it on their Keycloak user record. Optional so the service
+    /// works in environments without Keycloak wired (e.g. tests).
+    team_memberships_sync: Option<Arc<dyn TeamMembershipsSyncPort>>,
 }
 
 impl StandardTeamService {
@@ -249,6 +320,7 @@ impl StandardTeamService {
         event_bus: Arc<EventBus>,
         invitation_hmac_key: Option<Vec<u8>>,
         effective_tier_service: Option<Arc<dyn EffectiveTierService>>,
+        team_memberships_sync: Option<Arc<dyn TeamMembershipsSyncPort>>,
     ) -> Self {
         Self {
             team_repo,
@@ -259,6 +331,41 @@ impl StandardTeamService {
             event_bus,
             invitation_hmac_key,
             effective_tier_service,
+            team_memberships_sync,
+        }
+    }
+
+    /// Recompute the user's active team-tenant list from the membership
+    /// repository and stamp it via [`TeamMembershipsSyncPort`]. No-op when
+    /// the port is not wired. Failures are logged but never abort the
+    /// caller's workflow — the backfill loop heals divergence on next
+    /// startup.
+    async fn sync_team_memberships(&self, user_id: &str) {
+        let Some(port) = &self.team_memberships_sync else {
+            return;
+        };
+        let tenants = match self
+            .membership_repo
+            .find_active_team_tenants_for_user(user_id)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    user_id,
+                    "find_active_team_tenants_for_user failed; skipping team_memberships sync"
+                );
+                return;
+            }
+        };
+        if let Err(e) = port.set_team_memberships(user_id, &tenants).await {
+            tracing::warn!(
+                error = %e,
+                user_id,
+                tenant_count = tenants.len(),
+                "team_memberships Keycloak stamp failed (MCP middleware may fail-closed until next sync)"
+            );
         }
     }
 
@@ -374,6 +481,12 @@ impl TeamService for StandardTeamService {
         self.billing_service
             .provision_team_customer(team.id, cmd.owner_email, &team.tenant_id, team.tier)
             .await?;
+
+        // Stamp the `team_memberships` JWT claim on the owner — they are now
+        // an active member of this newly-provisioned tenant. Without this the
+        // upstream MCP middleware fails closed with 403 on the owner's first
+        // tenant-scoped tool call.
+        self.sync_team_memberships(&cmd.owner_user_id).await;
 
         // Drain events & publish.
         let events = team.take_events();
@@ -495,6 +608,11 @@ impl TeamService for StandardTeamService {
         );
         self.membership_repo.save(&membership).await?;
 
+        // Stamp the `team_memberships` JWT claim — the new tenant must be
+        // present before the invitee makes their first tenant-scoped MCP
+        // call, or the middleware fails closed with 403.
+        self.sync_team_memberships(&cmd.authenticated_user_id).await;
+
         // ADR-111 Phase 3: lift the joining member's effective personal tier
         // to match this colony's tier. Failures here are logged but do not
         // abort the invitation flow — the membership is saved and seats are
@@ -582,6 +700,12 @@ impl TeamService for StandardTeamService {
         }
 
         self.membership_repo.revoke(&team_id, &user_id).await?;
+
+        // Drop the revoked tenant from the user's `team_memberships` JWT
+        // claim immediately — leaving a stale entry would let the MCP
+        // middleware authorize calls against a tenant the user no longer
+        // belongs to.
+        self.sync_team_memberships(&user_id).await;
 
         // ADR-111 Phase 3: drop the revoked member's effective tier back to
         // their personal subscription tier (or any remaining active colony).
@@ -806,6 +930,23 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn find_active_team_tenants_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<String>, RepositoryError> {
+            // The in-memory fake derives the slug from the team_id; production
+            // performs the equivalent JOIN against the `teams.tenant_id`
+            // column. This stays consistent with `Team::provision`, which
+            // sets `tenant_id = TeamSlug::new(team_id).to_tenant_id()`.
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.user_id == user_id && m.status == MembershipStatus::Active)
+                .map(|m| TeamSlug::new(m.team_id).as_str().to_string())
+                .collect())
+        }
         async fn is_active_member(
             &self,
             user_id: &str,
@@ -953,6 +1094,7 @@ mod tests {
             Arc::new(EventBus::with_default_capacity()),
             Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
             None,
+            None,
         )
     }
 
@@ -1056,6 +1198,7 @@ mod tests {
             Arc::new(EventBus::with_default_capacity()),
             Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
             Some(Arc::new(StubPersonalTier(personal))),
+            None,
         )
     }
 
@@ -1083,6 +1226,298 @@ mod tests {
             .await
             .expect("business personal must allow business colony");
         assert_eq!(team.tier, TenantTier::Business);
+    }
+
+    // ── team_memberships JWT claim stamping (MCP middleware fail-closed gap) ─
+
+    /// Recording fake of [`TeamMembershipsSyncPort`]. Captures every
+    /// `set_team_memberships(user_id, tenants)` call in order so tests can
+    /// assert both the sequence of stamps and the resulting tenant set per
+    /// user.
+    #[derive(Default)]
+    struct RecordingMembershipsSync {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl TeamMembershipsSyncPort for RecordingMembershipsSync {
+        async fn set_team_memberships(
+            &self,
+            user_id: &str,
+            tenants: &[String],
+        ) -> Result<(), TeamServiceError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((user_id.to_string(), tenants.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// Stateful in-memory invitation repo so accept_invitation can round-trip
+    /// a token through `find_by_token_hash` → `mark_accepted`.
+    #[derive(Default)]
+    struct StatefulInvitationRepo {
+        items: Mutex<Vec<TeamInvitation>>,
+    }
+
+    #[async_trait]
+    impl TeamInvitationRepository for StatefulInvitationRepo {
+        async fn save(&self, invitation: &TeamInvitation) -> Result<(), RepositoryError> {
+            let mut g = self.items.lock().unwrap();
+            if let Some(slot) = g.iter_mut().find(|i| i.id == invitation.id) {
+                *slot = invitation.clone();
+            } else {
+                g.push(invitation.clone());
+            }
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            id: &TeamInvitationId,
+        ) -> Result<Option<TeamInvitation>, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|i| i.id == *id)
+                .cloned())
+        }
+        async fn find_by_token_hash(
+            &self,
+            token_hash: &str,
+        ) -> Result<Option<TeamInvitation>, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|i| i.token_hash == token_hash)
+                .cloned())
+        }
+        async fn find_pending_by_team(
+            &self,
+            team_id: &TeamId,
+        ) -> Result<Vec<TeamInvitation>, RepositoryError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|i| i.team_id == *team_id && i.status == InvitationStatus::Pending)
+                .cloned()
+                .collect())
+        }
+        async fn mark_accepted(&self, id: &TeamInvitationId) -> Result<(), RepositoryError> {
+            for i in self.items.lock().unwrap().iter_mut() {
+                if i.id == *id {
+                    i.status = InvitationStatus::Accepted;
+                }
+            }
+            Ok(())
+        }
+        async fn mark_cancelled(&self, _id: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn mark_expired(&self, _id: &TeamInvitationId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    fn build_service_with_memberships_sync(
+        sync: Arc<RecordingMembershipsSync>,
+    ) -> StandardTeamService {
+        StandardTeamService::new(
+            Arc::new(MemTeamRepo::default()),
+            Arc::new(MemMembershipRepo::default()),
+            Arc::new(StatefulInvitationRepo::default()),
+            Arc::new(MemTenantRepo::default()),
+            Arc::new(NoopBilling),
+            Arc::new(EventBus::with_default_capacity()),
+            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
+            None,
+            Some(sync),
+        )
+    }
+
+    /// Regression: provisioning a team must stamp `team_memberships` on the
+    /// owner so the new tenant is present in their JWT before they make any
+    /// tenant-scoped MCP call. Without this the upstream middleware fails
+    /// closed with 403 on the very first request.
+    #[tokio::test]
+    async fn team_memberships_stamped_on_provision_team() {
+        let sync = Arc::new(RecordingMembershipsSync::default());
+        let svc = build_service_with_memberships_sync(sync.clone());
+
+        let team = svc
+            .provision_team(cmd(TenantTier::Business))
+            .await
+            .expect("provision must succeed");
+
+        let calls = sync.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one stamp on provision (owner)");
+        assert_eq!(calls[0].0, "user-1", "owner is the stamp target");
+        assert_eq!(
+            calls[0].1,
+            vec![team.tenant_id.as_str().to_string()],
+            "owner's claim must contain exactly the new team tenant slug",
+        );
+    }
+
+    /// Regression: accept_invitation must stamp `team_memberships` on the
+    /// invitee with the new tenant included.
+    #[tokio::test]
+    async fn team_memberships_stamped_on_accept_invitation() {
+        let sync = Arc::new(RecordingMembershipsSync::default());
+        let svc = build_service_with_memberships_sync(sync.clone());
+
+        let team = svc
+            .provision_team(cmd(TenantTier::Business))
+            .await
+            .expect("provision must succeed");
+
+        // Owner sends invite, then invitee accepts.
+        let issued = svc
+            .invite_member(InviteMemberCommand {
+                team_id: team.id,
+                invitee_email: "newbie@example.com".to_string(),
+                invited_by_user_id: "user-1".to_string(),
+            })
+            .await
+            .expect("invite must succeed");
+
+        sync.calls.lock().unwrap().clear();
+
+        svc.accept_invitation(AcceptInvitationCommand {
+            token: issued.raw_token.clone(),
+            authenticated_email: "newbie@example.com".to_string(),
+            authenticated_user_id: "user-2".to_string(),
+        })
+        .await
+        .expect("accept must succeed");
+
+        let calls = sync.calls.lock().unwrap().clone();
+        let stamps_for_user2: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|(uid, _)| uid == "user-2")
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            stamps_for_user2.len(),
+            1,
+            "exactly one stamp on accept (invitee)"
+        );
+        assert!(
+            stamps_for_user2[0].contains(&team.tenant_id.as_str().to_string()),
+            "invitee's claim must include the new tenant; got {:?}",
+            stamps_for_user2[0]
+        );
+    }
+
+    /// Regression: revoke_membership must re-stamp the affected user's
+    /// `team_memberships` with the revoked tenant removed. A stale entry
+    /// would let the MCP middleware authorize calls against a tenant the
+    /// user no longer belongs to.
+    #[tokio::test]
+    async fn team_memberships_stamped_on_revoke_membership() {
+        let sync = Arc::new(RecordingMembershipsSync::default());
+        let svc = build_service_with_memberships_sync(sync.clone());
+
+        let team = svc
+            .provision_team(cmd(TenantTier::Business))
+            .await
+            .expect("provision must succeed");
+
+        let issued = svc
+            .invite_member(InviteMemberCommand {
+                team_id: team.id,
+                invitee_email: "victim@example.com".to_string(),
+                invited_by_user_id: "user-1".to_string(),
+            })
+            .await
+            .expect("invite must succeed");
+
+        svc.accept_invitation(AcceptInvitationCommand {
+            token: issued.raw_token,
+            authenticated_email: "victim@example.com".to_string(),
+            authenticated_user_id: "user-2".to_string(),
+        })
+        .await
+        .expect("accept must succeed");
+
+        sync.calls.lock().unwrap().clear();
+
+        svc.revoke_membership(team.id, "user-2".to_string(), "user-1".to_string())
+            .await
+            .expect("revoke must succeed");
+
+        let calls = sync.calls.lock().unwrap().clone();
+        let stamps_for_user2: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|(uid, _)| uid == "user-2")
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(stamps_for_user2.len(), 1, "exactly one stamp on revoke");
+        assert!(
+            !stamps_for_user2[0].contains(&team.tenant_id.as_str().to_string()),
+            "revoked tenant must NOT appear in the re-stamped claim; got {:?}",
+            stamps_for_user2[0]
+        );
+        assert!(
+            stamps_for_user2[0].is_empty(),
+            "victim had only this one membership; claim must be empty"
+        );
+    }
+
+    /// Regression for the new `find_active_team_tenants_for_user` repo
+    /// method: it must return the `t-{uuid}` slug for every active
+    /// membership and skip revoked rows. This is the source list the
+    /// `team_memberships` JWT claim is computed from.
+    #[tokio::test]
+    async fn find_active_team_tenants_for_user_returns_active_only() {
+        use crate::domain::team::TeamSlug;
+
+        let repo = MemMembershipRepo::default();
+        let team_a = TeamId::new();
+        let team_b = TeamId::new();
+        let team_c = TeamId::new();
+
+        // Two active, one revoked (the revoked team_c slug must NOT appear).
+        let active_a = Membership::new_active(team_a, "user-x".into(), MembershipRole::Member);
+        let active_b = Membership::new_active(team_b, "user-x".into(), MembershipRole::Owner);
+        let mut revoked_c = Membership::new_active(team_c, "user-x".into(), MembershipRole::Member);
+        revoked_c.status = MembershipStatus::Revoked;
+
+        repo.save(&active_a).await.unwrap();
+        repo.save(&active_b).await.unwrap();
+        repo.save(&revoked_c).await.unwrap();
+        // A membership for someone else — must not leak.
+        repo.save(&Membership::new_active(
+            team_a,
+            "user-y".into(),
+            MembershipRole::Member,
+        ))
+        .await
+        .unwrap();
+
+        let mut tenants = repo
+            .find_active_team_tenants_for_user("user-x")
+            .await
+            .unwrap();
+        tenants.sort();
+
+        let mut expected = vec![
+            TeamSlug::new(team_a).as_str().to_string(),
+            TeamSlug::new(team_b).as_str().to_string(),
+        ];
+        expected.sort();
+
+        assert_eq!(tenants, expected);
+        assert!(
+            !tenants.contains(&TeamSlug::new(team_c).as_str().to_string()),
+            "revoked team must not be reported"
+        );
     }
 
     #[tokio::test]

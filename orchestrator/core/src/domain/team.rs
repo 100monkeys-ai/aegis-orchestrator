@@ -698,6 +698,20 @@ pub trait MembershipRepository: Send + Sync {
     async fn find_active_for_user(&self, user_id: &str)
         -> Result<Vec<Membership>, RepositoryError>;
 
+    /// Return the `t-{uuid}` tenant slugs of every team the user is currently
+    /// an **active** member of. Used to populate the `team_memberships` JWT
+    /// claim — the upstream MCP middleware reads this list to authorize
+    /// tenant-scoped tool calls (a missing entry causes a fail-closed 403).
+    ///
+    /// Implementations SHOULD push this down to the database (JOIN
+    /// `team_memberships` against `teams` and project the slug column) rather
+    /// than fan out via `find_by_id` per row, but the default contract only
+    /// requires that the returned slugs match the active memberships.
+    async fn find_active_team_tenants_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, RepositoryError>;
+
     /// Authorization primitive for team-context `X-Tenant-Id` switching.
     /// Returns `true` iff the user currently has an Active membership on the
     /// given team.
