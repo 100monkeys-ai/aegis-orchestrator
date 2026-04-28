@@ -55,14 +55,25 @@ pub struct TenantMiddlewareState {
 
 /// Derive the base [`TenantId`] from a [`UserIdentity`] — the JWT-default
 /// branch of the resolution order.
+///
+/// Back-compat shim: the strict implementation lives in
+/// [`crate::domain::iam::derive_tenant_id_strict`] which returns
+/// `Result<TenantId, IamError>`. This wrapper fails closed onto
+/// `TenantId::system()` instead of the historic
+/// `unwrap_or_else(|_| TenantId::consumer())` footgun (ADR-097): a
+/// `TenantUser` with a malformed `tenant_slug` is an authentication
+/// failure, not a silent downgrade into the shared consumer tenant.
 pub fn derive_tenant_id(identity: &UserIdentity) -> TenantId {
-    match &identity.identity_kind {
-        IdentityKind::ConsumerUser { tenant_id, .. } => tenant_id.clone(),
-        IdentityKind::TenantUser { tenant_slug } => {
-            TenantId::from_realm_slug(tenant_slug.clone()).unwrap_or_else(|_| TenantId::consumer())
+    match crate::domain::iam::derive_tenant_id_strict(identity) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                sub = %identity.sub,
+                error = %e,
+                "tenant slug rejected; failing closed onto TenantId::system() (ADR-097)"
+            );
+            TenantId::system()
         }
-        IdentityKind::Operator { .. } => TenantId::system(),
-        IdentityKind::ServiceAccount { .. } => TenantId::system(),
     }
 }
 
@@ -172,7 +183,28 @@ pub async fn tenant_context_middleware(
 
     let method = request.method().clone();
 
-    let base_tenant = derive_tenant_id(&id);
+    // Use the strict derivation: a `TenantUser` carrying a malformed
+    // `tenant_slug` is an authentication failure, not a silent downgrade
+    // into `TenantId::consumer()` (ADR-097 footgun #5).
+    let base_tenant = match crate::domain::iam::derive_tenant_id_strict(&id) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                sub = %id.sub,
+                error = %e,
+                path = %path,
+                "rejecting request: tenant slug in token is invalid (ADR-097)"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "invalid_tenant_slug",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // 1. Operator cross-tenant override.
     if let Some(override_slug) = request.headers().get("x-aegis-tenant") {
@@ -413,6 +445,32 @@ mod tests {
             },
         };
         assert_eq!(derive_tenant_id(&id), TenantId::system());
+    }
+
+    // ── ADR-097 footgun #5 regression ─────────────────────────────────────
+    //
+    // A `TenantUser` with a malformed `tenant_slug` MUST NOT silently
+    // collapse onto `TenantId::consumer()`. The back-compat shim now
+    // fails closed onto `TenantId::system()` and the middleware itself
+    // rejects the JWT with 401.
+    #[test]
+    fn derive_tenant_user_with_invalid_slug_does_not_fall_back_to_consumer() {
+        let id = UserIdentity {
+            sub: "tu-bad".to_string(),
+            realm_slug: "tenant-Bad Slug!".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: "Bad Slug!".to_string(),
+            },
+        };
+        let tid = derive_tenant_id(&id);
+        assert_ne!(
+            tid,
+            TenantId::consumer(),
+            "ADR-097 footgun #5: malformed tenant_slug must not fall back to consumer"
+        );
+        assert_eq!(tid, TenantId::system(), "must fail closed onto system");
     }
 
     #[test]

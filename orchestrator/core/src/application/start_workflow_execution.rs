@@ -106,7 +106,22 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
         &self,
         request: StartWorkflowExecutionRequest,
     ) -> Result<StartedWorkflowExecution> {
-        let tenant_id = request.tenant_id.clone().unwrap_or_else(TenantId::consumer);
+        // ADR-097 footgun #4: refuse to silently fall back to
+        // `TenantId::consumer()` when the request omits a tenant. The
+        // caller must either supply a tenant explicitly (the
+        // authenticated path) or use `start_execution_for_tenant` with a
+        // deliberate `TenantId::system()` (system-initiated path —
+        // operator dashboards, internal cron, system agents). Silent
+        // fallback to consumer was leaking system executions into the
+        // shared consumer tenant.
+        let tenant_id = request.tenant_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "StartWorkflowExecutionRequest.tenant_id is required (ADR-097): \
+                 caller must supply an explicit tenant or invoke \
+                 start_execution_for_tenant directly with TenantId::system() \
+                 for system-initiated workflows"
+            )
+        })?;
         self.start_execution_for_tenant(&tenant_id, request, None)
             .await
     }
@@ -1266,5 +1281,52 @@ mod tests {
 
         assert_eq!(result.status, "running");
         assert_eq!(engine.calls().len(), 1);
+    }
+
+    // ── ADR-097 footgun #4 regression test ────────────────────────────────
+    //
+    // The default `start_execution(request)` trait method previously
+    // silently coerced a missing `tenant_id` to `TenantId::consumer()`.
+    // That was unsafe — system-initiated workflows ended up landing in
+    // the shared consumer tenant. The default impl now rejects when
+    // `request.tenant_id` is None; callers must either supply a tenant
+    // explicitly or invoke `start_execution_for_tenant` deliberately
+    // with `TenantId::system()` for system-initiated workflows.
+    #[tokio::test]
+    async fn start_execution_without_tenant_id_is_rejected() {
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingWorkflowEngine::new("ignored"));
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            Arc::new(InMemoryWorkflowExecutionRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: "anything".to_string(),
+                input: json!({}),
+                blackboard: None,
+                version: None,
+                tenant_id: None, // ← the footgun condition
+                security_context_name: None,
+                intent: None,
+            })
+            .await
+            .expect_err("missing tenant_id MUST be rejected (ADR-097)");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tenant_id is required"),
+            "expected ADR-097 rejection message, got: {msg}"
+        );
+        // Most importantly: the engine was not invoked — no workflow
+        // accidentally landed in the consumer tenant.
+        assert_eq!(
+            engine.calls().len(),
+            0,
+            "no workflow should be started when tenant_id is missing"
+        );
     }
 }

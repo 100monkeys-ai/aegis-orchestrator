@@ -328,7 +328,7 @@ impl InnerLoopService {
                     &ctx.conversation,
                     &tool_schemas,
                     ctx.user_identity.as_ref(),
-                    Some(&ctx.tenant_id),
+                    &ctx.tenant_id,
                 )
                 .await?;
 
@@ -600,7 +600,15 @@ impl InnerLoopService {
         conversation: &[ConversationMessage],
         tool_schemas: &[Value],
         user_identity: Option<&UserIdentity>,
-        tenant_id: Option<&TenantId>,
+        // ADR-097 footgun #8: the parent execution's tenant is REQUIRED
+        // here. Previously this was `Option<&TenantId>` and the body
+        // silently fell back to `TenantId::consumer()` when None — that
+        // routed every system-tier inner-loop's LLM rate-limit counter
+        // into the shared consumer bucket. The parent execution is
+        // always tenant-scoped (`InnerLoopContext::tenant_id`); if a
+        // caller has no tenant, that's an upstream bug and we want a
+        // type error rather than a silent footgun.
+        tenant_id: &TenantId,
     ) -> anyhow::Result<LlmOutput> {
         let chat_messages: Vec<ChatMessage> = conversation
             .iter()
@@ -678,20 +686,19 @@ impl InnerLoopService {
                         &fallback_identity
                     }
                 };
-                let effective_tenant_id = tenant_id.cloned().unwrap_or_else(TenantId::consumer);
                 let scope = if user_identity.is_some() {
                     RateLimitScope::User {
                         user_id: effective_identity.sub.clone(),
                     }
                 } else {
                     RateLimitScope::Tenant {
-                        tenant_id: effective_tenant_id.clone(),
+                        tenant_id: tenant_id.clone(),
                     }
                 };
                 let resource_type = RateLimitResourceType::LlmCall;
 
                 match resolver
-                    .resolve_policy(effective_identity, &effective_tenant_id, &resource_type)
+                    .resolve_policy(effective_identity, tenant_id, &resource_type)
                     .await
                 {
                     Ok(policy) => match enforcer.check_and_increment(&scope, &policy, 1).await {
@@ -802,15 +809,13 @@ impl InnerLoopService {
                                 &fallback_identity
                             }
                         };
-                        let effective_tenant_id =
-                            tenant_id.cloned().unwrap_or_else(TenantId::consumer);
                         let scope = if user_identity.is_some() {
                             RateLimitScope::User {
                                 user_id: effective_identity.sub.clone(),
                             }
                         } else {
                             RateLimitScope::Tenant {
-                                tenant_id: effective_tenant_id.clone(),
+                                tenant_id: tenant_id.clone(),
                             }
                         };
                         let resource_type = RateLimitResourceType::LlmToken;
@@ -818,11 +823,7 @@ impl InnerLoopService {
 
                         if token_cost > 0 {
                             match resolver
-                                .resolve_policy(
-                                    effective_identity,
-                                    &effective_tenant_id,
-                                    &resource_type,
-                                )
+                                .resolve_policy(effective_identity, tenant_id, &resource_type)
                                 .await
                             {
                                 Ok(policy) => {

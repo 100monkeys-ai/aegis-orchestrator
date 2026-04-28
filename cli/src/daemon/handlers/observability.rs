@@ -4,10 +4,13 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Json;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 
 use crate::daemon::cluster_helpers::cluster_status_view;
@@ -92,9 +95,40 @@ pub(crate) async fn list_storage_violations_handler(
     }))
 }
 
+/// Operator-only cross-tenant observability dashboard.
+///
+/// SCOPE (ADR-097 footgun #10): this handler intentionally aggregates data
+/// across ALL tenants — recent executions, workflow executions, swarms,
+/// stimuli, security incidents — by querying with `TenantId::system()`
+/// repository methods. The system-tenant query bypasses the per-tenant
+/// scoping applied to user-facing reads.
+///
+/// SECURITY: this MUST only be reachable by operators. We gate on the
+/// authenticated identity's `IdentityKind::Operator` discriminant; any
+/// other identity (consumer user, tenant user, service account) gets a
+/// 403. Tenant context middleware does not enforce this on its own — it
+/// only resolves the caller's home tenant; it doesn't restrict who can
+/// invoke a system-tenant query.
 pub(crate) async fn dashboard_summary_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<DashboardSummaryView> {
+    identity: Option<Extension<UserIdentity>>,
+) -> axum::response::Response {
+    // Operator gate.
+    let is_operator = matches!(
+        identity.as_ref().map(|e| &e.0.identity_kind),
+        Some(IdentityKind::Operator { .. })
+    );
+    if !is_operator {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "operator_required",
+                "message": "Dashboard summary aggregates data across all tenants and is restricted to operators (ADR-097)."
+            })),
+        )
+            .into_response();
+    }
+
     let cluster = cluster_status_view(&state).await;
     let swarms = state.swarm_service.list_swarms().await;
     let stimuli = state.operator_read_model.list_stimuli().await;
@@ -104,15 +138,21 @@ pub(crate) async fn dashboard_summary_handler(
         Ok(events) => events.len(),
         Err(_) => 0,
     };
+    // Use the system tenant explicitly: this is a deliberately
+    // cross-tenant aggregation for operator dashboards, NOT a fallback
+    // for a missing caller tenant. Per ADR-097 the only legitimate use
+    // of `TenantId::system()` is for system-initiated operations like
+    // this one.
+    let system_tenant = TenantId::system();
     let recent_execution_count = state
         .execution_repo
-        .find_recent_for_tenant(&TenantId::default(), 25)
+        .find_recent_for_tenant(&system_tenant, 25)
         .await
         .map(|items| items.len())
         .unwrap_or_default();
     let recent_workflow_execution_count = state
         .workflow_execution_repo
-        .list_paginated_for_tenant(&TenantId::default(), 25, 0)
+        .list_paginated_for_tenant(&system_tenant, 25, 0)
         .await
         .map(|items| items.len())
         .unwrap_or_default();
@@ -128,4 +168,5 @@ pub(crate) async fn dashboard_summary_handler(
         recent_execution_count,
         recent_workflow_execution_count,
     })
+    .into_response()
 }

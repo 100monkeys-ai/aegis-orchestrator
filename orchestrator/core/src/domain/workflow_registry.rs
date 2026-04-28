@@ -158,6 +158,25 @@ impl WorkflowRegistry {
         self.routes.len()
     }
 
+    /// Find every `(tenant_id, workflow_id)` pair that has registered the
+    /// given `source_name`.
+    ///
+    /// Used by the unauthenticated webhook ingestion path to discover the
+    /// owning tenant of an incoming stimulus without trusting caller-supplied
+    /// tenant headers. Tenant-scoped registrations are the source of truth
+    /// (ADR-097 / ADR-021): if exactly one tenant has registered a given
+    /// `source_name`, it owns the webhook; if multiple have, the webhook
+    /// route is ambiguous and MUST be rejected; if zero have, there is no
+    /// route and the request MUST be rejected.
+    pub fn find_routes_by_source(&self, source_name: &str) -> Vec<(TenantId, WorkflowId)> {
+        let needle = source_name.to_lowercase();
+        self.routes
+            .iter()
+            .filter(|((_, src), _)| src == &needle)
+            .map(|((tenant, _), wf)| (tenant.clone(), *wf))
+            .collect()
+    }
+
     /// Returns all registered source names for a tenant (sorted for deterministic output).
     pub fn registered_sources(&self, tenant_id: &TenantId) -> Vec<String> {
         let mut keys: Vec<String> = self

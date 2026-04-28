@@ -286,14 +286,60 @@ impl StandardIamService {
                     value: tier_value.to_string(),
                 })?;
 
-                // Extract per-user tenant_id from custom claim (ADR-097)
-                let tenant_id_str = claims
+                // Extract per-user tenant_id from custom claim (ADR-097).
+                //
+                // Per ADR-097 every consumer has a deterministic per-user tenant
+                // slug derived from the Keycloak `sub` claim. The claim is the
+                // canonical source; if Keycloak hasn't been configured to emit
+                // it (or emits a malformed value) we DO NOT silently fall back
+                // to the global `zaru-consumer` tenant — that would let one
+                // user's data accidentally land in another's tenant scope.
+                //
+                // Resolution order:
+                //   1. Use the explicit claim value when it parses as a TenantId.
+                //   2. Otherwise derive the canonical per-user slug from `sub`.
+                //   3. If derivation also fails (e.g. unusable `sub`), reject
+                //      the JWT.
+                let tenant_id = match claims
                     .extra
                     .get(&self.claims_config.tenant_id)
                     .and_then(|v| v.as_str())
-                    .unwrap_or("zaru-consumer");
-                let tenant_id = crate::domain::tenant::TenantId::from_string(tenant_id_str)
-                    .unwrap_or_else(|_| crate::domain::tenant::TenantId::consumer());
+                {
+                    Some(slug) => match crate::domain::tenant::TenantId::from_string(slug) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!(
+                                claim = %self.claims_config.tenant_id,
+                                claim_value = %slug,
+                                error = %e,
+                                sub = %claims.sub,
+                                "tenant_id claim malformed; deriving per-user tenant from `sub` (ADR-097)"
+                            );
+                            crate::domain::tenant::TenantId::for_consumer_user(&claims.sub)
+                                .map_err(|de| IamError::InvalidTenantSlug {
+                                    slug: slug.to_string(),
+                                    reason: format!(
+                                        "claim malformed ({e}); fallback derivation from sub also failed: {de}"
+                                    ),
+                                })?
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            claim = %self.claims_config.tenant_id,
+                            sub = %claims.sub,
+                            "tenant_id claim absent from token; deriving per-user tenant from `sub` (ADR-097)"
+                        );
+                        crate::domain::tenant::TenantId::for_consumer_user(&claims.sub).map_err(
+                            |e| IamError::InvalidTenantSlug {
+                                slug: String::new(),
+                                reason: format!(
+                                    "tenant_id claim absent and per-user derivation from sub failed: {e}"
+                                ),
+                            },
+                        )?
+                    }
+                };
 
                 Ok(IdentityKind::ConsumerUser {
                     zaru_tier: tier,
@@ -695,5 +741,117 @@ mod tests {
 
         let role = service.resolve_role(&token).unwrap();
         assert_eq!(role, AegisRole::Admin);
+    }
+
+    // ── ADR-097 footgun #1 regression tests ──────────────────────────────────
+    //
+    // The IAM service is the upstream root of tenant resolution. When a
+    // consumer JWT is missing the `tenant_id` claim, the per-user tenant
+    // MUST be derived from `sub` (`u-{sub_no_dashes}`) — never collapse
+    // onto the global `zaru-consumer` singleton.
+
+    fn make_test_service() -> StandardIamService {
+        let config = IamConfig {
+            realms: vec![],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        StandardIamService::new(&config, event_bus)
+    }
+
+    fn consumer_realm() -> IdentityRealm {
+        IdentityRealm {
+            realm_slug: "zaru-consumer".to_string(),
+            issuer_url: "https://auth.example.com/realms/zaru-consumer".to_string(),
+            jwks_uri: "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
+                .to_string(),
+            audience: "aegis-orchestrator".to_string(),
+            realm_kind: RealmKind::Consumer,
+        }
+    }
+
+    fn make_claims(sub: &str, extra: serde_json::Value) -> KeycloakClaims {
+        let extra_map: HashMap<String, serde_json::Value> = match extra {
+            serde_json::Value::Object(o) => o.into_iter().collect(),
+            _ => HashMap::new(),
+        };
+        KeycloakClaims {
+            sub: sub.to_string(),
+            iss: "https://auth.example.com/realms/zaru-consumer".to_string(),
+            aud: serde_json::json!("aegis-orchestrator"),
+            iat: 0,
+            exp: i64::MAX,
+            email: None,
+            azp: None,
+            extra: extra_map,
+        }
+    }
+
+    #[test]
+    fn consumer_jwt_without_tenant_claim_derives_per_user_tenant() {
+        let service = make_test_service();
+        let realm = consumer_realm();
+        let sub = "d7f8170035d349b6b237c391ccc19035";
+        let claims = make_claims(sub, serde_json::json!({ "zaru_tier": "free" }));
+
+        let kind = service.resolve_identity_kind(&claims, &realm).unwrap();
+        match kind {
+            IdentityKind::ConsumerUser { tenant_id, .. } => {
+                // Per ADR-097: u-{sub_no_dashes}
+                assert_eq!(tenant_id.as_str(), format!("u-{}", sub.replace('-', "")));
+                assert_ne!(
+                    tenant_id,
+                    crate::domain::tenant::TenantId::consumer(),
+                    "ADR-097 footgun #1: missing tenant_id claim must derive per-user, not collapse to consumer"
+                );
+            }
+            other => panic!("expected ConsumerUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consumer_jwt_with_malformed_tenant_claim_falls_back_to_per_user_derivation() {
+        let service = make_test_service();
+        let realm = consumer_realm();
+        let sub = "abc123";
+        let claims = make_claims(
+            sub,
+            serde_json::json!({
+                "zaru_tier": "free",
+                "tenant_id": "Bad Slug!", // invalid per RFC-1123 label rules
+            }),
+        );
+
+        let kind = service.resolve_identity_kind(&claims, &realm).unwrap();
+        match kind {
+            IdentityKind::ConsumerUser { tenant_id, .. } => {
+                assert_eq!(tenant_id.as_str(), "u-abc123");
+                assert_ne!(tenant_id, crate::domain::tenant::TenantId::consumer());
+            }
+            other => panic!("expected ConsumerUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consumer_jwt_with_valid_tenant_claim_uses_claim_value() {
+        let service = make_test_service();
+        let realm = consumer_realm();
+        let claims = make_claims(
+            "abc123",
+            serde_json::json!({
+                "zaru_tier": "free",
+                "tenant_id": "u-explicit",
+            }),
+        );
+
+        let kind = service.resolve_identity_kind(&claims, &realm).unwrap();
+        match kind {
+            IdentityKind::ConsumerUser { tenant_id, .. } => {
+                assert_eq!(tenant_id.as_str(), "u-explicit");
+            }
+            other => panic!("expected ConsumerUser, got {other:?}"),
+        }
     }
 }

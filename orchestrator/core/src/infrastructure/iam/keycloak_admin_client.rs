@@ -879,10 +879,39 @@ impl KeycloakAdminClient {
         role: &str,
         invite_token: &str,
     ) -> Result<String, KeycloakAdminError> {
+        // POLICY (ADR-097 footgun #9): Non-Enterprise team tiers (Pro,
+        // Business) reuse the shared `zaru-consumer` realm and rely on
+        // Keycloak group membership for tenant scoping; only Enterprise
+        // gets a dedicated `team-{slug}` realm.
+        //
+        // SECURITY IMPLICATIONS:
+        //   - Pro/Business team users authenticate against `zaru-consumer`,
+        //     so their JWTs carry the consumer realm's signing key. Tenant
+        //     isolation for these users is enforced at the application
+        //     layer via the `tenant_id` claim (ADR-097 per-user tenant
+        //     derivation) and the group attribute, NOT by realm boundary.
+        //   - A misconfigured group claim or a missing `tenant_id` claim
+        //     downgrades a team user into the global consumer tenant.
+        //     The IAM service is responsible for rejecting tokens whose
+        //     `tenant_id` claim is missing/malformed (ADR-097 footgun #1).
+        //   - Enterprise tenants get cryptographic isolation via realm
+        //     boundary; Pro/Business do not.
+        //
+        // This is operational policy, not a bug. If this trade-off becomes
+        // unacceptable, switch all tiers to dedicated realms (more
+        // Keycloak overhead, full isolation).
         let (realm, use_group) = match team_tier {
             TenantTier::Enterprise => (format!("team-{team_slug}"), false),
             _ => ("zaru-consumer".to_string(), true),
         };
+
+        tracing::info!(
+            team_tier = ?team_tier,
+            team_slug = %team_slug,
+            realm = %realm,
+            shared_realm = %use_group,
+            "inviting team user; non-Enterprise tiers share the zaru-consumer realm and rely on application-layer tenant isolation"
+        );
 
         // Reuse an existing user if one already exists with this email;
         // otherwise create a fresh invited user.

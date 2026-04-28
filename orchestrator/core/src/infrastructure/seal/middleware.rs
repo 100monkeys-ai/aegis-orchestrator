@@ -210,19 +210,21 @@ async fn check_rate_limit(
             serde_json::from_value::<ZaruTier>(serde_json::Value::String(t.to_string())).ok()
         })
         .unwrap_or(ZaruTier::Free);
+    // The session was attested by the SEAL handler with the resolved tenant
+    // (per ADR-097). Use it as the canonical source — never fabricate
+    // `TenantId::consumer()` as a fallback (that would route every consumer
+    // user's rate-limit counters into one shared bucket).
+    let tenant_id = session.tenant_id.clone();
     let identity = UserIdentity {
         sub: user_id.clone(),
-        realm_slug: "zaru-consumer".to_string(),
+        realm_slug: tenant_id.as_str().to_string(),
         email: None,
         name: None,
         identity_kind: IdentityKind::ConsumerUser {
             zaru_tier: tier,
-            tenant_id: crate::domain::tenant::TenantId::consumer(),
+            tenant_id: tenant_id.clone(),
         },
     };
-
-    // Use a default tenant for now; in production the session would carry the tenant.
-    let tenant_id = crate::domain::tenant::TenantId::consumer();
 
     let policy = resolver
         .resolve_policy(&identity, &tenant_id, &resource_type)

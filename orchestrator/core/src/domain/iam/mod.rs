@@ -27,7 +27,7 @@
 
 pub mod delegation;
 pub mod tenant_scope;
-pub use delegation::resolve_effective_tenant;
+pub use delegation::{derive_tenant_id_strict, resolve_effective_tenant};
 pub use tenant_scope::TenantScope;
 
 use crate::domain::tenant::TenantId;
@@ -318,6 +318,13 @@ pub enum IamError {
 
     #[error("Invalid claim value for {claim}: {value}")]
     InvalidClaimValue { claim: String, value: String },
+
+    /// The token's tenant slug claim is malformed, empty, or otherwise
+    /// unparseable as a `TenantId`. Authentication MUST be rejected — it is
+    /// never safe to silently fall back to a default tenant, because the
+    /// caller's effective tenant is unknown.
+    #[error("Invalid tenant slug '{slug}' in token: {reason}")]
+    InvalidTenantSlug { slug: String, reason: String },
 
     #[error("JWT decode error: {0}")]
     DecodeError(String),

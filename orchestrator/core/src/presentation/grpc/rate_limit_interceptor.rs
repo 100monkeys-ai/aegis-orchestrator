@@ -92,7 +92,14 @@ pub async fn check_rate_limit(
         None => return Ok(allow_all_decision()),
     };
 
-    let tenant_id = tenant_id_from_identity(identity);
+    let tenant_id = tenant_id_from_identity(identity).map_err(|e| {
+        warn!(
+            user = %identity.sub,
+            error = %e,
+            "rejecting request: tenant slug in token is invalid (ADR-097)"
+        );
+        Status::unauthenticated(format!("invalid tenant slug in token: {e}"))
+    })?;
     let resource_type = RateLimitResourceType::AgentExecution; // aggregate API limit
 
     // Resolve effective policy (tier default < tenant override < user override).
@@ -163,13 +170,20 @@ pub async fn check_rate_limit(
 // ---------------------------------------------------------------------------
 
 /// Derive a [`TenantId`] from the user's identity.
-fn tenant_id_from_identity(identity: &UserIdentity) -> TenantId {
+///
+/// Returns `Err` when the identity carries a malformed `tenant_slug`. The
+/// caller MUST translate the error into an unauthenticated status — silently
+/// collapsing onto `TenantId::consumer()` would route every malformed-slug
+/// request into the shared consumer rate-limit bucket (ADR-097 footgun #7).
+fn tenant_id_from_identity(
+    identity: &UserIdentity,
+) -> Result<TenantId, crate::domain::shared_kernel::TenantIdError> {
     match &identity.identity_kind {
-        IdentityKind::TenantUser { tenant_slug } => {
-            TenantId::new(format!("tenant-{tenant_slug}")).unwrap_or_else(|_| TenantId::consumer())
+        IdentityKind::TenantUser { tenant_slug } => TenantId::new(format!("tenant-{tenant_slug}")),
+        IdentityKind::ConsumerUser { tenant_id, .. } => Ok(tenant_id.clone()),
+        IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => {
+            Ok(TenantId::system())
         }
-        IdentityKind::ConsumerUser { tenant_id, .. } => tenant_id.clone(),
-        IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => TenantId::system(),
     }
 }
 
@@ -218,7 +232,10 @@ mod tests {
                 tenant_id: TenantId::consumer(),
             },
         };
-        assert_eq!(tenant_id_from_identity(&identity), TenantId::consumer());
+        assert_eq!(
+            tenant_id_from_identity(&identity).unwrap(),
+            TenantId::consumer()
+        );
     }
 
     #[test]
@@ -232,7 +249,10 @@ mod tests {
                 aegis_role: crate::domain::iam::AegisRole::Admin,
             },
         };
-        assert_eq!(tenant_id_from_identity(&identity), TenantId::system());
+        assert_eq!(
+            tenant_id_from_identity(&identity).unwrap(),
+            TenantId::system()
+        );
     }
 
     #[test]
@@ -246,8 +266,31 @@ mod tests {
                 tenant_slug: "acme".into(),
             },
         };
-        let tid = tenant_id_from_identity(&identity);
+        let tid = tenant_id_from_identity(&identity).unwrap();
         assert_eq!(tid.as_str(), "tenant-acme");
+    }
+
+    // ── ADR-097 footgun #7 regression ────────────────────────────────────
+    //
+    // A `TenantUser` with a malformed `tenant_slug` MUST be rejected
+    // outright. The previous implementation returned
+    // `TenantId::consumer()` and silently degraded the rate-limit scope.
+    #[test]
+    fn tenant_id_for_invalid_tenant_user_slug_returns_err() {
+        let identity = UserIdentity {
+            sub: "tu-bad".into(),
+            realm_slug: "tenant-Bad Slug!".into(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: "Bad Slug!".into(),
+            },
+        };
+        let result = tenant_id_from_identity(&identity);
+        assert!(
+            result.is_err(),
+            "ADR-097 footgun #7: malformed tenant_slug must return Err, got {result:?}"
+        );
     }
 
     #[test]

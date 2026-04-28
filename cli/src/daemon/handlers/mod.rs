@@ -71,7 +71,28 @@ pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> Tenant
         }
         Some(identity) => match &identity.identity_kind {
             IdentityKind::TenantUser { tenant_slug } => {
-                TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
+                // ADR-097 footgun #11 (Phase 3 finding): a malformed
+                // `tenant_slug` MUST NOT silently collapse onto
+                // `TenantId::consumer()` — that would route a tenant
+                // user's HTTP requests into the shared consumer tenant.
+                // Fail closed onto `TenantId::system()` (no application
+                // rights) and emit a structured warning. The
+                // tenant_context middleware rejects malformed slugs
+                // upstream with 401, but this helper is reached by code
+                // paths that bypass the middleware (e.g. tests, exempt
+                // paths) so it must also be safe.
+                match TenantId::from_realm_slug(tenant_slug) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            sub = %identity.sub,
+                            tenant_slug = %tenant_slug,
+                            error = %e,
+                            "tenant_slug rejected; failing closed onto TenantId::system() (ADR-097)"
+                        );
+                        TenantId::system()
+                    }
+                }
             }
             IdentityKind::Operator { .. } => TenantId::system(),
             IdentityKind::ServiceAccount { .. } => TenantId::system(),

@@ -72,6 +72,28 @@ pub enum StimulusError {
 
     #[error("workflow execution failed: {0}")]
     WorkflowError(#[from] anyhow::Error),
+
+    /// No tenant has registered a route for this webhook source.
+    ///
+    /// Webhooks are unauthenticated; the only way to discover the owning
+    /// tenant is via the per-tenant `(TenantId, source_name)` registration
+    /// table. If no registration matches the request MUST be rejected — the
+    /// system never falls back to the global consumer tenant (ADR-097).
+    #[error("no tenant has registered a route for webhook source '{source_name}'")]
+    UnregisteredWebhookSource { source_name: String },
+
+    /// Multiple tenants have registered the same webhook source name and
+    /// the webhook URL alone cannot disambiguate them. The operator must
+    /// either deduplicate the registrations or migrate to a tenant-scoped
+    /// webhook URL (e.g. `/v1/webhooks/{tenant}/{source}`).
+    #[error(
+        "webhook source '{source_name}' is registered by {tenant_count} tenants; \
+         route is ambiguous"
+    )]
+    AmbiguousWebhookRoute {
+        source_name: String,
+        tenant_count: usize,
+    },
 }
 
 impl StimulusError {
@@ -85,6 +107,13 @@ impl StimulusError {
             | StimulusError::RouterAgentFailed(_) => 422,
             StimulusError::IdempotentDuplicate { .. } => 409,
             StimulusError::WorkflowError(_) => 500,
+            // No registered route for an unauthenticated webhook → 404.
+            // The request reached us, signature was valid, but no tenant
+            // owns the source — looks like the resource doesn't exist.
+            StimulusError::UnregisteredWebhookSource { .. } => 404,
+            // Ambiguous registration → 409 Conflict (operator must
+            // disambiguate by deduplicating registrations).
+            StimulusError::AmbiguousWebhookRoute { .. } => 409,
         }
     }
 
@@ -98,6 +127,8 @@ impl StimulusError {
             StimulusError::ClassificationParseError(_) => "classification_parse_error",
             StimulusError::UnknownWorkflow { .. } => "unknown_workflow",
             StimulusError::WorkflowError(_) => "workflow_error",
+            StimulusError::UnregisteredWebhookSource { .. } => "unregistered_webhook_source",
+            StimulusError::AmbiguousWebhookRoute { .. } => "ambiguous_webhook_route",
         }
     }
 }
@@ -180,13 +211,71 @@ pub struct StandardStimulusService {
 }
 
 impl StandardStimulusService {
-    fn tenant_id_for_stimulus(stimulus: &Stimulus) -> TenantId {
-        stimulus
-            .headers
-            .get("x-aegis-tenant")
-            .or_else(|| stimulus.headers.get("x-tenant-id"))
-            .and_then(|value| TenantId::from_string(value).ok())
-            .unwrap_or_else(TenantId::consumer)
+    /// Resolve the owning tenant of an incoming stimulus.
+    ///
+    /// Per ADR-097 / ADR-021 the stimulus tenant is derived from one of two
+    /// trusted sources, in order:
+    ///
+    /// 1. The authenticated caller's identity (`/v1/stimuli` path — the JWT
+    ///    is the source of truth).
+    /// 2. The webhook's per-tenant registration in [`WorkflowRegistry`]
+    ///    (`/v1/webhooks/{source}` path — the request is HMAC-verified but
+    ///    unauthenticated, so the tenant comes from the registration table,
+    ///    NOT from caller-supplied headers).
+    ///
+    /// Caller-supplied tenant headers (`x-aegis-tenant`, `x-tenant-id`) are
+    /// **never** trusted on the unauthenticated webhook path. Trusting them
+    /// would allow an external system to spoof any tenant.
+    ///
+    /// # Errors
+    ///
+    /// - [`StimulusError::UnregisteredWebhookSource`] — webhook with no
+    ///   matching registration (404).
+    /// - [`StimulusError::AmbiguousWebhookRoute`] — webhook source registered
+    ///   by multiple tenants and the URL alone cannot disambiguate them
+    ///   (409). The operator must deduplicate registrations or migrate to a
+    ///   tenant-scoped URL.
+    async fn resolve_stimulus_tenant(
+        &self,
+        stimulus: &Stimulus,
+        identity: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<TenantId, StimulusError> {
+        use crate::domain::stimulus::StimulusSource;
+
+        // Authenticated path: trust the JWT-derived identity.
+        if let Some(id) = identity {
+            return Ok(
+                crate::domain::iam::derive_tenant_id_strict(id).map_err(|e| {
+                    StimulusError::WorkflowError(anyhow::anyhow!(
+                        "failed to derive tenant from authenticated stimulus identity: {e}"
+                    ))
+                })?,
+            );
+        }
+
+        // Unauthenticated webhook path: derive tenant from the registration
+        // table. There is no other trustworthy source — caller-supplied
+        // headers MUST NOT be used.
+        match &stimulus.source {
+            StimulusSource::Webhook { source_name } => {
+                let registry = self.registry.read().await;
+                let routes = registry.find_routes_by_source(source_name);
+                match routes.len() {
+                    0 => Err(StimulusError::UnregisteredWebhookSource {
+                        source_name: source_name.clone(),
+                    }),
+                    1 => Ok(routes.into_iter().next().expect("len == 1").0),
+                    n => Err(StimulusError::AmbiguousWebhookRoute {
+                        source_name: source_name.clone(),
+                        tenant_count: n,
+                    }),
+                }
+            }
+            // Other unauthenticated sources (e.g. internal sensors / cron
+            // dispatch) are explicitly system-initiated. There is no caller
+            // tenant to derive — the stimulus belongs to the system.
+            _ => Ok(TenantId::system()),
+        }
     }
 
     pub fn new(
@@ -335,7 +424,7 @@ impl StandardStimulusService {
             intent: None,
             input: json!({
                 "stimulus": stimulus.content,
-                "tenant_id": Self::tenant_id_for_stimulus(stimulus).to_string(),
+                "tenant_id": tenant_id.to_string(),
             }),
             workspace_volume_id: None,
             workspace_volume_mount_path: None,
@@ -473,7 +562,35 @@ impl StimulusService for StandardStimulusService {
             });
 
         // ── 3. Route the stimulus ─────────────────────────────────────────────
-        let stimulus_tenant_id = Self::tenant_id_for_stimulus(&stimulus);
+        //
+        // ADR-097 footgun #3: tenant resolution is fail-closed. The
+        // authenticated path uses the JWT identity; the webhook path
+        // looks the source up in the tenant-scoped registration table
+        // and rejects on miss/ambiguity. Caller-supplied tenant headers
+        // are NEVER trusted.
+        let stimulus_tenant_id = match self
+            .resolve_stimulus_tenant(&stimulus, identity.as_ref())
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let reason = match &e {
+                    StimulusError::UnregisteredWebhookSource { .. } => {
+                        "unregistered_webhook_source"
+                    }
+                    StimulusError::AmbiguousWebhookRoute { .. } => "ambiguous_webhook_route",
+                    _ => "tenant_resolution_failed",
+                };
+                metrics::counter!("aegis_stimuli_rejected_total", "reason" => reason).increment(1);
+                self.event_bus
+                    .publish_stimulus_event(StimulusEvent::StimulusRejected {
+                        stimulus_id: stimulus.id,
+                        reason: e.to_string(),
+                        rejected_at: Utc::now(),
+                    });
+                return Err(e);
+            }
+        };
         let decision = match self.route(&stimulus, &stimulus_tenant_id).await {
             Ok(d) => d,
             Err(StimulusError::LowConfidence {
@@ -505,6 +622,11 @@ impl StimulusService for StandardStimulusService {
                     // Already handled above, but be exhaustive
                     StimulusError::LowConfidence { .. } => "low_confidence",
                     StimulusError::IdempotentDuplicate { .. } => "idempotent_duplicate",
+                    // Resolved before reaching this match; listed for exhaustiveness.
+                    StimulusError::UnregisteredWebhookSource { .. } => {
+                        "unregistered_webhook_source"
+                    }
+                    StimulusError::AmbiguousWebhookRoute { .. } => "ambiguous_webhook_route",
                 };
                 metrics::counter!("aegis_stimuli_rejected_total", "reason" => reason).increment(1);
                 self.event_bus
@@ -528,7 +650,7 @@ impl StimulusService for StandardStimulusService {
             }),
             blackboard: None,
             version: None,
-            tenant_id: Some(Self::tenant_id_for_stimulus(&stimulus)),
+            tenant_id: Some(stimulus_tenant_id.clone()),
             // Stimulus-triggered workflows inherit the security context from the
             // route's bound context once ADR-083 Phase 2 lands.
             security_context_name: None,
@@ -1153,5 +1275,126 @@ mod tests {
         assert_eq!(identities.len(), 1);
         let forwarded = identities[0].as_ref().expect("identity must be forwarded");
         assert_eq!(forwarded.sub, "user-sub-abc123");
+    }
+
+    // ── ADR-097 footgun #3 regression tests ──────────────────────────────
+    //
+    // Webhooks are unauthenticated and MUST NOT trust caller-supplied
+    // tenant headers. The owning tenant is derived exclusively from the
+    // tenant-scoped registration table:
+    //   * 0 registrations  → reject (404 / UnregisteredWebhookSource)
+    //   * 1 registration   → use that tenant
+    //   * 2+ registrations → reject (409 / AmbiguousWebhookRoute)
+
+    #[tokio::test]
+    async fn unauthenticated_webhook_with_no_registration_is_rejected() {
+        let registry = WorkflowRegistry::new(None);
+        let execution_service = Arc::new(RecordingExecutionService::default());
+        let starter = Arc::new(RecordingStartWorkflowUseCase::new("unused"));
+        let event_bus = EventBus::new(8);
+        let service = build_service(registry, execution_service, starter, event_bus);
+
+        let stimulus = make_stimulus("ghost-source", "{}");
+        let err = service
+            .ingest(stimulus, None)
+            .await
+            .expect_err("must reject webhook with no registration");
+        assert!(
+            matches!(err, StimulusError::UnregisteredWebhookSource { .. }),
+            "expected UnregisteredWebhookSource, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_webhook_ignores_caller_supplied_tenant_header() {
+        // The webhook header `x-aegis-tenant` MUST be ignored. Even if
+        // the caller injects a header pointing at a real tenant, the
+        // ingest path must look up the registration; if there is no
+        // registration for the source the webhook is rejected.
+        let other_tenant = TenantId::from_realm_slug("other-tenant").unwrap();
+        let mut registry = WorkflowRegistry::new(None);
+        registry
+            .register_route(&other_tenant, "different-source", make_workflow_id())
+            .unwrap();
+
+        let execution_service = Arc::new(RecordingExecutionService::default());
+        let starter = Arc::new(RecordingStartWorkflowUseCase::new("unused"));
+        let event_bus = EventBus::new(8);
+        let service = build_service(registry, execution_service, starter, event_bus);
+
+        let stimulus = make_stimulus("api", "{}").with_headers(std::collections::HashMap::from([
+            ("x-aegis-tenant".to_string(), "other-tenant".to_string()),
+            ("x-tenant-id".to_string(), "other-tenant".to_string()),
+        ]));
+        let err = service
+            .ingest(stimulus, None)
+            .await
+            .expect_err("must reject — header MUST NOT be trusted");
+        assert!(
+            matches!(err, StimulusError::UnregisteredWebhookSource { .. }),
+            "expected UnregisteredWebhookSource (header ignored), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_webhook_with_ambiguous_registration_is_rejected() {
+        let tenant_a = TenantId::from_realm_slug("tenant-a").unwrap();
+        let tenant_b = TenantId::from_realm_slug("tenant-b").unwrap();
+        let mut registry = WorkflowRegistry::new(None);
+        registry
+            .register_route(&tenant_a, "shared-source", make_workflow_id())
+            .unwrap();
+        registry
+            .register_route(&tenant_b, "shared-source", make_workflow_id())
+            .unwrap();
+
+        let execution_service = Arc::new(RecordingExecutionService::default());
+        let starter = Arc::new(RecordingStartWorkflowUseCase::new("unused"));
+        let event_bus = EventBus::new(8);
+        let service = build_service(registry, execution_service, starter, event_bus);
+
+        let stimulus = make_stimulus("shared-source", "{}");
+        let err = service
+            .ingest(stimulus, None)
+            .await
+            .expect_err("must reject ambiguous webhook");
+        assert!(
+            matches!(
+                err,
+                StimulusError::AmbiguousWebhookRoute {
+                    tenant_count: 2,
+                    ..
+                }
+            ),
+            "expected AmbiguousWebhookRoute(2), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_webhook_with_unique_registration_uses_that_tenant() {
+        let owning_tenant = TenantId::from_realm_slug("u-abc123").unwrap();
+        let workflow_id = make_workflow_id();
+        let mut registry = WorkflowRegistry::new(None);
+        registry
+            .register_route(&owning_tenant, "stripe-events", workflow_id)
+            .unwrap();
+
+        let execution_service = Arc::new(RecordingExecutionService::default());
+        let starter = Arc::new(RecordingStartWorkflowUseCase::new("wf-id"));
+        let event_bus = EventBus::new(8);
+        let service = build_service(registry, execution_service, starter.clone(), event_bus);
+
+        let stimulus = make_stimulus("stripe-events", "{}");
+        let _resp = service.ingest(stimulus, None).await.unwrap();
+
+        let calls = starter.calls();
+        assert_eq!(calls.len(), 1);
+        // Workflow request must carry the registration's tenant, NEVER consumer.
+        let req_tenant = calls[0]
+            .tenant_id
+            .as_ref()
+            .expect("tenant must be set on workflow request");
+        assert_eq!(req_tenant, &owning_tenant);
+        assert_ne!(req_tenant, &TenantId::consumer());
     }
 }
