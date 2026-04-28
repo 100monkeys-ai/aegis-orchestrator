@@ -37,6 +37,38 @@ pub(crate) struct CreateApiKeyRequest {
 
 // ── Private helpers ──────────────────────────────────────────────────────────
 
+/// Project a `UserIdentity` onto the (`aegis_role`, `zaru_tier`) column
+/// values stored on `api_keys`.
+///
+/// The schema contract — established by the seal-side reader
+/// `identity_from_api_key`, which parses the column back through
+/// `AegisRole::from_claim` / `ZaruTier::from_claim` — is that both columns
+/// hold the **bare claim string**:
+///
+/// | Identity                          | `aegis_role`        | `zaru_tier` |
+/// | --------------------------------- | ------------------- | ----------- |
+/// | `Operator { aegis_role }`         | `aegis:admin`/…     | `None`      |
+/// | `ConsumerUser { zaru_tier, .. }`  | `None`              | `free`/`pro`/… |
+/// | other                             | `None`              | `None`      |
+///
+/// **Anti-pattern (the bug this helper exists to prevent):** storing
+/// `zaru_tier.to_security_context_name()` (`"zaru-free"`/`"zaru-pro"`/…)
+/// in the column. That value cannot be parsed by `ZaruTier::from_claim`
+/// on read-back and silently degrades to the default `ZaruTier::Free`,
+/// then gets a second `zaru-` prefix downstream → `"zaru-zaru-free"`
+/// SecurityContext lookup → 401.
+fn identity_claim_columns(identity: &UserIdentity) -> (Option<String>, Option<String>) {
+    match &identity.identity_kind {
+        IdentityKind::Operator { aegis_role } => {
+            (Some(aegis_role.as_claim_str().to_string()), None)
+        }
+        IdentityKind::ConsumerUser { zaru_tier, .. } => {
+            (None, Some(zaru_tier.to_claim_str().to_string()))
+        }
+        _ => (None, None),
+    }
+}
+
 /// Generate a new API key: `aegis_` prefix + 40 random alphanumeric chars.
 fn generate_api_key() -> String {
     let mut rng = rand::rng();
@@ -147,15 +179,7 @@ pub(crate) async fn create_api_key_handler(
     // Capture identity context at creation time so the validate endpoint
     // can return it without hitting the IAM provider.
     let tenant_id = resolve_effective_tenant(Some(&identity), None);
-    let (aegis_role, zaru_tier) = match &identity.identity_kind {
-        IdentityKind::Operator { aegis_role } => {
-            (Some(aegis_role.as_claim_str().to_string()), None)
-        }
-        IdentityKind::ConsumerUser { zaru_tier, .. } => {
-            (None, Some(zaru_tier.to_security_context_name().to_string()))
-        }
-        _ => (None, None),
-    };
+    let (aegis_role, zaru_tier) = identity_claim_columns(&identity);
 
     let row = CreateApiKeyRow {
         id: Uuid::new_v4(),
@@ -291,5 +315,128 @@ pub(crate) async fn validate_api_key_handler(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity, ZaruTier};
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+
+    fn consumer(sub: &str, tier: ZaruTier) -> UserIdentity {
+        UserIdentity {
+            sub: sub.to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: tier,
+                tenant_id: TenantId::for_consumer_user(sub).unwrap(),
+            },
+        }
+    }
+
+    fn operator(role: AegisRole) -> UserIdentity {
+        UserIdentity {
+            sub: "op-1".to_string(),
+            realm_slug: "aegis-system".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::Operator { aegis_role: role },
+        }
+    }
+
+    /// Regression: pre-fix, `create_api_key_handler` stored
+    /// `zaru_tier.to_security_context_name()` (e.g. `"zaru-pro"`) into the
+    /// `api_keys.zaru_tier` column. The seal-side reader
+    /// `identity_from_api_key` parses that column through
+    /// `ZaruTier::from_claim`, which accepts only bare claims
+    /// (`"free"`/`"pro"`/…). The bare-claim mismatch silently fell back to
+    /// `ZaruTier::Free`, then a downstream synthesizer prefixed `zaru-`
+    /// again → `"zaru-zaru-free"` → "Security context not found" → 401.
+    ///
+    /// This test pins the schema contract: `identity_claim_columns` must
+    /// emit values that `ZaruTier::from_claim` (and `AegisRole::from_claim`)
+    /// can round-trip — never the security-context-name encoding.
+    #[test]
+    fn consumer_user_zaru_tier_column_is_bare_claim_not_security_context_name() {
+        for tier in [
+            ZaruTier::Free,
+            ZaruTier::Pro,
+            ZaruTier::Business,
+            ZaruTier::Enterprise,
+        ] {
+            let identity = consumer("user-alpha", tier.clone());
+            let (aegis_role, zaru_tier_col) = identity_claim_columns(&identity);
+
+            assert_eq!(
+                aegis_role, None,
+                "consumer user must not populate aegis_role"
+            );
+            let zaru_tier_col = zaru_tier_col.expect("consumer user must populate zaru_tier");
+
+            // The exact bug: column must NOT hold the SecurityContext name.
+            assert!(
+                !zaru_tier_col.starts_with("zaru-"),
+                "zaru_tier column must hold the bare claim, got {zaru_tier_col:?} \
+                 (this is the security-context-name; storing it here makes \
+                  identity_from_api_key fall back to ZaruTier::Free and \
+                  synthesize a malformed `zaru-zaru-*` SecurityContext)"
+            );
+
+            // Round-trip through the seal-side reader's parser.
+            let parsed = ZaruTier::from_claim(&zaru_tier_col).unwrap_or_else(|| {
+                panic!(
+                    "ZaruTier::from_claim({zaru_tier_col:?}) returned None — \
+                     write/read encodings have drifted"
+                )
+            });
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    /// Operator branch was already correct (`as_claim_str`), but pin it
+    /// to the same round-trip contract so a future refactor can't regress
+    /// it the way the consumer branch was regressed.
+    #[test]
+    fn operator_aegis_role_column_round_trips_through_from_claim() {
+        for role in [AegisRole::Admin, AegisRole::Operator, AegisRole::Readonly] {
+            let identity = operator(role.clone());
+            let (aegis_role_col, zaru_tier) = identity_claim_columns(&identity);
+
+            assert_eq!(zaru_tier, None, "operator must not populate zaru_tier");
+            let aegis_role_col = aegis_role_col.expect("operator must populate aegis_role");
+
+            let parsed = AegisRole::from_claim(&aegis_role_col).unwrap_or_else(|| {
+                panic!("AegisRole::from_claim({aegis_role_col:?}) returned None")
+            });
+            assert_eq!(parsed, role);
+        }
+    }
+
+    #[test]
+    fn service_account_and_tenant_user_populate_neither_column() {
+        let svc = UserIdentity {
+            sub: "svc-1".to_string(),
+            realm_slug: "aegis-system".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::ServiceAccount {
+                client_id: "aegis-sdk".to_string(),
+            },
+        };
+        assert_eq!(identity_claim_columns(&svc), (None, None));
+
+        let tenant_user = UserIdentity {
+            sub: "tu-1".to_string(),
+            realm_slug: "tenant-acme".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: "acme".to_string(),
+            },
+        };
+        assert_eq!(identity_claim_columns(&tenant_user), (None, None));
     }
 }

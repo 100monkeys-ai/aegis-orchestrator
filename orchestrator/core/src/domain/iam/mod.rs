@@ -205,6 +205,23 @@ impl ZaruTier {
             _ => None,
         }
     }
+
+    /// Convert to the canonical bare claim string (`"free"`, `"pro"`, …).
+    ///
+    /// This is the inverse of [`ZaruTier::from_claim`] and is the value that
+    /// must be persisted in the `api_keys.zaru_tier` column so that
+    /// `identity_from_api_key` can round-trip it back into a `ZaruTier`.
+    /// Do **NOT** use [`ZaruTier::to_security_context_name`] for column
+    /// storage — that returns the `zaru-`-prefixed SEAL SecurityContext name
+    /// and will fail to parse on read-back.
+    pub fn to_claim_str(&self) -> &'static str {
+        match self {
+            ZaruTier::Free => "free",
+            ZaruTier::Pro => "pro",
+            ZaruTier::Business => "business",
+            ZaruTier::Enterprise => "enterprise",
+        }
+    }
 }
 
 /// Role for operators authenticated via the aegis-system realm.
@@ -420,6 +437,56 @@ mod tests {
             Some(AegisRole::Readonly)
         );
         assert_eq!(AegisRole::from_claim("unknown"), None);
+    }
+
+    /// Regression for: `create_api_key_handler` was storing
+    /// `zaru_tier.to_security_context_name()` (e.g. `"zaru-pro"`) in the
+    /// `api_keys.zaru_tier` column, but `identity_from_api_key` reads it
+    /// back through `ZaruTier::from_claim`, which expects the bare claim
+    /// (`"pro"`). The mismatch silently degraded every consumer API key to
+    /// `ZaruTier::Free` and produced a malformed `"zaru-zaru-free"`
+    /// SecurityContext lookup → 401. This test pins the bare-claim contract.
+    #[test]
+    fn zaru_tier_to_claim_str_roundtrips_via_from_claim() {
+        for tier in [
+            ZaruTier::Free,
+            ZaruTier::Pro,
+            ZaruTier::Business,
+            ZaruTier::Enterprise,
+        ] {
+            let claim_str = tier.to_claim_str();
+            // Bare claim, no `zaru-` prefix — that prefix is the
+            // SecurityContext name, not the column value.
+            assert!(
+                !claim_str.starts_with("zaru-"),
+                "to_claim_str must return the bare claim (got {claim_str:?})"
+            );
+            let parsed = ZaruTier::from_claim(claim_str).unwrap_or_else(|| {
+                panic!("from_claim({claim_str:?}) must round-trip but returned None")
+            });
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    /// Regression: confirm `to_security_context_name` is NOT a valid input
+    /// to `from_claim`. If this ever starts succeeding, the two encodings
+    /// have collapsed into one and the api_keys column-write contract
+    /// needs to be re-examined.
+    #[test]
+    fn zaru_tier_security_context_name_is_not_a_claim() {
+        for tier in [
+            ZaruTier::Free,
+            ZaruTier::Pro,
+            ZaruTier::Business,
+            ZaruTier::Enterprise,
+        ] {
+            let ctx_name = tier.to_security_context_name();
+            assert_eq!(
+                ZaruTier::from_claim(ctx_name),
+                None,
+                "from_claim({ctx_name:?}) must return None — that is the SecurityContext name, not a claim"
+            );
+        }
     }
 
     #[test]
