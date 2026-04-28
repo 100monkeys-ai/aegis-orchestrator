@@ -1047,6 +1047,13 @@ mod tests {
 
     #[tokio::test]
     async fn no_router_configured_returns_error_and_publishes_classification_failed() {
+        // Post-b2a614a: the webhook (unauthenticated) path now resolves the
+        // tenant from the registration table BEFORE invoking the router.
+        // To exercise `NoRouterConfigured`, supply an authenticated identity
+        // so `resolve_stimulus_tenant` takes the JWT-derived branch and the
+        // request reaches the router stage even with no registered route.
+        use crate::domain::iam::{IdentityKind, UserIdentity};
+
         let execution_service = Arc::new(RecordingExecutionService::default());
         let starter = Arc::new(RecordingStartWorkflowUseCase::new("wf-exec-123"));
         let event_bus = EventBus::new(8);
@@ -1058,8 +1065,21 @@ mod tests {
             event_bus,
         );
 
+        let identity = UserIdentity {
+            sub: "svc-no-router".to_string(),
+            realm_slug: "tenant-no-router".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: "tenant-no-router".to_string(),
+            },
+        };
+
         let stimulus = make_stimulus("github", "payload");
-        let error = service.ingest(stimulus.clone(), None).await.unwrap_err();
+        let error = service
+            .ingest(stimulus.clone(), Some(identity))
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1080,7 +1100,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn low_confidence_router_result_rejects_and_uses_tenant_header() {
+    async fn low_confidence_router_result_rejects_and_uses_authenticated_tenant() {
+        // Post-b2a614a: the caller-supplied `x-aegis-tenant` / `x-tenant-id`
+        // headers are no longer trusted. The tenant comes from either the
+        // authenticated identity or the webhook registration table. This
+        // test exercises the low-confidence rejection path with the tenant
+        // sourced from an authenticated identity.
+        use crate::domain::iam::{IdentityKind, UserIdentity};
+
         let router_agent_id = AgentId::new();
         let mut registry = WorkflowRegistry::new(Some(router_agent_id));
         registry.set_confidence_threshold(0.8).unwrap();
@@ -1098,14 +1125,22 @@ mod tests {
             event_bus,
         );
 
-        let stimulus = make_stimulus("github", "{\"event\":\"push\"}").with_headers(
-            std::collections::HashMap::from([(
-                "x-aegis-tenant".to_string(),
-                "tenant-42".to_string(),
-            )]),
-        );
+        let identity = UserIdentity {
+            sub: "user-low-conf".to_string(),
+            realm_slug: "tenant-42".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: "tenant-42".to_string(),
+            },
+        };
 
-        let error = service.ingest(stimulus.clone(), None).await.unwrap_err();
+        let stimulus = make_stimulus("github", "{\"event\":\"push\"}");
+
+        let error = service
+            .ingest(stimulus.clone(), Some(identity))
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1133,6 +1168,12 @@ mod tests {
 
     #[tokio::test]
     async fn valid_router_result_resolves_workflow_and_starts_execution() {
+        // Post-b2a614a: tenant comes from the authenticated identity (or the
+        // webhook registration table). The previous header-trust path is
+        // gone, so this test now supplies an authenticated identity for
+        // `tenant-99` rather than relying on `x-tenant-id`.
+        use crate::domain::iam::{IdentityKind, UserIdentity};
+
         let router_agent_id = AgentId::new();
         let workflow_id = make_workflow_id();
         let mut registry = WorkflowRegistry::new(Some(router_agent_id));
@@ -1157,11 +1198,25 @@ mod tests {
             event_bus,
         );
 
-        let stimulus = make_stimulus("github", "{\"event\":\"deploy\"}").with_headers(
-            std::collections::HashMap::from([("x-tenant-id".to_string(), "tenant-99".to_string())]),
-        );
+        let identity = UserIdentity {
+            sub: "user-valid-router".to_string(),
+            realm_slug: "tenant-99".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: "tenant-99".to_string(),
+            },
+        };
 
-        let response = service.ingest(stimulus.clone(), None).await.unwrap();
+        // Use a source that is NOT registered as a direct route for this
+        // tenant so Stage 1 (deterministic) misses and Stage 2 (router)
+        // executes.
+        let stimulus = make_stimulus("github", "{\"event\":\"deploy\"}");
+
+        let response = service
+            .ingest(stimulus.clone(), Some(identity))
+            .await
+            .unwrap();
 
         assert_eq!(response.workflow_execution_id, "wf-exec-456");
         let execution_calls = execution_service.start_calls();
