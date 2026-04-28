@@ -620,8 +620,15 @@ impl ToolInvocationService {
     /// Handler for `aegis.workflow.cancel` — cancels a running workflow execution.
     pub(super) async fn invoke_aegis_workflow_cancel_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution control is invoked. Without this gate any
+        // caller could cancel any tenant's workflow execution by guessing its
+        // UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -639,6 +646,29 @@ impl ToolInvocationService {
             })?,
         );
 
+        // Pre-flight tenant validation: a foreign-tenant execution must not
+        // reach the control port. `find_by_id_for_tenant` returns `Ok(None)`
+        // for an execution that does not belong to `tenant_id`.
+        if let Some(repo) = &self.workflow_execution_repo {
+            match repo.find_by_id_for_tenant(&tenant_id, exec_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.cancel",
+                        "cancelled": false,
+                        "error": format!("Workflow execution '{exec_id_str}' not found")
+                    })));
+                }
+                Err(error) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.cancel",
+                        "cancelled": false,
+                        "error": format!("Failed to verify workflow execution tenancy: {error}")
+                    })));
+                }
+            }
+        }
+
         let port = match &self.workflow_execution_control {
             Some(p) => p,
             None => {
@@ -649,7 +679,7 @@ impl ToolInvocationService {
             }
         };
 
-        match port.cancel_workflow_execution(exec_id).await {
+        match port.cancel_workflow_execution(&tenant_id, exec_id).await {
             Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.cancel",
                 "cancelled": true,
@@ -666,8 +696,15 @@ impl ToolInvocationService {
     /// Handler for `aegis.workflow.signal` — sends human input to a paused workflow.
     pub(super) async fn invoke_aegis_workflow_signal_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: signal injection is more dangerous than read — without the
+        // tenant gate any caller could deliver a human-input payload into a
+        // paused workflow waiting on someone else's tenant. Bind/verify the
+        // requested tenant against the authenticated scope first.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -692,7 +729,30 @@ impl ToolInvocationService {
                 SealSessionError::InvalidArguments(
                     "aegis.workflow.signal requires 'response' string".to_string(),
                 )
-            })?;
+            })?
+            .to_string();
+
+        // Pre-flight tenant validation against the workflow execution
+        // repository — a foreign-tenant execution must not receive a signal.
+        if let Some(repo) = &self.workflow_execution_repo {
+            match repo.find_by_id_for_tenant(&tenant_id, exec_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.signal",
+                        "signalled": false,
+                        "error": format!("Workflow execution '{exec_id_str}' not found")
+                    })));
+                }
+                Err(error) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.signal",
+                        "signalled": false,
+                        "error": format!("Failed to verify workflow execution tenancy: {error}")
+                    })));
+                }
+            }
+        }
 
         let port = match &self.workflow_execution_control {
             Some(p) => p,
@@ -704,7 +764,10 @@ impl ToolInvocationService {
             }
         };
 
-        match port.signal_workflow_execution(exec_id, response).await {
+        match port
+            .signal_workflow_execution(&tenant_id, exec_id, &response)
+            .await
+        {
             Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.signal",
                 "signalled": true,
@@ -721,8 +784,15 @@ impl ToolInvocationService {
     /// Handler for `aegis.workflow.remove` — removes a workflow execution record.
     pub(super) async fn invoke_aegis_workflow_remove_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution data is deleted. Without this gate any
+        // caller could delete the audit/history record of another tenant's
+        // workflow execution by guessing its UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -740,6 +810,28 @@ impl ToolInvocationService {
             })?,
         );
 
+        // Pre-flight tenant validation: a foreign-tenant execution must not
+        // be deleted via this surface.
+        if let Some(repo) = &self.workflow_execution_repo {
+            match repo.find_by_id_for_tenant(&tenant_id, exec_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.remove",
+                        "removed": false,
+                        "error": format!("Workflow execution '{exec_id_str}' not found")
+                    })));
+                }
+                Err(error) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.remove",
+                        "removed": false,
+                        "error": format!("Failed to verify workflow execution tenancy: {error}")
+                    })));
+                }
+            }
+        }
+
         let port = match &self.workflow_execution_control {
             Some(p) => p,
             None => {
@@ -750,7 +842,7 @@ impl ToolInvocationService {
             }
         };
 
-        match port.remove_workflow_execution(exec_id).await {
+        match port.remove_workflow_execution(&tenant_id, exec_id).await {
             Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.remove",
                 "removed": true,

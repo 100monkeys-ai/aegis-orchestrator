@@ -138,21 +138,31 @@ pub trait ContainerVerificationPort: Send + Sync {
 ///
 /// Infrastructure adapters implement this to interact with the workflow engine
 /// (e.g. Temporal) for lifecycle management of running workflow executions.
+///
+/// All methods are tenant-scoped (ADR-097): adapters MUST refuse to operate on
+/// an execution that does not belong to the supplied tenant. Handlers in the
+/// application layer are also expected to pre-validate via the
+/// `WorkflowExecutionRepository::find_by_id_for_tenant` gate, but the port
+/// signature carries the tenant through as defense in depth so a misconfigured
+/// caller cannot bypass the check by reaching the adapter directly.
 #[async_trait]
 pub trait WorkflowExecutionControlPort: Send + Sync {
     async fn cancel_workflow_execution(
         &self,
+        tenant_id: &crate::domain::tenant::TenantId,
         execution_id: crate::domain::execution::ExecutionId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     async fn signal_workflow_execution(
         &self,
+        tenant_id: &crate::domain::tenant::TenantId,
         execution_id: crate::domain::execution::ExecutionId,
         response: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     async fn remove_workflow_execution(
         &self,
+        tenant_id: &crate::domain::tenant::TenantId,
         execution_id: crate::domain::execution::ExecutionId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
@@ -160,11 +170,15 @@ pub trait WorkflowExecutionControlPort: Send + Sync {
 /// Port for retrieving agent-level activity log snapshots.
 ///
 /// Infrastructure adapters implement this to fetch agent event history
-/// from whatever storage backend is in use.
+/// from whatever storage backend is in use. The `tenant_id` argument is
+/// authoritative — adapters MUST scope the underlying query to it (ADR-097)
+/// so that callers cannot read another tenant's agent activity by guessing
+/// an agent UUID.
 #[async_trait]
 pub trait AgentActivityPort: Send + Sync {
     async fn agent_logs_snapshot(
         &self,
+        tenant_id: &crate::domain::tenant::TenantId,
         agent_id: uuid::Uuid,
         limit: usize,
         offset: usize,

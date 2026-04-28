@@ -490,8 +490,15 @@ impl ToolInvocationService {
     /// Handler for `aegis.agent.logs` — retrieves agent-level activity log snapshot.
     pub(super) async fn invoke_aegis_agent_logs_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any agent activity is read. Without this gate any
+        // caller could read another tenant's agent activity log by guessing
+        // the agent UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let agent_id_str = args
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -501,7 +508,7 @@ impl ToolInvocationService {
                 )
             })?;
 
-        let agent_id = uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
+        let agent_uuid = uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
             SealSessionError::InvalidArguments(format!(
                 "aegis.agent.logs: invalid agent_id UUID: {e}"
             ))
@@ -518,6 +525,21 @@ impl ToolInvocationService {
             .map(|n| n as usize)
             .unwrap_or(0);
 
+        // Pre-flight tenant validation: confirm the agent is visible to the
+        // caller's tenant before fetching its activity. `get_agent_for_tenant`
+        // returns an error when the agent does not belong to `tenant_id` and
+        // is not globally visible.
+        if let Err(e) = self
+            .agent_lifecycle
+            .get_agent_for_tenant(&tenant_id, crate::domain::agent::AgentId(agent_uuid))
+            .await
+        {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.logs",
+                "error": format!("Agent '{agent_id_str}' not found: {e}")
+            })));
+        }
+
         let port = match &self.agent_activity {
             Some(p) => p,
             None => {
@@ -528,7 +550,10 @@ impl ToolInvocationService {
             }
         };
 
-        match port.agent_logs_snapshot(agent_id, limit, offset).await {
+        match port
+            .agent_logs_snapshot(&tenant_id, agent_uuid, limit, offset)
+            .await
+        {
             Ok(events) => {
                 let total = events.len();
                 Ok(ToolInvocationResult::Direct(serde_json::json!({

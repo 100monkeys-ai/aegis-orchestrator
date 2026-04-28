@@ -1328,10 +1328,43 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<QueryCortexPatternsRequest>,
     ) -> Result<Response<QueryCortexPatternsResponse>, Status> {
-        let _identity = self
+        // ADR-097: derive the authenticated tenant from the request and bind
+        // any caller-supplied `req.tenant_id` to it. Without this gate any
+        // caller could send `req.tenant_id = "<other tenant>"` (or the empty
+        // string, which the Cortex service treats as "global") and read
+        // patterns belonging to other tenants. Mirrors the SEAL-side fix
+        // landed in 9a13cf4 — gRPC Cortex proxy was missed.
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/QueryCortexPatterns")
             .await?;
+        let authenticated_tenant = match auth {
+            Some((id, tid, _)) => {
+                let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
+                if matches!(
+                    id.identity_kind,
+                    crate::domain::iam::IdentityKind::ServiceAccount { .. }
+                ) {
+                    Some((effective_tid, true))
+                } else {
+                    Some((tid, false))
+                }
+            }
+            None => None,
+        };
         let req = request.into_inner();
+
+        let resolved_tenant_id = match &authenticated_tenant {
+            Some((tid, may_delegate)) => {
+                if req.tenant_id.is_empty() {
+                    tid.to_string()
+                } else if req.tenant_id == tid.to_string() || *may_delegate {
+                    req.tenant_id
+                } else {
+                    return Err(Status::permission_denied("tenant mismatch"));
+                }
+            }
+            None => req.tenant_id,
+        };
 
         let Some(ref cortex_client) = self.cortex_client else {
             tracing::debug!("QueryCortexPatterns called in memoryless mode — returning empty");
@@ -1345,7 +1378,7 @@ impl AegisRuntime for AegisRuntimeService {
             error_type: req.error_type,
             limit: req.limit,
             min_success_score: req.min_success_score,
-            tenant_id: req.tenant_id,
+            tenant_id: resolved_tenant_id,
         };
 
         match cortex_client.query_patterns(cortex_req).await {
@@ -1378,10 +1411,40 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<StoreCortexPatternRequest>,
     ) -> Result<Response<StoreCortexPatternResponse>, Status> {
-        let _identity = self
+        // ADR-097: same shape as `query_cortex_patterns` — bind any
+        // caller-supplied `req.tenant_id` to the authenticated tenant before
+        // forwarding to Cortex.
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/StoreCortexPattern")
             .await?;
+        let authenticated_tenant = match auth {
+            Some((id, tid, _)) => {
+                let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
+                if matches!(
+                    id.identity_kind,
+                    crate::domain::iam::IdentityKind::ServiceAccount { .. }
+                ) {
+                    Some((effective_tid, true))
+                } else {
+                    Some((tid, false))
+                }
+            }
+            None => None,
+        };
         let req = request.into_inner();
+
+        let resolved_tenant_id = match &authenticated_tenant {
+            Some((tid, may_delegate)) => {
+                if req.tenant_id.is_empty() {
+                    tid.to_string()
+                } else if req.tenant_id == tid.to_string() || *may_delegate {
+                    req.tenant_id
+                } else {
+                    return Err(Status::permission_denied("tenant mismatch"));
+                }
+            }
+            None => req.tenant_id,
+        };
 
         let Some(ref cortex_client) = self.cortex_client else {
             tracing::debug!("StoreCortexPattern called in memoryless mode — returning noop");
@@ -1400,7 +1463,7 @@ impl AegisRuntime for AegisRuntimeService {
             solution_code: req.solution_code,
             agent_id: req.agent_id,
             tags: req.tags,
-            tenant_id: req.tenant_id,
+            tenant_id: resolved_tenant_id,
         };
 
         match cortex_client.store_pattern(cortex_req).await {
@@ -3149,6 +3212,163 @@ mod tests {
         );
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Regression — residual tenant-isolation leak (ADR-097): the gRPC
+    /// `query_cortex_patterns` and `store_cortex_pattern` handlers used to
+    /// forward `req.tenant_id` to the Cortex client without validating it
+    /// against the authenticated identity. Any caller could read or write
+    /// patterns belonging to a different tenant by setting `req.tenant_id`
+    /// to any string. The fix derives the authenticated tenant via
+    /// `tenant_id_from_request` and rejects mismatches with
+    /// `permission_denied` unless the caller is a delegating service account.
+    mod cortex_proxy_tenant_isolation {
+        use super::*;
+        use crate::domain::iam::{
+            IamError, IdentityKind, IdentityProvider, IdentityRealm, RealmKind, UserIdentity,
+            ValidatedIdentityToken, ZaruTier,
+        };
+
+        struct StaticIdentityProvider {
+            identity: UserIdentity,
+        }
+
+        #[async_trait]
+        impl IdentityProvider for StaticIdentityProvider {
+            async fn validate_token(
+                &self,
+                _raw_jwt: &str,
+            ) -> std::result::Result<ValidatedIdentityToken, IamError> {
+                Ok(ValidatedIdentityToken {
+                    identity: self.identity.clone(),
+                    issued_at: Utc::now(),
+                    expires_at: Utc::now() + chrono::Duration::minutes(10),
+                    raw_claims: serde_json::json!({}),
+                })
+            }
+            fn resolve_tier(
+                &self,
+                _token: &ValidatedIdentityToken,
+            ) -> std::result::Result<ZaruTier, IamError> {
+                Ok(ZaruTier::Free)
+            }
+            fn resolve_role(
+                &self,
+                _token: &ValidatedIdentityToken,
+            ) -> std::result::Result<crate::domain::iam::AegisRole, IamError> {
+                Err(IamError::MissingClaim {
+                    claim: "aegis_role".to_string(),
+                })
+            }
+            fn known_realms(&self) -> Vec<IdentityRealm> {
+                vec![IdentityRealm {
+                    realm_slug: "zaru-consumer".to_string(),
+                    issuer_url: "https://auth.test/realms/zaru-consumer".to_string(),
+                    jwks_uri: "https://auth.test/realms/zaru-consumer/jwks".to_string(),
+                    audience: "zaru-client".to_string(),
+                    realm_kind: RealmKind::Consumer,
+                }]
+            }
+        }
+
+        fn tenant_a_identity() -> UserIdentity {
+            let tenant_a =
+                TenantId::for_consumer_user("user-a-sub").expect("tenant A construction");
+            UserIdentity {
+                sub: "user-a-sub".to_string(),
+                realm_slug: "zaru-consumer".to_string(),
+                email: None,
+                name: None,
+                identity_kind: IdentityKind::ConsumerUser {
+                    zaru_tier: ZaruTier::Free,
+                    tenant_id: tenant_a,
+                },
+            }
+        }
+
+        fn build_service_with_auth() -> AegisRuntimeService {
+            let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+                execution_id: ExecutionId::new(),
+                stream_events: Vec::new(),
+                persisted_execution: None,
+                tenant_lookups: Mutex::new(Vec::new()),
+            });
+            let validation_service = test_validation_service(execution_service.clone());
+            let auth = GrpcIamAuthInterceptor::new(
+                Arc::new(StaticIdentityProvider {
+                    identity: tenant_a_identity(),
+                }),
+                &crate::domain::node_config::GrpcAuthConfig {
+                    enabled: true,
+                    exempt_methods: vec![],
+                },
+            );
+            AegisRuntimeService::new(execution_service, validation_service).with_grpc_auth(auth)
+        }
+
+        fn make_request<T>(payload: T) -> Request<T> {
+            let mut req = Request::new(payload);
+            req.metadata_mut()
+                .insert("authorization", "Bearer test-token".parse().unwrap());
+            req
+        }
+
+        #[tokio::test]
+        async fn query_cortex_patterns_rejects_cross_tenant_request() {
+            let service = build_service_with_auth();
+            let foreign_tenant = TenantId::for_consumer_user("user-b-sub")
+                .expect("tenant B construction")
+                .to_string();
+
+            let request = make_request(QueryCortexPatternsRequest {
+                error_signature: "sig".to_string(),
+                error_type: Some("type".to_string()),
+                limit: Some(10),
+                min_success_score: Some(0.0),
+                tenant_id: foreign_tenant,
+            });
+
+            let err = service
+                .query_cortex_patterns(request)
+                .await
+                .expect_err("cross-tenant tenant_id must be rejected");
+            assert_eq!(
+                err.code(),
+                tonic::Code::PermissionDenied,
+                "expected PermissionDenied (tenant mismatch), got {:?}",
+                err.code()
+            );
+        }
+
+        #[tokio::test]
+        async fn store_cortex_pattern_rejects_cross_tenant_request() {
+            let service = build_service_with_auth();
+            let foreign_tenant = TenantId::for_consumer_user("user-b-sub")
+                .expect("tenant B construction")
+                .to_string();
+
+            let request = make_request(StoreCortexPatternRequest {
+                error_signature: "sig".to_string(),
+                error_type: "type".to_string(),
+                error_message: "msg".to_string(),
+                solution_approach: "approach".to_string(),
+                solution_code: Some("code".to_string()),
+                agent_id: Some(uuid::Uuid::new_v4().to_string()),
+                tags: vec![],
+                tenant_id: foreign_tenant,
+            });
+
+            let err = service
+                .store_cortex_pattern(request)
+                .await
+                .expect_err("cross-tenant tenant_id must be rejected");
+            assert_eq!(
+                err.code(),
+                tonic::Code::PermissionDenied,
+                "expected PermissionDenied (tenant mismatch), got {:?}",
+                err.code()
+            );
+        }
     }
 
     /// Regression: a valid execution_id must still parse normally regardless of

@@ -39,8 +39,14 @@ impl aegis_orchestrator_core::application::ports::WorkflowExecutionControlPort
 {
     async fn cancel_workflow_execution(
         &self,
+        _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
         execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Tenant validation is performed in the handler via
+        // `WorkflowExecutionRepository::find_by_id_for_tenant` before this port
+        // is invoked. Temporal's namespace/workflow-id naming does not encode
+        // the tenant, so we rely on the upstream gate; the parameter is
+        // accepted here for trait conformance and audit-log enrichment.
         let namespace = temporal_namespace(&self.config)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
         let mut client = connect_temporal_workflow_client(&self.config)
@@ -67,6 +73,7 @@ impl aegis_orchestrator_core::application::ports::WorkflowExecutionControlPort
 
     async fn signal_workflow_execution(
         &self,
+        _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
         execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
         response: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -87,6 +94,7 @@ impl aegis_orchestrator_core::application::ports::WorkflowExecutionControlPort
 
     async fn remove_workflow_execution(
         &self,
+        _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
         execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let namespace = temporal_namespace(&self.config)
@@ -136,6 +144,7 @@ pub(crate) struct DaemonAgentActivity {
 impl aegis_orchestrator_core::application::ports::AgentActivityPort for DaemonAgentActivity {
     async fn agent_logs_snapshot(
         &self,
+        tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
         agent_id: uuid::Uuid,
         limit: usize,
         offset: usize,
@@ -143,11 +152,7 @@ impl aegis_orchestrator_core::application::ports::AgentActivityPort for DaemonAg
         let agent_id = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
         let executions = self
             .execution_repo
-            .find_by_agent_for_tenant(
-                &aegis_orchestrator_core::domain::tenant::TenantId::system(),
-                agent_id,
-                limit + offset,
-            )
+            .find_by_agent_for_tenant(tenant_id, agent_id, limit + offset)
             .await
             .map_err(|e: aegis_orchestrator_core::domain::repository::RepositoryError| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 

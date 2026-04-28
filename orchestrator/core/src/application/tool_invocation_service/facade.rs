@@ -999,7 +999,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.agent.list" => Some(self.invoke_aegis_agent_list_tool(args, tenant_scope).await),
-            "aegis.agent.logs" => Some(self.invoke_aegis_agent_logs_tool(args).await),
+            "aegis.agent.logs" => Some(self.invoke_aegis_agent_logs_tool(args, tenant_scope).await),
             "aegis.workflow.delete" => Some(
                 self.invoke_aegis_workflow_delete_tool(args, tenant_scope)
                     .await,
@@ -1038,9 +1038,18 @@ impl ToolInvocationService {
                 self.invoke_aegis_workflow_wait_tool(args, tenant_scope)
                     .await,
             ),
-            "aegis.workflow.cancel" => Some(self.invoke_aegis_workflow_cancel_tool(args).await),
-            "aegis.workflow.signal" => Some(self.invoke_aegis_workflow_signal_tool(args).await),
-            "aegis.workflow.remove" => Some(self.invoke_aegis_workflow_remove_tool(args).await),
+            "aegis.workflow.cancel" => Some(
+                self.invoke_aegis_workflow_cancel_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.workflow.signal" => Some(
+                self.invoke_aegis_workflow_signal_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.workflow.remove" => Some(
+                self.invoke_aegis_workflow_remove_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.workflow.list" => Some(
                 self.invoke_aegis_workflow_list_tool(args, tenant_scope)
                     .await,

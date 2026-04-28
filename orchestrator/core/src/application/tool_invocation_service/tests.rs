@@ -4093,6 +4093,102 @@ async fn aegis_workflow_search_rejects_cross_tenant_args() {
 }
 
 // =============================================================================
+// Regression tests — residual tenant-isolation leaks closed alongside ADR-097
+// follow-up. Each test corresponds to one of the five leaks in
+// `plans/close-residual-tenant-leaks.md`: handlers that previously took no
+// `tenant_scope` argument and dispatched to the workflow control / agent
+// activity ports without binding the caller's tenant. After the fix, every
+// such handler routes through `enforce_tenant_arg` first and rejects any
+// cross-tenant argument with `SealSessionError::TenantMismatch` (unless the
+// caller is a `ServiceAccount`, per ADR-100 delegation).
+// =============================================================================
+
+#[tokio::test]
+async fn aegis_agent_logs_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({
+        "agent_id": uuid::Uuid::new_v4().to_string(),
+        "tenant_id": "u-other-user-sub",
+    });
+
+    let err = service
+        .invoke_aegis_agent_logs_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_workflow_cancel_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({
+        "execution_id": uuid::Uuid::new_v4().to_string(),
+        "tenant_id": "u-other-user-sub",
+    });
+
+    let err = service
+        .invoke_aegis_workflow_cancel_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_workflow_signal_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({
+        "execution_id": uuid::Uuid::new_v4().to_string(),
+        "response": "approved",
+        "tenant_id": "u-other-user-sub",
+    });
+
+    let err = service
+        .invoke_aegis_workflow_signal_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn aegis_workflow_remove_rejects_cross_tenant_args() {
+    let service = build_minimal_tool_invocation_service();
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({
+        "execution_id": uuid::Uuid::new_v4().to_string(),
+        "tenant_id": "u-other-user-sub",
+    });
+
+    let err = service
+        .invoke_aegis_workflow_remove_tool(&mut args, &scope)
+        .await
+        .expect_err("cross-tenant request must be rejected");
+
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+}
+
+// =============================================================================
 // Regression coverage: list responses surface a derived `summary` from intent.
 // =============================================================================
 
