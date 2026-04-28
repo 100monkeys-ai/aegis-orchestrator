@@ -4268,6 +4268,40 @@ async fn aegis_task_list_collapses_whitespace_in_summary() {
     assert_eq!(payload["executions"][0]["summary"], "hello world");
 }
 
+/// REGRESSION: `aegis.task.list` summary MUST reflect the caller's
+/// per-call intent (e.g. "Generate a Satisfactory beginner guide"), not
+/// the agent manifest's static `task.instruction` (e.g. "You are an AEGIS
+/// task monitoring agent…"). Previously `prepare_execution_input`
+/// overwrote `Execution.input.intent` with the rendered Handlebars prompt
+/// — which prepends `{{instruction}}` — so every execution by the same
+/// agent surfaced the same manifest text as its summary regardless of
+/// what the user actually asked for.
+#[tokio::test]
+async fn aegis_task_list_summary_reflects_caller_intent_not_manifest() {
+    let caller_intent = "Generate a Satisfactory beginner guide";
+    let exec = make_task_execution_with_intent(Some(caller_intent.to_string()));
+    let service = build_task_list_service_with_executions(vec![exec]);
+    let payload = invoke_task_list(&service).await;
+
+    let summary = payload["executions"][0]["summary"]
+        .as_str()
+        .expect("summary must be present and stringy");
+    assert_eq!(
+        summary, caller_intent,
+        "summary must mirror caller's per-call intent verbatim"
+    );
+    // Negative assertion: the failure mode we're guarding against is the
+    // manifest instruction text bleeding into the summary.
+    assert!(
+        !summary.contains("You are an AEGIS task monitoring agent"),
+        "summary must not contain the agent's manifest instruction text, got: {summary}"
+    );
+    assert!(
+        !summary.contains("You evaluate outputs from agent generation flows"),
+        "summary must not contain a judge-agent manifest instruction, got: {summary}"
+    );
+}
+
 async fn build_workflow_list_service_with_input(
     input_params: serde_json::Value,
 ) -> (ToolInvocationService, crate::domain::workflow::WorkflowId) {
