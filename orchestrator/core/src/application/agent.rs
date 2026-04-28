@@ -20,6 +20,7 @@
 //! - Fail closed on malformed or incomplete agent definitions.
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
+// AgentScope retained: used in `deploy_agent_for_tenant` signature.
 use crate::domain::iam::UserIdentity;
 use crate::domain::repository::AgentVersion;
 use crate::domain::tenant::TenantId;
@@ -87,80 +88,6 @@ pub trait AgentLifecycleService: Send + Sync {
         agent_id: AgentId,
     ) -> Result<Vec<AgentVersion>>;
 
-    /// Parse, validate, and persist a new agent manifest, returning the assigned [`AgentId`].
-    ///
-    /// When `force` is `false` the call fails if an agent with the same `metadata.name` **and**
-    /// `metadata.version` already exists.  Set `force = true` to silently overwrite that agent
-    /// in place (same [`AgentId`] is preserved).
-    ///
-    /// A different `metadata.version` will always update the existing agent regardless of `force`.
-    ///
-    /// # Errors
-    ///
-    /// - Manifest schema validation failures
-    /// - Same name + same version already deployed and `force = false`
-    /// - Database write errors
-    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId> {
-        self.deploy_agent_for_tenant(
-            &TenantId::consumer(),
-            manifest,
-            force,
-            AgentScope::Tenant,
-            None,
-        )
-        .await
-    }
-
-    /// Retrieve a fully-hydrated [`Agent`] by its UUID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `id` does not exist in the registry.
-    async fn get_agent(&self, id: AgentId) -> Result<Agent> {
-        self.get_agent_for_tenant(&TenantId::consumer(), id).await
-    }
-
-    /// Replace the manifest of an existing agent in-place.
-    ///
-    /// The agent's [`AgentId`] is unchanged. Running executions are not affected —
-    /// the new manifest takes effect on the next execution start.
-    ///
-    /// # Errors
-    ///
-    /// - `id` not found
-    /// - New manifest fails schema validation
-    async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> Result<()> {
-        self.update_agent_for_tenant(&TenantId::consumer(), id, manifest)
-            .await
-    }
-
-    /// Permanently remove an agent manifest from the registry.
-    ///
-    /// Does **not** cancel in-progress executions. Callers must cancel executions
-    /// before deleting the agent if that behaviour is required.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `id` does not exist.
-    async fn delete_agent(&self, id: AgentId) -> Result<()> {
-        self.delete_agent_for_tenant(&TenantId::consumer(), id)
-            .await
-    }
-
-    /// Return all registered agents in unspecified order.
-    async fn list_agents(&self) -> Result<Vec<Agent>> {
-        self.list_agents_for_tenant(&TenantId::consumer()).await
-    }
-
-    /// Resolve an agent name string to its [`AgentId`], or `None` if not found.
-    ///
-    /// Used by workflow execution to dereference agent name references in workflow
-    /// manifests (e.g. `agent: "code-reviewer"`).
-    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
-        self.lookup_agent_for_tenant(&TenantId::consumer(), name)
-            .await
-    }
-
     /// Resolve an agent name + version to its [`AgentId`], or `None` if not found.
     async fn lookup_agent_for_tenant_with_version(
         &self,
@@ -168,14 +95,4 @@ pub trait AgentLifecycleService: Send + Sync {
         name: &str,
         version: &str,
     ) -> Result<Option<AgentId>>;
-
-    /// Convenience wrapper calling [`Self::lookup_agent_for_tenant_with_version`] with the local default tenant.
-    async fn lookup_agent_with_version(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<AgentId>> {
-        self.lookup_agent_for_tenant_with_version(&TenantId::consumer(), name, version)
-            .await
-    }
 }

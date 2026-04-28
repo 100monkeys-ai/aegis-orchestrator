@@ -101,6 +101,14 @@ pub trait AgentRepository: Send + Sync {
         tenant_id: &TenantId,
     ) -> Result<Vec<Agent>, RepositoryError>;
 
+    /// List every agent across every tenant. Used by infrastructure
+    /// background tasks (Cortex discovery backfill / drift reconciliation)
+    /// that must observe agents under their own owning tenant rather than
+    /// a single hardcoded tenant. Each returned [`Agent`] carries its own
+    /// `tenant_id` field — callers MUST use it for downstream tenant-scoped
+    /// operations.
+    async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError>;
+
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -245,6 +253,14 @@ pub trait WorkflowRepository: Send + Sync {
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<Workflow>, RepositoryError>;
+
+    /// List every workflow across every tenant. Used by infrastructure
+    /// background tasks (Cortex discovery backfill / drift reconciliation)
+    /// that must observe workflows under their own owning tenant rather
+    /// than a single hardcoded tenant. Each returned [`Workflow`] carries
+    /// its own `tenant_id` field — callers MUST use it for downstream
+    /// tenant-scoped operations.
+    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError>;
 
     async fn delete_for_tenant(
         &self,

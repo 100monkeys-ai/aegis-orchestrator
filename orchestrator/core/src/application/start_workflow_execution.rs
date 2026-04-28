@@ -1051,6 +1051,10 @@ mod tests {
                 Ok(vec![])
             }
 
+            async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+                Ok(vec![])
+            }
+
             async fn delete_for_tenant(
                 &self,
                 _tenant_id: &TenantId,

@@ -334,6 +334,7 @@ pub(crate) async fn delete_workflow_handler(
             state.event_bus.publish_workflow_event(
                 aegis_orchestrator_core::domain::events::WorkflowEvent::WorkflowRemoved {
                     workflow_id,
+                    tenant_id: tenant_id.clone(),
                     workflow_name,
                     removed_at: Utc::now(),
                 },

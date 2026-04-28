@@ -286,6 +286,7 @@ pub enum StorageEvent {
 pub enum AgentLifecycleEvent {
     AgentDeployed {
         agent_id: AgentId,
+        tenant_id: crate::domain::tenant::TenantId,
         manifest: AgentManifest,
         deployed_at: DateTime<Utc>,
     },
@@ -299,12 +300,14 @@ pub enum AgentLifecycleEvent {
     },
     AgentUpdated {
         agent_id: AgentId,
+        tenant_id: crate::domain::tenant::TenantId,
         old_version: String,
         new_version: String,
         updated_at: DateTime<Utc>,
     },
     AgentRemoved {
         agent_id: AgentId,
+        tenant_id: crate::domain::tenant::TenantId,
         removed_at: DateTime<Utc>,
     },
     AgentFailed {
@@ -558,6 +561,7 @@ impl From<&crate::domain::llm::LLMError> for LlmErrorClass {
 pub enum WorkflowEvent {
     WorkflowRegistered {
         workflow_id: crate::domain::workflow::WorkflowId,
+        tenant_id: crate::domain::tenant::TenantId,
         name: String,
         version: String,
         scope: crate::domain::workflow::WorkflowScope,
@@ -682,6 +686,7 @@ pub enum WorkflowEvent {
     /// A workflow definition was permanently deleted from the registry.
     WorkflowRemoved {
         workflow_id: crate::domain::workflow::WorkflowId,
+        tenant_id: crate::domain::tenant::TenantId,
         workflow_name: String,
         removed_at: DateTime<Utc>,
     },

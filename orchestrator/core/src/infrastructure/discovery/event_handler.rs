@@ -155,28 +155,43 @@ impl DiscoveryIndexEventHandler {
         match event {
             DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
                 agent_id,
+                tenant_id,
                 manifest,
                 ..
             }) => {
-                self.handle_agent_upsert(&agent_id, &manifest).await;
+                self.handle_agent_upsert(&agent_id, &tenant_id, &manifest)
+                    .await;
             }
-            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentUpdated { agent_id, .. }) => {
-                self.handle_agent_update(&agent_id).await;
+            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentUpdated {
+                agent_id,
+                tenant_id,
+                ..
+            }) => {
+                self.handle_agent_update(&agent_id, &tenant_id).await;
             }
-            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentRemoved { agent_id, .. }) => {
-                self.handle_agent_remove(&agent_id).await;
+            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentRemoved {
+                agent_id,
+                tenant_id,
+                ..
+            }) => {
+                self.handle_agent_remove(&agent_id, &tenant_id).await;
             }
             DomainEvent::Workflow(WorkflowEvent::WorkflowRegistered {
                 workflow_id,
+                tenant_id,
                 name,
                 version,
                 ..
             }) => {
-                self.handle_workflow_upsert(&workflow_id, &name, &version)
+                self.handle_workflow_upsert(&workflow_id, &tenant_id, &name, &version)
                     .await;
             }
-            DomainEvent::Workflow(WorkflowEvent::WorkflowRemoved { workflow_id, .. }) => {
-                self.handle_workflow_remove(&workflow_id).await;
+            DomainEvent::Workflow(WorkflowEvent::WorkflowRemoved {
+                workflow_id,
+                tenant_id,
+                ..
+            }) => {
+                self.handle_workflow_remove(&workflow_id, &tenant_id).await;
             }
             _ => {} // Ignore other events
         }
@@ -246,6 +261,7 @@ impl DiscoveryIndexEventHandler {
 
     fn build_agent_index_request(
         agent_id: &AgentId,
+        tenant_id: &TenantId,
         manifest: &AgentManifest,
     ) -> IndexAgentRequest {
         let name = &manifest.metadata.name;
@@ -275,7 +291,7 @@ impl DiscoveryIndexEventHandler {
 
         IndexAgentRequest {
             agent_id: agent_id.to_string(),
-            tenant_id: TenantId::consumer().to_string(),
+            tenant_id: tenant_id.to_string(),
             name: name.clone(),
             version: version.clone(),
             description,
@@ -294,8 +310,13 @@ impl DiscoveryIndexEventHandler {
         }
     }
 
-    async fn handle_agent_upsert(&self, agent_id: &AgentId, manifest: &AgentManifest) {
-        let req = Self::build_agent_index_request(agent_id, manifest);
+    async fn handle_agent_upsert(
+        &self,
+        agent_id: &AgentId,
+        tenant_id: &TenantId,
+        manifest: &AgentManifest,
+    ) {
+        let req = Self::build_agent_index_request(agent_id, tenant_id, manifest);
         let fp = Self::fingerprint_agent(&req);
 
         if let Err(e) = self.index_agent_with_retry(req).await {
@@ -306,10 +327,10 @@ impl DiscoveryIndexEventHandler {
         }
     }
 
-    async fn handle_agent_update(&self, agent_id: &AgentId) {
+    async fn handle_agent_update(&self, agent_id: &AgentId, tenant_id: &TenantId) {
         let agent = match self
             .agent_repo
-            .find_by_id_for_tenant(&TenantId::consumer(), *agent_id)
+            .find_by_id_for_tenant(tenant_id, *agent_id)
             .await
         {
             Ok(Some(a)) => a,
@@ -323,13 +344,14 @@ impl DiscoveryIndexEventHandler {
             }
         };
 
-        self.handle_agent_upsert(agent_id, &agent.manifest).await;
+        self.handle_agent_upsert(agent_id, tenant_id, &agent.manifest)
+            .await;
     }
 
-    async fn handle_agent_remove(&self, agent_id: &AgentId) {
+    async fn handle_agent_remove(&self, agent_id: &AgentId, tenant_id: &TenantId) {
         let req = RemoveDiscoveryAgentRequest {
             agent_id: agent_id.to_string(),
-            tenant_id: TenantId::consumer().to_string(),
+            tenant_id: tenant_id.to_string(),
         };
 
         if let Err(e) = self.cortex_client.remove_discovery_agent(req).await {
@@ -340,10 +362,10 @@ impl DiscoveryIndexEventHandler {
         }
     }
 
-    async fn handle_workflow_remove(&self, workflow_id: &WorkflowId) {
+    async fn handle_workflow_remove(&self, workflow_id: &WorkflowId, tenant_id: &TenantId) {
         let req = RemoveDiscoveryWorkflowRequest {
             workflow_id: workflow_id.to_string(),
-            tenant_id: TenantId::consumer().to_string(),
+            tenant_id: tenant_id.to_string(),
         };
 
         if let Err(e) = self.cortex_client.remove_discovery_workflow(req).await {
@@ -358,21 +380,21 @@ impl DiscoveryIndexEventHandler {
     // Workflow handlers
     // ──────────────────────────────────────────────────────────────────────
 
-    /// Search for a workflow by name+version and then by ID across both the
-    /// consumer tenant and the system tenant. Built-in workflows are registered
-    /// under `TenantId::system()`, so a single-tenant lookup always misses them.
-    /// Errors at each step are logged and treated as not-found so that subsequent
-    /// fallbacks are always attempted.
-    async fn find_workflow_across_tenants(
+    /// Search for a workflow by name+version and then by ID under the given
+    /// owning tenant. The tenant is supplied by the publishing event so the
+    /// lookup is precise — no cross-tenant fallback is needed (built-in
+    /// workflows under `TenantId::system()` are published with that tenant
+    /// in the event).
+    async fn find_workflow_for_tenant(
         &self,
         workflow_id: &WorkflowId,
+        tenant_id: &TenantId,
         name: &str,
         version: &str,
     ) -> Option<crate::domain::workflow::Workflow> {
-        // 1. name+version under consumer
         match self
             .workflow_repo
-            .find_by_name_and_version_for_tenant(&TenantId::consumer(), name, version)
+            .find_by_name_and_version_for_tenant(tenant_id, name, version)
             .await
         {
             Ok(Some(w)) => return Some(w),
@@ -380,16 +402,16 @@ impl DiscoveryIndexEventHandler {
             Err(e) => {
                 tracing::warn!(
                     workflow_id = %workflow_id,
+                    tenant_id = %tenant_id,
                     error = %e,
-                    "Failed to look up workflow by name/version for consumer tenant"
+                    "Failed to look up workflow by name/version for tenant"
                 );
             }
         }
 
-        // 2. name+version under system
         match self
             .workflow_repo
-            .find_by_name_and_version_for_tenant(&TenantId::system(), name, version)
+            .find_by_id_for_tenant(tenant_id, *workflow_id)
             .await
         {
             Ok(Some(w)) => return Some(w),
@@ -397,42 +419,9 @@ impl DiscoveryIndexEventHandler {
             Err(e) => {
                 tracing::warn!(
                     workflow_id = %workflow_id,
+                    tenant_id = %tenant_id,
                     error = %e,
-                    "Failed to look up workflow by name/version for system tenant"
-                );
-            }
-        }
-
-        // 3. ID under consumer
-        match self
-            .workflow_repo
-            .find_by_id_for_tenant(&TenantId::consumer(), *workflow_id)
-            .await
-        {
-            Ok(Some(w)) => return Some(w),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    workflow_id = %workflow_id,
-                    error = %e,
-                    "Failed to look up workflow by ID for consumer tenant"
-                );
-            }
-        }
-
-        // 4. ID under system
-        match self
-            .workflow_repo
-            .find_by_id_for_tenant(&TenantId::system(), *workflow_id)
-            .await
-        {
-            Ok(Some(w)) => return Some(w),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    workflow_id = %workflow_id,
-                    error = %e,
-                    "Failed to look up workflow by ID for system tenant"
+                    "Failed to look up workflow by ID for tenant"
                 );
             }
         }
@@ -474,18 +463,25 @@ impl DiscoveryIndexEventHandler {
         }
     }
 
-    async fn handle_workflow_upsert(&self, workflow_id: &WorkflowId, name: &str, version: &str) {
+    async fn handle_workflow_upsert(
+        &self,
+        workflow_id: &WorkflowId,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) {
         // Look up full workflow from repo to get description, states, agents, labels.
-        // Searches across both the consumer and system tenants so that built-in
-        // workflows (registered under TenantId::system()) are not silently skipped.
+        // The owning tenant comes from the published event, so the lookup is
+        // precise to that tenant.
         let workflow = match self
-            .find_workflow_across_tenants(workflow_id, name, version)
+            .find_workflow_for_tenant(workflow_id, tenant_id, name, version)
             .await
         {
             Some(w) => w,
             None => {
                 tracing::warn!(
                     workflow_id = %workflow_id,
+                    tenant_id = %tenant_id,
                     name = name,
                     "Workflow not found for index upsert, skipping"
                 );
@@ -566,18 +562,22 @@ impl DiscoveryIndexEventHandler {
     /// Backfill the Cortex discovery index from all existing agents and workflows.
     /// Called once at startup. Unconditionally re-indexes every record — use
     /// [`Self::reconcile`] for the periodic drift-detection pass.
+    ///
+    /// Each record is indexed under its own `tenant_id` (sourced from the
+    /// loaded entity), not a hardcoded singleton.
     pub async fn backfill(&self) -> anyhow::Result<(usize, usize)> {
         tracing::info!("Starting Cortex discovery index backfill");
 
         let agents = self
             .agent_repo
-            .list_all_for_tenant(&TenantId::consumer())
+            .list_all()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agents for indexing: {e}"))?;
 
         let mut agent_count = 0usize;
         for agent in &agents {
-            self.handle_agent_upsert(&agent.id, &agent.manifest).await;
+            self.handle_agent_upsert(&agent.id, &agent.tenant_id, &agent.manifest)
+                .await;
             agent_count += 1;
             if agent_count.is_multiple_of(50) {
                 tracing::info!(agent_count, "Index progress: agents indexed");
@@ -586,15 +586,20 @@ impl DiscoveryIndexEventHandler {
 
         let workflows = self
             .workflow_repo
-            .list_all_for_tenant(&TenantId::consumer())
+            .list_all()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list workflows for indexing: {e}"))?;
 
         let mut workflow_count = 0usize;
         for workflow in &workflows {
             let version = workflow.metadata.version.as_deref().unwrap_or("0.1.0");
-            self.handle_workflow_upsert(&workflow.id, &workflow.metadata.name, version)
-                .await;
+            self.handle_workflow_upsert(
+                &workflow.id,
+                &workflow.tenant_id,
+                &workflow.metadata.name,
+                version,
+            )
+            .await;
             workflow_count += 1;
             if workflow_count.is_multiple_of(50) {
                 tracing::info!(workflow_count, "Index progress: workflows indexed");
@@ -624,15 +629,17 @@ impl DiscoveryIndexEventHandler {
         let mut summary = ReconcileSummary::default();
 
         // ── Agents ──────────────────────────────────────────────────────
+        // Iterate every agent across every tenant. Each agent is re-indexed
+        // under its own owning `tenant_id`, never a hardcoded singleton.
         let agents = self
             .agent_repo
-            .list_all_for_tenant(&TenantId::consumer())
+            .list_all()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agents for reconciliation: {e}"))?;
 
         for agent in &agents {
             summary.agents_checked += 1;
-            let req = Self::build_agent_index_request(&agent.id, &agent.manifest);
+            let req = Self::build_agent_index_request(&agent.id, &agent.tenant_id, &agent.manifest);
             let fp = Self::fingerprint_agent(&req);
             let cached = self.agent_index_cache.lock().await.get(&agent.id).copied();
             if cached == Some(fp) {
@@ -651,7 +658,7 @@ impl DiscoveryIndexEventHandler {
         // ── Workflows ───────────────────────────────────────────────────
         let workflows = self
             .workflow_repo
-            .list_all_for_tenant(&TenantId::consumer())
+            .list_all()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list workflows for reconciliation: {e}"))?;
 
@@ -779,37 +786,45 @@ mod tests {
     struct FakeCortexClient {
         index_agent_calls: AtomicUsize,
         index_workflow_calls: AtomicUsize,
+        index_agent_requests: Mutex<Vec<IndexAgentRequest>>,
+        index_workflow_requests: Mutex<Vec<IndexWorkflowRequest>>,
+        remove_agent_requests: Mutex<Vec<RemoveDiscoveryAgentRequest>>,
+        remove_workflow_requests: Mutex<Vec<RemoveDiscoveryWorkflowRequest>>,
     }
 
     #[async_trait]
     impl CortexDiscoveryClient for FakeCortexClient {
         async fn index_agent(
             &self,
-            _request: IndexAgentRequest,
+            request: IndexAgentRequest,
         ) -> Result<IndexAgentResponse, Status> {
             self.index_agent_calls.fetch_add(1, Ordering::SeqCst);
+            self.index_agent_requests.lock().await.push(request);
             Ok(IndexAgentResponse::default())
         }
 
         async fn index_workflow(
             &self,
-            _request: IndexWorkflowRequest,
+            request: IndexWorkflowRequest,
         ) -> Result<IndexWorkflowResponse, Status> {
             self.index_workflow_calls.fetch_add(1, Ordering::SeqCst);
+            self.index_workflow_requests.lock().await.push(request);
             Ok(IndexWorkflowResponse::default())
         }
 
         async fn remove_discovery_agent(
             &self,
-            _request: RemoveDiscoveryAgentRequest,
+            request: RemoveDiscoveryAgentRequest,
         ) -> Result<RemoveDiscoveryAgentResponse, Status> {
+            self.remove_agent_requests.lock().await.push(request);
             Ok(RemoveDiscoveryAgentResponse::default())
         }
 
         async fn remove_discovery_workflow(
             &self,
-            _request: RemoveDiscoveryWorkflowRequest,
+            request: RemoveDiscoveryWorkflowRequest,
         ) -> Result<RemoveDiscoveryWorkflowResponse, Status> {
+            self.remove_workflow_requests.lock().await.push(request);
             Ok(RemoveDiscoveryWorkflowResponse::default())
         }
     }
@@ -1046,5 +1061,194 @@ mod tests {
         );
         assert_eq!(summary.workflows_checked, 3);
         assert_eq!(summary.workflows_indexed, 1);
+    }
+
+    // ─── Phase 3 regression: tenant leakage ────────────────────────────────
+
+    /// Build an [`IndexAgentRequest`] for an agent under an explicit tenant.
+    /// Asserts the request carries that tenant — i.e. the handler is *not*
+    /// hardcoding `TenantId::consumer()` regardless of the actual owning
+    /// tenant.
+    #[tokio::test]
+    async fn build_agent_index_request_uses_supplied_tenant() {
+        let manifest = make_manifest("alpha");
+        let agent_id = AgentId::new();
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let req =
+            DiscoveryIndexEventHandler::build_agent_index_request(&agent_id, &alice, &manifest);
+
+        assert_eq!(req.tenant_id, alice.to_string());
+        assert_ne!(
+            req.tenant_id,
+            TenantId::consumer().to_string(),
+            "handler must not fall back to the consumer singleton"
+        );
+    }
+
+    /// Drive the handler with an `AgentDeployed` event for tenant Alice and
+    /// assert the resulting Cortex `IndexAgentRequest` is tenant-scoped to
+    /// Alice — never to the global consumer tenant.
+    #[tokio::test]
+    async fn handle_event_indexes_agent_under_event_tenant_id() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+        let manifest = make_manifest("alpha");
+        let agent_id = AgentId::new();
+
+        let event = DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
+            agent_id,
+            tenant_id: alice.clone(),
+            manifest,
+            deployed_at: Utc::now(),
+        });
+        handler.handle_event(event).await;
+
+        let calls = cortex.index_agent_requests.lock().await;
+        assert_eq!(calls.len(), 1, "exactly one IndexAgent call expected");
+        assert_eq!(
+            calls[0].tenant_id,
+            alice.to_string(),
+            "deployed agent must be indexed under the event's tenant_id, not consumer()"
+        );
+        assert_ne!(calls[0].tenant_id, TenantId::consumer().to_string());
+    }
+
+    /// Drive the handler with `WorkflowRegistered` for tenant Bob and assert
+    /// the resulting Cortex `IndexWorkflowRequest` is tenant-scoped to Bob.
+    #[tokio::test]
+    async fn handle_event_indexes_workflow_under_event_tenant_id() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+
+        let bob = TenantId::for_consumer_user("bob").expect("valid per-user tenant id for bob");
+
+        // Seed the workflow under Bob (handler must look it up under the
+        // event's tenant, not the consumer singleton).
+        let mut wf = make_workflow("wf-bob", "bob's workflow");
+        wf.tenant_id = bob.clone();
+        workflow_repo
+            .save_for_tenant(&bob, &wf)
+            .await
+            .expect("save bob workflow");
+
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+
+        let event = DomainEvent::Workflow(WorkflowEvent::WorkflowRegistered {
+            workflow_id: wf.id,
+            tenant_id: bob.clone(),
+            name: "wf-bob".to_string(),
+            version: "1.0.0".to_string(),
+            scope: crate::domain::workflow::WorkflowScope::default(),
+            registered_at: Utc::now(),
+        });
+        handler.handle_event(event).await;
+
+        let calls = cortex.index_workflow_requests.lock().await;
+        assert_eq!(calls.len(), 1, "exactly one IndexWorkflow call expected");
+        assert_eq!(
+            calls[0].tenant_id,
+            bob.to_string(),
+            "workflow must be indexed under event's tenant"
+        );
+    }
+
+    /// Drive the handler with `AgentRemoved` for an explicit tenant and
+    /// assert the `RemoveDiscoveryAgentRequest` is tenant-scoped — not
+    /// hardcoded to consumer.
+    #[tokio::test]
+    async fn handle_event_removes_agent_under_event_tenant_id() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+
+        let carol =
+            TenantId::for_consumer_user("carol").expect("valid per-user tenant id for carol");
+        let agent_id = AgentId::new();
+
+        let event = DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentRemoved {
+            agent_id,
+            tenant_id: carol.clone(),
+            removed_at: Utc::now(),
+        });
+        handler.handle_event(event).await;
+
+        let calls = cortex.remove_agent_requests.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tenant_id, carol.to_string());
+    }
+
+    /// Drive `WorkflowRemoved` and assert the remove request carries the
+    /// event's tenant.
+    #[tokio::test]
+    async fn handle_event_removes_workflow_under_event_tenant_id() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+
+        let dave = TenantId::for_consumer_user("dave").expect("valid per-user tenant id for dave");
+        let workflow_id = WorkflowId::new();
+
+        let event = DomainEvent::Workflow(WorkflowEvent::WorkflowRemoved {
+            workflow_id,
+            tenant_id: dave.clone(),
+            workflow_name: "wf-dave".to_string(),
+            removed_at: Utc::now(),
+        });
+        handler.handle_event(event).await;
+
+        let calls = cortex.remove_workflow_requests.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tenant_id, dave.to_string());
+    }
+
+    /// Backfill must index every agent under its OWN owning tenant — agents
+    /// from different per-user tenants must NOT collapse into the consumer
+    /// singleton.
+    #[tokio::test]
+    async fn backfill_indexes_each_agent_under_its_own_tenant() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+        let bob = TenantId::for_consumer_user("bob").expect("valid per-user tenant id for bob");
+
+        let mut alice_agent = make_agent("alpha");
+        alice_agent.tenant_id = alice.clone();
+        agent_repo
+            .save_for_tenant(&alice, &alice_agent)
+            .await
+            .unwrap();
+
+        let mut bob_agent = make_agent("beta");
+        bob_agent.tenant_id = bob.clone();
+        agent_repo.save_for_tenant(&bob, &bob_agent).await.unwrap();
+
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+        handler.backfill().await.expect("backfill ok");
+
+        let calls = cortex.index_agent_requests.lock().await;
+        assert_eq!(calls.len(), 2, "expected one IndexAgent per tenant");
+        let tenants: std::collections::HashSet<&str> =
+            calls.iter().map(|r| r.tenant_id.as_str()).collect();
+        assert!(tenants.contains(alice.as_str()));
+        assert!(tenants.contains(bob.as_str()));
+        assert!(
+            !tenants.contains(TenantId::consumer().as_str())
+                || alice == TenantId::consumer()
+                || bob == TenantId::consumer(),
+            "no per-user agent should collapse onto the consumer singleton"
+        );
     }
 }

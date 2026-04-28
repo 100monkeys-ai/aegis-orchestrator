@@ -177,6 +177,17 @@ impl AgentRepository for InMemoryAgentRepository {
             .unwrap_or_default())
     }
 
+    async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError> {
+        let agents = self.agents.read().unwrap();
+        let mut all = Vec::new();
+        for tenant_agents in agents.values() {
+            for a in tenant_agents.values() {
+                all.push(a.clone());
+            }
+        }
+        Ok(all)
+    }
+
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -731,6 +742,17 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
             .get(tenant_id)
             .map(|tenant_workflows| tenant_workflows.values().cloned().collect())
             .unwrap_or_default())
+    }
+
+    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        let mut all = Vec::new();
+        for tenant_workflows in workflows.values() {
+            for w in tenant_workflows.values() {
+                all.push(w.clone());
+            }
+        }
+        Ok(all)
     }
 
     async fn resolve_by_name(

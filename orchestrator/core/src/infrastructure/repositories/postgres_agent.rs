@@ -356,6 +356,63 @@ impl AgentRepository for PostgresAgentRepository {
         Ok(agents)
     }
 
+    async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, tenant_id, name, manifest_json, status, scope, created_at, updated_at
+            FROM agents
+            ORDER BY tenant_id ASC, name ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut agents = Vec::new();
+        for row in rows {
+            let id: uuid::Uuid = row.get("id");
+            let tenant_str: String = row.get("tenant_id");
+            let tenant_id = TenantId::from_string(&tenant_str).map_err(|e| {
+                RepositoryError::Serialization(format!("Invalid tenant_id in row: {e}"))
+            })?;
+            let name: String = row.get("name");
+            let manifest_val: serde_json::Value = row.get("manifest_json");
+            let status_str: String = row.get("status");
+            let scope_str: String = row.get("scope");
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
+
+            let status = match status_str.as_str() {
+                "active" => AgentStatus::Active,
+                "paused" => AgentStatus::Paused,
+                "archived" => AgentStatus::Archived,
+                _ => AgentStatus::Active,
+            };
+
+            let scope = match scope_str.as_str() {
+                "global" => AgentScope::Global,
+                _ => AgentScope::Tenant,
+            };
+
+            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
+            })?;
+
+            agents.push(Agent {
+                id: AgentId(id),
+                tenant_id,
+                scope,
+                name,
+                manifest,
+                status,
+                created_at,
+                updated_at,
+            });
+        }
+        Ok(agents)
+    }
+
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,

@@ -1608,6 +1608,7 @@ mod tests {
         let agent_id = crate::domain::agent::AgentId::new();
         let event = AgentLifecycleEvent::AgentDeployed {
             agent_id,
+            tenant_id: crate::domain::tenant::TenantId::consumer(),
             manifest: crate::domain::agent::AgentManifest {
                 api_version: "100monkeys.ai/v1".to_string(),
                 kind: "Agent".to_string(),

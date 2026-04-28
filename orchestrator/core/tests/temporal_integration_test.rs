@@ -43,76 +43,56 @@ impl AgentLifecycleService for MockAgentServiceInt {
     async fn deploy_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        manifest: AgentManifest,
-        force: bool,
+        _manifest: AgentManifest,
+        _force: bool,
         _scope: aegis_orchestrator_core::domain::agent::AgentScope,
         _caller_identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
     ) -> anyhow::Result<AgentId> {
-        self.deploy_agent(manifest, force).await
-    }
-
-    async fn deploy_agent(
-        &self,
-        _manifest: AgentManifest,
-        _force: bool,
-    ) -> anyhow::Result<AgentId> {
-        panic!("test-only mock: deploy_agent is not exercised in this integration fixture")
+        panic!(
+            "test-only mock: deploy_agent_for_tenant is not exercised in this integration fixture"
+        )
     }
 
     async fn get_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        id: AgentId,
+        _id: AgentId,
     ) -> anyhow::Result<Agent> {
-        self.get_agent(id).await
-    }
-
-    async fn get_agent(&self, _id: AgentId) -> anyhow::Result<Agent> {
-        panic!("test-only mock: get_agent is not exercised in this integration fixture")
+        panic!("test-only mock: get_agent_for_tenant is not exercised in this integration fixture")
     }
 
     async fn update_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        id: AgentId,
-        manifest: AgentManifest,
+        _id: AgentId,
+        _manifest: AgentManifest,
     ) -> anyhow::Result<()> {
-        self.update_agent(id, manifest).await
-    }
-
-    async fn update_agent(&self, _id: AgentId, _manifest: AgentManifest) -> anyhow::Result<()> {
-        panic!("test-only mock: update_agent is not exercised in this integration fixture")
+        panic!(
+            "test-only mock: update_agent_for_tenant is not exercised in this integration fixture"
+        )
     }
 
     async fn delete_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        id: AgentId,
+        _id: AgentId,
     ) -> anyhow::Result<()> {
-        self.delete_agent(id).await
-    }
-
-    async fn delete_agent(&self, _id: AgentId) -> anyhow::Result<()> {
-        panic!("test-only mock: delete_agent is not exercised in this integration fixture")
+        panic!(
+            "test-only mock: delete_agent_for_tenant is not exercised in this integration fixture"
+        )
     }
 
     async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> anyhow::Result<Vec<Agent>> {
-        self.list_agents().await
-    }
-
-    async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
-        panic!("test-only mock: list_agents is not exercised in this integration fixture")
+        panic!(
+            "test-only mock: list_agents_for_tenant is not exercised in this integration fixture"
+        )
     }
 
     async fn lookup_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        name: &str,
+        _name: &str,
     ) -> anyhow::Result<Option<AgentId>> {
-        self.lookup_agent(name).await
-    }
-
-    async fn lookup_agent(&self, _name: &str) -> anyhow::Result<Option<AgentId>> {
         Ok(Some(AgentId(
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
         )))
@@ -196,6 +176,10 @@ impl WorkflowRepository for MockWorkflowRepo {
         &self,
         _tenant_id: &TenantId,
     ) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![])
     }
 
@@ -299,6 +283,10 @@ impl WorkflowRepository for StaticWorkflowRepo {
         &self,
         _tenant_id: &TenantId,
     ) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![self.workflow.clone()])
+    }
+
+    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![self.workflow.clone()])
     }
 

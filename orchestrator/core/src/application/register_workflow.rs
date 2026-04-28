@@ -283,6 +283,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         self.event_bus.publish_workflow_event(
             crate::domain::events::WorkflowEvent::WorkflowRegistered {
                 workflow_id: workflow.id,
+                tenant_id: tenant_id.clone(),
                 name: workflow_name.clone(),
                 version: workflow_version.clone(),
                 scope: workflow.scope.clone(),
@@ -324,68 +325,44 @@ mod tests {
         async fn deploy_agent_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            manifest: AgentManifest,
-            force: bool,
+            _manifest: AgentManifest,
+            _force: bool,
             _scope: crate::domain::agent::AgentScope,
             _caller_identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> anyhow::Result<AgentId> {
-            self.deploy_agent(manifest, force).await
-        }
-
-        async fn deploy_agent(
-            &self,
-            _manifest: AgentManifest,
-            _force: bool,
-        ) -> anyhow::Result<AgentId> {
-            panic!("test-only fixture: deploy_agent is not exercised in this test")
+            panic!("test-only fixture: deploy_agent_for_tenant is not exercised in this test")
         }
 
         async fn get_agent_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            id: AgentId,
+            _id: AgentId,
         ) -> anyhow::Result<Agent> {
-            self.get_agent(id).await
-        }
-
-        async fn get_agent(&self, _id: AgentId) -> anyhow::Result<Agent> {
-            panic!("test-only fixture: get_agent is not exercised in this test")
+            panic!("test-only fixture: get_agent_for_tenant is not exercised in this test")
         }
 
         async fn update_agent_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            id: AgentId,
-            manifest: AgentManifest,
+            _id: AgentId,
+            _manifest: AgentManifest,
         ) -> anyhow::Result<()> {
-            self.update_agent(id, manifest).await
-        }
-
-        async fn update_agent(&self, _id: AgentId, _manifest: AgentManifest) -> anyhow::Result<()> {
-            panic!("test-only fixture: update_agent is not exercised in this test")
+            panic!("test-only fixture: update_agent_for_tenant is not exercised in this test")
         }
 
         async fn delete_agent_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            id: AgentId,
+            _id: AgentId,
         ) -> anyhow::Result<()> {
-            self.delete_agent(id).await
-        }
-
-        async fn delete_agent(&self, _id: AgentId) -> anyhow::Result<()> {
-            panic!("test-only fixture: delete_agent is not exercised in this test")
+            panic!("test-only fixture: delete_agent_for_tenant is not exercised in this test")
         }
 
         async fn list_agents_for_tenant(
             &self,
             _tenant_id: &TenantId,
         ) -> anyhow::Result<Vec<Agent>> {
-            self.list_agents().await
-        }
-
-        async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
-            panic!("test-only fixture: list_agents is not exercised in this test")
+            panic!("test-only fixture: list_agents_for_tenant is not exercised in this test")
         }
 
         async fn lookup_agent_for_tenant(
@@ -393,10 +370,6 @@ mod tests {
             _tenant_id: &TenantId,
             name: &str,
         ) -> anyhow::Result<Option<AgentId>> {
-            self.lookup_agent(name).await
-        }
-
-        async fn lookup_agent(&self, name: &str) -> anyhow::Result<Option<AgentId>> {
             if name == "nonexistent-agent" {
                 return Ok(None);
             }
@@ -410,7 +383,7 @@ mod tests {
             _tenant_id: &TenantId,
             name: &str,
         ) -> anyhow::Result<Option<AgentId>> {
-            self.lookup_agent(name).await
+            self.lookup_agent_for_tenant(_tenant_id, name).await
         }
 
         async fn lookup_agent_for_tenant_with_version(
@@ -419,7 +392,7 @@ mod tests {
             name: &str,
             _version: &str,
         ) -> anyhow::Result<Option<AgentId>> {
-            self.lookup_agent(name).await
+            self.lookup_agent_for_tenant(_tenant_id, name).await
         }
 
         async fn list_agents_visible_for_tenant(
@@ -552,6 +525,10 @@ spec:
             &self,
             _tenant_id: &TenantId,
         ) -> Result<Vec<Workflow>, RepositoryError> {
+            Ok(vec![])
+        }
+
+        async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
             Ok(vec![])
         }
 

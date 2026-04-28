@@ -136,16 +136,36 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
                 // preserving its AgentId so existing execution references remain valid.
                 // Preserve the existing scope on force-overwrite.
                 let mut updated = existing.clone();
+                let new_version = updated.manifest.metadata.version.clone();
+                let old_version = existing_version.clone();
                 updated.update_manifest(manifest);
                 self.repository.save_for_tenant(tenant_id, &updated).await?;
+                self.event_bus
+                    .publish_agent_event(AgentLifecycleEvent::AgentUpdated {
+                        agent_id: updated.id,
+                        tenant_id: tenant_id.clone(),
+                        old_version,
+                        new_version,
+                        updated_at: Utc::now(),
+                    });
                 return Ok(updated.id);
             }
 
             // Different version — treat as an in-place update (new version replaces old).
             // Preserve existing scope when updating version.
+            let old_version = existing_version.clone();
+            let new_version = manifest.metadata.version.clone();
             let mut updated = existing.clone();
             updated.update_manifest(manifest);
             self.repository.save_for_tenant(tenant_id, &updated).await?;
+            self.event_bus
+                .publish_agent_event(AgentLifecycleEvent::AgentUpdated {
+                    agent_id: updated.id,
+                    tenant_id: tenant_id.clone(),
+                    old_version,
+                    new_version,
+                    updated_at: Utc::now(),
+                });
             return Ok(updated.id);
         }
 
@@ -154,6 +174,14 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         agent.scope = scope;
         agent.tenant_id = tenant_id.clone();
         self.repository.save_for_tenant(tenant_id, &agent).await?;
+
+        self.event_bus
+            .publish_agent_event(AgentLifecycleEvent::AgentDeployed {
+                agent_id: agent.id,
+                tenant_id: tenant_id.clone(),
+                manifest: agent.manifest.clone(),
+                deployed_at: Utc::now(),
+            });
 
         metrics::counter!(
             "aegis_agent_lifecycle_operations_total",
@@ -187,8 +215,18 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         manifest: AgentManifest,
     ) -> Result<()> {
         let mut agent = self.get_agent_for_tenant(tenant_id, id).await?;
+        let old_version = agent.manifest.metadata.version.clone();
+        let new_version = manifest.metadata.version.clone();
         agent.update_manifest(manifest);
         self.repository.save_for_tenant(tenant_id, &agent).await?;
+        self.event_bus
+            .publish_agent_event(AgentLifecycleEvent::AgentUpdated {
+                agent_id: id,
+                tenant_id: tenant_id.clone(),
+                old_version,
+                new_version,
+                updated_at: Utc::now(),
+            });
         Ok(())
     }
 
@@ -198,6 +236,7 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         self.event_bus
             .publish_agent_event(AgentLifecycleEvent::AgentRemoved {
                 agent_id: id,
+                tenant_id: tenant_id.clone(),
                 removed_at: Utc::now(),
             });
 
@@ -274,5 +313,199 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             .list_versions_for_tenant(tenant_id, agent_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agent versions: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Phase 3 regression: AgentDeployed/AgentUpdated/AgentRemoved events
+    //! must carry the actual owning `tenant_id` so downstream subscribers
+    //! (Cortex discovery indexer in particular) cannot collapse every
+    //! agent onto the consumer singleton.
+
+    use super::*;
+    use crate::domain::agent::{
+        AgentManifest, AgentSpec, ImagePullPolicy, ManifestMetadata, RuntimeConfig, TaskConfig,
+    };
+    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::InMemoryAgentRepository;
+    use crate::infrastructure::security_context::InMemorySecurityContextRepository;
+    use std::collections::HashMap;
+
+    fn manifest(name: &str, version: &str) -> AgentManifest {
+        AgentManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "Agent".to_string(),
+            metadata: ManifestMetadata {
+                name: name.to_string(),
+                version: version.to_string(),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+            },
+            spec: AgentSpec {
+                runtime: RuntimeConfig {
+                    language: Some("python".to_string()),
+                    version: Some("3.11".to_string()),
+                    image: None,
+                    image_pull_policy: ImagePullPolicy::IfNotPresent,
+                    isolation: "inherit".to_string(),
+                    model: "default".to_string(),
+                    temperature: None,
+                },
+                task: Some(TaskConfig {
+                    instruction: Some("noop".to_string()),
+                    prompt_template: None,
+                    input_data: None,
+                }),
+                context: vec![],
+                execution: None,
+                security: None,
+                schedule: None,
+                tools: vec![],
+                env: HashMap::new(),
+                volumes: vec![],
+                advanced: None,
+                input_schema: None,
+                security_context: None,
+                output_handler: None,
+            },
+        }
+    }
+
+    fn make_service() -> (
+        StandardAgentLifecycleService,
+        Arc<crate::infrastructure::event_bus::EventBus>,
+    ) {
+        let repo = Arc::new(InMemoryAgentRepository::new());
+        let bus = Arc::new(crate::infrastructure::event_bus::EventBus::new(64));
+        let sec_repo = Arc::new(InMemorySecurityContextRepository::new());
+        let svc = StandardAgentLifecycleService::new(repo, bus.clone(), sec_repo);
+        (svc, bus)
+    }
+
+    #[tokio::test]
+    async fn agent_deployed_event_carries_owning_tenant_id() {
+        let (svc, bus) = make_service();
+        let mut rx = bus.subscribe();
+
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let _id = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                manifest("alpha", "1.0.0"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect("deploy ok");
+
+        let received = rx.recv().await.expect("event published");
+        match received {
+            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
+                tenant_id, ..
+            }) => {
+                assert_eq!(
+                    tenant_id, alice,
+                    "AgentDeployed must carry the owning tenant, not consumer()"
+                );
+                assert_ne!(tenant_id, TenantId::consumer());
+            }
+            other => panic!("expected AgentDeployed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_updated_event_carries_owning_tenant_id() {
+        let (svc, bus) = make_service();
+        let mut rx = bus.subscribe();
+
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        // Deploy v1
+        let id = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                manifest("alpha", "1.0.0"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect("deploy v1 ok");
+        // drain the deployed event
+        let _ = rx.recv().await.expect("deploy event");
+
+        // Update via versioned re-deploy → publishes AgentUpdated.
+        let _ = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                manifest("alpha", "1.1.0"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect("deploy v2 ok");
+
+        let received = rx.recv().await.expect("update event");
+        match received {
+            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentUpdated {
+                agent_id,
+                tenant_id,
+                old_version,
+                new_version,
+                ..
+            }) => {
+                assert_eq!(agent_id, id);
+                assert_eq!(tenant_id, alice);
+                assert_eq!(old_version, "1.0.0");
+                assert_eq!(new_version, "1.1.0");
+            }
+            other => panic!("expected AgentUpdated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_removed_event_carries_owning_tenant_id() {
+        let (svc, bus) = make_service();
+        let mut rx = bus.subscribe();
+
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let id = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                manifest("alpha", "1.0.0"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect("deploy ok");
+        // drain deploy event
+        let _ = rx.recv().await.expect("deploy event");
+
+        svc.delete_agent_for_tenant(&alice, id)
+            .await
+            .expect("delete ok");
+
+        let received = rx.recv().await.expect("remove event");
+        match received {
+            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentRemoved {
+                agent_id,
+                tenant_id,
+                ..
+            }) => {
+                assert_eq!(agent_id, id);
+                assert_eq!(tenant_id, alice);
+            }
+            other => panic!("expected AgentRemoved, got {other:?}"),
+        }
     }
 }

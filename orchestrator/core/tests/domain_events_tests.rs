@@ -107,6 +107,7 @@ fn execution_id_returns_none_for_workflow_registered() {
     let wid = WorkflowId::new();
     let event = DomainEvent::Workflow(WorkflowEvent::WorkflowRegistered {
         workflow_id: wid,
+        tenant_id: aegis_orchestrator_core::domain::tenant::TenantId::consumer(),
         name: "build-pipeline".to_string(),
         version: "1.0.0".to_string(),
         scope: aegis_orchestrator_core::domain::workflow::WorkflowScope::default(),
@@ -186,6 +187,7 @@ fn agent_id_returns_some_for_agent_deployed() {
         serde_json::from_value(manifest_json).unwrap();
     let event = DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
         agent_id: aid,
+        tenant_id: aegis_orchestrator_core::domain::tenant::TenantId::consumer(),
         manifest,
         deployed_at: Utc::now(),
     });
@@ -530,6 +532,7 @@ fn agent_lifecycle_updated_serde_roundtrip() {
     let aid = AgentId::new();
     let event = AgentLifecycleEvent::AgentUpdated {
         agent_id: aid,
+        tenant_id: aegis_orchestrator_core::domain::tenant::TenantId::consumer(),
         old_version: "1.0.0".to_string(),
         new_version: "1.1.0".to_string(),
         updated_at: Utc::now(),
@@ -554,6 +557,7 @@ fn agent_lifecycle_removed_serde_roundtrip() {
     let aid = AgentId::new();
     let event = AgentLifecycleEvent::AgentRemoved {
         agent_id: aid,
+        tenant_id: aegis_orchestrator_core::domain::tenant::TenantId::consumer(),
         removed_at: Utc::now(),
     };
     let json = serde_json::to_string(&event).unwrap();

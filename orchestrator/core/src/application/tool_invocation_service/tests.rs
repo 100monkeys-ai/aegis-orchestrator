@@ -154,65 +154,51 @@ impl AgentLifecycleService for TestAgentLifecycleService {
     async fn deploy_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        manifest: AgentManifest,
-        force: bool,
+        _manifest: AgentManifest,
+        _force: bool,
         _scope: crate::domain::agent::AgentScope,
         _caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<AgentId> {
-        self.deploy_agent(manifest, force).await
+        anyhow::bail!(
+            "TestAgentLifecycleService::deploy_agent_for_tenant not exercised in this test"
+        )
     }
 
-    async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
-        anyhow::bail!("TestAgentLifecycleService::deploy_agent not exercised in this test")
-    }
-
-    async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
-        self.get_agent(id).await
-    }
-
-    async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+    async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, _id: AgentId) -> Result<Agent> {
         Ok(test_agent_with_tools(&[]))
     }
 
     async fn update_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        id: AgentId,
-        manifest: AgentManifest,
+        _id: AgentId,
+        _manifest: AgentManifest,
     ) -> Result<()> {
-        self.update_agent(id, manifest).await
+        anyhow::bail!(
+            "TestAgentLifecycleService::update_agent_for_tenant not exercised in this test"
+        )
     }
 
-    async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
-        anyhow::bail!("TestAgentLifecycleService::update_agent not exercised in this test")
-    }
-
-    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
-        self.delete_agent(id).await
-    }
-
-    async fn delete_agent(&self, _: AgentId) -> Result<()> {
-        anyhow::bail!("TestAgentLifecycleService::delete_agent not exercised in this test")
+    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, _id: AgentId) -> Result<()> {
+        anyhow::bail!(
+            "TestAgentLifecycleService::delete_agent_for_tenant not exercised in this test"
+        )
     }
 
     async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
-        self.list_agents().await
-    }
-
-    async fn list_agents(&self) -> Result<Vec<Agent>> {
-        anyhow::bail!("TestAgentLifecycleService::list_agents not exercised in this test")
+        anyhow::bail!(
+            "TestAgentLifecycleService::list_agents_for_tenant not exercised in this test"
+        )
     }
 
     async fn lookup_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        name: &str,
+        _name: &str,
     ) -> Result<Option<AgentId>> {
-        self.lookup_agent(name).await
-    }
-
-    async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
-        anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
+        anyhow::bail!(
+            "TestAgentLifecycleService::lookup_agent_for_tenant not exercised in this test"
+        )
     }
 
     async fn lookup_agent_visible_for_tenant(
@@ -258,23 +244,17 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
     async fn deploy_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        manifest: AgentManifest,
-        force: bool,
+        _manifest: AgentManifest,
+        _force: bool,
         _scope: crate::domain::agent::AgentScope,
         _caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<AgentId> {
-        self.deploy_agent(manifest, force).await
-    }
-
-    async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
-        anyhow::bail!("FilteringAgentLifecycleService::deploy_agent not exercised in this test")
+        anyhow::bail!(
+            "FilteringAgentLifecycleService::deploy_agent_for_tenant not exercised in this test"
+        )
     }
 
     async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
-        self.get_agent(id).await
-    }
-
-    async fn get_agent(&self, id: AgentId) -> Result<Agent> {
         if id == self.agent.id {
             Ok(self.agent.clone())
         } else {
@@ -285,29 +265,21 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
     async fn update_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        id: AgentId,
-        manifest: AgentManifest,
+        _id: AgentId,
+        _manifest: AgentManifest,
     ) -> Result<()> {
-        self.update_agent(id, manifest).await
+        anyhow::bail!(
+            "FilteringAgentLifecycleService::update_agent_for_tenant not exercised in this test"
+        )
     }
 
-    async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
-        anyhow::bail!("FilteringAgentLifecycleService::update_agent not exercised in this test")
-    }
-
-    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
-        self.delete_agent(id).await
-    }
-
-    async fn delete_agent(&self, _: AgentId) -> Result<()> {
-        anyhow::bail!("FilteringAgentLifecycleService::delete_agent not exercised in this test")
+    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, _id: AgentId) -> Result<()> {
+        anyhow::bail!(
+            "FilteringAgentLifecycleService::delete_agent_for_tenant not exercised in this test"
+        )
     }
 
     async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
-        self.list_agents().await
-    }
-
-    async fn list_agents(&self) -> Result<Vec<Agent>> {
         Ok(vec![self.agent.clone()])
     }
 
@@ -316,29 +288,25 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
         _tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<AgentId>> {
-        self.lookup_agent(name).await
-    }
-
-    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
         Ok((name == self.agent.name).then_some(self.agent.id))
     }
 
     async fn lookup_agent_visible_for_tenant(
         &self,
-        _tenant_id: &TenantId,
+        tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<AgentId>> {
-        self.lookup_agent(name).await
+        self.lookup_agent_for_tenant(tenant_id, name).await
     }
 
     async fn lookup_agent_for_tenant_with_version(
         &self,
-        _tenant_id: &TenantId,
+        tenant_id: &TenantId,
         name: &str,
         _version: &str,
     ) -> Result<Option<AgentId>> {
         // Delegate to name-only lookup for existing tests
-        self.lookup_agent(name).await
+        self.lookup_agent_for_tenant(tenant_id, name).await
     }
 
     async fn list_agents_visible_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
@@ -2272,52 +2240,32 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
     async fn deploy_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        manifest: AgentManifest,
-        force: bool,
+        _manifest: AgentManifest,
+        _force: bool,
         _scope: crate::domain::agent::AgentScope,
         _caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<AgentId> {
-        self.deploy_agent(manifest, force).await
-    }
-
-    async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
         anyhow::bail!("not exercised")
     }
 
-    async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
-        self.get_agent(id).await
-    }
-
-    async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+    async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, _id: AgentId) -> Result<Agent> {
         anyhow::bail!("not exercised")
     }
 
     async fn update_agent_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        id: AgentId,
-        manifest: AgentManifest,
+        _id: AgentId,
+        _manifest: AgentManifest,
     ) -> Result<()> {
-        self.update_agent(id, manifest).await
-    }
-
-    async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
         anyhow::bail!("not exercised")
     }
 
-    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
-        self.delete_agent(id).await
-    }
-
-    async fn delete_agent(&self, _: AgentId) -> Result<()> {
+    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, _id: AgentId) -> Result<()> {
         anyhow::bail!("not exercised")
     }
 
     async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
-        self.list_agents().await
-    }
-
-    async fn list_agents(&self) -> Result<Vec<Agent>> {
         anyhow::bail!("not exercised")
     }
 
@@ -2326,32 +2274,20 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
         _tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<AgentId>> {
-        self.lookup_agent(name).await
-    }
-
-    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
         Ok((name == self.agent_name).then_some(self.agent_id))
     }
 
     async fn lookup_agent_visible_for_tenant(
         &self,
-        _tenant_id: &TenantId,
+        tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<AgentId>> {
-        self.lookup_agent(name).await
+        self.lookup_agent_for_tenant(tenant_id, name).await
     }
 
     async fn lookup_agent_for_tenant_with_version(
         &self,
         _tenant_id: &TenantId,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<AgentId>> {
-        self.lookup_agent_with_version(name, version).await
-    }
-
-    async fn lookup_agent_with_version(
-        &self,
         name: &str,
         version: &str,
     ) -> Result<Option<AgentId>> {
@@ -2382,35 +2318,28 @@ async fn version_aware_agent_lifecycle_service_lookup_agent_with_version_is_corr
         agent_version: agent_version.to_string(),
         agent_id,
     };
+    let tenant_id = TenantId::consumer();
 
     // Matching name and version returns Some(agent_id).
-    let result = service
-        .lookup_agent_with_version(agent_name, agent_version)
-        .await
-        .expect("lookup_agent_with_version should succeed");
-    assert_eq!(result, Some(agent_id));
-
-    // Correct name, wrong version returns None.
-    let result = service
-        .lookup_agent_with_version(agent_name, "9.9.9")
-        .await
-        .expect("lookup_agent_with_version should succeed");
-    assert_eq!(result, None);
-
-    // Wrong name, correct version returns None.
-    let result = service
-        .lookup_agent_with_version("other-agent", agent_version)
-        .await
-        .expect("lookup_agent_with_version should succeed");
-    assert_eq!(result, None);
-
-    // Also validate the tenant-scoped wrapper delegates correctly.
-    let tenant_id = TenantId::consumer();
     let result = service
         .lookup_agent_for_tenant_with_version(&tenant_id, agent_name, agent_version)
         .await
         .expect("lookup_agent_for_tenant_with_version should succeed");
     assert_eq!(result, Some(agent_id));
+
+    // Correct name, wrong version returns None.
+    let result = service
+        .lookup_agent_for_tenant_with_version(&tenant_id, agent_name, "9.9.9")
+        .await
+        .expect("lookup_agent_for_tenant_with_version should succeed");
+    assert_eq!(result, None);
+
+    // Wrong name, correct version returns None.
+    let result = service
+        .lookup_agent_for_tenant_with_version(&tenant_id, "other-agent", agent_version)
+        .await
+        .expect("lookup_agent_for_tenant_with_version should succeed");
+    assert_eq!(result, None);
 }
 
 /// Helper: build a `ToolInvocationService` backed by a `VersionAwareAgentLifecycleService`.
@@ -2982,60 +2911,36 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
         async fn deploy_agent_for_tenant(
             &self,
             _: &TenantId,
-            manifest: AgentManifest,
-            force: bool,
+            _: AgentManifest,
+            _: bool,
             _: crate::domain::agent::AgentScope,
             _: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<AgentId> {
-            self.deploy_agent(manifest, force).await
-        }
-
-        async fn deploy_agent(&self, _: AgentManifest, _: bool) -> Result<AgentId> {
             anyhow::bail!("not exercised")
         }
 
-        async fn get_agent_for_tenant(&self, _: &TenantId, id: AgentId) -> Result<Agent> {
-            self.get_agent(id).await
-        }
-
-        async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+        async fn get_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> Result<Agent> {
             Ok(self.agent.clone())
         }
 
         async fn update_agent_for_tenant(
             &self,
             _: &TenantId,
-            id: AgentId,
-            manifest: AgentManifest,
+            _: AgentId,
+            _: AgentManifest,
         ) -> Result<()> {
-            self.update_agent(id, manifest).await
-        }
-
-        async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
             anyhow::bail!("not exercised")
         }
 
-        async fn delete_agent_for_tenant(&self, _: &TenantId, id: AgentId) -> Result<()> {
-            self.delete_agent(id).await
-        }
-
-        async fn delete_agent(&self, _: AgentId) -> Result<()> {
+        async fn delete_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> Result<()> {
             anyhow::bail!("not exercised")
         }
 
         async fn list_agents_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
-            self.list_agents().await
-        }
-
-        async fn list_agents(&self) -> Result<Vec<Agent>> {
             anyhow::bail!("not exercised")
         }
 
         async fn lookup_agent_for_tenant(&self, _: &TenantId, _: &str) -> Result<Option<AgentId>> {
-            self.lookup_agent("").await
-        }
-
-        async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
             anyhow::bail!("not exercised")
         }
 
