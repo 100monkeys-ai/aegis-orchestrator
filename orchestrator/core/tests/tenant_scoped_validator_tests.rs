@@ -124,7 +124,11 @@ impl ExecutionService for TenantScopedMockExecutionService {
         anyhow::bail!("not exercised")
     }
 
-    async fn cancel_execution(&self, _id: ExecutionId) -> anyhow::Result<()> {
+    async fn cancel_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -146,15 +150,21 @@ impl ExecutionService for TenantScopedMockExecutionService {
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    async fn list_executions(
+    async fn list_executions_for_tenant(
         &self,
+        _tenant_id: &TenantId,
         _agent_id: Option<AgentId>,
+        _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         _limit: usize,
     ) -> anyhow::Result<Vec<Execution>> {
         Ok(vec![])
     }
 
-    async fn delete_execution(&self, _id: ExecutionId) -> anyhow::Result<()> {
+    async fn delete_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

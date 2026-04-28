@@ -140,8 +140,14 @@ impl ExecutionService for UnusedExecutionService {
         )
     }
 
-    async fn cancel_execution(&self, _id: ExecutionId) -> anyhow::Result<()> {
-        unreachable!("cancel_execution must not be called for deferred output handler variants")
+    async fn cancel_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        unreachable!(
+            "cancel_execution_for_tenant must not be called for deferred output handler variants"
+        )
     }
 
     async fn stream_execution(
@@ -158,16 +164,26 @@ impl ExecutionService for UnusedExecutionService {
         unreachable!("stream_agent_events must not be called for deferred output handler variants")
     }
 
-    async fn list_executions(
+    async fn list_executions_for_tenant(
         &self,
+        _tenant_id: &TenantId,
         _agent_id: Option<AgentId>,
+        _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         _limit: usize,
     ) -> anyhow::Result<Vec<Execution>> {
-        unreachable!("list_executions must not be called for deferred output handler variants")
+        unreachable!(
+            "list_executions_for_tenant must not be called for deferred output handler variants"
+        )
     }
 
-    async fn delete_execution(&self, _id: ExecutionId) -> anyhow::Result<()> {
-        unreachable!("delete_execution must not be called for deferred output handler variants")
+    async fn delete_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        unreachable!(
+            "delete_execution_for_tenant must not be called for deferred output handler variants"
+        )
     }
 
     async fn record_llm_interaction(

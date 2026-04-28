@@ -172,15 +172,25 @@ pub trait ExecutionService: Send + Sync {
         exec_id: ExecutionId,
     ) -> Result<Vec<Iteration>>;
 
-    /// Request cancellation of a running execution.
+    /// Request cancellation of a running execution within a tenant scope.
+    ///
+    /// All caller-facing cancellations MUST be tenant-scoped. There is no
+    /// `cancel_execution(id)` convenience that defaults to a consumer tenant —
+    /// pass the caller's authenticated `TenantId` explicitly. Cross-tenant
+    /// cancellation is impossible by construction.
     ///
     /// The execution may not terminate immediately; monitor via
     /// [`ExecutionService::stream_execution`] for the `ExecutionCancelled` event.
     ///
     /// # Errors
     ///
-    /// Returns an error if the execution does not exist or is already terminal.
-    async fn cancel_execution(&self, id: ExecutionId) -> Result<()>;
+    /// Returns an error if the execution does not exist within the given
+    /// tenant or is already terminal.
+    async fn cancel_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()>;
 
     /// Open a live server-sent event stream of [`ExecutionEvent`]s for a single execution.
     ///
@@ -200,19 +210,37 @@ pub trait ExecutionService: Send + Sync {
         id: AgentId,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>>;
 
-    /// List executions, optionally filtered by `agent_id`, newest first, capped at `limit`.
-    async fn list_executions(
+    /// List executions for a tenant, optionally filtered by `agent_id` and/or
+    /// `workflow_id`, newest first, capped at `limit`.
+    ///
+    /// All caller-facing list queries MUST be tenant-scoped. There is no
+    /// `list_executions` convenience that defaults to a consumer-tier
+    /// singleton — pass the caller's authenticated `TenantId` explicitly.
+    async fn list_executions_for_tenant(
         &self,
+        tenant_id: &TenantId,
         agent_id: Option<AgentId>,
+        workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
     ) -> Result<Vec<Execution>>;
 
-    /// Permanently delete an execution record and all its iterations.
+    /// Permanently delete an execution record and all its iterations within
+    /// a tenant scope.
+    ///
+    /// All caller-facing deletions MUST be tenant-scoped. There is no
+    /// `delete_execution(id)` convenience that defaults to a consumer tenant —
+    /// pass the caller's authenticated `TenantId` explicitly. Cross-tenant
+    /// deletion is impossible by construction.
     ///
     /// # Errors
     ///
-    /// Returns an error if the execution does not exist or is currently running.
-    async fn delete_execution(&self, id: ExecutionId) -> Result<()>;
+    /// Returns an error if the execution does not exist within the given
+    /// tenant or is currently running.
+    async fn delete_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()>;
 
     /// Append an LLM interaction record to an existing iteration.
     ///
@@ -3389,9 +3417,12 @@ impl ExecutionService for StandardExecutionService {
         StandardExecutionService::get_iterations_for_tenant(self, tenant_id, exec_id).await
     }
 
-    async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
-        self.cancel_execution_for_tenant(&TenantId::consumer(), id)
-            .await
+    async fn cancel_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        StandardExecutionService::cancel_execution_for_tenant(self, tenant_id, id).await
     }
 
     async fn stream_execution(
@@ -3420,13 +3451,21 @@ impl ExecutionService for StandardExecutionService {
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    async fn list_executions(
+    async fn list_executions_for_tenant(
         &self,
+        tenant_id: &TenantId,
         agent_id: Option<AgentId>,
+        workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
     ) -> Result<Vec<Execution>> {
-        self.list_executions_for_tenant(&TenantId::consumer(), agent_id, None, limit)
-            .await
+        StandardExecutionService::list_executions_for_tenant(
+            self,
+            tenant_id,
+            agent_id,
+            workflow_id,
+            limit,
+        )
+        .await
     }
 
     async fn start_child_execution(
@@ -3982,9 +4021,12 @@ impl ExecutionService for StandardExecutionService {
         Ok(child_execution_id)
     }
 
-    async fn delete_execution(&self, id: ExecutionId) -> Result<()> {
-        self.delete_execution_for_tenant(&TenantId::consumer(), id)
-            .await
+    async fn delete_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        StandardExecutionService::delete_execution_for_tenant(self, tenant_id, id).await
     }
 
     async fn record_llm_interaction(
