@@ -302,8 +302,12 @@ impl ExecutionService for ClusterAwareExecutionService {
             .await
     }
 
-    async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
-        self.inner.cancel_execution(id).await
+    async fn cancel_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        self.inner.cancel_execution_for_tenant(tenant_id, id).await
     }
 
     async fn stream_execution(
@@ -320,16 +324,24 @@ impl ExecutionService for ClusterAwareExecutionService {
         self.inner.stream_agent_events(id).await
     }
 
-    async fn list_executions(
+    async fn list_executions_for_tenant(
         &self,
+        tenant_id: &TenantId,
         agent_id: Option<AgentId>,
+        workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
     ) -> Result<Vec<Execution>> {
-        self.inner.list_executions(agent_id, limit).await
+        self.inner
+            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit)
+            .await
     }
 
-    async fn delete_execution(&self, id: ExecutionId) -> Result<()> {
-        self.inner.delete_execution(id).await
+    async fn delete_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        self.inner.delete_execution_for_tenant(tenant_id, id).await
     }
 
     async fn record_llm_interaction(

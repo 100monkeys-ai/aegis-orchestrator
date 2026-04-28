@@ -118,8 +118,14 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_task_status_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution data is touched. Without this gate any
+        // caller could read any tenant's execution by guessing its UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -134,7 +140,11 @@ impl ToolInvocationService {
                 |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
             )?);
 
-        match self.execution_service.get_execution_unscoped(exec_id).await {
+        match self
+            .execution_service
+            .get_execution_for_tenant(&tenant_id, exec_id)
+            .await
+        {
             Ok(exec) => {
                 let last_iter = exec.iterations().last();
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -161,8 +171,14 @@ impl ToolInvocationService {
     /// Returns the final execution status, output, and error (if any).
     pub(super) async fn invoke_aegis_task_wait_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution data is touched. Without this gate any
+        // caller could poll any tenant's execution by guessing its UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -190,7 +206,11 @@ impl ToolInvocationService {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
 
         loop {
-            match self.execution_service.get_execution_unscoped(exec_id).await {
+            match self
+                .execution_service
+                .get_execution_for_tenant(&tenant_id, exec_id)
+                .await
+            {
                 Ok(exec) => {
                     let status_str = format!("{:?}", exec.status).to_lowercase();
                     let is_terminal = matches!(
@@ -241,8 +261,14 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_task_logs_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution data is touched. Without this gate any
+        // caller could read any tenant's execution events by guessing its UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -271,7 +297,14 @@ impl ToolInvocationService {
             .map(|n| n as usize)
             .unwrap_or(0);
 
-        let execution = match self.execution_service.get_execution_unscoped(exec_id).await {
+        // The tenant gate is enforced here: get_execution_for_tenant returns
+        // an error when the execution doesn't belong to `tenant_id`, so a
+        // foreign-tenant UUID cannot reach the unscoped events query below.
+        let execution = match self
+            .execution_service
+            .get_execution_for_tenant(&tenant_id, exec_id)
+            .await
+        {
             Ok(execution) => execution,
             Err(error) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -316,14 +349,15 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_list_tool(
         &self,
         args: &mut Value,
-        _scope: &crate::domain::iam::TenantScope,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         // ADR-097: bind/verify the requested tenant against the authenticated
-        // scope before any execution data is touched. The underlying
-        // list_executions query is currently unscoped at the repository layer,
-        // but consumer-tier callers cannot delegate so the rejection happens
-        // here regardless.
-        let _tenant_id = Self::enforce_tenant_arg(args, _scope)?;
+        // scope and thread it through the repository query. Prior to this
+        // fix the captured tenant was discarded and the handler invoked the
+        // unscoped `list_executions`, which routed to the global
+        // `TenantId::consumer()` singleton — leaking every consumer-tier
+        // execution across all callers.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
 
         let agent_id = args
             .get("agent_id")
@@ -335,7 +369,7 @@ impl ToolInvocationService {
 
         match self
             .execution_service
-            .list_executions(agent_id, limit)
+            .list_executions_for_tenant(&tenant_id, agent_id, None, limit)
             .await
         {
             Ok(executions) => {
@@ -367,8 +401,14 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_task_cancel_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution data is touched. Without this gate any
+        // caller could cancel any tenant's execution by guessing its UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -383,7 +423,11 @@ impl ToolInvocationService {
                 |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
             )?);
 
-        match self.execution_service.cancel_execution(exec_id).await {
+        match self
+            .execution_service
+            .cancel_execution_for_tenant(&tenant_id, exec_id)
+            .await
+        {
             Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.task.cancel",
                 "cancelled": true,
@@ -399,8 +443,14 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_task_remove_tool(
         &self,
-        args: &Value,
+        args: &mut Value,
+        scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
+        // ADR-097: bind/verify the requested tenant against the authenticated
+        // scope before any execution data is touched. Without this gate any
+        // caller could delete any tenant's execution by guessing its UUID.
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
@@ -415,7 +465,11 @@ impl ToolInvocationService {
                 |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
             )?);
 
-        match self.execution_service.delete_execution(exec_id).await {
+        match self
+            .execution_service
+            .delete_execution_for_tenant(&tenant_id, exec_id)
+            .await
+        {
             Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.task.remove",
                 "removed": true,

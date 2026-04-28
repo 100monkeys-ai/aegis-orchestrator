@@ -397,7 +397,7 @@ impl ExecutionService for TestExecutionService {
     ) -> Result<Vec<Iteration>> {
         anyhow::bail!("TestExecutionService::get_iterations_for_tenant not exercised in this test")
     }
-    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("TestExecutionService::cancel_execution not exercised in this test")
     }
     async fn stream_execution(
@@ -412,10 +412,16 @@ impl ExecutionService for TestExecutionService {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
         anyhow::bail!("TestExecutionService::stream_agent_events not exercised in this test")
     }
-    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
-        anyhow::bail!("TestExecutionService::list_executions not exercised in this test")
+    async fn list_executions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: Option<AgentId>,
+        _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
+        anyhow::bail!("TestExecutionService::list_executions_for_tenant not exercised in this test")
     }
-    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("TestExecutionService::delete_execution not exercised in this test")
     }
     async fn record_llm_interaction(
@@ -498,7 +504,7 @@ impl ExecutionService for LogsTestExecutionService {
         )
     }
 
-    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("LogsTestExecutionService::cancel_execution not exercised in this test")
     }
 
@@ -516,11 +522,19 @@ impl ExecutionService for LogsTestExecutionService {
         anyhow::bail!("LogsTestExecutionService::stream_agent_events not exercised in this test")
     }
 
-    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
-        anyhow::bail!("LogsTestExecutionService::list_executions not exercised in this test")
+    async fn list_executions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: Option<AgentId>,
+        _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
+        anyhow::bail!(
+            "LogsTestExecutionService::list_executions_for_tenant not exercised in this test"
+        )
     }
 
-    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("LogsTestExecutionService::delete_execution not exercised in this test")
     }
 
@@ -1591,12 +1605,13 @@ async fn task_logs_tool_returns_paginated_execution_events() {
     )
     .with_workflow_execution_repo(workflow_execution_repo);
 
+    let mut logs_args = serde_json::json!({
+        "execution_id": execution.id.to_string(),
+        "limit": 500,
+        "offset": 1,
+    });
     let result = service
-        .invoke_aegis_task_logs_tool(&serde_json::json!({
-            "execution_id": execution.id.to_string(),
-            "limit": 500,
-            "offset": 1,
-        }))
+        .invoke_aegis_task_logs_tool(&mut logs_args, &test_tenant_scope())
         .await
         .expect("task logs should return a result");
 
@@ -1657,10 +1672,11 @@ async fn task_logs_tool_returns_execution_fetch_error() {
     )
     .with_workflow_execution_repo(Arc::new(StubWorkflowExecutionRepository::default()));
 
+    let mut logs_args = serde_json::json!({
+        "execution_id": ExecutionId::new().to_string(),
+    });
     let result = service
-        .invoke_aegis_task_logs_tool(&serde_json::json!({
-            "execution_id": ExecutionId::new().to_string(),
-        }))
+        .invoke_aegis_task_logs_tool(&mut logs_args, &test_tenant_scope())
         .await
         .expect("task logs should return direct error payload");
 
@@ -2905,7 +2921,7 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
             anyhow::bail!("not exercised")
         }
 
-        async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+        async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
             anyhow::bail!("not exercised")
         }
 
@@ -2923,11 +2939,17 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
             anyhow::bail!("not exercised")
         }
 
-        async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+        async fn list_executions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: Option<AgentId>,
+            _: Option<crate::domain::workflow::WorkflowId>,
+            _: usize,
+        ) -> Result<Vec<Execution>> {
             anyhow::bail!("not exercised")
         }
 
-        async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+        async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
             anyhow::bail!("not exercised")
         }
 
@@ -3613,7 +3635,7 @@ impl ExecutionService for AttachmentsCapturingExecutionService {
     ) -> Result<Vec<Iteration>> {
         anyhow::bail!("not exercised")
     }
-    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("not exercised")
     }
     async fn stream_execution(
@@ -3628,10 +3650,16 @@ impl ExecutionService for AttachmentsCapturingExecutionService {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
         anyhow::bail!("not exercised")
     }
-    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+    async fn list_executions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: Option<AgentId>,
+        _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
         anyhow::bail!("not exercised")
     }
-    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("not exercised")
     }
     async fn record_llm_interaction(
@@ -4115,7 +4143,7 @@ impl ExecutionService for CannedListExecutionService {
     ) -> Result<Vec<Iteration>> {
         anyhow::bail!("not exercised")
     }
-    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("not exercised")
     }
     async fn stream_execution(
@@ -4130,10 +4158,16 @@ impl ExecutionService for CannedListExecutionService {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
         anyhow::bail!("not exercised")
     }
-    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+    async fn list_executions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: Option<AgentId>,
+        _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
         Ok(self.executions.clone())
     }
-    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+    async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
         anyhow::bail!("not exercised")
     }
     async fn record_llm_interaction(
@@ -4363,5 +4397,491 @@ async fn aegis_workflow_execution_list_emits_null_summary_when_input_has_no_inte
             .expect("execution entry is an object")
             .contains_key("summary"),
         "summary key must be present in the response item"
+    );
+}
+
+// =============================================================================
+// Regression tests — `aegis.task.*` handlers must scope every query/mutation
+// by the caller's authenticated tenant.
+//
+// Two distinct bug classes are exercised here:
+//
+//  1. `aegis.task.list` previously gated the args via `enforce_tenant_arg`
+//     but then discarded the captured tenant and called the unscoped
+//     `list_executions(agent_id, limit)`, which routed to
+//     `list_executions_for_tenant(&TenantId::consumer(), ...)` — leaking
+//     every consumer-tier execution across all callers.
+//
+//  2. `aegis.task.status / wait / logs / cancel / remove` had no tenant
+//     gate at all and called the unscoped `*_unscoped` repository
+//     methods directly. Any caller could read, cancel, or delete any
+//     tenant's execution by guessing its UUID.
+//
+// The mocks below assert that the handlers now thread the caller's
+// tenant into every repository call. The `_for_tenant` repository
+// methods enforce ownership and return an `anyhow::Error` (surfaced as
+// "Failed to fetch execution" / "Failed to cancel execution" /
+// "Failed to remove execution" payload errors) when a foreign-tenant
+// UUID is presented — these tests document the chosen semantics.
+// =============================================================================
+
+/// `ExecutionService` stub that owns a single seeded execution stamped
+/// with a specific `TenantId`. All `_for_tenant` accessors enforce the
+/// stored tenant and return `not found` for any other tenant — exactly
+/// like the real `find_by_id_for_tenant` Postgres path. The capture
+/// fields let us assert which tenant the handler actually queried with.
+struct TenantScopedTaskExecutionService {
+    stored_tenant: TenantId,
+    execution: Execution,
+    cancel_called: std::sync::Mutex<Option<(TenantId, ExecutionId)>>,
+    delete_called: std::sync::Mutex<Option<(TenantId, ExecutionId)>>,
+    list_called_with: std::sync::Mutex<Option<TenantId>>,
+}
+
+impl TenantScopedTaskExecutionService {
+    fn new(stored_tenant: TenantId, execution: Execution) -> Self {
+        Self {
+            stored_tenant,
+            execution,
+            cancel_called: std::sync::Mutex::new(None),
+            delete_called: std::sync::Mutex::new(None),
+            list_called_with: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionService for TenantScopedTaskExecutionService {
+    async fn start_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        Ok(execution_id)
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Execution> {
+        if *tenant_id == self.stored_tenant && self.execution.id == id {
+            Ok(self.execution.clone())
+        } else {
+            anyhow::bail!("execution not found")
+        }
+    }
+    async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("get_execution_unscoped must not be reached from aegis.task.* handlers")
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn cancel_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        *self.cancel_called.lock().unwrap() = Some((tenant_id.clone(), id));
+        if *tenant_id == self.stored_tenant && self.execution.id == id {
+            Ok(())
+        } else {
+            anyhow::bail!("execution not found")
+        }
+    }
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_executions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        _: Option<AgentId>,
+        _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
+        *self.list_called_with.lock().unwrap() = Some(tenant_id.clone());
+        if *tenant_id == self.stored_tenant {
+            Ok(vec![self.execution.clone()])
+        } else {
+            Ok(vec![])
+        }
+    }
+    async fn delete_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        *self.delete_called.lock().unwrap() = Some((tenant_id.clone(), id));
+        if *tenant_id == self.stored_tenant && self.execution.id == id {
+            Ok(())
+        } else {
+            anyhow::bail!("execution not found")
+        }
+    }
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+}
+
+fn make_execution_with_tenant(tenant_id: TenantId) -> Execution {
+    let mut exec = Execution::new(
+        AgentId::new(),
+        ExecutionInput {
+            intent: Some("regression seed".to_string()),
+            input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        },
+        3,
+        "aegis-system-operator".to_string(),
+    );
+    exec.tenant_id = tenant_id;
+    exec
+}
+
+fn build_task_service_with(
+    execution_service: Arc<TenantScopedTaskExecutionService>,
+) -> ToolInvocationService {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        execution_service,
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution_repo(Arc::new(StubWorkflowExecutionRepository::default()))
+}
+
+/// Bug 1 — `aegis.task.list` regression: with EMPTY args (no `tenant_id`
+/// supplied) the handler must invoke the repository with the caller's
+/// authenticated tenant, NOT the global `TenantId::consumer()` singleton.
+/// Before the fix this returned every consumer-tier execution.
+#[tokio::test]
+async fn aegis_task_list_returns_only_callers_tenant_executions() {
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let tenant_b = TenantId::for_consumer_user("user-b-sub").unwrap();
+    let exec_b = make_execution_with_tenant(tenant_b.clone());
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(
+        tenant_b.clone(),
+        exec_b,
+    ));
+    let service = build_task_service_with(svc.clone());
+
+    // Caller authenticates as tenant_a, sends EMPTY args (no tenant_id).
+    let scope = consumer_tenant_scope(tenant_a.clone());
+    let mut args = serde_json::json!({});
+    let result = service
+        .invoke_aegis_task_list_tool(&mut args, &scope)
+        .await
+        .expect("task.list with empty args must succeed");
+
+    // The handler MUST query the repository with tenant_a (the caller's
+    // authenticated tenant), not the global consumer singleton or tenant_b.
+    let queried = svc
+        .list_called_with
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("list_executions_for_tenant must have been called");
+    assert_eq!(
+        queried, tenant_a,
+        "handler invoked repo with {queried:?} instead of caller tenant {tenant_a:?}"
+    );
+    assert_ne!(
+        queried,
+        TenantId::consumer(),
+        "handler must NOT fall back to TenantId::consumer() singleton"
+    );
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.task.list");
+    // tenant_a owns no executions in the mock — the cross-tenant exec
+    // belongs to tenant_b and must NOT appear in tenant_a's response.
+    assert_eq!(payload["count"], 0, "tenant_a must not see tenant_b's exec");
+}
+
+/// Bug 2 — `aegis.task.status` regression: a caller in tenant A presenting
+/// the UUID of an execution owned by tenant B must NOT receive that
+/// execution. Before the fix the handler called `get_execution_unscoped`
+/// and leaked it.
+///
+/// Semantics: the `_for_tenant` repository method returns
+/// `Err(anyhow!("Execution not found"))` for cross-tenant access; the
+/// handler surfaces this as `{"error": "Failed to get execution: ..."}`.
+#[tokio::test]
+async fn aegis_task_status_rejects_cross_tenant_execution_id() {
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let tenant_b = TenantId::for_consumer_user("user-b-sub").unwrap();
+    let exec_b = make_execution_with_tenant(tenant_b.clone());
+    let exec_b_id = exec_b.id;
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(tenant_b, exec_b));
+    let service = build_task_service_with(svc);
+
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({ "execution_id": exec_b_id.0.to_string() });
+    let result = service
+        .invoke_aegis_task_status_tool(&mut args, &scope)
+        .await
+        .expect("status tool returns a Direct payload (not an Err)");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.task.status");
+    let err = payload["error"]
+        .as_str()
+        .expect("cross-tenant access must surface as a payload error");
+    assert!(
+        err.contains("Failed to get execution"),
+        "expected NotFound surfaced as 'Failed to get execution', got {err}"
+    );
+    // Critically: NO leaked fields from the foreign-tenant execution.
+    assert!(
+        payload.get("agent_id").is_none(),
+        "agent_id must not leak across tenants"
+    );
+    assert!(
+        payload.get("status").is_none(),
+        "status must not leak across tenants"
+    );
+}
+
+/// Bug 2 — `aegis.task.wait` regression: same as task.status, but for the
+/// blocking-poll handler. The first poll must short-circuit on the
+/// tenant-scoped lookup failure rather than entering the wait loop.
+#[tokio::test]
+async fn aegis_task_wait_rejects_cross_tenant_execution_id() {
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let tenant_b = TenantId::for_consumer_user("user-b-sub").unwrap();
+    let exec_b = make_execution_with_tenant(tenant_b.clone());
+    let exec_b_id = exec_b.id;
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(tenant_b, exec_b));
+    let service = build_task_service_with(svc);
+
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({
+        "execution_id": exec_b_id.0.to_string(),
+        // Force a fast bail if the loop ever enters — it must not.
+        "poll_interval_seconds": 1,
+        "timeout_seconds": 1,
+    });
+    let result = service
+        .invoke_aegis_task_wait_tool(&mut args, &scope)
+        .await
+        .expect("wait tool returns a Direct payload");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.task.wait");
+    let err = payload["error"]
+        .as_str()
+        .expect("cross-tenant access must surface as a payload error");
+    assert!(
+        err.contains("Failed to get execution"),
+        "expected NotFound surfaced as 'Failed to get execution', got {err}"
+    );
+}
+
+/// Bug 2 — `aegis.task.logs` regression: a caller in tenant A presenting
+/// the UUID of an execution owned by tenant B must not receive any
+/// execution metadata or events. The tenant gate is enforced via the
+/// `get_execution_for_tenant` lookup before any events query fires.
+#[tokio::test]
+async fn aegis_task_logs_rejects_cross_tenant_execution_id() {
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let tenant_b = TenantId::for_consumer_user("user-b-sub").unwrap();
+    let exec_b = make_execution_with_tenant(tenant_b.clone());
+    let exec_b_id = exec_b.id;
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(tenant_b, exec_b));
+    let service = build_task_service_with(svc);
+
+    let scope = consumer_tenant_scope(tenant_a);
+    let mut args = serde_json::json!({ "execution_id": exec_b_id.0.to_string() });
+    let result = service
+        .invoke_aegis_task_logs_tool(&mut args, &scope)
+        .await
+        .expect("logs tool returns a Direct payload");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.task.logs");
+    let err = payload["error"]
+        .as_str()
+        .expect("cross-tenant access must surface as a payload error");
+    assert!(
+        err.contains("Failed to fetch execution"),
+        "expected NotFound surfaced as 'Failed to fetch execution', got {err}"
+    );
+    assert!(
+        payload.get("events").is_none(),
+        "events must not leak across tenants"
+    );
+}
+
+/// Bug 2 — `aegis.task.cancel` regression: a caller in tenant A must not
+/// be able to cancel an execution owned by tenant B by guessing its
+/// UUID. Asserts that the repository was invoked with tenant A (gate in
+/// place) and that the foreign execution is reported as not-cancelled.
+#[tokio::test]
+async fn aegis_task_cancel_rejects_cross_tenant_execution_id() {
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let tenant_b = TenantId::for_consumer_user("user-b-sub").unwrap();
+    let exec_b = make_execution_with_tenant(tenant_b.clone());
+    let exec_b_id = exec_b.id;
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(
+        tenant_b.clone(),
+        exec_b,
+    ));
+    let service = build_task_service_with(svc.clone());
+
+    let scope = consumer_tenant_scope(tenant_a.clone());
+    let mut args = serde_json::json!({ "execution_id": exec_b_id.0.to_string() });
+    let result = service
+        .invoke_aegis_task_cancel_tool(&mut args, &scope)
+        .await
+        .expect("cancel tool returns a Direct payload");
+
+    let (called_tenant, called_id) = svc
+        .cancel_called
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("cancel_execution_for_tenant must have been invoked with the caller's tenant");
+    assert_eq!(
+        called_tenant, tenant_a,
+        "handler invoked cancel with {called_tenant:?} instead of caller tenant {tenant_a:?}"
+    );
+    assert_eq!(called_id, exec_b_id);
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.task.cancel");
+    assert_eq!(
+        payload["cancelled"], false,
+        "cross-tenant cancel must not succeed"
+    );
+    let err = payload["error"]
+        .as_str()
+        .expect("cross-tenant cancel must surface a payload error");
+    assert!(
+        err.contains("Failed to cancel execution"),
+        "expected NotFound surfaced as 'Failed to cancel execution', got {err}"
+    );
+}
+
+/// Bug 2 — `aegis.task.remove` regression: a caller in tenant A must not
+/// be able to delete an execution owned by tenant B by guessing its
+/// UUID. Asserts both that the repo was called with the caller's tenant
+/// (gate in place) and that the foreign execution is reported as
+/// not-removed.
+#[tokio::test]
+async fn aegis_task_remove_rejects_cross_tenant_execution_id() {
+    let tenant_a = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let tenant_b = TenantId::for_consumer_user("user-b-sub").unwrap();
+    let exec_b = make_execution_with_tenant(tenant_b.clone());
+    let exec_b_id = exec_b.id;
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(
+        tenant_b.clone(),
+        exec_b,
+    ));
+    let service = build_task_service_with(svc.clone());
+
+    let scope = consumer_tenant_scope(tenant_a.clone());
+    let mut args = serde_json::json!({ "execution_id": exec_b_id.0.to_string() });
+    let result = service
+        .invoke_aegis_task_remove_tool(&mut args, &scope)
+        .await
+        .expect("remove tool returns a Direct payload");
+
+    let (called_tenant, called_id) = svc
+        .delete_called
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("delete_execution_for_tenant must have been invoked with the caller's tenant");
+    assert_eq!(called_tenant, tenant_a);
+    assert_eq!(called_id, exec_b_id);
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["tool"], "aegis.task.remove");
+    assert_eq!(
+        payload["removed"], false,
+        "cross-tenant remove must not succeed"
+    );
+    let err = payload["error"]
+        .as_str()
+        .expect("cross-tenant remove must surface a payload error");
+    assert!(
+        err.contains("Failed to remove execution"),
+        "expected NotFound surfaced as 'Failed to remove execution', got {err}"
     );
 }

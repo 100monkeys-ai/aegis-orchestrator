@@ -724,8 +724,12 @@ mod tests {
             anyhow::bail!("get_iterations_for_tenant not used in stimulus tests")
         }
 
-        async fn cancel_execution(&self, _id: ExecutionId) -> Result<()> {
-            anyhow::bail!("cancel_execution not used in stimulus tests")
+        async fn cancel_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            anyhow::bail!("cancel_execution_for_tenant not used in stimulus tests")
         }
 
         async fn stream_execution(
@@ -743,16 +747,22 @@ mod tests {
             anyhow::bail!("stream_agent_events not used in stimulus tests")
         }
 
-        async fn list_executions(
+        async fn list_executions_for_tenant(
             &self,
+            _tenant_id: &TenantId,
             _agent_id: Option<AgentId>,
+            _workflow_id: Option<crate::domain::workflow::WorkflowId>,
             _limit: usize,
         ) -> Result<Vec<Execution>> {
-            anyhow::bail!("list_executions not used in stimulus tests")
+            anyhow::bail!("list_executions_for_tenant not used in stimulus tests")
         }
 
-        async fn delete_execution(&self, _id: ExecutionId) -> Result<()> {
-            anyhow::bail!("delete_execution not used in stimulus tests")
+        async fn delete_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            anyhow::bail!("delete_execution_for_tenant not used in stimulus tests")
         }
 
         async fn record_llm_interaction(
