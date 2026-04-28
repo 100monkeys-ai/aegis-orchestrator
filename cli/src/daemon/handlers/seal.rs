@@ -156,7 +156,17 @@ where
     F: FnOnce(ExecutionId) -> Fut,
     Fut: std::future::Future<Output = Result<TenantId, ()>>,
 {
-    let identity = identity.ok_or(AttestTenantError::Unauthenticated)?;
+    let identity = match identity {
+        Some(i) => i,
+        None => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                variant = "Unauthenticated",
+                "tenant resolution rejected: no authenticated identity"
+            );
+            return Err(AttestTenantError::Unauthenticated);
+        }
+    };
     let canonical = identity_tenant(identity);
     let delegating = may_delegate(identity);
 
@@ -166,12 +176,36 @@ where
         .as_deref()
         .and_then(|s| ExecutionId::from_string(s).ok())
     {
-        let exec_tenant = lookup_execution_tenant(exec_id)
-            .await
-            .map_err(|_| AttestTenantError::ExecutionNotFound)?;
+        tracing::info!(
+            target: "aegis::seal::attest",
+            branch = "execution_id",
+            identity_tenant = %canonical.as_str(),
+            delegating,
+            "resolving tenant from execution_id"
+        );
+        let exec_tenant = match lookup_execution_tenant(exec_id).await {
+            Ok(t) => t,
+            Err(_) => {
+                tracing::warn!(
+                    target: "aegis::seal::attest",
+                    variant = "ExecutionNotFound",
+                    "tenant resolution rejected: execution lookup failed"
+                );
+                return Err(AttestTenantError::ExecutionNotFound);
+            }
+        };
         if exec_tenant == canonical || delegating {
             return Ok(exec_tenant);
         }
+        tracing::warn!(
+            target: "aegis::seal::attest",
+            variant = "TenantMismatch",
+            branch = "execution_id",
+            identity_tenant = %canonical.as_str(),
+            execution_tenant = %exec_tenant.as_str(),
+            identity_sub = %identity.sub,
+            "tenant resolution rejected: execution belongs to a different tenant and caller cannot delegate"
+        );
         return Err(AttestTenantError::TenantMismatch {
             expected: canonical.as_str().to_string(),
             got: exec_tenant.as_str().to_string(),
@@ -180,12 +214,32 @@ where
 
     // (3) explicit tenant_id branch.
     if let Some(explicit_slug) = request.tenant_id.as_deref().filter(|s| !s.is_empty()) {
-        let explicit = TenantId::from_realm_slug(explicit_slug).map_err(|_| {
-            AttestTenantError::TenantMismatch {
-                expected: canonical.as_str().to_string(),
-                got: explicit_slug.to_string(),
+        tracing::info!(
+            target: "aegis::seal::attest",
+            branch = "explicit_tenant_id",
+            identity_tenant = %canonical.as_str(),
+            requested_tenant = %explicit_slug,
+            delegating,
+            "resolving tenant from explicit tenant_id"
+        );
+        let explicit = match TenantId::from_realm_slug(explicit_slug) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    target: "aegis::seal::attest",
+                    variant = "TenantMismatch",
+                    branch = "explicit_tenant_id",
+                    identity_tenant = %canonical.as_str(),
+                    requested_tenant = %explicit_slug,
+                    error = %e,
+                    "tenant resolution rejected: explicit tenant_id is not a valid realm slug"
+                );
+                return Err(AttestTenantError::TenantMismatch {
+                    expected: canonical.as_str().to_string(),
+                    got: explicit_slug.to_string(),
+                });
             }
-        })?;
+        };
         if delegating {
             return Ok(explicit);
         }
@@ -210,32 +264,117 @@ where
 
     // (4) neither set.
     if matches!(identity.identity_kind, IdentityKind::Operator { .. }) {
+        tracing::warn!(
+            target: "aegis::seal::attest",
+            variant = "OperatorMissingTarget",
+            identity_sub = %identity.sub,
+            "tenant resolution rejected: operator must specify tenant_id or execution_id"
+        );
         return Err(AttestTenantError::OperatorMissingTarget);
     }
+    tracing::info!(
+        target: "aegis::seal::attest",
+        branch = "canonical",
+        identity_tenant = %canonical.as_str(),
+        "resolved tenant from identity canonical claim"
+    );
     Ok(canonical)
+}
+
+/// Returns the first 12 hex chars of the SHA-256 hash of an API key for
+/// safe correlation in logs. Never log the raw key, never log the full
+/// hash — this prefix is enough to grep DB rows or correlate across
+/// services without leaking material that could be used to reconstruct
+/// the key.
+fn key_hash_prefix(raw_token: &str) -> String {
+    let h = hash_key(raw_token);
+    h.chars().take(12).collect()
 }
 
 /// Synthesize a [`UserIdentity`] from an `aegis_*` API key row by looking
 /// the key up in the api_keys repository. Returns `None` if the key is
 /// unknown / revoked / expired.
 async fn identity_from_api_key(state: &AppState, raw_token: &str) -> Option<UserIdentity> {
-    let repo = state.api_key_repo.as_ref()?;
-    let row = repo.find_by_key_hash(&hash_key(raw_token)).await.ok()??;
+    let prefix = key_hash_prefix(raw_token);
+    let repo = match state.api_key_repo.as_ref() {
+        Some(r) => r,
+        None => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                key_prefix = %prefix,
+                "api_key_repo not configured; cannot validate API key"
+            );
+            return None;
+        }
+    };
+    let hash = hash_key(raw_token);
+    let row = match repo.find_by_key_hash(&hash).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                key_prefix = %prefix,
+                "API key hash not found in repository"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                key_prefix = %prefix,
+                error = %e,
+                "API key repository lookup errored"
+            );
+            return None;
+        }
+    };
+    tracing::info!(
+        target: "aegis::seal::attest",
+        key_prefix = %prefix,
+        user_id = %row.user_id,
+        tenant_id = %row.tenant_id,
+        has_aegis_role = row.aegis_role.is_some(),
+        has_zaru_tier = row.zaru_tier.is_some(),
+        "API key row found"
+    );
     let realm_slug = if row.aegis_role.is_some() {
         "aegis-system".to_string()
     } else {
         "zaru-consumer".to_string()
     };
     let identity_kind = if let Some(role_str) = row.aegis_role.as_deref() {
-        let role = AegisRole::from_claim(role_str)?;
+        let role = match AegisRole::from_claim(role_str) {
+            Some(r) => r,
+            None => {
+                tracing::warn!(
+                    target: "aegis::seal::attest",
+                    key_prefix = %prefix,
+                    aegis_role = %role_str,
+                    "AegisRole::from_claim returned None for stored aegis_role"
+                );
+                return None;
+            }
+        };
         IdentityKind::Operator { aegis_role: role }
     } else {
+        let tenant_id = match TenantId::from_realm_slug(&row.tenant_id) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    target: "aegis::seal::attest",
+                    key_prefix = %prefix,
+                    stored_tenant_id = %row.tenant_id,
+                    error = %e,
+                    "TenantId::from_realm_slug failed; cannot synthesize ConsumerUser identity"
+                );
+                return None;
+            }
+        };
         let zaru_tier = row
             .zaru_tier
             .as_deref()
             .and_then(ZaruTier::from_claim)
             .unwrap_or(ZaruTier::Free);
-        let tenant_id = TenantId::from_realm_slug(&row.tenant_id).ok()?;
         IdentityKind::ConsumerUser {
             zaru_tier,
             tenant_id,
@@ -260,19 +399,74 @@ async fn authenticate_attest_request(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Option<UserIdentity> {
-    let raw = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())?
-        .strip_prefix("Bearer ")?
-        .trim();
+    let raw_header = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                "no Authorization header on attestation request"
+            );
+            return None;
+        }
+    };
+    let raw = match raw_header.strip_prefix("Bearer ") {
+        Some(s) => s.trim(),
+        None => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                "Authorization header lacks Bearer prefix"
+            );
+            return None;
+        }
+    };
     if raw.is_empty() {
+        tracing::warn!(
+            target: "aegis::seal::attest",
+            "Authorization Bearer value empty"
+        );
         return None;
     }
     if raw.starts_with("aegis_") {
+        tracing::info!(
+            target: "aegis::seal::attest",
+            auth_method = "api_key",
+            key_prefix = %key_hash_prefix(raw),
+            "attempting API key validation"
+        );
         return identity_from_api_key(state, raw).await;
     }
-    let iam = state.iam_service.as_ref()?;
-    let validated = iam.validate_token(raw).await.ok()?;
+    tracing::info!(
+        target: "aegis::seal::attest",
+        auth_method = "jwt",
+        "attempting JWT validation"
+    );
+    let iam = match state.iam_service.as_ref() {
+        Some(i) => i,
+        None => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                "iam_service not configured; cannot validate JWT"
+            );
+            return None;
+        }
+    };
+    let validated = match iam.validate_token(raw).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                error = %e,
+                "JWT validation failed"
+            );
+            return None;
+        }
+    };
+    tracing::info!(
+        target: "aegis::seal::attest",
+        sub_prefix = %validated.identity.sub.chars().take(8).collect::<String>(),
+        realm = %validated.identity.realm_slug,
+        "JWT validated successfully"
+    );
     Some(validated.identity)
 }
 
@@ -281,6 +475,14 @@ pub(crate) async fn attest_seal_handler(
     headers: HeaderMap,
     Json(request): Json<HttpAttestationRequest>,
 ) -> impl IntoResponse {
+    tracing::info!(
+        target: "aegis::seal::attest",
+        has_explicit_tenant_id = request.tenant_id.is_some(),
+        has_execution_id = request.execution_id.is_some(),
+        has_authorization_header = headers.get("authorization").is_some(),
+        "attestation request received"
+    );
+
     // Authenticate the caller. /v1/seal/attest is exempt from the global
     // `iam_auth_middleware` because the orchestrator must accept BOTH
     // JWTs (Zaru consumer flow) and `aegis_*` API keys (SDK flow). The
@@ -333,24 +535,40 @@ pub(crate) async fn attest_seal_handler(
             task_summary: request.task_summary.clone(),
         };
 
+    let tenant_for_log = internal_req.tenant_id.as_str().to_string();
     match state.attestation_service.attest(internal_req).await {
-        Ok(res) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": res.status,
-                "security_token": res.security_token,
-                "expires_at": res.expires_at,
-                "session_id": res.session_id,
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": e.to_string()
-            })),
-        )
-            .into_response(),
+        Ok(res) => {
+            tracing::info!(
+                target: "aegis::seal::attest",
+                tenant_id = %tenant_for_log,
+                "attestation completed successfully"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": res.status,
+                    "security_token": res.security_token,
+                    "expires_at": res.expires_at,
+                    "session_id": res.session_id,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                tenant_id = %tenant_for_log,
+                error = %e,
+                "attestation_service.attest failed"
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": e.to_string()
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
