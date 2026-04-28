@@ -2264,6 +2264,7 @@ impl StandardExecutionService {
     /// - **Only `intent`**: use caller's free-text directly; skip rendering.
     /// - **Both**: render template with both `{{intent}}` and `{{input}}`
     ///   available; store result in `intent`.
+    ///
     /// Prepare execution input for both persistence and runtime dispatch.
     ///
     /// Returns `(persisted, runtime)`:

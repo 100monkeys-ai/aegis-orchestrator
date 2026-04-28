@@ -303,7 +303,7 @@ pub enum RuntimeError {
         /// timeout reported by the orchestrator-side health check.
         reason: String,
     },
-    /// The execution was cancelled via [`crate::application::execution::ExecutionService::cancel_execution`].
+    /// The execution was cancelled via [`crate::application::execution::ExecutionService::cancel_execution_for_tenant`].
     /// The Supervisor observed the cancellation token and terminated the running instance.
     #[error("Execution was cancelled")]
     Cancelled,
