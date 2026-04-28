@@ -56,7 +56,7 @@ fn generate_api_key() -> String {
 }
 
 /// SHA-256 hex digest of the raw key value.
-fn hash_key(key: &str) -> String {
+pub(crate) fn hash_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     format!("{:x}", hasher.finalize())
