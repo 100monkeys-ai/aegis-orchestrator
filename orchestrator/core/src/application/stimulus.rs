@@ -244,13 +244,11 @@ impl StandardStimulusService {
 
         // Authenticated path: trust the JWT-derived identity.
         if let Some(id) = identity {
-            return Ok(
-                crate::domain::iam::derive_tenant_id_strict(id).map_err(|e| {
-                    StimulusError::WorkflowError(anyhow::anyhow!(
-                        "failed to derive tenant from authenticated stimulus identity: {e}"
-                    ))
-                })?,
-            );
+            return crate::domain::iam::derive_tenant_id_strict(id).map_err(|e| {
+                StimulusError::WorkflowError(anyhow::anyhow!(
+                    "failed to derive tenant from authenticated stimulus identity: {e}"
+                ))
+            });
         }
 
         // Unauthenticated webhook path: derive tenant from the registration

@@ -549,7 +549,7 @@ pub struct SemanticAgentValidatorConfig {
 /// Gradient validator that runs a **judge agent** as a child execution (ADR-016) to
 /// semantically evaluate iteration output (ADR-017).
 ///
-/// The judge agent is identified by name via [`AgentLifecycleService::lookup_agent`].
+/// The judge agent is identified by name via [`AgentLifecycleService::lookup_agent_for_tenant`].
 /// It is spawned via [`ExecutionService::start_child_execution`] and polled for
 /// completion.  Its stdout must be a JSON [`GradientResult`].
 pub struct SemanticAgentValidator {
