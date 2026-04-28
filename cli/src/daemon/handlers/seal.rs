@@ -104,8 +104,8 @@ fn may_delegate(identity: &UserIdentity) -> bool {
 
 /// Derive the canonical tenant from an authenticated identity's claims.
 ///
-/// Mirrors [`crate::domain::iam::derive_tenant_id`] but is local to this
-/// handler so we can reason about it deterministically. `ConsumerUser`
+/// Mirrors `derive_tenant_id` (in `aegis_orchestrator_core::domain::iam::delegation`)
+/// but is local to this handler so we can reason about it deterministically. `ConsumerUser`
 /// carries its per-user tenant directly per ADR-097; `TenantUser` resolves
 /// from the realm slug; `Operator` and `ServiceAccount` resolve to
 /// `TenantId::system()` (and only honor explicit overrides via the
