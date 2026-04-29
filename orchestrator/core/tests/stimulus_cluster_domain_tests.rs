@@ -773,10 +773,11 @@ fn config_scope_equality() {
 fn registered_node_from_peer() {
     let peer = make_peer(NodeRole::Worker);
     let metadata = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+    let software_version = env!("CARGO_PKG_VERSION").to_string();
     let registered = RegisteredNode::from_peer(
         &peer,
         "worker-01.local".to_string(),
-        "0.15.0-pre-alpha".to_string(), // TODO: Why is the version hardcoded here?
+        software_version.clone(),
         metadata.clone(),
         Some("v1-abc".to_string()),
     );
@@ -784,7 +785,7 @@ fn registered_node_from_peer() {
     assert_eq!(registered.hostname, "worker-01.local");
     assert_eq!(registered.role, NodeRole::Worker);
     assert_eq!(registered.registry_status, RegistryStatus::Pending);
-    assert_eq!(registered.software_version, "0.15.0-pre-alpha"); // TODO: Why is the version hardcoded here?
+    assert_eq!(registered.software_version, software_version);
     assert_eq!(registered.config_version, Some("v1-abc".to_string()));
     assert_eq!(registered.metadata, metadata);
 }

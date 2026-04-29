@@ -26,3 +26,4 @@ pub mod manage_groups;
 pub mod manage_tags;
 pub mod revoke_edge;
 pub mod rotate_edge_key;
+pub mod transit;

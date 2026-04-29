@@ -127,7 +127,10 @@ impl EdgeApiClient {
             Ok(())
         } else {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("<unreadable response body>"));
             Err(anyhow!("{status}: {body}"))
         }
     }

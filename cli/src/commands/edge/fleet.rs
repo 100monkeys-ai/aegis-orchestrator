@@ -97,7 +97,7 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
                 tool_name: tool,
                 args: args_value,
                 security_context_name: security_context,
-                user_security_token: std::env::var("AEGIS_USER_TOKEN").unwrap_or_default(),
+                user_security_token: require_user_token()?,
                 mode: Some(mode),
                 max_concurrency,
                 failure_policy: Some(on_error),
@@ -109,7 +109,10 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
                 .await?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let txt = resp.text().await.unwrap_or_default();
+                let txt = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| String::from("<unreadable response body>"));
                 return Err(anyhow::anyhow!("{status}: {txt}"));
             }
             // Read SSE-style stream of `event:` / `data:` frames; print
@@ -142,7 +145,10 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
                 println!("cancelled");
             } else {
                 let status = resp.status();
-                let txt = resp.text().await.unwrap_or_default();
+                let txt = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| String::from("<unreadable response body>"));
                 return Err(anyhow::anyhow!("{status}: {txt}"));
             }
         }
@@ -155,4 +161,46 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fetch the operator's user-security-token from the env, failing fast if
+/// unset. Previously called via `unwrap_or_default()`, which silently sent an
+/// empty bearer to the orchestrator. ADR-117 audit pass 3, SEV-3-G.
+fn require_user_token() -> Result<String> {
+    std::env::var("AEGIS_USER_TOKEN")
+        .map_err(|_| anyhow::anyhow!("AEGIS_USER_TOKEN must be set; run `aegis auth login` first"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: ADR-117 audit pass 3 SEV-3-G — `aegis edge fleet run` must
+    /// surface a clear error when AEGIS_USER_TOKEN is missing rather than
+    /// silently sending an empty bearer to the orchestrator. Combined into
+    /// one test (rather than two) to avoid races on the shared process env
+    /// when cargo runs tests in parallel.
+    #[test]
+    fn require_user_token_unset_errors_then_set_returns_value() {
+        let prior = std::env::var("AEGIS_USER_TOKEN").ok();
+
+        // Phase 1: missing var produces the expected typed error.
+        std::env::remove_var("AEGIS_USER_TOKEN");
+        let err = require_user_token().expect_err("must error when unset");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("AEGIS_USER_TOKEN must be set"),
+            "unexpected error message: {msg}"
+        );
+
+        // Phase 2: present var returns the value verbatim.
+        std::env::set_var("AEGIS_USER_TOKEN", "test-token-value");
+        let v = require_user_token().expect("must succeed when set");
+        assert_eq!(v, "test-token-value");
+
+        match prior {
+            Some(p) => std::env::set_var("AEGIS_USER_TOKEN", p),
+            None => std::env::remove_var("AEGIS_USER_TOKEN"),
+        }
+    }
 }
