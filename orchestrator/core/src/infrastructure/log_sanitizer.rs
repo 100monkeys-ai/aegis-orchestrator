@@ -28,6 +28,8 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "session_id",
     "private_key",
     "signing_key",
+    "signature",
+    "sig",
 ];
 
 /// Redacts sensitive query parameters from a URL string.
@@ -114,6 +116,45 @@ mod tests {
     #[test]
     fn sanitize_url_handles_unparseable() {
         assert_eq!(sanitize_url("not a url"), "[unparseable-url]");
+    }
+
+    /// Regression test: ensure all known-sensitive query params are stripped from
+    /// URL logs. This guards against the leak fixed when `info!` was emitting a
+    /// generic message while `debug!` used `sanitize_url` — once `info!` was
+    /// switched to log the sanitized URL, every sensitive param the function
+    /// claims to redact must actually be redacted.
+    #[test]
+    fn sanitize_url_strips_all_known_sensitive_params() {
+        let url = "https://api.example.com/x?api_key=secret123&token=tok456&access_token=at789&signature=sig000&key=k111&safe=ok";
+        let result = sanitize_url(url);
+        assert!(
+            !result.contains("secret123"),
+            "api_key value leaked: {result}"
+        );
+        assert!(!result.contains("tok456"), "token value leaked: {result}");
+        assert!(
+            !result.contains("at789"),
+            "access_token value leaked: {result}"
+        );
+        assert!(
+            !result.contains("sig000"),
+            "signature value leaked: {result}"
+        );
+        assert!(!result.contains("k111"), "key value leaked: {result}");
+        assert!(result.contains("safe=ok"), "safe param dropped: {result}");
+    }
+
+    /// Targeted regression test: a URL with `?api_key=secret123` MUST NOT contain
+    /// `secret123` in the sanitized output. This is the precise leak vector the
+    /// `web_tools.rs` info!/debug! mismatch could have exposed.
+    #[test]
+    fn sanitize_url_api_key_value_never_leaks() {
+        let url = "https://api.example.com/data?api_key=secret123";
+        let result = sanitize_url(url);
+        assert!(
+            !result.contains("secret123"),
+            "api_key secret leaked into sanitized output: {result}"
+        );
     }
 
     #[test]
