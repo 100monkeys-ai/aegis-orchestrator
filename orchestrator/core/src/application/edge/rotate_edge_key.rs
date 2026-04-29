@@ -26,11 +26,17 @@ use crate::infrastructure::aegis_cluster_proto::{
     RotateEdgeKeyInner, RotateEdgeKeyRequest, RotateEdgeKeyResponse,
 };
 
+/// Default `exp - iat` for minted NodeSecurityTokens (seconds). Callers that
+/// want non-default behaviour use [`RotateEdgeKeyService::new`]; most use
+/// [`RotateEdgeKeyService::with_default_ttl`].
+pub const DEFAULT_TOKEN_TTL_SECONDS: i64 = 3600;
+
 pub struct RotateEdgeKeyService {
     edge_repo: Arc<dyn EdgeDaemonRepository>,
     secret_store: Arc<dyn SecretStore>,
     signing_key_path: String,
     overlap_seconds: i64,
+    token_ttl_seconds: i64,
 }
 
 impl RotateEdgeKeyService {
@@ -38,13 +44,29 @@ impl RotateEdgeKeyService {
         edge_repo: Arc<dyn EdgeDaemonRepository>,
         secret_store: Arc<dyn SecretStore>,
         signing_key_path: String,
+        token_ttl_seconds: i64,
     ) -> Self {
         Self {
             edge_repo,
             secret_store,
             signing_key_path,
             overlap_seconds: 60,
+            token_ttl_seconds,
         }
+    }
+
+    /// Construct with the canonical [`DEFAULT_TOKEN_TTL_SECONDS`] TTL.
+    pub fn with_default_ttl(
+        edge_repo: Arc<dyn EdgeDaemonRepository>,
+        secret_store: Arc<dyn SecretStore>,
+        signing_key_path: String,
+    ) -> Self {
+        Self::new(
+            edge_repo,
+            secret_store,
+            signing_key_path,
+            DEFAULT_TOKEN_TTL_SECONDS,
+        )
     }
 
     pub fn rotation_challenge(node_id: &NodeId, new_public_key: &[u8], nonce: &[u8]) -> Vec<u8> {
@@ -126,7 +148,7 @@ impl RotateEdgeKeyService {
         // Issue replacement NodeSecurityToken via the existing minting path.
         // For the application-layer skeleton we delegate to a thin helper that
         // returns the new bearer string.
-        let exp = (Utc::now() + ChronoDuration::hours(1)).timestamp();
+        let exp = (Utc::now() + ChronoDuration::seconds(self.token_ttl_seconds)).timestamp();
         let token = mint_node_security_token(
             &self.secret_store,
             &self.signing_key_path,
@@ -325,6 +347,14 @@ mod tests {
         signing_key: &SigningKey,
         node_id: NodeId,
     ) -> RotateEdgeKeyService {
+        make_service_and_seed_with_ttl(signing_key, node_id, DEFAULT_TOKEN_TTL_SECONDS).await
+    }
+
+    async fn make_service_and_seed_with_ttl(
+        signing_key: &SigningKey,
+        node_id: NodeId,
+        token_ttl_seconds: i64,
+    ) -> RotateEdgeKeyService {
         let repo = Arc::new(StubRepo::default());
         repo.upsert(&EdgeDaemon {
             node_id,
@@ -344,6 +374,7 @@ mod tests {
             repo,
             Arc::new(StubSecretStore),
             "transit/keys/test".to_string(),
+            token_ttl_seconds,
         )
     }
 
@@ -363,6 +394,39 @@ mod tests {
         let resp = svc.rotate(req).await.expect("same-key rotate must succeed");
         assert!(!resp.node_security_token.is_empty());
         assert!(resp.expires_at.is_some());
+    }
+
+    /// Regression: ADR-117 audit pass 3 SEV-2-B — token TTL must be configurable
+    /// (was hardcoded `Duration::hours(1)`). Constructing the service with a
+    /// 30-second TTL must produce a JWT whose `exp - iat` is ~30s, not 3600s.
+    #[tokio::test]
+    async fn rotate_honours_configured_token_ttl() {
+        use rand_core::OsRng;
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng);
+        let node_id = NodeId(uuid::Uuid::new_v4());
+        let svc = make_service_and_seed_with_ttl(&signing_key, node_id, 30).await;
+        let req = build_request(&signing_key, &signing_key, &node_id);
+        let resp = svc.rotate(req).await.expect("rotate must succeed");
+
+        // Decode JWT claims segment.
+        let token = resp.node_security_token;
+        let mut parts = token.split('.');
+        let _h = parts.next().expect("header");
+        let claims_b64 = parts.next().expect("claims");
+        let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(claims_b64)
+            .expect("base64 decode claims");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&claims_bytes).expect("parse claims");
+        let iat = claims.get("iat").and_then(|v| v.as_i64()).expect("iat");
+        let exp = claims.get("exp").and_then(|v| v.as_i64()).expect("exp");
+        let delta = exp - iat;
+        // Allow small slack (clock granularity / wall-clock between reads).
+        assert!(
+            delta <= 35 && delta >= 25,
+            "exp-iat={delta} expected ~30s for ttl=30; service ignored configured TTL"
+        );
     }
 
     #[tokio::test]
