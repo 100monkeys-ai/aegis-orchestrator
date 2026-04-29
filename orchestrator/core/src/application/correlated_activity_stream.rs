@@ -40,14 +40,20 @@ impl CorrelatedActivityStreamService {
 
     pub async fn stream_execution_activity(
         &self,
+        tenant_id: &TenantId,
         execution_id: ExecutionId,
         verbose: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CorrelatedActivityEvent>> + Send>>> {
-        let history = self.execution_history(execution_id, verbose).await?;
+        let history = self
+            .execution_history(tenant_id, execution_id, verbose)
+            .await?;
 
         if verbose {
-            // In verbose mode, subscribe to the global event bus so we also see
-            // system-level events that have no execution_id (e.g. MCP server lifecycle).
+            // In verbose mode, subscribe to the global event bus and forward
+            // ONLY events whose execution_id matches the (already tenant-scoped)
+            // exec_id. System-level events with no execution_id are NOT forwarded
+            // here — they belong to no tenant and therefore must not leak across
+            // a tenant-scoped stream (audit 002 §4.4).
             let receiver = self.event_bus.subscribe();
             let live = futures::stream::unfold(
                 (receiver, execution_id),
@@ -55,10 +61,8 @@ impl CorrelatedActivityStreamService {
                     loop {
                         match receiver.recv().await {
                             Ok(event) => {
-                                // Include events that match this execution OR have no execution_id
-                                // (system-level events visible only in verbose mode).
                                 let event_exec_id = event.execution_id();
-                                if event_exec_id == Some(exec_id) || event_exec_id.is_none() {
+                                if event_exec_id == Some(exec_id) {
                                     return Some((
                                         Ok(normalize_domain_event(&event, None)),
                                         (receiver, exec_id),
@@ -158,18 +162,23 @@ impl CorrelatedActivityStreamService {
 
     pub async fn execution_history(
         &self,
+        tenant_id: &TenantId,
         execution_id: ExecutionId,
         _verbose: bool,
     ) -> Result<Vec<CorrelatedActivityEvent>> {
-        let mut history = Vec::new();
-
-        if let Some(execution) = self
+        // Tenant-scoped lookup: callers MUST supply the authenticated tenant.
+        // A miss here returns an empty history (the SSE handler maps that to
+        // a 404-equivalent — no execution data is leaked across tenants).
+        // Audit 002 §4.3.
+        let execution = self
             .execution_repository
-            .find_by_id_unscoped(execution_id)
+            .find_by_id_for_tenant(tenant_id, execution_id)
             .await?
-        {
-            history.extend(execution_to_history(&execution));
-        }
+            .ok_or_else(|| {
+                anyhow!("Execution {execution_id} not found for the requesting tenant")
+            })?;
+
+        let mut history = execution_to_history(&execution);
 
         if let Some(repo) = &self.workflow_execution_repository {
             let records = repo.find_events_by_execution(execution_id, 500, 0).await?;
@@ -818,7 +827,7 @@ mod tests {
         let service = CorrelatedActivityStreamService::new(event_bus.clone(), repository, None);
         let execution_id = execution.id;
         let mut stream = service
-            .stream_execution_activity(execution_id, false)
+            .stream_execution_activity(&TenantId::system(), execution_id, false)
             .await
             .unwrap();
 
@@ -912,6 +921,186 @@ mod tests {
         assert_eq!(next.execution_id, Some(execution_id));
         assert_eq!(next.agent_id, Some(agent_id));
         assert_eq!(next.category, "storage");
+    }
+
+    /// Regression for audit 002 §4.3: a streamer authenticated as tenant-A
+    /// requesting tenant-B's execution_id MUST get an error (handler maps it
+    /// to a 404 — no execution data leaks across the tenant boundary).
+    #[tokio::test]
+    async fn stream_execution_activity_rejects_cross_tenant_lookup() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repository = Arc::new(InMemoryExecutionRepository::new());
+
+        let tenant_a = TenantId::from_string("tenant-a").unwrap();
+        let tenant_b = TenantId::from_string("tenant-b").unwrap();
+
+        let execution = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("victim".to_string()),
+                input: Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        let exec_id = execution.id;
+        repository
+            .save_for_tenant(&tenant_b, &execution)
+            .await
+            .unwrap();
+
+        let service = CorrelatedActivityStreamService::new(event_bus, repository, None);
+
+        // Tenant-A asks for tenant-B's execution → must error (handler returns 404).
+        let res = service
+            .stream_execution_activity(&tenant_a, exec_id, false)
+            .await;
+        assert!(
+            res.is_err(),
+            "cross-tenant stream_execution_activity must fail; got Ok stream"
+        );
+
+        // History lookup must also error out for the same reason — no rows leak.
+        let res = service.execution_history(&tenant_a, exec_id, false).await;
+        assert!(
+            res.is_err(),
+            "cross-tenant execution_history must fail; got Ok rows"
+        );
+    }
+
+    /// Regression for audit 002 §4.4: a verbose subscription scoped to
+    /// tenant-A's execution MUST NOT receive events emitted for an execution
+    /// owned by tenant-B, even though both flow through the same global
+    /// event bus. The previous implementation matched events whose
+    /// execution_id was `None` and additionally subscribed globally with no
+    /// tenant filter — turning verbose mode into a cross-tenant read primitive.
+    #[tokio::test]
+    async fn verbose_stream_drops_events_from_other_tenants() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repository = Arc::new(InMemoryExecutionRepository::new());
+
+        let tenant_a = TenantId::from_string("tenant-a").unwrap();
+        let tenant_b = TenantId::from_string("tenant-b").unwrap();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        let exec_a = Execution::new(
+            agent_a,
+            ExecutionInput {
+                intent: Some("a".to_string()),
+                input: Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        let exec_a_id = exec_a.id;
+        repository
+            .save_for_tenant(&tenant_a, &exec_a)
+            .await
+            .unwrap();
+
+        let exec_b = Execution::new(
+            agent_b,
+            ExecutionInput {
+                intent: Some("b".to_string()),
+                input: Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        let exec_b_id = exec_b.id;
+        repository
+            .save_for_tenant(&tenant_b, &exec_b)
+            .await
+            .unwrap();
+
+        let service =
+            CorrelatedActivityStreamService::new(event_bus.clone(), repository.clone(), None);
+
+        // Tenant-A subscribes (verbose=true) to its own execution.
+        let mut stream = service
+            .stream_execution_activity(&tenant_a, exec_a_id, true)
+            .await
+            .unwrap();
+
+        // Drain history (a single ExecutionStarted for exec_a).
+        let _ = stream.next().await.unwrap().unwrap();
+
+        // Publish a tenant-B-owned event AND a system-level event with no
+        // execution_id. Neither must reach tenant-A's stream.
+        event_bus.publish_storage_event(StorageEvent::FilesystemPolicyViolation {
+            execution_id: Some(exec_b_id),
+            workflow_execution_id: None,
+            volume_id: crate::domain::volume::VolumeId::new(),
+            operation: "write".to_string(),
+            path: "/workspace/tenant-b-secret.txt".to_string(),
+            policy_rule: "deny-write".to_string(),
+            violated_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
+        });
+        event_bus.publish_storage_event(StorageEvent::FileOpened {
+            execution_id: None,
+            workflow_execution_id: None,
+            volume_id: crate::domain::volume::VolumeId::new(),
+            path: "/system/global.log".to_string(),
+            open_mode: "read".to_string(),
+            opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
+        });
+
+        // Then publish one event that DOES belong to tenant-A's execution; the
+        // stream must skip past the cross-tenant + system-level events and
+        // deliver only this one.
+        event_bus.publish_storage_event(StorageEvent::FileOpened {
+            execution_id: Some(exec_a_id),
+            workflow_execution_id: None,
+            volume_id: crate::domain::volume::VolumeId::new(),
+            path: "/workspace/tenant-a-allowed.txt".to_string(),
+            open_mode: "read".to_string(),
+            opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
+        });
+
+        let next = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for tenant-A event")
+            .expect("stream ended unexpectedly")
+            .unwrap();
+
+        assert_eq!(next.event_type, "file_opened");
+        assert_eq!(
+            next.execution_id,
+            Some(exec_a_id),
+            "stream must only deliver events for tenant-A's execution; got exec_id={:?} (tenant-B was {:?}, system was None)",
+            next.execution_id,
+            exec_b_id,
+        );
+        assert!(
+            !next.message.contains("tenant-b-secret"),
+            "tenant-B's event must not appear in tenant-A's stream"
+        );
+        assert!(
+            !next.message.contains("/system/global.log"),
+            "system-level (execution_id=None) event must not appear in a tenant-scoped stream"
+        );
     }
 
     #[test]

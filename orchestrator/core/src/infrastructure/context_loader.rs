@@ -36,6 +36,7 @@
 
 use crate::domain::agent::ContextItem;
 use anyhow::{anyhow, Context, Result};
+use futures::StreamExt;
 use reqwest::Client;
 use std::fs;
 use std::path::Path;
@@ -199,7 +200,10 @@ impl ContextLoader {
             return Err(anyhow!("HTTP {} fetching URL: {}", response.status(), url));
         }
 
-        // Check content length if available
+        // Reject early if Content-Length advertises a payload over the cap.
+        // Note: the header is trivially spoofable / omittable, so we ALSO
+        // enforce the cap incrementally on the body stream below
+        // (audit 002 §4.22).
         if let Some(content_length) = response.content_length() {
             if content_length > self.max_file_size as u64 {
                 return Err(anyhow!(
@@ -211,19 +215,11 @@ impl ContextLoader {
             }
         }
 
-        let text = response
-            .text()
-            .await
-            .with_context(|| format!("Failed to read URL content: {url}"))?;
-
-        if text.len() > self.max_file_size {
-            return Err(anyhow!(
-                "URL content size ({} bytes) exceeds limit ({} bytes): {}",
-                text.len(),
-                self.max_file_size,
-                url
-            ));
-        }
+        // Stream the body chunk-by-chunk, capping at `max_file_size`. Refuses
+        // to allocate beyond the cap regardless of Content-Length honesty.
+        let bytes = read_capped(response, self.max_file_size, url).await?;
+        let text = String::from_utf8(bytes)
+            .with_context(|| format!("URL content is not valid UTF-8: {url}"))?;
 
         Ok(text)
     }
@@ -268,6 +264,28 @@ impl Default for ContextLoader {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Stream the response body chunk-by-chunk, refusing to buffer more than
+/// `max_bytes`. Returns the accumulated byte vector on success, an error
+/// the moment cumulative bytes exceed the cap.
+///
+/// This is the post-`Content-Length` defence for audit 002 §4.22 — a
+/// hostile upstream can spoof or omit `content-length`, so the cap MUST
+/// be enforced incrementally on the wire.
+async fn read_capped(response: reqwest::Response, max_bytes: usize, url: &str) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("Failed to read URL response chunk: {url}"))?;
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(anyhow!(
+                "URL content exceeds limit ({max_bytes} bytes): {url}"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 // ============================================================================
@@ -365,6 +383,44 @@ mod tests {
             err_msg.contains("exceeds"),
             "Error message should contain 'exceeds', got: {err_msg}"
         );
+    }
+
+    /// Regression for audit 002 §4.22: a hostile upstream that omits
+    /// `Content-Length` and streams a payload over the configured cap MUST
+    /// be rejected before the body is fully buffered. The previous
+    /// implementation called `response.text()` with no streaming cap,
+    /// allowing arbitrary memory blow-up.
+    #[tokio::test]
+    async fn url_load_caps_body_when_content_length_missing() {
+        // 64 KiB cap; payload is 256 KiB. No Content-Length header so the
+        // streaming cap is the only line of defence.
+        let mut server = mockito::Server::new_async().await;
+        let body = "x".repeat(256 * 1024);
+        let mock = server
+            .mock("GET", "/big")
+            .with_status(200)
+            .with_header("transfer-encoding", "chunked")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let loader = ContextLoader::with_limits(1 * 1024 * 1024, 64 * 1024);
+        let attachments = vec![ContextItem::Url {
+            url: format!("{}/big", server.url()),
+            description: None,
+        }];
+
+        let result = loader.load_attachments(&attachments).await;
+        assert!(
+            result.is_err(),
+            "load must fail when streamed body exceeds the cap; got Ok"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("exceeds limit"),
+            "expected 'exceeds limit' in error chain, got: {err_msg}"
+        );
+        mock.assert_async().await;
     }
 
     #[test]

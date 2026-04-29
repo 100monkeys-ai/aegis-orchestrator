@@ -193,18 +193,37 @@ impl EphemeralCliEngine {
                 private_key_pem,
                 passphrase: _, // container-ephemeral passphrases not supported
             }) => {
-                // Materialise the key inside the container via a heredoc
-                // in the shell prelude. Safer than bind-mounting a host
-                // tempfile through FUSE.
-                script_prelude.push_str("cat >/tmp/ssh_key <<'KEYEOF'\n");
-                script_prelude.push_str(private_key_pem.expose());
-                if !private_key_pem.expose().ends_with('\n') {
-                    script_prelude.push('\n');
-                }
-                script_prelude.push_str("KEYEOF\nchmod 0600 /tmp/ssh_key\n");
+                // Audit 002 §4.31: do NOT embed key material in the `sh -c`
+                // argv (heredoc-in-script). The argv is observable via
+                // `ps`, `docker inspect`, OTLP spans, and any tracing
+                // middleware that captures the spawned command. Pass the
+                // key via the environment variable `AEGIS_SSH_KEY` and
+                // materialise it inside the container with `printf '%s'`
+                // — this keeps the bytes out of argv. We chmod 0600,
+                // unset the env var so it does not leak to child
+                // processes (`git`, `ssh`), and `shred + rm` the file in
+                // a trap so the bytes are scrubbed on success and on
+                // failure paths alike. `set +o history` is a defensive
+                // no-op for non-interactive `sh` but documents intent.
+                env.insert(
+                    "AEGIS_SSH_KEY".to_string(),
+                    private_key_pem.expose().to_string(),
+                );
+                script_prelude.push_str(
+                    "set +o history 2>/dev/null || true\n\
+                     umask 0077\n\
+                     printf '%s' \"$AEGIS_SSH_KEY\" >/tmp/ssh_key\n\
+                     case \"$(tail -c1 /tmp/ssh_key | od -An -c | tr -d ' ')\" in\n\
+                       '\\n') ;;\n\
+                       *) printf '\\n' >>/tmp/ssh_key ;;\n\
+                     esac\n\
+                     chmod 0600 /tmp/ssh_key\n\
+                     unset AEGIS_SSH_KEY\n\
+                     trap 'shred -u /tmp/ssh_key 2>/dev/null || rm -f /tmp/ssh_key' EXIT INT TERM\n",
+                );
                 env.insert(
                     "GIT_SSH_COMMAND".to_string(),
-                    "ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string(),
+                    "ssh -i /tmp/ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string(),
                 );
                 binding.repo_url.clone()
             }
@@ -880,6 +899,155 @@ mod tests {
     fn shell_escape_quotes_single_quotes() {
         assert_eq!(shell_escape("a'b"), "'a'\\''b'");
         assert_eq!(shell_escape("abc"), "'abc'");
+    }
+
+    /// Regression for audit 002 §4.31: the SSH private key MUST NOT appear
+    /// anywhere in the spawned container's argv (the `sh -c` script).
+    /// Argv is observable via `ps`, `docker inspect`, OTLP spans, and any
+    /// tracing middleware that captures the command line. The key may
+    /// only travel through the container env (`AEGIS_SSH_KEY`), which the
+    /// in-script trampoline materialises to `/tmp/ssh_key` (mode 0600),
+    /// then `unset`s and `shred`s on exit.
+    #[tokio::test]
+    async fn ssh_key_never_appears_in_container_argv() {
+        use crate::domain::runtime::{
+            ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
+        };
+        use crate::domain::tenant::TenantId;
+        use crate::domain::volume::{
+            FilerEndpoint, StorageClass, Volume, VolumeBackend, VolumeOwnership,
+        };
+        use std::sync::Mutex;
+
+        struct CapturingRunner {
+            captured: Arc<Mutex<Option<ContainerStepConfig>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ContainerStepRunner for CapturingRunner {
+            async fn run_step(
+                &self,
+                config: ContainerStepConfig,
+            ) -> Result<ContainerStepResult, ContainerStepError> {
+                *self.captured.lock().unwrap() = Some(config);
+                // Return a 40-char SHA so the executor's parse step
+                // doesn't fail before we get to assert on the captured
+                // config.
+                Ok(ContainerStepResult {
+                    exit_code: 0,
+                    stdout: format!("{}\n", "a".repeat(40)),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                })
+            }
+        }
+
+        // Sentinel key with bytes unlikely to appear elsewhere in the script.
+        const SENTINEL_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+                                    AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK\n\
+                                    -----END OPENSSH PRIVATE KEY-----";
+
+        let captured = Arc::new(Mutex::new(None));
+        let runner = Arc::new(CapturingRunner {
+            captured: captured.clone(),
+        });
+        let registry = Arc::new(NfsVolumeRegistry::new());
+        let engine = EphemeralCliEngine::new(runner, registry);
+
+        let volume = Volume::new(
+            "audit-002-4-31".to_string(),
+            TenantId::system(),
+            StorageClass::Ephemeral,
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
+                remote_path: "/aegis/seaweedfs/test".to_string(),
+            },
+            1024 * 1024,
+            VolumeOwnership::persistent("audit-test"),
+        )
+        .unwrap();
+        let binding = GitRepoBinding::new(
+            TenantId::system(),
+            None,
+            "git@github.com:owner/repo.git".to_string(),
+            GitRef::Branch("main".to_string()),
+            None,
+            volume.id,
+            "audit-002-4-31".to_string(),
+            CloneStrategy::EphemeralCli {
+                reason: "test".to_string(),
+            },
+            false,
+            None,
+        );
+
+        let credential = ResolvedCredential::SshKey {
+            private_key_pem: SensitiveString::new(SENTINEL_KEY),
+            passphrase: None,
+        };
+
+        engine
+            .clone_into_volume(&binding, &volume, Some(credential), true)
+            .await
+            .expect("captured runner returns Ok");
+
+        let cfg = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("runner must have been called once");
+
+        // 1. The argv must contain only `["sh", "-c", "<script>"]`. The script
+        //    itself must NOT contain the sentinel key bytes.
+        let script = cfg.command.last().expect("script arg present");
+        assert!(
+            !script.contains("AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK"),
+            "SSH key bytes must NEVER appear in the spawned container argv; \
+             this is the audit 002 §4.31 regression. argv command was:\n{script}"
+        );
+        assert!(
+            !script.contains("BEGIN OPENSSH PRIVATE KEY"),
+            "PEM header must not appear in argv either"
+        );
+        for arg in &cfg.command {
+            assert!(
+                !arg.contains("AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK"),
+                "key bytes must not appear in any argv element"
+            );
+        }
+
+        // 2. The key MUST be passed via env var (acceptable per audit; the
+        //    in-script trampoline unsets + shreds it).
+        let env_key = cfg
+            .env
+            .get("AEGIS_SSH_KEY")
+            .expect("AEGIS_SSH_KEY env must carry the key");
+        assert!(
+            env_key.contains("AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK"),
+            "AEGIS_SSH_KEY env must carry the actual key bytes"
+        );
+
+        // 3. GIT_SSH_COMMAND must point at /tmp/ssh_key with IdentitiesOnly=yes.
+        let ssh_cmd = cfg
+            .env
+            .get("GIT_SSH_COMMAND")
+            .expect("GIT_SSH_COMMAND must be set for SSH credential path");
+        assert!(ssh_cmd.contains("-i /tmp/ssh_key"));
+        assert!(ssh_cmd.contains("IdentitiesOnly=yes"));
+
+        // 4. The trampoline must unset the env var and shred the file on exit.
+        assert!(
+            script.contains("unset AEGIS_SSH_KEY"),
+            "script must unset AEGIS_SSH_KEY before invoking git"
+        );
+        assert!(
+            script.contains("shred -u /tmp/ssh_key") || script.contains("rm -f /tmp/ssh_key"),
+            "script must scrub /tmp/ssh_key on EXIT/INT/TERM"
+        );
+        assert!(
+            script.contains("chmod 0600 /tmp/ssh_key"),
+            "script must chmod 0600 the materialised key"
+        );
     }
 
     // -----------------------------------------------------------------
