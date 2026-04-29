@@ -9,6 +9,7 @@
 pub mod connection_registry;
 pub mod enrollment_token_repo;
 pub mod group_repo;
+pub mod grpc_stream;
 pub mod postgres_repo;
 
 pub use connection_registry::{

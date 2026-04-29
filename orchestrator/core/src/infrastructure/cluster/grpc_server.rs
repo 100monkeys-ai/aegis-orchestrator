@@ -32,7 +32,14 @@ use prost::Message;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
+
+use crate::application::edge::connect_edge::ConnectEdgeService;
+use crate::application::edge::rotate_edge_key::RotateEdgeKeyService;
+use crate::infrastructure::aegis_cluster_proto::{
+    EdgeCommand, EdgeEvent, RotateEdgeKeyRequest, RotateEdgeKeyResponse,
+};
+use crate::infrastructure::edge::grpc_stream::{handle_connect_edge, handle_rotate_edge_key};
 
 pub struct NodeClusterServiceHandler {
     attest_node_use_case: Arc<AttestNodeUseCase>,
@@ -44,6 +51,11 @@ pub struct NodeClusterServiceHandler {
     sync_config_use_case: Arc<SyncConfigUseCase>,
     push_config_use_case: Arc<PushConfigUseCase>,
     cluster_repo: Arc<dyn NodeClusterRepository>,
+    /// ADR-117: present when this node serves Controller/Hybrid/RelayCoordinator
+    /// roles. None on pure-worker nodes; calling ConnectEdge in that case
+    /// returns FailedPrecondition.
+    connect_edge_service: Option<Arc<ConnectEdgeService>>,
+    rotate_edge_key_service: Option<Arc<RotateEdgeKeyService>>,
 }
 
 impl NodeClusterServiceHandler {
@@ -69,7 +81,21 @@ impl NodeClusterServiceHandler {
             sync_config_use_case,
             push_config_use_case,
             cluster_repo,
+            connect_edge_service: None,
+            rotate_edge_key_service: None,
         }
+    }
+
+    /// ADR-117: enable Edge Mode handlers. Activate only on roles
+    /// Controller / Hybrid / RelayCoordinator.
+    pub fn with_edge_services(
+        mut self,
+        connect_edge: Arc<ConnectEdgeService>,
+        rotate: Arc<RotateEdgeKeyService>,
+    ) -> Self {
+        self.connect_edge_service = Some(connect_edge);
+        self.rotate_edge_key_service = Some(rotate);
+        self
     }
 
     async fn authenticate_node<T: Message + Default>(
@@ -548,5 +574,33 @@ impl NodeClusterService for NodeClusterServiceHandler {
             nodes,
             cluster_id: "aegis-cluster".to_string(),
         }))
+    }
+
+    // ── ADR-117: Edge Mode handlers ──────────────────────────────────────
+
+    type ConnectEdgeStream = Pin<Box<dyn Stream<Item = Result<EdgeCommand, Status>> + Send>>;
+
+    async fn connect_edge(
+        &self,
+        request: Request<Streaming<EdgeEvent>>,
+    ) -> Result<Response<Self::ConnectEdgeStream>, Status> {
+        let svc = self
+            .connect_edge_service
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("edge mode disabled on this node"))?
+            .clone();
+        handle_connect_edge(svc, request).await
+    }
+
+    async fn rotate_edge_key(
+        &self,
+        request: Request<RotateEdgeKeyRequest>,
+    ) -> Result<Response<RotateEdgeKeyResponse>, Status> {
+        let svc = self
+            .rotate_edge_key_service
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("edge mode disabled on this node"))?
+            .clone();
+        handle_rotate_edge_key(svc, request).await
     }
 }
