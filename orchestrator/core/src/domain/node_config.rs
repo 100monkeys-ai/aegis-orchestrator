@@ -2436,6 +2436,8 @@ mod tests {
             stale_threshold_secs: None,
             sweep_interval_secs: None,
             tls: None,
+            edge: None,
+            ingress: None,
         });
 
         let bootstrap = manifest.bootstrap();

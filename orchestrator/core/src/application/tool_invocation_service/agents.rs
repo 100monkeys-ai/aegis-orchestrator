@@ -43,6 +43,7 @@ impl ToolInvocationService {
                             category: None,
                             limit: Some(1000),
                             offset: Some(0),
+                            fleet_capable: None,
                         },
                     )
                     .await;
@@ -371,6 +372,7 @@ impl ToolInvocationService {
                             category: None,
                             limit: Some(1000),
                             offset: Some(0),
+                            fleet_capable: None,
                         },
                     )
                     .await;
