@@ -209,6 +209,11 @@ pub(crate) async fn run_database_migrations(
     let database_url =
         resolve_env_value(&db_config.url).context("Failed to resolve spec.database.url")?;
 
+    // ADR-117 SEV-2 #2.1: the orchestrator binary lives in the `cli` crate;
+    // `sqlx::migrate!` resolves its argument relative to the crate root, so
+    // the canonical location for migrations is `cli/migrations/` (NOT
+    // `orchestrator/core/migrations/`). All ADR-117 edge migrations
+    // (029_edge_mode.sql, ...) live here.
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
     if dry_run {
