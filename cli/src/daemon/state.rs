@@ -138,4 +138,8 @@ pub(crate) struct AppState {
     /// Shared secret for zaru-client internal endpoints.
     /// Loaded from the `ZARU_INTERNAL_SECRET` environment variable.
     pub(crate) zaru_internal_secret: Option<String>,
+    /// ADR-117: bundle for the `/api/edge/*` REST surface and edge-side
+    /// dispatcher hooks. `None` on deployments where a Postgres pool is not
+    /// available or the controller is configured without edge enrollment.
+    pub(crate) edge_api: Option<aegis_orchestrator_core::api::rest::edge::EdgeApiState>,
 }

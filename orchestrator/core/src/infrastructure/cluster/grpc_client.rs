@@ -103,6 +103,9 @@ impl NodeClusterClient {
                 challenge_id: attest_resp.challenge_id,
                 node_id: node_id_str,
                 challenge_signature: signature.to_bytes().to_vec(),
+                // ADR-117: this client path is for worker/hybrid attestation;
+                // edge daemons attest through the daemon binary.
+                bootstrap_proof: None,
             }))
             .await
             .context("ChallengeNode RPC failed")?

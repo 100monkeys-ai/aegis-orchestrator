@@ -254,6 +254,17 @@ impl NodeSecurityToken {
     }
 }
 
+/// Claims carried inside a `NodeSecurityToken` (RS256 JWT issued at the end of
+/// the AttestNode/ChallengeNode handshake).
+///
+/// For ADR-117 edge daemons the controller additionally embeds:
+///
+/// * `tid` — persistent tenant binding established at enrollment time. Every
+///   request issued under this token is authoritatively scoped to this tenant
+///   regardless of any caller-supplied tenant hints.
+/// * `cep` — controller endpoint advertised at enrollment time. Allows the
+///   daemon to detect endpoint drift between attestation and reconnection so
+///   it can re-enroll instead of trusting a stale endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeTokenClaims {
     #[serde(rename = "sub")]
@@ -263,6 +274,14 @@ pub struct NodeTokenClaims {
     pub capabilities_hash: String,
     pub iat: i64,
     pub exp: i64,
+    /// ADR-117: persistent tenant binding for edge daemons. `None` for worker /
+    /// controller / hybrid nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid: Option<String>,
+    /// ADR-117: controller endpoint advertised at edge enrollment. `None` for
+    /// non-edge nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cep: Option<String>,
 }
 
 /// SealNodeEnvelope (Value Object)

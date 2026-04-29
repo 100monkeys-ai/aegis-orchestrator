@@ -1,6 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+use crate::application::cluster::challenge_node::BootstrapProof;
 use crate::application::cluster::{
     AttestNodeRequest as AppAttestNodeRequest, AttestNodeUseCase,
     ChallengeNodeRequest as AppChallengeNodeRequest, ChallengeNodeUseCase,
@@ -204,12 +205,18 @@ impl NodeClusterService for NodeClusterServiceHandler {
         request: Request<ChallengeNodeRequest>,
     ) -> Result<Response<ChallengeNodeResponse>, Status> {
         let req = request.into_inner();
+        // ADR-117: translate the prost-generated `bootstrap_proof` oneof.
+        use crate::infrastructure::aegis_cluster_proto::challenge_node_request::BootstrapProof as ProtoBootstrapProof;
+        let bootstrap_proof = req.bootstrap_proof.map(|bp| match bp {
+            ProtoBootstrapProof::EnrollmentToken(t) => BootstrapProof::EnrollmentToken(t),
+        });
         let app_req = AppChallengeNodeRequest {
             challenge_id: uuid::Uuid::parse_str(&req.challenge_id)
                 .map_err(|_| Status::invalid_argument("Invalid challenge_id"))?,
             node_id: NodeId::from_string(&req.node_id)
                 .map_err(|_| Status::invalid_argument("Invalid node_id"))?,
             challenge_signature: req.challenge_signature,
+            bootstrap_proof,
         };
 
         let resp = self

@@ -289,6 +289,9 @@ async fn join_cluster(
         challenge_id: attest_resp.challenge_id,
         node_id: config.spec.node.id.clone(),
         challenge_signature: signature.to_bytes().to_vec(),
+        // ADR-117: workers / hybrids / controllers do not supply a bootstrap
+        // proof. Edge daemons populate this with `EnrollmentToken`.
+        bootstrap_proof: None,
     };
 
     let _challenge_resp = client

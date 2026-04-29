@@ -80,7 +80,7 @@ mod tests {
                 assert_eq!(s.tags.len(), 2);
                 assert_eq!(s.labels.len(), 1);
             }
-            _ => panic!("expected Selector"),
+            _ => unreachable!("parse(\"tags=...\") must yield EdgeTarget::Selector"),
         }
     }
 }

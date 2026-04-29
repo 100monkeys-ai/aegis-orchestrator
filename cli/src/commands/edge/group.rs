@@ -1,6 +1,10 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+use anyhow::Result;
 use clap::Subcommand;
+use serde::{Deserialize, Serialize};
+
+use super::client::EdgeApiClient;
 
 #[derive(Debug, Subcommand)]
 pub enum GroupCommand {
@@ -11,27 +15,77 @@ pub enum GroupCommand {
         selector: String,
     },
     SetPinned {
-        name: String,
+        id: String,
         #[arg(long)]
-        add: Vec<String>,
-        #[arg(long)]
-        rm: Vec<String>,
+        members: Vec<String>,
     },
     Rm {
-        name: String,
+        id: String,
     },
 }
 
-pub async fn run(cmd: GroupCommand) -> anyhow::Result<()> {
+#[derive(Serialize)]
+struct CreateGroupBody {
+    name: String,
+    selector: aegis_orchestrator_core::domain::edge::EdgeSelector,
+    pinned_members: Vec<String>,
+    created_by: String,
+}
+
+#[derive(Serialize)]
+struct PatchGroupBody {
+    pinned_members: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GroupView {
+    id: String,
+    name: String,
+    selector: aegis_orchestrator_core::domain::edge::EdgeSelector,
+    pinned_members: Vec<String>,
+    created_by: String,
+    created_at: String,
+}
+
+pub async fn run(cmd: GroupCommand) -> Result<()> {
+    let client = EdgeApiClient::from_env()?;
     match cmd {
-        GroupCommand::Ls => println!("aegis edge group ls -> GET /api/edge/groups"),
+        GroupCommand::Ls => {
+            let groups: Vec<GroupView> = client.get("/api/edge/groups").await?;
+            println!("{}", serde_json::to_string_pretty(&groups)?);
+        }
         GroupCommand::Create { name, selector } => {
-            println!("aegis edge group create '{name}' --selector '{selector}'")
+            let target = super::selector::parse(&selector)?;
+            let sel = match target {
+                aegis_orchestrator_core::domain::edge::EdgeTarget::Selector(s) => s,
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "create requires a selector expression (tags=, labels=, ...)"
+                    ))
+                }
+            };
+            let body = CreateGroupBody {
+                name,
+                selector: sel,
+                pinned_members: vec![],
+                created_by: std::env::var("AEGIS_OPERATOR_SUB").unwrap_or_else(|_| "cli".into()),
+            };
+            let group: GroupView = client.post("/api/edge/groups", &body).await?;
+            println!("{}", serde_json::to_string_pretty(&group)?);
         }
-        GroupCommand::SetPinned { name, add, rm } => {
-            println!("aegis edge group set-pinned '{name}' add={add:?} rm={rm:?}")
+        GroupCommand::SetPinned { id, members } => {
+            let body = PatchGroupBody {
+                pinned_members: members,
+            };
+            let group: GroupView = client
+                .patch(&format!("/api/edge/groups/{id}"), &body)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&group)?);
         }
-        GroupCommand::Rm { name } => println!("aegis edge group rm '{name}'"),
+        GroupCommand::Rm { id } => {
+            client.delete(&format!("/api/edge/groups/{id}")).await?;
+            println!("deleted");
+        }
     }
     Ok(())
 }

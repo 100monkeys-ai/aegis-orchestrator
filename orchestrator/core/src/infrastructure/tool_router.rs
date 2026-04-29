@@ -195,6 +195,10 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.runtime.list",
     "aegis.execution.file",
     "aegis.attachment.read",
+    // ADR-117: edge fleet system tools.
+    "aegis.edge.fleet.list",
+    "aegis.edge.fleet.invoke",
+    "aegis.edge.fleet.cancel",
 ];
 
 /// Canonical registry of all builtin tool dispatchers.
@@ -262,6 +266,14 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid."),
     ("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes."),
     ("aegis.attachment.read", "Read the contents of a file attached to a chat message. Returns the file content (UTF-8 text or base64-encoded bytes for binary), MIME type, size, and SHA-256 digest. Tenant-scoped and read-only."),
+    // ADR-117 §D: edge fleet system tools (operator-tier). The
+    // dispatcher branches on these names directly in
+    // `try_dispatch_aegis_tool`; they are surfaced here so that
+    // discovery (`aegis.tools.list` / `aegis.tools.search`) and
+    // schema lookup (`schema_for_builtin`) can find them.
+    ("aegis.edge.fleet.list", "ADR-117: resolve an edge fleet target (selector / group / @node / all) and return the matched node ids without dispatching. Operator-tier."),
+    ("aegis.edge.fleet.invoke", "ADR-117: dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /api/edge/fleet/invoke. Operator-tier, fleet-capable."),
+    ("aegis.edge.fleet.cancel", "ADR-117: cancel an in-flight fleet operation by fleet_command_id. Operator-tier."),
 ];
 
 impl ToolRouter {
@@ -470,6 +482,7 @@ impl ToolRouter {
                         name: cap.clone(),
                         description: format!("Provided by MCP server '{}'", server.name),
                         input_schema: json!({ "type": "object" }),
+                        ..Default::default()
                     });
                 }
             }
@@ -485,6 +498,7 @@ impl ToolRouter {
                     name: cap.name.clone(),
                     description: dispatcher.description.clone(),
                     input_schema: Self::schema_for_builtin(&cap.name),
+                    ..Default::default()
                 });
             }
         }
@@ -505,6 +519,7 @@ impl ToolRouter {
                 name: name.to_string(),
                 description: description.to_string(),
                 input_schema: Self::schema_for_builtin(name),
+                ..Default::default()
             });
         }
 
@@ -1269,6 +1284,32 @@ impl ToolRouter {
                 "type": "object",
                 "properties": {}
             }),
+            // ADR-117 §D edge fleet system tools.
+            "aegis.edge.fleet.list" => json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "description": "EdgeTarget: { Node: '...' } | { Group: '...' } | { Selector: { os, arch, tools, labels, tags } } | 'All'."
+                    }
+                },
+                "required": ["target"]
+            }),
+            "aegis.edge.fleet.invoke" => json!({
+                "type": "object",
+                "properties": {
+                    "target": { "description": "EdgeTarget — see aegis.edge.fleet.list." },
+                    "tool_name": { "type": "string", "description": "Name of the tool to dispatch on every resolved edge daemon." },
+                    "args": { "type": "object", "description": "JSON object of tool arguments." }
+                },
+                "required": ["target", "tool_name"]
+            }),
+            "aegis.edge.fleet.cancel" => json!({
+                "type": "object",
+                "properties": {
+                    "fleet_command_id": { "type": "string", "description": "UUID returned by aegis.edge.fleet.invoke." }
+                },
+                "required": ["fleet_command_id"]
+            }),
             "aegis.agent.search" => json!({
                 "type": "object",
                 "properties": {
@@ -1443,12 +1484,21 @@ impl ToolRouter {
 ///
 /// Fields are serialized as camelCase to match the MCP protocol specification
 /// (e.g., `input_schema` → `inputSchema`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolMetadata {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// ADR-117: when set to `"edge"` the dispatcher routes this tool through
+    /// the EdgeRouter instead of the local builtin / MCP / SEAL chain. Default
+    /// `None` keeps every existing tool on its current path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    /// ADR-117: when `true` the tool is eligible for fleet (multi-target) fan
+    /// out via `aegis.edge.fleet.invoke`. Default `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet_capable: bool,
 }
 
 // =============================================================================

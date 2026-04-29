@@ -399,6 +399,15 @@ pub(crate) fn create_router(
         )
         .with_state(app_state.clone());
 
+    // ADR-117 §F: mount `/api/edge/*` whenever the edge bundle was constructed
+    // (i.e. a Postgres pool is available). Pure-worker deployments without a
+    // pool skip this mount and never serve the operator surface.
+    let router = if let Some(edge_state) = app_state.edge_api.clone() {
+        router.merge(aegis_orchestrator_core::api::rest::edge::router(edge_state))
+    } else {
+        router
+    };
+
     // Tenant-context middleware (ADR-056, ADR-111 §Tenant-Context Header
     // Extension) — inserts the resolved TenantId into request extensions and
     // enforces consumer team-switch authorization via MembershipRepository.

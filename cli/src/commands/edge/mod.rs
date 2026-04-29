@@ -5,6 +5,7 @@
 use clap::{Args, Subcommand};
 
 pub mod bootstrap;
+pub mod client;
 pub mod enroll;
 pub mod fleet;
 pub mod group;
