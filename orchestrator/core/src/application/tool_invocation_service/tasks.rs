@@ -379,8 +379,11 @@ impl ToolInvocationService {
                         serde_json::json!({
                             "id": e.id.0.to_string(),
                             "agent_id": e.agent_id.0.to_string(),
+                            "tenant_id": e.tenant_id.as_str(),
                             "status": format!("{:?}", e.status).to_lowercase(),
                             "started_at": e.started_at,
+                            "ended_at": e.ended_at,
+                            "iteration_count": e.iterations().len(),
                             "summary": super::summary::summarize_intent(&e.input.intent),
                         })
                     })

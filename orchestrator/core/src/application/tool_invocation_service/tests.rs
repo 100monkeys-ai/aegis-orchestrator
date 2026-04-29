@@ -4337,6 +4337,96 @@ async fn aegis_task_list_summary_reflects_caller_intent_not_manifest() {
     );
 }
 
+/// REGRESSION: `aegis.task.list` MUST surface `ended_at`, `tenant_id`, and
+/// `iteration_count` on every execution entry alongside the previously
+/// emitted fields. Operators rely on these fields to render duration,
+/// disambiguate cross-tenant rows in admin views, and gate UI actions on
+/// progress without an extra `aegis.task.status` round trip.
+///
+/// In-progress executions surface `ended_at: null`; completed executions
+/// surface a concrete RFC3339 timestamp. `iteration_count` matches the
+/// number of attempted iterations on the execution at list time.
+#[tokio::test]
+async fn aegis_task_list_emits_ended_at_tenant_id_and_iteration_count() {
+    use crate::domain::tenant::TenantId;
+
+    let mut in_progress = make_task_execution_with_intent(Some("in-progress task".to_string()));
+    in_progress.tenant_id = TenantId::consumer();
+    in_progress.start();
+    in_progress
+        .start_iteration("first attempt".to_string())
+        .expect("start iteration");
+    // Leave the iteration running and the execution un-completed so
+    // ended_at remains None on the wire.
+
+    let mut completed = make_task_execution_with_intent(Some("completed task".to_string()));
+    completed.tenant_id = TenantId::consumer();
+    completed.start();
+    completed
+        .start_iteration("first attempt".to_string())
+        .expect("start iteration");
+    completed.complete_iteration("done".to_string());
+    completed
+        .start_iteration("second attempt".to_string())
+        .expect("start iteration 2");
+    completed.complete_iteration("done again".to_string());
+    completed.complete();
+
+    let service =
+        build_task_list_service_with_executions(vec![in_progress.clone(), completed.clone()]);
+    let payload = invoke_task_list(&service).await;
+    let entries = payload["executions"]
+        .as_array()
+        .expect("executions array present");
+    assert_eq!(entries.len(), 2);
+
+    // Every entry must carry the new fields as keys, even when nullable.
+    for entry in entries {
+        let obj = entry.as_object().expect("entry is an object");
+        assert!(obj.contains_key("ended_at"), "ended_at key must be present");
+        assert!(
+            obj.contains_key("tenant_id"),
+            "tenant_id key must be present"
+        );
+        assert!(
+            obj.contains_key("iteration_count"),
+            "iteration_count key must be present"
+        );
+    }
+
+    // In-progress execution: ended_at null, iteration_count = 1.
+    let in_progress_entry = entries
+        .iter()
+        .find(|e| e["id"] == serde_json::json!(in_progress.id.0.to_string()))
+        .expect("in-progress entry");
+    assert!(
+        in_progress_entry["ended_at"].is_null(),
+        "in-progress ended_at must serialize as null, got {:?}",
+        in_progress_entry["ended_at"]
+    );
+    assert_eq!(in_progress_entry["iteration_count"], 1);
+    assert_eq!(
+        in_progress_entry["tenant_id"],
+        serde_json::json!(TenantId::consumer().as_str())
+    );
+
+    // Completed execution: ended_at populated, iteration_count = 2.
+    let completed_entry = entries
+        .iter()
+        .find(|e| e["id"] == serde_json::json!(completed.id.0.to_string()))
+        .expect("completed entry");
+    assert!(
+        completed_entry["ended_at"].is_string(),
+        "completed ended_at must serialize as an RFC3339 string, got {:?}",
+        completed_entry["ended_at"]
+    );
+    assert_eq!(completed_entry["iteration_count"], 2);
+    assert_eq!(
+        completed_entry["tenant_id"],
+        serde_json::json!(TenantId::consumer().as_str())
+    );
+}
+
 async fn build_workflow_list_service_with_input(
     input_params: serde_json::Value,
 ) -> (ToolInvocationService, crate::domain::workflow::WorkflowId) {
