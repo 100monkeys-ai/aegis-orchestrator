@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
-use axum::body::to_bytes;
 use axum::extract::{Extension, FromRequest, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use futures::StreamExt;
 use sha2::Digest;
 use uuid::Uuid;
 
@@ -286,12 +286,13 @@ pub(crate) async fn list_files(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
     let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
     let owner = user_sub(identity_ref);
     let vol_id = VolumeId(id);
 
     state
         .file_operations_service
-        .list_directory(&vol_id, &owner, &params.path)
+        .list_directory(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|entries| Json(serde_json::to_value(entries).unwrap_or(serde_json::json!([]))))
         .map_err(file_ops_error_response)
@@ -314,12 +315,13 @@ pub(crate) async fn stat_file(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
     let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
     let owner = user_sub(identity_ref);
     let vol_id = VolumeId(id);
 
     state
         .file_operations_service
-        .stat_attachment_for_user(&vol_id, &owner, &params.path)
+        .stat_attachment_for_user(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|attrs| Json(serde_json::to_value(attrs).unwrap_or(serde_json::json!({}))))
         .map_err(file_ops_error_response)
@@ -335,12 +337,13 @@ pub(crate) async fn download_file(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
     let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
     let owner = user_sub(identity_ref);
     let vol_id = VolumeId(id);
 
     let content = state
         .file_operations_service
-        .read_file(&vol_id, &owner, &params.path)
+        .read_file(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map_err(file_ops_error_response)?;
 
@@ -542,11 +545,65 @@ fn chat_attachments_volume_size_for_tier(tier: &ZaruTier) -> Option<u64> {
         })
 }
 
-/// Cast a per-tier byte cap into the `usize` accepted by `to_bytes`,
-/// saturating at `usize::MAX` for unbounded tiers (Enterprise = `u64::MAX`)
-/// and on 32-bit targets where `u64` exceeds `usize::MAX`.
-fn cap_as_usize(cap: u64) -> usize {
-    usize::try_from(cap).unwrap_or(usize::MAX)
+/// 413 response builder used by the streaming upload paths. The body has been
+/// rejected because its running byte count exceeded the per-tier cap. We emit
+/// this from the streaming path the *moment* the cap is crossed — the
+/// half-buffered prefix is immediately dropped.
+fn payload_too_large_response(cap: u64) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({
+            "error": format!("upload exceeds tier cap of {} bytes", cap)
+        })),
+    )
+}
+
+/// Stream a raw HTTP request body into a `Vec<u8>`, enforcing a tier cap on
+/// the running byte count. Returns:
+///
+/// * `Ok(buf)` when the body finishes at or below `cap`.
+/// * `Err(413)` the moment the running count exceeds `cap` — the partial
+///   buffer is dropped immediately and no further chunks are accumulated.
+///
+/// Extracted as a free function so the streaming behaviour can be tested
+/// directly without wiring a full Axum handler. This is the regression
+/// surface for security audit 002 §4.20.
+pub(crate) async fn read_body_capped(
+    body: axum::body::Body,
+    cap: u64,
+) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
+    let mut stream = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("body read error: {e}")})),
+            )
+        })?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > cap {
+            drop(buf);
+            return Err(payload_too_large_response(cap));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Reject early when the caller advertises a `Content-Length` larger than the
+/// per-tier cap. This is best-effort — `Content-Length` is trivially spoofable
+/// and may be omitted entirely, so the streaming size check below is the
+/// authoritative gate. The fast-fail path saves us from accepting any body
+/// frames when the caller has already declared they will exceed the cap.
+fn content_length_exceeds_cap(headers: &axum::http::HeaderMap, cap: u64) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|len| len > cap)
+        .unwrap_or(false)
 }
 
 /// POST /v1/volumes/:id/files/upload (ADR-079, ADR-113)
@@ -599,7 +656,13 @@ pub(crate) async fn upload_file(
             })),
         )
     })?;
-    let max_file_size_usize = cap_as_usize(max_file_size);
+    // 4.20: Reject up-front when the advertised Content-Length already
+    // exceeds the cap, so we never even start reading the body. The
+    // streaming check below remains the authoritative gate because
+    // Content-Length is spoofable / optional.
+    if content_length_exceeds_cap(request.headers(), max_file_size) {
+        return Err(payload_too_large_response(max_file_size));
+    }
 
     let is_multipart = request
         .headers()
@@ -630,9 +693,13 @@ pub(crate) async fn upload_file(
                 )
             })?;
         let mut found: Option<(Vec<u8>, Option<String>)> = None;
+        // Running byte count across *all* file-field bytes. We treat the
+        // upload-tier cap as the budget for the whole upload, not per-field,
+        // so a hostile client cannot bypass it with multiple sub-cap fields.
+        let mut total_bytes: u64 = 0;
         loop {
             let field_res = mp.next_field().await;
-            let field = match field_res {
+            let mut field = match field_res {
                 Ok(Some(f)) => f,
                 Ok(None) => break,
                 Err(e) => {
@@ -646,25 +713,34 @@ pub(crate) async fn upload_file(
             // dropped rather than failing the upload, since browsers may
             // include hidden CSRF/metadata fields.
             let file_name = field.file_name().map(|s| s.to_string());
-            let bytes = field.bytes().await.map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("multipart read error: {e}")})),
-                )
-            })?;
-            if bytes.len() as u64 > max_file_size {
-                return Err((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(serde_json::json!({
-                        "error": format!(
-                            "upload exceeds tier cap of {} bytes",
-                            max_file_size
-                        )
-                    })),
-                ));
+            // 4.20: Stream the field chunk-by-chunk, enforcing the running
+            // byte count against the tier cap. Abort the moment the cap is
+            // exceeded — never buffer the whole field first.
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+                        if total_bytes > max_file_size {
+                            return Err(payload_too_large_response(max_file_size));
+                        }
+                        if found.is_none() {
+                            buf.extend_from_slice(&chunk);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(
+                                serde_json::json!({"error": format!("multipart read error: {e}")}),
+                            ),
+                        ))
+                    }
+                }
             }
-            if found.is_none() && !bytes.is_empty() {
-                found = Some((bytes.to_vec(), file_name));
+            if found.is_none() && !buf.is_empty() {
+                found = Some((buf, file_name));
             }
         }
         match found {
@@ -677,15 +753,10 @@ pub(crate) async fn upload_file(
             }
         }
     } else {
-        let body = request.into_body();
-        // `to_bytes` enforces the per-tier cap directly: it returns an error
-        // (mapped to 413) if the body exceeds `max_file_size_usize`.
-        let bytes = to_bytes(body, max_file_size_usize).await.map_err(|e| {
-            (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({"error": format!("body read error: {e}")})),
-            )
-        })?;
+        // 4.20: Stream the raw body, aborting the moment the running byte
+        // count exceeds the tier cap — never buffer the whole body before
+        // checking. See `read_body_capped` for the regression surface.
+        let buf = read_body_capped(request.into_body(), max_file_size).await?;
         // Honor the X-Filename header on the raw-body branch (ADR-113).
         // Validation rejects path separators, `..`, control chars, NUL,
         // empty, or overlong values; an invalid header falls through to the
@@ -694,7 +765,7 @@ pub(crate) async fn upload_file(
             .as_deref()
             .filter(|n| validate_supplied_filename(n))
             .map(|n| n.to_string());
-        (bytes.to_vec(), header_name)
+        (buf, header_name)
     };
 
     let mime_type = sniff_upload_mime(&data);
@@ -705,7 +776,14 @@ pub(crate) async fn upload_file(
 
     state
         .file_operations_service
-        .write_file(&vol_id, &owner, &params.path, &data, max_file_size)
+        .write_file(
+            &vol_id,
+            &tenant_id,
+            &owner,
+            &params.path,
+            &data,
+            max_file_size,
+        )
         .await
         .map_err(file_ops_error_response)?;
 
@@ -741,12 +819,13 @@ pub(crate) async fn delete_path(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
     let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
     let owner = user_sub(identity_ref);
     let vol_id = VolumeId(id);
 
     state
         .file_operations_service
-        .delete_path(&vol_id, &owner, &params.path)
+        .delete_path(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|_| Json(serde_json::json!({"success": true})))
         .map_err(file_ops_error_response)
@@ -762,12 +841,13 @@ pub(crate) async fn mkdir(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
     let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
     let owner = user_sub(identity_ref);
     let vol_id = VolumeId(id);
 
     state
         .file_operations_service
-        .create_directory(&vol_id, &owner, &params.path)
+        .create_directory(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|_| Json(serde_json::json!({"success": true})))
         .map_err(file_ops_error_response)
@@ -783,12 +863,13 @@ pub(crate) async fn move_path(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
     let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
     let owner = user_sub(identity_ref);
     let vol_id = VolumeId(id);
 
     state
         .file_operations_service
-        .move_path(&vol_id, &owner, &body.from, &body.to)
+        .move_path(&vol_id, &tenant_id, &owner, &body.from, &body.to)
         .await
         .map(|_| Json(serde_json::json!({"success": true})))
         .map_err(file_ops_error_response)
@@ -977,14 +1058,128 @@ mod tests {
         assert_eq!(cap, u64::MAX);
     }
 
-    /// Enterprise's `u64::MAX` cap must convert into a `usize` that
-    /// `axum::body::to_bytes` accepts without overflow. On 64-bit targets
-    /// this is `usize::MAX`; on 32-bit it saturates rather than panics.
+    // ========================================================================
+    // Security audit 002 §4.20 — streaming body cap regressions.
+    //
+    // The pre-fix upload handler buffered the *entire* request body before
+    // checking against the per-tier cap, giving any authenticated caller a
+    // memory-based DoS surface. The streaming path now aborts the moment
+    // the running byte count crosses the cap. These tests exercise:
+    //
+    //   1. `content_length_exceeds_cap` rejects an advertised oversize
+    //      Content-Length up-front, before any body frame is read.
+    //   2. `read_body_capped` rejects a body that exceeds the cap *during*
+    //      streaming and bounds the materialised buffer to `<= cap` bytes.
+    //   3. A body whose length is at or below the cap streams through.
+    // ========================================================================
+
     #[test]
-    fn cap_as_usize_saturates_on_overflow() {
-        assert_eq!(cap_as_usize(u64::MAX), usize::MAX);
-        assert_eq!(cap_as_usize(0), 0);
-        assert_eq!(cap_as_usize(50 * 1024 * 1024), 50 * 1024 * 1024);
+    fn content_length_exceeds_cap_rejects_oversize_advertisement() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_static("104857601"), // 100 MiB + 1
+        );
+        // Cap is exactly 100 MiB.
+        assert!(content_length_exceeds_cap(&headers, 100 * 1024 * 1024));
+    }
+
+    #[test]
+    fn content_length_exceeds_cap_admits_under_cap_advertisement() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_static("1024"),
+        );
+        assert!(!content_length_exceeds_cap(&headers, 4096));
+    }
+
+    #[test]
+    fn content_length_exceeds_cap_admits_missing_header() {
+        // Missing Content-Length is fine — the streaming check is the
+        // authoritative gate.
+        let headers = axum::http::HeaderMap::new();
+        assert!(!content_length_exceeds_cap(&headers, 1024));
+    }
+
+    /// Regression for §4.20: a body whose mid-stream running count exceeds
+    /// the cap is rejected as soon as the threshold is crossed. The bytes
+    /// accepted before the rejection are bounded by the cap — proof that
+    /// the handler does not buffer the full body before checking.
+    #[tokio::test]
+    async fn read_body_capped_aborts_when_running_count_exceeds_cap() {
+        // Build a body as a stream of small chunks summing to 4 KiB.
+        // The cap is 1 KiB. The 5th chunk (5 * 256 = 1280) crosses it.
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = (0..16)
+            .map(|_| Ok(axum::body::Bytes::from(vec![0u8; 256])))
+            .collect();
+        let stream = futures::stream::iter(chunks);
+        let body = axum::body::Body::from_stream(stream);
+
+        let cap: u64 = 1024;
+        let result = read_body_capped(body, cap).await;
+        let (status, _json) = result.expect_err("must reject oversize body");
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The cap-exceeded error must be raised *before* the entire body is
+    /// drained: we bound the chunk producer with a counter and assert it
+    /// stops being polled once the cap is crossed. This is the load-bearing
+    /// guarantee — buffering the whole body would defeat the fix.
+    #[tokio::test]
+    async fn read_body_capped_does_not_drain_full_body_after_cap_exceeded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let yielded_inner = yielded.clone();
+
+        // Up to 1024 chunks of 1 KiB each (1 MiB max). Cap is 4 KiB. The
+        // stream MUST stop being polled shortly after the 4th chunk.
+        let stream = futures::stream::unfold(0usize, move |i| {
+            let yielded = yielded_inner.clone();
+            async move {
+                if i >= 1024 {
+                    None
+                } else {
+                    yielded.fetch_add(1, Ordering::SeqCst);
+                    Some((
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0u8; 1024])),
+                        i + 1,
+                    ))
+                }
+            }
+        });
+        let body = axum::body::Body::from_stream(stream);
+
+        let cap: u64 = 4 * 1024;
+        let result = read_body_capped(body, cap).await;
+        let (status, _) = result.expect_err("must reject");
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        // The fix's load-bearing claim: fewer than the full 1024 chunks
+        // are pulled. In practice we expect ~5 (cap / chunk_size + 1).
+        let pulled = yielded.load(Ordering::SeqCst);
+        assert!(
+            pulled < 1024,
+            "streaming check must abort early; pulled {pulled} of 1024 chunks"
+        );
+        assert!(
+            pulled <= 16,
+            "memory footprint bound: pulled {pulled} chunks (~{} KiB) — far under 1 MiB body",
+            pulled
+        );
+    }
+
+    /// Sanity: a body strictly under the cap streams through to completion.
+    #[tokio::test]
+    async fn read_body_capped_returns_body_under_cap() {
+        let payload = vec![0xCDu8; 512];
+        let body = axum::body::Body::from(payload.clone());
+        let got = read_body_capped(body, 1024)
+            .await
+            .expect("body under cap must succeed");
+        assert_eq!(got, payload);
     }
 
     /// Demonstrates the cap-vs-size comparison the handler performs for
