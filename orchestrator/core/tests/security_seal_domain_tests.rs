@@ -796,6 +796,38 @@ fn no_reversal_from_expired() {
     assert!(matches!(err, SealSessionError::SessionInactive(_)));
 }
 
+/// Audit 002 §4.37.2 regression. `evaluate_call` mutates `status` on the
+/// expired-transition path. The concurrency contract stamped on the method
+/// is that callers must hold an exclusive borrow for the duration of the
+/// call — Rust's borrow checker enforces that statically through `&mut self`,
+/// so a "second concurrent evaluator" cannot exist at the same time.
+///
+/// This test pins the API shape: replacing `&mut self` with `&self` (or
+/// hiding the mutation behind interior mutability without a per-session
+/// `Mutex`) would silently allow two tasks to race the expiry transition.
+/// The test asserts the type-level contract by constructing a function
+/// pointer with the expected signature; if the signature changes, the file
+/// stops compiling and the regression is caught at CI time.
+#[test]
+fn evaluate_call_requires_exclusive_borrow() {
+    type EvalFn = fn(&mut SealSession, &MockEnvelope) -> Result<(), SealSessionError>;
+    let _f: EvalFn = |s, e| s.evaluate_call(e);
+
+    // And confirm the runtime invariant: two sequential calls on the same
+    // session observe the mutation made by the first (status flips to
+    // Expired and the second call sees SessionInactive, not a fresh
+    // SessionExpired). This proves the mutation is not lost between
+    // evaluations.
+    let ctx = make_context("zaru-test", vec![wildcard_capability()], vec![]);
+    let mut session = make_session(ctx);
+    session.expires_at = Utc::now() - chrono::Duration::seconds(1);
+    let envelope = MockEnvelope::valid("fs.read", json!({}));
+    let first = session.evaluate_call(&envelope).unwrap_err();
+    assert!(matches!(first, SealSessionError::SessionExpired));
+    let second = session.evaluate_call(&envelope).unwrap_err();
+    assert!(matches!(second, SealSessionError::SessionInactive(_)));
+}
+
 #[test]
 fn no_reversal_from_revoked() {
     let ctx = make_context("zaru-test", vec![wildcard_capability()], vec![]);

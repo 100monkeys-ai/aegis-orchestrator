@@ -337,6 +337,22 @@ impl SealSession {
     /// This is the **single enforcement point** for all SEAL policy checks. Every
     /// tool call from any agent must pass through this method before being forwarded
     /// to the MCP server. See ADR-035 §4 (Enforcement Architecture).
+    ///
+    /// # Concurrency Contract (Audit 002 §4.37.2)
+    ///
+    /// `evaluate_call` takes `&mut self` and mutates the session's `status` on
+    /// the expiry-transition path. Callers MUST hold an exclusive borrow for the
+    /// duration of the call — a `SealSession` MUST NOT be shared across tasks
+    /// behind a non-exclusive primitive (`Arc<SealSession>`, `Arc<RwLock<_>>`
+    /// in read mode, etc.) while it is being evaluated. The canonical access
+    /// pattern is the per-call ownership cycle enforced by
+    /// [`crate::domain::seal_session_repository::SealSessionRepository`]:
+    /// `find_by_id` → mutate via `evaluate_call` → `save`. Each call gets its
+    /// own owned session instance, so concurrent evaluations on the same
+    /// `(agent_id, execution_id)` pair are serialised by the repository's
+    /// optimistic-concurrency contract rather than by an in-memory mutex on
+    /// the aggregate. Wrapping in a `tokio::Mutex` would push the boundary
+    /// into the wrong layer (the domain) and is not the chosen design.
     pub fn evaluate_call(
         &mut self,
         envelope: &impl EnvelopeVerifier,
