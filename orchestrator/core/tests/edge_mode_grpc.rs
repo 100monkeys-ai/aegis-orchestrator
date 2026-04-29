@@ -417,12 +417,52 @@ async fn hello_invoke_tool_command_result_round_trip() {
 
 /// Test 2 — drop-guard semantics when the daemon disconnects.
 ///
-/// After Hello+register, dropping the daemon-side stream must trigger the
-/// server-side `EdgeConnectionGuard::drop` and resolve any pending oneshots
-/// with `EdgeDisconnected`.
+/// Dropping the daemon-side `EdgeConnectionGuard` must:
+///   1. Remove the registered sender from `EdgeConnectionRegistry`.
+///   2. Resolve every pending `oneshot` registered against that node with
+///      `EdgeRouterError::EdgeDisconnected`.
+///
+/// Implemented directly against `EdgeConnectionRegistry` /
+/// `PendingEdgeCalls` (no tonic round-trip required), since the guard's
+/// invariants are independent of the gRPC layer — they only depend on the
+/// `Drop` impl firing once the daemon-side sender is dropped.
 #[tokio::test]
-#[ignore = "TODO(adr-117): expand in-process round-trip suite — drop-guard timing"]
-async fn drop_guard_resolves_pending_with_edge_disconnected() {}
+async fn drop_guard_resolves_pending_with_edge_disconnected() {
+    use aegis_orchestrator_core::domain::edge::EdgeRouterError;
+    use tokio::sync::mpsc;
+
+    let registry = EdgeConnectionRegistry::new();
+    let node_id = NodeId(Uuid::new_v4());
+    let (tx, _rx) = mpsc::channel(8);
+
+    // Register the connection — this hands back the drop-guard.
+    let guard = registry.register(node_id, tx);
+    assert!(
+        registry.get(&node_id).is_some(),
+        "registry must contain node after register"
+    );
+
+    // Register a pending RPC against the node.
+    let cmd_id = Uuid::new_v4();
+    let pending_rx = registry.pending().register(cmd_id, node_id);
+
+    // Dropping the guard must (a) remove the registry entry and
+    // (b) resolve every pending oneshot with EdgeDisconnected.
+    drop(guard);
+    assert!(
+        registry.get(&node_id).is_none(),
+        "registry entry must be removed on drop"
+    );
+
+    let resolved = tokio::time::timeout(Duration::from_secs(2), pending_rx)
+        .await
+        .expect("pending oneshot must resolve within 2s")
+        .expect("oneshot recv ok");
+    match resolved {
+        Err(EdgeRouterError::EdgeDisconnected) => {}
+        other => panic!("expected EdgeDisconnected, got {other:?}"),
+    }
+}
 
 /// Test 3 — server rejects Hello with mismatched signature.
 ///
