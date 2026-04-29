@@ -91,7 +91,7 @@ lru = "0.16"
 # Git Repository Volumes (ADR-081).
 # Vendored features keep the build self-contained and consistent with the
 # project's rustls-only posture in the runtime image (no libssl).
-git2 = { version = "0.19", default-features = false, features = ["https", "ssh", "vendored-libgit2", "vendored-openssl"] }
+git2 = { version = "0.20.4", default-features = false, features = ["https", "ssh", "vendored-libgit2", "vendored-openssl"] }
 scopeguard = "1.2"
 
 [dev-dependencies]
