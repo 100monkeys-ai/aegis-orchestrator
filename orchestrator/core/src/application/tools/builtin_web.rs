@@ -35,7 +35,8 @@ pub async fn invoke_web_tool(
                 .unwrap_or(DEFAULT_MAX_RESULTS);
             let max_results = u32::try_from(max_results_u64).map_err(|_| {
                 SealSessionError::InvalidArguments(
-                    "'max_results' must be between 0 and 4294967295 for web.search".to_string(),
+                    "'max_results' for web.search exceeds the maximum allowed value (4294967295)"
+                        .to_string(),
                 )
             })?;
 
