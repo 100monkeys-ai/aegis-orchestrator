@@ -911,6 +911,24 @@ fn classify_seal_error(e: &crate::domain::seal_session::SealSessionError) -> Sea
         // contract is grep-able and survives future enum additions.
         SealSessionError::UpstreamUnavailable(_) => SealErrorClass::Recoverable,
 
+        // The LLM produced bad tool arguments (missing field, wrong type,
+        // unparseable UUID, unknown tool name). Surface as a tool error so
+        // the LLM can correct itself in the next iteration (ADR-005).
+        // Listed explicitly so the contract is grep-able.
+        SealSessionError::InvalidArguments(_) => SealErrorClass::Recoverable,
+
+        // An internal infrastructure failure (DB error, IO error writing a
+        // generated manifest, repository call failure). The LLM should see
+        // this as a transient tool error and may retry — terminating the
+        // inner loop on a transient infra blip is the same anti-pattern as
+        // terminating on a 429.
+        SealSessionError::InternalError(_) => SealErrorClass::Recoverable,
+
+        // Tenant mismatch is a hard authorization failure — the caller is
+        // attempting to operate on another tenant. Surface as policy
+        // feedback so the LLM stops retrying with the wrong tenant_id.
+        SealSessionError::TenantMismatch { .. } => SealErrorClass::PolicyFeedback,
+
         // Everything else (MalformedPayload, SessionExpired, etc.) is recoverable.
         _ => SealErrorClass::Recoverable,
     }
@@ -1021,6 +1039,115 @@ mod tests {
             SealErrorClass::Fatal,
             "Brave 429 (UpstreamUnavailable) must NOT be Fatal — terminating the inner loop on a transient upstream rate-limit is the bug we are guarding against"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: Bug 3 — tool-argument validation failures (e.g. missing
+    // `agent_id` on `aegis.task.execute`) were wrapped in
+    // `SealSessionError::SignatureVerificationFailed`, which the classifier
+    // routed to `Fatal`, terminating the inner loop on a recoverable LLM
+    // mistake. After the fix, argument validation failures use
+    // `SealSessionError::InvalidArguments` and are classified as
+    // `Recoverable` so the LLM can correct its next tool call.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn invalid_arguments_is_recoverable_not_fatal() {
+        let err = SealSessionError::InvalidArguments(
+            "aegis.task.execute requires 'agent_id' string".to_string(),
+        );
+        let class = classify_seal_error(&err);
+        assert_eq!(
+            class,
+            SealErrorClass::Recoverable,
+            "InvalidArguments must be Recoverable so the LLM can correct itself, got {class:?}"
+        );
+        assert_ne!(
+            class,
+            SealErrorClass::Fatal,
+            "InvalidArguments must NOT be Fatal — bad LLM tool args should not kill the inner loop"
+        );
+    }
+
+    #[test]
+    fn invalid_arguments_display_does_not_mention_signature() {
+        // Operators reading logs must not be misled into chasing a SEAL
+        // signature bug when the LLM merely produced bad tool arguments.
+        let err = SealSessionError::InvalidArguments(
+            "aegis.task.execute requires 'agent_id' string".to_string(),
+        );
+        let s = err.to_string();
+        assert!(
+            !s.to_lowercase().contains("signature"),
+            "InvalidArguments must not be displayed as a signature failure: {s}"
+        );
+    }
+
+    #[test]
+    fn internal_error_is_recoverable_not_fatal() {
+        let err = SealSessionError::InternalError("repository call failed".to_string());
+        assert_eq!(
+            classify_seal_error(&err),
+            SealErrorClass::Recoverable,
+            "InternalError must be Recoverable — transient infra blips should not kill the inner loop"
+        );
+    }
+
+    #[test]
+    fn internal_error_display_does_not_mention_signature() {
+        let err = SealSessionError::InternalError("Failed to list agents: db timeout".to_string());
+        let s = err.to_string();
+        assert!(
+            !s.to_lowercase().contains("signature"),
+            "InternalError must not be displayed as a signature failure: {s}"
+        );
+    }
+
+    #[test]
+    fn tenant_mismatch_is_policy_feedback_not_fatal() {
+        let err = SealSessionError::TenantMismatch {
+            authenticated: "tenant-a".to_string(),
+            requested: "tenant-b".to_string(),
+        };
+        assert_eq!(
+            classify_seal_error(&err),
+            SealErrorClass::PolicyFeedback,
+            "TenantMismatch must be PolicyFeedback so the LLM stops trying the wrong tenant"
+        );
+    }
+
+    #[test]
+    fn tenant_mismatch_display_does_not_mention_signature() {
+        let err = SealSessionError::TenantMismatch {
+            authenticated: "tenant-a".to_string(),
+            requested: "tenant-b".to_string(),
+        };
+        let s = err.to_string();
+        assert!(
+            !s.to_lowercase().contains("signature"),
+            "TenantMismatch must not be displayed as a signature failure: {s}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: Copilot finding — building `aegis.task.execute` with a
+    // missing `agent_id` previously produced
+    // `SealSessionError::SignatureVerificationFailed`, classified as Fatal.
+    // The handler now produces `InvalidArguments`, classified Recoverable.
+    // This test pins the specific regression so it cannot silently regress
+    // by someone copy-pasting an old call site.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn task_execute_missing_agent_id_is_invalid_arguments_not_signature_failure() {
+        let err = SealSessionError::InvalidArguments(
+            "aegis.task.execute requires 'agent_id' string".to_string(),
+        );
+        // Must not be a SignatureVerificationFailed.
+        assert!(
+            !matches!(err, SealSessionError::SignatureVerificationFailed(_)),
+            "missing agent_id must not be wrapped as SignatureVerificationFailed"
+        );
+        // Must classify as Recoverable so the inner loop continues.
+        assert_eq!(classify_seal_error(&err), SealErrorClass::Recoverable);
     }
 
     #[test]

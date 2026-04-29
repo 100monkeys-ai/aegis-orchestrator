@@ -14,7 +14,7 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.task.execute requires 'agent_id' string".to_string(),
                 )
             })?;
@@ -130,15 +130,15 @@ impl ToolInvocationService {
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.task.status requires 'execution_id' string".to_string(),
                 )
             })?;
 
-        let exec_id =
-            crate::domain::execution::ExecutionId(uuid::Uuid::parse_str(exec_id_str).map_err(
-                |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
-            )?);
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str)
+                .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
+        );
 
         match self
             .execution_service
@@ -416,15 +416,15 @@ impl ToolInvocationService {
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.task.cancel requires 'execution_id' string".to_string(),
                 )
             })?;
 
-        let exec_id =
-            crate::domain::execution::ExecutionId(uuid::Uuid::parse_str(exec_id_str).map_err(
-                |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
-            )?);
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str)
+                .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
+        );
 
         match self
             .execution_service
@@ -458,15 +458,15 @@ impl ToolInvocationService {
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.task.remove requires 'execution_id' string".to_string(),
                 )
             })?;
 
-        let exec_id =
-            crate::domain::execution::ExecutionId(uuid::Uuid::parse_str(exec_id_str).map_err(
-                |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
-            )?);
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str)
+                .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
+        );
 
         match self
             .execution_service

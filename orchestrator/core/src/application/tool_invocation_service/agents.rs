@@ -12,7 +12,7 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.agent.create requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -87,7 +87,7 @@ impl ToolInvocationService {
                         &manifest_yaml,
                     )
                     .map_err(|e| {
-                        SealSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::InternalError(format!(
                             "Agent deployed but failed to persist manifest: {e}"
                         ))
                     })?;
@@ -141,9 +141,7 @@ impl ToolInvocationService {
             .agent_lifecycle
             .list_agents_visible_for_tenant(&tenant_id)
             .await
-            .map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!("Failed to list agents: {e}"))
-            })?;
+            .map_err(|e| SealSessionError::InternalError(format!("Failed to list agents: {e}")))?;
 
         let entries: Vec<serde_json::Value> = agents
             .iter()
@@ -178,16 +176,16 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.agent.delete requires 'agent_id' string".to_string(),
                 )
             })?;
 
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
-        let agent_id =
-            crate::domain::agent::AgentId(uuid::Uuid::parse_str(&agent_id_str).map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}"))
-            })?);
+        let agent_id = crate::domain::agent::AgentId(
+            uuid::Uuid::parse_str(&agent_id_str)
+                .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
+        );
 
         match self
             .agent_lifecycle
@@ -289,7 +287,7 @@ impl ToolInvocationService {
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.agent.update requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -411,7 +409,7 @@ impl ToolInvocationService {
                         manifest_yaml,
                     )
                     .map_err(|e| {
-                        SealSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::InternalError(format!(
                             "Agent updated but failed to persist manifest: {e}"
                         ))
                     })?;
@@ -444,7 +442,7 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::InvalidArguments(
                 "aegis.agent.export requires 'name' string".to_string(),
             )
         })?;

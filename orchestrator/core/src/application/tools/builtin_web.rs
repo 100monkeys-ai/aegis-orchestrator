@@ -54,7 +54,7 @@ pub async fn invoke_web_tool(
                 })
                 .await
         }
-        _ => Err(SealSessionError::SignatureVerificationFailed(format!(
+        _ => Err(SealSessionError::InvalidArguments(format!(
             "Unknown web tool: {tool_name}"
         ))),
     }

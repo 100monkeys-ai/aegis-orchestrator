@@ -43,7 +43,7 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::InvalidArguments(
                 "aegis.workflow.delete requires 'name' string".to_string(),
             )
         })?;
@@ -95,7 +95,7 @@ impl ToolInvocationService {
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.validate requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -148,7 +148,7 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::InvalidArguments(
                 "aegis.workflow.run requires 'name' string".to_string(),
             )
         })?;
@@ -491,7 +491,7 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::InvalidArguments(
                 "aegis.workflow.generate requires 'input' string".to_string(),
             )
         })?;
@@ -876,19 +876,13 @@ impl ToolInvocationService {
 
         let workflows = match scope_filter {
             Some("global") => repo.list_global().await.map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!(
-                    "Failed to list workflows: {e}"
-                ))
+                SealSessionError::InternalError(format!("Failed to list workflows: {e}"))
             })?,
             Some("visible") => repo.list_visible(&tenant_id).await.map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!(
-                    "Failed to list workflows: {e}"
-                ))
+                SealSessionError::InternalError(format!("Failed to list workflows: {e}"))
             })?,
             _ => repo.list_all_for_tenant(&tenant_id).await.map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!(
-                    "Failed to list workflows: {e}"
-                ))
+                SealSessionError::InternalError(format!("Failed to list workflows: {e}"))
             })?,
         };
 
@@ -923,7 +917,7 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::InvalidArguments(
                 "aegis.workflow.promote requires 'name' string".to_string(),
             )
         })?;
@@ -1014,7 +1008,7 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::InvalidArguments(
                 "aegis.workflow.demote requires 'name' string".to_string(),
             )
         })?;
@@ -1104,7 +1098,7 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::InvalidArguments(
                 "aegis.workflow.export requires 'name' string".to_string(),
             )
         })?;
@@ -1167,7 +1161,7 @@ impl ToolInvocationService {
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.update requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -1256,7 +1250,7 @@ impl ToolInvocationService {
                         manifest_yaml,
                     )
                     .map_err(|e| {
-                        SealSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::InternalError(format!(
                             "Workflow updated but failed to persist manifest: {e}"
                         ))
                     })?;
@@ -1293,7 +1287,7 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.create requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -1360,13 +1354,13 @@ impl ToolInvocationService {
         }
 
         let validation_service = self.validation_service.as_ref().ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
+            SealSessionError::ConfigurationError(
                 "Workflow semantic validation service not configured".to_string(),
             )
         })?;
         let register_workflow_use_case =
             self.register_workflow_use_case.as_ref().ok_or_else(|| {
-                SealSessionError::SignatureVerificationFailed(
+                SealSessionError::ConfigurationError(
                     "Workflow registration use case not configured".to_string(),
                 )
             })?;
@@ -1400,14 +1394,12 @@ impl ToolInvocationService {
                 .lookup_agent_visible_for_tenant(&tenant_id, judge_name)
                 .await
                 .map_err(|e| {
-                    SealSessionError::SignatureVerificationFailed(format!(
+                    SealSessionError::InternalError(format!(
                         "Failed to lookup judge agent '{judge_name}': {e}"
                     ))
                 })?
                 .ok_or_else(|| {
-                    SealSessionError::SignatureVerificationFailed(format!(
-                        "Judge agent '{judge_name}' not found"
-                    ))
+                    SealSessionError::NotFound(format!("Judge agent '{judge_name}' not found"))
                 })?;
             judges.push((judge_id, 1.0));
         }
@@ -1460,9 +1452,7 @@ impl ToolInvocationService {
             )
             .await
             .map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!(
-                    "Workflow semantic validation failed: {e}"
-                ))
+                SealSessionError::InternalError(format!("Workflow semantic validation failed: {e}"))
             })?;
 
         let semantic_passed = semantic_consensus.final_score >= min_score
@@ -1499,7 +1489,7 @@ impl ToolInvocationService {
                         &manifest_yaml,
                     )
                     .map_err(|e| {
-                        SealSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::InternalError(format!(
                             "Workflow deployed but failed to persist manifest: {e}"
                         ))
                     })?;
