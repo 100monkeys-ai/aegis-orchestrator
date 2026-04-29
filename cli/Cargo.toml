@@ -97,6 +97,7 @@ stripe-product = { package = "async-stripe-product", version = "=1.0.0-rc.5", fe
 
 [dev-dependencies]
 mockito = "1"
+tempfile = "3"
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]

@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 
 pub mod bootstrap;
 pub mod client;
+pub mod daemon;
 pub mod enroll;
 pub mod fleet;
 pub mod group;
@@ -28,6 +29,8 @@ pub struct EdgeArgs {
 pub enum EdgeCommand {
     /// Redeem an enrollment token and bootstrap local edge state.
     Enroll(enroll::EnrollArgs),
+    /// Run the long-lived ConnectEdge lifecycle (bidi stream + heartbeats).
+    Daemon(daemon::DaemonArgs),
     /// Show local daemon status, tenant binding and capabilities.
     Status(status::StatusArgs),
     /// Local revocation: delete node.token and key from disk.
@@ -54,6 +57,7 @@ pub enum EdgeCommand {
 pub async fn run(args: EdgeArgs) -> anyhow::Result<()> {
     match args.command {
         EdgeCommand::Enroll(a) => enroll::run(a).await,
+        EdgeCommand::Daemon(a) => daemon::run(a).await,
         EdgeCommand::Status(a) => status::run(a).await,
         EdgeCommand::Logout => logout::run().await,
         EdgeCommand::Ls(a) => ls::run(a).await,
