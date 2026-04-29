@@ -643,19 +643,19 @@ mod tests {
 
         // Mirror the `tool_advertises_edge_executor` decision shape so the
         // test fails if the lookup ever stops surfacing the executor field.
-        let advertises = |name: &str| {
+        let advertises = |name: String| {
             let catalog = &catalog;
             async move {
                 catalog
-                    .lookup(name)
+                    .lookup(&name)
                     .await
                     .map(|e| e.executor.as_deref() == Some("edge"))
                     .unwrap_or(false)
             }
         };
-        assert!(advertises("aegis.edge.fleet.invoke").await);
-        assert!(!advertises("aegis.agent.list").await);
-        assert!(!advertises("does.not.exist").await);
+        assert!(advertises("aegis.edge.fleet.invoke".to_string()).await);
+        assert!(!advertises("aegis.agent.list".to_string()).await);
+        assert!(!advertises("does.not.exist".to_string()).await);
     }
 
     /// ADR-117: the `?fleet_capable=true` filter on the discovery surface

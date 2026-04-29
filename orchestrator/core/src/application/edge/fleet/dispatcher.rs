@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Drives a [`FleetCommand`] across resolved targets per its
+//! Drives a [`crate::domain::edge_fleet::FleetCommand`] across resolved targets per its
 //! [`FleetDispatchPolicy`]. Per-node results stream as [`FleetEvent`].
 
 use prost_types::Struct;

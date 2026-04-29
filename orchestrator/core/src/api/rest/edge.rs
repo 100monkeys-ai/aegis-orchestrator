@@ -24,7 +24,7 @@
 //!
 //! `effective_tenant` is resolved per ADR-100 by the `TenantId` extractor
 //! that is already plugged into the orchestrator's middleware stack; here it
-//! is supplied via the [`EffectiveTenant`] header extractor.
+//! is supplied via the `EffectiveTenant` header extractor.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};

@@ -1308,9 +1308,7 @@ impl ToolInvocationService {
     ///   1. `args.target.edge_node_id` set → DispatchToEdge that node.
     ///   2. `args.target.edge_selector` set → resolve via EdgeFleetResolver.
     ///       - exactly 1 match → DispatchToEdge that node.
-    ///       - >1 matches → reject with `MultiTargetRequiresFleetTool` (this
-    ///     path is single-target; fleet calls go through
-    ///     `aegis.edge.fleet.invoke`).
+    ///       - >1 matches → reject with `MultiTargetRequiresFleetTool` (single-target path; fleet calls go through `aegis.edge.fleet.invoke`).
     ///   3. tool descriptor `executor=="edge"` and tenant has exactly one
     ///      connected edge → DispatchToEdge that node.
     ///   4. fall through.
