@@ -22,8 +22,22 @@ impl EventPublisher for NoOpEventPublisher {
 }
 
 /// Create test FSAL dependencies and empty NFS volume registry.
-fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
-    let storage_root = std::env::temp_dir().join("aegis-tool-invocation-tests");
+///
+/// Returns the storage root path as the third tuple element so callers (and the
+/// helper's own regression test) can verify per-invocation isolation. Each call
+/// produces a unique on-disk root keyed by process id and a nanosecond timestamp
+/// so concurrent test runs cannot collide on shared state under temp_dir.
+fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry, std::path::PathBuf) {
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos()
+    );
+    let storage_root =
+        std::env::temp_dir().join(format!("aegis-tool-invocation-tests-{unique_suffix}"));
     let storage = Arc::new(
         LocalHostStorageProvider::new(&storage_root)
             .expect("failed to initialize LocalHostStorageProvider for tests"),
@@ -37,7 +51,21 @@ fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
         publisher,
     ));
     let registry = NfsVolumeRegistry::new();
-    (fsal, registry)
+    (fsal, registry, storage_root)
+}
+
+#[test]
+fn test_fsal_deps_returns_unique_storage_roots() {
+    // Regression: prior to this fix, `test_fsal_deps` reused a single shared
+    // path under `std::env::temp_dir()`, which caused parallel test runs to
+    // collide on the same on-disk state. Each invocation must now yield a
+    // distinct storage root.
+    let (_fsal_a, _reg_a, root_a) = test_fsal_deps();
+    let (_fsal_b, _reg_b, root_b) = test_fsal_deps();
+    assert_ne!(
+        root_a, root_b,
+        "test_fsal_deps must return a unique storage_root per invocation to avoid cross-test collisions"
+    );
 }
 
 /// Build a permissive default `TenantScope` for tests. Tests that need to
@@ -819,7 +847,7 @@ async fn test_invoke_tool_no_session() {
 
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -876,7 +904,7 @@ async fn test_invoke_tool_bad_signature() {
 
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -908,7 +936,7 @@ async fn workflow_validate_tool_returns_success_for_valid_manifest() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
 
     let service = ToolInvocationService::new(
         repo,
@@ -950,7 +978,7 @@ async fn workflow_update_tool_returns_failure_with_deterministic_validation_deta
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
 
     let service = ToolInvocationService::new(
         repo,
@@ -1052,7 +1080,7 @@ async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_succe
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
 
     let service = ToolInvocationService::new(
         repo,
@@ -1275,15 +1303,15 @@ fn build_semantic_judge_payload_includes_tool_audit_history() {
 fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
     // Use oversized fixture content to force sanitization/compaction paths to run.
     // 5_000 chars is intentionally much larger than normal schema/manifest snippets.
-    const LARGE_CONTENT_REPEAT_LEN: usize = 5_000;
-    // Regression guardrail for semantic-judge payload compactness.
-    // 15_000 bytes is a conservative ceiling for this fixture to stay comfortably below
-    // semantic-judge input-size budgets while still catching compaction regressions early.
-    // If upstream limits change, update this threshold and keep this rationale in sync.
-    const MAX_SERIALIZED_PAYLOAD_LEN: usize = 15_000;
-    // Use a 1KB repeated-character sentinel so leaked raw schema/manifest blocks are obvious;
-    // sanitized payloads should not contain uninterrupted runs of this length.
-    const REDACTION_CHECK_REPEAT_LEN: usize = 1024;
+    const LARGE_CONTENT_REPEAT_LEN: usize = 5_000; // Oversized fixture chunk to force compaction/sanitization paths.
+                                                   // Regression guardrail for semantic-judge payload compactness.
+                                                   // 15_000 bytes is a conservative ceiling for this fixture to stay comfortably below
+                                                   // semantic-judge input-size budgets while still catching compaction regressions early.
+                                                   // If upstream limits change, update this threshold and keep this rationale in sync.
+    const MAX_SERIALIZED_PAYLOAD_LEN: usize = 15_000; // Per-test serialized payload budget ceiling.
+                                                      // Use a 1KB repeated-character sentinel so leaked raw schema/manifest blocks are obvious;
+                                                      // sanitized payloads should not contain uninterrupted runs of this length.
+    const REDACTION_CHECK_REPEAT_LEN: usize = 1024; // 1 KiB run-length sentinel to detect unsanitized raw content leaks.
 
     let execution_id = ExecutionId::new();
     let huge_schema_body = "x".repeat(LARGE_CONTENT_REPEAT_LEN);
@@ -1360,7 +1388,7 @@ async fn workflow_run_tool_forwards_blackboard() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
 
     let service = ToolInvocationService::new(
@@ -1442,7 +1470,7 @@ async fn workflow_execution_tools_list_and_get() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
     let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
     let tenant_id = TenantId::consumer();
@@ -1542,7 +1570,7 @@ async fn task_logs_tool_returns_paginated_execution_events() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
 
     let agent_id = AgentId::new();
     let mut execution = Execution::new(
@@ -1642,7 +1670,7 @@ async fn task_logs_tool_returns_execution_fetch_error() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let missing_execution = Execution::new(
         AgentId::new(),
         ExecutionInput {
@@ -1756,7 +1784,7 @@ async fn test_invoke_tool_execution_modes() {
     let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -1886,7 +1914,7 @@ async fn get_available_tools_returns_builtin_dispatcher_metadata() {
     let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -1968,7 +1996,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
         })
         .await
         .unwrap();
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -2049,7 +2077,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
         })
         .await
         .unwrap();
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -2133,7 +2161,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
     let middleware = Arc::new(SealMiddleware::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -2204,7 +2232,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let agent = test_agent_with_tools(&["fs.read"]);
     let agent_id = agent.id;
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -2390,7 +2418,7 @@ fn build_version_aware_service(
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
 
     ToolInvocationService::new(
@@ -2541,7 +2569,7 @@ async fn workflow_run_with_version_passes_version_through() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
 
     let service = ToolInvocationService::new(
@@ -2640,7 +2668,7 @@ fn make_execute_intent_service() -> ToolInvocationService {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -3071,7 +3099,7 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
     let middleware = Arc::new(SealMiddleware::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
 
     let service = ToolInvocationService::new(
         repo,
@@ -3262,7 +3290,12 @@ mod gateway_timeout_regression {
         // where IPv4 localhost is unavailable (for example, IPv6-only CI).
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
-            Err(_) => TcpListener::bind("[::1]:0").await.expect("bind loopback"),
+            Err(ipv4_err) => match TcpListener::bind("[::1]:0").await {
+                Ok(listener) => listener,
+                Err(ipv6_err) => panic!(
+                    "Failed to bind test gateway to both IPv4 (127.0.0.1:0) and IPv6 ([::1]:0) loopback addresses; ipv4 error: {ipv4_err}; ipv6 error: {ipv6_err}"
+                ),
+            },
         };
         let addr: SocketAddr = listener.local_addr().expect("local_addr");
         let url = format!("http://{addr}");
@@ -3314,7 +3347,7 @@ mod gateway_timeout_regression {
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
         );
-        let (fsal, volume_registry) = test_fsal_deps();
+        let (fsal, volume_registry, _storage_root) = test_fsal_deps();
         ToolInvocationService::new(
             repo,
             security_context_repo,
@@ -3664,7 +3697,7 @@ fn build_attachments_capturing_service(
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
 
     let captured = Arc::new(std::sync::Mutex::new(None));
     let exec_service = Arc::new(AttachmentsCapturingExecutionService {
@@ -3849,7 +3882,7 @@ fn build_minimal_tool_invocation_service() -> ToolInvocationService {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -4262,7 +4295,7 @@ fn build_task_list_service_with_executions(executions: Vec<Execution>) -> ToolIn
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     ToolInvocationService::new(
         repo,
         security_context_repo,
@@ -4502,7 +4535,7 @@ async fn build_workflow_list_service_with_input(
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
     let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
     let tenant_id = TenantId::default();
@@ -4787,7 +4820,7 @@ fn build_task_service_with(
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    let (fsal, volume_registry) = test_fsal_deps();
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     ToolInvocationService::new(
         repo,
         security_context_repo,
