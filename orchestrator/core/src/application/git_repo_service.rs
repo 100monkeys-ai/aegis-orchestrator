@@ -987,7 +987,25 @@ pub fn verify_webhook(auth: &WebhookAuth, payload: &[u8], secret: &[u8]) -> bool
             };
             mac.update(payload);
             let expected = mac.finalize().into_bytes();
-            ct_slice_eq(&given, expected.as_slice())
+            let valid = ct_slice_eq(&given, expected.as_slice());
+            if valid {
+                // Audit 002 §4.37.5 — Bitbucket Cloud's webhook signature
+                // header uses HMAC-SHA1, which is past its cryptographic
+                // shelf life. Bitbucket has not yet shipped a SHA-256
+                // alternative, so we still honour the signature, but every
+                // accepted SHA-1 verification gets a deprecation warning so
+                // the operator dashboard can track the residual risk and
+                // prepare to disable this provider once Bitbucket rolls a
+                // stronger algorithm.
+                warn!(
+                    provider = "bitbucket",
+                    algorithm = "hmac-sha1",
+                    "accepted Bitbucket webhook with deprecated HMAC-SHA1 signature \
+                     (audit 002 §4.37.5) — track upgrade to HMAC-SHA256 when Bitbucket \
+                     publishes the alternative header"
+                );
+            }
+            valid
         }
     }
 }
@@ -1293,6 +1311,38 @@ mod tests {
             signature: bb_signature(secret, body),
         };
         assert!(verify_webhook(&auth, body, secret));
+    }
+
+    /// Audit 002 §4.37.5 regression. Bitbucket's webhook signature still uses
+    /// HMAC-SHA1 (Bitbucket Cloud has not shipped a SHA-256 alternative as of
+    /// this audit). We continue to honour the signature so legitimate
+    /// Bitbucket integrations keep working, but every accepted SHA-1
+    /// verification logs a deprecation warning so operators can track the
+    /// residual risk and prepare to disable this provider once a stronger
+    /// header lands. This test pins the dual contract: a valid SHA-1
+    /// signature must still verify (so we don't silently break the
+    /// integration) AND a tampered payload must still be rejected (so the
+    /// deprecation warning never ships at the cost of skipping verification).
+    #[test]
+    fn bitbucket_sha1_remains_accepted_with_deprecation_path() {
+        let body = b"bb-payload";
+        let secret = b"bb-secret";
+        let auth = WebhookAuth {
+            provider: WebhookProvider::Bitbucket,
+            signature: bb_signature(secret, body),
+        };
+        // Acceptance arm — exercises the `warn!`-emitting branch.
+        assert!(
+            verify_webhook(&auth, body, secret),
+            "Bitbucket SHA-1 signatures must still verify; the deprecation \
+             warning is informational only and must not change semantics"
+        );
+        // Tamper arm — the deprecation logging must NOT bypass HMAC checks.
+        let tampered = b"bb-payload-tampered";
+        assert!(
+            !verify_webhook(&auth, tampered, secret),
+            "Bitbucket SHA-1 verification must reject tampered payloads"
+        );
     }
 
     // -----------------------------------------------------------------
