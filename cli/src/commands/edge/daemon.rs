@@ -105,16 +105,9 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
     })?;
     let edge_cfg = cluster.edge.clone().unwrap_or_default();
 
-    let heartbeat_interval = Duration::from_secs(cluster.heartbeat_interval_secs.max(1));
-    let reconnect_backoff: Vec<Duration> = if edge_cfg.stream_reconnect_backoff_secs.is_empty() {
-        vec![Duration::from_secs(60)]
-    } else {
-        edge_cfg
-            .stream_reconnect_backoff_secs
-            .iter()
-            .map(|s| Duration::from_secs(*s))
-            .collect()
-    };
+    let heartbeat_interval = validate_heartbeat_interval(cluster.heartbeat_interval_secs)?;
+    let reconnect_backoff: Vec<Duration> =
+        validate_reconnect_backoff(&edge_cfg.stream_reconnect_backoff_secs)?;
 
     // 5. Capabilities snapshot. v1: surface the operator-configured
     //    local_tools / mount_points / custom_labels verbatim. Hardware
@@ -220,10 +213,7 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
                 // run_edge_daemon's outer loop is unconditional — it only
                 // returns if it fails before entering the loop. Surface the
                 // error to the operator.
-                match res {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(e),
-                }
+                res
             }
             _ = shutdown_signal() => {
                 info!("edge daemon: received shutdown signal — exiting");
@@ -231,6 +221,46 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
             }
         }
     }
+}
+
+/// Lower bound (inclusive) for `spec.cluster.heartbeat_interval_secs`.
+const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 1;
+/// Upper bound (inclusive) for `spec.cluster.heartbeat_interval_secs`. Guards
+/// against an `u64::MAX` YAML value timing-overflowing the heartbeat ticker.
+const MAX_HEARTBEAT_INTERVAL_SECS: u64 = 3600;
+/// Inclusive range for each `spec.cluster.edge.stream_reconnect_backoff_secs[i]`.
+const RECONNECT_BACKOFF_MIN_SECS: u64 = 1;
+const RECONNECT_BACKOFF_MAX_SECS: u64 = 3600;
+
+/// Validate the configured heartbeat interval and convert to a `Duration`.
+/// Errors with a typed "exceeds maximum" message when over `MAX_HEARTBEAT_INTERVAL_SECS`;
+/// silently clamps zero up to `MIN_HEARTBEAT_INTERVAL_SECS`.
+fn validate_heartbeat_interval(raw: u64) -> Result<Duration> {
+    if raw > MAX_HEARTBEAT_INTERVAL_SECS {
+        return Err(anyhow::anyhow!(
+            "aegis-config.yaml spec.cluster.heartbeat_interval_secs ({raw}) exceeds maximum allowed value ({MAX_HEARTBEAT_INTERVAL_SECS})"
+        ));
+    }
+    Ok(Duration::from_secs(raw.max(MIN_HEARTBEAT_INTERVAL_SECS)))
+}
+
+/// Validate each entry of `stream_reconnect_backoff_secs` is in 1..=3600 and
+/// convert to `Duration`. An empty input falls back to a single 60s backoff.
+fn validate_reconnect_backoff(raw: &[u64]) -> Result<Vec<Duration>> {
+    if raw.is_empty() {
+        return Ok(vec![Duration::from_secs(60)]);
+    }
+    raw.iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            if !(RECONNECT_BACKOFF_MIN_SECS..=RECONNECT_BACKOFF_MAX_SECS).contains(s) {
+                return Err(anyhow::anyhow!(
+                    "invalid spec.cluster.edge.stream_reconnect_backoff_secs[{idx}]={s}; expected {RECONNECT_BACKOFF_MIN_SECS}..={RECONNECT_BACKOFF_MAX_SECS} seconds"
+                ));
+            }
+            Ok(Duration::from_secs(*s))
+        })
+        .collect()
 }
 
 /// Wait for SIGINT or (on Unix) SIGTERM. Mirrors `daemon::server::shutdown_signal`.
@@ -302,6 +332,69 @@ mod tests {
             Some(std::path::Path::new("/tmp/edge/aegis-config.yaml"))
         );
         assert!(parsed.once);
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_oversized_value() {
+        // Regression: prior code only guarded the lower bound with `.max(1)`.
+        // An `u64::MAX` from YAML compiled fine but timing-overflowed
+        // downstream. The fix returns a typed "exceeds maximum" error.
+        let err = validate_heartbeat_interval(u64::MAX).expect_err("u64::MAX must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeds maximum") && msg.contains("3600"),
+            "error must mention the bound: {msg}"
+        );
+        // Boundary: MAX + 1 is rejected, MAX is accepted.
+        validate_heartbeat_interval(MAX_HEARTBEAT_INTERVAL_SECS).expect("3600 accepted");
+        validate_heartbeat_interval(MAX_HEARTBEAT_INTERVAL_SECS + 1).expect_err("3601 rejected");
+        // Zero is silently clamped up to MIN.
+        let dur = validate_heartbeat_interval(0).expect("0 clamps to MIN");
+        assert_eq!(dur, Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS));
+    }
+
+    #[test]
+    fn reconnect_backoff_rejects_zero_with_index_zero() {
+        let err = validate_reconnect_backoff(&[0]).expect_err("zero entry rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stream_reconnect_backoff_secs[0]=0"),
+            "error must surface the zero-indexed bad entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_rejects_oversized_with_index_zero() {
+        let err = validate_reconnect_backoff(&[3601]).expect_err("3601 rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stream_reconnect_backoff_secs[0]=3601"),
+            "error must surface the bad entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_reports_correct_index_in_multi_element_list() {
+        // Regression: the prior `.iter().map(...).collect()` accepted any u64
+        // including 0. The new validator must surface the *index* of the bad
+        // entry (idx=1 here) so operators can find it in long YAML lists.
+        let err =
+            validate_reconnect_backoff(&[1, 4000, 5]).expect_err("idx=1 out of range rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stream_reconnect_backoff_secs[1]=4000"),
+            "error must surface the correct index (1): {msg}"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_accepts_valid_list_and_falls_back_when_empty() {
+        let v = validate_reconnect_backoff(&[1, 5, 60, 3600]).expect("valid list accepted");
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0], Duration::from_secs(1));
+        assert_eq!(v[3], Duration::from_secs(3600));
+        let fallback = validate_reconnect_backoff(&[]).expect("empty list falls back");
+        assert_eq!(fallback, vec![Duration::from_secs(60)]);
     }
 
     #[tokio::test]
