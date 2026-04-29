@@ -14,7 +14,7 @@
 //! | `POST   /v1/storage/git/:id/commit` | `volume:write` | **B2** — stage + commit workdir changes |
 //! | `POST   /v1/storage/git/:id/push` | `volume:write` | **B2** — push current branch to remote |
 //! | `GET    /v1/storage/git/:id/diff` | `volume:read` | **B2** — unified diff (staged or workdir) |
-//! | `POST   /v1/webhooks/git/:secret` | HMAC-only | Inbound git push webhook |
+//! | `POST   /v1/webhooks/git` | HMAC-only (`X-Aegis-Webhook-Secret` header) | Inbound git push webhook |
 //!
 //! All JSON endpoints require Keycloak JWT. The webhook endpoint
 //! is exempt from JWT middleware (see
@@ -370,20 +370,38 @@ pub(crate) async fn refresh_git_repo(
 // Webhook endpoint
 // ============================================================================
 
-/// `POST /v1/webhooks/git/:secret` — inbound git push webhook.
+/// `POST /v1/webhooks/git` — inbound git push webhook.
 ///
 /// Authentication: HMAC signature verified against the binding's stored
 /// `webhook_secret`. Supports GitHub (`X-Hub-Signature-256`), GitLab
 /// (`X-Gitlab-Token`), and Bitbucket (`X-Hub-Signature`) formats.
 /// **No JWT is required** — the path is exempt via
 /// `EXEMPT_PATH_PREFIXES` in the keycloak middleware.
+///
+/// Audit 002 §4.13: the per-binding `webhook_secret` MUST be supplied
+/// via the `X-Aegis-Webhook-Secret` header — never in the URL path.
+/// URL paths leak through proxy access logs, OTLP spans, and tracing
+/// middleware, turning the secret into a bearer token observable to
+/// any log reader.
 pub(crate) async fn webhook_git_repo(
     State(state): State<Arc<AppState>>,
-    Path(secret): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let svc = git_repo_service(&state)?;
+
+    let secret = headers
+        .get("x-aegis-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "missing X-Aegis-Webhook-Secret header"
+                })),
+            )
+        })?;
 
     let auth = match detect_webhook_auth(&headers) {
         Some(a) => a,

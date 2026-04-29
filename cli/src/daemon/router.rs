@@ -4,8 +4,11 @@
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post, put};
 use axum::{middleware, Router};
+
+use aegis_orchestrator_core::presentation::webhook_guard::MAX_WEBHOOK_BODY_BYTES;
 
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
 
@@ -255,8 +258,13 @@ pub(crate) fn create_router(
         .route("/v1/api-keys/{id}", delete(revoke_api_key_handler))
         // Keycloak webhook for tenant provisioning (ADR-097)
         .route("/v1/webhooks/keycloak", post(keycloak_event_handler))
-        // BC-8 Webhook stimulus ingestion (ADR-021)
-        .route("/v1/webhooks/{source}", post(webhook_handler))
+        // BC-8 Webhook stimulus ingestion (ADR-021).
+        // Audit 002 §4.21: cap pre-auth body reads at
+        // MAX_WEBHOOK_BODY_BYTES to prevent memory DoS.
+        .route(
+            "/v1/webhooks/{source}",
+            post(webhook_handler).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+        )
         // BC-11 Credential management (ADR-078) — static paths BEFORE parameterized
         .route("/v1/credentials", get(list_credentials_handler))
         .route("/v1/credentials/api-keys", post(store_api_key_handler))
@@ -335,7 +343,13 @@ pub(crate) fn create_router(
         .route("/v1/storage/git/{id}/diff", get(diff_git_repo))
         // BC-7 Git webhook (ADR-081 Wave A3) — HMAC-authenticated, exempt
         // from Keycloak JWT via EXEMPT_PATH_PREFIXES ("/v1/webhooks").
-        .route("/v1/webhooks/git/{secret}", post(webhook_git_repo))
+        // Audit 002 §4.13: secret is supplied via the
+        // `X-Aegis-Webhook-Secret` header, never in the URL path.
+        // Audit 002 §4.21: cap webhook body at MAX_WEBHOOK_BODY_BYTES.
+        .route(
+            "/v1/webhooks/git",
+            post(webhook_git_repo).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+        )
         // BC-7 Script persistence (ADR-110 §D7) — saved TypeScript
         // programs for Live Mode / Code Mode client-side execution.
         .route("/v1/scripts", post(create_script).get(list_scripts))

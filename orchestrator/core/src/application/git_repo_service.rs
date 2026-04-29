@@ -760,6 +760,8 @@ impl GitRepoService {
         auth: &WebhookAuth,
         payload: &[u8],
     ) -> Result<(), GitRepoError> {
+        use subtle::ConstantTimeEq;
+
         let mut binding = self
             .repo
             .find_by_webhook_secret(secret)
@@ -771,6 +773,22 @@ impl GitRepoService {
                 "binding has no webhook secret configured".into(),
             ));
         };
+
+        // Audit 002 §4.13: defense in depth — re-confirm the lookup
+        // result with a constant-time compare so any partial-match
+        // edge case in the underlying repository implementation cannot
+        // leak per-byte timing through the response path.
+        let presented = secret.as_bytes();
+        let stored = stored_secret.as_bytes();
+        let length_match = (presented.len() == stored.len()) as u8;
+        // Mask to a stable length so `ct_eq` runs identically every
+        // call regardless of whether the lengths actually match.
+        let lhs = if length_match == 1 { presented } else { stored };
+        if (lhs.ct_eq(stored).unwrap_u8() & length_match) != 1 {
+            return Err(GitRepoError::WebhookRejected(
+                "webhook secret mismatch".into(),
+            ));
+        }
 
         if !verify_webhook(auth, payload, stored_secret.as_bytes()) {
             return Err(GitRepoError::WebhookRejected(

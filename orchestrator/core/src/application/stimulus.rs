@@ -178,6 +178,13 @@ pub trait StimulusService: Send + Sync {
         tenant_id: &crate::domain::tenant::TenantId,
         source_name: &str,
     ) -> bool;
+
+    /// Return the set of tenants that have a direct route registered
+    /// for `source_name`. Used by the unauthenticated webhook handler
+    /// to enumerate candidate `(tenant, source)` HMAC secrets — closing
+    /// audit 002 §4.1 / §4.2 (caller-supplied tenant headers MUST NOT
+    /// be trusted; tenants are derived from the registration table).
+    async fn candidate_tenants_for_source(&self, source_name: &str) -> Vec<TenantId>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -251,11 +258,22 @@ impl StandardStimulusService {
             });
         }
 
-        // Unauthenticated webhook path: derive tenant from the registration
-        // table. There is no other trustworthy source — caller-supplied
-        // headers MUST NOT be used.
+        // Unauthenticated webhook path: derive tenant from the
+        // registration table. There is no other trustworthy source —
+        // caller-supplied headers MUST NOT be used.
+        //
+        // Audit 002 §4.2: when the presentation-layer HMAC guard has
+        // already bound a tenant by matching the request signature
+        // against a `(tenant, source)` secret, that tenant is the
+        // authoritative owner — even if multiple tenants registered
+        // the same `source_name`, since only one tenant's secret can
+        // produce the verified MAC. The fallback path (no verified
+        // tenant) preserves the strict registration-table semantics.
         match &stimulus.source {
             StimulusSource::Webhook { source_name } => {
+                if let Some(verified) = &stimulus.verified_tenant_id {
+                    return Ok(verified.clone());
+                }
                 let registry = self.registry.read().await;
                 let routes = registry.find_routes_by_source(source_name);
                 match routes.len() {
@@ -720,6 +738,15 @@ impl StimulusService for StandardStimulusService {
     ) -> bool {
         let mut registry = self.registry.write().await;
         registry.remove_route(tenant_id, source_name)
+    }
+
+    async fn candidate_tenants_for_source(&self, source_name: &str) -> Vec<TenantId> {
+        let registry = self.registry.read().await;
+        registry
+            .find_routes_by_source(source_name)
+            .into_iter()
+            .map(|(tenant, _)| tenant)
+            .collect()
     }
 }
 
@@ -1421,6 +1448,79 @@ mod tests {
             ),
             "expected AmbiguousWebhookRoute(2), got {err:?}"
         );
+    }
+
+    /// Audit 002 §4.2 regression: when the presentation-layer HMAC
+    /// guard has bound a tenant (`verified_tenant_id`), the application
+    /// service MUST honour that tenant even if multiple tenants share
+    /// the same `source_name` registration. Pre-fix the service rejected
+    /// such requests as `AmbiguousWebhookRoute`, breaking valid traffic.
+    #[tokio::test]
+    async fn webhook_with_verified_tenant_short_circuits_ambiguous_route() {
+        let tenant_a = TenantId::from_realm_slug("tenant-a").unwrap();
+        let tenant_b = TenantId::from_realm_slug("tenant-b").unwrap();
+        let workflow_a = make_workflow_id();
+        let workflow_b = make_workflow_id();
+        let mut registry = WorkflowRegistry::new(None);
+        registry
+            .register_route(&tenant_a, "shared-source", workflow_a)
+            .unwrap();
+        registry
+            .register_route(&tenant_b, "shared-source", workflow_b)
+            .unwrap();
+
+        let execution_service = Arc::new(RecordingExecutionService::default());
+        let starter = Arc::new(RecordingStartWorkflowUseCase::new("wf-shared"));
+        let event_bus = EventBus::new(8);
+        let service = build_service(registry, execution_service, starter.clone(), event_bus);
+
+        // The guard at the presentation layer would have set this to
+        // tenant_a after a successful HMAC match against tenant_a's
+        // `(tenant, source)` secret.
+        let stimulus =
+            make_stimulus("shared-source", "{}").with_verified_tenant_id(tenant_a.clone());
+
+        let resp = service.ingest(stimulus, None).await.unwrap();
+        assert!(!resp.workflow_execution_id.is_empty());
+
+        let calls = starter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tenant_id.as_ref().unwrap(), &tenant_a);
+        // tenant_b's workflow MUST NOT have been started.
+        assert_eq!(calls[0].workflow_id, workflow_a.0.to_string());
+    }
+
+    /// Audit 002 §4.1 regression: even when the source is registered
+    /// for multiple tenants, the service MUST NOT silently consume a
+    /// caller-supplied tenant header — the only trusted source for
+    /// the webhook tenant is `verified_tenant_id` (set by the HMAC
+    /// guard) or the unique registration in the table.
+    #[tokio::test]
+    async fn webhook_without_verified_tenant_falls_through_to_registration_lookup() {
+        let owning_tenant = TenantId::from_realm_slug("u-owner").unwrap();
+        let workflow_id = make_workflow_id();
+        let mut registry = WorkflowRegistry::new(None);
+        registry
+            .register_route(&owning_tenant, "lonely-src", workflow_id)
+            .unwrap();
+
+        let execution_service = Arc::new(RecordingExecutionService::default());
+        let starter = Arc::new(RecordingStartWorkflowUseCase::new("wf-lonely"));
+        let event_bus = EventBus::new(8);
+        let service = build_service(registry, execution_service, starter.clone(), event_bus);
+
+        // Caller injects a malicious header — the service MUST ignore
+        // it and resolve the tenant from the registration table.
+        let stimulus =
+            make_stimulus("lonely-src", "{}").with_headers(std::collections::HashMap::from([(
+                "x-aegis-tenant".to_string(),
+                "attacker-tenant".to_string(),
+            )]));
+
+        service.ingest(stimulus, None).await.unwrap();
+        let calls = starter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tenant_id.as_ref().unwrap(), &owning_tenant);
     }
 
     #[tokio::test]

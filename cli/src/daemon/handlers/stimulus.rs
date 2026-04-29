@@ -120,13 +120,28 @@ pub(crate) fn verify_stripe_signature(
     }
 }
 
+/// Headers that callers may attempt to use to spoof the stimulus
+/// tenant. These are stripped before forwarding into the domain so that
+/// downstream code can never accidentally trust them. The
+/// authoritative tenant comes from the JWT (authenticated path) or
+/// the `(tenant, source)` HMAC registration (webhook path) — see
+/// audit 002 §4.1 / §4.23 / §4.35.
+const UNTRUSTED_TENANT_HEADERS: &[&str] = &["x-aegis-tenant", "x-tenant-id"];
+
 fn axum_headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
         .filter_map(|(k, v)| {
+            let name = k.as_str();
+            if UNTRUSTED_TENANT_HEADERS
+                .iter()
+                .any(|untrusted| untrusted.eq_ignore_ascii_case(name))
+            {
+                return None;
+            }
             v.to_str()
                 .ok()
-                .map(|val| (k.as_str().to_string(), val.to_string()))
+                .map(|val| (name.to_string(), val.to_string()))
         })
         .collect()
 }
@@ -338,12 +353,12 @@ pub(crate) async fn webhook_handler(
     }
 
     // ── HMAC verification (non-Stripe webhooks) ─────────────────────────────
-    let guard =
-        match WebhookHmacGuard::from_request(req, state.webhook_secret_provider.as_ref()).await {
-            Ok(g) => g,
-            Err(e) => return e.into_response(),
-        };
-
+    //
+    // Audit 002 §4.1 / §4.2: webhooks are unauthenticated, so the
+    // owning tenant comes from the registration table — never from
+    // caller-supplied headers. Enumerate every tenant that has
+    // registered this source name and let the guard try each
+    // `(tenant, source)` secret with constant-time compare.
     let stimulus_service = match &state.stimulus_service {
         Some(svc) => svc.clone(),
         None => {
@@ -353,6 +368,19 @@ pub(crate) async fn webhook_handler(
                 Json(json!({ "error": "stimulus_service_unavailable", "message": "Stimulus service is not configured" })),
             ).into_response();
         }
+    };
+
+    let candidate_tenants = stimulus_service.candidate_tenants_for_source(&source).await;
+
+    let guard = match WebhookHmacGuard::from_request(
+        req,
+        state.webhook_secret_provider.as_ref(),
+        &candidate_tenants,
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => return e.into_response(),
     };
 
     // Convert verified body bytes to String (treat as UTF-8 if possible, else base64)
@@ -365,7 +393,8 @@ pub(crate) async fn webhook_handler(
         },
         content,
     )
-    .with_headers(axum_headers_to_map(&headers));
+    .with_headers(axum_headers_to_map(&headers))
+    .with_verified_tenant_id(guard.tenant_id.clone());
 
     match stimulus_service.ingest(stimulus, None).await {
         Ok(resp) => {

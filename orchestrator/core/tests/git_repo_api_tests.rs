@@ -19,8 +19,9 @@
 //! | `GET /v1/storage/git/:id` with wrong owner → 404 | `get_binding_wrong_owner_returns_not_found` |
 //! | `DELETE /v1/storage/git/:id` cleans up volume | `delete_binding_cleans_up_volume` |
 //! | `POST /v1/storage/git/:id/refresh` → 404 for non-owner | `refresh_refuses_non_owner` |
-//! | `POST /v1/webhooks/git/:secret` rejects bad hmac | `webhook_rejects_bad_signature` |
-//! | `POST /v1/webhooks/git/:secret` accepts valid hmac | `webhook_accepts_valid_signature` |
+//! | `POST /v1/webhooks/git` rejects bad hmac | `webhook_rejects_bad_signature` |
+//! | `POST /v1/webhooks/git` accepts valid hmac | `webhook_accepts_valid_signature` |
+//! | webhook rejects unknown secret in constant time | `webhook_rejects_unknown_secret` |
 //!
 //! [`GitRepoService`]: aegis_orchestrator_core::application::git_repo_service::GitRepoService
 
@@ -595,4 +596,27 @@ async fn webhook_accepts_valid_signature() {
         }
         _ => {}
     }
+}
+
+/// Audit 002 §4.13 regression: presenting a webhook secret that does
+/// not exist in any binding MUST be rejected as `WebhookRejected`. The
+/// pre-fix code path embedded the secret in the URL, leaking it to
+/// proxy / OTLP logs; this test guards the service-layer behaviour
+/// that the secret is rejected when no binding owns it.
+#[tokio::test]
+async fn webhook_rejects_unknown_secret() {
+    use aegis_orchestrator_core::application::git_repo_service::{WebhookAuth, WebhookProvider};
+    let fx = build_fixture();
+    let auth = WebhookAuth {
+        provider: WebhookProvider::GitHub,
+        signature: "sha256=00".to_string(),
+    };
+    let res = fx
+        .service
+        .handle_webhook("totally-unknown-secret-xyz", &auth, b"")
+        .await;
+    assert!(
+        matches!(res, Err(GitRepoError::WebhookRejected(_))),
+        "unknown secret must be rejected, got {res:?}"
+    );
 }

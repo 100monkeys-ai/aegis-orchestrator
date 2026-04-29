@@ -78,6 +78,13 @@ pub struct Stimulus {
     /// Used by RouterAgent for event-type classification (e.g. `X-GitHub-Event`).
     pub headers: HashMap<String, String>,
     pub received_at: DateTime<Utc>,
+    /// Tenant authoritatively bound to this stimulus by HMAC verification
+    /// against a `(tenant, source)` registration. Set ONLY on the
+    /// unauthenticated webhook path after the [`crate::presentation::webhook_guard`]
+    /// guard succeeds. `None` everywhere else (the authenticated path
+    /// derives the tenant from the JWT). See audit 002 §4.1 / §4.2.
+    #[serde(default)]
+    pub verified_tenant_id: Option<crate::domain::tenant::TenantId>,
 }
 
 impl Stimulus {
@@ -89,7 +96,18 @@ impl Stimulus {
             idempotency_key: None,
             headers: HashMap::new(),
             received_at: Utc::now(),
+            verified_tenant_id: None,
         }
+    }
+
+    /// Bind the tenant authoritatively resolved by HMAC verification
+    /// against a `(tenant, source)` registration. Callers MUST only
+    /// invoke this after a successful HMAC match; the value short-
+    /// circuits the registration-table lookup in the application
+    /// service (audit 002 §4.2).
+    pub fn with_verified_tenant_id(mut self, tenant_id: crate::domain::tenant::TenantId) -> Self {
+        self.verified_tenant_id = Some(tenant_id);
+        self
     }
 
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
