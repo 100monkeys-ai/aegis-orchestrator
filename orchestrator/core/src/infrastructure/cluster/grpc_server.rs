@@ -186,13 +186,25 @@ impl NodeClusterService for NodeClusterServiceHandler {
                 return Err(Status::invalid_argument("Missing capabilities"));
             },
             grpc_address: req.grpc_address,
+            enrolment_token: req.enrolment_token,
         };
 
         let resp = self
             .attest_node_use_case
             .execute(app_req)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            // Audit 002 §4.9: admission failures (missing / bad / replayed
+            // enrolment token) MUST surface as PermissionDenied, not Internal.
+            // The use-case layer wraps these in `anyhow!` so we string-match
+            // on the canonical "Cluster admission denied" prefix.
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.starts_with("Cluster admission denied") {
+                    Status::permission_denied(msg)
+                } else {
+                    Status::internal(msg)
+                }
+            })?;
 
         Ok(Response::new(AttestNodeResponse {
             challenge_nonce: resp.challenge_nonce,

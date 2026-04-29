@@ -77,12 +77,15 @@ impl NodeClusterClient {
         public_key: Vec<u8>,
         capabilities: NodeCapabilities,
         grpc_address: String,
+        enrolment_token: String,
     ) -> Result<String> {
         let node_id_str = self.node_id.0.to_string();
         let signing_key = self.signing_key.clone();
         let client = self.client_mut()?;
 
-        // Step 1: AttestNode -- present identity, receive challenge nonce
+        // Step 1: AttestNode -- present identity, receive challenge nonce.
+        // Audit 002 §4.9: a single-use cluster enrolment token bound to this
+        // node_id is required on the controller side for non-edge roles.
         let attest_resp = client
             .attest_node(tonic::Request::new(AttestNodeRequest {
                 node_id: node_id_str.clone(),
@@ -90,6 +93,7 @@ impl NodeClusterClient {
                 public_key,
                 capabilities: Some(capabilities),
                 grpc_address,
+                enrolment_token,
             }))
             .await
             .context("AttestNode RPC failed")?

@@ -1578,8 +1578,30 @@ fn default_metrics_path() -> String {
     "/metrics".to_string()
 }
 
+/// Default network bind address.
+///
+/// Security audit 002 §4.27: defaults to `127.0.0.1` (loopback). Operators
+/// MUST explicitly opt in to binding on a non-loopback address by setting
+/// `spec.network.bind_address`, AND MUST also configure `spec.network.tls`
+/// when doing so. The startup-time validation in `NodeConfigManifest::validate`
+/// refuses to boot otherwise.
 fn default_bind_address() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
+}
+
+/// Returns true if the configured bind address is a loopback address. Used
+/// by the startup-time TLS / mTLS validation gates (audit 002 §4.9, §4.27).
+pub fn is_loopback_bind(bind: &str) -> bool {
+    // Accept both bare host strings ("127.0.0.1", "::1", "localhost") and
+    // the documented YAML form. Anything that is not unambiguously loopback
+    // is treated as exposed.
+    if bind.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(addr) = bind.parse::<std::net::IpAddr>() {
+        return addr.is_loopback();
+    }
+    false
 }
 
 fn default_api_port() -> u16 {
@@ -2146,6 +2168,42 @@ impl NodeConfigManifest {
             cluster.validate_roles()?;
         }
 
+        // Security audit 002 §4.27: refuse to start when a non-loopback HTTP
+        // bind has no TLS configured. Loopback (127.0.0.1, ::1, localhost)
+        // remains permissive for local development.
+        if let Some(network) = &self.spec.network {
+            if !is_loopback_bind(&network.bind_address) && network.tls.is_none() {
+                anyhow::bail!(
+                    "spec.network.bind_address '{}' is non-loopback but spec.network.tls is not configured. \
+                     Bind to '127.0.0.1' for local development, or configure TLS to expose externally \
+                     (security audit 002 §4.27).",
+                    network.bind_address
+                );
+            }
+        }
+
+        // Security audit 002 §4.9: when clustering is enabled and the bind
+        // address is non-loopback, mTLS (server cert + client CA bundle) is
+        // mandatory before the controller will accept inter-node RPCs.
+        if let (Some(cluster), Some(network)) = (&self.spec.cluster, &self.spec.network) {
+            if cluster.enabled && !is_loopback_bind(&network.bind_address) {
+                let tls_ok = cluster
+                    .tls
+                    .as_ref()
+                    .map(|t| t.enabled && !t.ca_cert.is_empty())
+                    .unwrap_or(false);
+                if !tls_ok {
+                    anyhow::bail!(
+                        "Cluster mode is enabled with a non-loopback bind ('{}'), \
+                         but spec.cluster.tls.ca_cert is not configured. mTLS with a \
+                         client-CA bundle is required before the cluster gRPC server \
+                         will accept connections (security audit 002 §4.9).",
+                        network.bind_address
+                    );
+                }
+            }
+        }
+
         if self.is_production() {
             if self.spec.database.is_none() {
                 anyhow::bail!("Production nodes must configure spec.database");
@@ -2583,5 +2641,165 @@ mod tests {
             ingress: None,
         };
         assert!(cfg.validate_roles().is_err());
+    }
+
+    // ── Security audit 002 §4.27 — default bind + TLS gate ────────────────────
+
+    /// Audit 002 §4.27 regression: the default bind address must be the
+    /// loopback (`127.0.0.1`). External exposure requires explicit operator
+    /// opt-in.
+    #[test]
+    fn default_bind_address_is_loopback() {
+        assert_eq!(default_bind_address(), "127.0.0.1");
+        assert!(is_loopback_bind(&default_bind_address()));
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("10.0.0.1"));
+    }
+
+    fn manifest_with_network(bind: &str, tls: Option<TlsConfig>) -> NodeConfigManifest {
+        let mut manifest = NodeConfigManifest::default();
+        // Required scalar; default leaves empty in test path.
+        manifest.spec.node.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        manifest.spec.network = Some(NetworkConfig {
+            orchestrator_endpoint: None,
+            heartbeat_interval_seconds: default_heartbeat(),
+            tls,
+            bind_address: bind.to_string(),
+            port: default_api_port(),
+            grpc_port: default_grpc_port(),
+        });
+        // Minimal LLM provider so unrelated validate() checks pass.
+        manifest.spec.llm_providers = vec![LLMProviderConfig {
+            name: "ollama".to_string(),
+            provider_type: "ollama".to_string(),
+            endpoint: "http://localhost:11434".to_string(),
+            api_key: None,
+            enabled: true,
+            models: vec![ModelConfig {
+                alias: "default".to_string(),
+                model: "llama3.2:latest".to_string(),
+                capabilities: vec!["chat".to_string()],
+                context_window: 8192,
+                cost_per_1k_tokens: 0.0,
+                max_output_tokens: None,
+                temperature: None,
+            }],
+        }];
+        manifest
+    }
+
+    /// Audit 002 §4.27 regression: a node with `bind_address = 0.0.0.0` and
+    /// no `network.tls` configured must refuse to validate. Prior code
+    /// silently accepted this in non-production environments, leaving bearer
+    /// JWTs and webhook tokens to transit cleartext.
+    #[test]
+    fn validate_rejects_external_bind_without_tls() {
+        let manifest = manifest_with_network("0.0.0.0", None);
+        let err = manifest
+            .validate()
+            .expect_err("non-loopback bind without TLS must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-loopback") && msg.contains("§4.27"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_loopback_bind_without_tls() {
+        let manifest = manifest_with_network("127.0.0.1", None);
+        manifest
+            .validate()
+            .expect("loopback bind must validate without TLS");
+    }
+
+    #[test]
+    fn validate_accepts_external_bind_with_tls() {
+        let tls = TlsConfig {
+            cert_path: "/etc/aegis/cert.pem".into(),
+            key_path: "/etc/aegis/key.pem".into(),
+            ca_path: None,
+        };
+        let manifest = manifest_with_network("0.0.0.0", Some(tls));
+        manifest
+            .validate()
+            .expect("external bind WITH TLS must validate");
+    }
+
+    /// Audit 002 §4.9 regression: a non-loopback bind with cluster mode
+    /// enabled but no client-CA bundle (`cluster.tls.ca_cert`) must refuse to
+    /// validate. The cluster gRPC server cannot be allowed to accept
+    /// inter-node RPCs without mTLS when reachable from the network.
+    #[test]
+    fn validate_rejects_cluster_external_bind_without_mtls() {
+        let mut manifest = manifest_with_network(
+            "0.0.0.0",
+            Some(TlsConfig {
+                cert_path: "/etc/aegis/cert.pem".into(),
+                key_path: "/etc/aegis/key.pem".into(),
+                ca_path: None,
+            }),
+        );
+        manifest.spec.cluster = Some(ClusterConfig {
+            enabled: true,
+            role: NodeRole::Hybrid,
+            controller: None,
+            cluster_grpc_port: default_cluster_grpc_port(),
+            peers: vec![],
+            node_keypair_path: default_keypair_path(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            token_refresh_margin_secs: default_token_refresh_margin(),
+            stale_threshold_secs: None,
+            sweep_interval_secs: None,
+            tls: None, // ← no mTLS bundle
+            edge: None,
+            ingress: None,
+        });
+        let err = manifest
+            .validate()
+            .expect_err("clustered non-loopback bind without mTLS must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("§4.9") && msg.contains("ca_cert"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_cluster_external_bind_with_mtls() {
+        let mut manifest = manifest_with_network(
+            "0.0.0.0",
+            Some(TlsConfig {
+                cert_path: "/etc/aegis/cert.pem".into(),
+                key_path: "/etc/aegis/key.pem".into(),
+                ca_path: None,
+            }),
+        );
+        manifest.spec.cluster = Some(ClusterConfig {
+            enabled: true,
+            role: NodeRole::Hybrid,
+            controller: None,
+            cluster_grpc_port: default_cluster_grpc_port(),
+            peers: vec![],
+            node_keypair_path: default_keypair_path(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            token_refresh_margin_secs: default_token_refresh_margin(),
+            stale_threshold_secs: None,
+            sweep_interval_secs: None,
+            tls: Some(ClusterTlsConfig {
+                enabled: true,
+                cert_path: "/etc/aegis/node.pem".into(),
+                key_path: "/etc/aegis/node.key".into(),
+                ca_cert: "/etc/aegis/cluster-ca.pem".into(),
+            }),
+            edge: None,
+            ingress: None,
+        });
+        manifest
+            .validate()
+            .expect("clustered external bind WITH mTLS must validate");
     }
 }
