@@ -1184,7 +1184,7 @@ pub enum StimulusEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IamEvent {
     // ─── Authentication Events ────────────────────────────────────────────────
-    /// A JWT was successfully validated against a OIDC realm's JWKS.
+    /// A JWT was successfully validated against an OIDC realm's JWKS.
     UserAuthenticated {
         sub: String,
         realm_slug: String,

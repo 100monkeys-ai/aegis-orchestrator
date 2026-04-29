@@ -20,7 +20,7 @@
 //! ## Design Notes
 //!
 //! - `UserIdentity` is **never persisted** — reconstructed from JWT on every request.
-//! - `ZaruTier` is owned by BC-13 (IAM) and sourced from a OIDC custom claim.
+//! - `ZaruTier` is owned by BC-13 (IAM) and sourced from an OIDC custom claim.
 //!   Previously defined on `ZaruSession` in BC-12; the source of truth has moved.
 //! - SEAL agent attestation (Ed25519 ephemeral keypair) is **unchanged** by ADR-041.
 //!   OIDC is for human and service-account identities only.
@@ -67,7 +67,7 @@ pub enum RealmKind {
 
 // ── Entity: OidcClient ───────────────────────────────────────────────────────
 
-/// A registered OIDC client within a OIDC realm.
+/// A registered OIDC client within an OIDC realm.
 /// Service accounts use ClientCredentials grant.
 /// UI applications use AuthorizationCode + PKCE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,7 +161,7 @@ pub enum IdentityKind {
     TenantUser { tenant_slug: String },
 }
 
-/// ZaruTier is owned by BC-13 (IAM) and sourced from a OIDC custom claim.
+/// ZaruTier is owned by BC-13 (IAM) and sourced from an OIDC custom claim.
 /// Maps to SEAL SecurityContext names consumed by ZaruAuthMiddleware → AttestationService.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ZaruTier {
@@ -275,7 +275,7 @@ pub struct ValidatedIdentityToken {
     pub raw_claims: serde_json::Value,
 }
 
-/// Represents a OIDC tenant realm with its JWKS endpoint.
+/// Represents an OIDC tenant realm with its JWKS endpoint.
 /// Used during tenant onboarding (Phase 2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantRealm {
