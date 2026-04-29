@@ -229,11 +229,10 @@ pub(crate) async fn list_sessions_handler(
 
     let identity_ref = identity.as_ref().map(|e| &e.0);
     let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
     let include_archived = query.archived.unwrap_or(false);
 
     let sessions = service
-        .list_sessions(&tenant_id, &owner, include_archived)
+        .list_sessions(&tenant_id, include_archived)
         .await
         .map_err(canvas_error_response)?;
 
@@ -259,10 +258,9 @@ pub(crate) async fn get_session_handler(
 
     let identity_ref = identity.as_ref().map(|e| &e.0);
     let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
 
     service
-        .get_session(&CanvasSessionId(id), &tenant_id, &owner)
+        .get_session(&CanvasSessionId(id), &tenant_id)
         .await
         .map(|s| Json(serde_json::to_value(CanvasSessionResponse::from(s)).unwrap()))
         .map_err(canvas_error_response)
@@ -286,10 +284,9 @@ pub(crate) async fn terminate_session_handler(
 
     let identity_ref = identity.as_ref().map(|e| &e.0);
     let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
 
     service
-        .terminate_session(&CanvasSessionId(id), &tenant_id, &owner)
+        .terminate_session(&CanvasSessionId(id), &tenant_id)
         .await
         .map(|_| Json(serde_json::json!({ "success": true })))
         .map_err(canvas_error_response)
@@ -368,12 +365,11 @@ pub(crate) async fn stream_session_events_handler(
 
     let identity_ref = identity.as_ref().map(|e| &e.0);
     let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
 
     let session_id = CanvasSessionId(id);
     // Verify ownership before opening the stream; an unauthorized caller
     // never gets to subscribe to the event bus in the first place.
-    if let Err(e) = service.get_session(&session_id, &tenant_id, &owner).await {
+    if let Err(e) = service.get_session(&session_id, &tenant_id).await {
         return canvas_error_response(e).into_response();
     }
 

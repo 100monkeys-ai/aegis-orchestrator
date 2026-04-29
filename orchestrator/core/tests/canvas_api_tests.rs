@@ -620,21 +620,50 @@ async fn list_sessions_returns_only_callers_tenant() {
         .await
         .unwrap();
 
-    let alice_sessions = h
-        .service
-        .list_sessions(&tenant_a, "alice", false)
-        .await
-        .unwrap();
+    let alice_sessions = h.service.list_sessions(&tenant_a, false).await.unwrap();
     assert_eq!(alice_sessions.len(), 2);
     assert!(alice_sessions.iter().all(|s| s.tenant_id == tenant_a));
 
-    let bob_sessions = h
-        .service
-        .list_sessions(&tenant_b, "bob", false)
-        .await
-        .unwrap();
+    let bob_sessions = h.service.list_sessions(&tenant_b, false).await.unwrap();
     assert_eq!(bob_sessions.len(), 1);
     assert_eq!(bob_sessions[0].tenant_id, tenant_b);
+}
+
+/// Audit 002 §4.37.12 regression — `list_sessions` is tenant-scoped, not
+/// owner-scoped. The old API took an `owner: &str` parameter that the
+/// implementation discarded, which made the contract misleading and
+/// invited callers to assume per-user filtering. Drop the parameter
+/// entirely and pin the documented intent: sessions created with
+/// different `owner` strings inside the same tenant MUST all appear in
+/// the list (tenant-wide teams legitimately share sessions across seats
+/// per ADR-106 / ADR-097).
+#[tokio::test]
+async fn list_sessions_is_tenant_scoped_not_owner_scoped() {
+    let h = build_harness();
+    let team_tenant = TenantId::new("t-team".to_string()).unwrap();
+
+    for owner in ["alice", "bob", "carol"] {
+        h.service
+            .create_session(CreateCanvasSessionCommand {
+                tenant_id: team_tenant.clone(),
+                owner: owner.to_string(),
+                tier: ZaruTier::Enterprise,
+                conversation_id: ConversationId::new(),
+                workspace_mode: WorkspaceMode::Ephemeral,
+                name: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let listed = h.service.list_sessions(&team_tenant, false).await.unwrap();
+    assert_eq!(
+        listed.len(),
+        3,
+        "tenant-wide list MUST surface sessions created by every owner in the tenant; \
+         got {} expected 3",
+        listed.len()
+    );
 }
 
 // ============================================================================
@@ -661,18 +690,14 @@ async fn get_session_wrong_tenant_returns_not_found() {
         .unwrap();
 
     // Bob tries to read Alice's session.
-    let res = h.service.get_session(&session.id, &tenant_b, "bob").await;
+    let res = h.service.get_session(&session.id, &tenant_b).await;
     assert!(
         matches!(res, Err(CanvasError::NotFound(_))),
         "expected NotFound (info-leak protection), got {res:?}"
     );
 
     // Alice reads her own session successfully.
-    let ok = h
-        .service
-        .get_session(&session.id, &tenant_a, "alice")
-        .await
-        .unwrap();
+    let ok = h.service.get_session(&session.id, &tenant_a).await.unwrap();
     assert_eq!(ok.id, session.id);
 }
 
@@ -701,7 +726,7 @@ async fn terminate_session_ephemeral_deletes_volume() {
     let volume_id = session.workspace_volume_id;
 
     h.service
-        .terminate_session(&session.id, &tenant, "user-1")
+        .terminate_session(&session.id, &tenant)
         .await
         .unwrap();
 
@@ -736,7 +761,7 @@ async fn terminate_session_git_linked_retains_volume() {
         .unwrap();
 
     h.service
-        .terminate_session(&session.id, &tenant, "user-1")
+        .terminate_session(&session.id, &tenant)
         .await
         .unwrap();
 
@@ -767,10 +792,7 @@ async fn terminate_session_wrong_tenant_returns_not_found() {
         .await
         .unwrap();
 
-    let res = h
-        .service
-        .terminate_session(&session.id, &tenant_b, "bob")
-        .await;
+    let res = h.service.terminate_session(&session.id, &tenant_b).await;
     assert!(
         matches!(res, Err(CanvasError::NotFound(_))),
         "expected NotFound, got {res:?}"
@@ -916,9 +938,7 @@ async fn terminate_persists_state_when_volume_delete_fails() {
 
     let mut receiver = event_bus.subscribe();
 
-    let res = service
-        .terminate_session(&session.id, &tenant, "user-1")
-        .await;
+    let res = service.terminate_session(&session.id, &tenant).await;
     assert!(
         matches!(res, Err(CanvasError::VolumeProvisioningFailed(_))),
         "expected VolumeProvisioningFailed surfaced to the caller, got {res:?}"

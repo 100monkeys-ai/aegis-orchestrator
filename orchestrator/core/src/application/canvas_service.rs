@@ -132,12 +132,22 @@ pub trait CanvasService: Send + Sync {
         cmd: CreateCanvasSessionCommand,
     ) -> Result<CanvasSession, CanvasError>;
 
-    /// List the caller's canvas sessions. When `include_archived` is false
-    /// (default), archived sessions are excluded.
+    /// List canvas sessions owned by `tenant_id`. When `include_archived`
+    /// is false (default), archived sessions are excluded.
+    ///
+    /// Audit 002 §4.37.12 — this method is **tenant-scoped**, not
+    /// owner-scoped. Per ADR-106 §Domain Model and ADR-097 (per-user
+    /// tenants), the canvas session is owned by the tenant; for consumer
+    /// users a per-user tenant collapses owner and tenant to the same
+    /// boundary, and for tenant-wide teams (Business / Enterprise)
+    /// sessions are legitimately shared across seats within the colony.
+    /// The previous signature accepted an `owner: &str` argument that the
+    /// implementation discarded, which made the API misleading and
+    /// invited callers to assume per-user filtering. Drop the argument
+    /// entirely so the signature matches the documented intent.
     async fn list_sessions(
         &self,
         tenant_id: &TenantId,
-        owner: &str,
         include_archived: bool,
     ) -> Result<Vec<CanvasSession>, CanvasError>;
 
@@ -150,11 +160,13 @@ pub trait CanvasService: Send + Sync {
     /// Load a single session by id; verifies tenant ownership. Returns
     /// [`CanvasError::NotFound`] for missing or mis-tenanted rows (see
     /// ADR-106 §Security Considerations — no information leak).
+    ///
+    /// Audit 002 §4.37.12 — tenant-scoped, not owner-scoped (see
+    /// `list_sessions` for rationale).
     async fn get_session(
         &self,
         id: &CanvasSessionId,
         tenant_id: &TenantId,
-        owner: &str,
     ) -> Result<CanvasSession, CanvasError>;
 
     /// Terminate a session. Transitions status to
@@ -162,11 +174,12 @@ pub trait CanvasService: Send + Sync {
     /// [`CanvasEvent::SessionTerminated`], and deletes the backing volume
     /// when the session is [`WorkspaceMode::Ephemeral`]. Persistent and
     /// git-linked volumes are retained.
+    ///
+    /// Audit 002 §4.37.12 — tenant-scoped, not owner-scoped.
     async fn terminate_session(
         &self,
         id: &CanvasSessionId,
         tenant_id: &TenantId,
-        owner: &str,
     ) -> Result<(), CanvasError>;
 }
 
@@ -336,7 +349,6 @@ impl CanvasService for StandardCanvasService {
     async fn list_sessions(
         &self,
         tenant_id: &TenantId,
-        _owner: &str,
         include_archived: bool,
     ) -> Result<Vec<CanvasSession>, CanvasError> {
         // ADR-106: canvas sessions are tenant-scoped. Per-user tenants
@@ -378,7 +390,6 @@ impl CanvasService for StandardCanvasService {
         &self,
         id: &CanvasSessionId,
         tenant_id: &TenantId,
-        _owner: &str,
     ) -> Result<CanvasSession, CanvasError> {
         let session = self
             .session_repo
@@ -399,7 +410,6 @@ impl CanvasService for StandardCanvasService {
         &self,
         id: &CanvasSessionId,
         tenant_id: &TenantId,
-        _owner: &str,
     ) -> Result<(), CanvasError> {
         let mut session = self
             .session_repo
