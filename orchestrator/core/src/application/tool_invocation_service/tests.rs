@@ -113,6 +113,16 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
 fn test_agent_with_tools(tools: &[&str]) -> Agent {
+    let tools_yaml = if tools.is_empty() {
+        "  tools: []".to_string()
+    } else {
+        let entries = tools
+            .iter()
+            .map(|tool| format!("    - {tool}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("  tools:\n{entries}")
+    };
     let manifest_yaml = format!(
         r#"
 apiVersion: 100monkeys.ai/v1
@@ -126,14 +136,8 @@ spec:
     version: "3.11"
     isolation: inherit
     model: smart
-  tools:
-{}
-"#,
-        tools
-            .iter()
-            .map(|tool| format!("    - {tool}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+{tools_yaml}
+"#
     );
     let manifest: AgentManifest = serde_yaml::from_str(&manifest_yaml).unwrap();
     Agent {
@@ -146,6 +150,25 @@ spec:
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
+}
+
+#[test]
+fn test_agent_with_tools_empty_yields_empty_tools_list() {
+    let agent = test_agent_with_tools(&[]);
+    assert!(
+        agent.manifest.spec.tools.is_empty(),
+        "expected empty tools list for empty input, got: {:?}",
+        agent.manifest.spec.tools
+    );
+}
+
+#[test]
+fn test_agent_with_tools_non_empty_preserves_entries() {
+    let agent = test_agent_with_tools(&["foo", "bar"]);
+    assert_eq!(
+        agent.manifest.spec.tools,
+        vec!["foo".to_string(), "bar".to_string()]
+    );
 }
 
 struct TestAgentLifecycleService;
