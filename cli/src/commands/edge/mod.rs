@@ -9,6 +9,7 @@ pub mod client;
 pub mod enroll;
 pub mod fleet;
 pub mod group;
+pub mod grpc;
 pub mod keys;
 pub mod logout;
 pub mod ls;

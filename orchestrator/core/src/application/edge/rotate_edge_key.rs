@@ -99,9 +99,13 @@ impl RotateEdgeKeyService {
             .clone()
             .try_into()
             .map_err(|_| anyhow!("new_public_key not 32 bytes"))?;
-        if new_pk_bytes == old_pk_bytes {
-            return Err(anyhow!("new_public_key must differ from current"));
-        }
+        // Same-key rotations are intentionally permitted: this is the
+        // degenerate case used by `aegis edge token refresh` (T5), where the
+        // daemon re-attests with its existing keypair to obtain a fresh
+        // NodeSecurityToken without rolling the underlying Ed25519 identity.
+        // Dual-signature semantics still hold — the outer envelope proves
+        // possession of the (single) private key, and `signature_with_new_key`
+        // proves the same possession over the deterministic challenge.
         let new_pk = VerifyingKey::from_bytes(&new_pk_bytes)
             .map_err(|e| anyhow!("invalid new public_key: {e}"))?;
         let challenge = Self::rotation_challenge(&node_id, &inner.new_public_key, &inner.nonce);
@@ -179,6 +183,17 @@ async fn mint_node_security_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::cluster::NodePeerStatus;
+    use crate::domain::edge::{EdgeCapabilities, EdgeConnectionState, EdgeDaemon};
+    use crate::domain::secrets::{SecretStore, SecretsError};
+    use crate::domain::shared_kernel::TenantId;
+    use crate::infrastructure::aegis_cluster_proto::SealNodeEnvelope;
+    use async_trait::async_trait;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use prost::Message;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
 
     #[test]
     fn rotation_challenge_is_deterministic() {
@@ -188,5 +203,181 @@ mod tests {
         let a = RotateEdgeKeyService::rotation_challenge(&n, &pk, &nonce);
         let b = RotateEdgeKeyService::rotation_challenge(&n, &pk, &nonce);
         assert_eq!(a, b);
+    }
+
+    #[derive(Default)]
+    struct StubRepo {
+        edges: Mutex<HashMap<NodeId, EdgeDaemon>>,
+    }
+
+    #[async_trait]
+    impl crate::domain::edge::EdgeDaemonRepository for StubRepo {
+        async fn upsert(&self, edge: &EdgeDaemon) -> anyhow::Result<()> {
+            self.edges.lock().await.insert(edge.node_id, edge.clone());
+            Ok(())
+        }
+        async fn get(&self, node_id: &NodeId) -> anyhow::Result<Option<EdgeDaemon>> {
+            Ok(self.edges.lock().await.get(node_id).cloned())
+        }
+        async fn list_by_tenant(&self, _t: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
+        async fn update_status(&self, _: &NodeId, _: NodePeerStatus) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_tags(&self, _: &NodeId, _: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_capabilities(
+            &self,
+            _: &NodeId,
+            _: &EdgeCapabilities,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StubSecretStore;
+    #[async_trait]
+    impl SecretStore for StubSecretStore {
+        async fn read(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<HashMap<String, crate::domain::secrets::SensitiveString>, SecretsError>
+        {
+            Ok(HashMap::new())
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &str,
+            _: HashMap<String, crate::domain::secrets::SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::domain::secrets::DomainDynamicSecret, SecretsError> {
+            unimplemented!()
+        }
+        async fn renew_lease(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<std::time::Duration, SecretsError> {
+            Ok(std::time::Duration::from_secs(0))
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn transit_sign(&self, _key_name: &str, data: &[u8]) -> Result<String, SecretsError> {
+            // Return a deterministic fake signature in the format
+            // mint_node_security_token expects: "vault:v1:<base64>".
+            let sig_b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            Ok(format!("vault:v1:{sig_b64}"))
+        }
+        async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+            Ok(true)
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(String::new())
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            Ok(vec![])
+        }
+    }
+
+    fn build_request(
+        signing_key: &SigningKey,
+        new_signing_key: &SigningKey,
+        node_id: &NodeId,
+    ) -> RotateEdgeKeyRequest {
+        let nonce = [7u8; 32].to_vec();
+        let new_pub = new_signing_key.verifying_key().to_bytes().to_vec();
+        let inner = RotateEdgeKeyInner {
+            node_id: node_id.0.to_string(),
+            new_public_key: new_pub.clone(),
+            nonce: nonce.clone(),
+        };
+        let mut payload = Vec::new();
+        inner.encode(&mut payload).unwrap();
+        let outer_sig = signing_key.sign(&payload).to_bytes().to_vec();
+        let challenge = RotateEdgeKeyService::rotation_challenge(node_id, &new_pub, &nonce);
+        let new_sig = new_signing_key.sign(&challenge).to_bytes().to_vec();
+        RotateEdgeKeyRequest {
+            current_envelope: Some(SealNodeEnvelope {
+                node_security_token: String::new(),
+                signature: outer_sig,
+                payload,
+            }),
+            new_public_key: new_pub,
+            signature_with_new_key: new_sig,
+        }
+    }
+
+    async fn make_service_and_seed(
+        signing_key: &SigningKey,
+        node_id: NodeId,
+    ) -> RotateEdgeKeyService {
+        let repo = Arc::new(StubRepo::default());
+        repo.upsert(&EdgeDaemon {
+            node_id,
+            tenant_id: TenantId::new("t-test").unwrap(),
+            public_key: signing_key.verifying_key().to_bytes().to_vec(),
+            capabilities: EdgeCapabilities::default(),
+            status: NodePeerStatus::Active,
+            connection: EdgeConnectionState::Disconnected {
+                since: chrono::Utc::now(),
+            },
+            last_heartbeat_at: None,
+            enrolled_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+        RotateEdgeKeyService::new(
+            repo,
+            Arc::new(StubSecretStore),
+            "transit/keys/test".to_string(),
+        )
+    }
+
+    /// Regression: ADR-117 §"Key & token rotation" — `aegis edge token refresh`
+    /// reuses RotateEdgeKey with `new_public_key == current_public_key` (T5).
+    /// Prior to this commit the orchestrator rejected same-key rotations,
+    /// breaking the refresh path.
+    #[tokio::test]
+    async fn rotate_accepts_same_key_for_token_refresh() {
+        use rand_core::OsRng;
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng);
+        let node_id = NodeId(uuid::Uuid::new_v4());
+        let svc = make_service_and_seed(&signing_key, node_id).await;
+        // Same-key: reuse `signing_key` for the "new" key.
+        let req = build_request(&signing_key, &signing_key, &node_id);
+        let resp = svc.rotate(req).await.expect("same-key rotate must succeed");
+        assert!(!resp.node_security_token.is_empty());
+        assert!(resp.expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn rotate_accepts_distinct_new_key() {
+        use rand_core::OsRng;
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng);
+        let new_key = SigningKey::generate(&mut rng);
+        let node_id = NodeId(uuid::Uuid::new_v4());
+        let svc = make_service_and_seed(&signing_key, node_id).await;
+        let req = build_request(&signing_key, &new_key, &node_id);
+        let resp = svc
+            .rotate(req)
+            .await
+            .expect("distinct-key rotate must succeed");
+        assert!(!resp.node_security_token.is_empty());
     }
 }
