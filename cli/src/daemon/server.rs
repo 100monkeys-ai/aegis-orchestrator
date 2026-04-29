@@ -135,7 +135,8 @@ use aegis_orchestrator_core::{
 };
 
 use aegis_orchestrator_core::application::credential_service::{
-    CredentialManagementService, OAuthProviderRegistry, StandardCredentialManagementService,
+    validate_oauth_provider_registry, CredentialManagementService, OAuthProviderRegistry,
+    StandardCredentialManagementService,
 };
 use aegis_orchestrator_core::domain::credential::CredentialBindingRepository;
 use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
@@ -1516,8 +1517,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             // OAuth provider registry (RFC 6749 §4.1.3 token exchange). Empty
             // for now — providers are loaded from node config in a follow-up.
             // Requests against unregistered providers return
-            // `CredentialError::ProviderNotConfigured`.
-            let oauth_providers = Arc::new(OAuthProviderRegistry::new());
+            // `CredentialError::ProviderNotConfigured`. The registry is
+            // validated at startup (security audit 002 §4.11, §4.18): any
+            // configured provider MUST have a real HTTPS authorization URL
+            // (no `placeholder` substring) and a non-empty
+            // `redirect_uri_allowlist`. Boot fails if validation fails.
+            let registry = OAuthProviderRegistry::new();
+            validate_oauth_provider_registry(&registry)
+                .context("OAuth provider registry failed startup validation")?;
+            let oauth_providers = Arc::new(registry);
             Arc::new(StandardCredentialManagementService::new(
                 repo,
                 secrets_manager.clone(),

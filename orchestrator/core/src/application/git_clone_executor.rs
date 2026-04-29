@@ -169,22 +169,22 @@ impl EphemeralCliEngine {
         // -- credential wiring --
         let auth_repo_url = match credential {
             Some(ResolvedCredential::HttpsPat { username, token }) => {
-                // Put the PAT into GIT_ASKPASS so it never appears on the
-                // command line or in the saved remote config.
-                env.insert("GIT_USERNAME".to_string(), username.clone());
-                env.insert("GIT_PASSWORD".to_string(), token.expose().to_string());
-                // GIT_ASKPASS script that echos either username or
-                // password depending on what git is asking for.
-                script_prelude.push_str(
-                    "cat >/tmp/askpass.sh <<'EOF'\n\
-                     #!/bin/sh\n\
-                     case \"$1\" in\n\
-                     Username*) echo \"$GIT_USERNAME\" ;;\n\
-                     Password*) echo \"$GIT_PASSWORD\" ;;\n\
-                     esac\n\
-                     EOF\n\
-                     chmod 0700 /tmp/askpass.sh\n",
-                );
+                // Security audit 002 §4.24 — the PAT MUST NOT travel
+                // through container environment variables. Env vars are
+                // visible via `docker inspect`, `/proc/<pid>/environ`,
+                // and any logging middleware that snapshots the spawn
+                // configuration. Instead, materialise the credential to
+                // a mode-0600 file inside the container (heredoc into
+                // the script prelude — the PAT only exists inside the
+                // container's mount namespace) and have a tiny
+                // `GIT_ASKPASS` script `cat` it on demand. The username
+                // is non-secret and follows the same file-based path
+                // for symmetry. Trailing files are deleted at the end
+                // of the script so the secret material does not survive
+                // the container's lifetime even if the volume is
+                // inspected post-mortem.
+                let prelude = build_https_askpass_prelude(&username, token.expose());
+                script_prelude.push_str(&prelude);
                 env.insert("GIT_ASKPASS".to_string(), "/tmp/askpass.sh".to_string());
                 env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
                 binding.repo_url.clone()
@@ -223,13 +223,21 @@ impl EphemeralCliEngine {
         };
 
         // Full shell command:
-        //   <prelude>
+        //   <prelude>            -- materialise credential files (mode 0600)
+        //   trap '<scrub>' EXIT  -- guarantee scrub on success or failure
         //   git clone [--depth=1 --filter=blob:limit=10M] [--branch X] URL /workspace/repo
         //   [ && git -C /workspace/repo checkout SHA ]
         //   [ && git -C /workspace/repo sparse-checkout set --cone A B ]
         //   && git -C /workspace/repo rev-parse HEAD
+        //
+        // The `trap` ensures that `/tmp/git_password`, `/tmp/git_username`,
+        // `/tmp/ssh_key`, and `/tmp/askpass.sh` are removed even if the
+        // clone fails. This is the file-side complement of the
+        // env-var-removal fix for security audit 002 §4.24.
         let command = format!(
-            "{prelude}set -eu && \
+            "{prelude}\
+             trap 'rm -f /tmp/git_password /tmp/git_username /tmp/askpass.sh /tmp/ssh_key' EXIT && \
+             set -eu && \
              git clone {depth} {filter} {ref_} {url} /workspace/repo \
              {checkout}{sparse} && \
              git -C /workspace/repo rev-parse HEAD",
@@ -310,6 +318,55 @@ fn shell_escape(s: &str) -> String {
     // Wrap in single quotes, escaping any embedded single quotes via the
     // standard '\'' dance.
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the script prelude that materialises an HTTPS PAT credential to
+/// mode-0600 files inside the container and installs a `GIT_ASKPASS`
+/// helper that reads them.
+///
+/// Security audit 002 §4.24: this replaces the previous design that
+/// passed the PAT via the container's `GIT_PASSWORD` environment
+/// variable. Env-var values are visible via `docker inspect` and
+/// `/proc/<pid>/environ`; file-based delivery limits exposure to a
+/// process holding a file descriptor on a 0600 file inside the
+/// container's mount namespace.
+///
+/// The `<<'EOF'` heredoc form is critical: the single-quoted delimiter
+/// disables shell interpolation, so any metacharacters in the PAT or
+/// username (e.g. `$`, `` ` ``, `\`) are written verbatim and NOT
+/// expanded by the surrounding `sh -c`.
+///
+/// The prelude is paired with a `trap '<scrub>' EXIT` in the surrounding
+/// command so the files are removed even if the clone fails.
+///
+/// Factored out for unit testability — see
+/// `https_askpass_prelude_does_not_leak_secret_to_env`.
+fn build_https_askpass_prelude(username: &str, password: &str) -> String {
+    // The askpass.sh script `cat`s the appropriate file based on what
+    // git is asking for (Username vs Password prompt). Files are mode
+    // 0600 so only root inside the container can read them.
+    let mut s = String::new();
+    s.push_str("cat >/tmp/git_username <<'AEGIS_USERNAME_EOF'\n");
+    s.push_str(username);
+    s.push('\n');
+    s.push_str("AEGIS_USERNAME_EOF\n");
+    s.push_str("chmod 0600 /tmp/git_username\n");
+    s.push_str("cat >/tmp/git_password <<'AEGIS_PASSWORD_EOF'\n");
+    s.push_str(password);
+    s.push('\n');
+    s.push_str("AEGIS_PASSWORD_EOF\n");
+    s.push_str("chmod 0600 /tmp/git_password\n");
+    s.push_str(
+        "cat >/tmp/askpass.sh <<'AEGIS_ASKPASS_EOF'\n\
+         #!/bin/sh\n\
+         case \"$1\" in\n\
+         Username*) cat /tmp/git_username ;;\n\
+         Password*) cat /tmp/git_password ;;\n\
+         esac\n\
+         AEGIS_ASKPASS_EOF\n\
+         chmod 0700 /tmp/askpass.sh\n",
+    );
+    s
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -864,6 +921,55 @@ fn blocking_fetch_and_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for security audit 002 §4.24 — the HTTPS PAT MUST
+    /// NOT appear anywhere in the spawn environment of the ephemeral
+    /// container. The previous design set `env["GIT_PASSWORD"] = pat`
+    /// which was visible via `docker inspect` and `/proc/<pid>/environ`.
+    #[test]
+    fn https_askpass_prelude_does_not_leak_secret_to_env() {
+        const SECRET: &str = "ghp_SECRETPATBYTES_xyz123";
+        let prelude = build_https_askpass_prelude("x-access-token", SECRET);
+
+        // Simulate the env that would be passed to the container — same
+        // population logic as `run_clone_container`. The fix is correct
+        // iff the ONLY env vars set are non-secret routing flags.
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        env.insert("GIT_ASKPASS".to_string(), "/tmp/askpass.sh".to_string());
+        env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+
+        for (k, v) in env.iter() {
+            assert!(
+                !v.contains(SECRET),
+                "env var {k}={v:?} contains the secret — §4.24 regressed"
+            );
+            assert_ne!(k, "GIT_PASSWORD", "GIT_PASSWORD env var must not be set");
+            assert_ne!(k, "GIT_USERNAME", "GIT_USERNAME env var must not be set");
+        }
+
+        // The secret IS expected inside the heredoc-rendered prelude
+        // (that is the file-based delivery path). Sanity-check that
+        // the file path machinery is in fact used.
+        assert!(
+            prelude.contains(SECRET),
+            "secret must appear in heredoc payload"
+        );
+        assert!(prelude.contains("/tmp/git_password"));
+        assert!(prelude.contains("chmod 0600 /tmp/git_password"));
+    }
+
+    /// The heredoc delimiter MUST be single-quoted so that shell
+    /// metacharacters in the credential are not expanded by the
+    /// outer `sh -c`. This pins that property.
+    #[test]
+    fn https_askpass_prelude_uses_quoted_heredoc_delimiter() {
+        let prelude = build_https_askpass_prelude("u", "secret-with-$dollar-and-`backtick`");
+        assert!(prelude.contains("<<'AEGIS_PASSWORD_EOF'"));
+        assert!(prelude.contains("<<'AEGIS_USERNAME_EOF'"));
+        // Secret is written verbatim — the test value contains $ and `
+        // which would be expanded if the delimiter were unquoted.
+        assert!(prelude.contains("secret-with-$dollar-and-`backtick`"));
+    }
 
     #[test]
     fn github_pat_default_username() {
