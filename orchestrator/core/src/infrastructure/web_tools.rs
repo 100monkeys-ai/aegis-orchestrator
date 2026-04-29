@@ -169,7 +169,11 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
         };
 
         let brave_resp: BraveSearchResponse = response.json().await.map_err(|e| {
-            SealSessionError::UpstreamUnavailable(format!("web.search response parse failed: {e}"))
+            // Log details for operators, but surface a generic message to the
+            // caller so internal struct field names / response shape don't
+            // leak through SealSessionError into LLM-visible output.
+            warn!(error = %e, "web.search response parse failed");
+            SealSessionError::UpstreamUnavailable("web.search response parse failed".to_string())
         })?;
 
         let results: Vec<serde_json::Value> = brave_resp
@@ -215,17 +219,20 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
         .await
         {
             Ok((status, is_html, body)) => {
-                let mut content = body;
-
-                if request.to_markdown && is_html {
-                    content = html2md::parse_html(&content);
-                }
+                let (content, content_format) = if request.to_markdown && is_html {
+                    html_to_markdown_or_fallback(&body)
+                } else if is_html {
+                    (body, "html")
+                } else {
+                    (body, "text")
+                };
 
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "status": "success",
                     "url": request.url,
                     "http_status": status,
                     "content_length": content.len(),
+                    "content_format": content_format,
                     "content": content
                 })))
             }
@@ -276,6 +283,31 @@ async fn perform_fetch(
         .map_err(|e| format!("Failed to read response body: {e}"))?;
 
     Ok((status, is_html, body))
+}
+
+/// Convert HTML to Markdown via `html2md`, falling back to the original HTML
+/// when conversion produces empty output from non-empty input.
+///
+/// `html2md` silently emits an empty string for HTML it cannot meaningfully
+/// represent (e.g. pages whose visible content is entirely inside `<script>`
+/// or `<style>` blocks). Returning empty content to the caller hides the
+/// fact that real bytes were fetched. When this happens we log a warning,
+/// preserve the original HTML, and report `content_format: "html"` so
+/// downstream consumers can adapt.
+///
+/// Returns `(content, content_format)` where `content_format` is one of
+/// `"markdown"` or `"html"`.
+pub(super) fn html_to_markdown_or_fallback(html: &str) -> (String, &'static str) {
+    if html.trim().is_empty() {
+        return (html.to_string(), "html");
+    }
+    let markdown = html2md::parse_html(html);
+    if markdown.trim().is_empty() {
+        warn!("HTML to Markdown conversion produced empty output; returning original HTML content");
+        (html.to_string(), "html")
+    } else {
+        (markdown, "markdown")
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +554,156 @@ mod tests {
             !err.to_string().contains("Signature verification"),
             "transport failure must not mention signature verification: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a malformed JSON body from Brave MUST surface as a generic
+    // UpstreamUnavailable error whose message is exactly
+    // "web.search response parse failed" — no serde field names, no byte
+    // offsets, no struct shape. Detailed parse errors get logged at warn
+    // level for operator debugging.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn web_search_parse_error_does_not_leak_serde_details() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            // Malformed JSON — missing closing brace, wrong types.
+            .with_body(r#"{"web": {"results": "not-an-array""#)
+            .create_async()
+            .await;
+
+        let adapter =
+            ReqwestWebToolAdapter::with_base_url(Some("test-key".to_string()), server.url());
+        let result = adapter
+            .search(WebSearchRequest {
+                query: "test".to_string(),
+                max_results: 5,
+            })
+            .await;
+        assert!(result.is_err(), "malformed JSON must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SealSessionError::UpstreamUnavailable(_)),
+            "parse failure must be UpstreamUnavailable, got: {err:?}"
+        );
+        let err_str = match &err {
+            SealSessionError::UpstreamUnavailable(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            err_str, "web.search response parse failed",
+            "error string must be exactly the generic message — no leaked serde details: got {err_str:?}"
+        );
+        // Defence-in-depth: ensure no common serde detail leaks even if the
+        // generic string above were ever modified.
+        for needle in [
+            "line ",
+            "column ",
+            "expected",
+            "BraveSearchResponse",
+            "BraveWebResults",
+            "BraveResult",
+            "missing field",
+            "invalid type",
+        ] {
+            assert!(
+                !err_str.contains(needle),
+                "error must not leak serde detail {needle:?}: {err_str}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: html2md silently emits an empty string for some valid HTML
+    // (e.g. content entirely inside <script> tags). The fetch path must
+    // detect this case and fall back to the original HTML so callers do not
+    // receive empty content for pages that returned real bytes.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn web_fetch_html_to_markdown_fallback_on_empty_conversion() {
+        // Empty input → empty html (no fallback drama, format is "html").
+        let (content, fmt) = html_to_markdown_or_fallback("");
+        assert_eq!(content, "");
+        assert_eq!(fmt, "html");
+
+        // Whitespace-only input → treated as empty.
+        let (content, fmt) = html_to_markdown_or_fallback("   \n  ");
+        assert_eq!(fmt, "html", "whitespace-only must short-circuit to html");
+        assert!(content.trim().is_empty());
+
+        // Valid HTML with real content → markdown.
+        let html = "<h1>Hello</h1><p>world</p>";
+        let (content, fmt) = html_to_markdown_or_fallback(html);
+        assert_eq!(fmt, "markdown");
+        assert!(
+            !content.trim().is_empty(),
+            "valid HTML must produce non-empty markdown"
+        );
+
+        // HTML that html2md collapses to empty (script-only). The fallback
+        // must preserve the original HTML and report content_format = "html".
+        let script_only = "<script>var x = 1;</script>";
+        let html2md_output = html2md::parse_html(script_only);
+        // Sanity: confirm html2md actually emits empty for this input on the
+        // current dependency version. If this assertion ever fails the test
+        // becomes vacuous — adjust the script_only fixture.
+        assert!(
+            html2md_output.trim().is_empty(),
+            "fixture invariant: html2md is expected to produce empty markdown for script-only HTML; got {html2md_output:?}"
+        );
+        let (content, fmt) = html_to_markdown_or_fallback(script_only);
+        assert_eq!(
+            fmt, "html",
+            "fallback must report html when conversion is empty"
+        );
+        assert_eq!(
+            content, script_only,
+            "fallback must preserve the original HTML byte-for-byte"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: the web.fetch JSON response MUST include a content_format
+    // field so callers can distinguish HTML from converted Markdown.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn web_fetch_response_includes_content_format() {
+        use crate::application::ports::{ExternalWebToolPort, WebFetchRequest};
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/page")
+            .with_status(200)
+            .with_header("content-type", "text/html; charset=utf-8")
+            .with_body("<h1>Title</h1><p>body text</p>")
+            .create_async()
+            .await;
+
+        let adapter = ReqwestWebToolAdapter::unconfigured();
+        let url = format!("{}/page", server.url());
+        let result = adapter
+            .fetch(WebFetchRequest {
+                url: url.clone(),
+                timeout_secs: 5,
+                follow_redirects: true,
+                to_markdown: true,
+            })
+            .await;
+        assert!(result.is_ok(), "fetch must succeed: {:?}", result);
+        if let Ok(ToolInvocationResult::Direct(v)) = result {
+            assert!(
+                v.get("content_format").is_some(),
+                "response must include content_format field: {v}"
+            );
+            assert_eq!(
+                v["content_format"], "markdown",
+                "HTML page with to_markdown=true must report markdown: {v}"
+            );
+        }
     }
 
     #[tokio::test]
