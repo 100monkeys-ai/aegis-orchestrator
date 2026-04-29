@@ -109,15 +109,54 @@ pub struct FuseVolumeContext {
 ///
 /// # Safety
 ///
-/// `BackgroundSession` contains a `*mut c_void` (the libfuse session handle).
-/// The orchestrator only creates, holds, and drops sessions sequentially —
-/// the handle is never accessed concurrently from multiple threads. The
-/// underlying libfuse mount/unmount operations are thread-safe.
+/// `fuser::BackgroundSession` is not `Send + Sync` upstream because it
+/// stores a raw `*mut c_void` pointer to the libfuse session handle. The
+/// audit (002 finding 4.37.17) flagged this as a manually-asserted invariant
+/// rather than a compile-checked one; this comment block documents WHY the
+/// assertion is sound so a future maintainer cannot silently invalidate it.
+///
+/// **Why the invariant holds:**
+///
+/// 1. **Exclusive ownership.** The wrapped `BackgroundSession` is owned by a
+///    single [`FuseMountHandle`] and is never cloned, never aliased, never
+///    handed to another task. The handle moves through:
+///    create → store in `MountHandleMap` (behind an `Arc<Mutex<…>>`) → drop.
+/// 2. **No concurrent access to the inner pointer.** The only operation
+///    performed on the session after creation is `Drop`, which calls into
+///    libfuse's `fuse_session_destroy` / unmount path. Tokio cannot spuriously
+///    move a `BackgroundSession` between threads while a method is in flight
+///    because there are no methods called on it after construction —
+///    everything else operates on `mountpoint` / `mount_key` / metadata.
+/// 3. **libfuse mount/unmount thread-safety.** Per `libfuse` documentation,
+///    `fuse_session_destroy` is safe to call from a thread other than the
+///    one that created the session, provided no other thread is concurrently
+///    using the session — which point (1) guarantees.
+///
+/// **Why we do not wrap in `Mutex<…>` instead.** A `Mutex` would make the
+/// type `Send + Sync` via the type system but adds a runtime lock around a
+/// drop-only resource. The lock would never be contended (there is no
+/// concurrent reader), so the cost is pure ceremony for a value whose only
+/// use is RAII unmount. The `unsafe impl` is the more honest expression of
+/// the actual invariant.
+///
+/// **Invariants a future maintainer MUST preserve:**
+///
+/// - Do not add methods that mutate the inner `BackgroundSession` from
+///   shared references.
+/// - Do not clone or duplicate `SendSyncSession`.
+/// - Do not expose `&BackgroundSession` across an `await` point in a
+///   multi-threaded runtime without re-validating thread-safety.
 #[expect(dead_code, reason = "held for RAII drop — unmounts on drop")]
 struct SendSyncSession(fuser::BackgroundSession);
 
-// SAFETY: see `SendSyncSession` doc comment above.
+// SAFETY: see `SendSyncSession` doc comment above. The inner
+// `BackgroundSession` is exclusively owned, never aliased, never accessed
+// concurrently, and only touched by `Drop`. libfuse `fuse_session_destroy`
+// is documented as thread-safe under exclusive-ownership conditions.
 unsafe impl Send for SendSyncSession {}
+// SAFETY: same justification as `Send` above. There are no shared-reference
+// methods on `SendSyncSession`, so `&Self` carries no concurrent-access
+// hazard — `Sync` is vacuous in practice for this type.
 unsafe impl Sync for SendSyncSession {}
 
 /// Handle to an active FUSE mount. Dropping this handle unmounts the filesystem.
