@@ -60,31 +60,36 @@ pub fn init_metrics(
 ///
 /// This function is idempotent — subsequent calls are no-ops because the
 /// `metrics` crate deduplicates registrations by name.
+/// Label keys used on the intent-pipeline Prometheus metrics. Centralised so
+/// regression tests can assert that high-cardinality identifiers (notably
+/// `tenant_id`, see audit 002 finding 4.26) are not present.
+pub const INTENT_PIPELINE_STARTS_LABELS: &[&str] = &["language"];
+pub const INTENT_PIPELINE_DURATION_LABELS: &[&str] = &["language", "outcome"];
+pub const INTENT_PIPELINE_AGENT_CACHE_HITS_LABELS: &[&str] = &[];
+pub const INTENT_PIPELINE_CONTAINER_EXIT_CODE_LABELS: &[&str] = &["exit_code"];
+
 pub fn register_intent_pipeline_metrics() {
-    // Counter: pipeline start events, labelled by tenant and language.
+    // Counter: pipeline start events, labelled by language only. Per-tenant
+    // breakdown is intentionally omitted to bound Prometheus cardinality
+    // (audit 002, finding 4.26).
     metrics::counter!(
         "zaru_intent_pipeline_starts_total",
-        "tenant_id" => "",
         "language" => ""
     )
     .absolute(0);
 
-    // Histogram: end-to-end pipeline duration, labelled by tenant, language, and outcome.
-    // Buckets are picked up from the `_duration_seconds` suffix matcher set in `init_metrics`.
+    // Histogram: end-to-end pipeline duration, labelled by language and
+    // outcome. Buckets are picked up from the `_duration_seconds` suffix
+    // matcher set in `init_metrics`.
     metrics::histogram!(
         "zaru_intent_pipeline_duration_seconds",
-        "tenant_id" => "",
         "language" => "",
         "outcome" => ""
     )
     .record(0.0);
 
-    // Counter: Cortex / agent cache hits, labelled by tenant.
-    metrics::counter!(
-        "zaru_intent_pipeline_agent_cache_hits_total",
-        "tenant_id" => ""
-    )
-    .absolute(0);
+    // Counter: Cortex / agent cache hits. Aggregated across all tenants.
+    metrics::counter!("zaru_intent_pipeline_agent_cache_hits_total").absolute(0);
 
     // Counter: container exit codes observed by the step runner.
     metrics::counter!(
@@ -96,7 +101,11 @@ pub fn register_intent_pipeline_metrics() {
 
 #[cfg(test)]
 mod tests {
-    use super::register_intent_pipeline_metrics;
+    use super::{
+        register_intent_pipeline_metrics, INTENT_PIPELINE_AGENT_CACHE_HITS_LABELS,
+        INTENT_PIPELINE_CONTAINER_EXIT_CODE_LABELS, INTENT_PIPELINE_DURATION_LABELS,
+        INTENT_PIPELINE_STARTS_LABELS,
+    };
 
     /// Regression: all four ADR-087 metric descriptors must register without panicking.
     /// The `metrics` crate panics if a metric is registered with conflicting types.
@@ -112,16 +121,11 @@ mod tests {
     fn test_intent_pipeline_counter_increment_valid_labels() {
         metrics::counter!(
             "zaru_intent_pipeline_starts_total",
-            "tenant_id" => "tenant-abc",
             "language" => "python"
         )
         .increment(1);
 
-        metrics::counter!(
-            "zaru_intent_pipeline_agent_cache_hits_total",
-            "tenant_id" => "tenant-abc"
-        )
-        .increment(1);
+        metrics::counter!("zaru_intent_pipeline_agent_cache_hits_total").increment(1);
 
         metrics::counter!(
             "zaru_intent_pipeline_container_exit_code_total",
@@ -131,10 +135,28 @@ mod tests {
 
         metrics::histogram!(
             "zaru_intent_pipeline_duration_seconds",
-            "tenant_id" => "tenant-abc",
             "language" => "python",
             "outcome" => "success"
         )
         .record(1.5);
+    }
+
+    /// Regression for finding 4.26 (002 audit): Prometheus metrics MUST NOT
+    /// carry `tenant_id` as a label. Per-tenant labels create unbounded
+    /// cardinality (one series per tenant × other labels), risk DOSing
+    /// Prometheus, and disclose tenant identifiers to any `/metrics` scraper.
+    #[test]
+    fn test_intent_pipeline_metrics_have_no_tenant_id_label() {
+        for labels in [
+            INTENT_PIPELINE_STARTS_LABELS,
+            INTENT_PIPELINE_DURATION_LABELS,
+            INTENT_PIPELINE_AGENT_CACHE_HITS_LABELS,
+            INTENT_PIPELINE_CONTAINER_EXIT_CODE_LABELS,
+        ] {
+            assert!(
+                !labels.contains(&"tenant_id"),
+                "intent pipeline metrics must not include tenant_id label, got {labels:?}"
+            );
+        }
     }
 }

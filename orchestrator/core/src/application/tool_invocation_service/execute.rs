@@ -119,14 +119,14 @@ impl ToolInvocationService {
             }
         };
 
-        // Metric labels — captured here where tenant_id and language are in scope.
-        let tenant_id_label = tenant_id.as_str().to_string();
+        // Metric labels — `tenant_id` is intentionally NOT a Prometheus label
+        // (audit 002 finding 4.26: per-tenant labels are a cardinality bomb
+        // and disclose tenant IDs to scrapers).
         let language_label = format!("{lang:?}").to_lowercase();
 
         // ADR-087 §Observability: increment pipeline starts counter.
         metrics::counter!(
             "zaru_intent_pipeline_starts_total",
-            "tenant_id" => tenant_id_label.clone(),
             "language" => language_label.clone()
         )
         .increment(1);
@@ -152,7 +152,6 @@ impl ToolInvocationService {
         let outcome = if result.is_ok() { "success" } else { "failed" };
         metrics::histogram!(
             "zaru_intent_pipeline_duration_seconds",
-            "tenant_id" => tenant_id_label,
             "language" => language_label,
             "outcome" => outcome
         )

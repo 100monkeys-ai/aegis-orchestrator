@@ -170,7 +170,7 @@ impl Capability {
             if let Some(ref allowlist) = self.domain_allowlist {
                 if let Some(url) = args.get("url").and_then(|u| u.as_str()) {
                     let domain = Self::extract_domain(url);
-                    if !allowlist.iter().any(|d| domain.ends_with(d)) {
+                    if !allowlist.iter().any(|d| Self::domain_matches(&domain, d)) {
                         return Err(PolicyViolation::DomainNotAllowed {
                             domain,
                             allowed_domains: allowlist.clone(),
@@ -181,6 +181,23 @@ impl Capability {
         }
 
         Ok(())
+    }
+
+    /// Match `domain` against an allowlist entry `allowed` using DNS label
+    /// boundaries. The match succeeds only if `domain` is exactly `allowed`
+    /// or a subdomain of it (i.e. `domain == allowed` or
+    /// `domain.ends_with(".{allowed}")`). This prevents suffix-spoofing
+    /// attacks like `evilexample.com` matching an `example.com` entry.
+    fn domain_matches(domain: &str, allowed: &str) -> bool {
+        let d = domain.trim_end_matches('.').to_ascii_lowercase();
+        let a = allowed
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if a.is_empty() {
+            return false;
+        }
+        d == a || d.ends_with(&format!(".{a}"))
     }
 
     fn matches_tool(&self, tool_name: &str) -> bool {
@@ -319,5 +336,56 @@ mod tests {
         assert!(cap_empty
             .allows("fs.read", &json!({"path": "solution.py"}))
             .is_err());
+    }
+
+    /// Regression for finding 4.28 (002 audit): the domain allowlist must
+    /// match on DNS label boundaries, not via raw `ends_with`. Otherwise an
+    /// attacker can register `evilexample.com` and have it satisfy an
+    /// `example.com` allowlist entry.
+    #[test]
+    fn test_domain_allowlist_label_boundary_match() {
+        // Direct unit-level checks of the matcher.
+        assert!(Capability::domain_matches("example.com", "example.com"));
+        assert!(Capability::domain_matches("foo.example.com", "example.com"));
+        assert!(Capability::domain_matches(
+            "deep.foo.example.com",
+            "example.com"
+        ));
+        // Boundary violation: must NOT match.
+        assert!(!Capability::domain_matches(
+            "evilexample.com",
+            "example.com"
+        ));
+        assert!(!Capability::domain_matches(
+            "example.com.evil.io",
+            "example.com"
+        ));
+        // Case-insensitive and trailing-dot tolerant.
+        assert!(Capability::domain_matches(
+            "FOO.Example.com.",
+            "example.com"
+        ));
+
+        // End-to-end via Capability::allows on a `web.*` tool.
+        let cap = Capability {
+            tool_pattern: "web.*".to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: Some(vec!["example.com".to_string()]),
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        };
+        assert!(cap
+            .allows("web.fetch", &json!({"url": "https://example.com/"}))
+            .is_ok());
+        assert!(cap
+            .allows("web.fetch", &json!({"url": "https://foo.example.com/"}))
+            .is_ok());
+        assert!(matches!(
+            cap.allows("web.fetch", &json!({"url": "https://evilexample.com/"})),
+            Err(PolicyViolation::DomainNotAllowed { .. })
+        ));
     }
 }
