@@ -1143,6 +1143,16 @@ impl ToolInvocationService {
             }
             "aegis.system.info" => Some(self.invoke_aegis_system_info_tool().await),
             "aegis.system.config" => Some(self.invoke_aegis_system_config_tool().await),
+            // ── ADR-117 Edge fleet system tools ────────────────────
+            "aegis.edge.fleet.list" => Some(
+                self.invoke_aegis_edge_fleet_list_tool(args, tenant_scope)
+                    .await,
+            ),
+            "aegis.edge.fleet.invoke" => Some(
+                self.invoke_aegis_edge_fleet_invoke_tool(args, security_context, tenant_scope)
+                    .await,
+            ),
+            "aegis.edge.fleet.cancel" => Some(self.invoke_aegis_edge_fleet_cancel_tool(args).await),
             "aegis.tools.list" => Some(self.invoke_aegis_tools_list(args, security_context).await),
             "aegis.tools.search" => {
                 Some(self.invoke_aegis_tools_search(args, security_context).await)
@@ -1416,6 +1426,131 @@ impl ToolInvocationService {
                 "edge dispatch: {e}"
             )))),
         }
+    }
+
+    /// `aegis.edge.fleet.list` — resolve an EdgeTarget and return matched +
+    /// skipped lists without dispatching.
+    async fn invoke_aegis_edge_fleet_list_tool(
+        &self,
+        args: &Value,
+        tenant_scope: &TenantScope,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        let resolver = self.edge_resolver.as_ref().ok_or_else(|| {
+            SealSessionError::InternalError(
+                "edge fleet not configured on this orchestrator".to_string(),
+            )
+        })?;
+        let target_value = args
+            .get("target")
+            .ok_or_else(|| SealSessionError::MalformedPayload("missing target".to_string()))?;
+        let target: crate::domain::edge::EdgeTarget = serde_json::from_value(target_value.clone())
+            .map_err(|e| SealSessionError::MalformedPayload(format!("target parse: {e}")))?;
+        let resolved = resolver
+            .resolve(&tenant_scope.authenticated_tenant, &target)
+            .await
+            .map_err(|e| SealSessionError::InternalError(format!("resolve: {e}")))?;
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "resolved": resolved.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            "skipped": Vec::<serde_json::Value>::new(),
+        })))
+    }
+
+    /// `aegis.edge.fleet.invoke` — multi-target reverse-RPC dispatch via
+    /// `FleetDispatcher::spawn`. Returns the fleet command id; per-node
+    /// progress is observable via the FleetEvent stream surfaced over the
+    /// REST `/api/edge/fleet/invoke` SSE channel.
+    async fn invoke_aegis_edge_fleet_invoke_tool(
+        &self,
+        args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
+        tenant_scope: &TenantScope,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        let resolver = self.edge_resolver.as_ref().ok_or_else(|| {
+            SealSessionError::InternalError(
+                "edge fleet not configured on this orchestrator".to_string(),
+            )
+        })?;
+        let dispatcher = self.edge_fleet_dispatcher.as_ref().ok_or_else(|| {
+            SealSessionError::InternalError("edge fleet dispatcher not configured".to_string())
+        })?;
+
+        let target_value = args
+            .get("target")
+            .ok_or_else(|| SealSessionError::MalformedPayload("missing target".to_string()))?;
+        let target: crate::domain::edge::EdgeTarget = serde_json::from_value(target_value.clone())
+            .map_err(|e| SealSessionError::MalformedPayload(format!("target parse: {e}")))?;
+        let tool_name = args
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SealSessionError::MalformedPayload("missing tool_name".to_string()))?
+            .to_string();
+        let inner_args = args.get("args").cloned().unwrap_or(serde_json::json!({}));
+        let args_struct: prost_types::Struct = serde_json::from_value(inner_args)
+            .map_err(|e| SealSessionError::MalformedPayload(format!("args: {e}")))?;
+
+        let resolved = resolver
+            .resolve(&tenant_scope.authenticated_tenant, &target)
+            .await
+            .map_err(|e| SealSessionError::InternalError(format!("resolve: {e}")))?;
+
+        let policy = crate::domain::cluster::FleetDispatchPolicy {
+            mode: crate::domain::cluster::FleetMode::Parallel,
+            max_concurrency: None,
+            failure_policy: crate::domain::cluster::FailurePolicy::ContinueOnError,
+            require_min_targets: None,
+            per_target_deadline: std::time::Duration::from_secs(60),
+        };
+
+        let inv = crate::application::edge::fleet::dispatcher::FleetInvocation {
+            fleet_command_id: crate::domain::cluster::FleetCommandId::new(),
+            tenant_id: tenant_scope.authenticated_tenant.clone(),
+            tool_name,
+            args: args_struct,
+            security_context_name: security_context.name.clone(),
+            user_seal_envelope: crate::infrastructure::aegis_cluster_proto::SealEnvelope {
+                user_security_token: String::new(),
+                tenant_id: tenant_scope.authenticated_tenant.as_str().to_string(),
+                security_context_name: security_context.name.clone(),
+                payload: None,
+                signature: vec![],
+            },
+            resolved: resolved.clone(),
+            policy,
+        };
+        let fleet_id = inv.fleet_command_id.0.to_string();
+        // Spawn returns a Receiver of FleetEvent; we don't consume it here —
+        // SSE consumers go through the REST endpoint.
+        let _rx = dispatcher.clone().spawn(inv);
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "fleet_command_id": fleet_id,
+            "resolved": resolved.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        })))
+    }
+
+    /// `aegis.edge.fleet.cancel` — cancel a running fleet operation.
+    async fn invoke_aegis_edge_fleet_cancel_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        let cancel = self.edge_fleet_cancel.as_ref().ok_or_else(|| {
+            SealSessionError::InternalError(
+                "edge fleet cancel not configured on this orchestrator".to_string(),
+            )
+        })?;
+        let id_str = args
+            .get("fleet_command_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SealSessionError::MalformedPayload("missing fleet_command_id".to_string())
+            })?;
+        let uuid = uuid::Uuid::parse_str(id_str)
+            .map_err(|e| SealSessionError::MalformedPayload(format!("fleet_command_id: {e}")))?;
+        let cancelled = cancel
+            .cancel(crate::domain::cluster::FleetCommandId(uuid))
+            .await;
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "cancelled": cancelled,
+        })))
     }
 
     /// Look up a tool descriptor in the catalog and check whether it
