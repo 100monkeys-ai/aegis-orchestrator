@@ -107,13 +107,11 @@ impl IssueEnrollmentToken {
             .transit_sign(&self.signing_key_path, signing_input.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("transit_sign failed: {e}"))?;
-        let sig_b64 = raw_sig
-            .rsplit_once(':')
-            .map(|(_, b)| b.to_string())
-            .unwrap_or(raw_sig);
+        let sig_b64 = super::transit::parse_vault_signature(&raw_sig)
+            .map_err(|e| anyhow::anyhow!("transit_sign parse: {e}"))?;
         // OpenBao returns standard base64; convert to URL-safe-no-pad for JWT.
         let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&sig_b64)
+            .decode(sig_b64)
             .map_err(|e| anyhow::anyhow!("decode transit signature: {e}"))?;
         let s_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
         let token = format!("{signing_input}.{s_b64}");
@@ -131,8 +129,88 @@ impl IssueEnrollmentToken {
 
 #[cfg(test)]
 mod tests {
-    // Round-trip is exercised in integration tests where the real SecretStore
-    // signing key is available; here we keep coverage to construction only.
-    #[test]
-    fn module_compiles() {}
+    use super::*;
+    use crate::domain::secrets::{SecretStore, SecretsError, SensitiveString};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+
+    struct MalformedTransitStore {
+        raw: &'static str,
+    }
+    #[async_trait]
+    impl SecretStore for MalformedTransitStore {
+        async fn read(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
+            Ok(HashMap::new())
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &str,
+            _: HashMap<String, SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::domain::secrets::DomainDynamicSecret, SecretsError> {
+            unimplemented!()
+        }
+        async fn renew_lease(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<std::time::Duration, SecretsError> {
+            Ok(std::time::Duration::from_secs(0))
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn transit_sign(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(self.raw.to_string())
+        }
+        async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+            Ok(true)
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(String::new())
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Regression: ADR-117 audit pass 3 SEV-2-C — `IssueEnrollmentToken::issue`
+    /// must reject malformed Vault transit envelopes. Prior code silently
+    /// fell through to base64-decode garbage.
+    #[tokio::test]
+    async fn issue_rejects_malformed_transit_signature() {
+        use crate::domain::shared_kernel::TenantId;
+        use std::sync::Arc;
+
+        for malformed in ["justbase64", "vault::abc", "vault:notv:abc", "vault:v1:"] {
+            let svc = IssueEnrollmentToken::new(
+                Arc::new(MalformedTransitStore { raw: malformed }),
+                "issuer".to_string(),
+                "endpoint".to_string(),
+                "transit/keys/test".to_string(),
+            );
+            let tenant = TenantId::new("t-test").unwrap();
+            let err = svc
+                .issue(&tenant, "operator")
+                .await
+                .expect_err(&format!("expected error for malformed input {malformed:?}"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("transit_sign parse")
+                    || msg.contains("unexpected transit_sign format"),
+                "unexpected error for {malformed:?}: {msg}"
+            );
+        }
+    }
 }

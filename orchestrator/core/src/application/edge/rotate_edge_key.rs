@@ -196,7 +196,8 @@ async fn mint_node_security_token(
         .transit_sign(signing_key_path, signing_input.as_bytes())
         .await
         .map_err(|e| anyhow!("transit_sign: {e}"))?;
-    let sig_b64 = raw.rsplit_once(':').map(|(_, b)| b).unwrap_or(&raw);
+    let sig_b64 = super::transit::parse_vault_signature(&raw)
+        .map_err(|e| anyhow!("transit_sign parse: {e}"))?;
     let sig_bytes = base64::engine::general_purpose::STANDARD.decode(sig_b64)?;
     let s = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes);
     Ok(format!("{signing_input}.{s}"))
@@ -394,6 +395,105 @@ mod tests {
         let resp = svc.rotate(req).await.expect("same-key rotate must succeed");
         assert!(!resp.node_security_token.is_empty());
         assert!(resp.expires_at.is_some());
+    }
+
+    /// Stub that returns a caller-controlled malformed transit_sign payload.
+    struct MalformedSecretStore {
+        raw: &'static str,
+    }
+    #[async_trait]
+    impl SecretStore for MalformedSecretStore {
+        async fn read(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<HashMap<String, crate::domain::secrets::SensitiveString>, SecretsError>
+        {
+            Ok(HashMap::new())
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &str,
+            _: HashMap<String, crate::domain::secrets::SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::domain::secrets::DomainDynamicSecret, SecretsError> {
+            unimplemented!()
+        }
+        async fn renew_lease(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<std::time::Duration, SecretsError> {
+            Ok(std::time::Duration::from_secs(0))
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn transit_sign(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(self.raw.to_string())
+        }
+        async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+            Ok(true)
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(String::new())
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Regression: ADR-117 audit pass 3 SEV-2-C — malformed transit_sign output
+    /// must surface a typed error, NOT silently base64-decode garbage. Prior
+    /// code used `rsplit_once(':').unwrap_or(&raw)` and would proceed to
+    /// decode `"justbase64"` as a valid JWT signature.
+    #[tokio::test]
+    async fn rotate_rejects_malformed_transit_signature() {
+        use rand_core::OsRng;
+        let mut rng = OsRng;
+        for malformed in ["justbase64", "vault::abc", "vault:notv:abc", "vault:v1:"] {
+            let signing_key = SigningKey::generate(&mut rng);
+            let node_id = NodeId(uuid::Uuid::new_v4());
+            // Seed an edge directly so we can swap in the malformed store.
+            let repo = Arc::new(StubRepo::default());
+            repo.upsert(&EdgeDaemon {
+                node_id,
+                tenant_id: TenantId::new("t-test").unwrap(),
+                public_key: signing_key.verifying_key().to_bytes().to_vec(),
+                capabilities: EdgeCapabilities::default(),
+                status: NodePeerStatus::Active,
+                connection: EdgeConnectionState::Disconnected {
+                    since: chrono::Utc::now(),
+                },
+                last_heartbeat_at: None,
+                enrolled_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+            let svc = RotateEdgeKeyService::with_default_ttl(
+                repo,
+                Arc::new(MalformedSecretStore { raw: malformed }),
+                "transit/keys/test".to_string(),
+            );
+            let req = build_request(&signing_key, &signing_key, &node_id);
+            let err = svc
+                .rotate(req)
+                .await
+                .expect_err(&format!("expected error for malformed input {malformed:?}"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("transit_sign parse")
+                    || msg.contains("unexpected transit_sign format"),
+                "unexpected error for {malformed:?}: {msg}"
+            );
+        }
     }
 
     /// Regression: ADR-117 audit pass 3 SEV-2-B — token TTL must be configurable
