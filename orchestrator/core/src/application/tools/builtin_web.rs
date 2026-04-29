@@ -3,7 +3,11 @@ use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
 use crate::domain::seal_session::SealSessionError;
 use serde_json::Value;
+use std::convert::TryFrom;
 use tracing::debug;
+
+const DEFAULT_MAX_RESULTS: u64 = 10;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 pub async fn invoke_web_tool(
     tool_name: &str,
@@ -25,10 +29,15 @@ pub async fn invoke_web_tool(
                     ))
                 }
             };
-            let max_results = args
+            let max_results_u64 = args
                 .get("max_results")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(10) as u32;
+                .unwrap_or(DEFAULT_MAX_RESULTS);
+            let max_results = u32::try_from(max_results_u64).map_err(|_| {
+                SealSessionError::InvalidArguments(
+                    "'max_results' must be between 0 and 4294967295 for web.search".to_string(),
+                )
+            })?;
 
             web_port
                 .search(WebSearchRequest { query, max_results })
@@ -54,7 +63,7 @@ pub async fn invoke_web_tool(
             let timeout_secs = args
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(30);
+                .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
             web_port
                 .fetch(WebFetchRequest {
@@ -76,6 +85,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     struct MockWebPort;
 
@@ -93,6 +103,36 @@ mod tests {
             _request: WebFetchRequest,
         ) -> Result<ToolInvocationResult, SealSessionError> {
             panic!("MockWebPort::fetch must not be called when arg validation fails");
+        }
+    }
+
+    struct RecordingWebPort {
+        search_called: Arc<Mutex<bool>>,
+        fetch_called: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait]
+    impl ExternalWebToolPort for RecordingWebPort {
+        async fn search(
+            &self,
+            _request: WebSearchRequest,
+        ) -> Result<ToolInvocationResult, SealSessionError> {
+            *self
+                .search_called
+                .lock()
+                .expect("search_called mutex poisoned") = true;
+            Ok(ToolInvocationResult::Direct(json!({"status": "search ok"})))
+        }
+
+        async fn fetch(
+            &self,
+            _request: WebFetchRequest,
+        ) -> Result<ToolInvocationResult, SealSessionError> {
+            *self
+                .fetch_called
+                .lock()
+                .expect("fetch_called mutex poisoned") = true;
+            Ok(ToolInvocationResult::Direct(json!({"status": "fetch ok"})))
         }
     }
 
@@ -128,6 +168,59 @@ mod tests {
         let port = MockWebPort;
         let result =
             invoke_web_tool("web.fetch", &json!({"url": ""}), ExecutionId::new(), &port).await;
+        assert!(matches!(result, Err(SealSessionError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn web_search_valid_query_invokes_port_successfully() {
+        let search_called = Arc::new(Mutex::new(false));
+        let fetch_called = Arc::new(Mutex::new(false));
+        let port = RecordingWebPort {
+            search_called: Arc::clone(&search_called),
+            fetch_called: Arc::clone(&fetch_called),
+        };
+        let result = invoke_web_tool(
+            "web.search",
+            &json!({"query": "rust ddd"}),
+            ExecutionId::new(),
+            &port,
+        )
+        .await;
+        assert!(matches!(result, Ok(ToolInvocationResult::Direct(_))));
+        assert!(*search_called.lock().expect("search_called mutex poisoned"));
+        assert!(!*fetch_called.lock().expect("fetch_called mutex poisoned"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_valid_url_invokes_port_successfully() {
+        let search_called = Arc::new(Mutex::new(false));
+        let fetch_called = Arc::new(Mutex::new(false));
+        let port = RecordingWebPort {
+            search_called: Arc::clone(&search_called),
+            fetch_called: Arc::clone(&fetch_called),
+        };
+        let result = invoke_web_tool(
+            "web.fetch",
+            &json!({"url": "https://example.com"}),
+            ExecutionId::new(),
+            &port,
+        )
+        .await;
+        assert!(matches!(result, Ok(ToolInvocationResult::Direct(_))));
+        assert!(*fetch_called.lock().expect("fetch_called mutex poisoned"));
+        assert!(!*search_called.lock().expect("search_called mutex poisoned"));
+    }
+
+    #[tokio::test]
+    async fn web_search_max_results_exceeding_u32_max_is_invalid_arguments() {
+        let port = MockWebPort;
+        let result = invoke_web_tool(
+            "web.search",
+            &json!({"query": "ok", "max_results": 4_294_967_296_u64}),
+            ExecutionId::new(),
+            &port,
+        )
+        .await;
         assert!(matches!(result, Err(SealSessionError::InvalidArguments(_))));
     }
 }
