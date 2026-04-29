@@ -993,7 +993,7 @@ pub(crate) async fn list_prices_handler(
             warn!(error = %e, "Failed to list Stripe products");
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Failed to list products from Stripe: {e}")})),
+                Json(json!({"error": "Failed to list products from Stripe"})),
             )
                 .into_response();
         }
@@ -1185,7 +1185,7 @@ pub(crate) async fn create_checkout_handler(
             warn!(error = %e, "Failed to ensure Stripe customer");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Billing unavailable: {e}")})),
+                Json(json!({"error": "Billing unavailable"})),
             )
                 .into_response();
         }
@@ -1248,7 +1248,7 @@ pub(crate) async fn create_checkout_handler(
             warn!(error = %e, "Failed to create Checkout session");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to create checkout session: {e}")})),
+                Json(json!({"error": "Failed to create checkout session"})),
             )
                 .into_response()
         }
@@ -1334,7 +1334,7 @@ pub(crate) async fn create_portal_handler(
             warn!(error = %e, "Failed to ensure Stripe customer for portal");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Billing unavailable: {e}")})),
+                Json(json!({"error": "Billing unavailable"})),
             )
                 .into_response();
         }
@@ -1351,7 +1351,7 @@ pub(crate) async fn create_portal_handler(
             warn!(error = %e, "Failed to create portal session");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to create portal session: {e}")})),
+                Json(json!({"error": "Failed to create portal session"})),
             )
                 .into_response()
         }
@@ -1440,7 +1440,7 @@ pub(crate) async fn update_seats_handler(
             warn!(error = %e, "Failed to retrieve Stripe subscription");
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Failed to retrieve subscription from Stripe: {e}")})),
+                Json(json!({"error": "Failed to retrieve subscription from Stripe"})),
             )
                 .into_response();
         }
@@ -1508,7 +1508,7 @@ pub(crate) async fn update_seats_handler(
             warn!(error = %e, "Failed to update seat count on Stripe subscription");
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Failed to update seats: {e}")})),
+                Json(json!({"error": "Failed to update seats"})),
             )
                 .into_response();
         }
@@ -1540,7 +1540,7 @@ pub(crate) async fn update_seats_handler(
                                 warn!(error = %e, invoice_id = %inv_id, "Failed to pay proration invoice");
                                 return (
                                     StatusCode::PAYMENT_REQUIRED,
-                                    Json(json!({"error": format!("Seat update succeeded but payment failed: {e}")})),
+                                    Json(json!({"error": "Seat update succeeded but payment failed"})),
                                 )
                                     .into_response();
                             }
@@ -1552,7 +1552,7 @@ pub(crate) async fn update_seats_handler(
                 warn!(error = %e, "Failed to list open invoices after seat update");
                 return (
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": format!("Seat update succeeded but could not retrieve invoice: {e}")})),
+                    Json(json!({"error": "Seat update succeeded but could not retrieve invoice"})),
                 )
                     .into_response();
             }
@@ -1671,7 +1671,7 @@ async fn tier_change_context(
             warn!(error = %e, "Failed to retrieve Stripe subscription");
             return Err((
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Failed to retrieve subscription from Stripe: {e}")})),
+                Json(json!({"error": "Failed to retrieve subscription from Stripe"})),
             )
                 .into_response());
         }
@@ -1872,7 +1872,7 @@ pub(crate) async fn preview_tier_change_handler(
                     warn!(error = %e, "Failed to create preview invoice");
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({"error": format!("Failed to preview tier change: {e}")})),
+                        Json(json!({"error": "Failed to preview tier change"})),
                     )
                         .into_response();
                 }
@@ -2019,7 +2019,7 @@ pub(crate) async fn change_tier_handler(
                     warn!(error = %e, "Failed to schedule subscription cancellation");
                     (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({"error": format!("Failed to cancel subscription: {e}")})),
+                        Json(json!({"error": "Failed to cancel subscription"})),
                     )
                         .into_response()
                 }
@@ -2085,7 +2085,7 @@ pub(crate) async fn change_tier_handler(
                     warn!(error = %e, "Failed to create subscription schedule for downgrade");
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({"error": format!("Failed to schedule downgrade: {e}")})),
+                        Json(json!({"error": "Failed to schedule downgrade"})),
                     )
                         .into_response();
                 }
@@ -2148,7 +2148,7 @@ pub(crate) async fn change_tier_handler(
                     warn!(error = %e, "Failed to update subscription schedule with new phase");
                     (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({"error": format!("Failed to schedule downgrade phase: {e}")})),
+                        Json(json!({"error": "Failed to schedule downgrade phase"})),
                     )
                         .into_response()
                 }
@@ -2185,7 +2185,7 @@ pub(crate) async fn change_tier_handler(
                 warn!(error = %e, "Failed to apply tier upgrade");
                 return (
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": format!("Failed to apply tier change: {e}")})),
+                    Json(json!({"error": "Failed to apply tier change"})),
                 )
                     .into_response();
             }
@@ -2219,7 +2219,7 @@ pub(crate) async fn change_tier_handler(
                                     return (
                                         StatusCode::PAYMENT_REQUIRED,
                                         Json(json!({
-                                            "error": format!("Tier change applied but payment failed: {e}")
+                                            "error": "Tier change applied but payment failed"
                                         })),
                                     )
                                         .into_response();
@@ -2395,7 +2395,7 @@ pub(crate) async fn list_invoices_handler(
             warn!(error = %e, "Failed to ensure Stripe customer for invoice listing");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Billing unavailable: {e}")})),
+                Json(json!({"error": "Billing unavailable"})),
             )
                 .into_response();
         }
@@ -2430,7 +2430,7 @@ pub(crate) async fn list_invoices_handler(
             warn!(error = %e, "Failed to list invoices");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to list invoices: {e}")})),
+                Json(json!({"error": "Failed to list invoices"})),
             )
                 .into_response()
         }
@@ -4841,5 +4841,80 @@ mod tests {
             assert_eq!(rebound.tenant_id, new_tenant);
             assert_eq!(rebound.stripe_customer_id, "cus_xyz");
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Regression tests — Finding 4.25 (security-audits/002 §4.25)
+//
+// Stripe SDK error strings must never be embedded in HTTP response bodies.
+// The fix scrubs every `Json(json!({"error": format!("...: {e}")}))` site to a
+// static literal. The test below is a source-grep gate against the file: any
+// future regression that interpolates `{e}` (or any other interpolation) into
+// the JSON `error` field will fail this test.
+// ──────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod stripe_error_leak_tests {
+    /// 4.25 regression: no HTTP error body in this handler interpolates the
+    /// raw error value (`{e}`) into the response JSON. SDK errors must be
+    /// logged at warn/error and replaced with a static public message.
+    #[test]
+    fn no_format_e_in_http_error_bodies() {
+        let src = include_str!("billing.rs");
+        // Walk the source and assert that no `Json(json!({"error": format!(`
+        // call contains a `{e}` interpolation. We allow `format!` for
+        // non-error fields (e.g. constructing identifiers) and we allow
+        // `format!` strings that DO NOT contain `{e}` (the two remaining
+        // sites at the time of writing interpolate static config inputs —
+        // tier name and billing interval — not SDK errors).
+        let needle = "Json(json!({\"error\": format!(";
+        let mut idx = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        while let Some(pos) = src[idx..].find(needle) {
+            let start = idx + pos;
+            // Take up to the next `)})),` to bound the call.
+            let tail = &src[start..];
+            let end = tail.find(")}))").unwrap_or(tail.len().min(400));
+            let snippet = &tail[..end];
+            if snippet.contains("{e}") || snippet.contains("{ e }") {
+                // Locate line number for the offender.
+                let line = src[..start].bytes().filter(|b| *b == b'\n').count() + 1;
+                offenders.push(format!("line {line}: {snippet}"));
+            }
+            idx = start + needle.len();
+        }
+        assert!(
+            offenders.is_empty(),
+            "Stripe SDK error leakage (Finding 4.25) — these sites still \
+             interpolate `{{e}}` into HTTP response bodies:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// 4.25 regression: no HTTP error body uses `Display` of an error type
+    /// via `{e}`/`{err}` even outside a `format!(` (catches multi-line
+    /// `json!({"error": format!(\n...\n)})` blocks).
+    #[test]
+    fn no_e_interpolation_in_json_error_bodies() {
+        let src = include_str!("billing.rs");
+        // Find every `"error": format!(` and look forward for `{e}`.
+        let needle = "\"error\": format!(";
+        let mut idx = 0usize;
+        let mut offenders: Vec<usize> = Vec::new();
+        while let Some(pos) = src[idx..].find(needle) {
+            let start = idx + pos;
+            let tail = &src[start..];
+            let end = tail.find("))").unwrap_or(tail.len().min(400));
+            let snippet = &tail[..end];
+            if snippet.contains("{e}") || snippet.contains("{ e }") {
+                let line = src[..start].bytes().filter(|b| *b == b'\n').count() + 1;
+                offenders.push(line);
+            }
+            idx = start + needle.len();
+        }
+        assert!(
+            offenders.is_empty(),
+            "Stripe SDK error leakage (Finding 4.25) at lines: {offenders:?}"
+        );
     }
 }
