@@ -1085,6 +1085,8 @@ mod tests {
             },
             false,
             None,
+            None,
+            None,
         );
 
         let credential = ResolvedCredential::SshKey {

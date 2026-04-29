@@ -199,6 +199,8 @@ fn test_binding(url: &str) -> GitRepoBinding {
         CloneStrategy::Libgit2,
         false,
         None,
+        None,
+        None,
     )
 }
 
@@ -389,6 +391,8 @@ async fn fetch_and_checkout_tag_pins_to_tag_commit() {
         CloneStrategy::Libgit2,
         false,
         None,
+        None,
+        None,
     );
 
     let tag_sha = executor
@@ -421,6 +425,8 @@ async fn fetch_and_checkout_commit_pins_to_exact_sha() {
         "fixture-commit".to_string(),
         CloneStrategy::Libgit2,
         false,
+        None,
+        None,
         None,
     );
     let pinned_sha = executor
@@ -478,6 +484,8 @@ async fn sparse_checkout_prunes_working_tree() {
         "sparse".to_string(),
         CloneStrategy::Libgit2,
         false,
+        None,
+        None,
         None,
     );
     executor

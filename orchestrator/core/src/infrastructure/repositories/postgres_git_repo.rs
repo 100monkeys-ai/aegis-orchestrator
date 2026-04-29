@@ -12,8 +12,14 @@
 //!                    git_ref_type, git_ref_value, sparse_paths, volume_id,
 //!                    label, status, status_error, clone_strategy,
 //!                    last_cloned_at, last_commit_sha, auto_refresh,
-//!                    webhook_secret, created_at, updated_at)
+//!                    webhook_secret_ciphertext, webhook_lookup_hash,
+//!                    created_at, updated_at)
 //! ```
+//!
+//! Audit 002 §4.37.13 — `webhook_secret` (cleartext) was replaced with the
+//! `webhook_secret_ciphertext` (OpenBao Transit ciphertext) +
+//! `webhook_lookup_hash` (deterministic SHA-256 lookup index) pair via
+//! migration 031.
 
 use crate::domain::credential::CredentialBindingId;
 use crate::domain::git_repo::{
@@ -164,9 +170,14 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> Result<GitRepoBinding, Reposi
     let auto_refresh: bool = row
         .try_get("auto_refresh")
         .map_err(|e| RepositoryError::Serialization(format!("auto_refresh: {e}")))?;
-    let webhook_secret: Option<String> = row
-        .try_get("webhook_secret")
-        .map_err(|e| RepositoryError::Serialization(format!("webhook_secret: {e}")))?;
+    // Audit 002 §4.37.13 — store the Transit ciphertext + lookup hash
+    // pair instead of the cleartext webhook secret.
+    let webhook_secret_ciphertext: Option<String> = row
+        .try_get("webhook_secret_ciphertext")
+        .map_err(|e| RepositoryError::Serialization(format!("webhook_secret_ciphertext: {e}")))?;
+    let webhook_lookup_hash: Option<String> = row
+        .try_get("webhook_lookup_hash")
+        .map_err(|e| RepositoryError::Serialization(format!("webhook_lookup_hash: {e}")))?;
     let created_at: DateTime<Utc> = row
         .try_get("created_at")
         .map_err(|e| RepositoryError::Serialization(format!("created_at: {e}")))?;
@@ -199,7 +210,12 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> Result<GitRepoBinding, Reposi
         last_cloned_at,
         last_commit_sha,
         auto_refresh,
-        webhook_secret,
+        // Audit 002 §4.37.13 — cleartext is transient, never persisted.
+        // Hydrate as None; the application service decrypts the
+        // ciphertext on demand at verify time.
+        webhook_secret: None,
+        webhook_secret_ciphertext,
+        webhook_lookup_hash,
         created_at,
         updated_at,
         domain_events: Vec::new(),
@@ -229,27 +245,29 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
                 id, tenant_id, credential_binding_id, repo_url,
                 git_ref_type, git_ref_value, sparse_paths, volume_id,
                 label, status, status_error, clone_strategy,
-                last_cloned_at, last_commit_sha, auto_refresh, webhook_secret,
+                last_cloned_at, last_commit_sha, auto_refresh,
+                webhook_secret_ciphertext, webhook_lookup_hash,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             ON CONFLICT (id) DO UPDATE SET
-                tenant_id             = EXCLUDED.tenant_id,
-                credential_binding_id = EXCLUDED.credential_binding_id,
-                repo_url              = EXCLUDED.repo_url,
-                git_ref_type          = EXCLUDED.git_ref_type,
-                git_ref_value         = EXCLUDED.git_ref_value,
-                sparse_paths          = EXCLUDED.sparse_paths,
-                volume_id             = EXCLUDED.volume_id,
-                label                 = EXCLUDED.label,
-                status                = EXCLUDED.status,
-                status_error          = EXCLUDED.status_error,
-                clone_strategy        = EXCLUDED.clone_strategy,
-                last_cloned_at        = EXCLUDED.last_cloned_at,
-                last_commit_sha       = EXCLUDED.last_commit_sha,
-                auto_refresh          = EXCLUDED.auto_refresh,
-                webhook_secret        = EXCLUDED.webhook_secret,
-                updated_at            = EXCLUDED.updated_at
+                tenant_id                  = EXCLUDED.tenant_id,
+                credential_binding_id      = EXCLUDED.credential_binding_id,
+                repo_url                   = EXCLUDED.repo_url,
+                git_ref_type               = EXCLUDED.git_ref_type,
+                git_ref_value              = EXCLUDED.git_ref_value,
+                sparse_paths               = EXCLUDED.sparse_paths,
+                volume_id                  = EXCLUDED.volume_id,
+                label                      = EXCLUDED.label,
+                status                     = EXCLUDED.status,
+                status_error               = EXCLUDED.status_error,
+                clone_strategy             = EXCLUDED.clone_strategy,
+                last_cloned_at             = EXCLUDED.last_cloned_at,
+                last_commit_sha            = EXCLUDED.last_commit_sha,
+                auto_refresh               = EXCLUDED.auto_refresh,
+                webhook_secret_ciphertext  = EXCLUDED.webhook_secret_ciphertext,
+                webhook_lookup_hash        = EXCLUDED.webhook_lookup_hash,
+                updated_at                 = EXCLUDED.updated_at
             "#,
         )
         .bind(binding.id.0)
@@ -267,7 +285,9 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
         .bind(binding.last_cloned_at)
         .bind(binding.last_commit_sha.as_deref())
         .bind(binding.auto_refresh)
-        .bind(binding.webhook_secret.as_deref())
+        // Audit 002 §4.37.13 — persist the encrypted/hashed pair.
+        .bind(binding.webhook_secret_ciphertext.as_deref())
+        .bind(binding.webhook_lookup_hash.as_deref())
         .bind(binding.created_at)
         .bind(binding.updated_at)
         .execute(&self.pool)
@@ -347,17 +367,19 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
         }
     }
 
-    async fn find_by_webhook_secret(
+    async fn find_by_webhook_lookup_hash(
         &self,
-        secret: &str,
+        hash: &str,
     ) -> Result<Option<GitRepoBinding>, RepositoryError> {
-        let row = sqlx::query("SELECT * FROM git_repo_bindings WHERE webhook_secret = $1")
-            .bind(secret)
+        // Audit 002 §4.37.13 — query by deterministic HMAC hash, never by
+        // cleartext secret. The cleartext is no longer stored.
+        let row = sqlx::query("SELECT * FROM git_repo_bindings WHERE webhook_lookup_hash = $1")
+            .bind(hash)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| {
                 RepositoryError::Database(format!(
-                    "Failed to look up git_repo_binding by webhook_secret: {e}"
+                    "Failed to look up git_repo_binding by webhook_lookup_hash: {e}"
                 ))
             })?;
 

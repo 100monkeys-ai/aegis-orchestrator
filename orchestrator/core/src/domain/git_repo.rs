@@ -234,7 +234,26 @@ pub struct GitRepoBinding {
     pub last_cloned_at: Option<DateTime<Utc>>,
     pub last_commit_sha: Option<String>,
     pub auto_refresh: bool,
+    /// Audit 002 §4.37.13 — cleartext webhook secret. **Transient** — not
+    /// stored in the database. The aggregate carries the cleartext only
+    /// during in-memory operations: at create time so the application
+    /// service can return it to the caller, and at verify time after the
+    /// service has decrypted `webhook_secret_ciphertext` via Transit.
+    /// Persistence ignores this field; the repository hydrates it as
+    /// `None` on every read and the application service decrypts on
+    /// demand when verifying webhook deliveries.
     pub webhook_secret: Option<String>,
+    /// Audit 002 §4.37.13 — Transit ciphertext of the cleartext webhook
+    /// secret. Persisted at rest under
+    /// `git_repo_bindings.webhook_secret_ciphertext`. Decrypted via
+    /// `SecretsManager::decrypt` on every webhook verification call.
+    pub webhook_secret_ciphertext: Option<String>,
+    /// Audit 002 §4.37.13 — deterministic HMAC-SHA256 of the cleartext
+    /// webhook secret used as a lookup index. Replaces the previous
+    /// `webhook_secret = $1` query path. The hash is irreversible
+    /// without the HMAC key, so DB-only access cannot recover the
+    /// cleartext. Stored under `git_repo_bindings.webhook_lookup_hash`.
+    pub webhook_lookup_hash: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Event buffer. Drained by [`take_events`](Self::take_events) at the
@@ -259,7 +278,13 @@ impl GitRepoBinding {
         label: String,
         clone_strategy: CloneStrategy,
         auto_refresh: bool,
+        // Audit 002 §4.37.13 — the constructor receives the cleartext
+        // (transient — returned to the caller for git-provider setup,
+        // never persisted) plus the encrypted/hashed pair (persisted at
+        // rest in place of the cleartext).
         webhook_secret: Option<String>,
+        webhook_secret_ciphertext: Option<String>,
+        webhook_lookup_hash: Option<String>,
     ) -> Self {
         let id = GitRepoBindingId::new();
         let now = Utc::now();
@@ -278,6 +303,8 @@ impl GitRepoBinding {
             last_commit_sha: None,
             auto_refresh,
             webhook_secret,
+            webhook_secret_ciphertext,
+            webhook_lookup_hash,
             created_at: now,
             updated_at: now,
             domain_events: Vec::new(),
@@ -441,13 +468,19 @@ pub trait GitRepoBindingRepository: Send + Sync {
         volume_id: &VolumeId,
     ) -> Result<Option<GitRepoBinding>, RepositoryError>;
 
-    /// Lookup a binding by its `webhook_secret` path parameter.
+    /// Lookup a binding by the deterministic HMAC-SHA256 hash of its
+    /// webhook secret (Audit 002 §4.37.13). Replaces the previous
+    /// `find_by_webhook_secret(cleartext)` query.
     ///
-    /// Used by the unauthenticated webhook endpoint to route an inbound push
-    /// event to its binding before validating the HMAC signature.
-    async fn find_by_webhook_secret(
+    /// Used by the unauthenticated webhook endpoint to route an inbound
+    /// push event to its binding before validating the HMAC signature.
+    /// The hash is computed by the application layer from the URL path
+    /// parameter using the same fixed key the binding was registered
+    /// with; an attacker with DB-only access cannot reverse the hash to
+    /// recover the cleartext.
+    async fn find_by_webhook_lookup_hash(
         &self,
-        secret: &str,
+        hash: &str,
     ) -> Result<Option<GitRepoBinding>, RepositoryError>;
 
     /// Count the number of bindings owned by `owner` within `tenant_id`.
@@ -555,6 +588,8 @@ mod tests {
             "hello-world".to_string(),
             CloneStrategy::Libgit2,
             false,
+            None,
+            None,
             None,
         )
     }

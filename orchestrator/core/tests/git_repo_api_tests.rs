@@ -100,16 +100,16 @@ impl GitRepoBindingRepository for InMemoryGitRepoBindingRepository {
     ) -> Result<Option<GitRepoBinding>, RepositoryError> {
         Ok(None)
     }
-    async fn find_by_webhook_secret(
+    async fn find_by_webhook_lookup_hash(
         &self,
-        secret: &str,
+        hash: &str,
     ) -> Result<Option<GitRepoBinding>, RepositoryError> {
         Ok(self
             .bindings
             .read()
             .unwrap()
             .values()
-            .find(|b| b.webhook_secret.as_deref() == Some(secret))
+            .find(|b| b.webhook_lookup_hash.as_deref() == Some(hash))
             .cloned())
     }
     async fn count_by_owner(

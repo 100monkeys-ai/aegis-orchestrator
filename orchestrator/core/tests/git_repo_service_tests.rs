@@ -96,16 +96,16 @@ impl GitRepoBindingRepository for InMemoryGitRepoBindingRepository {
             .find(|b| &b.volume_id == volume_id)
             .cloned())
     }
-    async fn find_by_webhook_secret(
+    async fn find_by_webhook_lookup_hash(
         &self,
-        secret: &str,
+        hash: &str,
     ) -> Result<Option<GitRepoBinding>, RepositoryError> {
         Ok(self
             .bindings
             .read()
             .unwrap()
             .values()
-            .find(|b| b.webhook_secret.as_deref() == Some(secret))
+            .find(|b| b.webhook_lookup_hash.as_deref() == Some(hash))
             .cloned())
     }
     async fn count_by_owner(
@@ -727,4 +727,120 @@ async fn handle_webhook_accepts_valid_github_signature() {
         }
         Err(other) => panic!("unexpected error variant: {other:?}"),
     }
+}
+
+/// Audit 002 §4.37.13 regression — `git_repo_bindings.webhook_secret` was
+/// stored as cleartext, exposing every binding to a single DB-only
+/// compromise. After the fix:
+///
+/// 1. The persisted aggregate carries `webhook_secret_ciphertext` (Transit
+///    ciphertext) and `webhook_lookup_hash` (deterministic SHA-256 of the
+///    cleartext) — never the cleartext itself.
+/// 2. The cleartext is returned to the caller in-memory (so the user can
+///    configure their git provider) but a re-load from the repository
+///    surfaces `webhook_secret == None`.
+/// 3. The webhook verification path uses the lookup hash to find the
+///    binding and the ciphertext (decrypted on demand) to recompute HMAC.
+#[tokio::test]
+async fn webhook_secret_is_persisted_as_ciphertext_plus_lookup_hash_only() {
+    let fx = build_fixture();
+    let t = TenantId::consumer();
+
+    let binding = fx
+        .service
+        .create_binding(CreateGitRepoCommand {
+            tenant_id: t.clone(),
+            owner: "alice".to_string(),
+            zaru_tier: ZaruTier::Pro,
+            credential_binding_id: None,
+            repo_url: "https://github.com/a/audit13.git".to_string(),
+            git_ref: Default::default(),
+            sparse_paths: None,
+            label: "audit13".to_string(),
+            auto_refresh: true,
+            shallow: true,
+        })
+        .await
+        .unwrap();
+
+    // Cleartext is returned to the caller (so they can configure the
+    // webhook in their git provider).
+    let cleartext = binding
+        .webhook_secret
+        .clone()
+        .expect("auto_refresh → cleartext returned to caller");
+
+    // Persistent state carries the ciphertext + hash, NOT the cleartext.
+    assert!(
+        binding.webhook_secret_ciphertext.is_some(),
+        "ciphertext column must be populated when auto_refresh is on"
+    );
+    assert!(
+        binding.webhook_lookup_hash.is_some(),
+        "lookup-hash column must be populated when auto_refresh is on"
+    );
+    assert_ne!(
+        binding.webhook_secret_ciphertext.as_deref(),
+        Some(cleartext.as_str()),
+        "ciphertext MUST differ from cleartext — the audit fix is moot otherwise"
+    );
+    assert_ne!(
+        binding.webhook_lookup_hash.as_deref(),
+        Some(cleartext.as_str()),
+        "lookup hash MUST differ from cleartext (it is a SHA-256 digest)"
+    );
+
+    // Re-load from the repository (via the service): cleartext field is wiped.
+    let reloaded = fx
+        .service
+        .get_binding(&binding.id, &t, "alice")
+        .await
+        .expect("binding persisted");
+    assert!(
+        reloaded.webhook_secret.is_none(),
+        "DB hydration MUST NOT carry the cleartext — it is a transient field, \
+         wiped on reload to enforce the at-rest contract"
+    );
+    assert!(
+        reloaded.webhook_secret_ciphertext.is_some(),
+        "ciphertext survives reload"
+    );
+    assert!(
+        reloaded.webhook_lookup_hash.is_some(),
+        "lookup hash survives reload"
+    );
+
+    // Webhook verification still works end-to-end: the URL header carries
+    // the cleartext, the service hashes it to find the binding, decrypts
+    // to recover the cleartext, and validates HMAC.
+    use aegis_orchestrator_core::application::git_repo_service::{WebhookAuth, WebhookProvider};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let body = b"audit-13-payload";
+    let mut mac = Hmac::<Sha256>::new_from_slice(cleartext.as_bytes()).unwrap();
+    mac.update(body);
+    let sig_hex = hex::encode(mac.finalize().into_bytes());
+    let auth = WebhookAuth {
+        provider: WebhookProvider::GitHub,
+        signature: format!("sha256={sig_hex}"),
+    };
+    let res = fx.service.handle_webhook(&cleartext, &auth, body).await;
+    // Authentication MUST pass; the binding has no working tree yet so
+    // the refresh side may fail — that's not the concern of this test.
+    assert!(
+        !matches!(res, Err(GitRepoError::WebhookRejected(_))),
+        "valid signature MUST NOT be rejected after the encrypt-at-rest \
+         migration; got {res:?}"
+    );
+
+    // A bogus secret (not registered) MUST be rejected — the lookup
+    // hash will not match any binding.
+    let res_bogus = fx
+        .service
+        .handle_webhook("000000000000000000000000bogus000", &auth, body)
+        .await;
+    assert!(
+        matches!(res_bogus, Err(GitRepoError::WebhookRejected(_))),
+        "unknown secret MUST be rejected by lookup-hash miss; got {res_bogus:?}"
+    );
 }

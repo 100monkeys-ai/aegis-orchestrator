@@ -71,6 +71,25 @@ use crate::infrastructure::secrets_manager::SecretsManager;
 /// [`UserVolumeService`].
 const DEFAULT_CLONE_VOLUME_BYTES: u64 = 500 * 1024 * 1024;
 
+/// Audit 002 §4.37.13 — name of the OpenBao Transit key used to encrypt
+/// webhook secrets at rest. The orchestrator pre-provisions this key at
+/// startup; rotation is a Transit `rotate` operation that does not
+/// invalidate ciphertexts encrypted with prior key versions.
+const WEBHOOK_TRANSIT_KEY: &str = "webhook-secret";
+
+/// Audit 002 §4.37.13 — compute the deterministic lookup hash that
+/// replaces the previous `webhook_secret = $1` query path.
+///
+/// The cleartext is a `uuid::Uuid::new_v4().simple()` string (128 bits of
+/// entropy), so a SHA-256 digest is computationally infeasible to
+/// brute-force from DB-only access. We hex-encode the digest so the
+/// lookup column type stays a plain `TEXT`.
+fn compute_webhook_lookup_hash(cleartext: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(cleartext.as_bytes());
+    hex::encode(digest)
+}
+
 /// Request to create a new [`GitRepoBinding`].
 ///
 /// Bundles all create-path inputs into a single struct so the service
@@ -294,12 +313,32 @@ impl GitRepoService {
             .await?;
 
         // Generate a webhook secret whenever auto_refresh is requested.
-        // The secret doubles as the URL path parameter and as the HMAC
-        // key for GitLab-style header-token verification.
-        let webhook_secret = if cmd.auto_refresh {
-            Some(uuid::Uuid::new_v4().simple().to_string())
+        // The secret doubles as the `X-Aegis-Webhook-Secret` header value
+        // routing the inbound event to its binding and as the HMAC key
+        // for GitLab-style header-token verification.
+        //
+        // Audit 002 §4.37.13 — the cleartext is returned to the caller
+        // (so they can configure the webhook in their git provider) but
+        // is **never** persisted in plaintext. Encrypt the cleartext via
+        // OpenBao Transit for at-rest storage, and persist a SHA-256
+        // hash as a deterministic lookup index. The cleartext is
+        // 128-bit random, so brute-forcing the hash from DB-only access
+        // is computationally infeasible.
+        let (webhook_secret, webhook_secret_ciphertext, webhook_lookup_hash) = if cmd.auto_refresh {
+            let cleartext = uuid::Uuid::new_v4().simple().to_string();
+            let ciphertext = self
+                .secret_manager
+                .encrypt(WEBHOOK_TRANSIT_KEY, cleartext.as_bytes())
+                .await
+                .map_err(|e| {
+                    GitRepoError::SecretResolutionFailed(format!(
+                        "transit-encrypt webhook secret: {e}"
+                    ))
+                })?;
+            let hash = compute_webhook_lookup_hash(&cleartext);
+            (Some(cleartext), Some(ciphertext), Some(hash))
         } else {
-            None
+            (None, None, None)
         };
 
         // Pick a clone strategy based on the backing volume's backend.
@@ -327,6 +366,8 @@ impl GitRepoService {
             provisional_strategy,
             cmd.auto_refresh,
             webhook_secret,
+            webhook_secret_ciphertext,
+            webhook_lookup_hash,
         );
 
         self.repo.save(&binding).await?;
@@ -762,27 +803,41 @@ impl GitRepoService {
     ) -> Result<(), GitRepoError> {
         use subtle::ConstantTimeEq;
 
+        // Audit 002 §4.37.13 — the binding is no longer indexed by
+        // cleartext secret. Compute the deterministic lookup hash and
+        // query by that. The DB row carries only the ciphertext + hash;
+        // the cleartext is decrypted on demand via Transit below.
+        let lookup_hash = compute_webhook_lookup_hash(secret);
         let mut binding = self
             .repo
-            .find_by_webhook_secret(secret)
+            .find_by_webhook_lookup_hash(&lookup_hash)
             .await?
             .ok_or_else(|| GitRepoError::WebhookRejected("unknown webhook secret".into()))?;
 
-        let Some(stored_secret) = binding.webhook_secret.as_ref() else {
+        let Some(ciphertext) = binding.webhook_secret_ciphertext.as_ref() else {
             return Err(GitRepoError::WebhookRejected(
                 "binding has no webhook secret configured".into(),
             ));
         };
 
-        // Audit 002 §4.13: defense in depth — re-confirm the lookup
-        // result with a constant-time compare so any partial-match
-        // edge case in the underlying repository implementation cannot
-        // leak per-byte timing through the response path.
+        // Decrypt the stored ciphertext via Transit. The cleartext is
+        // pulled into a local `Vec<u8>` only for the lifetime of the
+        // verification call.
+        let stored_secret_bytes = self
+            .secret_manager
+            .decrypt(WEBHOOK_TRANSIT_KEY, ciphertext)
+            .await
+            .map_err(|e| {
+                GitRepoError::WebhookRejected(format!("transit-decrypt webhook secret: {e}"))
+            })?;
+
+        // Audit 002 §4.13: defense in depth — constant-time compare the
+        // presented header value against the decrypted stored value so
+        // a hash collision (or future repository drift) cannot leak
+        // per-byte timing through the response path.
         let presented = secret.as_bytes();
-        let stored = stored_secret.as_bytes();
+        let stored = stored_secret_bytes.as_slice();
         let length_match = (presented.len() == stored.len()) as u8;
-        // Mask to a stable length so `ct_eq` runs identically every
-        // call regardless of whether the lengths actually match.
         let lhs = if length_match == 1 { presented } else { stored };
         if (lhs.ct_eq(stored).unwrap_u8() & length_match) != 1 {
             return Err(GitRepoError::WebhookRejected(
@@ -790,7 +845,7 @@ impl GitRepoService {
             ));
         }
 
-        if !verify_webhook(auth, payload, stored_secret.as_bytes()) {
+        if !verify_webhook(auth, payload, stored) {
             return Err(GitRepoError::WebhookRejected(
                 "hmac signature verification failed".into(),
             ));

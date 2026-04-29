@@ -161,16 +161,16 @@ impl GitRepoBindingRepository for InMemoryGitRepoRepo {
             .cloned())
     }
 
-    async fn find_by_webhook_secret(
+    async fn find_by_webhook_lookup_hash(
         &self,
-        secret: &str,
+        hash: &str,
     ) -> Result<Option<GitRepoBinding>, RepositoryError> {
         Ok(self
             .bindings
             .read()
             .unwrap()
             .values()
-            .find(|b| b.webhook_secret.as_deref() == Some(secret))
+            .find(|b| b.webhook_lookup_hash.as_deref() == Some(hash))
             .cloned())
     }
 
@@ -386,6 +386,8 @@ fn ready_git_binding(tenant: TenantId) -> GitRepoBinding {
         CloneStrategy::Libgit2,
         false,
         None,
+        None,
+        None,
     );
     let _ = binding.take_events();
     binding.start_clone();
@@ -468,6 +470,8 @@ async fn create_session_git_linked_rejects_non_ready_binding() {
         "hello-world".to_string(),
         CloneStrategy::Libgit2,
         false,
+        None,
+        None,
         None,
     );
     let _ = binding.take_events();

@@ -206,7 +206,9 @@ fn redacted_binding(b: &GitRepoBinding) -> serde_json::Value {
         "last_cloned_at": b.last_cloned_at,
         "last_commit_sha": b.last_commit_sha,
         "auto_refresh": b.auto_refresh,
-        "webhook_secret_set": b.webhook_secret.is_some(),
+        // Audit 002 §4.37.13 — `webhook_secret` is transient (cleartext is
+        // never stored). Probe the persisted ciphertext column instead.
+        "webhook_secret_set": b.webhook_secret_ciphertext.is_some(),
         "created_at": b.created_at,
         "updated_at": b.updated_at,
     })

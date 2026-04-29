@@ -34,6 +34,8 @@ fn make_binding() -> GitRepoBinding {
         CloneStrategy::Libgit2,
         false,
         None,
+        None,
+        None,
     )
 }
 

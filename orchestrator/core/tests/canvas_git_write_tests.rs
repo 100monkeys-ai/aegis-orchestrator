@@ -104,9 +104,9 @@ impl GitRepoBindingRepository for InMemoryGitRepoBindingRepository {
             .find(|b| &b.volume_id == volume_id)
             .cloned())
     }
-    async fn find_by_webhook_secret(
+    async fn find_by_webhook_lookup_hash(
         &self,
-        _secret: &str,
+        _hash: &str,
     ) -> Result<Option<GitRepoBinding>, RepositoryError> {
         Ok(None)
     }
