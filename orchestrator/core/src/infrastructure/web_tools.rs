@@ -23,6 +23,19 @@ const BRAVE_MAX_ATTEMPTS: u32 = 3;
 /// before retry `n` (1-indexed) is `BRAVE_RETRY_BACKOFF_MS * 2^(n-1)`.
 const BRAVE_RETRY_BACKOFF_MS: u64 = 250;
 
+/// Computes the exponential backoff delay (in milliseconds) before the next
+/// Brave Search retry given the just-completed `attempt` (1-indexed).
+///
+/// Uses `saturating_pow` and `saturating_mul` so that an overly large
+/// `attempt` value can never overflow — the result simply saturates at
+/// `u64::MAX` rather than wrapping or panicking. A bit-shift `1u64 << N`
+/// would be undefined behaviour for `N >= 64`; this form is safe for any
+/// `u32` input.
+pub(super) fn brave_retry_backoff_ms(attempt: u32) -> u64 {
+    let exp = 2u64.saturating_pow(attempt.saturating_sub(1));
+    BRAVE_RETRY_BACKOFF_MS.saturating_mul(exp)
+}
+
 pub struct ReqwestWebToolAdapter {
     api_key: Option<String>,
     brave_base_url: String,
@@ -134,7 +147,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
             }
 
             if attempt < BRAVE_MAX_ATTEMPTS {
-                let backoff = BRAVE_RETRY_BACKOFF_MS.saturating_mul(1u64 << (attempt - 1));
+                let backoff = brave_retry_backoff_ms(attempt);
                 warn!(
                     attempt,
                     backoff_ms = backoff,
@@ -268,6 +281,37 @@ async fn perform_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test: prior implementation used `1u64 << (attempt - 1)`,
+    /// which is undefined behaviour for `attempt - 1 >= 64` and would also
+    /// underflow at `attempt == 0`. The current implementation must
+    /// saturate gracefully at the upper edge and never panic for any
+    /// `u32` input, including 0 and the full 64+ range.
+    #[test]
+    fn test_brave_retry_backoff_ms_does_not_overflow() {
+        // attempt = 1 → base * 2^0 = base
+        assert_eq!(brave_retry_backoff_ms(1), BRAVE_RETRY_BACKOFF_MS);
+        // attempt = 2 → base * 2
+        assert_eq!(brave_retry_backoff_ms(2), BRAVE_RETRY_BACKOFF_MS * 2);
+        // attempt = 3 → base * 4
+        assert_eq!(brave_retry_backoff_ms(3), BRAVE_RETRY_BACKOFF_MS * 4);
+
+        // attempt = 0 must not panic from underflow on `attempt - 1`.
+        // saturating_sub yields 0, so 2^0 = 1, returning the base value.
+        assert_eq!(brave_retry_backoff_ms(0), BRAVE_RETRY_BACKOFF_MS);
+
+        // Exercise the full 0..=64 range. The original `1u64 << N` form
+        // is UB at N >= 64; this loop must complete without panicking
+        // for every value.
+        for attempt in 0u32..=64 {
+            let _ = brave_retry_backoff_ms(attempt);
+        }
+
+        // At attempt = 64, 2^63 multiplied by 250 saturates to u64::MAX.
+        assert_eq!(brave_retry_backoff_ms(64), u64::MAX);
+        // And well beyond u32::MAX-style edges, still saturated.
+        assert_eq!(brave_retry_backoff_ms(u32::MAX), u64::MAX);
+    }
 
     #[tokio::test]
     async fn test_search_without_api_key_returns_error_not_empty_results() {
