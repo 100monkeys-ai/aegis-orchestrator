@@ -128,6 +128,16 @@ pub enum SealSessionError {
         authenticated: String,
         requested: String,
     },
+    /// An upstream service used by a built-in tool (e.g. Brave Search,
+    /// remote HTTP fetch) returned a transient failure such as HTTP 429
+    /// Too Many Requests, 5xx, transport error, or unparseable response.
+    ///
+    /// This variant exists so that transient external-service failures are
+    /// **never** conflated with SEAL signature verification failures. It is
+    /// classified as `Recoverable` by the inner-loop error classifier so
+    /// the LLM receives the error as a normal tool-call failure and can
+    /// adapt (per ADR-005 iterative refinement).
+    UpstreamUnavailable(String),
 }
 
 impl std::fmt::Display for SealSessionError {
@@ -153,6 +163,9 @@ impl std::fmt::Display for SealSessionError {
                 f,
                 "Tenant mismatch: caller is authenticated as tenant '{authenticated}' but requested operation on tenant '{requested}'"
             ),
+            Self::UpstreamUnavailable(msg) => {
+                write!(f, "Upstream service unavailable: {msg}")
+            }
         }
     }
 }
