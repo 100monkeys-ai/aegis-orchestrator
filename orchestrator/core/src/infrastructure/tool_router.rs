@@ -136,163 +136,138 @@ pub struct ToolRouter {
     builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
 }
 
-/// Read-only / low-risk tools that bypass the inner-loop semantic judge.
+/// Canonical structured definition of one builtin tool dispatcher.
 ///
-/// This constant is consumed by `builtin_dispatchers()` to populate
-/// `BuiltinDispatcherConfig.skip_judge` for the corresponding builtin tools.
+/// Every tool name, description, and per-tool behavior flag (`skip_judge`,
+/// `edge_executor`, `fleet_capable`) lives in a single row of
+/// `BUILTIN_TOOL_DEFINITIONS`. Consumers derive their behavior from this
+/// registry — there is no secondary list to keep in sync.
 ///
-/// Manifest deployment tools (aegis.agent.create, aegis.agent.update, aegis.agent.delete,
-/// aegis.workflow.create, aegis.workflow.update) are included here because they accept a
-/// `manifest_yaml` payload that may contain tool names such as `cmd.run` or `fs.*` as part
-/// of the manifest's `spec.tools` array.  The tool-call-policy-judge evaluates tool usage
-/// semantics (is the agent misusing cmd.run instead of fs.* for filesystem inspection?), but
-/// manifest deployment tools are not execution tools — they carry a YAML document describing
-/// an agent, not a command to run.  Passing their payload through the policy judge causes
-/// hallucinated violations because the judge reads `cmd.run` in the text and incorrectly
-/// infers a policy breach.  Skipping the judge here is correct: these are registry-write
-/// operations, not inner-loop execution actions, and they have their own structural
-/// validation via aegis.schema.validate before they ever reach this point.
-const SKIP_JUDGE_TOOLS: &[&str] = &[
-    "fs.read",
-    "fs.list",
-    "fs.grep",
-    "fs.glob",
-    "web.search",
-    "web.fetch",
-    "aegis.schema.get",
-    "aegis.schema.validate",
-    // Manifest deployment tools — payload contains YAML with tool names; policy judge
-    // must not evaluate manifest content as if it were an execution tool invocation.
-    "aegis.agent.create",
-    "aegis.agent.update",
-    "aegis.agent.delete",
-    "aegis.workflow.create",
-    "aegis.workflow.update",
-    "aegis.workflow.list",
-    "aegis.workflow.export",
-    "aegis.workflow.validate",
-    "aegis.workflow.status",
-    "aegis.workflow.logs",
-    "aegis.workflow.executions.list",
-    "aegis.workflow.executions.get",
-    "aegis.workflow.wait",
-    "aegis.workflow.cancel",
-    "aegis.workflow.signal",
-    "aegis.workflow.remove",
-    "aegis.workflow.search",
-    "aegis.agent.list",
-    "aegis.agent.export",
-    "aegis.agent.logs",
-    "aegis.agent.search",
-    "aegis.task.status",
-    "aegis.task.list",
-    "aegis.task.logs",
-    "aegis.task.wait",
-    "aegis.agent.wait",
-    "aegis.execute.status",
-    "aegis.execute.wait",
-    "aegis.tools.list",
-    "aegis.tools.search",
-    "aegis.system.info",
-    "aegis.system.config",
-    "aegis.runtime.list",
-    "aegis.execution.file",
-    "aegis.attachment.read",
-    // ADR-117: edge fleet system tools.
-    "aegis.edge.fleet.list",
-    "aegis.edge.fleet.invoke",
-    "aegis.edge.fleet.cancel",
-];
-
-/// ADR-117: builtin tool names that advertise `executor == "edge"`. These are
-/// the system-tier fleet operations whose canonical execution target is the
-/// edge daemon (or fan-out across many daemons), not the local builtin /
-/// MCP / SEAL chain.
-const EDGE_EXECUTOR_TOOLS: &[&str] = &[
-    "aegis.edge.fleet.list",
-    "aegis.edge.fleet.invoke",
-    "aegis.edge.fleet.cancel",
-];
-
-/// ADR-117: builtin tool names that are eligible for fleet (multi-target) fan
-/// out via `aegis.edge.fleet.invoke`. Currently only `aegis.edge.fleet.invoke`
-/// itself; the list and cancel siblings are operator-tier coordination tools
-/// that do not themselves fan out further.
-const FLEET_CAPABLE_TOOLS: &[&str] = &["aegis.edge.fleet.invoke"];
-
-/// Canonical registry of all builtin tool dispatchers.
+/// `skip_judge`: read-only / low-risk tools (and manifest deployment tools
+/// whose YAML payload would be misread by the tool-call-policy-judge) bypass
+/// the inner-loop semantic judge. Manifest deployment tools (aegis.agent.*
+/// create/update/delete, aegis.workflow.* create/update) are included
+/// because they accept a `manifest_yaml` payload that may textually contain
+/// tool names such as `cmd.run` or `fs.*` as part of `spec.tools`. The judge
+/// would hallucinate violations from that text; skipping it is correct
+/// because these are registry-write operations with their own structural
+/// validation via aegis.schema.validate before they reach this point.
 ///
-/// Every tool name and its description live here. The daemon startup and
-/// all other consumers derive their dispatcher list from this function —
-/// no second list to keep in sync.
-const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
-    ("cmd.run", "Executes a shell command inside the agent's ephemeral container environment. Use this to build, run, or analyze code locally."),
-    ("fs.read", "Read the contents of a file at the given POSIX path from the mounted Workspace volume."),
-    ("fs.write", "Write content to a file at the given POSIX path in the Workspace volume. Automatically creates missing parent directories."),
-    ("fs.list", "List the contents of a directory in the Workspace volume."),
-    ("fs.create_dir", "Creates a new directory along with any necessary parent directories."),
-    ("fs.delete", "Deletes a file or directory."),
-    ("fs.edit", "Performs an exact string replacement in a file."),
-    ("fs.multi_edit", "Performs multiple sequential string replacements in a file."),
-    ("fs.grep", "Recursively searches for a regex pattern within files in a given directory."),
-    ("fs.glob", "Recursively matches files against a glob pattern."),
-    ("web.search", "Performs an internet search query."),
-    ("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown."),
-    ("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow)."),
-    ("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema."),
-    ("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry."),
-    ("aegis.agent.list", "Lists currently deployed agents and metadata."),
-    ("aegis.agent.update", "Updates an existing Agent manifest in the registry."),
-    ("aegis.agent.export", "Exports an Agent manifest by name."),
-    ("aegis.agent.delete", "Removes a deployed agent from the registry by UUID."),
-    ("aegis.agent.generate", "Generates an Agent manifest from a natural-language intent."),
-    ("aegis.agent.logs", "Retrieve agent-level activity log snapshot."),
-    ("aegis.agent.search", "Semantic search over deployed agents by natural-language query."),
-    ("aegis.workflow.create", "Performs strict deterministic and semantic workflow validation, then registers on pass."),
-    ("aegis.workflow.list", "Lists currently registered workflows and metadata."),
-    ("aegis.workflow.validate", "Validate a workflow manifest against the schema."),
-    ("aegis.workflow.update", "Updates an existing Workflow manifest in the registry."),
-    ("aegis.workflow.export", "Exports a Workflow manifest by name."),
-    ("aegis.workflow.delete", "Removes a registered workflow from the registry by workflow name (not UUID)."),
-    ("aegis.workflow.run", "Executes a registered workflow by name with optional input parameters."),
-    ("aegis.workflow.generate", "Generates a Workflow manifest from a natural-language objective."),
-    ("aegis.workflow.logs", "Returns paginated workflow execution events."),
-    ("aegis.workflow.wait", "Polls a workflow execution until it reaches a terminal state and returns the result."),
-    ("aegis.workflow.cancel", "Cancel a running workflow execution."),
-    ("aegis.workflow.signal", "Send human input response to a paused workflow execution."),
-    ("aegis.workflow.remove", "Remove a workflow execution record."),
-    ("aegis.workflow.promote", "Promote a workflow from user scope to tenant scope."),
-    ("aegis.workflow.demote", "Demote a workflow from tenant scope to user scope."),
-    ("aegis.workflow.executions.list", "Lists workflow executions, optionally filtered."),
-    ("aegis.workflow.executions.get", "Returns details of a specific workflow execution."),
-    ("aegis.workflow.status", "Returns current status of a workflow execution."),
-    ("aegis.workflow.search", "Semantic search over registered workflows."),
-    ("aegis.task.execute", "Starts a new agent execution (task) by agent UUID or name."),
-    ("aegis.task.status", "Returns the current status and output of an execution by UUID."),
-    ("aegis.task.list", "Lists recent executions, optionally filtered by agent."),
-    ("aegis.task.cancel", "Cancels an active agent execution by UUID."),
-    ("aegis.task.remove", "Removes a completed or failed execution record by UUID."),
-    ("aegis.task.logs", "Returns paginated execution events for a task by UUID."),
-    ("aegis.task.wait", "Polls an execution until it reaches a terminal state and returns the result."),
-    ("aegis.agent.wait", "Alias for aegis.task.wait. Blocks until an agent execution completes."),
-    ("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
-    ("aegis.execute.status", "Returns the current status of an intent-to-execution pipeline run."),
-    ("aegis.execute.wait", "Alias for aegis.workflow.wait. Blocks until pipeline execution completes."),
-    ("aegis.tools.list", "List all MCP tools available to your security context with pagination and optional source/category filtering."),
-    ("aegis.tools.search", "Search for MCP tools by keyword, name pattern, source, category, or tags. Returns tools matching your query within your security context."),
-    ("aegis.system.info", "Returns system version, status, and capabilities."),
-    ("aegis.system.config", "Returns the current node configuration."),
-    ("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid."),
-    ("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes."),
-    ("aegis.attachment.read", "Read the contents of a file attached to a chat message. Returns the file content (UTF-8 text or base64-encoded bytes for binary), MIME type, size, and SHA-256 digest. Tenant-scoped and read-only."),
-    // ADR-117 §D: edge fleet system tools (operator-tier). The
-    // dispatcher branches on these names directly in
-    // `try_dispatch_aegis_tool`; they are surfaced here so that
-    // discovery (`aegis.tools.list` / `aegis.tools.search`) and
-    // schema lookup (`schema_for_builtin`) can find them.
-    ("aegis.edge.fleet.list", "ADR-117: resolve an edge fleet target (selector / group / @node / all) and return the matched node ids without dispatching. Operator-tier."),
-    ("aegis.edge.fleet.invoke", "ADR-117: dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /api/edge/fleet/invoke. Operator-tier, fleet-capable."),
-    ("aegis.edge.fleet.cancel", "ADR-117: cancel an in-flight fleet operation by fleet_command_id. Operator-tier."),
+/// `edge_executor`: ADR-117 system-tier tools whose canonical execution
+/// target is the edge daemon (or fan-out across many daemons) rather than
+/// the local builtin / MCP / SEAL chain. `list_tools` advertises
+/// `executor = "edge"` for these.
+///
+/// `fleet_capable`: ADR-117 tools eligible for fleet (multi-target) fan
+/// out via `aegis.edge.fleet.invoke`. Currently only that tool itself; the
+/// list / cancel siblings are operator-tier coordination tools that do not
+/// fan out further.
+struct BuiltinToolDefinition {
+    name: &'static str,
+    description: &'static str,
+    skip_judge: bool,
+    edge_executor: bool,
+    fleet_capable: bool,
+}
+
+impl BuiltinToolDefinition {
+    const fn new(name: &'static str, description: &'static str) -> Self {
+        Self {
+            name,
+            description,
+            skip_judge: false,
+            edge_executor: false,
+            fleet_capable: false,
+        }
+    }
+
+    const fn skip_judge(mut self) -> Self {
+        self.skip_judge = true;
+        self
+    }
+
+    const fn edge_executor(mut self) -> Self {
+        self.edge_executor = true;
+        self
+    }
+
+    const fn fleet_capable(mut self) -> Self {
+        self.fleet_capable = true;
+        self
+    }
+
+    /// Look up a definition by name, if present in the registry.
+    fn lookup(name: &str) -> Option<&'static BuiltinToolDefinition> {
+        BUILTIN_TOOL_DEFINITIONS.iter().find(|d| d.name == name)
+    }
+}
+
+/// Canonical registry of all builtin tool dispatchers. Single source of
+/// truth — the daemon startup and every other consumer derives its data
+/// from this slice.
+const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
+    BuiltinToolDefinition::new("cmd.run", "Executes a shell command inside the agent's ephemeral container environment. Use this to build, run, or analyze code locally."),
+    BuiltinToolDefinition::new("fs.read", "Read the contents of a file at the given POSIX path from the mounted Workspace volume.").skip_judge(),
+    BuiltinToolDefinition::new("fs.write", "Write content to a file at the given POSIX path in the Workspace volume. Automatically creates missing parent directories."),
+    BuiltinToolDefinition::new("fs.list", "List the contents of a directory in the Workspace volume.").skip_judge(),
+    BuiltinToolDefinition::new("fs.create_dir", "Creates a new directory along with any necessary parent directories."),
+    BuiltinToolDefinition::new("fs.delete", "Deletes a file or directory."),
+    BuiltinToolDefinition::new("fs.edit", "Performs an exact string replacement in a file."),
+    BuiltinToolDefinition::new("fs.multi_edit", "Performs multiple sequential string replacements in a file."),
+    BuiltinToolDefinition::new("fs.grep", "Recursively searches for a regex pattern within files in a given directory.").skip_judge(),
+    BuiltinToolDefinition::new("fs.glob", "Recursively matches files against a glob pattern.").skip_judge(),
+    BuiltinToolDefinition::new("web.search", "Performs an internet search query.").skip_judge(),
+    BuiltinToolDefinition::new("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
+    BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.list", "Lists currently deployed agents and metadata.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.update", "Updates an existing Agent manifest in the registry.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.export", "Exports an Agent manifest by name.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.delete", "Removes a deployed agent from the registry by UUID.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.generate", "Generates an Agent manifest from a natural-language intent."),
+    BuiltinToolDefinition::new("aegis.agent.logs", "Retrieve agent-level activity log snapshot.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.search", "Semantic search over deployed agents by natural-language query.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.create", "Performs strict deterministic and semantic workflow validation, then registers on pass.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.list", "Lists currently registered workflows and metadata.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.validate", "Validate a workflow manifest against the schema.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.update", "Updates an existing Workflow manifest in the registry.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.export", "Exports a Workflow manifest by name.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.delete", "Removes a registered workflow from the registry by workflow name (not UUID)."),
+    BuiltinToolDefinition::new("aegis.workflow.run", "Executes a registered workflow by name with optional input parameters."),
+    BuiltinToolDefinition::new("aegis.workflow.generate", "Generates a Workflow manifest from a natural-language objective."),
+    BuiltinToolDefinition::new("aegis.workflow.logs", "Returns paginated workflow execution events.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.wait", "Polls a workflow execution until it reaches a terminal state and returns the result.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.cancel", "Cancel a running workflow execution.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.signal", "Send human input response to a paused workflow execution.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.remove", "Remove a workflow execution record.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.promote", "Promote a workflow from user scope to tenant scope."),
+    BuiltinToolDefinition::new("aegis.workflow.demote", "Demote a workflow from tenant scope to user scope."),
+    BuiltinToolDefinition::new("aegis.workflow.executions.list", "Lists workflow executions, optionally filtered.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.executions.get", "Returns details of a specific workflow execution.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.status", "Returns current status of a workflow execution.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.search", "Semantic search over registered workflows.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.task.execute", "Starts a new agent execution (task) by agent UUID or name."),
+    BuiltinToolDefinition::new("aegis.task.status", "Returns the current status and output of an execution by UUID.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.task.list", "Lists recent executions, optionally filtered by agent.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.task.cancel", "Cancels an active agent execution by UUID."),
+    BuiltinToolDefinition::new("aegis.task.remove", "Removes a completed or failed execution record by UUID."),
+    BuiltinToolDefinition::new("aegis.task.logs", "Returns paginated execution events for a task by UUID.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.task.wait", "Polls an execution until it reaches a terminal state and returns the result.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.agent.wait", "Alias for aegis.task.wait. Blocks until an agent execution completes.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
+    BuiltinToolDefinition::new("aegis.execute.status", "Returns the current status of an intent-to-execution pipeline run.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.execute.wait", "Alias for aegis.workflow.wait. Blocks until pipeline execution completes.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.tools.list", "List all MCP tools available to your security context with pagination and optional source/category filtering.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.tools.search", "Search for MCP tools by keyword, name pattern, source, category, or tags. Returns tools matching your query within your security context.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.system.info", "Returns system version, status, and capabilities.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.system.config", "Returns the current node configuration.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.attachment.read", "Read the contents of a file attached to a chat message. Returns the file content (UTF-8 text or base64-encoded bytes for binary), MIME type, size, and SHA-256 digest. Tenant-scoped and read-only.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.edge.fleet.list", "ADR-117: resolve an edge fleet target (selector / group / @node / all) and return the matched node ids without dispatching. Operator-tier.").skip_judge().edge_executor(),
+    BuiltinToolDefinition::new("aegis.edge.fleet.invoke", "ADR-117: dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /api/edge/fleet/invoke. Operator-tier, fleet-capable.").skip_judge().edge_executor().fleet_capable(),
+    BuiltinToolDefinition::new("aegis.edge.fleet.cancel", "ADR-117: cancel an in-flight fleet operation by fleet_command_id. Operator-tier.").skip_judge().edge_executor(),
 ];
 
 impl ToolRouter {
@@ -302,48 +277,30 @@ impl ToolRouter {
     pub fn builtin_dispatchers() -> Vec<BuiltinDispatcherConfig> {
         BUILTIN_TOOL_DEFINITIONS
             .iter()
-            .map(|(name, description)| {
-                let skip_judge = SKIP_JUDGE_TOOLS.contains(name);
-                BuiltinDispatcherConfig {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    enabled: true,
-                    capabilities: vec![crate::domain::node_config::CapabilityConfig {
-                        name: name.to_string(),
-                        skip_judge,
-                    }],
-                    api_key: None,
-                }
+            .map(|def| BuiltinDispatcherConfig {
+                name: def.name.to_string(),
+                description: def.description.to_string(),
+                enabled: true,
+                capabilities: vec![crate::domain::node_config::CapabilityConfig {
+                    name: def.name.to_string(),
+                    skip_judge: def.skip_judge,
+                }],
+                api_key: None,
             })
             .collect()
     }
 
+    /// Returns `true` for any builtin workflow / execute tool currently
+    /// present in the canonical registry. Derived from
+    /// `BUILTIN_TOOL_DEFINITIONS`, restricted to the `aegis.workflow.` and
+    /// `aegis.execute.` prefixes so the gate semantically matches the
+    /// pre-consolidation behavior: only registered workflow / execute
+    /// tools are considered supported here.
     fn is_supported_builtin_workflow_tool(tool_name: &str) -> bool {
-        matches!(
-            tool_name,
-            "aegis.workflow.create"
-                | "aegis.workflow.list"
-                | "aegis.workflow.validate"
-                | "aegis.workflow.update"
-                | "aegis.workflow.export"
-                | "aegis.workflow.delete"
-                | "aegis.workflow.run"
-                | "aegis.workflow.executions.list"
-                | "aegis.workflow.executions.get"
-                | "aegis.workflow.status"
-                | "aegis.workflow.generate"
-                | "aegis.workflow.logs"
-                | "aegis.workflow.wait"
-                | "aegis.workflow.cancel"
-                | "aegis.workflow.signal"
-                | "aegis.workflow.remove"
-                | "aegis.workflow.search"
-                | "aegis.workflow.promote"
-                | "aegis.workflow.demote"
-                | "aegis.execute.intent"
-                | "aegis.execute.status"
-                | "aegis.execute.wait"
-        )
+        if !tool_name.starts_with("aegis.workflow.") && !tool_name.starts_with("aegis.execute.") {
+            return false;
+        }
+        BuiltinToolDefinition::lookup(tool_name).is_some()
     }
 
     fn should_advertise_builtin_tool(tool_name: &str) -> bool {
@@ -513,12 +470,11 @@ impl ToolRouter {
                     continue;
                 }
 
-                let executor = if EDGE_EXECUTOR_TOOLS.contains(&cap.name.as_str()) {
-                    Some("edge".to_string())
-                } else {
-                    None
-                };
-                let fleet_capable = FLEET_CAPABLE_TOOLS.contains(&cap.name.as_str());
+                let registry_def = BuiltinToolDefinition::lookup(&cap.name);
+                let executor = registry_def
+                    .filter(|d| d.edge_executor)
+                    .map(|_| "edge".to_string());
+                let fleet_capable = registry_def.is_some_and(|d| d.fleet_capable);
                 all_tools.push(ToolMetadata {
                     name: cap.name.clone(),
                     description: dispatcher.description.clone(),
@@ -534,25 +490,24 @@ impl ToolRouter {
         // daemon was constructed with a partial dispatcher list).
         let existing_names: std::collections::HashSet<String> =
             all_tools.iter().map(|t| t.name.clone()).collect();
-        for (name, description) in BUILTIN_TOOL_DEFINITIONS {
-            if !Self::should_advertise_builtin_tool(name) {
+        for def in BUILTIN_TOOL_DEFINITIONS {
+            if !Self::should_advertise_builtin_tool(def.name) {
                 continue;
             }
-            if existing_names.contains(*name) {
+            if existing_names.contains(def.name) {
                 continue;
             }
-            let executor = if EDGE_EXECUTOR_TOOLS.contains(name) {
+            let executor = if def.edge_executor {
                 Some("edge".to_string())
             } else {
                 None
             };
-            let fleet_capable = FLEET_CAPABLE_TOOLS.contains(name);
             all_tools.push(ToolMetadata {
-                name: name.to_string(),
-                description: description.to_string(),
-                input_schema: Self::schema_for_builtin(name),
+                name: def.name.to_string(),
+                description: def.description.to_string(),
+                input_schema: Self::schema_for_builtin(def.name),
                 executor,
-                fleet_capable,
+                fleet_capable: def.fleet_capable,
             });
         }
 
@@ -563,923 +518,1218 @@ impl ToolRouter {
     /// Falls back to a bare `{"type": "object"}` for unknown tools.
     fn schema_for_builtin(tool_name: &str) -> Value {
         match tool_name {
-            "cmd.run" => json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Command to execute"
-                    }
-                },
-                "required": ["command"]
-            }),
-            "fs.read" => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative POSIX path of the file to read."
-                    }
-                },
-                "required": ["path"]
-            }),
-            "fs.write" => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative POSIX path of the file to write."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "String content to write to the file."
-                    }
-                },
-                "required": ["path", "content"]
-            }),
-            "fs.list" => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative POSIX path of the directory to list."
-                    }
-                },
-                "required": ["path"]
-            }),
-            "fs.create_dir" => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative POSIX path of the directory to create."
-                    }
-                },
-                "required": ["path"]
-            }),
-            "fs.delete" => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative POSIX path of the file or directory to delete."
-                    },
-                    "recursive": {
-                        "type": "boolean",
-                        "description": "Set to true to delete a directory and all its contents."
-                    }
-                },
-                "required": ["path"]
-            }),
-            "fs.edit" => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative POSIX path of the file to edit."
-                    },
-                    "target_content": {
-                        "type": "string",
-                        "description": "Exact string content to find and replace. Must match exactly once."
-                    },
-                    "replacement_content": {
-                        "type": "string",
-                        "description": "New string content to insert in place of target_content."
-                    }
-                },
-                "required": ["path", "target_content", "replacement_content"]
-            }),
-            "fs.multi_edit" => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative POSIX path of the file to edit."
-                    },
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "target_content": { "type": "string" },
-                                "replacement_content": { "type": "string" }
-                            },
-                            "required": ["target_content", "replacement_content"]
-                        },
-                        "description": "Array of edits to apply sequentially."
-                    }
-                },
-                "required": ["path", "edits"]
-            }),
-            "fs.grep" => json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regex pattern to search for."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path to start the recursive search from."
-                    }
-                },
-                "required": ["pattern", "path"]
-            }),
-            "fs.glob" => json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern to match files (e.g. *.rs)."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path to start the recursive search from."
-                    }
-                },
-                "required": ["pattern", "path"]
-            }),
-            "web.search" => json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query."
-                    }
-                },
-                "required": ["query"]
-            }),
-            "web.fetch" => json!({
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to fetch content from."
-                    }
-                },
-                "required": ["url"]
-            }),
-            "aegis.schema.get" => json!({
-                "type": "object",
-                "properties": {
-                    "key": {
-                        "type": "string",
-                        "description": "Schema key to retrieve. Supported: \"agent/manifest/v1\", \"workflow/manifest/v1\""
-                    }
-                },
-                "required": ["key"]
-            }),
-            "aegis.schema.validate" => json!({
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "description": "Manifest kind to validate against. Supported: \"agent\", \"workflow\""
-                    },
-                    "manifest_yaml": {
-                        "type": "string",
-                        "description": "Full manifest YAML text to validate against the canonical schema."
-                    }
-                },
-                "required": ["kind", "manifest_yaml"]
-            }),
-            "aegis.agent.create" => json!({
-                "type": "object",
-                "properties": {
-                    "manifest_yaml": {
-                        "type": "string",
-                        "description": "Full Agent manifest YAML to parse, validate, and deploy. Supports spec.type: 'user' (default) | 'system' — declares the agent's execution tier. 'user' agents run within the requesting tenant's context. 'system' agents run in the privileged platform tier with elevated access. Omit to default to 'user'."
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Overwrite an existing deployed agent with the same name/version."
-                    }
-                },
-                "required": ["manifest_yaml"]
-            }),
-            "aegis.agent.list" => json!({
-                "type": "object",
-                "properties": {}
-            }),
-            "aegis.agent.update" => json!({
-                "type": "object",
-                "properties": {
-                    "manifest_yaml": {
-                        "type": "string",
-                        "description": "Full Agent manifest YAML to update an existing agent. Supports spec.type: 'user' (default) | 'system' — declares the agent's execution tier. 'user' agents run within the requesting tenant's context. 'system' agents run in the privileged platform tier with elevated access. Omit to default to 'user'."
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Overwrite an existing version if it already exists."
-                    }
-                },
-                "required": ["manifest_yaml"]
-            }),
-            "aegis.agent.export" => json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the agent to export."
-                    }
-                },
-                "required": ["name"]
-            }),
-            "aegis.agent.delete" => json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "UUID of the agent to remove."
-                    }
-                },
-                "required": ["agent_id"]
-            }),
-            "aegis.agent.generate" => json!({
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "type": "string",
-                        "description": "Natural-language intent for the agent to create."
-                    },
-                    "attachments": {
-                        "type": "array",
-                        "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
-                        "items": {
-                            "type": "object",
-                            "required": ["volume_id", "path", "name", "mime_type", "size"],
-                            "properties": {
-                                "volume_id": { "type": "string" },
-                                "path":      { "type": "string" },
-                                "name":      { "type": "string" },
-                                "mime_type": { "type": "string" },
-                                "size":      { "type": "integer" },
-                                "sha256":    { "type": "string" }
-                            }
-                        }
-                    }
-                },
-                "required": ["input"]
-            }),
-            "aegis.agent.logs" => json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "UUID of the agent whose activity log should be retrieved."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of events to return.",
-                        "default": 50
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Zero-based starting offset into the activity log.",
-                        "default": 0
-                    }
-                },
-                "required": ["agent_id"]
-            }),
-            "aegis.workflow.list" => json!({
-                "type": "object",
-                "properties": {
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["global", "visible"],
-                        "description": "Optional scope filter. 'global' lists only global workflows. 'visible' lists user+tenant+global. Omit to list all for tenant."
-                    },
-                    "user_id": {
-                        "type": "string",
-                        "description": "Optional user ID for 'visible' scope filter."
-                    }
-                }
-            }),
-            "aegis.workflow.validate" => json!({
-                "type": "object",
-                "properties": {
-                    "manifest_yaml": {
-                        "type": "string",
-                        "description": "Full Workflow manifest YAML to parse and deterministically validate."
-                    }
-                },
-                "required": ["manifest_yaml"]
-            }),
-            "aegis.workflow.update" => json!({
-                "type": "object",
-                "properties": {
-                    "manifest_yaml": {
-                        "type": "string",
-                        "description": "Full Workflow manifest YAML to update an existing workflow."
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Overwrite an existing version if it already exists."
-                    }
-                },
-                "required": ["manifest_yaml"]
-            }),
-            "aegis.workflow.export" => json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the workflow to export."
-                    }
-                },
-                "required": ["name"]
-            }),
-            "aegis.workflow.delete" => json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the workflow to delete."
-                    }
-                },
-                "required": ["name"]
-            }),
-            "aegis.workflow.run" => json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the workflow to execute."
-                    },
-                    "intent": {
-                        "type": "string",
-                        "description": "Natural-language description of the goal for this workflow run. Injected into the workflow input so task activities and agents can access it."
-                    },
-                    "input": {
-                        "type": "object",
-                        "description": "Workflow input parameters."
-                    },
-                    "blackboard": {
-                        "type": "object",
-                        "description": "Optional blackboard overrides merged into the workflow execution before startup."
-                    },
-                    "version": {
-                        "type": "string",
-                        "description": "Optional semantic version of the workflow to execute. When omitted, the latest deployed version is used."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    }
-                },
-                "required": ["name"]
-            }),
-            "aegis.workflow.executions.list" => json!({
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return.",
-                        "default": 20
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Pagination offset.",
-                        "default": 0
-                    },
-                    "workflow_id": {
-                        "type": "string",
-                        "description": "Optional workflow UUID or workflow name filter."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    }
-                }
-            }),
-            "aegis.workflow.executions.get" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the workflow execution to inspect."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.workflow.status" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the workflow execution to inspect."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.workflow.generate" => json!({
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "type": "string",
-                        "description": "Natural-language workflow objective."
-                    }
-                },
-                "required": ["input"]
-            }),
-            "aegis.workflow.wait" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the workflow execution to wait for."
-                    },
-                    "poll_interval_seconds": {
-                        "type": "integer",
-                        "description": "Seconds between polls (default: 5)."
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "Maximum wait time in seconds (default: 300)."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.workflow.cancel" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the workflow execution to cancel."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.workflow.signal" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the workflow execution to signal."
-                    },
-                    "response": {
-                        "type": "string",
-                        "description": "Human input response text to send to the paused workflow."
-                    }
-                },
-                "required": ["execution_id", "response"]
-            }),
-            "aegis.workflow.remove" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the workflow execution to remove."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.workflow.promote" => json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Workflow name or ID to promote."
-                    },
-                    "target_scope": {
-                        "type": "string",
-                        "enum": ["tenant", "global"],
-                        "description": "Target scope (default: global)."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    }
-                },
-                "required": ["name"]
-            }),
-            "aegis.workflow.demote" => json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Workflow name or ID to demote."
-                    },
-                    "target_scope": {
-                        "type": "string",
-                        "enum": ["tenant", "user"],
-                        "description": "Target scope (default: tenant)."
-                    },
-                    "user_id": {
-                        "type": "string",
-                        "description": "Owner user ID when demoting to user scope."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    }
-                },
-                "required": ["name"]
-            }),
-            "aegis.execute.intent" => json!({
-                "type": "object",
-                "properties": {
-                    "intent": {
-                        "type": "string",
-                        "description": "Natural-language description of what to execute (e.g. 'resize images in /workspace to 800x600')."
-                    },
-                    "inputs": {
-                        "type": "object",
-                        "description": "Optional structured inputs passed to the pipeline."
-                    },
-                    "volume_id": {
-                        "type": "string",
-                        "description": "Optional persistent volume ID to use as workspace. When omitted, an ephemeral volume is created."
-                    },
-                    "language": {
-                        "type": "string",
-                        "enum": ["python", "javascript", "bash"],
-                        "description": "Execution language (default: python)."
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "Optional execution timeout in seconds."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    },
-                    "attachments": {
-                        "type": "array",
-                        "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
-                        "items": {
-                            "type": "object",
-                            "required": ["volume_id", "path", "name", "mime_type", "size"],
-                            "properties": {
-                                "volume_id": { "type": "string" },
-                                "path":      { "type": "string" },
-                                "name":      { "type": "string" },
-                                "mime_type": { "type": "string" },
-                                "size":      { "type": "integer" },
-                                "sha256":    { "type": "string" }
-                            }
-                        }
-                    }
-                },
-                "required": ["intent"]
-            }),
-            "aegis.execute.status" => json!({
-                "type": "object",
-                "properties": {
-                    "pipeline_execution_id": {
-                        "type": "string",
-                        "description": "UUID of the pipeline execution to check."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Optional tenant identifier. Defaults to the local tenant."
-                    }
-                },
-                "required": ["pipeline_execution_id"]
-            }),
-            "aegis.execute.wait" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the workflow/pipeline execution to wait for."
-                    },
-                    "poll_interval_seconds": {
-                        "type": "integer",
-                        "description": "Seconds between polls (default: 5)."
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "Maximum wait time in seconds (default: 300)."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.task.execute" => json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "UUID or Name of the agent to execute."
-                    },
-                    "intent": {
-                        "type": "string",
-                        "description": "Free-form natural-language steering for the agent. Use when the agent has no input_schema. When input_schema is present, intent is optional supplemental context."
-                    },
-                    "input": {
-                        "type": "object",
-                        "description": "Structured data for the agent. When the agent declares input_schema, pass exactly the properties defined there — do not wrap them in additional keys. When the agent has no input_schema, omit this field and use 'intent' instead."
-                    },
-                    "version": {
-                        "type": "string",
-                        "description": "Optional semantic version of the agent to execute. When omitted, the latest deployed version is used."
-                    },
-                    "attachments": {
-                        "type": "array",
-                        "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
-                        "items": {
-                            "type": "object",
-                            "required": ["volume_id", "path", "name", "mime_type", "size"],
-                            "properties": {
-                                "volume_id": { "type": "string" },
-                                "path":      { "type": "string" },
-                                "name":      { "type": "string" },
-                                "mime_type": { "type": "string" },
-                                "size":      { "type": "integer" },
-                                "sha256":    { "type": "string" }
-                            }
-                        }
-                    }
-                },
-                "required": ["agent_id"]
-            }),
-            "aegis.task.status" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the execution to check."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.task.wait" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the execution to wait for."
-                    },
-                    "poll_interval_seconds": {
-                        "type": "integer",
-                        "description": "Seconds between status polls (default 10).",
-                        "minimum": 1
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "Maximum seconds to wait before returning a timeout (default 300).",
-                        "minimum": 1
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.agent.wait" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the execution to wait for."
-                    },
-                    "poll_interval_seconds": {
-                        "type": "integer",
-                        "description": "Seconds between status polls (default 10).",
-                        "minimum": 1
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "Maximum seconds to wait before returning a timeout (default 300).",
-                        "minimum": 1
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.task.logs" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the execution whose event log should be retrieved."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of events to return.",
-                        "default": 50
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Zero-based starting offset into the persisted event log.",
-                        "default": 0
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.task.list" => json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "Optional UUID to filter by agent."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results.",
-                        "default": 20
-                    }
-                }
-            }),
-            "aegis.task.cancel" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the execution to cancel."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.task.remove" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "UUID of the execution to remove."
-                    }
-                },
-                "required": ["execution_id"]
-            }),
-            "aegis.system.info" => json!({
-                "type": "object",
-                "properties": {}
-            }),
-            "aegis.system.config" => json!({
-                "type": "object",
-                "properties": {}
-            }),
+            "cmd.run" => Self::schema_cmd_run(),
+            "fs.read" => Self::schema_fs_read(),
+            "fs.write" => Self::schema_fs_write(),
+            "fs.list" => Self::schema_fs_list(),
+            "fs.create_dir" => Self::schema_fs_create_dir(),
+            "fs.delete" => Self::schema_fs_delete(),
+            "fs.edit" => Self::schema_fs_edit(),
+            "fs.multi_edit" => Self::schema_fs_multi_edit(),
+            "fs.grep" => Self::schema_fs_grep(),
+            "fs.glob" => Self::schema_fs_glob(),
+            "web.search" => Self::schema_web_search(),
+            "web.fetch" => Self::schema_web_fetch(),
+            "aegis.schema.get" => Self::schema_aegis_schema_get(),
+            "aegis.schema.validate" => Self::schema_aegis_schema_validate(),
+            "aegis.agent.create" => Self::schema_aegis_agent_create(),
+            "aegis.agent.list" => Self::schema_aegis_agent_list(),
+            "aegis.agent.update" => Self::schema_aegis_agent_update(),
+            "aegis.agent.export" => Self::schema_aegis_agent_export(),
+            "aegis.agent.delete" => Self::schema_aegis_agent_delete(),
+            "aegis.agent.generate" => Self::schema_aegis_agent_generate(),
+            "aegis.agent.logs" => Self::schema_aegis_agent_logs(),
+            "aegis.workflow.list" => Self::schema_aegis_workflow_list(),
+            "aegis.workflow.validate" => Self::schema_aegis_workflow_validate(),
+            "aegis.workflow.update" => Self::schema_aegis_workflow_update(),
+            "aegis.workflow.export" => Self::schema_aegis_workflow_export(),
+            "aegis.workflow.delete" => Self::schema_aegis_workflow_delete(),
+            "aegis.workflow.run" => Self::schema_aegis_workflow_run(),
+            "aegis.workflow.executions.list" => Self::schema_aegis_workflow_executions_list(),
+            "aegis.workflow.executions.get" => Self::schema_aegis_workflow_executions_get(),
+            "aegis.workflow.status" => Self::schema_aegis_workflow_status(),
+            "aegis.workflow.generate" => Self::schema_aegis_workflow_generate(),
+            "aegis.workflow.wait" => Self::schema_aegis_workflow_wait(),
+            "aegis.workflow.cancel" => Self::schema_aegis_workflow_cancel(),
+            "aegis.workflow.signal" => Self::schema_aegis_workflow_signal(),
+            "aegis.workflow.remove" => Self::schema_aegis_workflow_remove(),
+            "aegis.workflow.promote" => Self::schema_aegis_workflow_promote(),
+            "aegis.workflow.demote" => Self::schema_aegis_workflow_demote(),
+            "aegis.execute.intent" => Self::schema_aegis_execute_intent(),
+            "aegis.execute.status" => Self::schema_aegis_execute_status(),
+            "aegis.execute.wait" => Self::schema_aegis_execute_wait(),
+            "aegis.task.execute" => Self::schema_aegis_task_execute(),
+            "aegis.task.status" => Self::schema_aegis_task_status(),
+            "aegis.task.wait" => Self::schema_aegis_task_wait(),
+            "aegis.agent.wait" => Self::schema_aegis_agent_wait(),
+            "aegis.task.logs" => Self::schema_aegis_task_logs(),
+            "aegis.task.list" => Self::schema_aegis_task_list(),
+            "aegis.task.cancel" => Self::schema_aegis_task_cancel(),
+            "aegis.task.remove" => Self::schema_aegis_task_remove(),
+            "aegis.system.info" => Self::schema_aegis_system_info(),
+            "aegis.system.config" => Self::schema_aegis_system_config(),
             // ADR-117 §D edge fleet system tools.
-            "aegis.edge.fleet.list" => json!({
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "description": "EdgeTarget: { Node: '...' } | { Group: '...' } | { Selector: { os, arch, tools, labels, tags } } | 'All'."
-                    }
-                },
-                "required": ["target"]
-            }),
-            "aegis.edge.fleet.invoke" => json!({
-                "type": "object",
-                "properties": {
-                    "target": { "description": "EdgeTarget — see aegis.edge.fleet.list." },
-                    "tool_name": { "type": "string", "description": "Name of the tool to dispatch on every resolved edge daemon." },
-                    "args": { "type": "object", "description": "JSON object of tool arguments." }
-                },
-                "required": ["target", "tool_name"]
-            }),
-            "aegis.edge.fleet.cancel" => json!({
-                "type": "object",
-                "properties": {
-                    "fleet_command_id": { "type": "string", "description": "UUID returned by aegis.edge.fleet.invoke." }
-                },
-                "required": ["fleet_command_id"]
-            }),
-            "aegis.agent.search" => json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural-language description of the agent you are looking for."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Tenant ID to search within. Defaults to current tenant."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum results (1-100, tier-dependent cap). Default: 10."
-                    },
-                    "min_score": {
-                        "type": "number",
-                        "description": "Minimum relevance score threshold (0.0-1.0). Default: 0.3."
-                    },
-                    "labels": {
-                        "type": "object",
-                        "description": "Label key-value pairs to filter by. All must match.",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    "status": {
-                        "type": "string",
-                        "description": "Filter by agent status.",
-                        "enum": ["active", "paused", "failed"]
-                    },
-                    "include_platform_templates": {
-                        "type": "boolean",
-                        "description": "Include platform-provided template agents. Default: true."
-                    }
-                },
-                "required": ["query"]
-            }),
-            "aegis.workflow.search" => json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural-language description of the workflow you are looking for."
-                    },
-                    "tenant_id": {
-                        "type": "string",
-                        "description": "Tenant ID to search within. Defaults to current tenant."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum results (1-100, tier-dependent cap). Default: 10."
-                    },
-                    "min_score": {
-                        "type": "number",
-                        "description": "Minimum relevance score threshold (0.0-1.0). Default: 0.3."
-                    },
-                    "labels": {
-                        "type": "object",
-                        "description": "Label key-value pairs to filter by. All must match.",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    "include_platform_templates": {
-                        "type": "boolean",
-                        "description": "Include platform-provided template workflows. Default: true."
-                    }
-                },
-                "required": ["query"]
-            }),
-            "aegis.workflow.create" => json!({
-                "type": "object",
-                "properties": {
-                    "manifest_yaml": {
-                        "type": "string",
-                        "description": "Full Workflow manifest YAML to parse, validate, semantically judge, and register."
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Overwrite an existing version if it already exists."
-                    },
-                    "task_context": {
-                        "type": "string",
-                        "description": "Optional task context to guide semantic judges."
-                    },
-                    "judge_agents": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Judge agent names to use for semantic validation."
-                    },
-                    "min_score": {
-                        "type": "number",
-                        "description": "Minimum consensus score required for deployment."
-                    },
-                    "min_confidence": {
-                        "type": "number",
-                        "description": "Minimum consensus confidence required for deployment."
-                    }
-                },
-                "required": ["manifest_yaml"]
-            }),
-            "aegis.runtime.list" => json!({
-                "type": "object",
-                "properties": {
-                    "language": {
-                        "type": "string",
-                        "description": "Optional: filter by language name (e.g. \"python\", \"go\")"
-                    }
-                }
-            }),
-            "aegis.execution.file" => json!({
-                "type": "object",
-                "properties": {
-                    "execution_id": {
-                        "type": "string",
-                        "description": "The execution ID."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File path (e.g. 'output.md' or '/workspace/output.md')."
-                    }
-                },
-                "required": ["execution_id", "path"]
-            }),
-            "aegis.attachment.read" => json!({
-                "type": "object",
-                "properties": {
-                    "volume_id": {
-                        "type": "string",
-                        "description": "UUID of the tenant-scoped volume containing the attachment."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "POSIX path of the attachment within the volume."
-                    }
-                },
-                "required": ["volume_id", "path"]
-            }),
+            "aegis.edge.fleet.list" => Self::schema_aegis_edge_fleet_list(),
+            "aegis.edge.fleet.invoke" => Self::schema_aegis_edge_fleet_invoke(),
+            "aegis.edge.fleet.cancel" => Self::schema_aegis_edge_fleet_cancel(),
+            "aegis.agent.search" => Self::schema_aegis_agent_search(),
+            "aegis.workflow.search" => Self::schema_aegis_workflow_search(),
+            "aegis.workflow.create" => Self::schema_aegis_workflow_create(),
+            "aegis.runtime.list" => Self::schema_aegis_runtime_list(),
+            "aegis.execution.file" => Self::schema_aegis_execution_file(),
+            "aegis.attachment.read" => Self::schema_aegis_attachment_read(),
             _ => json!({ "type": "object" }),
         }
+    }
+
+    /// JSON schema for the `cmd.run` builtin tool.
+    fn schema_cmd_run() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Command to execute"
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    /// JSON schema for the `fs.read` builtin tool.
+    fn schema_fs_read() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative POSIX path of the file to read."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    /// JSON schema for the `fs.write` builtin tool.
+    fn schema_fs_write() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative POSIX path of the file to write."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "String content to write to the file."
+                }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    /// JSON schema for the `fs.list` builtin tool.
+    fn schema_fs_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative POSIX path of the directory to list."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    /// JSON schema for the `fs.create_dir` builtin tool.
+    fn schema_fs_create_dir() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative POSIX path of the directory to create."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    /// JSON schema for the `fs.delete` builtin tool.
+    fn schema_fs_delete() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative POSIX path of the file or directory to delete."
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Set to true to delete a directory and all its contents."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    /// JSON schema for the `fs.edit` builtin tool.
+    fn schema_fs_edit() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative POSIX path of the file to edit."
+                },
+                "target_content": {
+                    "type": "string",
+                    "description": "Exact string content to find and replace. Must match exactly once."
+                },
+                "replacement_content": {
+                    "type": "string",
+                    "description": "New string content to insert in place of target_content."
+                }
+            },
+            "required": ["path", "target_content", "replacement_content"]
+        })
+    }
+
+    /// JSON schema for the `fs.multi_edit` builtin tool.
+    fn schema_fs_multi_edit() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative POSIX path of the file to edit."
+                },
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target_content": { "type": "string" },
+                            "replacement_content": { "type": "string" }
+                        },
+                        "required": ["target_content", "replacement_content"]
+                    },
+                    "description": "Array of edits to apply sequentially."
+                }
+            },
+            "required": ["path", "edits"]
+        })
+    }
+
+    /// JSON schema for the `fs.grep` builtin tool.
+    fn schema_fs_grep() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to start the recursive search from."
+                }
+            },
+            "required": ["pattern", "path"]
+        })
+    }
+
+    /// JSON schema for the `fs.glob` builtin tool.
+    fn schema_fs_glob() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match files (e.g. *.rs)."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to start the recursive search from."
+                }
+            },
+            "required": ["pattern", "path"]
+        })
+    }
+
+    /// JSON schema for the `web.search` builtin tool.
+    fn schema_web_search() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    /// JSON schema for the `web.fetch` builtin tool.
+    fn schema_web_fetch() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "URL to fetch content from."
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    /// JSON schema for the `aegis.schema.get` builtin tool.
+    fn schema_aegis_schema_get() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Schema key to retrieve. Supported: \"agent/manifest/v1\", \"workflow/manifest/v1\""
+                }
+            },
+            "required": ["key"]
+        })
+    }
+
+    /// JSON schema for the `aegis.schema.validate` builtin tool.
+    fn schema_aegis_schema_validate() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "Manifest kind to validate against. Supported: \"agent\", \"workflow\""
+                },
+                "manifest_yaml": {
+                    "type": "string",
+                    "description": "Full manifest YAML text to validate against the canonical schema."
+                }
+            },
+            "required": ["kind", "manifest_yaml"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.create` builtin tool.
+    fn schema_aegis_agent_create() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "manifest_yaml": {
+                    "type": "string",
+                    "description": "Full Agent manifest YAML to parse, validate, and deploy. Supports spec.type: 'user' (default) | 'system' — declares the agent's execution tier. 'user' agents run within the requesting tenant's context. 'system' agents run in the privileged platform tier with elevated access. Omit to default to 'user'."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Overwrite an existing deployed agent with the same name/version."
+                }
+            },
+            "required": ["manifest_yaml"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.list` builtin tool.
+    fn schema_aegis_agent_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.update` builtin tool.
+    fn schema_aegis_agent_update() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "manifest_yaml": {
+                    "type": "string",
+                    "description": "Full Agent manifest YAML to update an existing agent. Supports spec.type: 'user' (default) | 'system' — declares the agent's execution tier. 'user' agents run within the requesting tenant's context. 'system' agents run in the privileged platform tier with elevated access. Omit to default to 'user'."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Overwrite an existing version if it already exists."
+                }
+            },
+            "required": ["manifest_yaml"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.export` builtin tool.
+    fn schema_aegis_agent_export() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the agent to export."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.delete` builtin tool.
+    fn schema_aegis_agent_delete() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "UUID of the agent to remove."
+                }
+            },
+            "required": ["agent_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.generate` builtin tool.
+    fn schema_aegis_agent_generate() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Natural-language intent for the agent to create."
+                },
+                "attachments": {
+                    "type": "array",
+                    "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                    "items": {
+                        "type": "object",
+                        "required": ["volume_id", "path", "name", "mime_type", "size"],
+                        "properties": {
+                            "volume_id": { "type": "string" },
+                            "path":      { "type": "string" },
+                            "name":      { "type": "string" },
+                            "mime_type": { "type": "string" },
+                            "size":      { "type": "integer" },
+                            "sha256":    { "type": "string" }
+                        }
+                    }
+                }
+            },
+            "required": ["input"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.logs` builtin tool.
+    fn schema_aegis_agent_logs() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "UUID of the agent whose activity log should be retrieved."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of events to return.",
+                    "default": 50
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Zero-based starting offset into the activity log.",
+                    "default": 0
+                }
+            },
+            "required": ["agent_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.list` builtin tool.
+    fn schema_aegis_workflow_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["global", "visible"],
+                    "description": "Optional scope filter. 'global' lists only global workflows. 'visible' lists user+tenant+global. Omit to list all for tenant."
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Optional user ID for 'visible' scope filter."
+                }
+            }
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.validate` builtin tool.
+    fn schema_aegis_workflow_validate() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "manifest_yaml": {
+                    "type": "string",
+                    "description": "Full Workflow manifest YAML to parse and deterministically validate."
+                }
+            },
+            "required": ["manifest_yaml"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.update` builtin tool.
+    fn schema_aegis_workflow_update() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "manifest_yaml": {
+                    "type": "string",
+                    "description": "Full Workflow manifest YAML to update an existing workflow."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Overwrite an existing version if it already exists."
+                }
+            },
+            "required": ["manifest_yaml"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.export` builtin tool.
+    fn schema_aegis_workflow_export() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the workflow to export."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.delete` builtin tool.
+    fn schema_aegis_workflow_delete() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the workflow to delete."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.run` builtin tool.
+    fn schema_aegis_workflow_run() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the workflow to execute."
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "Natural-language description of the goal for this workflow run. Injected into the workflow input so task activities and agents can access it."
+                },
+                "input": {
+                    "type": "object",
+                    "description": "Workflow input parameters."
+                },
+                "blackboard": {
+                    "type": "object",
+                    "description": "Optional blackboard overrides merged into the workflow execution before startup."
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Optional semantic version of the workflow to execute. When omitted, the latest deployed version is used."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.executions.list` builtin tool.
+    fn schema_aegis_workflow_executions_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return.",
+                    "default": 20
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Pagination offset.",
+                    "default": 0
+                },
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Optional workflow UUID or workflow name filter."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            }
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.executions.get` builtin tool.
+    fn schema_aegis_workflow_executions_get() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the workflow execution to inspect."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.status` builtin tool.
+    fn schema_aegis_workflow_status() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the workflow execution to inspect."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.generate` builtin tool.
+    fn schema_aegis_workflow_generate() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Natural-language workflow objective."
+                }
+            },
+            "required": ["input"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.wait` builtin tool.
+    fn schema_aegis_workflow_wait() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the workflow execution to wait for."
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "description": "Seconds between polls (default: 5)."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Maximum wait time in seconds (default: 300)."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.cancel` builtin tool.
+    fn schema_aegis_workflow_cancel() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the workflow execution to cancel."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.signal` builtin tool.
+    fn schema_aegis_workflow_signal() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the workflow execution to signal."
+                },
+                "response": {
+                    "type": "string",
+                    "description": "Human input response text to send to the paused workflow."
+                }
+            },
+            "required": ["execution_id", "response"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.remove` builtin tool.
+    fn schema_aegis_workflow_remove() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the workflow execution to remove."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.promote` builtin tool.
+    fn schema_aegis_workflow_promote() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Workflow name or ID to promote."
+                },
+                "target_scope": {
+                    "type": "string",
+                    "enum": ["tenant", "global"],
+                    "description": "Target scope (default: global)."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.demote` builtin tool.
+    fn schema_aegis_workflow_demote() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Workflow name or ID to demote."
+                },
+                "target_scope": {
+                    "type": "string",
+                    "enum": ["tenant", "user"],
+                    "description": "Target scope (default: tenant)."
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Owner user ID when demoting to user scope."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    /// JSON schema for the `aegis.execute.intent` builtin tool.
+    fn schema_aegis_execute_intent() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": "Natural-language description of what to execute (e.g. 'resize images in /workspace to 800x600')."
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": "Optional structured inputs passed to the pipeline."
+                },
+                "volume_id": {
+                    "type": "string",
+                    "description": "Optional persistent volume ID to use as workspace. When omitted, an ephemeral volume is created."
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["python", "javascript", "bash"],
+                    "description": "Execution language (default: python)."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Optional execution timeout in seconds."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                },
+                "attachments": {
+                    "type": "array",
+                    "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                    "items": {
+                        "type": "object",
+                        "required": ["volume_id", "path", "name", "mime_type", "size"],
+                        "properties": {
+                            "volume_id": { "type": "string" },
+                            "path":      { "type": "string" },
+                            "name":      { "type": "string" },
+                            "mime_type": { "type": "string" },
+                            "size":      { "type": "integer" },
+                            "sha256":    { "type": "string" }
+                        }
+                    }
+                }
+            },
+            "required": ["intent"]
+        })
+    }
+
+    /// JSON schema for the `aegis.execute.status` builtin tool.
+    fn schema_aegis_execute_status() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pipeline_execution_id": {
+                    "type": "string",
+                    "description": "UUID of the pipeline execution to check."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            },
+            "required": ["pipeline_execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.execute.wait` builtin tool.
+    fn schema_aegis_execute_wait() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the workflow/pipeline execution to wait for."
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "description": "Seconds between polls (default: 5)."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Maximum wait time in seconds (default: 300)."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.task.execute` builtin tool.
+    fn schema_aegis_task_execute() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "UUID or Name of the agent to execute."
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "Free-form natural-language steering for the agent. Use when the agent has no input_schema. When input_schema is present, intent is optional supplemental context."
+                },
+                "input": {
+                    "type": "object",
+                    "description": "Structured data for the agent. When the agent declares input_schema, pass exactly the properties defined there — do not wrap them in additional keys. When the agent has no input_schema, omit this field and use 'intent' instead."
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Optional semantic version of the agent to execute. When omitted, the latest deployed version is used."
+                },
+                "attachments": {
+                    "type": "array",
+                    "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                    "items": {
+                        "type": "object",
+                        "required": ["volume_id", "path", "name", "mime_type", "size"],
+                        "properties": {
+                            "volume_id": { "type": "string" },
+                            "path":      { "type": "string" },
+                            "name":      { "type": "string" },
+                            "mime_type": { "type": "string" },
+                            "size":      { "type": "integer" },
+                            "sha256":    { "type": "string" }
+                        }
+                    }
+                }
+            },
+            "required": ["agent_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.task.status` builtin tool.
+    fn schema_aegis_task_status() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution to check."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.task.wait` builtin tool.
+    fn schema_aegis_task_wait() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution to wait for."
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "description": "Seconds between status polls (default 10).",
+                    "minimum": 1
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Maximum seconds to wait before returning a timeout (default 300).",
+                    "minimum": 1
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.wait` builtin tool.
+    fn schema_aegis_agent_wait() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution to wait for."
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "description": "Seconds between status polls (default 10).",
+                    "minimum": 1
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Maximum seconds to wait before returning a timeout (default 300).",
+                    "minimum": 1
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.task.logs` builtin tool.
+    fn schema_aegis_task_logs() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution whose event log should be retrieved."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of events to return.",
+                    "default": 50
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Zero-based starting offset into the persisted event log.",
+                    "default": 0
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.task.list` builtin tool.
+    fn schema_aegis_task_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional UUID to filter by agent."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results.",
+                    "default": 20
+                }
+            }
+        })
+    }
+
+    /// JSON schema for the `aegis.task.cancel` builtin tool.
+    fn schema_aegis_task_cancel() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution to cancel."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.task.remove` builtin tool.
+    fn schema_aegis_task_remove() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution to remove."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.system.info` builtin tool.
+    fn schema_aegis_system_info() -> Value {
+        json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    /// JSON schema for the `aegis.system.config` builtin tool.
+    fn schema_aegis_system_config() -> Value {
+        json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    /// JSON schema for the `aegis.edge.fleet.list` builtin tool.
+    fn schema_aegis_edge_fleet_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "description": "EdgeTarget: { Node: '...' } | { Group: '...' } | { Selector: { os, arch, tools, labels, tags } } | 'All'."
+                }
+            },
+            "required": ["target"]
+        })
+    }
+
+    /// JSON schema for the `aegis.edge.fleet.invoke` builtin tool.
+    fn schema_aegis_edge_fleet_invoke() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": { "description": "EdgeTarget — see aegis.edge.fleet.list." },
+                "tool_name": { "type": "string", "description": "Name of the tool to dispatch on every resolved edge daemon." },
+                "args": { "type": "object", "description": "JSON object of tool arguments." }
+            },
+            "required": ["target", "tool_name"]
+        })
+    }
+
+    /// JSON schema for the `aegis.edge.fleet.cancel` builtin tool.
+    fn schema_aegis_edge_fleet_cancel() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "fleet_command_id": { "type": "string", "description": "UUID returned by aegis.edge.fleet.invoke." }
+            },
+            "required": ["fleet_command_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.agent.search` builtin tool.
+    fn schema_aegis_agent_search() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language description of the agent you are looking for."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant ID to search within. Defaults to current tenant."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results (1-100, tier-dependent cap). Default: 10."
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": "Minimum relevance score threshold (0.0-1.0). Default: 0.3."
+                },
+                "labels": {
+                    "type": "object",
+                    "description": "Label key-value pairs to filter by. All must match.",
+                    "additionalProperties": { "type": "string" }
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Filter by agent status.",
+                    "enum": ["active", "paused", "failed"]
+                },
+                "include_platform_templates": {
+                    "type": "boolean",
+                    "description": "Include platform-provided template agents. Default: true."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.search` builtin tool.
+    fn schema_aegis_workflow_search() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language description of the workflow you are looking for."
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tenant ID to search within. Defaults to current tenant."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results (1-100, tier-dependent cap). Default: 10."
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": "Minimum relevance score threshold (0.0-1.0). Default: 0.3."
+                },
+                "labels": {
+                    "type": "object",
+                    "description": "Label key-value pairs to filter by. All must match.",
+                    "additionalProperties": { "type": "string" }
+                },
+                "include_platform_templates": {
+                    "type": "boolean",
+                    "description": "Include platform-provided template workflows. Default: true."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    /// JSON schema for the `aegis.workflow.create` builtin tool.
+    fn schema_aegis_workflow_create() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "manifest_yaml": {
+                    "type": "string",
+                    "description": "Full Workflow manifest YAML to parse, validate, semantically judge, and register."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Overwrite an existing version if it already exists."
+                },
+                "task_context": {
+                    "type": "string",
+                    "description": "Optional task context to guide semantic judges."
+                },
+                "judge_agents": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Judge agent names to use for semantic validation."
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": "Minimum consensus score required for deployment."
+                },
+                "min_confidence": {
+                    "type": "number",
+                    "description": "Minimum consensus confidence required for deployment."
+                }
+            },
+            "required": ["manifest_yaml"]
+        })
+    }
+
+    /// JSON schema for the `aegis.runtime.list` builtin tool.
+    fn schema_aegis_runtime_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "description": "Optional: filter by language name (e.g. \"python\", \"go\")"
+                }
+            }
+        })
+    }
+
+    /// JSON schema for the `aegis.execution.file` builtin tool.
+    fn schema_aegis_execution_file() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "The execution ID."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File path (e.g. 'output.md' or '/workspace/output.md')."
+                }
+            },
+            "required": ["execution_id", "path"]
+        })
+    }
+
+    /// JSON schema for the `aegis.attachment.read` builtin tool.
+    fn schema_aegis_attachment_read() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "volume_id": {
+                    "type": "string",
+                    "description": "UUID of the tenant-scoped volume containing the attachment."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "POSIX path of the attachment within the volume."
+                }
+            },
+            "required": ["volume_id", "path"]
+        })
     }
 
     /// Returns `true` if the operator has flagged `tool_name` to bypass the inner-loop
@@ -2340,5 +2590,223 @@ mod tests {
         // `tasklist /NH` with a non-matching PID filter typically emits empty
         // stdout. Empty input must yield false (process not alive).
         assert!(!parse_tasklist_csv_for_pid("", 4242));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for the builtin tool registry consolidation.
+    //
+    // Prior to consolidation the registry was fragmented across four
+    // separate constants (`BUILTIN_TOOL_DEFINITIONS` as `(name, description)`
+    // tuples, plus three sibling `&[&str]` slices: `SKIP_JUDGE_TOOLS`,
+    // `EDGE_EXECUTOR_TOOLS`, `FLEET_CAPABLE_TOOLS`). These tests freeze the
+    // pre-consolidation membership of each sibling slice and assert that the
+    // corresponding boolean flag on every consolidated `BuiltinToolDefinition`
+    // remains `true`. They are deliberately written as test-as-checklist:
+    // each list is hard-coded so future drift is caught here, not in
+    // production.
+    // -----------------------------------------------------------------------
+
+    /// Pre-consolidation `SKIP_JUDGE_TOOLS` membership (frozen).
+    const FROZEN_SKIP_JUDGE_TOOLS: &[&str] = &[
+        "fs.read",
+        "fs.list",
+        "fs.grep",
+        "fs.glob",
+        "web.search",
+        "web.fetch",
+        "aegis.schema.get",
+        "aegis.schema.validate",
+        "aegis.agent.create",
+        "aegis.agent.update",
+        "aegis.agent.delete",
+        "aegis.workflow.create",
+        "aegis.workflow.update",
+        "aegis.workflow.list",
+        "aegis.workflow.export",
+        "aegis.workflow.validate",
+        "aegis.workflow.status",
+        "aegis.workflow.logs",
+        "aegis.workflow.executions.list",
+        "aegis.workflow.executions.get",
+        "aegis.workflow.wait",
+        "aegis.workflow.cancel",
+        "aegis.workflow.signal",
+        "aegis.workflow.remove",
+        "aegis.workflow.search",
+        "aegis.agent.list",
+        "aegis.agent.export",
+        "aegis.agent.logs",
+        "aegis.agent.search",
+        "aegis.task.status",
+        "aegis.task.list",
+        "aegis.task.logs",
+        "aegis.task.wait",
+        "aegis.agent.wait",
+        "aegis.execute.status",
+        "aegis.execute.wait",
+        "aegis.tools.list",
+        "aegis.tools.search",
+        "aegis.system.info",
+        "aegis.system.config",
+        "aegis.runtime.list",
+        "aegis.execution.file",
+        "aegis.attachment.read",
+        "aegis.edge.fleet.list",
+        "aegis.edge.fleet.invoke",
+        "aegis.edge.fleet.cancel",
+    ];
+
+    /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).
+    const FROZEN_EDGE_EXECUTOR_TOOLS: &[&str] = &[
+        "aegis.edge.fleet.list",
+        "aegis.edge.fleet.invoke",
+        "aegis.edge.fleet.cancel",
+    ];
+
+    /// Pre-consolidation `FLEET_CAPABLE_TOOLS` membership (frozen).
+    const FROZEN_FLEET_CAPABLE_TOOLS: &[&str] = &["aegis.edge.fleet.invoke"];
+
+    #[test]
+    fn every_skip_judge_tool_in_old_list_remains_skip_judge() {
+        for name in FROZEN_SKIP_JUDGE_TOOLS {
+            let def = BuiltinToolDefinition::lookup(name).unwrap_or_else(|| {
+                panic!(
+                    "tool `{name}` from frozen SKIP_JUDGE_TOOLS list is missing from \
+                     BUILTIN_TOOL_DEFINITIONS"
+                )
+            });
+            assert!(
+                def.skip_judge,
+                "tool `{name}` was in SKIP_JUDGE_TOOLS before consolidation but \
+                 BuiltinToolDefinition::skip_judge is now false — regression!"
+            );
+        }
+    }
+
+    #[test]
+    fn every_edge_executor_tool_in_old_list_remains_edge_executor() {
+        for name in FROZEN_EDGE_EXECUTOR_TOOLS {
+            let def = BuiltinToolDefinition::lookup(name).unwrap_or_else(|| {
+                panic!(
+                    "tool `{name}` from frozen EDGE_EXECUTOR_TOOLS list is missing from \
+                     BUILTIN_TOOL_DEFINITIONS"
+                )
+            });
+            assert!(
+                def.edge_executor,
+                "tool `{name}` was in EDGE_EXECUTOR_TOOLS before consolidation but \
+                 BuiltinToolDefinition::edge_executor is now false — regression!"
+            );
+        }
+    }
+
+    #[test]
+    fn every_fleet_capable_tool_in_old_list_remains_fleet_capable() {
+        for name in FROZEN_FLEET_CAPABLE_TOOLS {
+            let def = BuiltinToolDefinition::lookup(name).unwrap_or_else(|| {
+                panic!(
+                    "tool `{name}` from frozen FLEET_CAPABLE_TOOLS list is missing from \
+                     BUILTIN_TOOL_DEFINITIONS"
+                )
+            });
+            assert!(
+                def.fleet_capable,
+                "tool `{name}` was in FLEET_CAPABLE_TOOLS before consolidation but \
+                 BuiltinToolDefinition::fleet_capable is now false — regression!"
+            );
+        }
+    }
+
+    #[test]
+    fn no_unexpected_skip_judge_flags_outside_frozen_set() {
+        // Every tool with `skip_judge == true` in the registry must appear in
+        // the frozen pre-consolidation list. Catches the inverse drift:
+        // accidentally flagging a tool that was previously NOT skip-judge.
+        let frozen: std::collections::HashSet<&str> =
+            FROZEN_SKIP_JUDGE_TOOLS.iter().copied().collect();
+        for def in BUILTIN_TOOL_DEFINITIONS {
+            if def.skip_judge {
+                assert!(
+                    frozen.contains(def.name),
+                    "tool `{}` is now flagged skip_judge but was not in the frozen \
+                     pre-consolidation list — was this an intentional behavior change?",
+                    def.name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_supported_builtin_workflow_tool_derives_from_registry() {
+        // Every aegis.workflow.* / aegis.execute.* tool present in the
+        // canonical registry must be reported as supported.
+        for def in BUILTIN_TOOL_DEFINITIONS {
+            if def.name.starts_with("aegis.workflow.") || def.name.starts_with("aegis.execute.") {
+                assert!(
+                    ToolRouter::is_supported_builtin_workflow_tool(def.name),
+                    "registry-listed tool `{}` should be reported as a supported \
+                     builtin workflow tool",
+                    def.name,
+                );
+            }
+        }
+
+        // Nonsense names with the right prefix must be rejected.
+        assert!(!ToolRouter::is_supported_builtin_workflow_tool(
+            "aegis.workflow.does_not_exist"
+        ));
+        assert!(!ToolRouter::is_supported_builtin_workflow_tool(
+            "aegis.execute.bogus"
+        ));
+
+        // Non-prefix tools must be rejected even if they are in the registry.
+        assert!(!ToolRouter::is_supported_builtin_workflow_tool("cmd.run"));
+        assert!(!ToolRouter::is_supported_builtin_workflow_tool("fs.read"));
+
+        // Wholly unknown tool names must be rejected.
+        assert!(!ToolRouter::is_supported_builtin_workflow_tool(
+            "totally.unrelated.tool"
+        ));
+    }
+
+    #[test]
+    fn schema_for_builtin_returns_specific_schema_for_known_tool() {
+        // aegis.workflow.create — manifest_yaml must be required.
+        let wf_create = ToolRouter::schema_for_builtin("aegis.workflow.create");
+        assert_eq!(wf_create["type"], json!("object"));
+        let wf_required = wf_create["required"]
+            .as_array()
+            .expect("aegis.workflow.create must declare a `required` array");
+        assert!(
+            wf_required
+                .iter()
+                .any(|v| v.as_str() == Some("manifest_yaml")),
+            "aegis.workflow.create.required must include `manifest_yaml`, got {wf_required:?}"
+        );
+        assert!(
+            wf_create["properties"]["manifest_yaml"].is_object(),
+            "aegis.workflow.create.properties.manifest_yaml must exist"
+        );
+
+        // aegis.runtime.list — properties.language is the only declared field.
+        let rt_list = ToolRouter::schema_for_builtin("aegis.runtime.list");
+        assert_eq!(rt_list["type"], json!("object"));
+        assert!(
+            rt_list["properties"]["language"].is_object(),
+            "aegis.runtime.list.properties.language must exist"
+        );
+
+        // cmd.run — `command` required.
+        let cmd_run = ToolRouter::schema_for_builtin("cmd.run");
+        let cmd_required = cmd_run["required"]
+            .as_array()
+            .expect("cmd.run must declare a `required` array");
+        assert!(cmd_required.iter().any(|v| v.as_str() == Some("command")));
+    }
+
+    #[test]
+    fn schema_for_builtin_returns_empty_object_for_unknown_tool() {
+        let bogus = ToolRouter::schema_for_builtin("totally.unknown.tool");
+        assert_eq!(bogus, json!({ "type": "object" }));
     }
 }
