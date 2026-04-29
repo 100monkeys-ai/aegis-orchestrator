@@ -48,6 +48,7 @@ pub mod cortex_client;
 pub mod db;
 pub mod discovery;
 pub mod docker;
+pub mod edge;
 pub mod event_bus;
 pub mod fuse;
 pub mod human_input_service;

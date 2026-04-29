@@ -240,6 +240,70 @@ pub enum EdgeRouterError {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Repository traits
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[async_trait::async_trait]
+pub trait EdgeDaemonRepository: Send + Sync {
+    async fn upsert(&self, edge: &EdgeDaemon) -> anyhow::Result<()>;
+    async fn get(&self, node_id: &NodeId) -> anyhow::Result<Option<EdgeDaemon>>;
+    async fn list_by_tenant(&self, tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>>;
+    async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()>;
+    async fn update_tags(&self, node_id: &NodeId, tags: &[String]) -> anyhow::Result<()>;
+    async fn update_capabilities(
+        &self,
+        node_id: &NodeId,
+        capabilities: &EdgeCapabilities,
+    ) -> anyhow::Result<()>;
+    async fn delete(&self, node_id: &NodeId) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnrollmentTokenError {
+    #[error("token already redeemed")]
+    AlreadyRedeemed,
+    #[error("token not found")]
+    NotFound,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+#[async_trait::async_trait]
+pub trait EnrollmentTokenRepository: Send + Sync {
+    /// Atomically record the enrollment. Returns `Err(AlreadyRedeemed)` if
+    /// the JTI was previously inserted.
+    async fn redeem(
+        &self,
+        jti: Uuid,
+        tenant_id: &TenantId,
+        issued_to: &str,
+        exp: DateTime<Utc>,
+    ) -> Result<(), EnrollmentTokenError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EdgeGroupRepoError {
+    #[error("group with name already exists for tenant")]
+    GroupExists,
+    #[error("group not found")]
+    NotFound,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+#[async_trait::async_trait]
+pub trait EdgeGroupRepository: Send + Sync {
+    async fn create(&self, group: &EdgeGroup) -> Result<(), EdgeGroupRepoError>;
+    async fn get(&self, id: &EdgeGroupId) -> Result<Option<EdgeGroup>, EdgeGroupRepoError>;
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError>;
+    async fn update(&self, group: &EdgeGroup) -> Result<(), EdgeGroupRepoError>;
+    async fn delete(&self, id: &EdgeGroupId) -> Result<(), EdgeGroupRepoError>;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
