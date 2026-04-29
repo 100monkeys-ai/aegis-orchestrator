@@ -25,6 +25,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::Mutex;
 
+/// In-memory `EdgeDaemonRepository` test double for tenant-isolation
+/// scenarios; mutations fake persistence behind a `Mutex<HashMap>`.
 #[derive(Default)]
 struct StubRepo {
     edges: Mutex<HashMap<NodeId, EdgeDaemon>>,
@@ -77,6 +79,9 @@ impl EdgeDaemonRepository for StubRepo {
     }
 }
 
+/// In-memory `EdgeGroupRepository` test double; rejects duplicate
+/// `(tenant_id, name)` with `GroupExists` to mirror the SQL UNIQUE
+/// constraint enforced by the production Postgres repo.
 #[derive(Default)]
 struct StubGroups {
     groups: Mutex<HashMap<EdgeGroupId, EdgeGroup>>,
@@ -120,6 +125,9 @@ impl EdgeGroupRepository for StubGroups {
     }
 }
 
+/// Builds a minimal `EdgeDaemon` in `Disconnected` state for selector
+/// and tag tests. Caller supplies the tenant, tags, and OS; all other
+/// capabilities default to lab-friendly stable values.
 fn make_edge(tenant: &TenantId, tags: &[&str], os: &str) -> EdgeDaemon {
     EdgeDaemon {
         node_id: NodeId::new(),

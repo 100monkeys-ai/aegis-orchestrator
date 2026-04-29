@@ -753,6 +753,9 @@ mod tests {
     use aegis_orchestrator_core::domain::security_context::{Capability, SecurityContextMetadata};
     use ed25519_dalek::{Verifier, VerifyingKey};
 
+    /// Builds a minimal `SecurityContext` for policy-evaluation tests:
+    /// allows `cmd.run` against `/bin/echo` only, with no other capabilities
+    /// or deny-list entries. Caller supplies the context name.
     fn build_test_security_context(name: &str) -> SecurityContext {
         SecurityContext {
             name: name.to_string(),

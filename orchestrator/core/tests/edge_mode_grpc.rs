@@ -56,6 +56,8 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::ExecutionEvent;
 use aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry;
 
+/// In-memory `EdgeDaemonRepository` test double for the in-process tonic
+/// round-trip suite; mutations fake persistence behind a `Mutex<HashMap>`.
 #[derive(Default)]
 struct StubEdgeRepo {
     edges: Mutex<HashMap<NodeId, EdgeDaemon>>,
@@ -110,7 +112,8 @@ impl EdgeDaemonRepository for StubEdgeRepo {
 
 /// Minimal `NodeClusterService` impl: only `connect_edge` is wired; every
 /// other RPC returns `Status::unimplemented`. Sufficient for round-trip
-/// coverage of the edge mode bidi surface.
+/// coverage of the edge mode bidi surface — accidental coupling to other
+/// RPCs in tests will surface as an `unimplemented` status.
 struct EdgeOnlyClusterService {
     connect_edge: Arc<ConnectEdgeService>,
 }
@@ -213,6 +216,10 @@ fn fake_node_jwt(node_id: NodeId) -> String {
     format!("{header}.{payload}.{sig}")
 }
 
+/// Builds a minimal `EdgeDaemon` for the in-process tonic round-trip
+/// suite — same shape as the `make_edge` helper in `edge_mode.rs` but
+/// kept local (and named differently to reflect the different signature)
+/// to avoid a `tests/common` module just for two integration files.
 fn make_test_edge(node_id: NodeId, tenant: &TenantId) -> EdgeDaemon {
     EdgeDaemon {
         node_id,
@@ -241,7 +248,10 @@ async fn spawn_edge_only_server(
 ) -> (String, tokio::sync::oneshot::Sender<()>) {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l,
-        Err(_) => TcpListener::bind("[::1]:0").await.expect("bind loopback"),
+        Err(v4_err) => match TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(v6_err) => panic!("failed to bind 127.0.0.1:0 ({v4_err}) and [::1]:0 ({v6_err})"),
+        },
     };
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
     let url = format!("http://{addr}");
