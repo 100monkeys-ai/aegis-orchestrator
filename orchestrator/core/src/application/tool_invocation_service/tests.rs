@@ -123,6 +123,9 @@ impl EnvelopeVerifier for DummyEnvelope {
     fn extract_arguments(&self) -> Option<Value> {
         Some(serde_json::json!({}))
     }
+    fn replay_nonce(&self) -> String {
+        format!("dummy-nonce-{}", self.token)
+    }
 }
 
 use crate::domain::agent::{Agent, AgentManifest, AgentStatus};
@@ -1876,6 +1879,9 @@ async fn test_invoke_tool_execution_modes() {
         }
         fn extract_arguments(&self) -> Option<Value> {
             Some(serde_json::json!({}))
+        }
+        fn replay_nonce(&self) -> String {
+            format!("dummy-remote-nonce-{}", self.token)
         }
     }
 

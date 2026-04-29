@@ -87,6 +87,8 @@ fn build_minimal_workflow(name: &str) -> Workflow {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states,
+            storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .expect("workflow")

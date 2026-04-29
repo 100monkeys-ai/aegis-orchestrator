@@ -1180,11 +1180,26 @@ impl ToolInvocationService {
             "aegis.runtime.list" => Some(self.invoke_aegis_runtime_list_tool(args).await),
 
             // ── File operations (aegis.file.*) ─────────────────────────
-            "aegis.file.list" => Some(self.invoke_aegis_file_list(args, caller_identity).await),
-            "aegis.file.read" => Some(self.invoke_aegis_file_read(args, caller_identity).await),
-            "aegis.file.write" => Some(self.invoke_aegis_file_write(args, caller_identity).await),
-            "aegis.file.delete" => Some(self.invoke_aegis_file_delete(args, caller_identity).await),
-            "aegis.file.mkdir" => Some(self.invoke_aegis_file_mkdir(args, caller_identity).await),
+            "aegis.file.list" => Some(
+                self.invoke_aegis_file_list(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.file.read" => Some(
+                self.invoke_aegis_file_read(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.file.write" => Some(
+                self.invoke_aegis_file_write(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.file.delete" => Some(
+                self.invoke_aegis_file_delete(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.file.mkdir" => Some(
+                self.invoke_aegis_file_mkdir(args, caller_identity, tenant_scope)
+                    .await,
+            ),
 
             // ── Volume operations (aegis.volume.*) ─────────────────────
             "aegis.volume.create" => Some(

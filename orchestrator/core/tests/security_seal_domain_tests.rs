@@ -157,6 +157,10 @@ impl EnvelopeVerifier for MockEnvelope {
     fn extract_arguments(&self) -> Option<serde_json::Value> {
         self.arguments.clone()
     }
+
+    fn replay_nonce(&self) -> String {
+        format!("mock-nonce-{}", self.token)
+    }
 }
 
 // ============================================================================

@@ -644,7 +644,8 @@ pub(crate) async fn upload_file(
     validate_dest_path(&params.path)?;
 
     let vol_id =
-        resolve_or_provision_upload_volume(&state, &id_or_name, tenant_id, &owner, &tier).await?;
+        resolve_or_provision_upload_volume(&state, &id_or_name, tenant_id.clone(), &owner, &tier)
+            .await?;
 
     // Resolve the per-tier upload cap. Fail closed: an unknown tier rejects
     // the upload rather than falling back to an unbounded ceiling.

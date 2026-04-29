@@ -1516,8 +1516,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         };
 
     // ─── Credential Management Service (BC-11, ADR-078) ────────────────────────
-    let credential_service: Option<Arc<dyn CredentialManagementService>> =
-        db_pool.as_ref().map(|pool| {
+    let credential_service: Option<Arc<dyn CredentialManagementService>> = match db_pool.as_ref() {
+        None => None,
+        Some(pool) => {
             let repo = Arc::new(PostgresCredentialBindingRepository::new(pool.clone()))
                 as Arc<dyn CredentialBindingRepository>;
             // OAuth provider registry (RFC 6749 §4.1.3 token exchange). Empty
@@ -1532,13 +1533,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             validate_oauth_provider_registry(&registry)
                 .context("OAuth provider registry failed startup validation")?;
             let oauth_providers = Arc::new(registry);
-            Arc::new(StandardCredentialManagementService::new(
+            Some(Arc::new(StandardCredentialManagementService::new(
                 repo,
                 secrets_manager.clone(),
                 event_bus.clone(),
                 oauth_providers,
-            )) as Arc<dyn CredentialManagementService>
-        });
+            )) as Arc<dyn CredentialManagementService>)
+        }
+    };
 
     // ─── Container Step Runner (ADR-050) ──────────────────────────────────────
     // Dedicated Docker client + image manager + step runner for CI/CD container

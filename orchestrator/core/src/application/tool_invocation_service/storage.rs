@@ -76,20 +76,22 @@ fn not_configured(tool: &str, service: &str) -> ToolResult {
 impl ToolInvocationService {
     pub(super) async fn invoke_aegis_file_list(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.file_operations_service {
             Some(s) => s,
             None => return not_configured("aegis.file.list", "file operations service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
         let volume_id = require_str(args, "volume_id")?;
         let path = require_str(args, "path")?;
         let owner = user_sub(caller);
         let vid = parse_volume_id(volume_id)?;
 
         let entries = svc
-            .list_directory(&vid, &owner, path)
+            .list_directory(&vid, &tenant_id, &owner, path)
             .await
             .map_err(internal_err)?;
 
@@ -98,20 +100,22 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_file_read(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.file_operations_service {
             Some(s) => s,
             None => return not_configured("aegis.file.read", "file operations service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
         let volume_id = require_str(args, "volume_id")?;
         let path = require_str(args, "path")?;
         let owner = user_sub(caller);
         let vid = parse_volume_id(volume_id)?;
 
         let content = svc
-            .read_file(&vid, &owner, path)
+            .read_file(&vid, &tenant_id, &owner, path)
             .await
             .map_err(internal_err)?;
 
@@ -128,13 +132,15 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_file_write(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.file_operations_service {
             Some(s) => s,
             None => return not_configured("aegis.file.write", "file operations service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
         let volume_id = require_str(args, "volume_id")?;
         let path = require_str(args, "path")?;
         let content = require_str(args, "content")?;
@@ -142,7 +148,7 @@ impl ToolInvocationService {
         let tier = user_tier(caller);
         let vid = parse_volume_id(volume_id)?;
 
-        svc.write_file_for_tier(&vid, &owner, path, content.as_bytes(), &tier)
+        svc.write_file_for_tier(&vid, &tenant_id, &owner, path, content.as_bytes(), &tier)
             .await
             .map_err(internal_err)?;
 
@@ -151,19 +157,21 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_file_delete(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.file_operations_service {
             Some(s) => s,
             None => return not_configured("aegis.file.delete", "file operations service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
         let volume_id = require_str(args, "volume_id")?;
         let path = require_str(args, "path")?;
         let owner = user_sub(caller);
         let vid = parse_volume_id(volume_id)?;
 
-        svc.delete_path(&vid, &owner, path)
+        svc.delete_path(&vid, &tenant_id, &owner, path)
             .await
             .map_err(internal_err)?;
 
@@ -172,19 +180,21 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_file_mkdir(
         &self,
-        args: &Value,
+        args: &mut Value,
         caller: Option<&UserIdentity>,
+        scope: &crate::domain::iam::TenantScope,
     ) -> ToolResult {
         let svc = match &self.file_operations_service {
             Some(s) => s,
             None => return not_configured("aegis.file.mkdir", "file operations service"),
         };
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
         let volume_id = require_str(args, "volume_id")?;
         let path = require_str(args, "path")?;
         let owner = user_sub(caller);
         let vid = parse_volume_id(volume_id)?;
 
-        svc.create_directory(&vid, &owner, path)
+        svc.create_directory(&vid, &tenant_id, &owner, path)
             .await
             .map_err(internal_err)?;
 

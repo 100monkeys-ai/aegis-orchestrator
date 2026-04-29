@@ -267,6 +267,7 @@ mod tests {
             Duration::from_secs(30),
             margin,
             signing_key,
+            "test-enrolment-token".to_string(),
         );
 
         // The field is accessible without an underscore prefix — this would fail

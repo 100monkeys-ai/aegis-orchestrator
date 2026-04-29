@@ -19,6 +19,7 @@ pub struct AttestNodeRequest {
     pub enrolment_token: String,
 }
 
+#[derive(Debug)]
 pub struct AttestNodeResponse {
     pub challenge_nonce: Vec<u8>,
     pub challenge_id: uuid::Uuid,

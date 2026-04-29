@@ -259,6 +259,7 @@ pub struct StoreApiKeyCommand {
 // ============================================================================
 
 /// Return value of [`CredentialManagementService::initiate_oauth_connection`].
+#[derive(Debug)]
 pub struct OAuthInitiation {
     /// The provider's authorization URL the client must redirect to.
     pub authorization_url: String,

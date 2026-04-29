@@ -1063,7 +1063,7 @@ mod tests {
         let volume = Volume::new(
             "audit-002-4-31".to_string(),
             TenantId::system(),
-            StorageClass::Ephemeral,
+            StorageClass::ephemeral_hours(1),
             VolumeBackend::SeaweedFS {
                 filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
                 remote_path: "/aegis/seaweedfs/test".to_string(),
