@@ -3323,6 +3323,12 @@ mod gateway_timeout_regression {
     /// `fetch_gateway_tools_grpc` returns Ok(empty) within ~6 seconds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fetch_gateway_tools_grpc_returns_empty_when_gateway_hangs() {
+        // The production code applies a 5s internal `list_tools` timeout.
+        // Both the outer test guard and the elapsed assertion sit just above
+        // that, leaving slack for scheduling without masking a hang.
+        const MAX_ELAPSED_SECS: u64 = 7;
+        const OUTER_TIMEOUT_SECS: u64 = 7;
+
         let observed = Arc::new(AtomicBool::new(false));
         let (url, _shutdown) = spawn_gateway(HungGateway {
             list_tools_observed: observed.clone(),
@@ -3332,11 +3338,11 @@ mod gateway_timeout_regression {
 
         let start = std::time::Instant::now();
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
+            std::time::Duration::from_secs(OUTER_TIMEOUT_SECS),
             service.fetch_gateway_tools_grpc(),
         )
         .await
-        .expect("fetch_gateway_tools_grpc must not hang past 8s");
+        .expect("fetch_gateway_tools_grpc must not hang past 7s");
         let elapsed = start.elapsed();
 
         let tools = result.expect("hang must downgrade to Ok(empty), not error");
@@ -3350,7 +3356,7 @@ mod gateway_timeout_regression {
             "stub gateway should have received the list_tools call"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(7),
+            elapsed < std::time::Duration::from_secs(MAX_ELAPSED_SECS),
             "gateway enumeration must respect the 5s list_tools timeout (took {:?})",
             elapsed
         );
