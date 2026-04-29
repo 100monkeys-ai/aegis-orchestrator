@@ -356,34 +356,37 @@ async fn send_result(
 /// * `security_context_name` matches the value on the outer
 ///   `InvokeToolCommand` (consistency check — protects against a server-side
 ///   bug substituting contexts in the inner envelope).
-fn verify_inner_envelope(envelope: &ProtoSealEnvelope, outer_scn: &str) -> Result<(), EdgeResult> {
+fn verify_inner_envelope(
+    envelope: &ProtoSealEnvelope,
+    outer_scn: &str,
+) -> Result<(), Box<EdgeResult>> {
     if envelope.user_security_token.trim().is_empty() {
-        return Err(error_result(
+        return Err(Box::new(error_result(
             "envelope_invalid",
             "inner SealEnvelope missing user_security_token",
-        ));
+        )));
     }
     let parts = envelope.user_security_token.split('.').count();
     if parts != 3 {
-        return Err(error_result(
+        return Err(Box::new(error_result(
             "envelope_invalid",
             "inner user_security_token is not a JWT (expected 3 dot segments)",
-        ));
+        )));
     }
     if envelope.tenant_id.trim().is_empty() {
-        return Err(error_result(
+        return Err(Box::new(error_result(
             "envelope_invalid",
             "inner SealEnvelope missing tenant_id",
-        ));
+        )));
     }
     if envelope.security_context_name != outer_scn {
-        return Err(error_result(
+        return Err(Box::new(error_result(
             "envelope_invalid",
             format!(
                 "inner SealEnvelope security_context_name '{}' does not match outer '{}'",
                 envelope.security_context_name, outer_scn
             ),
-        ));
+        )));
     }
     // TODO(adr-117): verify the Ed25519 signature on the inner envelope
     // against the originating principal's public key. Requires the daemon
@@ -397,12 +400,12 @@ fn verify_inner_envelope(envelope: &ProtoSealEnvelope, outer_scn: &str) -> Resul
 fn resolve_security_context<'a>(
     contexts: &'a [SecurityContext],
     name: &str,
-) -> Result<&'a SecurityContext, EdgeResult> {
+) -> Result<&'a SecurityContext, Box<EdgeResult>> {
     contexts.iter().find(|c| c.name == name).ok_or_else(|| {
-        error_result(
+        Box::new(error_result(
             "security_context_not_found",
             format!("SecurityContext '{name}' not present in merged config"),
-        )
+        ))
     })
 }
 
@@ -455,14 +458,14 @@ async fn handle_invoke_tool(
         }
     };
     if let Err(e) = verify_inner_envelope(envelope, &inv.security_context_name) {
-        return e;
+        return *e;
     }
 
     // 2. Resolve SecurityContext from merged config.
     let context = match resolve_security_context(&cfg.security_contexts, &inv.security_context_name)
     {
         Ok(c) => c,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
 
     // 3. Apply policy (deny-list + capability evaluation against tool args).

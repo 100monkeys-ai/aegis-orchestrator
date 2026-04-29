@@ -42,7 +42,7 @@ impl EdgeApiClient {
                             format!("https://{}", p.env)
                         }
                     })
-                    .ok_or_else(|| std::env::VarError::NotPresent)
+                    .ok_or(std::env::VarError::NotPresent)
             })
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
 

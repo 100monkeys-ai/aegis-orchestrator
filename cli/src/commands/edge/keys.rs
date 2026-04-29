@@ -186,11 +186,11 @@ fn schedule_archive_pruning(state_dir: &Path, keep_old: Duration) -> Result<()> 
 
 fn humanize(d: Duration) -> String {
     let secs = d.as_secs();
-    if secs % 86_400 == 0 {
+    if secs.is_multiple_of(86_400) {
         format!("{}d", secs / 86_400)
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")

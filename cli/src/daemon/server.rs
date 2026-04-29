@@ -25,6 +25,19 @@ type RepositoryTuple = (
     Arc<dyn aegis_orchestrator_core::domain::repository::ExecutionRepository>,
     Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository>,
 );
+
+// ADR-117: edge component bundle wired into the daemon HTTP surface and
+// pre-routing hook. Aliased to avoid clippy::type_complexity at the binding
+// site.
+type EdgeComponentsBundle = (
+    Arc<dyn aegis_orchestrator_core::domain::edge::EdgeDaemonRepository>,
+    Arc<dyn aegis_orchestrator_core::domain::edge::EdgeGroupRepository>,
+    aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry,
+    Arc<aegis_orchestrator_core::application::edge::dispatch_to_edge::DispatchToEdgeService>,
+    Arc<aegis_orchestrator_core::application::edge::fleet::EdgeFleetResolver>,
+    Arc<aegis_orchestrator_core::application::edge::fleet::dispatcher::FleetDispatcher>,
+    Arc<aegis_orchestrator_core::application::edge::fleet::CancelFleetService>,
+);
 use sqlx::postgres::PgPool;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
@@ -1639,15 +1652,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // `/api/edge/*` REST surface (constructed below) — we collect them here
     // and reuse them in the `EdgeApiState` bundle so there is exactly one
     // EdgeConnectionRegistry / FleetRegistry per process.
-    let edge_components: Option<(
-        Arc<dyn aegis_orchestrator_core::domain::edge::EdgeDaemonRepository>,
-        Arc<dyn aegis_orchestrator_core::domain::edge::EdgeGroupRepository>,
-        aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry,
-        Arc<aegis_orchestrator_core::application::edge::dispatch_to_edge::DispatchToEdgeService>,
-        Arc<aegis_orchestrator_core::application::edge::fleet::EdgeFleetResolver>,
-        Arc<aegis_orchestrator_core::application::edge::fleet::dispatcher::FleetDispatcher>,
-        Arc<aegis_orchestrator_core::application::edge::fleet::CancelFleetService>,
-    )> = if let Some(ref pool) = db_pool {
+    let edge_components: Option<EdgeComponentsBundle> = if let Some(ref pool) = db_pool {
         use aegis_orchestrator_core::application::edge::dispatch_to_edge::DispatchToEdgeService;
         use aegis_orchestrator_core::application::edge::fleet::dispatcher::FleetDispatcher;
         use aegis_orchestrator_core::application::edge::fleet::registry::FleetRegistry;
