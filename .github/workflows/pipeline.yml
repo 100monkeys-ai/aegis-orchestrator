@@ -18,6 +18,9 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: 100monkeys-ai/aegis-runtime
 
+permissions:
+  contents: read
+
 jobs:
   # ── Stage 1: All checks in parallel ────────────────────────────────────────
   fmt:
