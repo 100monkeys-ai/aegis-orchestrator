@@ -427,30 +427,38 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let operator_read_model = OperatorReadModelStore::spawn_collector(event_bus.clone());
     let swarm_service = Arc::new(StandardSwarmService::new());
     swarm_service.start_gc_task();
-    let iam_service: Option<Arc<dyn IdentityProvider>> = config.spec.iam.as_ref().map(|iam| {
-        let resolved_realms: Vec<IamRealmConfig> = iam
-            .realms
-            .iter()
-            .map(|realm| IamRealmConfig {
-                slug: resolve_env_value(&realm.slug).unwrap_or_else(|_| realm.slug.clone()),
-                issuer_url: resolve_env_value(&realm.issuer_url)
-                    .unwrap_or_else(|_| realm.issuer_url.clone()),
-                jwks_uri: resolve_env_value(&realm.jwks_uri)
-                    .unwrap_or_else(|_| realm.jwks_uri.clone()),
-                audience: resolve_env_value(&realm.audience)
-                    .unwrap_or_else(|_| realm.audience.clone()),
-                kind: resolve_env_value(&realm.kind).unwrap_or_else(|_| realm.kind.clone()),
-            })
-            .collect();
-        let resolved_iam = IamConfig {
-            realms: resolved_realms,
-            jwks_cache_ttl_seconds: iam.jwks_cache_ttl_seconds,
-            claims: iam.claims.clone(),
-            keycloak_admin: iam.keycloak_admin.clone(),
-        };
-        Arc::new(StandardIamService::new(&resolved_iam, event_bus.clone()))
-            as Arc<dyn IdentityProvider>
-    });
+    let iam_service: Option<Arc<dyn IdentityProvider>> = match config.spec.iam.as_ref() {
+        Some(iam) => {
+            let resolved_realms: Vec<IamRealmConfig> = iam
+                .realms
+                .iter()
+                .map(|realm| IamRealmConfig {
+                    slug: resolve_env_value(&realm.slug).unwrap_or_else(|_| realm.slug.clone()),
+                    issuer_url: resolve_env_value(&realm.issuer_url)
+                        .unwrap_or_else(|_| realm.issuer_url.clone()),
+                    jwks_uri: resolve_env_value(&realm.jwks_uri)
+                        .unwrap_or_else(|_| realm.jwks_uri.clone()),
+                    audience: resolve_env_value(&realm.audience)
+                        .unwrap_or_else(|_| realm.audience.clone()),
+                    kind: resolve_env_value(&realm.kind).unwrap_or_else(|_| realm.kind.clone()),
+                })
+                .collect();
+            let resolved_iam = IamConfig {
+                realms: resolved_realms,
+                jwks_cache_ttl_seconds: iam.jwks_cache_ttl_seconds,
+                claims: iam.claims.clone(),
+                keycloak_admin: iam.keycloak_admin.clone(),
+            };
+            // `StandardIamService::new` returns `IamError::Configuration` for
+            // malformed realms (unknown kind, malformed tenant slug). Surface
+            // that as a fatal boot error rather than panicking out of the
+            // YAML-load path.
+            let svc = StandardIamService::new(&resolved_iam, event_bus.clone())
+                .map_err(|e| anyhow::anyhow!("IAM service initialization failed: {e}"))?;
+            Some(Arc::new(svc) as Arc<dyn IdentityProvider>)
+        }
+        None => None,
+    };
 
     if config.is_production() && config.spec.iam.is_none() {
         anyhow::bail!(

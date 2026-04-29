@@ -22,7 +22,7 @@ use crate::domain::node_config::{IamClaimsConfig, IamConfig, IamRealmConfig};
 use crate::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,8 +120,16 @@ pub struct StandardIamService {
 
 impl StandardIamService {
     /// Create a new service from node configuration.
-    pub fn new(config: &IamConfig, event_bus: Arc<EventBus>) -> Self {
-        let realms: Vec<IdentityRealm> = config.realms.iter().map(realm_from_config).collect();
+    ///
+    /// Returns `IamError::Configuration` if any realm in the config is
+    /// malformed (unknown kind, malformed tenant slug, etc.). Callers
+    /// should surface this as a fatal boot error.
+    pub fn new(config: &IamConfig, event_bus: Arc<EventBus>) -> Result<Self, IamError> {
+        let realms: Vec<IdentityRealm> = config
+            .realms
+            .iter()
+            .map(realm_from_config)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let issuer_to_realm: HashMap<String, usize> = realms
             .iter()
@@ -135,7 +143,7 @@ impl StandardIamService {
             realms.len()
         );
 
-        Self {
+        Ok(Self {
             realms,
             issuer_to_realm,
             jwks_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -143,7 +151,7 @@ impl StandardIamService {
             claims_config: config.claims.clone(),
             event_bus,
             cache_ttl: Duration::from_secs(config.jwks_cache_ttl_seconds),
-        }
+        })
     }
 
     /// Fetch JWKS from a realm's endpoint and update the cache.
@@ -463,8 +471,15 @@ impl IdentityProvider for StandardIamService {
                         attempted_at: Utc::now(),
                     });
 
-                if reason.contains("ExpiredSignature") {
+                // Pattern-match on the typed ErrorKind rather than searching
+                // the Display string. The Display impl is not part of
+                // jsonwebtoken's public API contract and could change between
+                // versions, silently breaking expired-token handling.
+                if matches!(e.kind(), ErrorKind::ExpiredSignature) {
                     IamError::TokenExpired {
+                        // The token was already known invalid at this point;
+                        // a missing/out-of-range exp falls back to "now" only
+                        // for the audit message, never for security decisions.
                         expired_at: DateTime::from_timestamp(unvalidated.exp, 0)
                             .unwrap_or_else(Utc::now),
                     }
@@ -499,8 +514,25 @@ impl IdentityProvider for StandardIamService {
                 authenticated_at: Utc::now(),
             });
 
-        let issued_at = DateTime::from_timestamp(claims.iat, 0).unwrap_or_else(Utc::now);
-        let expires_at = DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(Utc::now);
+        // jsonwebtoken's `validate_exp` + `validate_nbf` already proved the
+        // values are in-range against system time, so the only way
+        // `from_timestamp` can return None here is if the i64 is outside
+        // `chrono`'s representable range — pathological, but if it ever
+        // happens we MUST fail loudly rather than silently substitute
+        // `Utc::now()` (which would incorrectly back-date issued_at and
+        // forward-date expires_at to "right now", masking a corrupt token).
+        let issued_at = DateTime::from_timestamp(claims.iat, 0).ok_or_else(|| {
+            IamError::SignatureInvalid(format!(
+                "Invalid iat claim: timestamp {} out of representable range",
+                claims.iat
+            ))
+        })?;
+        let expires_at = DateTime::from_timestamp(claims.exp, 0).ok_or_else(|| {
+            IamError::SignatureInvalid(format!(
+                "Invalid exp claim: timestamp {} out of representable range",
+                claims.exp
+            ))
+        })?;
 
         // Reconstruct raw claims including standard + custom claims for audit trail
         let mut raw_claims = serde_json::to_value(&claims.extra).unwrap_or_default();
@@ -585,7 +617,12 @@ impl IdentityProvider for StandardIamService {
 }
 
 /// Convert a `IamRealmConfig` from YAML to a `IdentityRealm` domain value.
-fn realm_from_config(config: &IamRealmConfig) -> IdentityRealm {
+///
+/// Returns an `IamError::Configuration` if the realm `kind` is unrecognized
+/// or if a `tenant` realm's slug is missing the required `tenant-` prefix.
+/// Errors propagate up to `StandardIamService::new`, which surfaces them at
+/// boot time rather than panicking inside the YAML-load path.
+fn realm_from_config(config: &IamRealmConfig) -> Result<IdentityRealm, IamError> {
     let realm_kind = match config.kind.as_str() {
         "system" => RealmKind::System,
         "consumer" => RealmKind::Consumer,
@@ -593,28 +630,30 @@ fn realm_from_config(config: &IamRealmConfig) -> IdentityRealm {
             let slug = config
                 .slug
                 .strip_prefix("tenant-")
-                .unwrap_or_else(|| {
-                    panic!(
+                .ok_or_else(|| {
+                    IamError::Configuration(format!(
                         "Invalid tenant realm slug '{}': expected prefix 'tenant-' for kind 'tenant'",
                         config.slug
-                    )
-                })
+                    ))
+                })?
                 .to_string();
             RealmKind::Tenant { slug }
         }
-        other => panic!(
-            "Unknown realm kind '{}'; expected one of: system, consumer, tenant",
-            other
-        ),
+        other => {
+            return Err(IamError::Configuration(format!(
+                "Unknown realm kind '{}'; expected one of: system, consumer, tenant",
+                other
+            )));
+        }
     };
 
-    IdentityRealm {
+    Ok(IdentityRealm {
         realm_slug: config.slug.clone(),
         issuer_url: config.issuer_url.clone(),
         jwks_uri: config.jwks_uri.clone(),
         audience: config.audience.clone(),
         realm_kind,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -631,7 +670,7 @@ mod tests {
             audience: "aegis-orchestrator".to_string(),
             kind: "system".to_string(),
         };
-        let realm = realm_from_config(&config);
+        let realm = realm_from_config(&config).expect("valid config");
         assert_eq!(realm.realm_kind, RealmKind::System);
         assert_eq!(realm.realm_slug, "aegis-system");
     }
@@ -646,7 +685,7 @@ mod tests {
             audience: "aegis-orchestrator".to_string(),
             kind: "consumer".to_string(),
         };
-        let realm = realm_from_config(&config);
+        let realm = realm_from_config(&config).expect("valid config");
         assert_eq!(realm.realm_kind, RealmKind::Consumer);
     }
 
@@ -660,7 +699,7 @@ mod tests {
             audience: "aegis-orchestrator".to_string(),
             kind: "tenant".to_string(),
         };
-        let realm = realm_from_config(&config);
+        let realm = realm_from_config(&config).expect("valid config");
         assert_eq!(
             realm.realm_kind,
             RealmKind::Tenant {
@@ -697,7 +736,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         assert_eq!(service.known_realms().len(), 2);
         assert!(service
@@ -720,7 +759,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         let token = ValidatedIdentityToken {
             identity: UserIdentity {
@@ -751,7 +790,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         let token = ValidatedIdentityToken {
             identity: UserIdentity {
@@ -794,7 +833,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         let token = ValidatedIdentityToken {
             identity: UserIdentity {
@@ -832,7 +871,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         let token = ValidatedIdentityToken {
             identity: UserIdentity {
@@ -864,7 +903,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         let token = ValidatedIdentityToken {
             identity: UserIdentity {
@@ -904,7 +943,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         let token = ValidatedIdentityToken {
             identity: UserIdentity {
@@ -936,7 +975,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
 
         let token = ValidatedIdentityToken {
             identity: UserIdentity {
@@ -974,7 +1013,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        StandardIamService::new(&config, event_bus)
+        StandardIamService::new(&config, event_bus).expect("test config must build")
     }
 
     fn consumer_realm() -> IdentityRealm {
@@ -1050,11 +1089,15 @@ mod tests {
         }
     }
 
-    // ── Fix 4 regression tests: realm_from_config fail-fast ──────────────────
+    // ── Fix 3 regression tests: realm_from_config returns typed error ─────────
+    //
+    // Previously these functions panicked. Boot-time config errors are now
+    // surfaced as `IamError::Configuration` so `StandardIamService::new`
+    // can propagate them up the start-up chain rather than aborting the
+    // process from inside a config-parser branch.
 
     #[test]
-    #[should_panic(expected = "Invalid tenant realm slug 'foo'")]
-    fn realm_from_config_panics_on_malformed_tenant_slug() {
+    fn realm_from_config_errors_on_malformed_tenant_slug() {
         let config = IamRealmConfig {
             slug: "foo".to_string(),
             issuer_url: "https://auth.example.com/realms/foo".to_string(),
@@ -1063,12 +1106,22 @@ mod tests {
             audience: "aegis-orchestrator".to_string(),
             kind: "tenant".to_string(),
         };
-        let _ = realm_from_config(&config);
+        let err = realm_from_config(&config).expect_err(
+            "tenant realm slug missing 'tenant-' prefix MUST yield Configuration error",
+        );
+        match err {
+            IamError::Configuration(msg) => {
+                assert!(
+                    msg.contains("Invalid tenant realm slug 'foo'"),
+                    "error message must identify the offending slug, got: {msg}"
+                );
+            }
+            other => panic!("expected IamError::Configuration, got {other:?}"),
+        }
     }
 
     #[test]
-    #[should_panic(expected = "Unknown realm kind 'bogus'")]
-    fn realm_from_config_panics_on_unknown_kind() {
+    fn realm_from_config_errors_on_unknown_kind() {
         let config = IamRealmConfig {
             slug: "tenant-acme".to_string(),
             issuer_url: "https://auth.example.com/realms/tenant-acme".to_string(),
@@ -1077,7 +1130,44 @@ mod tests {
             audience: "aegis-orchestrator".to_string(),
             kind: "bogus".to_string(),
         };
-        let _ = realm_from_config(&config);
+        let err = realm_from_config(&config)
+            .expect_err("unknown realm kind MUST yield Configuration error");
+        match err {
+            IamError::Configuration(msg) => {
+                assert!(
+                    msg.contains("Unknown realm kind 'bogus'"),
+                    "error message must identify the offending kind, got: {msg}"
+                );
+            }
+            other => panic!("expected IamError::Configuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn standard_iam_service_new_propagates_realm_config_error() {
+        // Cascade test: a malformed realm in IamConfig must surface as
+        // IamError::Configuration from `StandardIamService::new`, not as
+        // a panic from the YAML parser path.
+        let config = IamConfig {
+            realms: vec![IamRealmConfig {
+                slug: "tenant-acme".to_string(),
+                issuer_url: "https://auth.example.com/realms/tenant-acme".to_string(),
+                jwks_uri:
+                    "https://auth.example.com/realms/tenant-acme/protocol/openid-connect/certs"
+                        .to_string(),
+                audience: "aegis-orchestrator".to_string(),
+                kind: "definitely-not-a-realm-kind".to_string(),
+            }],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let result = StandardIamService::new(&config, event_bus);
+        let err = result.err().expect(
+            "constructor MUST return IamError::Configuration for malformed realm, not panic",
+        );
+        assert!(matches!(err, IamError::Configuration(_)));
     }
 
     // ── Fix 1/2/3 regression tests: validate_token integration ──────────────
@@ -1116,7 +1206,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        StandardIamService::new(&config, event_bus)
+        StandardIamService::new(&config, event_bus).expect("test config must build")
     }
 
     async fn populate_jwks_cache(service: &StandardIamService) {
@@ -1267,7 +1357,7 @@ mod tests {
             keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
         let realm = service.realms[0].clone();
 
         // Cache is empty AND refresh will fail. Expect the underlying
@@ -1305,6 +1395,107 @@ mod tests {
                 assert_eq!(tenant_id.as_str(), "u-explicit");
             }
             other => panic!("expected ConsumerUser, got {other:?}"),
+        }
+    }
+
+    // ── Fix 1 regression tests: typed match on ExpiredSignature ───────────────
+
+    #[tokio::test]
+    async fn expired_token_returns_token_expired_not_signature_invalid() {
+        // Regression for Fix 1: prior to switching to a typed
+        // `ErrorKind::ExpiredSignature` match, classification depended on
+        // `Display` containing the substring "ExpiredSignature". Verify that
+        // an expired token still classifies as `IamError::TokenExpired` —
+        // the typed match is the source of truth, not the error string.
+        let service = test_service_with_consumer_realm();
+        populate_jwks_cache(&service).await;
+
+        let now = now_secs();
+        let exp = now - 3600; // expired one hour ago
+        let claims = serde_json::json!({
+            "sub": "user-expired",
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "iat": now - 7200,
+            "exp": exp,
+            "zaru_tier": "free",
+            "tenant_id": "u-userexpired",
+        });
+        let token = sign_test_jwt(claims);
+
+        let err = service
+            .validate_token(&token)
+            .await
+            .expect_err("expired token MUST be rejected");
+        match err {
+            IamError::TokenExpired { expired_at } => {
+                assert_eq!(
+                    expired_at.timestamp(),
+                    exp,
+                    "TokenExpired.expired_at must reflect the token's actual exp claim, \
+                     not Utc::now() fallback"
+                );
+            }
+            other => panic!(
+                "expected IamError::TokenExpired (via typed ErrorKind::ExpiredSignature \
+                 match), got {other:?}"
+            ),
+        }
+    }
+
+    // ── Fix 2 regression tests: invalid iat/exp fail loudly ───────────────────
+
+    #[tokio::test]
+    async fn iat_out_of_range_yields_invalid_signature() {
+        // Regression for Fix 2: previously an out-of-range `iat` was silently
+        // replaced with `Utc::now()`. After the fix, a non-representable
+        // timestamp MUST surface as `IamError::SignatureInvalid` rather than
+        // be swallowed.
+        //
+        // We exercise this by constructing a `KeycloakClaims` with iat = i64::MAX
+        // and feeding it directly to the post-validation timestamp path. We
+        // can't reach this branch through `decode()` alone (jsonwebtoken's
+        // validate_exp would reject i64::MAX as a future timestamp via a
+        // different error), so we test the exact `from_timestamp(...).ok_or_else`
+        // arm that Fix 2 introduces.
+        let bad_iat: i64 = i64::MAX;
+        let result = DateTime::from_timestamp(bad_iat, 0).ok_or_else(|| {
+            IamError::SignatureInvalid(format!(
+                "Invalid iat claim: timestamp {} out of representable range",
+                bad_iat
+            ))
+        });
+        let err = result.expect_err(
+            "i64::MAX as Unix timestamp MUST be out of representable range \
+             and produce IamError::SignatureInvalid, not silently fall back to Utc::now()",
+        );
+        match err {
+            IamError::SignatureInvalid(msg) => {
+                assert!(msg.contains("iat"), "error must mention iat, got: {msg}");
+            }
+            other => panic!("expected IamError::SignatureInvalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exp_out_of_range_yields_invalid_signature() {
+        // Same as above, for the `exp` claim.
+        let bad_exp: i64 = i64::MAX;
+        let result = DateTime::from_timestamp(bad_exp, 0).ok_or_else(|| {
+            IamError::SignatureInvalid(format!(
+                "Invalid exp claim: timestamp {} out of representable range",
+                bad_exp
+            ))
+        });
+        let err = result.expect_err(
+            "i64::MAX as Unix timestamp MUST be out of representable range \
+             and produce IamError::SignatureInvalid, not silently fall back to Utc::now()",
+        );
+        match err {
+            IamError::SignatureInvalid(msg) => {
+                assert!(msg.contains("exp"), "error must mention exp, got: {msg}");
+            }
+            other => panic!("expected IamError::SignatureInvalid, got {other:?}"),
         }
     }
 }

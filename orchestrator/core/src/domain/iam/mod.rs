@@ -354,6 +354,12 @@ pub enum IamError {
 
     #[error("JWT decode error: {0}")]
     DecodeError(String),
+
+    /// IAM configuration is malformed or invalid (e.g. unknown realm kind,
+    /// malformed tenant realm slug). Surfaced at boot time when parsing
+    /// `aegis-config.yaml` rather than via panic.
+    #[error("IAM configuration error: {0}")]
+    Configuration(String),
 }
 
 // ── Repository: RealmRepository ──────────────────────────────────────────────
