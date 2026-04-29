@@ -1091,19 +1091,17 @@ impl EventBus {
 
     /// Publish a workflow event
     pub fn publish_workflow_event(&self, event: WorkflowEvent) {
-        // ADR-087 §Observability: record agent cache hit when the pipeline reused an
-        // existing agent. Use the tenant_id carried on the event for per-tenant breakdown.
+        // ADR-087 §Observability: record agent cache hit when the pipeline
+        // reused an existing agent. Aggregated across all tenants — per-tenant
+        // labels are forbidden on Prometheus metrics (audit 002, finding 4.26)
+        // because they create unbounded cardinality and leak tenant IDs to
+        // scrapers.
         if let WorkflowEvent::IntentExecutionPipelineCompleted {
             reused_existing_agent: true,
-            tenant_id,
             ..
         } = &event
         {
-            metrics::counter!(
-                "zaru_intent_pipeline_agent_cache_hits_total",
-                "tenant_id" => tenant_id.as_str().to_owned()
-            )
-            .increment(1);
+            metrics::counter!("zaru_intent_pipeline_agent_cache_hits_total").increment(1);
         }
         self.publish(DomainEvent::Workflow(event));
     }
