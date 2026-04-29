@@ -180,8 +180,11 @@ impl StandardToolCatalog {
         let filtered: Vec<&CatalogEntry> = cache
             .iter()
             .filter(|e| {
-                permitted_tools.is_empty()
-                    || permitted_tools
+                // Deny-by-default: empty `permitted_tools` means no tools are visible,
+                // matching the SecurityContext invariant (security_context.rs: "An empty
+                // `capabilities` vec means **no tools are allowed** (most restrictive)").
+                !permitted_tools.is_empty()
+                    && permitted_tools
                         .iter()
                         .any(|p| Self::pattern_matches(p, &e.name))
             })
@@ -211,6 +214,9 @@ impl StandardToolCatalog {
 
     /// Search tools with keyword/filter criteria, scoped to the caller's permitted
     /// tool names.
+    ///
+    /// `permitted_tools` follows the same deny-by-default invariant as
+    /// [`list_tools`](Self::list_tools): an empty slice means *no tools are visible*.
     pub async fn search_tools(
         &self,
         permitted_tools: &[String],
@@ -222,8 +228,11 @@ impl StandardToolCatalog {
         let results: Vec<CatalogEntry> = cache
             .iter()
             .filter(|e| {
-                permitted_tools.is_empty()
-                    || permitted_tools
+                // Deny-by-default: empty `permitted_tools` means no tools are visible,
+                // matching the SecurityContext invariant (security_context.rs: "An empty
+                // `capabilities` vec means **no tools are allowed** (most restrictive)").
+                !permitted_tools.is_empty()
+                    && permitted_tools
                         .iter()
                         .any(|p| Self::pattern_matches(p, &e.name))
             })
@@ -721,5 +730,149 @@ mod tests {
         assert_eq!(response.tools.len(), 2);
         assert_eq!(response.tools[0].name, "aegis.tool.3");
         assert_eq!(response.tools[1].name, "aegis.tool.4");
+    }
+
+    // ---------------------------------------------------------------------
+    // Security regression tests — deny-by-default for `permitted_tools`.
+    //
+    // Prior to the fix, `list_tools` and `search_tools` filtered with
+    // `permitted_tools.is_empty() || any(matches)`, which inverted the
+    // SecurityContext invariant ("empty capabilities means no tools allowed")
+    // into a "default allow" allowlist — granting universal tool access to
+    // any caller whose permitted-tool slice happened to be empty. These tests
+    // pin the deny-by-default semantic.
+    // ---------------------------------------------------------------------
+
+    fn two_tool_catalog_metadata() -> Vec<crate::infrastructure::tool_router::ToolMetadata> {
+        vec![
+            crate::infrastructure::tool_router::ToolMetadata {
+                name: "tool.allowed".to_string(),
+                description: "Allowed tool".to_string(),
+                input_schema: json!({"type": "object"}),
+                ..Default::default()
+            },
+            crate::infrastructure::tool_router::ToolMetadata {
+                name: "tool.other".to_string(),
+                description: "Other tool".to_string(),
+                input_schema: json!({"type": "object"}),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn list_tools_empty_permitted_denies_all() {
+        let catalog = StandardToolCatalog::new();
+        catalog.refresh_from(two_tool_catalog_metadata()).await;
+
+        let permitted: Vec<String> = vec![];
+        let response = catalog
+            .list_tools(&permitted, ToolListQuery::default())
+            .await;
+
+        assert_eq!(
+            response.total, 0,
+            "empty permitted_tools must hide all tools (deny-by-default)"
+        );
+        assert!(
+            response.tools.is_empty(),
+            "empty permitted_tools must yield zero visible tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tools_only_returns_permitted_match() {
+        let catalog = StandardToolCatalog::new();
+        catalog.refresh_from(two_tool_catalog_metadata()).await;
+
+        let permitted = vec!["tool.allowed".to_string()];
+        let response = catalog
+            .list_tools(&permitted, ToolListQuery::default())
+            .await;
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.tools.len(), 1);
+        assert_eq!(response.tools[0].name, "tool.allowed");
+    }
+
+    #[tokio::test]
+    async fn search_tools_empty_permitted_denies_all() {
+        let catalog = StandardToolCatalog::new();
+        catalog.refresh_from(two_tool_catalog_metadata()).await;
+
+        let permitted: Vec<String> = vec![];
+        let response = catalog
+            .search_tools(&permitted, ToolSearchQuery::default())
+            .await;
+
+        assert_eq!(
+            response.total_matches, 0,
+            "empty permitted_tools must hide all tools from search (deny-by-default)"
+        );
+        assert!(
+            response.tools.is_empty(),
+            "empty permitted_tools must yield zero search results"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tools_only_returns_permitted_match() {
+        let catalog = StandardToolCatalog::new();
+        catalog.refresh_from(two_tool_catalog_metadata()).await;
+
+        let permitted = vec!["tool.allowed".to_string()];
+        let response = catalog
+            .search_tools(&permitted, ToolSearchQuery::default())
+            .await;
+
+        assert_eq!(response.total_matches, 1);
+        assert_eq!(response.tools.len(), 1);
+        assert_eq!(response.tools[0].name, "tool.allowed");
+    }
+
+    #[tokio::test]
+    async fn permitted_tools_glob_pattern_still_works_post_fix() {
+        let catalog = StandardToolCatalog::new();
+        catalog
+            .refresh_from(vec![
+                crate::infrastructure::tool_router::ToolMetadata {
+                    name: "aegis.agent.list".to_string(),
+                    description: "List agents".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                crate::infrastructure::tool_router::ToolMetadata {
+                    name: "aegis.agent.create".to_string(),
+                    description: "Create agent".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                crate::infrastructure::tool_router::ToolMetadata {
+                    name: "aegis.workflow.list".to_string(),
+                    description: "List workflows".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+            ])
+            .await;
+
+        let permitted = vec!["aegis.agent.*".to_string()];
+
+        let list_resp = catalog
+            .list_tools(&permitted, ToolListQuery::default())
+            .await;
+        assert_eq!(list_resp.total, 2);
+        let mut names: Vec<&str> = list_resp.tools.iter().map(|t| t.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["aegis.agent.create", "aegis.agent.list"]);
+
+        let search_resp = catalog
+            .search_tools(&permitted, ToolSearchQuery::default())
+            .await;
+        assert_eq!(search_resp.total_matches, 2);
+        let mut search_names: Vec<&str> =
+            search_resp.tools.iter().map(|t| t.name.as_str()).collect();
+        search_names.sort();
+        assert_eq!(search_names, vec!["aegis.agent.create", "aegis.agent.list"]);
     }
 }
