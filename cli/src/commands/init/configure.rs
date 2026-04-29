@@ -321,9 +321,11 @@ impl ConfigWizard {
     }
 
     fn collect_advanced_config(&self, components: &SelectedComponents) -> Result<AdvancedConfig> {
+        // Audit 002 §4.27: default bind is loopback. Operators must explicitly
+        // change this AND configure TLS to expose the daemon externally.
         let defaults = AdvancedConfig {
             node_type: "hybrid".to_string(),
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "127.0.0.1".to_string(),
             api_port: 8088,
             log_level: "info".to_string(),
             docker_network: "aegis-network".to_string(),

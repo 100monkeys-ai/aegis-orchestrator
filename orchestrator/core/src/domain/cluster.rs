@@ -584,6 +584,56 @@ pub trait NodeChallengeRepository: Send + Sync {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Cluster Enrolment Tokens (security audit 002 §4.9)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Cluster admission gate for non-edge worker / controller / hybrid nodes.
+//
+// A `ClusterEnrolmentToken` is a single-use, opaque credential issued out of
+// band by the controller's admin path (separate from the `AttestNode` RPC).
+// Each token is bound to a specific `NodeId` at issue time. The
+// `AttestNodeUseCase` validates the token and atomically marks it redeemed
+// before accepting the supplied public key. This prevents an unauthenticated
+// caller with network reach from attesting an arbitrary self-generated key.
+
+/// Errors raised while validating a `ClusterEnrolmentToken`.
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterEnrolmentTokenError {
+    /// Token format malformed (expected `<token_id>.<secret_b64>`).
+    #[error("malformed enrolment token")]
+    Malformed,
+    /// Token does not exist or has already been redeemed.
+    #[error("enrolment token not found or already redeemed")]
+    NotFound,
+    /// Token is bound to a different node identity than the caller claimed.
+    #[error("enrolment token node_id mismatch: bound to {bound:?}, presented for {presented:?}")]
+    NodeIdMismatch { bound: NodeId, presented: NodeId },
+    /// Token expiry exceeded.
+    #[error("enrolment token expired at {0}")]
+    Expired(DateTime<Utc>),
+    /// Repository / transport error.
+    #[error("enrolment token repository error: {0}")]
+    Other(#[source] anyhow::Error),
+}
+
+/// Repository for redeeming cluster enrolment tokens. Redemption is single-use
+/// and atomic — implementations MUST guarantee that a token can only be
+/// redeemed once even under concurrent attest calls.
+#[async_trait::async_trait]
+pub trait ClusterEnrolmentTokenRepository: Send + Sync {
+    /// Validate and redeem a token in one atomic step. The token format is
+    /// `<token_id>.<secret_b64>`. Implementations look up the row by
+    /// `token_id`, verify the supplied secret matches (constant-time), check
+    /// expiry, and mark the row redeemed. If the row is already redeemed,
+    /// returns `NotFound`. Returns the bound `NodeId` on success.
+    async fn redeem(
+        &self,
+        token: &str,
+        presented_node_id: &NodeId,
+    ) -> Result<NodeId, ClusterEnrolmentTokenError>;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Hierarchical Configuration (ADR-060)
 // ──────────────────────────────────────────────────────────────────────────────
 

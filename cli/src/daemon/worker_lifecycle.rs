@@ -48,6 +48,10 @@ pub struct WorkerLifecycle {
     heartbeat_interval: Duration,
     token_refresh_margin: Duration,
     signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// Audit 002 §4.9: cluster admission token presented on the initial
+    /// `AttestNode` call (and on every re-attestation). Sourced from
+    /// `spec.cluster.controller.token` in the node config.
+    enrolment_token: String,
 }
 
 impl WorkerLifecycle {
@@ -61,6 +65,7 @@ impl WorkerLifecycle {
         heartbeat_interval: Duration,
         token_refresh_margin: Duration,
         signing_key: Arc<ed25519_dalek::SigningKey>,
+        enrolment_token: String,
     ) -> Self {
         Self {
             client,
@@ -71,6 +76,7 @@ impl WorkerLifecycle {
             heartbeat_interval,
             token_refresh_margin,
             signing_key,
+            enrolment_token,
         }
     }
 
@@ -95,6 +101,7 @@ impl WorkerLifecycle {
                 public_key,
                 self.capabilities.clone(),
                 self.grpc_address.clone(),
+                self.enrolment_token.clone(),
             )
             .await
             .context("Attestation handshake failed")?;
@@ -135,6 +142,7 @@ impl WorkerLifecycle {
                                 public_key,
                                 self.capabilities.clone(),
                                 self.grpc_address.clone(),
+                                self.enrolment_token.clone(),
                             ).await {
                                 Ok(_) => tracing::info!(node_id = %self.node_id, "Token refreshed successfully"),
                                 Err(e) => tracing::warn!(

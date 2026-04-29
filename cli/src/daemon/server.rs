@@ -2256,11 +2256,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Build HTTP router
     let app = create_router(Arc::new(app_state), iam_service.clone());
 
-    // Start HTTP server
+    // Start HTTP server. Audit 002 §4.27: when no network block is supplied
+    // we default to the loopback address. Operators must explicitly set
+    // `spec.network.bind_address` AND configure `spec.network.tls` to bind
+    // on a non-loopback interface (enforced by NodeConfigManifest::validate).
     let bind_addr = if let Some(network) = &config.spec.network {
         network.bind_address.clone()
     } else {
-        "0.0.0.0".to_string()
+        "127.0.0.1".to_string()
     };
 
     // Config port takes precedence over CLI default if we consider config the source of truth for the node.
@@ -2389,8 +2392,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         // warning and skip – clustering without persistence is unsupported.
         if let Some(ref pool) = db_pool {
             use aegis_orchestrator_core::infrastructure::cluster::{
-                NodeClusterServiceHandler, PgConfigLayerRepository, PgNodeChallengeRepository,
-                PgNodeClusterRepository, PgNodeRegistryRepository, RoundRobinNodeRouter,
+                NodeClusterServiceHandler, PgClusterEnrolmentTokenRepository,
+                PgConfigLayerRepository, PgNodeChallengeRepository, PgNodeClusterRepository,
+                PgNodeRegistryRepository, RoundRobinNodeRouter,
             };
             use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::NodeClusterServiceServer;
 
@@ -2402,9 +2406,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
             let secret_store = secrets_manager.secret_store();
 
+            // Audit 002 §4.9: cluster admission gate — single-use enrolment
+            // token, scoped to a node identity, redeemed atomically at attest
+            // time. Issued out of band by the controller admin path.
+            let cluster_enrolment_repo: Arc<
+                dyn aegis_orchestrator_core::domain::cluster::ClusterEnrolmentTokenRepository,
+            > = Arc::new(PgClusterEnrolmentTokenRepository::new(pool.clone()));
             let attest_uc = Arc::new(
                 aegis_orchestrator_core::application::cluster::AttestNodeUseCase::new(
                     challenge_repo.clone(),
+                    cluster_enrolment_repo.clone(),
                 ),
             );
             let challenge_uc = Arc::new(
@@ -2708,6 +2719,17 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                             worker_node_id,
                                         );
 
+                                    // Audit 002 §4.9: cluster admission token
+                                    // sourced from the controller config block.
+                                    // env: indirection is supported.
+                                    let enrolment_token = controller
+                                        .token
+                                        .as_deref()
+                                        .map(|t| {
+                                            aegis_orchestrator_core::domain::node_config::resolve_env_value(t)
+                                                .unwrap_or_else(|_| t.to_string())
+                                        })
+                                        .unwrap_or_default();
                                     let lifecycle = super::worker_lifecycle::WorkerLifecycle::new(
                                         client,
                                         worker_node_id,
@@ -2717,6 +2739,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                         heartbeat_interval,
                                         token_refresh_margin,
                                         signing_key,
+                                        enrolment_token,
                                     );
 
                                     let (shutdown_tx, shutdown_rx) =

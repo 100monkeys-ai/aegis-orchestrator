@@ -273,6 +273,21 @@ async fn join_cluster(
             .as_ref()
             .map(|n| format!("localhost:{}", n.grpc_port))
             .unwrap_or_else(|| "localhost:50051".to_string()),
+        // Audit 002 §4.9: cluster admission token. Sourced from
+        // spec.cluster.controller.token (env: indirection supported via
+        // resolve_env_value). Edge daemons leave this empty and present a
+        // bootstrap_proof on ChallengeNode instead.
+        enrolment_token: config
+            .spec
+            .cluster
+            .as_ref()
+            .and_then(|c| c.controller.as_ref())
+            .and_then(|c| c.token.as_deref())
+            .map(|t| {
+                aegis_orchestrator_core::domain::node_config::resolve_env_value(t)
+                    .unwrap_or_else(|_| t.to_string())
+            })
+            .unwrap_or_default(),
     };
 
     if !output_format.is_structured() {
