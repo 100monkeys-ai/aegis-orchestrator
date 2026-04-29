@@ -23,7 +23,12 @@ pub async fn refresh_token(profile: &AegisProfile) -> Result<AegisProfile> {
         "https://auth.{}/realms/aegis-system/protocol/openid-connect",
         profile.env
     );
-    let client = reqwest::Client::new();
+    // Audit 002 §4.37.9 — bound the refresh wait on a frozen IdP.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client must build");
 
     let resp = client
         .post(format!("{auth_base}/token"))

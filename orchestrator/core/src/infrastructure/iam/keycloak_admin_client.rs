@@ -111,8 +111,17 @@ fn build_set_multivalue_body(
 
 impl KeycloakAdminClient {
     pub fn new(config: KeycloakAdminConfig) -> Self {
+        // Audit 002 §4.37.9 — bound the wait on a frozen Keycloak host. A
+        // naked `Client::new()` inherits no implicit total/connect timeout,
+        // which means a non-responsive admin endpoint stalls every
+        // `set_user_attribute` / realm operation indefinitely.
+        let http = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("keycloak admin http client must build with valid defaults");
         Self {
-            http: Client::new(),
+            http,
             config,
             cached_token: RwLock::new(None),
         }

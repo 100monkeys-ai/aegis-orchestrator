@@ -110,7 +110,14 @@ async fn logout() -> Result<()> {
 }
 
 async fn revoke_session(profile: &auth::AegisProfile) -> Result<()> {
-    let client = reqwest::Client::new();
+    // Audit 002 §4.37.9 — bound the logout wait on a frozen IdP. Logout is
+    // best-effort, so use a tight budget to avoid hanging the user's
+    // terminal on a flaky auth host.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| anyhow::anyhow!("reqwest client build: {e}"))?;
     let url = format!(
         "https://auth.{}/realms/aegis-system/protocol/openid-connect/logout",
         profile.env

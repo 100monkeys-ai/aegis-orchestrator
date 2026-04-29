@@ -408,7 +408,15 @@ impl StandardCredentialManagementService {
             repo,
             secrets,
             event_bus,
-            http: reqwest::Client::new(),
+            // Audit 002 §4.37.9 — explicit timeout. A naked
+            // `reqwest::Client::new()` inherits no implicit total/connect
+            // timeout, so a frozen OAuth provider hangs the credential
+            // service indefinitely.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("default reqwest client must build"),
             oauth_providers,
         }
     }

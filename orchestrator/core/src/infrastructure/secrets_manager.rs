@@ -51,6 +51,19 @@ impl From<vaultrs::error::ClientError> for SecretsError {
     }
 }
 
+/// Audit 002 §4.37.9 — every raw `reqwest::Client::new()` in the OpenBao path
+/// inherits no implicit total/connect timeout. A non-responsive vault host
+/// (dropped SYNs, dead route, frozen TLS handshake) would hang lease
+/// generation, renewal, revocation, and namespace operations indefinitely.
+/// Use a single helper so every call site applies the same bounded budget.
+fn vault_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("vault http client must build with valid defaults")
+}
+
 // ---------------------------------------------------------------------------
 // OpenBaoSecretStore — production implementation using AppRole auth
 // ---------------------------------------------------------------------------
@@ -219,7 +232,7 @@ impl SecretStore for OpenBaoSecretStore {
         let address = client.settings().address.clone();
         let token = client.settings().token.clone();
         let url = format!("{address}v1/{engine_path}/creds/{role}");
-        let http_resp = reqwest::Client::new()
+        let http_resp = vault_http_client()
             .get(&url)
             .header("X-Vault-Token", &token)
             .send()
@@ -282,7 +295,7 @@ impl SecretStore for OpenBaoSecretStore {
             "lease_id": lease_id,
             "increment": format!("{}s", increment.as_secs()),
         });
-        let http_resp = reqwest::Client::new()
+        let http_resp = vault_http_client()
             .put(&url)
             .header("X-Vault-Token", &token)
             .json(&body)
@@ -315,7 +328,7 @@ impl SecretStore for OpenBaoSecretStore {
         let token = client.settings().token.clone();
         let url = format!("{address}v1/sys/leases/revoke");
         let body = serde_json::json!({ "lease_id": lease_id });
-        let http_resp = reqwest::Client::new()
+        let http_resp = vault_http_client()
             .put(&url)
             .header("X-Vault-Token", &token)
             .json(&body)
@@ -403,7 +416,7 @@ impl SecretStore for OpenBaoSecretStore {
         let address = client.settings().address.clone();
         let token = client.settings().token.clone();
         let url = format!("{address}v1/sys/namespaces/{name}");
-        let resp = reqwest::Client::new()
+        let resp = vault_http_client()
             .post(&url)
             .header("X-Vault-Token", &token)
             .json(&serde_json::json!({}))
@@ -441,7 +454,7 @@ impl SecretStore for OpenBaoSecretStore {
         let address = client.settings().address.clone();
         let token = client.settings().token.clone();
         let url = format!("{address}v1/sys/namespaces/{name}");
-        let resp = reqwest::Client::new()
+        let resp = vault_http_client()
             .delete(&url)
             .header("X-Vault-Token", &token)
             .send()
@@ -1130,6 +1143,37 @@ mod tests {
             .read_secret_field("kv", "mcp-tools/gmail", "nonexistent", &ctx)
             .await;
         assert!(matches!(result, Err(SecretsError::SecretNotFound { .. })));
+    }
+
+    /// Audit 002 §4.37.9 regression — `vault_http_client()` must apply an
+    /// explicit total timeout. A naked `reqwest::Client::new()` inherits
+    /// no budget, so every Vault HTTP call (lease gen / renew / revoke /
+    /// namespace ops) would hang indefinitely against a frozen host. We
+    /// can't directly read the configured timeout off `reqwest::Client`,
+    /// but we can prove the helper applies a finite budget by pointing it
+    /// at a black-hole sink and asserting the request fails inside the
+    /// configured window rather than hanging beyond it.
+    #[tokio::test]
+    async fn test_vault_http_client_has_bounded_timeout() {
+        let client = vault_http_client();
+        // 192.0.2.0/24 is RFC-5737 TEST-NET-1 — guaranteed to be
+        // non-routable, so the request will hit the connect_timeout. If
+        // the helper applied no timeout, this future would hang for the
+        // OS default (~75s on Linux); the assertion enforces a tight
+        // cap with margin.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.get("http://192.0.2.1:1/vault").send(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "vault_http_client must apply a bounded timeout; request \
+             exceeded the 15s outer cap, indicating no internal budget"
+        );
+        // The inner reqwest call itself should have errored (timeout or
+        // connection refused), not succeeded.
+        assert!(result.unwrap().is_err());
     }
 
     #[tokio::test]

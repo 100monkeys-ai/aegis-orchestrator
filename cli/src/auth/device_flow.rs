@@ -30,7 +30,14 @@ struct TokenResponse {
 
 pub async fn run_device_flow(env: &str) -> Result<AegisProfile> {
     let auth_base = format!("https://auth.{env}/realms/aegis-system/protocol/openid-connect");
-    let client = reqwest::Client::new();
+    // Audit 002 §4.37.9 — bound the wait on a frozen IdP. Without an
+    // explicit timeout, a dropped SYN or stalled TLS handshake hangs the
+    // CLI indefinitely.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client must build");
 
     let device_resp = client
         .post(format!("{auth_base}/auth/device"))
