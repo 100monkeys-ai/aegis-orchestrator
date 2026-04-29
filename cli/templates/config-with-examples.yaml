@@ -248,6 +248,19 @@ spec:
       key_path: "/etc/aegis/tls/node.key"
       ca_path: "/etc/aegis/tls/ca.crt"
 
+    # Operator-acknowledged opt-out of the security audit 002 §4.27 gate
+    # (default: false). Set to true ONLY when TLS is terminated UPSTREAM
+    # of this pod by a trusted-network ingress (e.g. a Caddy reverse proxy
+    # in the same Podman pod-network) and the bound endpoint is therefore
+    # only reachable from inside the trusted internal network. The
+    # validator will refuse to start a non-loopback bind without TLS
+    # otherwise. When true, a WARN-level entry is emitted on every boot
+    # for audit-trail visibility.
+    #
+    # Setting this true on a publicly-exposed host is a serious security
+    # regression — every external request would transit cleartext.
+    # allow_insecure_bind: false
+
   # --------------------------------------------------------------------------
   # Observability
   # --------------------------------------------------------------------------
