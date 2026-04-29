@@ -138,6 +138,9 @@ pub struct ToolRouter {
 
 /// Read-only / low-risk tools that bypass the inner-loop semantic judge.
 ///
+/// This constant is consumed by `builtin_dispatchers()` to populate
+/// `BuiltinDispatcherConfig.skip_judge` for the corresponding builtin tools.
+///
 /// Manifest deployment tools (aegis.agent.create, aegis.agent.update, aegis.agent.delete,
 /// aegis.workflow.create, aegis.workflow.update) are included here because they accept a
 /// `manifest_yaml` payload that may contain tool names such as `cmd.run` or `fs.*` as part
@@ -1557,6 +1560,36 @@ pub struct ToolServerManager {
     secrets_manager: Arc<SecretsManager>,
 }
 
+/// Parse Windows `tasklist /FO CSV /NH` output and determine whether the given
+/// PID is present in the result set.
+///
+/// The CSV format produced by `tasklist /FO CSV /NH` is one row per process:
+///   `"Image Name","PID","Session Name","Session#","Mem Usage"`
+///
+/// We extract the second field (PID), parse it as `u32`, and check for an exact
+/// match against the requested PID. This avoids brittle substring matches against
+/// localized "INFO: No tasks are running" messages or process names that happen
+/// to contain phrases like "No tasks".
+///
+/// Returns `false` for empty stdout (which is what `/NH` produces when no rows
+/// match the filter), for non-CSV lines, and for any input where the requested
+/// PID does not appear in the PID column of any row.
+pub(crate) fn parse_tasklist_csv_for_pid(stdout: &str, pid: u32) -> bool {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            // CSV row format:
+            //   "Image Name","PID","Session Name","Session#","Mem Usage"
+            // We only need the 2nd field (PID).
+            let mut parts = line.split("\",\"");
+            let _image_name = parts.next()?;
+            let pid_field = parts.next()?;
+            let pid_text = pid_field.trim_matches('"');
+            pid_text.parse::<u32>().ok()
+        })
+        .any(|found_pid| found_pid == pid)
+}
+
 impl ToolServerManager {
     pub fn new(
         registry: Arc<dyn ToolRegistry>,
@@ -1787,16 +1820,17 @@ impl ToolServerManager {
 
         #[cfg(windows)]
         {
-            // Use tasklist to check if PID exists
+            // Use tasklist to check if PID exists.
+            // Request CSV output and parse the PID column to avoid brittle substring
+            // matching against localized "No tasks are running" messages or process
+            // names that happen to contain that phrase.
             match std::process::Command::new("tasklist")
-                .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+                .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
                 .output()
             {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    // tasklist returns the process info if it exists,
-                    // or "INFO: No tasks are running..." if it doesn't
-                    !stdout.contains("No tasks")
+                    parse_tasklist_csv_for_pid(&stdout, pid)
                 }
                 Err(_) => {
                     // If tasklist itself fails, fail closed and report unhealthy.
@@ -2255,5 +2289,56 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected `{tool_name}` to be advertised"));
             assert_attachments_property_shape(&tool.input_schema, tool_name);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for `parse_tasklist_csv_for_pid`.
+    //
+    // The previous implementation used `!stdout.contains("No tasks")` to detect
+    // process liveness on Windows. This had two failure modes:
+    //   1. False positive when a process Image Name (or other column) happened
+    //      to contain the substring "No tasks".
+    //   2. Locale-dependent — `tasklist` localizes the
+    //      "INFO: No tasks are running" message, breaking the check on any
+    //      non-English Windows host.
+    //
+    // The fix parses CSV output from `tasklist /FO CSV /NH` and matches the
+    // PID column exactly. These tests pin that behavior.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_tasklist_csv_pid_present() {
+        // Typical CSV row produced by `tasklist /FI "PID eq 4242" /FO CSV /NH`.
+        let stdout = "\"my-process.exe\",\"4242\",\"Console\",\"1\",\"12,345 K\"\r\n";
+        assert!(parse_tasklist_csv_for_pid(stdout, 4242));
+    }
+
+    #[test]
+    fn parse_tasklist_csv_pid_absent() {
+        // Localized "no match" output from older tasklist versions that print
+        // a banner instead of returning empty stdout. The PID 4242 is nowhere
+        // in this text, so the parser must return false.
+        let stdout = "INFO: No tasks are running which match the specified criteria.\r\n";
+        assert!(!parse_tasklist_csv_for_pid(stdout, 4242));
+    }
+
+    #[test]
+    fn parse_tasklist_csv_pid_substring_in_image_name() {
+        // Adversarial input: an image name contains the literal substring
+        // "No tasks". Under the old `!stdout.contains("No tasks")` logic this
+        // would have collapsed both branches to the same answer. The new
+        // parser must treat this row as "PID 99 exists" and therefore return
+        // false when asked about PID 4242.
+        let stdout = "\"No tasks helper.exe\",\"99\",\"Console\",\"1\",\"1,000 K\"\r\n";
+        assert!(!parse_tasklist_csv_for_pid(stdout, 4242));
+        // Sanity: the row's actual PID is correctly recognized.
+        assert!(parse_tasklist_csv_for_pid(stdout, 99));
+    }
+
+    #[test]
+    fn parse_tasklist_csv_localized_no_match_text() {
+        // `tasklist /NH` with a non-matching PID filter typically emits empty
+        // stdout. Empty input must yield false (process not alive).
+        assert!(!parse_tasklist_csv_for_pid("", 4242));
     }
 }
