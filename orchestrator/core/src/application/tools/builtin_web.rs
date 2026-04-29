@@ -34,10 +34,10 @@ pub async fn invoke_web_tool(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(DEFAULT_MAX_RESULTS);
             let max_results = u32::try_from(max_results_u64).map_err(|_| {
-                SealSessionError::InvalidArguments(
-                    "'max_results' for web.search exceeds the maximum allowed value (4294967295)"
-                        .to_string(),
-                )
+                SealSessionError::InvalidArguments(format!(
+                    "'max_results' for web.search exceeds the maximum allowed value ({})",
+                    u32::MAX
+                ))
             })?;
 
             web_port
