@@ -221,7 +221,7 @@ pub struct EnrollmentTokenClaims {
 // EdgeRouterError
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EdgeRouterError {
     #[error("edge {node_id} unavailable")]
     EdgeUnavailable { node_id: NodeId },
