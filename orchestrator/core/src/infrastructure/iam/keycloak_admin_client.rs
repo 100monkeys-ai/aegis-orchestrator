@@ -36,11 +36,21 @@ pub struct SamlIdpConfig {
 }
 
 /// Configuration for Keycloak Admin REST API access (ADR-097).
+///
+/// # Security
+///
+/// Audit 002 §4.37.10 — `admin_password` is wrapped in
+/// [`SensitiveString`](crate::domain::secrets::SensitiveString) so the
+/// derived `Debug` impl emits `[REDACTED]` rather than the raw value. The
+/// previous `String` field combined with `#[derive(Debug)]` meant any
+/// `tracing::error!(?config, ...)` or `panic!("{config:?}")` site could
+/// dump the admin credential into logs. Mirrors the §4.30 fix already
+/// applied to other config structs in BC-11.
 #[derive(Debug, Clone)]
 pub struct KeycloakAdminConfig {
     pub host: String,
     pub admin_username: String,
-    pub admin_password: String,
+    pub admin_password: crate::domain::secrets::SensitiveString,
 }
 
 /// HTTP client for Keycloak Admin REST API operations.
@@ -181,8 +191,10 @@ impl KeycloakAdminClient {
             .form(&[
                 ("grant_type", "password"),
                 ("client_id", "admin-cli"),
-                ("username", &self.config.admin_username),
-                ("password", &self.config.admin_password),
+                ("username", self.config.admin_username.as_str()),
+                // Audit 002 §4.37.10 — only expose the wrapped value at
+                // the point of injection into the form body.
+                ("password", self.config.admin_password.expose()),
             ])
             .send()
             .await?;
@@ -1036,6 +1048,35 @@ impl KeycloakAdminClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 002 §4.37.10 regression — `KeycloakAdminConfig`'s `Debug`
+    /// output must NOT contain the admin password. Before the fix,
+    /// `admin_password: String` combined with `#[derive(Debug)]` meant
+    /// any `tracing::error!(?config, ...)` site dumped the credential
+    /// to logs. Wrapping the field in `SensitiveString` redirects
+    /// `Debug` to `[REDACTED]` regardless of the value.
+    #[test]
+    fn keycloak_admin_config_debug_redacts_password() {
+        let cfg = KeycloakAdminConfig {
+            host: "https://auth.example.com".to_string(),
+            admin_username: "admin".to_string(),
+            admin_password: crate::domain::secrets::SensitiveString::new(
+                "super-secret-do-not-leak-12345",
+            ),
+        };
+        let dumped = format!("{cfg:?}");
+        assert!(
+            !dumped.contains("super-secret-do-not-leak-12345"),
+            "Debug output must NOT contain the raw password; got: {dumped}"
+        );
+        assert!(
+            dumped.contains("REDACTED"),
+            "Debug output must mark the password as redacted; got: {dumped}"
+        );
+        // Other fields should still be visible for diagnostics.
+        assert!(dumped.contains("auth.example.com"));
+        assert!(dumped.contains("admin"));
+    }
 
     // ── build_set_attribute_body ───────────────────────────────────────────
 

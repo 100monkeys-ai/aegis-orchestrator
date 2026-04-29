@@ -1816,7 +1816,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminConfig {
                         host,
                         admin_username: username,
-                        admin_password: password,
+                        // Audit 002 §4.37.10 — wrap at the construction
+                        // boundary so the admin password is redacted in
+                        // any subsequent Debug output.
+                        admin_password: aegis_orchestrator_core::domain::secrets::SensitiveString::new(password),
                     },
                 ),
             ))
