@@ -43,25 +43,118 @@ use url::Url;
 // OAuth Provider Configuration
 // ============================================================================
 
-/// Per-provider OAuth 2.0 client configuration required to exchange an
-/// authorization code for an access token (RFC 6749 §4.1.3).
+/// Per-provider OAuth 2.0 client configuration required to drive an
+/// authorization-code + PKCE flow (RFC 6749 §4.1, RFC 7636).
 ///
 /// `client_secret` is optional: public clients (per RFC 6749 §2.1) omit it and
-/// rely on PKCE (RFC 7636) for proof of possession.
+/// rely on PKCE for proof of possession.
+///
+/// `authorization_url` and `redirect_uri_allowlist` are mandatory and validated
+/// at registry construction time via [`validate_oauth_provider_registry`]:
+/// placeholder hosts (`oauth.placeholder`, anything containing the literal
+/// substring `"placeholder"`) are rejected, and the allowlist must be
+/// non-empty. This is the fix for security audit 002 §4.11 and §4.18.
 #[derive(Debug, Clone)]
 pub struct OAuthProviderConfig {
+    /// Provider's authorization endpoint URL (where the user-agent is sent
+    /// to begin the flow). MUST be HTTPS and MUST NOT be a placeholder.
+    pub authorization_url: String,
     /// Provider's token endpoint URL. MUST be HTTPS (localhost exempted for dev).
     pub token_url: String,
     /// OAuth 2.0 `client_id` registered with the provider.
     pub client_id: String,
     /// OAuth 2.0 `client_secret` for confidential clients. `None` for public clients.
     pub client_secret: Option<SensitiveString>,
+    /// Exact-match allowlist of `redirect_uri` values the application is
+    /// permitted to use. The caller-supplied `redirect_uri` is rejected
+    /// unless it appears verbatim in this list.
+    pub redirect_uri_allowlist: Vec<String>,
 }
 
 /// Registry mapping `CredentialProvider` → `OAuthProviderConfig`.
 ///
 /// Shared across the service; loaded at startup from platform configuration.
+/// Validate the registry with [`validate_oauth_provider_registry`] before
+/// wrapping it in `Arc` and handing it to the service.
 pub type OAuthProviderRegistry = HashMap<CredentialProvider, OAuthProviderConfig>;
+
+/// Errors produced by [`validate_oauth_provider_registry`] at startup.
+///
+/// Boot MUST fail when any of these are returned — see security audit 002
+/// §4.11 (placeholder URLs leak PKCE state) and §4.18 (open redirect via
+/// arbitrary `redirect_uri`).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OAuthRegistryError {
+    #[error("OAuth provider {provider}: authorization_url must not be empty")]
+    EmptyAuthorizationUrl { provider: String },
+    #[error(
+        "OAuth provider {provider}: authorization_url is a placeholder ({url}) — \
+         configure a real provider endpoint before booting"
+    )]
+    PlaceholderAuthorizationUrl { provider: String, url: String },
+    #[error("OAuth provider {provider}: authorization_url must be HTTPS: {url}")]
+    InsecureAuthorizationUrl { provider: String, url: String },
+    #[error("OAuth provider {provider}: authorization_url is unparseable: {detail}")]
+    UnparseableAuthorizationUrl { provider: String, detail: String },
+    #[error("OAuth provider {provider}: redirect_uri_allowlist must contain at least one entry")]
+    EmptyRedirectAllowlist { provider: String },
+    #[error("OAuth provider {provider}: redirect_uri_allowlist entry is unparseable: {detail}")]
+    UnparseableRedirectUri { provider: String, detail: String },
+}
+
+/// Validate every entry in the registry before the service is constructed.
+///
+/// Refuses to return `Ok` if any provider has a placeholder authorization
+/// URL or an empty allowlist. Callers MUST propagate this error and refuse
+/// to boot — there is no safe fallback.
+pub fn validate_oauth_provider_registry(
+    registry: &OAuthProviderRegistry,
+) -> Result<(), OAuthRegistryError> {
+    for (provider, cfg) in registry.iter() {
+        let provider_str = provider.to_string();
+
+        if cfg.authorization_url.is_empty() {
+            return Err(OAuthRegistryError::EmptyAuthorizationUrl {
+                provider: provider_str,
+            });
+        }
+        // Hard refusal of any URL that contains the literal substring
+        // "placeholder" anywhere — this catches the legacy
+        // `oauth.placeholder` host and any developer copy-paste of the
+        // default value.
+        if cfg.authorization_url.contains("placeholder") {
+            return Err(OAuthRegistryError::PlaceholderAuthorizationUrl {
+                provider: provider_str,
+                url: cfg.authorization_url.clone(),
+            });
+        }
+        let parsed = Url::parse(&cfg.authorization_url).map_err(|e| {
+            OAuthRegistryError::UnparseableAuthorizationUrl {
+                provider: provider_str.clone(),
+                detail: e.to_string(),
+            }
+        })?;
+        if parsed.scheme() != "https" {
+            return Err(OAuthRegistryError::InsecureAuthorizationUrl {
+                provider: provider_str,
+                url: cfg.authorization_url.clone(),
+            });
+        }
+
+        if cfg.redirect_uri_allowlist.is_empty() {
+            return Err(OAuthRegistryError::EmptyRedirectAllowlist {
+                provider: provider_str,
+            });
+        }
+        for entry in &cfg.redirect_uri_allowlist {
+            Url::parse(entry).map_err(|e| OAuthRegistryError::UnparseableRedirectUri {
+                provider: provider_str.clone(),
+                detail: format!("{entry}: {e}"),
+            })?;
+        }
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Error types
@@ -90,6 +183,10 @@ pub enum CredentialError {
     /// Provider returned a malformed or unparseable token response.
     #[error("OAuth token response was malformed: {0}")]
     InvalidResponse(String),
+    /// Caller-supplied `redirect_uri` was not in the per-provider allowlist
+    /// (security audit 002 §4.18 — open-redirect prevention).
+    #[error("OAuth redirect_uri not in provider allowlist")]
+    RedirectUriNotAllowlisted,
 }
 
 /// Enforce HTTPS on the token URL per RFC 6749 §3.1.2.1, with a development
@@ -510,6 +607,25 @@ impl CredentialManagementService for StandardCredentialManagementService {
         provider: CredentialProvider,
         redirect_uri: String,
     ) -> anyhow::Result<OAuthInitiation> {
+        // Resolve the provider's configuration up front. Refuse to start the
+        // flow if the provider is unconfigured — this is the fix for
+        // security audit 002 §4.11 (no more `oauth.placeholder` host).
+        let cfg = self
+            .oauth_providers
+            .get(&provider)
+            .ok_or_else(|| CredentialError::ProviderNotConfigured(provider.to_string()))?;
+
+        // §4.18: the caller-supplied `redirect_uri` MUST be an exact match
+        // against one of the provider's allowlisted entries. Anything else
+        // is a potential open-redirect / token-leak vector.
+        if !cfg
+            .redirect_uri_allowlist
+            .iter()
+            .any(|allowed| allowed == &redirect_uri)
+        {
+            return Err(CredentialError::RedirectUriNotAllowlisted.into());
+        }
+
         // Generate a cryptographically random state token using two UUIDs concatenated.
         let state = format!(
             "{}{}",
@@ -560,13 +676,28 @@ impl CredentialManagementService for StandardCredentialManagementService {
             .save_oauth_state(&state, &binding_id, &code_verifier, &redirect_uri)
             .await?;
 
-        let authorization_url = format!(
-            "https://oauth.placeholder/{}/authorize?state={}&code_challenge={}&code_challenge_method=S256&redirect_uri={}",
-            provider, state, code_challenge, redirect_uri
-        );
+        // Build the authorization URL by parsing the validated provider
+        // base and appending properly-encoded query parameters via
+        // `Url::query_pairs_mut` — never via `format!` (security audit 002
+        // §4.11: caller-supplied `redirect_uri` must be percent-encoded).
+        let mut auth_url = Url::parse(&cfg.authorization_url).map_err(|e| {
+            anyhow!(
+                "configured authorization_url for {} is unparseable: {}",
+                provider,
+                e
+            )
+        })?;
+        auth_url
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &cfg.client_id)
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("redirect_uri", &redirect_uri);
 
         Ok(OAuthInitiation {
-            authorization_url,
+            authorization_url: auth_url.to_string(),
             state,
         })
     }
@@ -598,6 +729,21 @@ impl CredentialManagementService for StandardCredentialManagementService {
             .find_by_id(&pending.binding_id)
             .await?
             .ok_or_else(|| anyhow!("Credential binding not found for pending OAuth state"))?;
+
+        // §4.18 (defence in depth): re-validate the persisted redirect_uri
+        // against the current allowlist. If the operator has tightened the
+        // allowlist since the flow started, reject the callback rather than
+        // proceeding with a now-disallowed URI.
+        if let Some(cfg) = self.oauth_providers.get(&binding.provider) {
+            if !cfg
+                .redirect_uri_allowlist
+                .iter()
+                .any(|allowed| allowed == &pending.redirect_uri)
+            {
+                self.repo.delete_oauth_state(state).await?;
+                return Err(CredentialError::RedirectUriNotAllowlisted.into());
+            }
+        }
 
         // RFC 6749 §4.1.3 + RFC 7636: exchange the authorization code + PKCE
         // verifier for an access token at the provider's token endpoint. A

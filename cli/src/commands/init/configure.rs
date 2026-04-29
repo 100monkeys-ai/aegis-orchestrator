@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use dialoguer::{Confirm, Input, Password};
@@ -30,8 +31,12 @@ pub struct NodeConfig {
     pub node_id: String,
     /// Ollama model alias (e.g. "llama3.2:latest")
     pub ollama_model: String,
-    /// Cloud LLM API key (None when Ollama is selected)
-    pub api_key: Option<String>,
+    /// Cloud LLM API key (None when Ollama is selected).
+    ///
+    /// Wrapped in [`SensitiveString`] so it is auto-redacted by `Debug` /
+    /// `Display` (security audit 002 §4.30 — prevent
+    /// `tracing::debug!("{:?}", cfg)` from leaking the credential).
+    pub api_key: Option<SensitiveString>,
     /// The working directory where stack files will be written
     pub working_dir: PathBuf,
     /// Gemini model alias if Gemini is the primary provider
@@ -61,12 +66,14 @@ pub struct AdvancedConfig {
     pub lmstudio_smart_model: String,
     pub lmstudio_judge_model: String,
     pub enable_anthropic_extra: bool,
-    pub anthropic_api_key: String,
+    /// Wrapped to auto-redact in `Debug` (security audit 002 §4.30).
+    pub anthropic_api_key: SensitiveString,
     pub anthropic_smart_model: String,
     pub anthropic_judge_model: String,
     pub enable_gemini: bool,
     pub gemini_endpoint: String,
-    pub gemini_api_key: String,
+    /// Wrapped to auto-redact in `Debug` (security audit 002 §4.30).
+    pub gemini_api_key: SensitiveString,
     pub gemini_smart_model: String,
     pub gemini_judge_model: String,
     pub enable_otlp_logging: bool,
@@ -81,7 +88,8 @@ pub struct AdvancedConfig {
     pub cluster_role: String,
     pub cluster_grpc_port: u16,
     pub cluster_controller_endpoint: String,
-    pub cluster_token: String,
+    /// Wrapped to auto-redact in `Debug` (security audit 002 §4.30).
+    pub cluster_token: SensitiveString,
     pub cpu_cores: u32,
     pub memory_gb: u32,
     pub disk_gb: u32,
@@ -240,7 +248,7 @@ impl ConfigWizard {
             node_name,
             node_id,
             ollama_model,
-            api_key,
+            api_key: api_key.map(SensitiveString::new),
             working_dir: working_dir.clone(),
             gemini_model,
             openai_compatible_endpoint,
@@ -339,7 +347,7 @@ impl ConfigWizard {
             lmstudio_smart_model: "google/gemma-3-4b".to_string(),
             lmstudio_judge_model: "google/gemma-3-4b".to_string(),
             enable_anthropic_extra: false,
-            anthropic_api_key: String::new(),
+            anthropic_api_key: SensitiveString::new(""),
             anthropic_smart_model: "claude-sonnet-4-5".to_string(),
             anthropic_judge_model: "claude-sonnet-4-5".to_string(),
             enable_gemini: false,
@@ -348,7 +356,7 @@ impl ConfigWizard {
             // Gemini can be treated as an OpenAI-style provider; update both places
             // together if this default ever changes.
             gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
-            gemini_api_key: String::new(),
+            gemini_api_key: SensitiveString::new(""),
             gemini_smart_model: "gemini-2.5-flash".to_string(),
             gemini_judge_model: "gemini-2.5-pro".to_string(),
             enable_otlp_logging: components.observability,
@@ -367,7 +375,7 @@ impl ConfigWizard {
             cluster_role: "hybrid".to_string(),
             cluster_grpc_port: 50056,
             cluster_controller_endpoint: "https://aegis-controller.example.com:50056".to_string(),
-            cluster_token: "env:AEGIS_CLUSTER_TOKEN".to_string(),
+            cluster_token: SensitiveString::new("env:AEGIS_CLUSTER_TOKEN"),
             cpu_cores: 4,
             memory_gb: 16,
             disk_gb: 100,
@@ -482,12 +490,13 @@ impl ConfigWizard {
             },
             enable_anthropic_extra,
             anthropic_api_key: if enable_anthropic_extra {
-                Password::new()
+                let s: String = Password::new()
                     .with_prompt("ANTHROPIC_API_KEY (optional; blank to set later)")
                     .allow_empty_password(true)
-                    .interact()?
+                    .interact()?;
+                SensitiveString::new(s)
             } else {
-                String::new()
+                SensitiveString::new("")
             },
             anthropic_smart_model: if enable_anthropic_extra {
                 Input::new()
@@ -515,12 +524,13 @@ impl ConfigWizard {
                 defaults.gemini_endpoint.clone()
             },
             gemini_api_key: if enable_gemini {
-                Password::new()
+                let s: String = Password::new()
                     .with_prompt("GEMINI_API_KEY (optional; blank to set later)")
                     .allow_empty_password(true)
-                    .interact()?
+                    .interact()?;
+                SensitiveString::new(s)
             } else {
-                String::new()
+                SensitiveString::new("")
             },
             gemini_smart_model: if enable_gemini {
                 Input::new()
@@ -614,10 +624,11 @@ impl ConfigWizard {
                 defaults.cluster_controller_endpoint.clone()
             },
             cluster_token: if enable_cluster {
-                Input::new()
+                let s: String = Input::new()
                     .with_prompt("Cluster bootstrap token")
-                    .default(defaults.cluster_token.clone())
-                    .interact_text()?
+                    .default(defaults.cluster_token.expose().to_string())
+                    .interact_text()?;
+                SensitiveString::new(s)
             } else {
                 defaults.cluster_token.clone()
             },
@@ -1186,7 +1197,7 @@ impl ConfigWizard {
                 role = config.advanced.cluster_role,
                 port = config.advanced.cluster_grpc_port,
                 endpoint = config.advanced.cluster_controller_endpoint,
-                token = config.advanced.cluster_token,
+                token = config.advanced.cluster_token.expose(),
             )
         } else {
             String::new()
@@ -1284,49 +1295,50 @@ spec:
         let cluster_section = if config.advanced.enable_cluster {
             format!(
                 "\n# ─── Cluster / Multi-Node ────────────────────────────────────────────────────\nAEGIS_CLUSTER_PORT={}\nAEGIS_CLUSTER_TOKEN={}\n",
-                config.advanced.cluster_grpc_port, config.advanced.cluster_token
+                config.advanced.cluster_grpc_port,
+                config.advanced.cluster_token.expose()
             )
         } else {
             "".to_string()
         };
 
+        // `.expose()` is the audited injection point — these credentials
+        // are being written to a `.env` file the user explicitly asked
+        // for (security audit 002 §4.30 wraps them only against
+        // accidental `Debug` leaks).
+        let api_key_str = config.api_key.as_ref().map(|s| s.expose());
         let api_key_line = match &components.llm {
             LlmChoice::Ollama => {
                 "# OPENAI_API_KEY=sk-...\n# ANTHROPIC_API_KEY=sk-ant-...".to_string()
             }
-            LlmChoice::OpenAI => format!(
-                "OPENAI_API_KEY={}",
-                config.api_key.as_deref().unwrap_or("sk-...")
-            ),
-            LlmChoice::Anthropic => format!(
-                "ANTHROPIC_API_KEY={}",
-                config.api_key.as_deref().unwrap_or("sk-ant-...")
-            ),
-            LlmChoice::Gemini => format!(
-                "GEMINI_API_KEY={}",
-                config.api_key.as_deref().unwrap_or("AIza...")
-            ),
-            LlmChoice::OpenAICompatible => format!(
-                "OPENAI_COMPATIBLE_API_KEY={}",
-                config.api_key.as_deref().unwrap_or("")
-            ),
+            LlmChoice::OpenAI => format!("OPENAI_API_KEY={}", api_key_str.unwrap_or("sk-...")),
+            LlmChoice::Anthropic => {
+                format!("ANTHROPIC_API_KEY={}", api_key_str.unwrap_or("sk-ant-..."))
+            }
+            LlmChoice::Gemini => format!("GEMINI_API_KEY={}", api_key_str.unwrap_or("AIza...")),
+            LlmChoice::OpenAICompatible => {
+                format!("OPENAI_COMPATIBLE_API_KEY={}", api_key_str.unwrap_or(""))
+            }
         };
         let anthropic_key_line = if config.advanced.enable_anthropic_extra
             && !matches!(components.llm, LlmChoice::Anthropic)
         {
-            if config.advanced.anthropic_api_key.is_empty() {
+            if config.advanced.anthropic_api_key.expose().is_empty() {
                 "ANTHROPIC_API_KEY=sk-ant-...".to_string()
             } else {
-                format!("ANTHROPIC_API_KEY={}", config.advanced.anthropic_api_key)
+                format!(
+                    "ANTHROPIC_API_KEY={}",
+                    config.advanced.anthropic_api_key.expose()
+                )
             }
         } else {
             String::new()
         };
         let gemini_key_line = if config.advanced.enable_gemini {
-            if config.advanced.gemini_api_key.is_empty() {
+            if config.advanced.gemini_api_key.expose().is_empty() {
                 "GEMINI_API_KEY=AIza...".to_string()
             } else {
-                format!("GEMINI_API_KEY={}", config.advanced.gemini_api_key)
+                format!("GEMINI_API_KEY={}", config.advanced.gemini_api_key.expose())
             }
         } else {
             String::new()
@@ -1516,7 +1528,7 @@ mod tests {
                 lmstudio_smart_model: "google/gemma-3-4b".to_string(),
                 lmstudio_judge_model: "google/gemma-3-4b".to_string(),
                 enable_anthropic_extra: false,
-                anthropic_api_key: String::new(),
+                anthropic_api_key: SensitiveString::new(""),
                 anthropic_smart_model: "claude-sonnet-4-5".to_string(),
                 anthropic_judge_model: "claude-sonnet-4-5".to_string(),
                 enable_gemini: false,
@@ -1524,7 +1536,7 @@ mod tests {
                 // and allows treating Gemini as an OpenAI-style provider.
                 gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
                     .to_string(),
-                gemini_api_key: String::new(),
+                gemini_api_key: SensitiveString::new(""),
                 gemini_smart_model: "gemini-2.5-flash".to_string(),
                 gemini_judge_model: "gemini-2.5-pro".to_string(),
                 enable_otlp_logging: false,
@@ -1540,7 +1552,7 @@ mod tests {
                 cluster_grpc_port: 50056,
                 cluster_controller_endpoint: "https://aegis-controller.example.com:50056"
                     .to_string(),
-                cluster_token: "env:AEGIS_CLUSTER_TOKEN".to_string(),
+                cluster_token: SensitiveString::new("env:AEGIS_CLUSTER_TOKEN"),
                 cpu_cores: 4,
                 memory_gb: 16,
                 disk_gb: 100,
@@ -1570,7 +1582,7 @@ mod tests {
             node_name: "test-node".to_string(),
             node_id: "test-node-id".to_string(),
             ollama_model: "llama3.2:latest".to_string(),
-            api_key: Some("anthropic-key".to_string()),
+            api_key: Some(SensitiveString::new("anthropic-key")),
             working_dir: PathBuf::from("/tmp"),
             gemini_model: None,
             openai_compatible_endpoint: None,
@@ -1591,13 +1603,13 @@ mod tests {
                 lmstudio_smart_model: "google/gemma-3-4b".to_string(),
                 lmstudio_judge_model: "google/gemma-3-4b".to_string(),
                 enable_anthropic_extra: false,
-                anthropic_api_key: String::new(),
+                anthropic_api_key: SensitiveString::new(""),
                 anthropic_smart_model: "claude-sonnet-4-5".to_string(),
                 anthropic_judge_model: "claude-sonnet-4-5".to_string(),
                 enable_gemini: false,
                 gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
                     .to_string(),
-                gemini_api_key: String::new(),
+                gemini_api_key: SensitiveString::new(""),
                 gemini_smart_model: "gemini-2.5-flash".to_string(),
                 gemini_judge_model: "gemini-2.5-pro".to_string(),
                 enable_otlp_logging: false,
@@ -1613,7 +1625,7 @@ mod tests {
                 cluster_grpc_port: 50056,
                 cluster_controller_endpoint: "https://aegis-controller.example.com:50056"
                     .to_string(),
-                cluster_token: "env:AEGIS_CLUSTER_TOKEN".to_string(),
+                cluster_token: SensitiveString::new("env:AEGIS_CLUSTER_TOKEN"),
                 cpu_cores: 4,
                 memory_gb: 16,
                 disk_gb: 100,
@@ -1635,6 +1647,87 @@ mod tests {
         assert!(rendered.contains(r#"endpoint: "https://api.anthropic.com/v1""#));
         assert!(rendered.contains(r#"model: "claude-sonnet-4-5""#));
         assert!(!rendered.contains(r#"endpoint: "https://api.anthropic.com""#));
+    }
+
+    /// Build a `NodeConfig` whose every credential field is set to a
+    /// known sentinel string, then assert that `format!("{:?}", cfg)`
+    /// does NOT contain the sentinel. This is the regression for
+    /// security audit 002 §4.30: a `tracing::debug!("{:?}", cfg)` call
+    /// MUST NOT leak any of the four secret-bearing fields
+    /// (`api_key`, `anthropic_api_key`, `gemini_api_key`,
+    /// `cluster_token`).
+    #[test]
+    fn debug_format_does_not_leak_secrets() {
+        const SENTINEL: &str = "SECRET-SENTINEL-12345";
+        let config = NodeConfig {
+            node_name: "test-node".to_string(),
+            node_id: "test-node-id".to_string(),
+            ollama_model: String::new(),
+            api_key: Some(SensitiveString::new(SENTINEL)),
+            working_dir: PathBuf::from("/tmp"),
+            gemini_model: None,
+            openai_compatible_endpoint: None,
+            openai_compatible_model: None,
+            advanced: AdvancedConfig {
+                node_type: "hybrid".to_string(),
+                bind_address: "0.0.0.0".to_string(),
+                api_port: 8088,
+                log_level: "info".to_string(),
+                docker_network: "aegis-network".to_string(),
+                orchestrator_url: "http://aegis-runtime:8088".to_string(),
+                nfs_host: "127.0.0.1".to_string(),
+                database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+                keep_container: false,
+                enable_lmstudio: false,
+                lmstudio_endpoint: "x".to_string(),
+                lmstudio_smart_model: "x".to_string(),
+                lmstudio_judge_model: "x".to_string(),
+                enable_anthropic_extra: true,
+                anthropic_api_key: SensitiveString::new(SENTINEL),
+                anthropic_smart_model: "x".to_string(),
+                anthropic_judge_model: "x".to_string(),
+                enable_gemini: true,
+                gemini_endpoint: "x".to_string(),
+                gemini_api_key: SensitiveString::new(SENTINEL),
+                gemini_smart_model: "x".to_string(),
+                gemini_judge_model: "x".to_string(),
+                enable_otlp_logging: false,
+                otlp_endpoint: "x".to_string(),
+                otlp_protocol: "grpc".to_string(),
+                otlp_min_level: "info".to_string(),
+                otlp_service_name: "x".to_string(),
+                enable_metrics: false,
+                metrics_port: 0,
+                metrics_path: "/m".to_string(),
+                enable_cluster: true,
+                cluster_role: "controller".to_string(),
+                cluster_grpc_port: 0,
+                cluster_controller_endpoint: "x".to_string(),
+                cluster_token: SensitiveString::new(SENTINEL),
+                cpu_cores: 0,
+                memory_gb: 0,
+                disk_gb: 0,
+                gpu_count: 0,
+                vram_gb: 0,
+            },
+        };
+
+        let dbg = format!("{:?}", config);
+        assert!(
+            !dbg.contains(SENTINEL),
+            "Debug output MUST NOT contain the secret sentinel ({SENTINEL}) \
+             — security audit 002 §4.30 regressed. Output: {dbg}"
+        );
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "Debug output should contain redaction marker. Output: {dbg}"
+        );
+
+        // Also assert each sub-field individually.
+        assert!(!format!("{:?}", config.api_key).contains(SENTINEL));
+        assert!(!format!("{:?}", config.advanced.anthropic_api_key).contains(SENTINEL));
+        assert!(!format!("{:?}", config.advanced.gemini_api_key).contains(SENTINEL));
+        assert!(!format!("{:?}", config.advanced.cluster_token).contains(SENTINEL));
     }
 
     #[test]

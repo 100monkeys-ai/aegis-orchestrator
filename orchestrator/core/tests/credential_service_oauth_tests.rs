@@ -11,7 +11,8 @@
 //! that error paths surface a typed error.
 
 use aegis_orchestrator_core::application::credential_service::{
-    CredentialError, CredentialManagementService, OAuthProviderConfig, OAuthProviderRegistry,
+    validate_oauth_provider_registry, CredentialError, CredentialManagementService,
+    OAuthProviderConfig, OAuthProviderRegistry, OAuthRegistryError,
     StandardCredentialManagementService,
 };
 use aegis_orchestrator_core::domain::credential::{
@@ -138,9 +139,11 @@ async fn setup_harness(token_url: String) -> Harness {
     registry.insert(
         CredentialProvider::GitHub,
         OAuthProviderConfig {
+            authorization_url: "https://github.com/login/oauth/authorize".to_string(),
             token_url,
             client_id: "test-client-id".to_string(),
             client_secret: Some(SensitiveString::new("test-client-secret")),
+            redirect_uri_allowlist: vec!["https://app.example/oauth/callback".to_string()],
         },
     );
     let oauth_providers = Arc::new(registry);
@@ -436,4 +439,165 @@ async fn oauth_exchange_rejects_insecure_non_localhost_token_url() {
         .unwrap()
         .expect("binding present");
     assert_eq!(binding.secret_path.path, "PENDING_OAUTH");
+}
+
+// ---------------------------------------------------------------------------
+// Security audit 002 §4.11 — registry validation
+// ---------------------------------------------------------------------------
+
+/// Regression for security audit 002 §4.11. Booting the service with the
+/// historical `oauth.placeholder` host MUST fail validation, not silently
+/// emit an authorization URL pointing at an attacker-controlled domain.
+#[test]
+fn registry_validation_rejects_placeholder_authorization_url() {
+    let mut registry: OAuthProviderRegistry = HashMap::new();
+    registry.insert(
+        CredentialProvider::GitHub,
+        OAuthProviderConfig {
+            authorization_url: "https://oauth.placeholder/github/authorize".to_string(),
+            token_url: "https://github.com/token".to_string(),
+            client_id: "id".to_string(),
+            client_secret: None,
+            redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
+        },
+    );
+    let err = validate_oauth_provider_registry(&registry).expect_err("must reject");
+    match err {
+        OAuthRegistryError::PlaceholderAuthorizationUrl { provider, url } => {
+            assert_eq!(provider, "github");
+            assert!(url.contains("placeholder"));
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+}
+
+#[test]
+fn registry_validation_rejects_insecure_authorization_url() {
+    let mut registry: OAuthProviderRegistry = HashMap::new();
+    registry.insert(
+        CredentialProvider::GitHub,
+        OAuthProviderConfig {
+            authorization_url: "http://github.com/login/oauth/authorize".to_string(),
+            token_url: "https://github.com/token".to_string(),
+            client_id: "id".to_string(),
+            client_secret: None,
+            redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
+        },
+    );
+    assert!(matches!(
+        validate_oauth_provider_registry(&registry),
+        Err(OAuthRegistryError::InsecureAuthorizationUrl { .. })
+    ));
+}
+
+#[test]
+fn registry_validation_rejects_empty_redirect_allowlist() {
+    let mut registry: OAuthProviderRegistry = HashMap::new();
+    registry.insert(
+        CredentialProvider::GitHub,
+        OAuthProviderConfig {
+            authorization_url: "https://github.com/login/oauth/authorize".to_string(),
+            token_url: "https://github.com/token".to_string(),
+            client_id: "id".to_string(),
+            client_secret: None,
+            redirect_uri_allowlist: vec![],
+        },
+    );
+    assert!(matches!(
+        validate_oauth_provider_registry(&registry),
+        Err(OAuthRegistryError::EmptyRedirectAllowlist { .. })
+    ));
+}
+
+#[test]
+fn registry_validation_accepts_real_https_authorization_url() {
+    let mut registry: OAuthProviderRegistry = HashMap::new();
+    registry.insert(
+        CredentialProvider::GitHub,
+        OAuthProviderConfig {
+            authorization_url: "https://github.com/login/oauth/authorize".to_string(),
+            token_url: "https://github.com/login/oauth/access_token".to_string(),
+            client_id: "id".to_string(),
+            client_secret: Some(SensitiveString::new("secret")),
+            redirect_uri_allowlist: vec!["https://app.example/oauth/callback".to_string()],
+        },
+    );
+    assert!(validate_oauth_provider_registry(&registry).is_ok());
+}
+
+/// Regression for the original `oauth.placeholder` URL construction at
+/// `credential_service.rs:563-566`. After the fix, the constructed
+/// authorization URL MUST be derived from the configured
+/// `authorization_url` and MUST NOT contain the literal "placeholder"
+/// substring.
+#[tokio::test]
+async fn initiate_oauth_uses_configured_authorization_url_not_placeholder() {
+    let harness = setup_harness("https://github.com/login/oauth/access_token".to_string()).await;
+    let init = harness
+        .service
+        .initiate_oauth_connection(
+            "user-sub-abc",
+            &TenantId::consumer(),
+            CredentialProvider::GitHub,
+            "https://app.example/oauth/callback".to_string(),
+        )
+        .await
+        .expect("initiate should succeed");
+    assert!(
+        init.authorization_url
+            .starts_with("https://github.com/login/oauth/authorize?"),
+        "authorization_url must derive from configured base, got: {}",
+        init.authorization_url
+    );
+    assert!(
+        !init.authorization_url.contains("placeholder"),
+        "authorization_url MUST NOT contain placeholder substring, got: {}",
+        init.authorization_url
+    );
+    // redirect_uri MUST be percent-encoded (the `/` and `:` in the
+    // callback are encoded by `url::Url::query_pairs_mut`).
+    assert!(
+        init.authorization_url
+            .contains("redirect_uri=https%3A%2F%2Fapp.example%2Foauth%2Fcallback"),
+        "redirect_uri must be URL-encoded, got: {}",
+        init.authorization_url
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Security audit 002 §4.18 — redirect_uri allowlist
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn initiate_oauth_rejects_redirect_uri_outside_allowlist() {
+    let harness = setup_harness("https://github.com/login/oauth/access_token".to_string()).await;
+    let err = harness
+        .service
+        .initiate_oauth_connection(
+            "user-sub-abc",
+            &TenantId::consumer(),
+            CredentialProvider::GitHub,
+            "https://attacker.example/steal".to_string(),
+        )
+        .await
+        .expect_err("non-allowlisted redirect_uri must be rejected");
+    match downcast_credential_error(&err) {
+        CredentialError::RedirectUriNotAllowlisted => {}
+        other => panic!("expected RedirectUriNotAllowlisted, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn initiate_oauth_accepts_allowlisted_redirect_uri() {
+    let harness = setup_harness("https://github.com/login/oauth/access_token".to_string()).await;
+    harness
+        .service
+        .initiate_oauth_connection(
+            "user-sub-abc",
+            &TenantId::consumer(),
+            CredentialProvider::GitHub,
+            "https://app.example/oauth/callback".to_string(),
+        )
+        .await
+        .expect("allowlisted redirect_uri must succeed");
 }
