@@ -2014,6 +2014,35 @@ impl NodeConfigManifest {
             }
         }
 
+        // AEGIS_NETWORK_ALLOW_INSECURE_BIND → spec.network.allow_insecure_bind
+        // (only if still at the serde default of `false`). Mirrors the
+        // operator-acknowledged opt-out documented on the YAML field. Used by
+        // dev-stack compose harnesses where the orchestrator binds 0.0.0.0
+        // inside a trusted compose network with no in-pod TLS.
+        if let Ok(raw) = std::env::var("AEGIS_NETWORK_ALLOW_INSECURE_BIND") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let parsed = matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                );
+                if parsed {
+                    let network = self.spec.network.get_or_insert_with(|| NetworkConfig {
+                        bind_address: default_bind_address(),
+                        port: default_api_port(),
+                        grpc_port: default_grpc_port(),
+                        orchestrator_endpoint: None,
+                        heartbeat_interval_seconds: default_heartbeat(),
+                        tls: None,
+                        allow_insecure_bind: false,
+                    });
+                    if !network.allow_insecure_bind {
+                        network.allow_insecure_bind = true;
+                    }
+                }
+            }
+        }
+
         // AEGIS_LOG_LEVEL → spec.observability.logging.level (only if at default)
         if let Ok(level) = std::env::var("AEGIS_LOG_LEVEL") {
             if !level.is_empty() {
@@ -2846,6 +2875,33 @@ path: "/metrics"
         assert!(
             msg.contains("non-loopback") && msg.contains("§4.27"),
             "unexpected error: {msg}"
+        );
+    }
+
+    /// Audit 002 §4.27 env-override regression: when
+    /// `AEGIS_NETWORK_ALLOW_INSECURE_BIND=true` is set in the environment,
+    /// `apply_env_overrides` MUST flip `spec.network.allow_insecure_bind`
+    /// from its serde default of `false` to `true`. Mirrors the existing
+    /// `AEGIS_HOST`/`AEGIS_PORT` env-var precedents and unblocks dev-stack
+    /// compose harnesses that need a non-loopback bind without in-pod TLS.
+    #[test]
+    fn apply_env_overrides_sets_allow_insecure_bind_from_env() {
+        // The env var is process-global; clear it before and after to keep
+        // parallel tests deterministic. The other env-var-driven tests in
+        // this module follow the same pattern.
+        std::env::set_var("AEGIS_NETWORK_ALLOW_INSECURE_BIND", "true");
+        let mut manifest = manifest_with_network_full("127.0.0.1", None, false);
+        manifest.apply_env_overrides();
+        std::env::remove_var("AEGIS_NETWORK_ALLOW_INSECURE_BIND");
+
+        let net = manifest
+            .spec
+            .network
+            .as_ref()
+            .expect("network section present");
+        assert!(
+            net.allow_insecure_bind,
+            "AEGIS_NETWORK_ALLOW_INSECURE_BIND=true must flip the serde default"
         );
     }
 

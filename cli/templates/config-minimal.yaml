@@ -63,10 +63,21 @@ spec:
     # nfs_mountport: 2049                               # Optional (default: 2049)
 
   network:
-    # bind_address: "0.0.0.0"  # Optional (default: 0.0.0.0)
-    # port: 8088               # Optional (default: 8088)
+    # bind_address: "127.0.0.1"  # Optional (default: 127.0.0.1, loopback)
+    # port: 8088                 # Optional (default: 8088)
     # orchestrator_endpoint: "https://orchestrator.aegis.ai"  # Optional
     # heartbeat_interval_seconds: 30  # Optional
+    #
+    # If you set bind_address to a non-loopback value (e.g. "0.0.0.0") the
+    # validator refuses to start unless either `tls:` is configured below,
+    # or — only when TLS is terminated UPSTREAM by a trusted-network ingress
+    # — `allow_insecure_bind: true` is set to acknowledge the override. The
+    # opt-out logs a WARN entry on every boot and must NEVER be set on a
+    # publicly-exposed host. See cli/templates/config-with-examples.yaml.
+    # tls:
+    #   cert_path: "/etc/aegis/tls/server.crt"
+    #   key_path:  "/etc/aegis/tls/server.key"
+    # allow_insecure_bind: false
 
   observability:
     logging:
