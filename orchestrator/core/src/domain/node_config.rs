@@ -1241,12 +1241,10 @@ impl ClusterConfig {
                     );
                 }
             }
-            NodeRole::RelayCoordinator => {
-                if self.ingress.is_none() {
-                    anyhow::bail!(
-                        "cluster.ingress.public_endpoint required for role=relay-coordinator"
-                    );
-                }
+            NodeRole::RelayCoordinator if self.ingress.is_none() => {
+                anyhow::bail!(
+                    "cluster.ingress.public_endpoint required for role=relay-coordinator"
+                );
             }
             _ => {}
         }

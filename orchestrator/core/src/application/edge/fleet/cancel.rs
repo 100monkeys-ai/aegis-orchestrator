@@ -4,8 +4,6 @@
 //! task and additionally sends `CancelCommand` over the connection registry
 //! for any node whose `command_id` is known.
 
-use std::sync::Arc;
-
 use super::registry::FleetRegistry;
 use crate::domain::cluster::FleetCommandId;
 use crate::infrastructure::aegis_cluster_proto::{

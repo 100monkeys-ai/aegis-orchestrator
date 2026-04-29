@@ -30,7 +30,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use prost_types::Struct;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::application::edge::dispatch_to_edge::DispatchToEdgeService;
-use crate::application::edge::fleet::dispatcher::{FleetDispatcher, FleetEvent, FleetInvocation};
+use crate::application::edge::fleet::dispatcher::{FleetDispatcher, FleetInvocation};
 use crate::application::edge::fleet::{CancelFleetService, EdgeFleetResolver};
 use crate::application::edge::issue_enrollment_token::IssueEnrollmentToken;
 use crate::application::edge::manage_groups::ManageGroupsService;

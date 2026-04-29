@@ -1824,6 +1824,7 @@ pub struct ToolServerManager {
 /// Returns `false` for empty stdout (which is what `/NH` produces when no rows
 /// match the filter), for non-CSV lines, and for any input where the requested
 /// PID does not appear in the PID column of any row.
+#[cfg(windows)]
 pub(crate) fn parse_tasklist_csv_for_pid(stdout: &str, pid: u32) -> bool {
     stdout
         .lines()
@@ -2556,6 +2557,7 @@ mod tests {
     // PID column exactly. These tests pin that behavior.
     // -----------------------------------------------------------------------
 
+    #[cfg(windows)]
     #[test]
     fn parse_tasklist_csv_pid_present() {
         // Typical CSV row produced by `tasklist /FI "PID eq 4242" /FO CSV /NH`.
@@ -2563,6 +2565,7 @@ mod tests {
         assert!(parse_tasklist_csv_for_pid(stdout, 4242));
     }
 
+    #[cfg(windows)]
     #[test]
     fn parse_tasklist_csv_pid_absent() {
         // Localized "no match" output from older tasklist versions that print
@@ -2572,6 +2575,7 @@ mod tests {
         assert!(!parse_tasklist_csv_for_pid(stdout, 4242));
     }
 
+    #[cfg(windows)]
     #[test]
     fn parse_tasklist_csv_pid_substring_in_image_name() {
         // Adversarial input: an image name contains the literal substring
@@ -2585,6 +2589,7 @@ mod tests {
         assert!(parse_tasklist_csv_for_pid(stdout, 99));
     }
 
+    #[cfg(windows)]
     #[test]
     fn parse_tasklist_csv_localized_no_match_text() {
         // `tasklist /NH` with a non-matching PID filter typically emits empty

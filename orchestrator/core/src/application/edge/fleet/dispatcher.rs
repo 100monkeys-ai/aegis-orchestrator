@@ -3,18 +3,15 @@
 //! Drives a [`FleetCommand`] across resolved targets per its
 //! [`FleetDispatchPolicy`]. Per-node results stream as [`FleetEvent`].
 
-use chrono::Utc;
 use prost_types::Struct;
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Semaphore};
-use uuid::Uuid;
 
 use super::registry::{FleetCommandHandle, FleetRegistry};
 use crate::application::edge::dispatch_to_edge::{DispatchRequest, DispatchToEdgeService};
 use crate::domain::cluster::{
-    FailurePolicy, FleetCommandId, FleetDispatchPolicy, FleetMode, FleetSummary, SkipReason,
+    FailurePolicy, FleetCommandId, FleetDispatchPolicy, FleetMode, FleetSummary,
 };
 use crate::domain::edge::EdgeRouterError;
 use crate::domain::shared_kernel::{NodeId, TenantId};
