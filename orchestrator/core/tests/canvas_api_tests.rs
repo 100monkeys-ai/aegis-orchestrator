@@ -1041,7 +1041,8 @@ fn canvas_event_session_id(event: &CanvasEvent) -> CanvasSessionId {
         | CanvasEvent::FilesWrittenByAgent { session_id, .. }
         | CanvasEvent::GitCommitMade { session_id, .. }
         | CanvasEvent::GitPushed { session_id, .. }
-        | CanvasEvent::SessionTerminated { session_id, .. } => *session_id,
+        | CanvasEvent::SessionTerminated { session_id, .. }
+        | CanvasEvent::WorkspaceVolumeOrphaned { session_id, .. } => *session_id,
     }
 }
 
