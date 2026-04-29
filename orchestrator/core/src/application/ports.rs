@@ -190,8 +190,17 @@ pub trait AgentActivityPort: Send + Sync {
 #[async_trait]
 pub trait SwarmCancellationPort: Send + Sync {
     /// Look up the swarm associated with this execution and cancel it.
+    ///
+    /// `tenant_id` MUST be the tenant of the cancelling caller. The swarm
+    /// is only cancelled if it belongs to the same tenant — cross-tenant
+    /// cascade is silently ignored (audit 002, finding 4.34).
+    ///
     /// Returns Ok(()) if no swarm is associated or the cancellation succeeds.
-    async fn cascade_cancel_for_execution(&self, execution_id: ExecutionId) -> anyhow::Result<()>;
+    async fn cascade_cancel_for_execution(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<()>;
 }
 
 /// Client for communicating with the SEAL gateway's control plane (ADR-088 §A8).

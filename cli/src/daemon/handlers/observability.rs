@@ -130,7 +130,9 @@ pub(crate) async fn dashboard_summary_handler(
     }
 
     let cluster = cluster_status_view(&state).await;
-    let swarms = state.swarm_service.list_swarms().await;
+    // Operator dashboard aggregates across all tenants — gated above by
+    // the operator check, mirroring the system-tenant usage below.
+    let swarms = state.swarm_service.list_swarms_unscoped().await;
     let stimuli = state.operator_read_model.list_stimuli().await;
     let security_incidents = state.operator_read_model.list_security_incidents().await;
 
