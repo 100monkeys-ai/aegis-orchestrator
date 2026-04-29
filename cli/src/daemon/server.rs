@@ -1665,7 +1665,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // ADR-117: build edge components and wire the four-step pre-routing hook
     // when a Postgres pool is available. The same components feed the
-    // `/api/edge/*` REST surface (constructed below) — we collect them here
+    // `/v1/edge/*` REST surface (constructed below) — we collect them here
     // and reuse them in the `EdgeApiState` bundle so there is exactly one
     // EdgeConnectionRegistry / FleetRegistry per process.
     let edge_components: Option<EdgeComponentsBundle> = if let Some(ref pool) = db_pool {
@@ -2130,7 +2130,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         _ => None,
     };
 
-    // ADR-117 §F: assemble the `/api/edge/*` REST surface from the edge
+    // ADR-117 §F: assemble the `/v1/edge/*` REST surface from the edge
     // components built above (one EdgeConnectionRegistry per process). The
     // operator-facing services (IssueEnrollmentToken, ManageGroups, ManageTags,
     // RevokeEdge) are local to this bundle and not shared with the
@@ -2146,10 +2146,32 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 fleet_dispatcher,
                 fleet_cancel,
             )| {
-                use aegis_orchestrator_core::application::edge::issue_enrollment_token::IssueEnrollmentToken;
+                use aegis_orchestrator_core::application::edge::issue_enrollment_token::{
+                    EnrollmentTokenIssuer, IssueEnrollmentToken, RelayProxyEnrollmentTokenIssuer,
+                    EDGE_ENROLLMENT_SIGNING_KEY,
+                };
                 use aegis_orchestrator_core::application::edge::manage_groups::ManageGroupsService;
                 use aegis_orchestrator_core::application::edge::manage_tags::ManageTagsService;
                 use aegis_orchestrator_core::application::edge::revoke_edge::RevokeEdgeService;
+                use aegis_orchestrator_core::domain::node_config::NodeRole;
+
+                // ADR-117 SaaS topology: signing capability for
+                // `transit/sign/edge-enrollment-token` is held ONLY by the
+                // `relay-coordinator` AppRole. The Controller pod does not
+                // have the OpenBao policy and MUST proxy enrollment-token
+                // requests to a co-located Relay Coordinator over the
+                // trusted in-pod network.
+                let cluster_role = config
+                    .spec
+                    .cluster
+                    .as_ref()
+                    .map(|c| c.role)
+                    .unwrap_or(NodeRole::Hybrid);
+                let relay_endpoint = config
+                    .spec
+                    .cluster
+                    .as_ref()
+                    .and_then(|c| c.relay_coordinator_endpoint.clone());
 
                 let cluster_endpoint = config
                     .spec
@@ -2157,19 +2179,40 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     .as_ref()
                     .map(|n| format!("{}:{}", n.bind_address, n.grpc_port))
                     .unwrap_or_else(|| "0.0.0.0:50051".to_string());
-                let issuer = config
+                let issuer_url = config
                     .spec
                     .zaru
                     .as_ref()
                     .and_then(|z| resolve_env_value(&z.public_url).ok())
                     .unwrap_or_else(|| "aegis-controller".to_string());
 
-                let issue_token = Arc::new(IssueEnrollmentToken::new(
-                    secrets_manager.secret_store(),
-                    issuer,
-                    cluster_endpoint,
-                    "aegis-node-controller-key".to_string(),
-                ));
+                // The dispatch is keyed strictly on the presence of
+                // `cluster.relay_coordinator_endpoint`. When set, this
+                // process MUST proxy — it does not hold the OpenBao policy.
+                // When unset (OSS single-process, or relay-coordinator
+                // itself), sign locally with the canonical key name.
+                let issue_token: Arc<dyn EnrollmentTokenIssuer> = match relay_endpoint {
+                    Some(endpoint) => {
+                        tracing::info!(
+                            role = ?cluster_role,
+                            relay = %endpoint,
+                            "edge enrollment-token issuer: proxy to relay-coordinator (ADR-117)"
+                        );
+                        Arc::new(RelayProxyEnrollmentTokenIssuer::new(endpoint))
+                    }
+                    None => {
+                        tracing::info!(
+                            role = ?cluster_role,
+                            "edge enrollment-token issuer: local signer"
+                        );
+                        Arc::new(IssueEnrollmentToken::new(
+                            secrets_manager.secret_store(),
+                            issuer_url,
+                            cluster_endpoint,
+                            EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+                        ))
+                    }
+                };
                 let group_service = Arc::new(ManageGroupsService::new(group_repo.clone()));
                 let tag_service = Arc::new(ManageTagsService::new(edge_repo.clone()));
                 let revoke_service = Arc::new(RevokeEdgeService::new(

@@ -23,10 +23,10 @@ pub fn parse(expr: &str) -> Result<EdgeTarget> {
     }
     if let Some(_name) = trimmed.strip_prefix("group:") {
         // Server resolves group names to ids; the CLI looks them up via
-        // /api/edge/groups before calling fleet endpoints. For now expose
+        // /v1/edge/groups before calling fleet endpoints. For now expose
         // the raw selector form when the CLI resolves a group locally.
         return Err(anyhow!(
-            "group:<name> requires a server lookup; use the resolved id via /api/edge/groups"
+            "group:<name> requires a server lookup; use the resolved id via /v1/edge/groups"
         ));
     }
     let mut sel = EdgeSelector::default();

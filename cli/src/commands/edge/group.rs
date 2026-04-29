@@ -51,7 +51,7 @@ pub async fn run(cmd: GroupCommand) -> Result<()> {
     let client = EdgeApiClient::from_env()?;
     match cmd {
         GroupCommand::Ls => {
-            let groups: Vec<GroupView> = client.get("/api/edge/groups").await?;
+            let groups: Vec<GroupView> = client.get("/v1/edge/groups").await?;
             println!("{}", serde_json::to_string_pretty(&groups)?);
         }
         GroupCommand::Create { name, selector } => {
@@ -70,7 +70,7 @@ pub async fn run(cmd: GroupCommand) -> Result<()> {
                 pinned_members: vec![],
                 created_by: std::env::var("AEGIS_OPERATOR_SUB").unwrap_or_else(|_| "cli".into()),
             };
-            let group: GroupView = client.post("/api/edge/groups", &body).await?;
+            let group: GroupView = client.post("/v1/edge/groups", &body).await?;
             println!("{}", serde_json::to_string_pretty(&group)?);
         }
         GroupCommand::SetPinned { id, members } => {
@@ -78,12 +78,12 @@ pub async fn run(cmd: GroupCommand) -> Result<()> {
                 pinned_members: members,
             };
             let group: GroupView = client
-                .patch(&format!("/api/edge/groups/{id}"), &body)
+                .patch(&format!("/v1/edge/groups/{id}"), &body)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&group)?);
         }
         GroupCommand::Rm { id } => {
-            client.delete(&format!("/api/edge/groups/{id}")).await?;
+            client.delete(&format!("/v1/edge/groups/{id}")).await?;
             println!("deleted");
         }
     }

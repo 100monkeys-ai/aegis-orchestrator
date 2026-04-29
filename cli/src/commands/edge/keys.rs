@@ -28,7 +28,7 @@ pub enum KeysCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Operator-side revoke: `DELETE /api/edge/hosts/{node_id}` which evicts
+    /// Operator-side revoke: `DELETE /v1/edge/hosts/{node_id}` which evicts
     /// the daemon and disables further dispatches.
     RevokeRemote { node_id: String },
 }
@@ -38,7 +38,7 @@ pub async fn run(cmd: KeysCommand) -> Result<()> {
         KeysCommand::Rotate { keep_old, force } => rotate(&keep_old, force).await,
         KeysCommand::RevokeRemote { node_id } => {
             let client = EdgeApiClient::from_env()?;
-            client.delete(&format!("/api/edge/hosts/{node_id}")).await?;
+            client.delete(&format!("/v1/edge/hosts/{node_id}")).await?;
             println!("revoked {node_id}");
             Ok(())
         }

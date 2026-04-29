@@ -74,7 +74,7 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Preview { target } => {
             let parsed = selector::parse(&target)?;
             let resp: PreviewResponse = client
-                .post("/api/edge/fleet/preview", &PreviewBody { target: parsed })
+                .post("/v1/edge/fleet/preview", &PreviewBody { target: parsed })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&resp.resolved)?);
         }
@@ -104,9 +104,7 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
                 require_min_targets: require_min,
                 deadline_secs: Some(deadline_secs),
             };
-            let resp = client
-                .post_streamed("/api/edge/fleet/invoke", &body)
-                .await?;
+            let resp = client.post_streamed("/v1/edge/fleet/invoke", &body).await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let txt = resp
@@ -137,7 +135,7 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
             // Router exposes this as POST returning 204; we don't decode a body.
             let resp = client
                 .post_streamed(
-                    &format!("/api/edge/fleet/{fleet_command_id}/cancel"),
+                    &format!("/v1/edge/fleet/{fleet_command_id}/cancel"),
                     &serde_json::json!({}),
                 )
                 .await?;
@@ -153,7 +151,7 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
             }
         }
         FleetCommand::Runs { output } => {
-            let runs: serde_json::Value = client.get("/api/edge/fleet/runs").await?;
+            let runs: serde_json::Value = client.get("/v1/edge/fleet/runs").await?;
             match output.as_str() {
                 "json" => println!("{}", serde_json::to_string_pretty(&runs)?),
                 _ => println!("{runs}"),

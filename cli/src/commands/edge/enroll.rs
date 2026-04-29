@@ -11,7 +11,7 @@ use super::bootstrap::{run_bootstrap, BootstrapPlan, BootstrapPolicy, OutputForm
 
 #[derive(Debug, Args)]
 pub struct EnrollArgs {
-    /// Enrollment token issued by `POST /api/edge/enrollment-tokens`.
+    /// Enrollment token issued by `POST /v1/edge/enrollment-tokens`.
     pub token: String,
     /// Override the local edge state directory (default: `~/.aegis/edge`).
     #[arg(long)]

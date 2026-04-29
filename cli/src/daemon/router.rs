@@ -413,7 +413,7 @@ pub(crate) fn create_router(
         )
         .with_state(app_state.clone());
 
-    // ADR-117 §F: mount `/api/edge/*` whenever the edge bundle was constructed
+    // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed
     // (i.e. a Postgres pool is available). Pure-worker deployments without a
     // pool skip this mount and never serve the operator surface.
     let router = if let Some(edge_state) = app_state.edge_api.clone() {

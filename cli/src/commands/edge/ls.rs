@@ -31,7 +31,7 @@ struct EdgeHostView {
 pub async fn run(args: LsArgs) -> Result<()> {
     let _ = (&args.label, &args.connected); // ADR-117: server-side filters TBD
     let client = EdgeApiClient::from_env()?;
-    let hosts: Vec<EdgeHostView> = client.get("/api/edge/hosts").await?;
+    let hosts: Vec<EdgeHostView> = client.get("/v1/edge/hosts").await?;
 
     let filtered: Vec<&EdgeHostView> = hosts
         .iter()

@@ -10,7 +10,7 @@
 //!
 //! Authentication header (`Authorization: Bearer <access_key>`) is supplied by
 //! the active profile when present. The orchestrator's tenant middleware
-//! requires `X-Effective-Tenant` for every `/api/edge/*` call; the helper
+//! requires `X-Effective-Tenant` for every `/v1/edge/*` call; the helper
 //! injects it from `AEGIS_EFFECTIVE_TENANT` or fails with a typed error so
 //! the caller can surface a useful message.
 
@@ -57,7 +57,7 @@ impl EdgeApiClient {
         }
 
         let tenant = std::env::var("AEGIS_EFFECTIVE_TENANT").map_err(|_| {
-            anyhow!("AEGIS_EFFECTIVE_TENANT env var is required for /api/edge/* calls")
+            anyhow!("AEGIS_EFFECTIVE_TENANT env var is required for /v1/edge/* calls")
         })?;
         let name = HeaderName::from_static("x-effective-tenant");
         headers.insert(

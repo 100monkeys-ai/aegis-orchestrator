@@ -29,7 +29,7 @@ pub async fn run(cmd: TagCommand) -> Result<()> {
                 remove_tags: None,
             };
             let updated: Vec<String> = client
-                .patch(&format!("/api/edge/hosts/{node_id}"), &body)
+                .patch(&format!("/v1/edge/hosts/{node_id}"), &body)
                 .await?;
             println!("tags: {}", updated.join(","));
         }
@@ -39,7 +39,7 @@ pub async fn run(cmd: TagCommand) -> Result<()> {
                 remove_tags: Some(tags),
             };
             let updated: Vec<String> = client
-                .patch(&format!("/api/edge/hosts/{node_id}"), &body)
+                .patch(&format!("/v1/edge/hosts/{node_id}"), &body)
                 .await?;
             println!("tags: {}", updated.join(","));
         }

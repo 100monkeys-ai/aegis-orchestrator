@@ -1472,7 +1472,7 @@ impl ToolInvocationService {
     /// `aegis.edge.fleet.invoke` — multi-target reverse-RPC dispatch via
     /// `FleetDispatcher::spawn`. Returns the fleet command id; per-node
     /// progress is observable via the FleetEvent stream surfaced over the
-    /// REST `/api/edge/fleet/invoke` SSE channel.
+    /// REST `/v1/edge/fleet/invoke` SSE channel.
     async fn invoke_aegis_edge_fleet_invoke_tool(
         &self,
         args: &Value,

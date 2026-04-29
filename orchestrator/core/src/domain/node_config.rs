@@ -1243,6 +1243,15 @@ pub struct ClusterConfig {
     /// ADR-117: ingress config for `role = relay-coordinator`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<RelayIngressConfig>,
+    /// ADR-117 SaaS topology. Set on a Controller pod that sits next to
+    /// a separate Relay Coordinator pod. When present, the core
+    /// orchestrator's `POST /v1/edge/enrollment-tokens` handler proxies
+    /// to this URL over the trusted in-pod network rather than
+    /// attempting to sign locally (only the relay-coordinator AppRole
+    /// holds the OpenBao policy on `transit/sign/edge-enrollment-token`).
+    /// Format: full base URL, e.g. `http://aegis-relay-coordinator:8088`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_coordinator_endpoint: Option<String>,
 }
 
 impl ClusterConfig {
@@ -2576,6 +2585,7 @@ mod tests {
             tls: None,
             edge: None,
             ingress: None,
+            relay_coordinator_endpoint: None,
         });
 
         let bootstrap = manifest.bootstrap();
@@ -2678,6 +2688,7 @@ mod tests {
             tls: None,
             edge: None,
             ingress: None,
+            relay_coordinator_endpoint: None,
         };
         assert!(cfg.validate_roles().is_err());
     }
@@ -2701,6 +2712,7 @@ mod tests {
             tls: None,
             edge: Some(EdgeConfig::default()),
             ingress: None,
+            relay_coordinator_endpoint: None,
         };
         assert!(cfg.validate_roles().is_ok());
     }
@@ -2721,6 +2733,7 @@ mod tests {
             tls: None,
             edge: None,
             ingress: None,
+            relay_coordinator_endpoint: None,
         };
         assert!(cfg.validate_roles().is_err());
     }
@@ -2949,6 +2962,7 @@ grpc_port: 50051
             tls: None, // ← no mTLS bundle
             edge: None,
             ingress: None,
+            relay_coordinator_endpoint: None,
         });
         let err = manifest
             .validate()
@@ -2989,6 +3003,7 @@ grpc_port: 50051
             }),
             edge: None,
             ingress: None,
+            relay_coordinator_endpoint: None,
         });
         manifest
             .validate()
