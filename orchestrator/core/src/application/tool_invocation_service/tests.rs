@@ -2341,7 +2341,7 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
 }
 
 #[tokio::test]
-async fn version_aware_agent_lifecycle_service_lookup_agent_with_version_is_correct() {
+async fn lookup_agent_with_version_returns_expected_agent_id() {
     let agent_id = AgentId::new();
     let agent_name = "example-agent";
     let agent_version = "1.2.3";
