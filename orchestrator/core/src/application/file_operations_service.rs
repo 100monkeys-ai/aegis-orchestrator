@@ -13,6 +13,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use crate::domain::fsal::{AegisFSAL, FsalError};
 use crate::domain::path_sanitizer::PathSanitizer;
 use crate::domain::storage::{FileType, OpenMode, StorageError};
+use crate::domain::tenant::TenantId;
 use crate::domain::volume::VolumeId;
 
 // ============================================================================
@@ -130,10 +131,14 @@ impl FileOperationsService {
     pub async fn list_directory(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
     ) -> Result<Vec<DirEntry>, FileOperationsError> {
-        let volume = self.fsal.authorize_for_user(owner, volume_id).await?;
+        let volume = self
+            .fsal
+            .authorize_for_user(tenant_id, owner, volume_id)
+            .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
         let entries = self
@@ -158,10 +163,14 @@ impl FileOperationsService {
     pub async fn read_file(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
     ) -> Result<FileContent, FileOperationsError> {
-        let volume = self.fsal.authorize_for_user(owner, volume_id).await?;
+        let volume = self
+            .fsal
+            .authorize_for_user(tenant_id, owner, volume_id)
+            .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
         let handle = self
@@ -198,6 +207,7 @@ impl FileOperationsService {
     pub async fn write_file(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
         data: &[u8],
@@ -207,7 +217,10 @@ impl FileOperationsService {
             return Err(FileOperationsError::FileTooLarge);
         }
 
-        let volume = self.fsal.authorize_for_user(owner, volume_id).await?;
+        let volume = self
+            .fsal
+            .authorize_for_user(tenant_id, owner, volume_id)
+            .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
         // Ensure parent directory exists
@@ -244,6 +257,7 @@ impl FileOperationsService {
     pub async fn write_file_for_tier(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
         data: &[u8],
@@ -255,17 +269,21 @@ impl FileOperationsService {
             .get(tier)
             .map(|l| l.max_file_size_bytes)
             .unwrap_or(50 * 1024 * 1024);
-        self.write_file(volume_id, owner, path, data, max_file_size)
+        self.write_file(volume_id, tenant_id, owner, path, data, max_file_size)
             .await
     }
 
     pub async fn delete_path(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
     ) -> Result<(), FileOperationsError> {
-        let volume = self.fsal.authorize_for_user(owner, volume_id).await?;
+        let volume = self
+            .fsal
+            .authorize_for_user(tenant_id, owner, volume_id)
+            .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
         // Try file first, then directory
@@ -289,10 +307,14 @@ impl FileOperationsService {
     pub async fn create_directory(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
     ) -> Result<(), FileOperationsError> {
-        let volume = self.fsal.authorize_for_user(owner, volume_id).await?;
+        let volume = self
+            .fsal
+            .authorize_for_user(tenant_id, owner, volume_id)
+            .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
         self.fsal
@@ -307,11 +329,15 @@ impl FileOperationsService {
     pub async fn move_path(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         from: &str,
         to: &str,
     ) -> Result<(), FileOperationsError> {
-        let volume = self.fsal.authorize_for_user(owner, volume_id).await?;
+        let volume = self
+            .fsal
+            .authorize_for_user(tenant_id, owner, volume_id)
+            .await?;
         let from_full = self.sanitize_and_resolve(from, &volume)?;
         let to_full = self.sanitize_and_resolve(to, &volume)?;
 
@@ -332,10 +358,14 @@ impl FileOperationsService {
     pub async fn get_attributes(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
     ) -> Result<FileAttributes, FileOperationsError> {
-        let volume = self.fsal.authorize_for_user(owner, volume_id).await?;
+        let volume = self
+            .fsal
+            .authorize_for_user(tenant_id, owner, volume_id)
+            .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
         let attrs = self
@@ -387,10 +417,11 @@ impl FileOperationsService {
     pub async fn stat_attachment_for_user(
         &self,
         volume_id: &VolumeId,
+        tenant_id: &TenantId,
         owner: &str,
         path: &str,
     ) -> Result<AttachmentStat, FileOperationsError> {
-        let content = self.read_file(volume_id, owner, path).await?;
+        let content = self.read_file(volume_id, tenant_id, owner, path).await?;
         let size = content.data.len() as u64;
         let mime_type = infer::get(&content.data)
             .map(|k| k.mime_type().to_string())
@@ -456,8 +487,9 @@ impl FileOperationsService {
         };
 
         // Delegate to the standard read_file path so sanitization and FSAL
-        // semantics are identical to `aegis.file.read`.
-        self.read_file(volume_id, &owner, path).await
+        // semantics are identical to `aegis.file.read`. Tenant scoping flows
+        // through `authorize_for_user`.
+        self.read_file(volume_id, tenant_id, &owner, path).await
     }
 
     pub async fn read_file_for_execution(

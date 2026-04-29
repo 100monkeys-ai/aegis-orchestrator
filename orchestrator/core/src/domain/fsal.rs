@@ -543,9 +543,16 @@ impl AegisFSAL {
         Ok(volume)
     }
 
-    /// Authorize a user (not an execution) to access a volume they own
+    /// Authorize a user (not an execution) to access a volume they own.
+    ///
+    /// Authorisation is keyed on the full `(tenant_id, user_id, volume_id)`
+    /// triple. Granting access on `(user_id, volume_id)` alone is unsound
+    /// because a Keycloak `sub` is not guaranteed to be globally unique
+    /// across realms, and matched a tenant-A `sub` to a tenant-B volume.
+    /// See security audit 002 §4.19.
     pub async fn authorize_for_user(
         &self,
+        tenant_id: &crate::domain::tenant::TenantId,
         user_id: &str,
         volume_id: &VolumeId,
     ) -> Result<Volume, FsalError> {
@@ -555,6 +562,16 @@ impl AegisFSAL {
             .await
             .map_err(|_| FsalError::VolumeNotFound(*volume_id))?
             .ok_or(FsalError::VolumeNotFound(*volume_id))?;
+
+        // Tenant isolation MUST precede ownership matching: an attacker's
+        // tenant-B `sub` must never collide with a tenant-A volume's
+        // `Persistent { owner }` value.
+        if &volume.tenant_id != tenant_id {
+            return Err(FsalError::UnauthorizedAccess {
+                execution_id: ExecutionId::new(),
+                volume_id: *volume_id,
+            });
+        }
 
         match &volume.status {
             VolumeStatus::Available | VolumeStatus::Attached => {}
@@ -1731,19 +1748,49 @@ mod tests {
     #[tokio::test]
     async fn authorize_for_user_correct_owner_passes() {
         let vol = make_available_persistent_volume("alice");
+        let tenant = vol.tenant_id.clone();
         let fsal = make_fsal_with_volume(&vol).await;
-        let result = fsal.authorize_for_user("alice", &vol.id).await;
+        let result = fsal.authorize_for_user(&tenant, "alice", &vol.id).await;
         assert!(result.is_ok(), "correct owner should pass: {:?}", result);
     }
 
     #[tokio::test]
     async fn authorize_for_user_wrong_owner_fails() {
         let vol = make_available_persistent_volume("alice");
+        let tenant = vol.tenant_id.clone();
         let fsal = make_fsal_with_volume(&vol).await;
-        let result = fsal.authorize_for_user("bob", &vol.id).await;
+        let result = fsal.authorize_for_user(&tenant, "bob", &vol.id).await;
         assert!(
             matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
             "wrong owner should fail: {:?}",
+            result
+        );
+    }
+
+    /// Regression for security audit 002 §4.19. Volume belongs to tenant-A;
+    /// caller from tenant-B presents the same `user_id` (`sub` collision).
+    /// Authorisation MUST be denied based on tenant mismatch — never granted
+    /// on `(user_id, volume_id)` alone.
+    #[tokio::test]
+    async fn authorize_for_user_cross_tenant_sub_collision_rejected() {
+        use crate::domain::tenant::TenantId;
+        let vol = make_available_persistent_volume("alice");
+        // Sanity: the helper assigns `TenantId::consumer()`; build a distinct
+        // tenant for the attacker.
+        let attacker_tenant = TenantId::system();
+        assert_ne!(
+            vol.tenant_id, attacker_tenant,
+            "test setup requires distinct tenants"
+        );
+        let fsal = make_fsal_with_volume(&vol).await;
+        // Attacker's `sub` is "alice" — same as the volume owner — but the
+        // tenant differs. Pre-fix, this would have been admitted.
+        let result = fsal
+            .authorize_for_user(&attacker_tenant, "alice", &vol.id)
+            .await;
+        assert!(
+            matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+            "cross-tenant access with matching sub MUST be rejected: {:?}",
             result
         );
     }
@@ -1787,7 +1834,8 @@ mod tests {
             Arc::new(NoopPublisher),
         );
 
-        let result = fsal.authorize_for_user("alice", &vol.id).await;
+        let tenant = vol.tenant_id.clone();
+        let result = fsal.authorize_for_user(&tenant, "alice", &vol.id).await;
         assert!(
             matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
             "workflow ownership should fail user auth: {:?}",

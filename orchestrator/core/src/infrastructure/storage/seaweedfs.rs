@@ -25,9 +25,38 @@ use crate::domain::storage::{
 };
 use async_trait::async_trait;
 use chrono;
-use reqwest::{multipart, Client, StatusCode};
+use futures::StreamExt;
+use reqwest::{multipart, Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+/// Hard ceiling for any single response body materialised from SeaweedFS.
+/// Per security audit 002 §4.22, raw `.bytes()` reads are unbounded and a
+/// hostile / compromised filer could exhaust orchestrator memory. The cap
+/// is the smaller of the per-volume request size and 100 MiB. Reads larger
+/// than this MUST be issued via ranged `read_at` against the upper layers.
+const SEAWEEDFS_MAX_RESPONSE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Stream the response body chunk-by-chunk, enforcing a running byte cap.
+/// Returns `StorageError::Unknown` the moment the running count exceeds
+/// `max_bytes` — without buffering further chunks.
+async fn read_capped_body(response: Response, max_bytes: u64) -> Result<Vec<u8>, StorageError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total: u64 = 0;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| StorageError::Unknown(format!("body stream error: {e}")))?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > max_bytes {
+            drop(buf);
+            return Err(StorageError::Unknown(format!(
+                "SeaweedFS response exceeded {max_bytes}-byte cap"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
 
 /// SeaweedFS Filer adapter
 pub struct SeaweedFSAdapter {
@@ -363,8 +392,13 @@ impl StorageProvider for SeaweedFSAdapter {
 
         match response.status() {
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
-                let bytes = response.bytes().await?;
-                Ok(bytes.to_vec())
+                // 4.22: cap the read at min(requested length + slack, hard cap).
+                // The caller-requested `length` is the natural limit; we
+                // additionally clamp at `SEAWEEDFS_MAX_RESPONSE_BYTES` so a
+                // compromised filer cannot exceed it even if it ignores the
+                // Range header.
+                let cap = std::cmp::min(length as u64, SEAWEEDFS_MAX_RESPONSE_BYTES);
+                read_capped_body(response, cap).await
             }
             StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path)),
             status => Err(StorageError::Unknown(format!(
@@ -390,11 +424,14 @@ impl StorageProvider for SeaweedFSAdapter {
         // or append-only writes for efficiency
 
         let mut content = if offset > 0 {
-            // Read existing content if we're writing at an offset
+            // Read existing content if we're writing at an offset.
+            // 4.22: capped streaming read instead of unbounded `.bytes()`.
             let response = self.client.get(&url).send().await;
             if let Ok(resp) = response {
                 if resp.status().is_success() {
-                    resp.bytes().await.unwrap_or_default().to_vec()
+                    read_capped_body(resp, SEAWEEDFS_MAX_RESPONSE_BYTES)
+                        .await
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -570,7 +607,8 @@ impl StorageProvider for SeaweedFSAdapter {
             )));
         }
 
-        let data = read_response.bytes().await?.to_vec();
+        // 4.22: cap the rename copy at the per-response hard ceiling.
+        let data = read_capped_body(read_response, SEAWEEDFS_MAX_RESPONSE_BYTES).await?;
 
         // 3. Write to destination
         let to_url = self.build_url(to);
@@ -777,6 +815,65 @@ mod tests {
             Ok(4096),
             "get_usage must parse JSON when Accept header is present"
         );
+    }
+
+    /// Regression for security audit 002 §4.22. A hostile / compromised
+    /// filer returns a body larger than the per-response cap. The capped
+    /// stream reader MUST return `Err` *before* materialising the full
+    /// payload — verified by setting the cap below the body size and
+    /// checking that the error is the cap-exceeded variant.
+    #[tokio::test]
+    async fn read_capped_body_rejects_oversize_response() {
+        let mut server = mockito::Server::new_async().await;
+        // 1 MiB body, 256 KiB cap. The cap-exceeded check must fire well
+        // before the full body is consumed.
+        let body = vec![0u8; 1 * 1024 * 1024];
+        let cap: u64 = 256 * 1024;
+        let _mock = server
+            .mock("GET", "/big")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&format!("{}/big", server.url()))
+            .send()
+            .await
+            .expect("request");
+        let result = read_capped_body(resp, cap).await;
+        match result {
+            Err(StorageError::Unknown(msg)) => {
+                assert!(
+                    msg.contains("exceeded") && msg.contains(&cap.to_string()),
+                    "expected cap-exceeded error, got: {msg}"
+                );
+            }
+            other => panic!("expected cap-exceeded Err, got {other:?}"),
+        }
+    }
+
+    /// Companion test: a body smaller than the cap is returned in full.
+    #[tokio::test]
+    async fn read_capped_body_returns_body_under_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let body = vec![0xABu8; 1024];
+        let _mock = server
+            .mock("GET", "/small")
+            .with_status(200)
+            .with_body(body.clone())
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&format!("{}/small", server.url()))
+            .send()
+            .await
+            .expect("request");
+        let got = read_capped_body(resp, 4096).await.expect("should succeed");
+        assert_eq!(got, body);
     }
 
     // Integration tests require running SeaweedFS instance
