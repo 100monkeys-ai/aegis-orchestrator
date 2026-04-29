@@ -14,6 +14,20 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && echo "user_allow_other" >> /etc/fuse.conf
 
+# Install grpc_health_probe for Kubernetes/Podman exec gRPC health probes
+# (replaces the tcpSocket fallback in pod-relay-coordinator.yaml — ADR-117).
+# Pinned version; multi-arch (amd64/arm64) via runtime uname -m detection.
+ARG GRPC_HEALTH_PROBE_VERSION=v0.4.24
+RUN ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+        x86_64) ARCH=amd64 ;; \
+        aarch64) ARCH=arm64 ;; \
+        *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /usr/local/bin/grpc_health_probe \
+        "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-linux-${ARCH}" \
+    && chmod +x /usr/local/bin/grpc_health_probe
+
 WORKDIR /app
 
 # Copy pre-built binary from build context root
