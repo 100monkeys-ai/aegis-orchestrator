@@ -186,6 +186,52 @@ impl CortexGrpcClient {
     }
 }
 
+/// Reduce a tool-argument JSON blob to a content-free *shape* signature
+/// before forwarding it to the Cortex learning service.
+///
+/// Audit 002 §4.37.3 — Cortex stores **process data**, not customer content.
+/// The orchestrator was forwarding the full `arguments_json` payload, which
+/// for tools like `web_fetch`, `mcp.send_email`, `db.query`, etc. carries
+/// the raw user data in the call. Cortex only needs the structural
+/// trajectory (which keys were present, which types) to learn tool-call
+/// patterns; the leaf values are never required and must not leave the
+/// orchestrator boundary.
+///
+/// Strategy: parse the JSON; for objects, retain keys but replace each
+/// value with a JSON-type tag (`"<string>"`, `"<number>"`, `"<bool>"`,
+/// `"<null>"`, `"<array:N>"`, `"<object>"`). Recursively redact nested
+/// objects and arrays. On parse failure, drop the payload entirely with
+/// a fixed `"<unparseable>"` marker so we never accidentally exfiltrate a
+/// malformed-but-leaky string.
+fn redact_arguments_for_cortex(arguments_json: &str) -> String {
+    let value: serde_json::Value = match serde_json::from_str(arguments_json) {
+        Ok(v) => v,
+        Err(_) => return "\"<unparseable>\"".to_string(),
+    };
+    serde_json::to_string(&redact_value(&value)).unwrap_or_else(|_| "\"<error>\"".to_string())
+}
+
+fn redact_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let redacted: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), redact_value(v)))
+                .collect();
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::Array(items) => {
+            // Preserve length (useful structural signal for trajectory
+            // matching) but drop every element value.
+            serde_json::Value::String(format!("<array:{}>", items.len()))
+        }
+        serde_json::Value::String(_) => serde_json::Value::String("<string>".to_string()),
+        serde_json::Value::Number(_) => serde_json::Value::String("<number>".to_string()),
+        serde_json::Value::Bool(_) => serde_json::Value::String("<bool>".to_string()),
+        serde_json::Value::Null => serde_json::Value::String("<null>".to_string()),
+    }
+}
+
 #[async_trait]
 impl CortexPatternPort for CortexGrpcClient {
     async fn store_trajectory_pattern(
@@ -200,7 +246,11 @@ impl CortexPatternPort for CortexGrpcClient {
                 .map(
                     |s| crate::infrastructure::aegis_cortex_proto::TrajectoryStep {
                         tool_name: s.tool_name,
-                        arguments_json: s.arguments_json,
+                        // Audit 002 §4.37.3: redact customer content from
+                        // the payload before crossing the orchestrator
+                        // boundary. Cortex receives the structural shape
+                        // only.
+                        arguments_json: redact_arguments_for_cortex(&s.arguments_json),
                         order_index: s.order_index,
                     },
                 )
@@ -213,5 +263,59 @@ impl CortexPatternPort for CortexGrpcClient {
             .await
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod cortex_redaction_tests {
+    use super::*;
+
+    /// Audit 002 §4.37.3 regression — leaf values of every JSON type must
+    /// be replaced with a type tag so customer content cannot egress to
+    /// Cortex through `arguments_json`.
+    #[test]
+    fn redact_strips_string_number_bool_null_leaves() {
+        let input = r#"{
+            "url": "https://victim.example.com/secret?api_key=AKIA1234",
+            "retries": 3,
+            "force": true,
+            "context": null
+        }"#;
+        let out = redact_arguments_for_cortex(input);
+        assert!(!out.contains("victim.example.com"));
+        assert!(!out.contains("AKIA1234"));
+        assert!(!out.contains('3'));
+        assert!(out.contains("<string>"));
+        assert!(out.contains("<number>"));
+        assert!(out.contains("<bool>"));
+        assert!(out.contains("<null>"));
+        // Keys themselves are preserved — they're tool-schema fields,
+        // not customer content.
+        assert!(out.contains("\"url\""));
+        assert!(out.contains("\"retries\""));
+    }
+
+    #[test]
+    fn redact_collapses_arrays_to_length_signal() {
+        let input = r#"{"to": ["alice@example.com", "bob@example.com", "eve@example.com"]}"#;
+        let out = redact_arguments_for_cortex(input);
+        assert!(!out.contains("alice"));
+        assert!(!out.contains("eve"));
+        assert!(out.contains("<array:3>"));
+    }
+
+    #[test]
+    fn redact_recurses_into_nested_objects() {
+        let input = r#"{"outer": {"inner_secret": "DROP TABLE users"}}"#;
+        let out = redact_arguments_for_cortex(input);
+        assert!(!out.contains("DROP TABLE"));
+        assert!(out.contains("\"inner_secret\""));
+        assert!(out.contains("<string>"));
+    }
+
+    #[test]
+    fn redact_unparseable_input_is_dropped_entirely() {
+        let out = redact_arguments_for_cortex("not json at all { secret_value");
+        assert_eq!(out, "\"<unparseable>\"");
     }
 }
