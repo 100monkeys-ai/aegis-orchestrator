@@ -172,6 +172,14 @@ impl EnvelopeVerifier for SealEnvelope {
             self.payload.get("params").cloned()
         }
     }
+
+    fn replay_nonce(&self) -> String {
+        // Use the base64 Ed25519 signature as the nonce key. The signature
+        // is a deterministic function of (security_token, canonical_payload,
+        // timestamp) under the agent's private key, so any replay of the
+        // same envelope produces the same signature and is detectable.
+        self.signature.clone()
+    }
 }
 
 impl SealEnvelope {

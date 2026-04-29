@@ -275,6 +275,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             // ADR-072: dual-scope — enforce user-scoped rate limit when identity is available
             if let Some(id) = identity {
                 let user_scope = RateLimitScope::User {
+                    tenant_id: tenant_id.clone(),
                     user_id: id.sub.clone(),
                 };
                 let resource_type = RateLimitResourceType::WorkflowExecution;

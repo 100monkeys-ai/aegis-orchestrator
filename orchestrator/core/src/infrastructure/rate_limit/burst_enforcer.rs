@@ -113,6 +113,7 @@ mod tests {
 
     fn user_scope() -> RateLimitScope {
         RateLimitScope::User {
+            tenant_id: crate::domain::tenant::TenantId::consumer(),
             user_id: "user-1".into(),
         }
     }

@@ -28,6 +28,7 @@ use crate::domain::rate_limit::{
     RateLimitEnforcer, RateLimitPolicyResolver, RateLimitResourceType, RateLimitScope,
 };
 use crate::domain::seal_session::{EnvelopeVerifier, SealSession, SealSessionError};
+use crate::infrastructure::seal::nonce_store::{NonceOutcome, NonceStore};
 
 /// Orchestrator middleware that verifies and unwraps incoming SEAL envelopes.
 ///
@@ -37,14 +38,19 @@ use crate::domain::seal_session::{EnvelopeVerifier, SealSession, SealSessionErro
 pub struct SealMiddleware {
     rate_limit_enforcer: Option<Arc<dyn RateLimitEnforcer>>,
     rate_limit_resolver: Option<Arc<dyn RateLimitPolicyResolver>>,
+    nonce_store: Option<Arc<dyn NonceStore>>,
 }
 
 impl SealMiddleware {
-    /// Create a new middleware instance without rate limiting.
+    /// Create a new middleware instance without rate limiting or replay
+    /// protection. **Production wire-up MUST always supply a `NonceStore`**
+    /// (see [`SealMiddleware::with_replay_protection`]); this constructor
+    /// exists only for tests that drive the SEAL evaluation path directly.
     pub fn new() -> Self {
         Self {
             rate_limit_enforcer: None,
             rate_limit_resolver: None,
+            nonce_store: None,
         }
     }
 
@@ -56,7 +62,19 @@ impl SealMiddleware {
         Self {
             rate_limit_enforcer,
             rate_limit_resolver,
+            nonce_store: None,
         }
+    }
+
+    /// Attach a [`NonceStore`] for replay protection (audit 002 §4.17).
+    ///
+    /// When configured, every envelope is checked against the store after
+    /// signature verification: a previously-seen [`EnvelopeVerifier::replay_nonce`]
+    /// within the freshness window is rejected with
+    /// [`SealSessionError::ReplayProtectionFailed`].
+    pub fn with_replay_protection(mut self, nonce_store: Arc<dyn NonceStore>) -> Self {
+        self.nonce_store = Some(nonce_store);
+        self
     }
 
     /// Verify the envelope against the given session and extract the inner MCP arguments.
@@ -92,6 +110,31 @@ impl SealMiddleware {
         match session.evaluate_call(envelope) {
             Ok(()) => {
                 info!("SEAL envelope verified successfully");
+
+                // Audit 002 §4.17: Replay protection — reject any envelope
+                // whose nonce (signature) we've seen inside the freshness
+                // window. This runs BEFORE rate limiting so a replay does
+                // not bump the legitimate caller's quota.
+                if let Some(store) = &self.nonce_store {
+                    let nonce = envelope.replay_nonce();
+                    match store.record(&nonce) {
+                        NonceOutcome::Fresh => {}
+                        NonceOutcome::Replay => {
+                            warn!(
+                                session_id = %session.id,
+                                "SEAL envelope replay detected (duplicate nonce within freshness window)"
+                            );
+                            metrics::counter!(
+                                "aegis_seal_policy_violations_total",
+                                "violation_type" => "replay_protection_failed"
+                            )
+                            .increment(1);
+                            return Err(SealSessionError::ReplayProtectionFailed(
+                                "envelope nonce already seen within freshness window".to_string(),
+                            ));
+                        }
+                    }
+                }
 
                 // ADR-072: Rate limit check after policy evaluation succeeds.
                 if let (Some(enforcer), Some(resolver)) =
@@ -203,13 +246,22 @@ async fn check_rate_limit(
         .user_id
         .clone()
         .unwrap_or_else(|| session.agent_id.to_string());
-    let tier = session
-        .zaru_tier
-        .as_deref()
-        .and_then(|t| {
-            serde_json::from_value::<ZaruTier>(serde_json::Value::String(t.to_string())).ok()
-        })
-        .unwrap_or(ZaruTier::Free);
+    // Audit 002 §4.16: parse the stored tier claim using the canonical
+    // case-insensitive parser. `serde_json::from_value::<ZaruTier>` would
+    // require PascalCase and silently collapse every paying tier to `Free`
+    // when given the lowercase claim value the session actually stores.
+    let tier = match session.zaru_tier.as_deref() {
+        Some(raw) => {
+            ZaruTier::from_claim(raw).ok_or_else(|| PolicyViolation::RateLimitExceeded {
+                resource_type: format!("{:?}", resource_type),
+                bucket: "invalid_tier".into(),
+                limit: 0,
+                current: 0,
+                retry_after_seconds: 0,
+            })?
+        }
+        None => ZaruTier::Free,
+    };
     // The session was attested by the SEAL handler with the resolved tenant
     // (per ADR-097). Use it as the canonical source — never fabricate
     // `TenantId::consumer()` as a fallback (that would route every consumer
@@ -237,7 +289,15 @@ async fn check_rate_limit(
             retry_after_seconds: 60,
         })?;
 
-    let scope = RateLimitScope::User { user_id };
+    // Audit 002 §4.15: bucket key MUST be (tenant_id, user_id). Without
+    // tenant_id in the scope key, two consumer users carrying identical
+    // user_ids in different tenants would share a single bucket and could
+    // exhaust each other's quota. The session's `tenant_id` was bound at
+    // attestation time and is the canonical source of truth.
+    let scope = RateLimitScope::User {
+        tenant_id: tenant_id.clone(),
+        user_id,
+    };
 
     let decision = enforcer
         .check_and_increment(&scope, &policy, 1)
@@ -309,6 +369,29 @@ mod tests {
         signature_result: Result<(), SealSessionError>,
         tool_name: Option<String>,
         arguments: Option<Value>,
+        nonce: String,
+    }
+
+    impl DummyEnvelope {
+        fn new(
+            signature_result: Result<(), SealSessionError>,
+            tool_name: Option<String>,
+            arguments: Option<Value>,
+        ) -> Self {
+            // Default to a random nonce per envelope so unrelated tests do not
+            // accidentally collide when a NonceStore is attached.
+            Self {
+                signature_result,
+                tool_name,
+                arguments,
+                nonce: uuid::Uuid::new_v4().to_string(),
+            }
+        }
+
+        fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
+            self.nonce = nonce.into();
+            self
+        }
     }
 
     impl EnvelopeVerifier for DummyEnvelope {
@@ -326,6 +409,10 @@ mod tests {
 
         fn extract_arguments(&self) -> Option<Value> {
             self.arguments.clone()
+        }
+
+        fn replay_nonce(&self) -> String {
+            self.nonce.clone()
         }
     }
 
@@ -388,6 +475,7 @@ mod tests {
                 "path": "/workspace/file.txt",
                 "flags": ["--check"]
             })),
+            nonce: uuid::Uuid::new_v4().to_string(),
         };
 
         let args = middleware
@@ -416,6 +504,7 @@ mod tests {
             )),
             tool_name: Some("tool.run".to_string()),
             arguments: Some(json!({"path": "/workspace/file.txt"})),
+            nonce: uuid::Uuid::new_v4().to_string(),
         };
 
         let error = middleware
@@ -437,6 +526,7 @@ mod tests {
             signature_result: Ok(()),
             tool_name: Some("tool.run".to_string()),
             arguments: None,
+            nonce: uuid::Uuid::new_v4().to_string(),
         };
 
         let error = middleware
@@ -486,6 +576,7 @@ mod tests {
                 "force": true,
                 "version": "1.2.3"
             })),
+            nonce: uuid::Uuid::new_v4().to_string(),
         };
 
         let args = middleware
@@ -521,6 +612,7 @@ mod tests {
                     "version": "2.0.0",
                     "force": false
                 })),
+                nonce: uuid::Uuid::new_v4().to_string(),
             };
 
             let args = middleware
@@ -556,6 +648,7 @@ mod tests {
                 "force": true,
                 "version": "1.2.3"
             })),
+            nonce: uuid::Uuid::new_v4().to_string(),
         };
 
         let args = middleware
@@ -613,6 +706,7 @@ mod tests {
             signature_result: Ok(()),
             tool_name: Some("tool.run".to_string()),
             arguments: Some(json!({"path": "/workspace/file.txt"})),
+            nonce: uuid::Uuid::new_v4().to_string(),
         };
 
         let error = middleware
@@ -625,6 +719,130 @@ mod tests {
             SealSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied {
                 tool_name: "tool.run".to_string(),
             })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit 002 regression tests
+    //
+    //   §4.15 — rate-limit bucket key must include `tenant_id`
+    //   §4.16 — `ZaruTier::from_claim` must be case-insensitive and reject
+    //           unknown values
+    //   §4.17 — replayed envelopes within the freshness window must be
+    //           rejected by the nonce store
+    // -----------------------------------------------------------------------
+
+    /// Audit 002 §4.15 regression — `RateLimitScope::User` MUST include the
+    /// caller's `tenant_id`. Two consumer users carrying identical `user_id`
+    /// values in different tenants must produce distinct bucket keys, otherwise
+    /// a noisy tenant exhausts another tenant's quota.
+    #[test]
+    fn audit_4_15_rate_limit_user_scope_is_keyed_by_tenant() {
+        use crate::domain::rate_limit::RateLimitScope;
+        use crate::domain::tenant::TenantId;
+
+        let tenant_a = TenantId::new("tenant-a".to_string()).expect("valid slug");
+        let tenant_b = TenantId::new("tenant-b".to_string()).expect("valid slug");
+
+        let scope_a = RateLimitScope::User {
+            tenant_id: tenant_a.clone(),
+            user_id: "shared-user".to_string(),
+        };
+        let scope_b = RateLimitScope::User {
+            tenant_id: tenant_b.clone(),
+            user_id: "shared-user".to_string(),
+        };
+
+        assert_ne!(
+            scope_a, scope_b,
+            "user buckets sharing a user_id across tenants MUST NOT collide"
+        );
+
+        // The postgres enforcer derives its column key from the scope; verify
+        // the stored value namespace includes the tenant.
+        let composite_a = match &scope_a {
+            RateLimitScope::User { tenant_id, user_id } => {
+                format!("{}:{}", tenant_id.as_str(), user_id)
+            }
+            _ => unreachable!(),
+        };
+        let composite_b = match &scope_b {
+            RateLimitScope::User { tenant_id, user_id } => {
+                format!("{}:{}", tenant_id.as_str(), user_id)
+            }
+            _ => unreachable!(),
+        };
+        assert_ne!(composite_a, composite_b);
+        assert!(composite_a.starts_with(tenant_a.as_str()));
+        assert!(composite_b.starts_with(tenant_b.as_str()));
+    }
+
+    /// Audit 002 §4.16 regression — every casing of every tier value the
+    /// session may carry MUST round-trip to the same enum, and unknown
+    /// values must NOT silently collapse to `Free`.
+    #[test]
+    fn audit_4_16_zaru_tier_from_claim_is_case_insensitive() {
+        use crate::domain::iam::ZaruTier;
+
+        for raw in &["pro", "PRO", "Pro", "pRo", "  pro  "] {
+            assert_eq!(
+                ZaruTier::from_claim(raw),
+                Some(ZaruTier::Pro),
+                "tier claim {raw:?} must parse to Pro"
+            );
+        }
+        for raw in &["enterprise", "ENTERPRISE", "Enterprise"] {
+            assert_eq!(ZaruTier::from_claim(raw), Some(ZaruTier::Enterprise));
+        }
+        // Unknown / typo'd tier MUST NOT collapse silently to Free.
+        assert!(
+            ZaruTier::from_claim("PROO").is_none(),
+            "unknown tier 'PROO' must return None — collapsing to Free is the §4.16 bug"
+        );
+        assert!(ZaruTier::from_claim("plat1num").is_none());
+    }
+
+    /// Audit 002 §4.17 regression — a replayed envelope (same nonce) within
+    /// the freshness window must be rejected as
+    /// [`SealSessionError::ReplayProtectionFailed`]; the second call must
+    /// not reach the tool handler.
+    #[tokio::test]
+    async fn audit_4_17_replay_within_window_is_rejected() {
+        use crate::infrastructure::seal::nonce_store::InMemoryNonceStore;
+
+        let store: Arc<dyn NonceStore> = Arc::new(InMemoryNonceStore::new());
+        let middleware = SealMiddleware::new().with_replay_protection(store);
+        let mut session = session_with_context(allow_all_context());
+        let nonce = "fixed-signature-bytes".to_string();
+
+        let envelope_first = DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("tool.run".to_string()),
+            arguments: Some(json!({"path": "/workspace/file.txt"})),
+            nonce: nonce.clone(),
+        };
+        let envelope_replay = DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("tool.run".to_string()),
+            arguments: Some(json!({"path": "/workspace/file.txt"})),
+            nonce: nonce.clone(),
+        };
+
+        // First call passes.
+        middleware
+            .verify_and_unwrap(&mut session, &envelope_first)
+            .await
+            .expect("first call with fresh nonce must succeed");
+
+        // Identical (envelope, signature) replayed within 30 s window — reject.
+        let err = middleware
+            .verify_and_unwrap(&mut session, &envelope_replay)
+            .await
+            .expect_err("replay within freshness window MUST be rejected");
+
+        assert!(
+            matches!(err, SealSessionError::ReplayProtectionFailed(_)),
+            "expected ReplayProtectionFailed, got {err:?}"
         );
     }
 }

@@ -688,6 +688,7 @@ impl InnerLoopService {
                 };
                 let scope = if user_identity.is_some() {
                     RateLimitScope::User {
+                        tenant_id: tenant_id.clone(),
                         user_id: effective_identity.sub.clone(),
                     }
                 } else {
@@ -811,6 +812,7 @@ impl InnerLoopService {
                         };
                         let scope = if user_identity.is_some() {
                             RateLimitScope::User {
+                                tenant_id: tenant_id.clone(),
                                 user_id: effective_identity.sub.clone(),
                             }
                         } else {

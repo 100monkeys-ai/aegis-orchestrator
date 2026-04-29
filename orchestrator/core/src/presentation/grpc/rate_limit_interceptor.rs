@@ -114,6 +114,7 @@ pub async fn check_rate_limit(
 
     // Check and atomically increment counters.
     let scope = RateLimitScope::User {
+        tenant_id: tenant_id.clone(),
         user_id: identity.sub.clone(),
     };
 
@@ -193,6 +194,7 @@ fn allow_all_decision() -> RateLimitDecision {
         allowed: true,
         resource_type: RateLimitResourceType::AgentExecution,
         scope: RateLimitScope::User {
+            tenant_id: TenantId::system(),
             user_id: String::new(),
         },
         exhausted_bucket: None,
