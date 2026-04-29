@@ -66,6 +66,18 @@ pub struct CatalogEntry {
     pub source: ToolSource,
     pub category: ToolCategory,
     pub tags: Vec<String>,
+    /// ADR-117: when set to `"edge"`, the EdgeRouter step-3 implicit branch
+    /// dispatches this tool through the edge fleet when the caller's tenant
+    /// has exactly one connected edge daemon. Defaults to `None` (i.e. local
+    /// builtin / MCP / SEAL chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    /// ADR-117: when `true`, the tool is eligible for fleet (multi-target) fan
+    /// out via `aegis.edge.fleet.invoke`. Surfaced so clients (e.g. Zaru
+    /// fleet-launcher picker) can filter discovery results. Defaults to
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet_capable: bool,
 }
 
 /// Query for listing tools.
@@ -76,6 +88,11 @@ pub struct ToolListQuery {
     pub limit: Option<u32>,
     pub source: Option<ToolSource>,
     pub category: Option<ToolCategory>,
+    /// ADR-117: when `Some(true)`, restrict results to tools with
+    /// `fleet_capable == true` (used by the Zaru fleet-launcher picker).
+    /// `Some(false)` excludes fleet-capable tools; `None` is unfiltered.
+    #[serde(default)]
+    pub fleet_capable: Option<bool>,
 }
 
 /// Query for searching tools.
@@ -87,6 +104,11 @@ pub struct ToolSearchQuery {
     pub source: Option<ToolSource>,
     pub category: Option<ToolCategory>,
     pub tags: Option<Vec<String>>,
+    /// ADR-117: when `Some(true)`, restrict results to tools with
+    /// `fleet_capable == true`. `Some(false)` excludes them; `None` is
+    /// unfiltered.
+    #[serde(default)]
+    pub fleet_capable: Option<bool>,
 }
 
 /// Paginated response from [`StandardToolCatalog::list_tools`].
@@ -165,6 +187,7 @@ impl StandardToolCatalog {
             })
             .filter(|e| query.source.is_none_or(|s| e.source == s))
             .filter(|e| query.category.is_none_or(|c| e.category == c))
+            .filter(|e| query.fleet_capable.is_none_or(|f| e.fleet_capable == f))
             .collect();
 
         let total = filtered.len() as u32;
@@ -227,6 +250,7 @@ impl StandardToolCatalog {
                     true
                 }
             })
+            .filter(|e| query.fleet_capable.is_none_or(|f| e.fleet_capable == f))
             .cloned()
             .collect();
 
@@ -253,7 +277,18 @@ impl StandardToolCatalog {
             source,
             category,
             tags,
+            executor: tool.executor,
+            fleet_capable: tool.fleet_capable,
         }
+    }
+
+    /// ADR-117: look up a single entry by exact tool name. Used by
+    /// `tool_advertises_edge_executor` in the EdgeRouter step-3 decision.
+    /// Returns `None` if the catalog has not been refreshed yet or the tool
+    /// is not registered.
+    pub async fn lookup(&self, tool_name: &str) -> Option<CatalogEntry> {
+        let cache = self.cache.read().await;
+        cache.iter().find(|e| e.name == tool_name).cloned()
     }
 
     fn classify_source(name: &str) -> ToolSource {
@@ -556,6 +591,103 @@ mod tests {
 
         assert_eq!(response.total_matches, 1);
         assert_eq!(response.tools[0].name, "aegis.workflow.list");
+    }
+
+    /// ADR-117 audit SEV-2-E (T1) regression: `CatalogEntry` must preserve the
+    /// `executor` and `fleet_capable` fields plumbed up from `ToolMetadata`,
+    /// and `lookup()` must return them so `tool_advertises_edge_executor` can
+    /// implement EdgeRouter step 3 instead of always returning false.
+    #[tokio::test]
+    async fn lookup_surfaces_edge_executor_flag() {
+        let catalog = StandardToolCatalog::new();
+        catalog
+            .refresh_from(vec![
+                crate::infrastructure::tool_router::ToolMetadata {
+                    name: "aegis.edge.fleet.invoke".to_string(),
+                    description: "Fleet invoke".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    executor: Some("edge".to_string()),
+                    fleet_capable: true,
+                },
+                crate::infrastructure::tool_router::ToolMetadata {
+                    name: "aegis.agent.list".to_string(),
+                    description: "List agents".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    executor: None,
+                    fleet_capable: false,
+                },
+            ])
+            .await;
+
+        // Edge tool: executor == "edge"
+        let edge = catalog.lookup("aegis.edge.fleet.invoke").await.unwrap();
+        assert_eq!(edge.executor.as_deref(), Some("edge"));
+        assert!(edge.fleet_capable);
+
+        // Local tool: executor == None
+        let local = catalog.lookup("aegis.agent.list").await.unwrap();
+        assert_eq!(local.executor, None);
+        assert!(!local.fleet_capable);
+
+        // Unknown tool: lookup returns None (caller defaults to false)
+        assert!(catalog.lookup("does.not.exist").await.is_none());
+
+        // Mirror the `tool_advertises_edge_executor` decision shape so the
+        // test fails if the lookup ever stops surfacing the executor field.
+        let advertises = |name: &str| {
+            let catalog = &catalog;
+            async move {
+                catalog
+                    .lookup(name)
+                    .await
+                    .map(|e| e.executor.as_deref() == Some("edge"))
+                    .unwrap_or(false)
+            }
+        };
+        assert!(advertises("aegis.edge.fleet.invoke").await);
+        assert!(!advertises("aegis.agent.list").await);
+        assert!(!advertises("does.not.exist").await);
+    }
+
+    /// ADR-117: the `?fleet_capable=true` filter on the discovery surface
+    /// must restrict results to tools tagged fleet-capable. Used by zaru-client
+    /// fleet-launcher picker.
+    #[tokio::test]
+    async fn list_tools_filters_by_fleet_capable() {
+        let catalog = StandardToolCatalog::new();
+        catalog
+            .refresh_from(vec![
+                crate::infrastructure::tool_router::ToolMetadata {
+                    name: "aegis.edge.fleet.invoke".to_string(),
+                    description: "Fleet invoke".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    executor: Some("edge".to_string()),
+                    fleet_capable: true,
+                },
+                crate::infrastructure::tool_router::ToolMetadata {
+                    name: "aegis.agent.list".to_string(),
+                    description: "List agents".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    executor: None,
+                    fleet_capable: false,
+                },
+            ])
+            .await;
+
+        let permitted = vec!["aegis.*".to_string()];
+        let response = catalog
+            .list_tools(
+                &permitted,
+                ToolListQuery {
+                    fleet_capable: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.tools[0].name, "aegis.edge.fleet.invoke");
+        assert!(response.tools[0].fleet_capable);
     }
 
     #[tokio::test]

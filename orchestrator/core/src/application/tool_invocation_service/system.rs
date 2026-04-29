@@ -46,6 +46,7 @@ impl ToolInvocationService {
                 .get("category")
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_value(Value::String(s.to_string())).ok()),
+            fleet_capable: args.get("fleet_capable").and_then(|v| v.as_bool()),
         };
 
         let response = catalog.list_tools(&permitted_tools, query).await;
@@ -93,6 +94,7 @@ impl ToolInvocationService {
                     .filter_map(|item| item.as_str().map(ToOwned::to_owned))
                     .collect()
             }),
+            fleet_capable: args.get("fleet_capable").and_then(|v| v.as_bool()),
         };
 
         let response = catalog.search_tools(&permitted_tools, query).await;

@@ -1556,16 +1556,20 @@ impl ToolInvocationService {
     /// Look up a tool descriptor in the catalog and check whether it
     /// advertises `executor == "edge"`. Returns false when the catalog is not
     /// configured or the tool is not present.
-    async fn tool_advertises_edge_executor(&self, _tool_name: &str) -> bool {
-        // The catalog stores `CatalogEntry` (without `executor`); the source
-        // of truth is `ToolMetadata` in the router. Built-in aegis.* tools
-        // never have `executor=="edge"`; only system-tier registrations do.
-        // For v1 we keep this implicit branch conservative: only step 1 / 2
-        // (explicit `target.*`) trigger edge dispatch. Step 3 is reserved for
-        // a future tool-descriptor lookup that surfaces the `executor` field
-        // through the catalog.
-        // TODO(adr-117): once `CatalogEntry` carries `executor`, return true
-        // when descriptor.executor == "edge".
-        false
+    ///
+    /// ADR-117 §D step 3: when a tool's descriptor declares `executor: "edge"`
+    /// and the caller's tenant has exactly one connected edge daemon, the
+    /// EdgeRouter dispatches the tool through that edge implicitly (no
+    /// explicit `target.*` argument required). This accessor is the data
+    /// source for that decision.
+    async fn tool_advertises_edge_executor(&self, tool_name: &str) -> bool {
+        let Some(catalog) = self.tool_catalog.as_ref() else {
+            return false;
+        };
+        catalog
+            .lookup(tool_name)
+            .await
+            .map(|entry| entry.executor.as_deref() == Some("edge"))
+            .unwrap_or(false)
     }
 }

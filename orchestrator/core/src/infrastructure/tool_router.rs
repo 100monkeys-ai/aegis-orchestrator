@@ -201,6 +201,22 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.edge.fleet.cancel",
 ];
 
+/// ADR-117: builtin tool names that advertise `executor == "edge"`. These are
+/// the system-tier fleet operations whose canonical execution target is the
+/// edge daemon (or fan-out across many daemons), not the local builtin /
+/// MCP / SEAL chain.
+const EDGE_EXECUTOR_TOOLS: &[&str] = &[
+    "aegis.edge.fleet.list",
+    "aegis.edge.fleet.invoke",
+    "aegis.edge.fleet.cancel",
+];
+
+/// ADR-117: builtin tool names that are eligible for fleet (multi-target) fan
+/// out via `aegis.edge.fleet.invoke`. Currently only `aegis.edge.fleet.invoke`
+/// itself; the list and cancel siblings are operator-tier coordination tools
+/// that do not themselves fan out further.
+const FLEET_CAPABLE_TOOLS: &[&str] = &["aegis.edge.fleet.invoke"];
+
 /// Canonical registry of all builtin tool dispatchers.
 ///
 /// Every tool name and its description live here. The daemon startup and
@@ -494,11 +510,18 @@ impl ToolRouter {
                     continue;
                 }
 
+                let executor = if EDGE_EXECUTOR_TOOLS.contains(&cap.name.as_str()) {
+                    Some("edge".to_string())
+                } else {
+                    None
+                };
+                let fleet_capable = FLEET_CAPABLE_TOOLS.contains(&cap.name.as_str());
                 all_tools.push(ToolMetadata {
                     name: cap.name.clone(),
                     description: dispatcher.description.clone(),
                     input_schema: Self::schema_for_builtin(&cap.name),
-                    ..Default::default()
+                    executor,
+                    fleet_capable,
                 });
             }
         }
@@ -515,11 +538,18 @@ impl ToolRouter {
             if existing_names.contains(*name) {
                 continue;
             }
+            let executor = if EDGE_EXECUTOR_TOOLS.contains(name) {
+                Some("edge".to_string())
+            } else {
+                None
+            };
+            let fleet_capable = FLEET_CAPABLE_TOOLS.contains(name);
             all_tools.push(ToolMetadata {
                 name: name.to_string(),
                 description: description.to_string(),
                 input_schema: Self::schema_for_builtin(name),
-                ..Default::default()
+                executor,
+                fleet_capable,
             });
         }
 
