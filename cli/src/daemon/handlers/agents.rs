@@ -294,9 +294,15 @@ pub(crate) async fn list_agents_handler(
                     entry
                 })
                 .collect();
-            Ok(Json(serde_json::json!(json_agents)))
+            Ok((StatusCode::OK, Json(serde_json::json!(json_agents))))
         }
-        Err(e) => Ok(Json(serde_json::json!({"error": e.to_string()}))),
+        // Audit 002 §4.37.6 — surface backend failures as 500, not 200 with
+        // an `{"error":...}` body. Returning 200 makes every client treat
+        // database/repository errors as a successful (empty) response.
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
@@ -322,19 +328,25 @@ pub(crate) async fn delete_agent_handler(
     {
         Ok(agent) => {
             let roles = build_roles(&identity);
-            let authorized = match &agent.scope {
-                AgentScope::Global => roles
-                    .iter()
-                    .any(|r| r == "aegis:operator" || r == "aegis:admin"),
-                AgentScope::Tenant => true,
-            };
+            let authorized = agent_admin_authorized(&agent.scope, &roles);
 
             if !authorized {
+                // Audit 002 §4.37.7 — for Global-scope agents, an unauthorised
+                // tenant user cannot prove the agent exists by probing the
+                // delete endpoint. Returning 403 leaks the existence of the
+                // Global agent (the only branch that returns 404 is "agent
+                // not visible to this tenant"). Collapse the unauthorised
+                // case into the same 404 the lookup path returns so an
+                // attacker cannot distinguish "exists but I can't touch it"
+                // from "doesn't exist".
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    scope = ?agent.scope,
+                    "rejected delete on Global agent without operator/admin role; surfacing as 404"
+                );
                 return Ok((
-                    StatusCode::FORBIDDEN,
-                    Json(
-                        serde_json::json!({"error": "Unauthorized: insufficient permissions to delete this agent"}),
-                    ),
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Agent not found"})),
                 ));
             }
 
@@ -354,6 +366,21 @@ pub(crate) async fn delete_agent_handler(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Agent not found"})),
         )),
+    }
+}
+
+/// Audit 002 §4.37.7 — decide whether `roles` are sufficient to administer an
+/// agent of the given `scope`. Pure function so the policy can be unit-tested
+/// without spinning up the full handler. A `Tenant`-scoped agent is always
+/// administrable by the caller (tenant isolation already enforced upstream by
+/// `get_agent_for_tenant`); a `Global` agent requires `aegis:operator` or
+/// `aegis:admin`.
+fn agent_admin_authorized(scope: &AgentScope, roles: &[String]) -> bool {
+    match scope {
+        AgentScope::Global => roles
+            .iter()
+            .any(|r| r == "aegis:operator" || r == "aegis:admin"),
+        AgentScope::Tenant => true,
     }
 }
 
@@ -421,9 +448,19 @@ pub(crate) async fn get_agent_handler(
             if let Some(schema) = &agent.manifest.spec.input_schema {
                 response["input_schema"] = serde_json::json!(schema);
             }
-            Ok(Json(response))
+            Ok((StatusCode::OK, Json(response)))
         }
-        Err(e) => Ok(Json(serde_json::json!({"error": e.to_string()}))),
+        // Audit 002 §4.37.6 — return 404 (not-found / not-visible folds into
+        // the same opaque code per the visibility-isolation contract) so the
+        // client sees a real HTTP error code rather than a 200 with an error
+        // body.
+        Err(e) => {
+            tracing::debug!(error = %e, agent_id = %id, "get_agent failed");
+            Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            ))
+        }
     }
 }
 
@@ -444,8 +481,15 @@ pub(crate) async fn list_agent_versions_handler(
         .list_versions_for_tenant(&tenant_id, AgentId(agent_id))
         .await
     {
-        Ok(versions) => Ok(Json(serde_json::to_value(versions).unwrap_or_default())),
-        Err(e) => Ok(Json(serde_json::json!({"error": e.to_string()}))),
+        Ok(versions) => Ok((
+            StatusCode::OK,
+            Json(serde_json::to_value(versions).unwrap_or_default()),
+        )),
+        // Audit 002 §4.37.6 — return 500 on backend errors instead of 200.
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
@@ -502,17 +546,20 @@ pub(crate) async fn update_agent_handler(
     {
         Ok(agent) => {
             let roles = build_roles(&identity);
-            let authorized = match &agent.scope {
-                AgentScope::Global => roles
-                    .iter()
-                    .any(|r| r == "aegis:operator" || r == "aegis:admin"),
-                AgentScope::Tenant => true,
-            };
+            let authorized = agent_admin_authorized(&agent.scope, &roles);
 
             if !authorized {
+                // Audit 002 §4.37.7 — same info-leak fix as `delete_agent_handler`.
+                // Collapse 403-on-Global to 404 so the existence of a Global
+                // agent cannot be probed by an unauthorised tenant.
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    scope = ?agent.scope,
+                    "rejected update on Global agent without operator/admin role; surfacing as 404"
+                );
                 return Ok((
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({"error": "Unauthorized: insufficient permissions to update this agent"})),
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Agent not found"})),
                 )
                     .into_response());
             }
@@ -660,6 +707,55 @@ mod tests {
             !roles.iter().any(|r| r == "aegis:operator"),
             "audit 4.36: missing identity MUST NOT grant aegis:operator (privilege escalation)"
         );
+    }
+
+    // ─── Audit 002 §4.37.7 — Global-agent existence info-leak ───────────────
+    //
+    // The previous code returned 403 FORBIDDEN when a tenant user without
+    // operator/admin role attempted to delete or update a Global-scope
+    // agent. That distinguished "agent exists but you can't touch it" from
+    // "agent doesn't exist", letting an attacker enumerate Global agent ids
+    // by probing for 403s. The fix collapses unauthorised Global access to
+    // 404 NOT_FOUND so the response is indistinguishable from a missing
+    // agent. The pure-function `agent_admin_authorized` carries the policy
+    // so the regression test pins the decision matrix without spinning up
+    // the full HTTP handler.
+
+    #[test]
+    fn agent_admin_authorized_global_requires_operator_or_admin() {
+        // Tenant user with no operator-tier role MUST NOT be able to admin
+        // a Global agent. Caller folds this `false` into a 404 response.
+        assert!(!agent_admin_authorized(&AgentScope::Global, &[]));
+        assert!(!agent_admin_authorized(
+            &AgentScope::Global,
+            &["tenant:admin".to_string()]
+        ));
+        assert!(!agent_admin_authorized(
+            &AgentScope::Global,
+            &["user".to_string()]
+        ));
+
+        // Operator and admin are both allowed.
+        assert!(agent_admin_authorized(
+            &AgentScope::Global,
+            &["aegis:operator".to_string()]
+        ));
+        assert!(agent_admin_authorized(
+            &AgentScope::Global,
+            &["aegis:admin".to_string()]
+        ));
+    }
+
+    #[test]
+    fn agent_admin_authorized_tenant_always_passes_after_isolation_check() {
+        // Tenant-scope agents are gated by tenant isolation in the
+        // repository call; once the agent is loaded for the caller's
+        // tenant, no additional role check is needed.
+        assert!(agent_admin_authorized(&AgentScope::Tenant, &[]));
+        assert!(agent_admin_authorized(
+            &AgentScope::Tenant,
+            &["user".to_string()]
+        ));
     }
 
     /// Confirms the operator path still resolves correctly when identity IS

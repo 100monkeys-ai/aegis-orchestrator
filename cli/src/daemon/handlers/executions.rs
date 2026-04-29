@@ -45,14 +45,23 @@ pub(crate) async fn get_execution_handler(
         .get_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
-        Ok(exec) => Ok(axum::Json(serde_json::json!({
-            "id": exec.id.0,
-            "agent_id": exec.agent_id.0,
-            "status": format!("{:?}", exec.status),
-            // "started_at": exec.started_at,
-            // "ended_at": exec.ended_at
-        }))),
-        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
+        Ok(exec) => Ok((
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": exec.id.0,
+                "agent_id": exec.agent_id.0,
+                "status": format!("{:?}", exec.status),
+            })),
+        )),
+        // Audit 002 §4.37.6 — collapse not-found / not-visible to 404 instead
+        // of returning 200 with an error body.
+        Err(e) => {
+            tracing::debug!(error = %e, %execution_id, "get_execution failed");
+            Ok((
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": "Execution not found"})),
+            ))
+        }
     }
 }
 
@@ -72,8 +81,15 @@ pub(crate) async fn cancel_execution_handler(
         .cancel_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
-        Ok(_) => Ok(axum::Json(serde_json::json!({"success": true}))),
-        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
+        Ok(_) => Ok((
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"success": true})),
+        )),
+        // Audit 002 §4.37.6 — return 500 on backend error instead of 200.
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
@@ -129,8 +145,15 @@ pub(crate) async fn delete_execution_handler(
         .delete_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
-        Ok(_) => Ok(axum::Json(serde_json::json!({"success": true}))),
-        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
+        Ok(_) => Ok((
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"success": true})),
+        )),
+        // Audit 002 §4.37.6 — return 500 on backend error instead of 200.
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
