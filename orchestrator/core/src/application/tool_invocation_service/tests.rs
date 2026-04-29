@@ -1250,11 +1250,15 @@ fn build_semantic_judge_payload_includes_tool_audit_history() {
 
 #[test]
 fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
+    const LARGE_CONTENT_REPEAT_LEN: usize = 5_000;
+    const MAX_SERIALIZED_PAYLOAD_LEN: usize = 15_000;
+    const REDACTION_CHECK_REPEAT_LEN: usize = 1024;
+
     let execution_id = ExecutionId::new();
-    let huge_schema_body = "x".repeat(5_000);
+    let huge_schema_body = "x".repeat(LARGE_CONTENT_REPEAT_LEN);
     let huge_manifest = format!(
         "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: huge\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      {}\n",
-        "y".repeat(5_000)
+        "y".repeat(LARGE_CONTENT_REPEAT_LEN)
     );
     let tool_audit_history = vec![
         crate::domain::execution::TrajectoryStep {
@@ -1300,12 +1304,12 @@ fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
 
     let serialized = serde_json::to_string(&payload).expect("payload should serialize");
     assert!(
-        serialized.len() < 15_000,
+        serialized.len() < MAX_SERIALIZED_PAYLOAD_LEN,
         "payload too large: {}",
         serialized.len()
     );
-    assert!(!serialized.contains(&"x".repeat(1024)));
-    assert!(!serialized.contains(&"y".repeat(1024)));
+    assert!(!serialized.contains(&"x".repeat(REDACTION_CHECK_REPEAT_LEN)));
+    assert!(!serialized.contains(&"y".repeat(REDACTION_CHECK_REPEAT_LEN)));
     assert_eq!(
         payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["schema_key"],
         "agent/manifest/v1"
