@@ -1273,8 +1273,14 @@ fn build_semantic_judge_payload_includes_tool_audit_history() {
 
 #[test]
 fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
+    // Use oversized fixture content to force sanitization/compaction paths to run.
+    // 5_000 chars is intentionally much larger than normal schema/manifest snippets.
     const LARGE_CONTENT_REPEAT_LEN: usize = 5_000;
+    // Regression guardrail for semantic-judge payload compactness.
+    // This bound should remain aligned with semantic judge input-size expectations in production;
+    // if upstream limits change, update this threshold and its rationale accordingly.
     const MAX_SERIALIZED_PAYLOAD_LEN: usize = 15_000;
+    // Validate that large repeated raw content is redacted/truncated from the serialized payload.
     const REDACTION_CHECK_REPEAT_LEN: usize = 1024;
 
     let execution_id = ExecutionId::new();
