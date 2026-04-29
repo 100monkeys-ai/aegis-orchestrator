@@ -231,6 +231,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         let version = env!("CARGO_PKG_VERSION");
 
         aegis_orchestrator_core::infrastructure::telemetry::init_metrics(
+            &metrics_cfg.bind_address,
             metrics_cfg.port,
             &config.spec.node.id,
             &config.metadata.name,
@@ -238,7 +239,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             version,
         )
         .context("Failed to initialize metrics")?;
-        info!(port = metrics_cfg.port, "Metrics exporter initialized");
+        info!(
+            bind_address = %metrics_cfg.bind_address,
+            port = metrics_cfg.port,
+            "Metrics exporter initialized"
+        );
     }
 
     if let Some(seal_gateway) = &config.spec.seal_gateway {

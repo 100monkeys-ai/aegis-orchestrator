@@ -683,6 +683,17 @@ pub struct MetricsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Metrics endpoint bind address.
+    ///
+    /// Security audit 002 finding 4.37.18: defaults to `127.0.0.1` (loopback)
+    /// to prevent unauthenticated network exposure of the Prometheus scrape
+    /// endpoint. Operators who need to expose metrics off-host MUST set this
+    /// explicitly to a non-loopback address (e.g. `0.0.0.0`) AND front the
+    /// endpoint with an authenticating reverse proxy. The value is consumed
+    /// by `infrastructure::telemetry::init_metrics`.
+    #[serde(default = "default_metrics_bind_address")]
+    pub bind_address: String,
+
     /// Metrics endpoint port
     #[serde(default = "default_metrics_port")]
     pub port: u16,
@@ -1572,6 +1583,15 @@ fn default_log_format() -> String {
 
 fn default_metrics_port() -> u16 {
     9091
+}
+
+/// Default Prometheus metrics bind address.
+///
+/// Security audit 002 finding 4.37.18: defaults to `127.0.0.1` (loopback)
+/// so the metrics endpoint is not unauthenticated-exposed on the public
+/// network unless an operator explicitly opts in.
+fn default_metrics_bind_address() -> String {
+    "127.0.0.1".to_string()
 }
 
 fn default_metrics_path() -> String {
@@ -2657,6 +2677,35 @@ mod tests {
         assert!(is_loopback_bind("localhost"));
         assert!(!is_loopback_bind("0.0.0.0"));
         assert!(!is_loopback_bind("10.0.0.1"));
+    }
+
+    /// Audit 002 finding 4.37.18 — regression.
+    ///
+    /// The Prometheus metrics endpoint previously bound `0.0.0.0` with no
+    /// way to override. The fix adds `MetricsConfig::bind_address` defaulting
+    /// to `127.0.0.1`. Pin the default so a future refactor cannot silently
+    /// re-expose the unauthenticated scrape endpoint.
+    #[test]
+    fn default_metrics_bind_address_is_loopback() {
+        assert_eq!(default_metrics_bind_address(), "127.0.0.1");
+        assert!(is_loopback_bind(&default_metrics_bind_address()));
+    }
+
+    /// Audit 002 finding 4.37.18 — regression.
+    ///
+    /// A `MetricsConfig` deserialized with no `bind_address` field MUST
+    /// default to loopback. Operators who need network exposure must set
+    /// the field explicitly.
+    #[test]
+    fn metrics_config_yaml_without_bind_address_defaults_to_loopback() {
+        let yaml = r#"
+enabled: true
+port: 9091
+path: "/metrics"
+"#;
+        let cfg: MetricsConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(cfg.bind_address, "127.0.0.1");
+        assert!(is_loopback_bind(&cfg.bind_address));
     }
 
     fn manifest_with_network(bind: &str, tls: Option<TlsConfig>) -> NodeConfigManifest {

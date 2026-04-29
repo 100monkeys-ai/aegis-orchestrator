@@ -285,6 +285,11 @@ spec:
     metrics:
       # Enable Prometheus metrics endpoint (/metrics)
       enabled: true
+      # Bind address for the Prometheus metrics listener.
+      # Defaults to 127.0.0.1 (loopback) per security audit 002 finding
+      # 4.37.18. Set to "0.0.0.0" only when fronting the endpoint with an
+      # authenticating reverse proxy.
+      bind_address: "127.0.0.1"
       port: 9091
       path: "/metrics"
 

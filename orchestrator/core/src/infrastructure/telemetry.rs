@@ -13,15 +13,27 @@ use std::net::SocketAddr;
 
 /// Initializes the Prometheus metrics exporter.
 ///
-/// Binds an HTTP listener to the specified port and registers initial node metadata.
+/// Binds an HTTP listener to `bind_address:port` and registers initial node
+/// metadata.
+///
+/// # Security
+///
+/// Per audit 002 finding 4.37.18, callers MUST pass an explicit
+/// `bind_address`; the default in [`crate::domain::node_config::MetricsConfig`]
+/// is `127.0.0.1` (loopback). Binding `0.0.0.0` exposes the unauthenticated
+/// scrape endpoint to the network and requires an external authenticating
+/// reverse proxy.
 pub fn init_metrics(
+    bind_address: &str,
     port: u16,
     node_id: &str,
     node_name: &str,
     region: Option<&str>,
     version: &str,
 ) -> anyhow::Result<()> {
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    let addr: SocketAddr = format!("{bind_address}:{port}").parse().map_err(|e| {
+        anyhow::anyhow!("Invalid metrics bind_address={bind_address} port={port}: {e}")
+    })?;
 
     PrometheusBuilder::new()
         .with_http_listener(addr)
