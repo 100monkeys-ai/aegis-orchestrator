@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aegis_orchestrator_core::application::edge::manage_groups::ManageGroupsService;
-use aegis_orchestrator_core::application::edge::manage_tags::ManageTagsService;
-use aegis_orchestrator_core::application::edge::revoke_edge::RevokeEdgeService;
+use aegis_orchestrator_core::application::edge::manage_tags::{ManageTagsError, ManageTagsService};
+use aegis_orchestrator_core::application::edge::revoke_edge::{RevokeEdgeError, RevokeEdgeService};
 use aegis_orchestrator_core::domain::cluster::NodePeerStatus;
 use aegis_orchestrator_core::domain::edge::{
     EdgeCapabilities, EdgeConnectionState, EdgeDaemon, EdgeDaemonRepository, EdgeGroup,
@@ -151,7 +151,66 @@ async fn cross_tenant_revoke_refused() {
     let id = edge.node_id;
     repo.upsert(&edge).await.unwrap();
     let r = svc.revoke(&tenant_b, id).await;
-    assert!(r.is_err(), "expected cross-tenant revoke to fail");
+    assert!(
+        matches!(r, Err(RevokeEdgeError::Forbidden)),
+        "expected cross-tenant revoke to fail with Forbidden, got {r:?}"
+    );
+
+    // Side-effect check: re-fetch the edge and assert it's still Active
+    let persisted = repo.get(&id).await.unwrap().expect("edge still present");
+    assert_eq!(
+        persisted.status,
+        NodePeerStatus::Active,
+        "wrong-tenant revoke must not mutate status"
+    );
+    assert_eq!(
+        persisted.tenant_id, tenant_a,
+        "wrong-tenant revoke must not mutate tenant"
+    );
+}
+
+#[tokio::test]
+async fn cross_tenant_tag_mutation_refused() {
+    let repo: Arc<dyn EdgeDaemonRepository> = Arc::new(StubRepo::default());
+    let svc = ManageTagsService::new(repo.clone());
+    let tenant_a = TenantId::new("tenant-a").unwrap();
+    let tenant_b = TenantId::new("tenant-b").unwrap();
+    let edge = make_edge(&tenant_a, &[], "linux");
+    let id = edge.node_id;
+    repo.upsert(&edge).await.unwrap();
+
+    // add_tags from foreign tenant must fail with Forbidden.
+    let r = svc.add_tags(&tenant_b, id, vec!["prod".into()]).await;
+    assert!(
+        matches!(r, Err(ManageTagsError::Forbidden)),
+        "expected cross-tenant add_tags to fail with Forbidden, got {r:?}"
+    );
+
+    // Side-effect check: tags unchanged.
+    let persisted = repo.get(&id).await.unwrap().expect("edge still present");
+    assert!(
+        persisted.capabilities.tags.is_empty(),
+        "wrong-tenant add_tags must not mutate tags, got {:?}",
+        persisted.capabilities.tags
+    );
+
+    // Seed a tag from the right tenant, then attempt remove_tags from foreign tenant.
+    svc.add_tags(&tenant_a, id, vec!["prod".into()])
+        .await
+        .unwrap();
+    let r = svc.remove_tags(&tenant_b, id, vec!["prod".into()]).await;
+    assert!(
+        matches!(r, Err(ManageTagsError::Forbidden)),
+        "expected cross-tenant remove_tags to fail with Forbidden, got {r:?}"
+    );
+
+    // Side-effect check: tags still contain "prod".
+    let persisted = repo.get(&id).await.unwrap().expect("edge still present");
+    assert_eq!(
+        persisted.capabilities.tags,
+        vec!["prod".to_string()],
+        "wrong-tenant remove_tags must not mutate tags"
+    );
 }
 
 #[tokio::test]
@@ -224,4 +283,77 @@ fn selector_matches_compound() {
         tags: vec![TagMatch::Has("prod".into())],
     };
     assert!(caps.satisfies(&sel));
+}
+
+#[test]
+fn selector_rejects_compound_mismatch() {
+    let caps = EdgeCapabilities {
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        local_tools: vec!["docker".into()],
+        custom_labels: [("region".to_string(), "us".to_string())]
+            .into_iter()
+            .collect(),
+        tags: vec!["prod".into()],
+        mount_points: vec![],
+    };
+
+    // Wrong OS.
+    let sel = EdgeSelector {
+        os: Some("windows".into()),
+        arch: Some("x86_64".into()),
+        tools: vec![],
+        labels: vec![],
+        tags: vec![],
+    };
+    assert!(!caps.satisfies(&sel), "wrong os must not satisfy");
+
+    // Missing required tool.
+    let sel = EdgeSelector {
+        os: Some("linux".into()),
+        arch: None,
+        tools: vec!["kubectl".into()],
+        labels: vec![],
+        tags: vec![],
+    };
+    assert!(
+        !caps.satisfies(&sel),
+        "absent required tool must not satisfy"
+    );
+
+    // Missing required tag.
+    let sel = EdgeSelector {
+        os: None,
+        arch: None,
+        tools: vec![],
+        labels: vec![],
+        tags: vec![TagMatch::Has("staging".into())],
+    };
+    assert!(
+        !caps.satisfies(&sel),
+        "missing required tag must not satisfy"
+    );
+
+    // Mismatched label value.
+    let sel = EdgeSelector {
+        os: None,
+        arch: None,
+        tools: vec![],
+        labels: vec![LabelMatch::Equals("region".into(), "eu".into())],
+        tags: vec![],
+    };
+    assert!(
+        !caps.satisfies(&sel),
+        "mismatched label value must not satisfy"
+    );
+
+    // Combined mismatch (compound failure across multiple fields).
+    let sel = EdgeSelector {
+        os: Some("windows".into()),
+        arch: Some("x86_64".into()),
+        tools: vec!["kubectl".into()],
+        labels: vec![LabelMatch::Equals("region".into(), "us".into())],
+        tags: vec![TagMatch::Has("staging".into())],
+    };
+    assert!(!caps.satisfies(&sel), "combined mismatch must not satisfy");
 }

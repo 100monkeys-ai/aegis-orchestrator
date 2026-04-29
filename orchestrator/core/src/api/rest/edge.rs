@@ -256,16 +256,38 @@ async fn patch_host(
             .tag_service
             .add_tags(&tenant, nid, add)
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(map_tags_err)?;
     }
     if let Some(rm) = body.remove_tags {
         tags = s
             .tag_service
             .remove_tags(&tenant, nid, rm)
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(map_tags_err)?;
     }
     Ok(Json(tags))
+}
+
+fn map_tags_err(e: crate::application::edge::manage_tags::ManageTagsError) -> ApiError {
+    use crate::application::edge::manage_tags::ManageTagsError;
+    match e {
+        ManageTagsError::NotFound => ApiError::not_found("edge"),
+        ManageTagsError::Forbidden => {
+            ApiError::new(StatusCode::FORBIDDEN, "forbidden", "cross-tenant refused")
+        }
+        ManageTagsError::Repo(msg) => ApiError::internal(msg),
+    }
+}
+
+fn map_revoke_err(e: crate::application::edge::revoke_edge::RevokeEdgeError) -> ApiError {
+    use crate::application::edge::revoke_edge::RevokeEdgeError;
+    match e {
+        RevokeEdgeError::NotFound => ApiError::not_found("edge"),
+        RevokeEdgeError::Forbidden => {
+            ApiError::new(StatusCode::FORBIDDEN, "forbidden", "cross-tenant refused")
+        }
+        RevokeEdgeError::Repo(msg) => ApiError::internal(msg),
+    }
 }
 
 async fn delete_host(
@@ -278,7 +300,7 @@ async fn delete_host(
     s.revoke_service
         .revoke(&tenant, nid)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(map_revoke_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
