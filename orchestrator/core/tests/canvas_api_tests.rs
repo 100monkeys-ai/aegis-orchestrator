@@ -781,6 +781,188 @@ async fn terminate_session_wrong_tenant_returns_not_found() {
     assert_ne!(row.status, CanvasSessionStatus::Terminated);
 }
 
+/// VolumeService wrapper that delegates everything to the inner service
+/// EXCEPT `delete_volume`, which always fails. Used by the
+/// `terminate_persists_state_when_volume_delete_fails` regression test.
+struct FailingDeleteVolumeService {
+    inner: Arc<RecordingVolumeService>,
+}
+
+#[async_trait]
+impl VolumeService for FailingDeleteVolumeService {
+    async fn create_volume(
+        &self,
+        name: String,
+        tenant_id: TenantId,
+        storage_class: StorageClass,
+        size_limit_mb: u64,
+        ownership: VolumeOwnership,
+    ) -> anyhow::Result<VolumeId> {
+        self.inner
+            .create_volume(name, tenant_id, storage_class, size_limit_mb, ownership)
+            .await
+    }
+    async fn get_volume(&self, id: VolumeId) -> anyhow::Result<Volume> {
+        self.inner.get_volume(id).await
+    }
+    async fn list_volumes_by_tenant(&self, tenant_id: TenantId) -> anyhow::Result<Vec<Volume>> {
+        self.inner.list_volumes_by_tenant(tenant_id).await
+    }
+    async fn list_volumes_by_ownership(
+        &self,
+        ownership: &VolumeOwnership,
+    ) -> anyhow::Result<Vec<Volume>> {
+        self.inner.list_volumes_by_ownership(ownership).await
+    }
+    async fn attach_volume(
+        &self,
+        volume_id: VolumeId,
+        instance_id: InstanceId,
+        mount_point: std::path::PathBuf,
+        access_mode: AccessMode,
+    ) -> anyhow::Result<VolumeMount> {
+        self.inner
+            .attach_volume(volume_id, instance_id, mount_point, access_mode)
+            .await
+    }
+    async fn detach_volume(
+        &self,
+        volume_id: VolumeId,
+        instance_id: InstanceId,
+    ) -> anyhow::Result<()> {
+        self.inner.detach_volume(volume_id, instance_id).await
+    }
+    async fn delete_volume(&self, _volume_id: VolumeId) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("simulated storage backend outage"))
+    }
+    async fn get_volume_usage(&self, volume_id: VolumeId) -> anyhow::Result<u64> {
+        self.inner.get_volume_usage(volume_id).await
+    }
+    async fn cleanup_expired_volumes(&self) -> anyhow::Result<usize> {
+        self.inner.cleanup_expired_volumes().await
+    }
+    async fn create_volumes_for_execution(
+        &self,
+        execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        tenant_id: TenantId,
+        volume_specs: &[aegis_orchestrator_core::domain::agent::VolumeSpec],
+        storage_mode: &str,
+    ) -> anyhow::Result<Vec<Volume>> {
+        self.inner
+            .create_volumes_for_execution(execution_id, tenant_id, volume_specs, storage_mode)
+            .await
+    }
+    async fn persist_external_volume(
+        &self,
+        volume_id: VolumeId,
+        name: String,
+        tenant_id: TenantId,
+        remote_path: String,
+        size_limit_bytes: u64,
+        ownership: VolumeOwnership,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .persist_external_volume(
+                volume_id,
+                name,
+                tenant_id,
+                remote_path,
+                size_limit_bytes,
+                ownership,
+            )
+            .await
+    }
+}
+
+/// Audit 002 §4.37.4 regression — when terminating a Canvas session whose
+/// ephemeral workspace volume fails to delete (storage backend outage,
+/// transient I/O error, etc.), the session row MUST still be persisted as
+/// `Terminated` so the user-visible state reflects domain reality, and a
+/// `WorkspaceVolumeOrphaned` event MUST be emitted carrying the volume id
+/// so a janitor / retry path can finish the cleanup. The previous code
+/// path saved the session AFTER the volume delete, so a delete failure
+/// rolled back the entire terminate and orphaned the volume on the next
+/// attempt.
+#[tokio::test]
+async fn terminate_persists_state_when_volume_delete_fails() {
+    let inner_volumes = Arc::new(RecordingVolumeService::default());
+    let failing = Arc::new(FailingDeleteVolumeService {
+        inner: inner_volumes.clone(),
+    });
+    let sessions = InMemoryCanvasRepo::default();
+    let git_repos = InMemoryGitRepoRepo::default();
+    let event_bus = Arc::new(EventBus::new(128));
+
+    let service = StandardCanvasService::new(
+        Arc::new(sessions.clone()),
+        failing as Arc<dyn VolumeService>,
+        Arc::new(git_repos),
+        event_bus.clone(),
+    );
+
+    let tenant = TenantId::consumer();
+    let session = service
+        .create_session(CreateCanvasSessionCommand {
+            tenant_id: tenant.clone(),
+            owner: "user-1".to_string(),
+            tier: ZaruTier::Free,
+            conversation_id: ConversationId::new(),
+            workspace_mode: WorkspaceMode::Ephemeral,
+            name: None,
+        })
+        .await
+        .unwrap();
+    let volume_id = session.workspace_volume_id;
+
+    let mut receiver = event_bus.subscribe();
+
+    let res = service
+        .terminate_session(&session.id, &tenant, "user-1")
+        .await;
+    assert!(
+        matches!(res, Err(CanvasError::VolumeProvisioningFailed(_))),
+        "expected VolumeProvisioningFailed surfaced to the caller, got {res:?}"
+    );
+
+    // 1. Session row persisted as Terminated despite the cleanup failure.
+    let row = sessions.find_by_id(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        CanvasSessionStatus::Terminated,
+        "terminate must persist Terminated state even when volume cleanup fails"
+    );
+
+    // 2. Both SessionTerminated AND WorkspaceVolumeOrphaned events were
+    //    published to the bus, with the orphan event carrying the volume id.
+    let mut saw_terminated = false;
+    let mut saw_orphan = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
+            Ok(Ok(DomainEvent::Canvas(CanvasEvent::SessionTerminated { .. }))) => {
+                saw_terminated = true;
+            }
+            Ok(Ok(DomainEvent::Canvas(CanvasEvent::WorkspaceVolumeOrphaned {
+                volume_id: vid,
+                session_id: sid,
+                ..
+            }))) => {
+                assert_eq!(vid, volume_id);
+                assert_eq!(sid, session.id);
+                saw_orphan = true;
+            }
+            _ => break,
+        }
+        if saw_terminated && saw_orphan {
+            break;
+        }
+    }
+    assert!(saw_terminated, "SessionTerminated event must be published");
+    assert!(
+        saw_orphan,
+        "WorkspaceVolumeOrphaned event must be published with the orphaned volume id"
+    );
+}
+
 // ============================================================================
 // Event bus: SessionCreated is published on create
 // ============================================================================

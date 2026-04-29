@@ -441,7 +441,8 @@ fn canvas_event_session_id(event: &CanvasEvent) -> CanvasSessionId {
         | CanvasEvent::FilesWrittenByAgent { session_id, .. }
         | CanvasEvent::GitCommitMade { session_id, .. }
         | CanvasEvent::GitPushed { session_id, .. }
-        | CanvasEvent::SessionTerminated { session_id, .. } => *session_id,
+        | CanvasEvent::SessionTerminated { session_id, .. }
+        | CanvasEvent::WorkspaceVolumeOrphaned { session_id, .. } => *session_id,
     }
 }
 
@@ -454,5 +455,6 @@ fn canvas_event_name(event: &CanvasEvent) -> &'static str {
         CanvasEvent::GitCommitMade { .. } => "canvas_git_commit_made",
         CanvasEvent::GitPushed { .. } => "canvas_git_pushed",
         CanvasEvent::SessionTerminated { .. } => "canvas_session_terminated",
+        CanvasEvent::WorkspaceVolumeOrphaned { .. } => "canvas_workspace_volume_orphaned",
     }
 }

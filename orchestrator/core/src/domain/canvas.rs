@@ -273,6 +273,17 @@ pub enum CanvasEvent {
         session_id: CanvasSessionId,
         terminated_at: DateTime<Utc>,
     },
+    /// Audit 002 §4.37.4 — emitted when a Canvas session terminated successfully
+    /// (the row is now in `Terminated` state) but the cleanup of its ephemeral
+    /// workspace volume could not complete inline. The event carries the volume
+    /// id so a janitor / retry path can finish the cleanup asynchronously
+    /// without leaving the volume orphaned.
+    WorkspaceVolumeOrphaned {
+        session_id: CanvasSessionId,
+        volume_id: VolumeId,
+        reason: String,
+        observed_at: DateTime<Utc>,
+    },
 }
 
 // ============================================================================

@@ -412,25 +412,50 @@ impl CanvasService for StandardCanvasService {
         }
 
         session.terminate();
+        let workspace_volume_id = session.workspace_volume_id;
+        let is_ephemeral = matches!(session.workspace_mode, WorkspaceMode::Ephemeral);
 
-        // Ephemeral volumes are released on terminate — there is no value in
-        // retaining a random workspace after the session closes. Persistent
-        // and git-linked volumes survive because the user explicitly chose
-        // them and may mount them in a new session.
-        if matches!(session.workspace_mode, WorkspaceMode::Ephemeral) {
-            // Migration 020 uses `ON DELETE SET NULL` on workspace_volume_id
-            // so deleting the volume does not cascade-delete the session row
-            // — the historical record is preserved with a NULL volume
-            // pointer.
-            self.volume_service
-                .delete_volume(session.workspace_volume_id)
-                .await
-                .map_err(|e| CanvasError::VolumeProvisioningFailed(e.to_string()))?;
-        }
-
+        // Audit 002 §4.37.4 — persist the Terminated state BEFORE attempting
+        // to release the ephemeral volume. The previous order (delete volume
+        // first, then save session) had a hole: if `delete_volume` failed,
+        // the session row stayed in its prior status and the next terminate
+        // attempt would re-issue the delete on a volume that may already be
+        // half-removed, leaving an orphan. Persisting the session first
+        // means the row reflects domain reality (the user terminated the
+        // session) regardless of cleanup outcome, and the volume cleanup
+        // becomes an at-least-once retryable side effect.
+        //
+        // Migration 020 uses `ON DELETE SET NULL` on `workspace_volume_id`
+        // so the historical session row is preserved if the volume is later
+        // pruned by the janitor.
         self.session_repo.save(&session).await?;
 
-        let events = session.take_events();
+        // Drain the SessionTerminated event from the aggregate so callers
+        // see the terminate signal even if cleanup races below.
+        let mut events = session.take_events();
+
+        if is_ephemeral {
+            match self.volume_service.delete_volume(workspace_volume_id).await {
+                Ok(_) => {}
+                Err(e) => {
+                    // Don't fail the terminate. The session is already
+                    // Terminated in storage. Emit a follow-up
+                    // `WorkspaceVolumeOrphaned` event so a janitor /
+                    // operator-visible alert can finish the cleanup. The
+                    // event carries the volume id so retries don't need to
+                    // re-resolve it.
+                    events.push(CanvasEvent::WorkspaceVolumeOrphaned {
+                        session_id: *id,
+                        volume_id: workspace_volume_id,
+                        reason: e.to_string(),
+                        observed_at: chrono::Utc::now(),
+                    });
+                    self.publish_events(events);
+                    return Err(CanvasError::VolumeProvisioningFailed(e.to_string()));
+                }
+            }
+        }
+
         self.publish_events(events);
 
         Ok(())

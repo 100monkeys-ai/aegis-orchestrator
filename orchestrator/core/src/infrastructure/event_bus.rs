@@ -634,6 +634,7 @@ impl DomainEvent {
                 CanvasEvent::GitCommitMade { committed_at, .. } => *committed_at,
                 CanvasEvent::GitPushed { pushed_at, .. } => *pushed_at,
                 CanvasEvent::SessionTerminated { terminated_at, .. } => *terminated_at,
+                CanvasEvent::WorkspaceVolumeOrphaned { observed_at, .. } => *observed_at,
             },
             DomainEvent::Script(event) => match event {
                 ScriptEvent::Created { created_at, .. } => *created_at,
@@ -886,6 +887,7 @@ impl DomainEvent {
                 CanvasEvent::GitCommitMade { .. } => "canvas_git_commit_made",
                 CanvasEvent::GitPushed { .. } => "canvas_git_pushed",
                 CanvasEvent::SessionTerminated { .. } => "canvas_session_terminated",
+                CanvasEvent::WorkspaceVolumeOrphaned { .. } => "canvas_workspace_volume_orphaned",
             },
             DomainEvent::Script(event) => match event {
                 ScriptEvent::Created { .. } => "script_created",
