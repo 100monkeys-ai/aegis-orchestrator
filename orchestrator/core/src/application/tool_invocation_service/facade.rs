@@ -99,7 +99,26 @@ impl ToolInvocationService {
             user_volume_service: None,
             git_repo_service: None,
             script_service: None,
+            edge_dispatcher: None,
+            edge_resolver: None,
+            edge_fleet_dispatcher: None,
+            edge_fleet_cancel: None,
         }
+    }
+
+    /// ADR-117: enable the four-step edge dispatch pre-routing hook.
+    pub fn with_edge_router(
+        mut self,
+        dispatcher: Arc<crate::application::edge::dispatch_to_edge::DispatchToEdgeService>,
+        resolver: Arc<crate::application::edge::fleet::EdgeFleetResolver>,
+        fleet_dispatcher: Arc<crate::application::edge::fleet::dispatcher::FleetDispatcher>,
+        fleet_cancel: Arc<crate::application::edge::fleet::CancelFleetService>,
+    ) -> Self {
+        self.edge_dispatcher = Some(dispatcher);
+        self.edge_resolver = Some(resolver);
+        self.edge_fleet_dispatcher = Some(fleet_dispatcher);
+        self.edge_fleet_cancel = Some(fleet_cancel);
+        self
     }
 
     /// Enables built-in workflow authoring tools that require registration and semantic validation.
@@ -788,6 +807,24 @@ impl ToolInvocationService {
         // `entry().or_insert_with(...)` shortcut was a leak: it accepted any
         // caller-supplied value without comparing it to the session tenant.
 
+        // ADR-117 §D: edge dispatch pre-routing hook. Resolves four cases in
+        // strict order before the standard aegis.* / builtin / MCP / SEAL
+        // chain runs:
+        //   1. args.target.edge_node_id          → DispatchToEdge
+        //   2. args.target.edge_selector         → resolve → DispatchToEdge
+        //                                          (singular) or fail with
+        //                                          MultiTargetRequiresFleetTool
+        //   3. tool descriptor `executor=="edge"` and tenant has exactly one
+        //      connected edge → DispatchToEdge that node
+        //   4. otherwise fall through to the existing routing.
+        if let Some(edge_result) = self
+            .try_dispatch_via_edge(&tool_name, &args, security_context, tenant_scope)
+            .await
+        {
+            publish_result(&edge_result);
+            return edge_result;
+        }
+
         // Built-in orchestrator aegis.* tool dispatch chain.
         let aegis_result = self
             .try_dispatch_aegis_tool(
@@ -1250,5 +1287,150 @@ impl ToolInvocationService {
             }
             _ => None,
         }
+    }
+
+    /// ADR-117 §D: edge dispatch pre-routing hook.
+    ///
+    /// Returns `Some(result)` when the tool was dispatched (or rejected) via
+    /// the EdgeRouter, `None` to fall through to the standard routing chain.
+    ///
+    /// Decision order (strict):
+    ///   1. `args.target.edge_node_id` set → DispatchToEdge that node.
+    ///   2. `args.target.edge_selector` set → resolve via EdgeFleetResolver.
+    ///       - exactly 1 match → DispatchToEdge that node.
+    ///       - >1 matches → reject with `MultiTargetRequiresFleetTool` (this
+    ///         path is single-target; fleet calls go through
+    ///         `aegis.edge.fleet.invoke`).
+    ///   3. tool descriptor `executor=="edge"` and tenant has exactly one
+    ///      connected edge → DispatchToEdge that node.
+    ///   4. fall through.
+    async fn try_dispatch_via_edge(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        security_context: &crate::domain::security_context::SecurityContext,
+        tenant_scope: &TenantScope,
+    ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
+        let dispatcher = self.edge_dispatcher.as_ref()?;
+        let resolver = self.edge_resolver.as_ref()?;
+
+        let tenant = &tenant_scope.authenticated_tenant;
+
+        // Step 1 — explicit node id.
+        let target = args.get("target");
+        let explicit_node = target
+            .and_then(|t| t.get("edge_node_id"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| crate::domain::shared_kernel::NodeId::from_string(s).ok());
+
+        // Step 2 — selector.
+        let explicit_selector = target.and_then(|t| t.get("edge_selector")).cloned();
+
+        let resolved_node: Option<crate::domain::shared_kernel::NodeId> = if let Some(n) =
+            explicit_node
+        {
+            Some(n)
+        } else if let Some(sel_value) = explicit_selector {
+            let sel: crate::domain::edge::EdgeSelector = match serde_json::from_value(sel_value) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Some(Err(SealSessionError::MalformedPayload(format!(
+                        "edge_selector parse: {e}"
+                    ))));
+                }
+            };
+            match resolver
+                .resolve(tenant, &crate::domain::edge::EdgeTarget::Selector(sel))
+                .await
+            {
+                Ok(nodes) if nodes.len() == 1 => Some(nodes[0]),
+                Ok(_) => {
+                    return Some(Err(SealSessionError::InternalError(
+                        "edge_selector matched multiple nodes; use \
+                         aegis.edge.fleet.invoke for fan-out (\
+                         MultiTargetRequiresFleetTool)"
+                            .to_string(),
+                    )));
+                }
+                Err(e) => {
+                    return Some(Err(SealSessionError::InternalError(format!(
+                        "edge resolve: {e}"
+                    ))));
+                }
+            }
+        } else {
+            // Step 3 — implicit single-edge tenant for executor=="edge" tools.
+            let advertises_edge = self.tool_advertises_edge_executor(tool_name).await;
+            if advertises_edge {
+                match resolver
+                    .resolve(tenant, &crate::domain::edge::EdgeTarget::All)
+                    .await
+                {
+                    Ok(nodes) if nodes.len() == 1 => Some(nodes[0]),
+                    Ok(_) => None, // ambiguous; fall through to other routing
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        };
+
+        let node_id = resolved_node?;
+
+        // Build args struct.
+        let args_struct: prost_types::Struct = match serde_json::from_value(args.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                return Some(Err(SealSessionError::MalformedPayload(format!(
+                    "args must be a JSON object for edge dispatch: {e}"
+                ))));
+            }
+        };
+
+        let dispatch_req = crate::application::edge::dispatch_to_edge::DispatchRequest {
+            node_id,
+            tenant_id: tenant.clone(),
+            tool_name: tool_name.to_string(),
+            args: args_struct,
+            security_context_name: security_context.name.clone(),
+            user_seal_envelope: crate::infrastructure::aegis_cluster_proto::SealEnvelope {
+                user_security_token: String::new(),
+                tenant_id: tenant.as_str().to_string(),
+                security_context_name: security_context.name.clone(),
+                payload: None,
+                signature: vec![],
+            },
+            deadline: std::time::Duration::from_secs(60),
+        };
+
+        match dispatcher.dispatch(dispatch_req).await {
+            Ok(result) => Some(Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "ok": result.ok,
+                "exit_code": result.exit_code,
+                "stdout": String::from_utf8_lossy(&result.stdout).to_string(),
+                "stderr": String::from_utf8_lossy(&result.stderr).to_string(),
+                "error_kind": result.error_kind,
+                "error_message": result.error_message,
+            })))),
+            Err(e) => Some(Err(SealSessionError::InternalError(format!(
+                "edge dispatch: {e}"
+            )))),
+        }
+    }
+
+    /// Look up a tool descriptor in the catalog and check whether it
+    /// advertises `executor == "edge"`. Returns false when the catalog is not
+    /// configured or the tool is not present.
+    async fn tool_advertises_edge_executor(&self, _tool_name: &str) -> bool {
+        // The catalog stores `CatalogEntry` (without `executor`); the source
+        // of truth is `ToolMetadata` in the router. Built-in aegis.* tools
+        // never have `executor=="edge"`; only system-tier registrations do.
+        // For v1 we keep this implicit branch conservative: only step 1 / 2
+        // (explicit `target.*`) trigger edge dispatch. Step 3 is reserved for
+        // a future tool-descriptor lookup that surfaces the `executor` field
+        // through the catalog.
+        // TODO(adr-117): once `CatalogEntry` carries `executor`, return true
+        // when descriptor.executor == "edge".
+        false
     }
 }

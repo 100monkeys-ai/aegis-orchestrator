@@ -470,6 +470,7 @@ impl ToolRouter {
                         name: cap.clone(),
                         description: format!("Provided by MCP server '{}'", server.name),
                         input_schema: json!({ "type": "object" }),
+                        ..Default::default()
                     });
                 }
             }
@@ -485,6 +486,7 @@ impl ToolRouter {
                     name: cap.name.clone(),
                     description: dispatcher.description.clone(),
                     input_schema: Self::schema_for_builtin(&cap.name),
+                    ..Default::default()
                 });
             }
         }
@@ -505,6 +507,7 @@ impl ToolRouter {
                 name: name.to_string(),
                 description: description.to_string(),
                 input_schema: Self::schema_for_builtin(name),
+                ..Default::default()
             });
         }
 
@@ -1443,12 +1446,21 @@ impl ToolRouter {
 ///
 /// Fields are serialized as camelCase to match the MCP protocol specification
 /// (e.g., `input_schema` → `inputSchema`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolMetadata {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// ADR-117: when set to `"edge"` the dispatcher routes this tool through
+    /// the EdgeRouter instead of the local builtin / MCP / SEAL chain. Default
+    /// `None` keeps every existing tool on its current path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    /// ADR-117: when `true` the tool is eligible for fleet (multi-target) fan
+    /// out via `aegis.edge.fleet.invoke`. Default `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet_capable: bool,
 }
 
 // =============================================================================

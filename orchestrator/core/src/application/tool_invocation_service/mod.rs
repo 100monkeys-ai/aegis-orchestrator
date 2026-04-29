@@ -132,4 +132,16 @@ pub struct ToolInvocationService {
     git_repo_service: Option<Arc<crate::application::git_repo_service::GitRepoService>>,
     /// Script service for aegis.script.* tools.
     script_service: Option<Arc<crate::application::script_service::ScriptService>>,
+    /// ADR-117: edge dispatcher consumed by the four-step pre-routing hook.
+    /// `None` on deployments without edge enrollment.
+    edge_dispatcher: Option<Arc<crate::application::edge::dispatch_to_edge::DispatchToEdgeService>>,
+    /// ADR-117: edge fleet resolver. Used by the pre-routing hook to map
+    /// `target.edge_selector` to a concrete node set.
+    edge_resolver: Option<Arc<crate::application::edge::fleet::EdgeFleetResolver>>,
+    /// ADR-117: edge fleet dispatcher and registry — consumed by the
+    /// `aegis.edge.fleet.*` system tools.
+    edge_fleet_dispatcher:
+        Option<Arc<crate::application::edge::fleet::dispatcher::FleetDispatcher>>,
+    /// ADR-117: cancel handle for fleet operations.
+    edge_fleet_cancel: Option<Arc<crate::application::edge::fleet::CancelFleetService>>,
 }

@@ -1626,6 +1626,72 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             tool_invocation_service_builder.with_discovery_service(disc_svc.clone());
     }
 
+    // ADR-117: build edge components and wire the four-step pre-routing hook
+    // when a Postgres pool is available. The same components feed the
+    // `/api/edge/*` REST surface (constructed below) — we collect them here
+    // and reuse them in the `EdgeApiState` bundle so there is exactly one
+    // EdgeConnectionRegistry / FleetRegistry per process.
+    let edge_components: Option<(
+        Arc<dyn aegis_orchestrator_core::domain::edge::EdgeDaemonRepository>,
+        Arc<dyn aegis_orchestrator_core::domain::edge::EdgeGroupRepository>,
+        aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry,
+        Arc<aegis_orchestrator_core::application::edge::dispatch_to_edge::DispatchToEdgeService>,
+        Arc<aegis_orchestrator_core::application::edge::fleet::EdgeFleetResolver>,
+        Arc<aegis_orchestrator_core::application::edge::fleet::dispatcher::FleetDispatcher>,
+        Arc<aegis_orchestrator_core::application::edge::fleet::CancelFleetService>,
+    )> = if let Some(ref pool) = db_pool {
+        use aegis_orchestrator_core::application::edge::dispatch_to_edge::DispatchToEdgeService;
+        use aegis_orchestrator_core::application::edge::fleet::dispatcher::FleetDispatcher;
+        use aegis_orchestrator_core::application::edge::fleet::registry::FleetRegistry;
+        use aegis_orchestrator_core::application::edge::fleet::{
+            CancelFleetService, EdgeFleetResolver,
+        };
+        use aegis_orchestrator_core::infrastructure::edge::{
+            EdgeConnectionRegistry, PgEdgeDaemonRepository, PgEdgeGroupRepository,
+        };
+
+        let edge_repo: Arc<dyn aegis_orchestrator_core::domain::edge::EdgeDaemonRepository> =
+            Arc::new(PgEdgeDaemonRepository::new(pool.clone()));
+        let group_repo: Arc<dyn aegis_orchestrator_core::domain::edge::EdgeGroupRepository> =
+            Arc::new(PgEdgeGroupRepository::new(pool.clone()));
+        let conn_registry = EdgeConnectionRegistry::new();
+        let dispatch = Arc::new(DispatchToEdgeService::new(
+            edge_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let resolver = Arc::new(EdgeFleetResolver::new(
+            edge_repo.clone(),
+            group_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let fleet_registry = FleetRegistry::new();
+        let fleet_dispatcher = Arc::new(FleetDispatcher::new(
+            dispatch.clone(),
+            fleet_registry.clone(),
+        ));
+        let fleet_cancel = Arc::new(CancelFleetService::new(
+            fleet_registry,
+            conn_registry.clone(),
+        ));
+        tool_invocation_service_builder = tool_invocation_service_builder.with_edge_router(
+            dispatch.clone(),
+            resolver.clone(),
+            fleet_dispatcher.clone(),
+            fleet_cancel.clone(),
+        );
+        Some((
+            edge_repo,
+            group_repo,
+            conn_registry,
+            dispatch,
+            resolver,
+            fleet_dispatcher,
+            fleet_cancel,
+        ))
+    } else {
+        None
+    };
+
     let tool_invocation_service = Arc::new(tool_invocation_service_builder);
 
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
@@ -2032,90 +2098,66 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         _ => None,
     };
 
-    // ADR-117 §F: assemble the `/api/edge/*` REST surface and the edge
-    // dispatcher hooks consumed by the MCP tool dispatcher. Wired whenever a
-    // Postgres pool is available — pure-worker deployments without a pool
-    // never serve `/api/edge/*` and never receive `executor:"edge"` tools.
+    // ADR-117 §F: assemble the `/api/edge/*` REST surface from the edge
+    // components built above (one EdgeConnectionRegistry per process). The
+    // operator-facing services (IssueEnrollmentToken, ManageGroups, ManageTags,
+    // RevokeEdge) are local to this bundle and not shared with the
+    // tool-invocation service.
     let edge_api_state: Option<aegis_orchestrator_core::api::rest::edge::EdgeApiState> =
-        if let Some(ref pool) = db_pool {
-            use aegis_orchestrator_core::application::edge::dispatch_to_edge::DispatchToEdgeService;
-            use aegis_orchestrator_core::application::edge::fleet::dispatcher::FleetDispatcher;
-            use aegis_orchestrator_core::application::edge::fleet::registry::FleetRegistry;
-            use aegis_orchestrator_core::application::edge::fleet::{
-                CancelFleetService, EdgeFleetResolver,
-            };
-            use aegis_orchestrator_core::application::edge::issue_enrollment_token::IssueEnrollmentToken;
-            use aegis_orchestrator_core::application::edge::manage_groups::ManageGroupsService;
-            use aegis_orchestrator_core::application::edge::manage_tags::ManageTagsService;
-            use aegis_orchestrator_core::application::edge::revoke_edge::RevokeEdgeService;
-            use aegis_orchestrator_core::infrastructure::edge::{
-                EdgeConnectionRegistry, PgEdgeDaemonRepository, PgEdgeGroupRepository,
-            };
-
-            let edge_repo: Arc<dyn aegis_orchestrator_core::domain::edge::EdgeDaemonRepository> =
-                Arc::new(PgEdgeDaemonRepository::new(pool.clone()));
-            let group_repo: Arc<dyn aegis_orchestrator_core::domain::edge::EdgeGroupRepository> =
-                Arc::new(PgEdgeGroupRepository::new(pool.clone()));
-            let conn_registry = EdgeConnectionRegistry::new();
-
-            let cluster_endpoint = config
-                .spec
-                .network
-                .as_ref()
-                .map(|n| format!("{}:{}", n.bind_address, n.grpc_port))
-                .unwrap_or_else(|| "0.0.0.0:50051".to_string());
-            let issuer = config
-                .spec
-                .zaru
-                .as_ref()
-                .and_then(|z| resolve_env_value(&z.public_url).ok())
-                .unwrap_or_else(|| "aegis-controller".to_string());
-
-            let issue_token = Arc::new(IssueEnrollmentToken::new(
-                secrets_manager.secret_store(),
-                issuer,
-                cluster_endpoint,
-                "aegis-node-controller-key".to_string(),
-            ));
-            let group_service = Arc::new(ManageGroupsService::new(group_repo.clone()));
-            let tag_service = Arc::new(ManageTagsService::new(edge_repo.clone()));
-            let revoke_service = Arc::new(RevokeEdgeService::new(
-                edge_repo.clone(),
-                conn_registry.clone(),
-            ));
-            let resolver = Arc::new(EdgeFleetResolver::new(
-                edge_repo.clone(),
-                group_repo.clone(),
-                conn_registry.clone(),
-            ));
-            let dispatch_service = Arc::new(DispatchToEdgeService::new(
-                edge_repo.clone(),
-                conn_registry.clone(),
-            ));
-            let fleet_registry = FleetRegistry::new();
-            let fleet_dispatcher = Arc::new(FleetDispatcher::new(
-                dispatch_service.clone(),
-                fleet_registry.clone(),
-            ));
-            let fleet_cancel = Arc::new(CancelFleetService::new(
-                fleet_registry,
-                conn_registry.clone(),
-            ));
-
-            Some(aegis_orchestrator_core::api::rest::edge::EdgeApiState {
-                issue_token,
+        edge_components.as_ref().map(
+            |(
                 edge_repo,
-                group_service,
-                tag_service,
-                revoke_service,
+                group_repo,
+                conn_registry,
+                dispatch_service,
                 resolver,
                 fleet_dispatcher,
                 fleet_cancel,
-                dispatch_service,
-            })
-        } else {
-            None
-        };
+            )| {
+                use aegis_orchestrator_core::application::edge::issue_enrollment_token::IssueEnrollmentToken;
+                use aegis_orchestrator_core::application::edge::manage_groups::ManageGroupsService;
+                use aegis_orchestrator_core::application::edge::manage_tags::ManageTagsService;
+                use aegis_orchestrator_core::application::edge::revoke_edge::RevokeEdgeService;
+
+                let cluster_endpoint = config
+                    .spec
+                    .network
+                    .as_ref()
+                    .map(|n| format!("{}:{}", n.bind_address, n.grpc_port))
+                    .unwrap_or_else(|| "0.0.0.0:50051".to_string());
+                let issuer = config
+                    .spec
+                    .zaru
+                    .as_ref()
+                    .and_then(|z| resolve_env_value(&z.public_url).ok())
+                    .unwrap_or_else(|| "aegis-controller".to_string());
+
+                let issue_token = Arc::new(IssueEnrollmentToken::new(
+                    secrets_manager.secret_store(),
+                    issuer,
+                    cluster_endpoint,
+                    "aegis-node-controller-key".to_string(),
+                ));
+                let group_service = Arc::new(ManageGroupsService::new(group_repo.clone()));
+                let tag_service = Arc::new(ManageTagsService::new(edge_repo.clone()));
+                let revoke_service = Arc::new(RevokeEdgeService::new(
+                    edge_repo.clone(),
+                    conn_registry.clone(),
+                ));
+
+                aegis_orchestrator_core::api::rest::edge::EdgeApiState {
+                    issue_token,
+                    edge_repo: edge_repo.clone(),
+                    group_service,
+                    tag_service,
+                    revoke_service,
+                    resolver: resolver.clone(),
+                    fleet_dispatcher: fleet_dispatcher.clone(),
+                    fleet_cancel: fleet_cancel.clone(),
+                    dispatch_service: dispatch_service.clone(),
+                }
+            },
+        );
 
     let app_state = AppState {
         agent_service: agent_service.clone(),

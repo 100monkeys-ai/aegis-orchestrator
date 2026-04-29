@@ -392,6 +392,7 @@ mod tests {
             name: "aegis.agent.list".to_string(),
             description: "List all agents".to_string(),
             input_schema: json!({"type": "object"}),
+            ..Default::default()
         }
     }
 
@@ -409,6 +410,7 @@ mod tests {
             name: "fs.write".to_string(),
             description: "Write a file".to_string(),
             input_schema: json!({"type": "object"}),
+            ..Default::default()
         };
         let entry = StandardToolCatalog::enrich(meta);
         assert_eq!(entry.source, ToolSource::Builtin);
@@ -422,6 +424,7 @@ mod tests {
             name: "web.fetch".to_string(),
             description: "Fetch a URL".to_string(),
             input_schema: json!({"type": "object"}),
+            ..Default::default()
         };
         let entry = StandardToolCatalog::enrich(meta);
         assert_eq!(entry.source, ToolSource::McpServer);
@@ -436,6 +439,7 @@ mod tests {
             name: "custom-workflow-tool".to_string(),
             description: "Some external tool".to_string(),
             input_schema: json!({"type": "object"}),
+            ..Default::default()
         };
         let entry = StandardToolCatalog::enrich(meta);
         assert_eq!(entry.source, ToolSource::SealGateway);
@@ -493,11 +497,13 @@ mod tests {
                     name: "aegis.agent.list".to_string(),
                     description: "List agents".to_string(),
                     input_schema: json!({"type": "object"}),
+                    ..Default::default()
                 },
                 crate::infrastructure::tool_router::ToolMetadata {
                     name: "web.fetch".to_string(),
                     description: "Fetch URL".to_string(),
                     input_schema: json!({"type": "object"}),
+                    ..Default::default()
                 },
             ])
             .await;
@@ -526,11 +532,13 @@ mod tests {
                     name: "aegis.agent.list".to_string(),
                     description: "List all agents".to_string(),
                     input_schema: json!({"type": "object"}),
+                    ..Default::default()
                 },
                 crate::infrastructure::tool_router::ToolMetadata {
                     name: "aegis.workflow.list".to_string(),
                     description: "List all workflows".to_string(),
                     input_schema: json!({"type": "object"}),
+                    ..Default::default()
                 },
             ])
             .await;
@@ -558,6 +566,7 @@ mod tests {
                 name: format!("aegis.tool.{i}"),
                 description: format!("Tool {i}"),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             })
             .collect();
         catalog.refresh_from(tools).await;

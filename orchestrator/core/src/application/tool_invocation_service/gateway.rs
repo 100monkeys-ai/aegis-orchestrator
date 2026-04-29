@@ -246,6 +246,7 @@ impl ToolInvocationService {
                 name: item.name,
                 description: item.description,
                 input_schema,
+                ..Default::default()
             });
         }
 
