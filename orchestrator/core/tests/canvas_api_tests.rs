@@ -958,10 +958,17 @@ async fn terminate_persists_state_when_volume_delete_fails() {
 
     // 2. Both SessionTerminated AND WorkspaceVolumeOrphaned events were
     //    published to the bus, with the orphan event carrying the volume id.
+    //    Drain the bus until we see both, ignoring unrelated events; cap by
+    //    a generous overall deadline so a missing event still fails the test.
     let mut saw_terminated = false;
     let mut saw_orphan = false;
-    for _ in 0..4 {
-        match tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !(saw_terminated && saw_orphan) {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(deadline - now, receiver.recv()).await {
             Ok(Ok(DomainEvent::Canvas(CanvasEvent::SessionTerminated { .. }))) => {
                 saw_terminated = true;
             }
@@ -974,10 +981,10 @@ async fn terminate_persists_state_when_volume_delete_fails() {
                 assert_eq!(sid, session.id);
                 saw_orphan = true;
             }
-            _ => break,
-        }
-        if saw_terminated && saw_orphan {
-            break;
+            // Unrelated event, broadcast lag, or channel closed — keep
+            // draining until the deadline. Don't break early; that's the
+            // bug the previous version of this test had.
+            _ => continue,
         }
     }
     assert!(saw_terminated, "SessionTerminated event must be published");
