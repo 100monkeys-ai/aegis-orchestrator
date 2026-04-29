@@ -299,7 +299,19 @@ impl DomainEvent {
                 | ClusterEvent::NodeRegistered { .. }
                 | ClusterEvent::NodeDeregistered { .. }
                 | ClusterEvent::NodeUnhealthy { .. }
-                | ClusterEvent::ClusterConfigPushed { .. } => None,
+                | ClusterEvent::ClusterConfigPushed { .. }
+                | ClusterEvent::EdgeEnrolled { .. }
+                | ClusterEvent::EdgeConnected { .. }
+                | ClusterEvent::EdgeDisconnected { .. }
+                | ClusterEvent::EdgeCommandDispatched { .. }
+                | ClusterEvent::EdgeRevoked { .. }
+                | ClusterEvent::EdgeTagsChanged { .. }
+                | ClusterEvent::EdgeGroupCreated { .. }
+                | ClusterEvent::EdgeGroupUpdated { .. }
+                | ClusterEvent::EdgeGroupDeleted { .. }
+                | ClusterEvent::FleetCommandStarted { .. }
+                | ClusterEvent::FleetCommandCompleted { .. }
+                | ClusterEvent::FleetCommandCancelled { .. } => None,
             },
             DomainEvent::Swarm(event) => match event {
                 SwarmEvent::ChildSpawned { execution_id, .. }
@@ -575,6 +587,20 @@ impl DomainEvent {
                 ClusterEvent::NodeUnhealthy { marked_at, .. } => *marked_at,
                 ClusterEvent::ExecutionForwarded { forwarded_at, .. } => *forwarded_at,
                 ClusterEvent::ClusterConfigPushed { pushed_at, .. } => *pushed_at,
+                ClusterEvent::EdgeEnrolled { enrolled_at, .. } => *enrolled_at,
+                ClusterEvent::EdgeConnected { connected_at, .. } => *connected_at,
+                ClusterEvent::EdgeDisconnected {
+                    disconnected_at, ..
+                } => *disconnected_at,
+                ClusterEvent::EdgeCommandDispatched { dispatched_at, .. } => *dispatched_at,
+                ClusterEvent::EdgeRevoked { revoked_at, .. } => *revoked_at,
+                ClusterEvent::EdgeTagsChanged { changed_at, .. } => *changed_at,
+                ClusterEvent::EdgeGroupCreated { created_at, .. } => *created_at,
+                ClusterEvent::EdgeGroupUpdated { updated_at, .. } => *updated_at,
+                ClusterEvent::EdgeGroupDeleted { deleted_at, .. } => *deleted_at,
+                ClusterEvent::FleetCommandStarted { started_at, .. } => *started_at,
+                ClusterEvent::FleetCommandCompleted { completed_at, .. } => *completed_at,
+                ClusterEvent::FleetCommandCancelled { cancelled_at, .. } => *cancelled_at,
             },
             DomainEvent::RateLimit(event) => match event {
                 RateLimitEvent::Exceeded { timestamp, .. }
@@ -808,6 +834,18 @@ impl DomainEvent {
                 ClusterEvent::NodeUnhealthy { .. } => "node_unhealthy",
                 ClusterEvent::ExecutionForwarded { .. } => "execution_forwarded",
                 ClusterEvent::ClusterConfigPushed { .. } => "cluster_config_pushed",
+                ClusterEvent::EdgeEnrolled { .. } => "edge_enrolled",
+                ClusterEvent::EdgeConnected { .. } => "edge_connected",
+                ClusterEvent::EdgeDisconnected { .. } => "edge_disconnected",
+                ClusterEvent::EdgeCommandDispatched { .. } => "edge_command_dispatched",
+                ClusterEvent::EdgeRevoked { .. } => "edge_revoked",
+                ClusterEvent::EdgeTagsChanged { .. } => "edge_tags_changed",
+                ClusterEvent::EdgeGroupCreated { .. } => "edge_group_created",
+                ClusterEvent::EdgeGroupUpdated { .. } => "edge_group_updated",
+                ClusterEvent::EdgeGroupDeleted { .. } => "edge_group_deleted",
+                ClusterEvent::FleetCommandStarted { .. } => "fleet_command_started",
+                ClusterEvent::FleetCommandCompleted { .. } => "fleet_command_completed",
+                ClusterEvent::FleetCommandCancelled { .. } => "fleet_command_cancelled",
             },
             DomainEvent::RateLimit(event) => match event {
                 RateLimitEvent::Exceeded { .. } => "rate_limit_exceeded",

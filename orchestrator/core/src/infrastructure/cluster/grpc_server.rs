@@ -540,6 +540,13 @@ impl NodeClusterService for NodeClusterServiceHandler {
                     DomainNodeRole::Hybrid => {
                         crate::infrastructure::aegis_cluster_proto::NodeRole::Hybrid.into()
                     }
+                    DomainNodeRole::Edge => {
+                        crate::infrastructure::aegis_cluster_proto::NodeRole::Edge.into()
+                    }
+                    DomainNodeRole::RelayCoordinator => {
+                        crate::infrastructure::aegis_cluster_proto::NodeRole::RelayCoordinator
+                            .into()
+                    }
                 };
                 let status: i32 = match p.status {
                     NodePeerStatus::Active => {
