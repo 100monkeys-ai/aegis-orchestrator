@@ -108,6 +108,19 @@ const JWKS_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// so anything beyond this bound indicates a frozen peer.
 const JWKS_REQUEST_TIMEOUT_SECS: u64 = 8;
 
+/// Maximum staleness ceiling (seconds) for cached JWKS that are served
+/// after a refresh failure. Audit finding 4.29 (BC-13): without an upper
+/// bound, a long Keycloak outage combined with a known-compromised key
+/// would leave the cache serving the rotated-out key indefinitely. Past
+/// this ceiling the cache fails closed with `JwksFetchFailed` so a
+/// compromised-key rotation can propagate.
+///
+/// One hour balances:
+///   * tolerance for transient upstream outages (well within typical
+///     Keycloak restart / failover windows), and
+///   * a hard cap on how long a rotated-out key remains accepted.
+const MAX_JWKS_STALENESS_SECS: u64 = 3600;
+
 /// Production implementation of [`IdentityProvider`].
 ///
 /// Validates JWTs against Keycloak realm JWKS endpoints with in-memory caching.
@@ -267,15 +280,58 @@ impl StandardIamService {
                 reason: "Cache empty after refresh".to_string(),
             }),
             (Err(e), Some(stale)) => {
+                // Audit 4.29 (BC-13): enforce a max-staleness ceiling. A
+                // multi-hour Keycloak outage combined with a known-compromised
+                // signing key would otherwise leave that key honored
+                // indefinitely. Past the ceiling we MUST fail closed.
+                let age = stale.fetched_at.elapsed();
+                if age > Duration::from_secs(MAX_JWKS_STALENESS_SECS) {
+                    warn!(
+                        realm = %realm.realm_slug,
+                        error = %e,
+                        stale_age_secs = age.as_secs(),
+                        ceiling_secs = MAX_JWKS_STALENESS_SECS,
+                        "JWKS refresh failed and cached keys exceed max-staleness ceiling; \
+                         failing closed to allow rotated-out keys to propagate"
+                    );
+                    return Err(IamError::JwksFetchFailed {
+                        realm: realm.realm_slug.clone(),
+                        reason: format!(
+                            "refresh failed ({e}) and cached JWKS is {}s old, \
+                             exceeding the {}s max-staleness ceiling",
+                            age.as_secs(),
+                            MAX_JWKS_STALENESS_SECS
+                        ),
+                    });
+                }
                 warn!(
                     realm = %realm.realm_slug,
                     error = %e,
-                    "JWKS refresh failed, serving stale keys"
+                    stale_age_secs = age.as_secs(),
+                    "JWKS refresh failed, serving stale keys (within max-staleness ceiling)"
                 );
                 Ok(stale.keys.clone())
             }
             (Err(e), None) => Err(e),
         }
+    }
+
+    /// Return `true` if `kid` is present in any cached realm JWKS OTHER than
+    /// `selected_realm_slug`. Audit 4.10 (BC-13) defense: a colliding kid
+    /// across two trusted realms is evidence that the `iss`-driven realm
+    /// selection cannot be safely disambiguated; tokens bearing such a
+    /// kid are rejected outright.
+    async fn kid_is_ambiguous_across_realms(&self, kid: &str, selected_realm_slug: &str) -> bool {
+        let cache = self.jwks_cache.read().await;
+        for (slug, cached) in cache.iter() {
+            if slug == selected_realm_slug {
+                continue;
+            }
+            if cached.keys.keys.iter().any(|k| k.kid == kid) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Find the realm matching a JWT's issuer claim.
@@ -448,7 +504,22 @@ impl IdentityProvider for StandardIamService {
                 .claims
         };
 
-        // 3. Find the realm matching the issuer claim
+        // 3. Find the realm matching the issuer claim.
+        //
+        // Audit 4.10 (BC-13): the `iss` claim used here is unsigned at this
+        // point. Two defenses run in concert to prevent cross-realm kid-
+        // collision forgery:
+        //   (a) The `kid` MUST be unique across all currently-cached realm
+        //       JWKS (enforced below). If two realms have published the same
+        //       `kid`, no token bearing that `kid` is accepted from either —
+        //       the ambiguity is fatal rather than guessed.
+        //   (b) `Validation::set_issuer(&[&realm.issuer_url])` re-pins the
+        //       verified `iss` claim to the realm we selected here, so once
+        //       the signature verifies, the `iss` is also bound.
+        // Together these mean: even if an attacker forges `iss = realm-B`
+        // on a token signed by realm-A, either (a) the kid is shared and
+        // BOTH realms reject it, or (b) realm-B's JWKS does not contain a
+        // key that verifies the signature.
         let realm = self.find_realm_by_issuer(&unvalidated.iss).ok_or_else(|| {
             self.event_bus
                 .publish_iam_event(IamEvent::TokenValidationFailed {
@@ -463,6 +534,28 @@ impl IdentityProvider for StandardIamService {
 
         // 4. Get JWKS for this realm
         let jwks = self.get_jwks(realm).await?;
+
+        // 4a. Audit 4.10 (BC-13): reject any `kid` that collides across
+        // multiple trusted realms' JWKS. If the same key id is present in
+        // another realm's cache, we cannot safely use the unsigned `iss`
+        // claim to disambiguate which realm's key should verify the
+        // signature — the ambiguity itself is the vulnerability.
+        if self
+            .kid_is_ambiguous_across_realms(&kid, &realm.realm_slug)
+            .await
+        {
+            self.event_bus
+                .publish_iam_event(IamEvent::TokenValidationFailed {
+                    realm_slug: Some(realm.realm_slug.clone()),
+                    reason: format!(
+                        "kid '{kid}' collides across multiple trusted realms; rejecting"
+                    ),
+                    attempted_at: Utc::now(),
+                });
+            return Err(IamError::SignatureInvalid(format!(
+                "kid '{kid}' is ambiguous across multiple trusted realms"
+            )));
+        }
 
         // 5. Find the key matching the JWT's kid
         let jwk_key = jwks.keys.iter().find(|k| k.kid == kid).ok_or_else(|| {
@@ -1536,5 +1629,289 @@ mod tests {
             }
             other => panic!("expected IamError::SignatureInvalid, got {other:?}"),
         }
+    }
+
+    // ── Audit 4.10 regression: kid-collision across realms is rejected ────────
+    //
+    // Two trusted realms publish JWKS that happen to share a `kid`. An
+    // attacker holds a token signed by realm-A's key but claims `iss = realm-B`
+    // in the token body. Prior behavior: realm selection used the unsigned
+    // `iss`, so realm-B's JWKS was consulted; if realm-B coincidentally had
+    // the same kid (different key material here, but the structural
+    // ambiguity is the bug), the validator could be tricked. The fix
+    // rejects ANY token whose kid is present in more than one realm's cache.
+
+    fn second_consumer_realm_config() -> IamRealmConfig {
+        IamRealmConfig {
+            slug: "zaru-consumer-2".to_string(),
+            issuer_url: "https://auth.example.com/realms/zaru-consumer-2".to_string(),
+            jwks_uri:
+                "https://auth.example.com/realms/zaru-consumer-2/protocol/openid-connect/certs"
+                    .to_string(),
+            audience: TEST_AUDIENCE.to_string(),
+            kind: "consumer".to_string(),
+        }
+    }
+
+    fn test_service_with_two_realms() -> StandardIamService {
+        let config = IamConfig {
+            realms: vec![
+                IamRealmConfig {
+                    slug: "zaru-consumer".to_string(),
+                    issuer_url: TEST_ISSUER.to_string(),
+                    jwks_uri:
+                        "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
+                            .to_string(),
+                    audience: TEST_AUDIENCE.to_string(),
+                    kind: "consumer".to_string(),
+                },
+                second_consumer_realm_config(),
+            ],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        StandardIamService::new(&config, event_bus).expect("test config must build")
+    }
+
+    /// Pre-populate two realms' JWKS caches with the SAME kid. Realm-A
+    /// holds the real public key; realm-B holds an arbitrary other key
+    /// under the same kid. This models the audit-4.10 collision condition.
+    async fn populate_two_realms_with_colliding_kid(service: &StandardIamService) {
+        let real_jwks = JwksResponse {
+            keys: vec![JwkKey {
+                kty: "RSA".to_string(),
+                kid: TEST_KID.to_string(),
+                n: TEST_JWK_N.to_string(),
+                e: TEST_JWK_E.to_string(),
+                alg: Some("RS256".to_string()),
+                key_use: Some("sig".to_string()),
+            }],
+        };
+        // Realm-B's JWKS uses the SAME kid but a different (placeholder)
+        // modulus. The structural collision — not the key bytes — is what
+        // the defense rejects.
+        let other_jwks = JwksResponse {
+            keys: vec![JwkKey {
+                kty: "RSA".to_string(),
+                kid: TEST_KID.to_string(),
+                n: "differentModulusBase64UrlEncodedValue".to_string(),
+                e: TEST_JWK_E.to_string(),
+                alg: Some("RS256".to_string()),
+                key_use: Some("sig".to_string()),
+            }],
+        };
+        let mut cache = service.jwks_cache.write().await;
+        cache.insert(
+            "zaru-consumer".to_string(),
+            CachedJwks {
+                keys: real_jwks,
+                fetched_at: Instant::now(),
+                ttl: Duration::from_secs(300),
+            },
+        );
+        cache.insert(
+            "zaru-consumer-2".to_string(),
+            CachedJwks {
+                keys: other_jwks,
+                fetched_at: Instant::now(),
+                ttl: Duration::from_secs(300),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn token_with_kid_colliding_across_realms_is_rejected() {
+        // Audit 4.10 (BC-13): a token whose `kid` is present in more than
+        // one trusted realm's JWKS MUST be rejected outright. Without this
+        // defense, the `iss`-driven realm selection is exploitable when
+        // two realms happen to publish the same `kid`.
+        let service = test_service_with_two_realms();
+        populate_two_realms_with_colliding_kid(&service).await;
+
+        let now = now_secs();
+        let claims = serde_json::json!({
+            "sub": "abc-collide",
+            // Attacker forges `iss = zaru-consumer` (realm-A) — but realm-B
+            // (zaru-consumer-2) also publishes a key under the same kid.
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "iat": now,
+            "exp": now + 3600,
+            "zaru_tier": "free",
+            "tenant_id": "u-abccollide",
+        });
+        let token = sign_test_jwt(claims);
+
+        let err = service
+            .validate_token(&token)
+            .await
+            .expect_err("kid-collision across realms MUST be rejected");
+        match err {
+            IamError::SignatureInvalid(msg) => {
+                assert!(
+                    msg.contains("ambiguous") || msg.contains("collides"),
+                    "error must surface the kid-collision condition, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected IamError::SignatureInvalid (audit 4.10 kid-collision), got {other:?}"
+            ),
+        }
+    }
+
+    /// Sanity check: a unique-kid token in the same two-realm setup still
+    /// validates. Confirms the kid-collision check only fires on actual
+    /// collisions and does not regress the happy path.
+    #[tokio::test]
+    async fn token_with_unique_kid_still_validates_in_multi_realm_setup() {
+        let service = test_service_with_two_realms();
+        // Only realm-A populated — realm-B has no cached JWKS at all,
+        // so kid is unique.
+        populate_jwks_cache(&service).await;
+
+        let now = now_secs();
+        let claims = serde_json::json!({
+            "sub": "abc-unique",
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "iat": now,
+            "exp": now + 3600,
+            "zaru_tier": "free",
+            "tenant_id": "u-abcunique",
+        });
+        let token = sign_test_jwt(claims);
+
+        service
+            .validate_token(&token)
+            .await
+            .expect("unique-kid token MUST validate in multi-realm setup");
+    }
+
+    // ── Audit 4.29 regression: stale JWKS past max-staleness ceiling ──────────
+    //
+    // After a refresh failure, the cache previously served stale keys
+    // indefinitely. The fix imposes a max-staleness ceiling
+    // (MAX_JWKS_STALENESS_SECS) past which `get_jwks` MUST return
+    // JwksFetchFailed.
+
+    #[tokio::test]
+    async fn stale_jwks_past_max_staleness_ceiling_fails_closed() {
+        // Use a non-routable jwks_uri so refresh deterministically fails.
+        let config = IamConfig {
+            realms: vec![IamRealmConfig {
+                slug: "zaru-consumer".to_string(),
+                issuer_url: TEST_ISSUER.to_string(),
+                // RFC 5737 TEST-NET-1: guaranteed-non-routable
+                jwks_uri: "http://192.0.2.1:1/jwks".to_string(),
+                audience: TEST_AUDIENCE.to_string(),
+                kind: "consumer".to_string(),
+            }],
+            // TTL is irrelevant for this test — what matters is fetched_at
+            // age vs MAX_JWKS_STALENESS_SECS.
+            jwks_cache_ttl_seconds: 1,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
+        let realm = service.realms[0].clone();
+
+        // Pre-populate cache with a "fetched" timestamp older than the
+        // ceiling. We can't subtract from `Instant::now()` arbitrarily on
+        // all platforms, so synthesize an Instant in the past via
+        // `checked_sub`.
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(MAX_JWKS_STALENESS_SECS + 60))
+            .expect("instant subtraction within representable range");
+        {
+            let mut cache = service.jwks_cache.write().await;
+            cache.insert(
+                "zaru-consumer".to_string(),
+                CachedJwks {
+                    keys: JwksResponse { keys: vec![] },
+                    fetched_at: past,
+                    ttl: Duration::from_secs(1),
+                },
+            );
+        }
+
+        // Cache is expired (TTL=1s, but cache is hours old) so refresh is
+        // attempted; refresh fails (non-routable). Stale fallback exists
+        // but is older than MAX_JWKS_STALENESS_SECS → fail closed.
+        let result = tokio::time::timeout(Duration::from_secs(15), service.get_jwks(&realm)).await;
+        let result = result.expect("get_jwks should not hang");
+        let err = result.expect_err(
+            "audit 4.29: stale JWKS older than max-staleness ceiling MUST fail closed, \
+             not be served indefinitely",
+        );
+        match err {
+            IamError::JwksFetchFailed { reason, .. } => {
+                assert!(
+                    reason.contains("max-staleness ceiling")
+                        || reason.contains(&MAX_JWKS_STALENESS_SECS.to_string()),
+                    "error reason must surface the staleness-ceiling cause, got: {reason}"
+                );
+            }
+            other => panic!("expected JwksFetchFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_jwks_within_max_staleness_ceiling_is_still_served() {
+        // Sibling regression: fresh-stale (within ceiling) still works.
+        // This pins the existing "serve-stale-on-transient-failure"
+        // behavior so the 4.29 fix does not over-tighten.
+        let config = IamConfig {
+            realms: vec![IamRealmConfig {
+                slug: "zaru-consumer".to_string(),
+                issuer_url: TEST_ISSUER.to_string(),
+                jwks_uri: "http://192.0.2.1:1/jwks".to_string(),
+                audience: TEST_AUDIENCE.to_string(),
+                kind: "consumer".to_string(),
+            }],
+            jwks_cache_ttl_seconds: 1,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus).expect("test config must build");
+        let realm = service.realms[0].clone();
+
+        // 60 seconds old: expired vs TTL=1, but well within the
+        // MAX_JWKS_STALENESS_SECS ceiling.
+        let recent = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("instant subtraction within representable range");
+        let placeholder_keys = JwksResponse {
+            keys: vec![JwkKey {
+                kty: "RSA".to_string(),
+                kid: "stale-kid".to_string(),
+                n: "n".to_string(),
+                e: "AQAB".to_string(),
+                alg: Some("RS256".to_string()),
+                key_use: Some("sig".to_string()),
+            }],
+        };
+        {
+            let mut cache = service.jwks_cache.write().await;
+            cache.insert(
+                "zaru-consumer".to_string(),
+                CachedJwks {
+                    keys: placeholder_keys.clone(),
+                    fetched_at: recent,
+                    ttl: Duration::from_secs(1),
+                },
+            );
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(15), service.get_jwks(&realm)).await;
+        let result = result.expect("get_jwks should not hang");
+        let jwks = result.expect(
+            "stale JWKS within max-staleness ceiling MUST still be served on refresh failure",
+        );
+        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.keys[0].kid, "stale-kid");
     }
 }

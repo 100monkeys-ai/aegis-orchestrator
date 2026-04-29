@@ -357,16 +357,32 @@ pub(crate) async fn delete_agent_handler(
     }
 }
 
+/// Build the list of roles asserted by the request's authenticated identity.
+///
+/// SECURITY (audit 4.36, BC-13): when identity is absent — i.e. a route was
+/// reached without identity middleware attaching a `UserIdentity` — this
+/// function MUST return an empty role set. Any caller that gates an
+/// operator-tier action must therefore fail closed against the empty set.
+/// Defaulting to `aegis:operator` (the prior behavior) silently grants
+/// operator privileges to any misconfigured route and is a privilege-
+/// escalation surface.
 fn build_roles(identity: &Option<Extension<UserIdentity>>) -> Vec<String> {
-    identity
-        .as_ref()
-        .map(|ext| match &ext.0.identity_kind {
-            IdentityKind::Operator { aegis_role } => vec![aegis_role.as_claim_str().to_string()],
-            IdentityKind::ServiceAccount { .. } => vec!["aegis:operator".to_string()],
-            IdentityKind::TenantUser { .. } => vec!["tenant:admin".to_string()],
-            _ => vec!["user".to_string()],
-        })
-        .unwrap_or_else(|| vec!["aegis:operator".to_string()]) // local daemon defaults to operator
+    let Some(ext) = identity.as_ref() else {
+        // Fail closed. The absence of an identity extension is a
+        // configuration anomaly worth surfacing in logs, but it MUST NOT
+        // grant any roles.
+        tracing::warn!(
+            "build_roles called without identity extension; returning empty role set \
+             (route is missing identity middleware or token validation failed silently)"
+        );
+        return Vec::new();
+    };
+    match &ext.0.identity_kind {
+        IdentityKind::Operator { aegis_role } => vec![aegis_role.as_claim_str().to_string()],
+        IdentityKind::ServiceAccount { .. } => vec!["aegis:operator".to_string()],
+        IdentityKind::TenantUser { .. } => vec!["tenant:admin".to_string()],
+        IdentityKind::ConsumerUser { .. } => vec!["user".to_string()],
+    }
 }
 
 pub(crate) async fn get_agent_handler(
@@ -616,5 +632,50 @@ pub(crate) async fn update_agent_scope_handler(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::iam::AegisRole;
+
+    /// Audit finding 4.36 (BC-13 / BC-1) regression test.
+    ///
+    /// `build_roles` previously returned `vec!["aegis:operator"]` when the
+    /// `Option<Extension<UserIdentity>>` was `None`. That meant any route
+    /// that reached this function without identity middleware silently
+    /// granted operator privileges. After the fix, missing identity MUST
+    /// resolve to the empty role set, and any operator-tier check must
+    /// fail closed against it.
+    #[test]
+    fn build_roles_without_identity_returns_empty_role_set_not_operator() {
+        let roles = build_roles(&None);
+        assert!(
+            roles.is_empty(),
+            "audit 4.36: missing identity MUST yield empty role set, got {:?}",
+            roles
+        );
+        assert!(
+            !roles.iter().any(|r| r == "aegis:operator"),
+            "audit 4.36: missing identity MUST NOT grant aegis:operator (privilege escalation)"
+        );
+    }
+
+    /// Confirms the operator path still resolves correctly when identity IS
+    /// attached — the fix must only close the empty-identity hole.
+    #[test]
+    fn build_roles_with_operator_identity_returns_operator_role() {
+        let identity = Extension(UserIdentity {
+            sub: "op-sub".to_string(),
+            realm_slug: "aegis-system".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::Operator {
+                aegis_role: AegisRole::Operator,
+            },
+        });
+        let roles = build_roles(&Some(identity));
+        assert_eq!(roles, vec!["aegis:operator".to_string()]);
     }
 }
