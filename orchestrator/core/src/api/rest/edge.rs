@@ -22,16 +22,17 @@
 //! | GET    | /api/edge/fleet/runs        | History (in-memory). |
 //! | GET    | /api/edge/fleet/runs/{id}    | Single run detail. |
 //!
-//! `effective_tenant` is resolved per ADR-100 by the `TenantId` extractor
-//! that is already plugged into the orchestrator's middleware stack; here it
-//! is supplied via the `EffectiveTenant` header extractor.
+//! Effective tenant is resolved per ADR-100 / ADR-111 by
+//! `tenant_context_middleware`, which inserts a [`TenantId`] into the request
+//! extensions. Handlers obtain it via axum's [`Extension`] extractor — they do
+//! NOT read any tenant header directly.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use prost_types::Struct;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -85,18 +86,6 @@ pub fn router(state: EdgeApiState) -> Router {
         .route("/api/edge/fleet/runs", get(list_runs))
         .route("/api/edge/fleet/runs/{id}", get(get_run))
         .with_state(state)
-}
-
-// ── Tenant resolution (ADR-100) ────────────────────────────────────────
-
-const TENANT_HEADER: &str = "X-Effective-Tenant";
-
-fn effective_tenant(headers: &HeaderMap) -> Result<TenantId, ApiError> {
-    headers
-        .get(TENANT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::bad_request("missing X-Effective-Tenant"))
-        .and_then(|s| TenantId::new(s).map_err(|e| ApiError::bad_request(e.to_string())))
 }
 
 // ── Error envelope ─────────────────────────────────────────────────────
@@ -155,10 +144,9 @@ struct IssueTokenResponse {
 
 async fn post_enrollment_token(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<IssueTokenRequest>,
 ) -> Result<Json<IssueTokenResponse>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let issued = s
         .issue_token
         .issue(&tenant, &req.issued_to)
@@ -187,9 +175,8 @@ struct EdgeHostView {
 
 async fn list_hosts(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
 ) -> Result<Json<Vec<EdgeHostView>>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let edges = s
         .edge_repo
         .list_by_tenant(&tenant)
@@ -212,10 +199,9 @@ async fn list_hosts(
 
 async fn get_host(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<Json<EdgeHostView>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let nid = parse_node_id(&id)?;
     let edge = s
         .edge_repo
@@ -244,11 +230,10 @@ struct PatchHost {
 
 async fn patch_host(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<PatchHost>,
 ) -> Result<Json<Vec<String>>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let nid = parse_node_id(&id)?;
     let mut tags = Vec::new();
     if let Some(add) = body.add_tags {
@@ -292,10 +277,9 @@ fn map_revoke_err(e: crate::application::edge::revoke_edge::RevokeEdgeError) -> 
 
 async fn delete_host(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let nid = parse_node_id(&id)?;
     s.revoke_service
         .revoke(&tenant, nid)
@@ -338,10 +322,9 @@ fn group_view(g: &crate::domain::edge::EdgeGroup) -> GroupView {
 
 async fn create_group(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<CreateGroup>,
 ) -> Result<Json<GroupView>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let pinned: Vec<NodeId> = req
         .pinned_members
         .iter()
@@ -357,19 +340,17 @@ async fn create_group(
 
 async fn list_groups(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
 ) -> Result<Json<Vec<GroupView>>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let gs = s.group_service.list(&tenant).await.map_err(map_group_err)?;
     Ok(Json(gs.iter().map(group_view).collect()))
 }
 
 async fn get_group(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<Json<GroupView>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let gid =
         EdgeGroupId(uuid::Uuid::parse_str(&id).map_err(|e| ApiError::bad_request(e.to_string()))?);
     let g = s
@@ -389,11 +370,10 @@ struct PatchGroup {
 
 async fn patch_group(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<PatchGroup>,
 ) -> Result<Json<GroupView>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let gid =
         EdgeGroupId(uuid::Uuid::parse_str(&id).map_err(|e| ApiError::bad_request(e.to_string()))?);
     let mut g = s
@@ -423,10 +403,9 @@ async fn patch_group(
 
 async fn delete_group(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let gid =
         EdgeGroupId(uuid::Uuid::parse_str(&id).map_err(|e| ApiError::bad_request(e.to_string()))?);
     s.group_service
@@ -460,10 +439,9 @@ struct FleetPreview {
 
 async fn fleet_preview(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<FleetTargetSpec>,
 ) -> Result<Json<FleetPreview>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let resolved = s
         .resolver
         .resolve(&tenant, &req.target)
@@ -493,10 +471,9 @@ struct FleetInvokeRequest {
 
 async fn fleet_invoke(
     State(s): State<EdgeApiState>,
-    headers: HeaderMap,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<FleetInvokeRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let tenant = effective_tenant(&headers)?;
     let resolved = s
         .resolver
         .resolve(&tenant, &req.target)
@@ -556,6 +533,7 @@ fn build_policy(req: &FleetInvokeRequest) -> Result<FleetDispatchPolicy, ApiErro
 
 async fn fleet_cancel(
     State(s): State<EdgeApiState>,
+    Extension(_tenant): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let fleet_id = FleetCommandId(
@@ -576,7 +554,7 @@ struct EmptyList {
 
 async fn list_runs(
     State(_s): State<EdgeApiState>,
-    _headers: HeaderMap,
+    Extension(_tenant): Extension<TenantId>,
     _q: Query<std::collections::HashMap<String, String>>,
 ) -> Json<EmptyList> {
     // ADR-117 v1: fleet runs are transient (in-memory). History persistence
@@ -587,6 +565,7 @@ async fn list_runs(
 
 async fn get_run(
     State(_s): State<EdgeApiState>,
+    Extension(_tenant): Extension<TenantId>,
     Path(_id): Path<String>,
 ) -> Result<Json<EmptyList>, ApiError> {
     Err(ApiError::not_found(
@@ -598,4 +577,244 @@ async fn get_run(
 
 fn parse_node_id(s: &str) -> Result<NodeId, ApiError> {
     NodeId::from_string(s).map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the tenant-extraction contract.
+    //!
+    //! Bug: the edge handlers used to read a `X-Effective-Tenant` header
+    //! invented locally in `edge.rs`. The rest of the orchestrator (per
+    //! ADR-100 / ADR-111) injects a `TenantId` into request extensions via
+    //! `tenant_context_middleware`, and clients send `X-Tenant-Id`. The
+    //! divergence caused real browser requests to fail with
+    //! `400 missing X-Effective-Tenant`. These tests assert the new
+    //! contract: handlers consume the resolved tenant via
+    //! `Extension<TenantId>` and never look at headers themselves.
+    use super::*;
+    use crate::application::edge::dispatch_to_edge::DispatchToEdgeService;
+    use crate::application::edge::fleet::dispatcher::FleetDispatcher;
+    use crate::application::edge::fleet::registry::FleetRegistry;
+    use crate::application::edge::fleet::{CancelFleetService, EdgeFleetResolver};
+    use crate::application::edge::issue_enrollment_token::IssueEnrollmentToken;
+    use crate::application::edge::manage_groups::ManageGroupsService;
+    use crate::application::edge::manage_tags::ManageTagsService;
+    use crate::application::edge::revoke_edge::RevokeEdgeService;
+    use crate::domain::cluster::NodePeerStatus;
+    use crate::domain::edge::{
+        EdgeDaemon, EdgeDaemonRepository, EdgeGroup, EdgeGroupId, EdgeGroupRepoError,
+        EdgeGroupRepository,
+    };
+    use crate::domain::shared_kernel::TenantId;
+    use crate::infrastructure::edge::EdgeConnectionRegistry;
+    use crate::infrastructure::secrets_manager::TestSecretStore;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::middleware::{from_fn, Next};
+    use tower::ServiceExt;
+
+    // Stub edge repository — list_by_tenant returns empty so list_hosts succeeds.
+    struct StubEdgeRepo;
+    #[async_trait::async_trait]
+    impl EdgeDaemonRepository for StubEdgeRepo {
+        async fn upsert(&self, _edge: &EdgeDaemon) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _node_id: &NodeId) -> anyhow::Result<Option<EdgeDaemon>> {
+            Ok(None)
+        }
+        async fn list_by_tenant(&self, _tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
+        async fn update_status(
+            &self,
+            _node_id: &NodeId,
+            _status: NodePeerStatus,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_tags(&self, _node_id: &NodeId, _tags: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_capabilities(
+            &self,
+            _node_id: &NodeId,
+            _capabilities: &crate::domain::edge::EdgeCapabilities,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _node_id: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StubGroupRepo;
+    #[async_trait::async_trait]
+    impl EdgeGroupRepository for StubGroupRepo {
+        async fn create(&self, _group: &EdgeGroup) -> Result<(), EdgeGroupRepoError> {
+            Ok(())
+        }
+        async fn get(&self, _id: &EdgeGroupId) -> Result<Option<EdgeGroup>, EdgeGroupRepoError> {
+            Ok(None)
+        }
+        async fn list_by_tenant(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
+            Ok(vec![])
+        }
+        async fn update(&self, _group: &EdgeGroup) -> Result<(), EdgeGroupRepoError> {
+            Ok(())
+        }
+        async fn delete(&self, _id: &EdgeGroupId) -> Result<(), EdgeGroupRepoError> {
+            Ok(())
+        }
+    }
+
+    fn build_state() -> EdgeApiState {
+        let edge_repo: Arc<dyn EdgeDaemonRepository> = Arc::new(StubEdgeRepo);
+        let group_repo: Arc<dyn EdgeGroupRepository> = Arc::new(StubGroupRepo);
+        let conn_registry = EdgeConnectionRegistry::new();
+        let fleet_registry = FleetRegistry::new();
+        let secret_store = Arc::new(TestSecretStore::new());
+
+        let issue_token = Arc::new(IssueEnrollmentToken::new(
+            secret_store,
+            "test-issuer".into(),
+            "test-controller:443".into(),
+            "test-key".into(),
+        ));
+        let group_service = Arc::new(ManageGroupsService::new(group_repo.clone()));
+        let tag_service = Arc::new(ManageTagsService::new(edge_repo.clone()));
+        let revoke_service = Arc::new(RevokeEdgeService::new(
+            edge_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let resolver = Arc::new(EdgeFleetResolver::new(
+            edge_repo.clone(),
+            group_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let dispatch_service = Arc::new(DispatchToEdgeService::new(
+            edge_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let fleet_dispatcher = Arc::new(FleetDispatcher::new(
+            dispatch_service.clone(),
+            fleet_registry.clone(),
+        ));
+        let fleet_cancel = Arc::new(CancelFleetService::new(
+            fleet_registry,
+            conn_registry.clone(),
+        ));
+
+        EdgeApiState {
+            issue_token,
+            edge_repo,
+            group_service,
+            tag_service,
+            revoke_service,
+            resolver,
+            fleet_dispatcher,
+            fleet_cancel,
+            dispatch_service,
+        }
+    }
+
+    /// Wrap the edge router with a synthetic middleware that mirrors
+    /// `tenant_context_middleware`'s observable contract: when (and only when)
+    /// a request arrives carrying `X-Tenant-Id`, insert a `TenantId` into
+    /// request extensions. This isolates the test from the full IAM stack
+    /// while still exercising the *integration* point that previously broke.
+    fn router_under_tenant_extension_layer() -> Router {
+        let state = build_state();
+        router(state).layer(from_fn(
+            |req: axum::extract::Request, next: Next| async move {
+                let tenant = req
+                    .headers()
+                    .get("X-Tenant-Id")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| TenantId::new(s).ok());
+                let mut req = req;
+                if let Some(t) = tenant {
+                    req.extensions_mut().insert(t);
+                }
+                next.run(req).await
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn list_hosts_succeeds_with_x_tenant_id_header() {
+        // GIVEN the edge router behind a tenant-injection middleware that
+        // mirrors tenant_context_middleware's contract,
+        // WHEN a request arrives with `X-Tenant-Id` (the canonical header
+        // from zaru-client and ADR-100 service-account delegation),
+        // THEN the handler must succeed — proving it consumes the resolved
+        // tenant from request extensions, NOT a hand-rolled
+        // `X-Effective-Tenant` header.
+        let app = router_under_tenant_extension_layer();
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/api/edge/hosts")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "list_hosts must succeed when TenantId is supplied via Extension; \
+             a 400 here means edge.rs has regressed to reading X-Effective-Tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_runs_succeeds_with_x_tenant_id_header() {
+        let app = router_under_tenant_extension_layer();
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/api/edge/fleet/runs")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_tenant_extension_does_not_emit_legacy_400() {
+        // The middleware contract is: if no tenant is resolvable, the
+        // *middleware* short-circuits the request — handlers never observe
+        // missing-tenant. With the synthetic middleware in this test, no
+        // injection happens when X-Tenant-Id is absent, and the handler's
+        // `Extension<TenantId>` extractor must fail with axum's standard
+        // 500 — NOT the legacy hand-rolled 400 / "missing X-Effective-Tenant"
+        // body that the bug emitted.
+        let app = router_under_tenant_extension_layer();
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/api/edge/hosts")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            !body_str.contains("X-Effective-Tenant"),
+            "response must not reference the obsolete X-Effective-Tenant \
+             header (got status={status}, body={body_str})"
+        );
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "handler must not emit a hand-rolled 400 for missing tenant — \
+             the middleware owns that failure mode"
+        );
+    }
 }
