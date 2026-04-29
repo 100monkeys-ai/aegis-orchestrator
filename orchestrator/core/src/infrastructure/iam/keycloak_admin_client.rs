@@ -119,6 +119,38 @@ impl KeycloakAdminClient {
     }
 
     /// Obtain an admin access token, using cache if valid.
+    ///
+    /// # Authentication mechanism
+    ///
+    /// This call uses the OAuth 2.0 Resource Owner Password Credentials
+    /// (ROPC) grant against Keycloak's `master` realm with the built-in
+    /// `admin-cli` client. The orchestrator presents
+    /// `admin_username` / `admin_password` and receives a short-lived admin
+    /// access token used for subsequent Keycloak Admin REST API calls.
+    ///
+    /// # Deprecation status (audit 002 finding 4.37.19)
+    ///
+    /// ROPC is being phased out by the IETF — the OAuth 2.0 Security Best
+    /// Current Practice draft (`draft-ietf-oauth-security-topics`) and
+    /// OAuth 2.1 both deprecate the password grant because it requires the
+    /// client to handle and transmit user credentials, defeats MFA, and
+    /// has no PKCE-equivalent protection. Keycloak still supports it for
+    /// administrative bootstrap clients but recommends migrating to
+    /// service-account credentials (the `client_credentials` grant against
+    /// a dedicated confidential client with `realm-management` roles).
+    ///
+    /// # Planned migration
+    ///
+    /// Replace the ROPC call below with `client_credentials` once a
+    /// dedicated `aegis-admin` confidential client is provisioned in the
+    /// `master` realm with the minimum required `realm-management` role
+    /// composites (`manage-users`, `view-users`, `manage-realm` as needed).
+    /// The orchestrator config will then carry `admin_client_id` /
+    /// `admin_client_secret` instead of `admin_username` / `admin_password`,
+    /// and Vault/OpenBao can rotate the secret without touching the human
+    /// admin account. Tracked as a follow-up to audit 002 finding 4.37.19;
+    /// no immediate code change because the alternative path is not yet
+    /// provisioned.
     async fn get_admin_token(&self) -> Result<String, KeycloakAdminError> {
         // Check cache
         if let Ok(guard) = self.cached_token.read() {
