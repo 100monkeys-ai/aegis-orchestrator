@@ -199,8 +199,14 @@ impl ZaruTier {
     }
 
     /// Parse from the string value in the OIDC `zaru_tier` custom claim.
+    ///
+    /// The comparison is case-insensitive (audit 002 §4.16): claim values may
+    /// be stored as `"free"`, `"Free"`, or `"FREE"` in different upstreams,
+    /// and silently collapsing unknown casings to `Free` masked paying tiers
+    /// at the SEAL rate-limit boundary. Unknown values still return `None`
+    /// so callers can reject loudly instead of degrading silently.
     pub fn from_claim(value: &str) -> Option<ZaruTier> {
-        match value {
+        match value.trim().to_ascii_lowercase().as_str() {
             "free" => Some(ZaruTier::Free),
             "pro" => Some(ZaruTier::Pro),
             "business" => Some(ZaruTier::Business),

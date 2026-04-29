@@ -68,8 +68,17 @@ pub struct RateLimitPolicy {
 /// Counter key scope for rate limiting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RateLimitScope {
-    User { user_id: String },
-    Tenant { tenant_id: TenantId },
+    /// Per-user bucket. The `tenant_id` namespaces the bucket so that two
+    /// users with the same `user_id` in different tenants do not collide
+    /// (audit 002 §4.15). NEVER drop `tenant_id` — without it, a noisy
+    /// consumer would exhaust an enterprise tenant's quota.
+    User {
+        tenant_id: TenantId,
+        user_id: String,
+    },
+    Tenant {
+        tenant_id: TenantId,
+    },
 }
 
 /// Result of a rate limit evaluation.

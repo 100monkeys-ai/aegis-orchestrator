@@ -141,7 +141,9 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
 
         // Emit remaining-quota gauge for each bucket (ADR-072 §10)
         let scope_id = match scope {
-            RateLimitScope::User { user_id } => user_id.clone(),
+            RateLimitScope::User { tenant_id, user_id } => {
+                format!("{}:{}", tenant_id.as_str(), user_id)
+            }
             RateLimitScope::Tenant { tenant_id } => tenant_id.to_string(),
         };
         for (bucket, remaining_value) in &decision.remaining {
@@ -218,7 +220,9 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
 /// Extract `(user_id, tenant_id)` from a [`RateLimitScope`] for event payloads.
 fn scope_ids(scope: &RateLimitScope) -> (Option<String>, Option<String>) {
     match scope {
-        RateLimitScope::User { user_id } => (Some(user_id.clone()), None),
+        RateLimitScope::User { tenant_id, user_id } => {
+            (Some(user_id.clone()), Some(tenant_id.to_string()))
+        }
         RateLimitScope::Tenant { tenant_id } => (None, Some(tenant_id.to_string())),
     }
 }

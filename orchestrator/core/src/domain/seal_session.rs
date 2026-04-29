@@ -203,6 +203,15 @@ pub trait EnvelopeVerifier {
     ///
     /// Returns `None` if the payload is missing or the `params` field is absent.
     fn extract_arguments(&self) -> Option<serde_json::Value>;
+
+    /// Return a stable per-envelope nonce identifier used for replay detection.
+    ///
+    /// Audit 002 §4.17 requires that recently-seen envelopes be rejected
+    /// inside the 30 s freshness window. The returned string MUST be unique
+    /// per envelope (the signature bytes are a natural choice — they bind
+    /// payload + timestamp + security_token via Ed25519 over the canonical
+    /// message). Callers consult a nonce store keyed by this value.
+    fn replay_nonce(&self) -> String;
 }
 
 /// Aggregate root for the SEAL session lifecycle (BC-12, ADR-035).

@@ -31,7 +31,9 @@ impl PostgresWindowEnforcer {
 
     fn scope_parts(scope: &RateLimitScope) -> (&str, String) {
         match scope {
-            RateLimitScope::User { user_id } => ("user", user_id.clone()),
+            RateLimitScope::User { tenant_id, user_id } => {
+                ("user", format!("{}:{}", tenant_id.as_str(), user_id))
+            }
             RateLimitScope::Tenant { tenant_id } => ("tenant", tenant_id.as_str().to_owned()),
         }
     }
