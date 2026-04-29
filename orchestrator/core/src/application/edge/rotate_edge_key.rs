@@ -198,7 +198,16 @@ async fn mint_node_security_token(
         .map_err(|e| anyhow!("transit_sign: {e}"))?;
     let sig_b64 = super::transit::parse_vault_signature(&raw)
         .map_err(|e| anyhow!("transit_sign parse: {e}"))?;
-    let sig_bytes = base64::engine::general_purpose::STANDARD.decode(sig_b64)?;
+    // Vault transit's documented signature format is standard base64.
+    // We decode it and re-encode as URL_SAFE_NO_PAD for the JWT signature
+    // segment. We tolerate URL_SAFE_NO_PAD on input as a forward-compat
+    // fallback in case a future transit version standardises on it.
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64))
+        .map_err(|e| {
+            anyhow!("decode transit signature (tried STANDARD and URL_SAFE_NO_PAD): {e}")
+        })?;
     let s = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes);
     Ok(format!("{signing_input}.{s}"))
 }
@@ -395,6 +404,161 @@ mod tests {
         let resp = svc.rotate(req).await.expect("same-key rotate must succeed");
         assert!(!resp.node_security_token.is_empty());
         assert!(resp.expires_at.is_some());
+    }
+
+    /// Stub that signs with a deterministic ed25519 keypair and re-encodes the
+    /// signature with the chosen base64 alphabet, wrapped as `vault:v1:...`.
+    ///
+    /// Used to verify the defensive STANDARD-then-URL_SAFE_NO_PAD decode path
+    /// in `mint_node_security_token`.
+    enum B64Alphabet {
+        Standard,
+        UrlSafeNoPad,
+    }
+    struct ConfigurableB64SecretStore {
+        alphabet: B64Alphabet,
+    }
+    #[async_trait]
+    impl SecretStore for ConfigurableB64SecretStore {
+        async fn read(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<HashMap<String, crate::domain::secrets::SensitiveString>, SecretsError>
+        {
+            Ok(HashMap::new())
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &str,
+            _: HashMap<String, crate::domain::secrets::SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::domain::secrets::DomainDynamicSecret, SecretsError> {
+            unimplemented!()
+        }
+        async fn renew_lease(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<std::time::Duration, SecretsError> {
+            Ok(std::time::Duration::from_secs(0))
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn transit_sign(&self, _: &str, data: &[u8]) -> Result<String, SecretsError> {
+            // Use raw input bytes as the "signature" — same trick as
+            // StubSecretStore. The point is to compare alphabets, not
+            // verify a real signature.
+            let encoded = match self.alphabet {
+                B64Alphabet::Standard => base64::engine::general_purpose::STANDARD.encode(data),
+                B64Alphabet::UrlSafeNoPad => {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+                }
+            };
+            Ok(format!("vault:v1:{encoded}"))
+        }
+        async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+            Ok(true)
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(String::new())
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Regression: ADR-117 audit pass 3 SEV-2-D — `mint_node_security_token`
+    /// must accept BOTH standard base64 (Vault's documented format) and
+    /// URL-safe-no-pad (forward-compat hedge) on the wire. Prior code did
+    /// `STANDARD.decode(...).?` and would have panicked / errored if a
+    /// future Vault version returned URL-safe input.
+    #[tokio::test]
+    async fn rotate_accepts_either_base64_alphabet_from_transit() {
+        use rand_core::OsRng;
+        let mut rng = OsRng;
+
+        // Standard alphabet: the "current Vault" path.
+        let signing_key_a = SigningKey::generate(&mut rng);
+        let node_id_a = NodeId(uuid::Uuid::new_v4());
+        let repo_a = Arc::new(StubRepo::default());
+        repo_a
+            .upsert(&EdgeDaemon {
+                node_id: node_id_a,
+                tenant_id: TenantId::new("t-test").unwrap(),
+                public_key: signing_key_a.verifying_key().to_bytes().to_vec(),
+                capabilities: EdgeCapabilities::default(),
+                status: NodePeerStatus::Active,
+                connection: EdgeConnectionState::Disconnected {
+                    since: chrono::Utc::now(),
+                },
+                last_heartbeat_at: None,
+                enrolled_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let svc_a = RotateEdgeKeyService::with_default_ttl(
+            repo_a,
+            Arc::new(ConfigurableB64SecretStore {
+                alphabet: B64Alphabet::Standard,
+            }),
+            "transit/keys/test".to_string(),
+        );
+        let resp_a = svc_a
+            .rotate(build_request(&signing_key_a, &signing_key_a, &node_id_a))
+            .await
+            .expect("STANDARD-base64 transit output must round-trip");
+
+        // URL-safe-no-pad alphabet: the forward-compat hedge.
+        let signing_key_b = SigningKey::generate(&mut rng);
+        let node_id_b = NodeId(uuid::Uuid::new_v4());
+        let repo_b = Arc::new(StubRepo::default());
+        repo_b
+            .upsert(&EdgeDaemon {
+                node_id: node_id_b,
+                tenant_id: TenantId::new("t-test").unwrap(),
+                public_key: signing_key_b.verifying_key().to_bytes().to_vec(),
+                capabilities: EdgeCapabilities::default(),
+                status: NodePeerStatus::Active,
+                connection: EdgeConnectionState::Disconnected {
+                    since: chrono::Utc::now(),
+                },
+                last_heartbeat_at: None,
+                enrolled_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let svc_b = RotateEdgeKeyService::with_default_ttl(
+            repo_b,
+            Arc::new(ConfigurableB64SecretStore {
+                alphabet: B64Alphabet::UrlSafeNoPad,
+            }),
+            "transit/keys/test".to_string(),
+        );
+        let resp_b = svc_b
+            .rotate(build_request(&signing_key_b, &signing_key_b, &node_id_b))
+            .await
+            .expect("URL_SAFE_NO_PAD-base64 transit output must round-trip");
+
+        // Both tokens must be well-formed three-segment JWTs whose third
+        // segment is URL-safe-no-pad base64 of the same bytes (i.e., the
+        // signing input itself, per the stub).
+        for token in [&resp_a.node_security_token, &resp_b.node_security_token] {
+            let parts: Vec<&str> = token.split('.').collect();
+            assert_eq!(parts.len(), 3, "JWT must have 3 segments");
+            // The signature segment must decode under URL_SAFE_NO_PAD.
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[2])
+                .expect("JWT sig segment must be URL_SAFE_NO_PAD base64");
+        }
     }
 
     /// Stub that returns a caller-controlled malformed transit_sign payload.

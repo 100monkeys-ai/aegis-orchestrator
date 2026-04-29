@@ -109,10 +109,18 @@ impl IssueEnrollmentToken {
             .map_err(|e| anyhow::anyhow!("transit_sign failed: {e}"))?;
         let sig_b64 = super::transit::parse_vault_signature(&raw_sig)
             .map_err(|e| anyhow::anyhow!("transit_sign parse: {e}"))?;
-        // OpenBao returns standard base64; convert to URL-safe-no-pad for JWT.
+        // Vault transit's documented signature format is standard base64.
+        // We decode it and re-encode as URL_SAFE_NO_PAD for the JWT signature
+        // segment. We tolerate URL_SAFE_NO_PAD on input as a forward-compat
+        // fallback in case a future transit version standardises on it.
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(sig_b64)
-            .map_err(|e| anyhow::anyhow!("decode transit signature: {e}"))?;
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "decode transit signature (tried STANDARD and URL_SAFE_NO_PAD): {e}"
+                )
+            })?;
         let s_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
         let token = format!("{signing_input}.{s_b64}");
 
