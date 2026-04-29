@@ -88,6 +88,8 @@ fn make_token_claims(exp_offset_secs: i64) -> NodeTokenClaims {
         capabilities_hash: "abc123".to_string(),
         iat: now,
         exp: now + exp_offset_secs,
+        tid: None,
+        cep: None,
     }
 }
 

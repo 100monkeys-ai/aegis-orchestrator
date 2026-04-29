@@ -86,6 +86,8 @@ impl ChallengeNodeUseCase {
             capabilities_hash: challenge.capabilities.hash(),
             iat,
             exp,
+            tid: None,
+            cep: None,
         };
 
         // Construct JWT header and payload
