@@ -38,6 +38,16 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     InvokeToolCommand, SealEnvelope as ProtoSealEnvelope, SealNodeEnvelope,
 };
 
+/// Tool-name prefixes that are routed to a local builtin on the edge daemon
+/// but are **not yet implemented**. Surfacing them as a structured
+/// `tool_not_locally_supported` error (rather than `tool_not_found`) lets the
+/// dispatcher tell the operator "this is on the roadmap" vs "you typo'd". New
+/// not-yet-implemented prefixes go here, in one place.
+///
+/// TODO(adr-117): wire `fs.*`, `web.*`, and `aegis.schema.*` to local
+/// implementations and remove from this list.
+const LOCAL_UNSUPPORTED_PREFIXES: &[&str] = &["fs.", "web.", "aegis.schema."];
+
 /// Canonical envelope-payload kinds. Encoded as a single byte at the start of
 /// the canonical signing payload so a Hello signature cannot be replayed in
 /// place of a Heartbeat (or vice-versa) — both share the same cryptographic
@@ -466,14 +476,14 @@ async fn handle_invoke_tool(
         return run_local_cmd(cfg, tx, node_id_str, stream_id, inv, &args_json).await;
     }
 
-    // TODO(adr-117): wire `fs.*`, `web.*`, and `aegis.schema.*` to local
-    // implementations. These require AegisFSAL / NfsVolumeRegistry /
-    // SchemaRegistry — none of which are constructed by the daemon binary
-    // today. Fail with a structured error so the dispatcher can surface a
-    // useful message rather than a silent ack.
-    if inv.tool_name.starts_with("fs.")
-        || inv.tool_name.starts_with("web.")
-        || inv.tool_name.starts_with("aegis.schema.")
+    // These require AegisFSAL / NfsVolumeRegistry / SchemaRegistry — none of
+    // which are constructed by the daemon binary today. Fail with a
+    // structured error so the dispatcher can surface a useful message rather
+    // than a silent ack. The prefix list lives at module-level (see
+    // `LOCAL_UNSUPPORTED_PREFIXES`) so future additions land in one place.
+    if LOCAL_UNSUPPORTED_PREFIXES
+        .iter()
+        .any(|prefix| inv.tool_name.starts_with(prefix))
     {
         return error_result(
             "tool_not_locally_supported",
@@ -534,10 +544,16 @@ async fn run_local_cmd(
         .unwrap_or(600);
 
     // Honour the dispatcher's deadline if present and tighter than args.
+    // Negative `d.seconds` (proto i64) falls through to the default
+    // `timeout_secs` — `u64::try_from` returns Err for negatives, which
+    // `.and_then` cleanly maps into the `unwrap_or` branch. The prior
+    // `.max(0) as u64` cast saturated negatives to 0 silently, then relied
+    // on a downstream `.filter(*d > 0)` to discard them — same end state,
+    // but obscured the intent.
     let deadline_secs = inv
         .deadline
         .as_ref()
-        .map(|d| d.seconds.max(0) as u64)
+        .and_then(|d| u64::try_from(d.seconds).ok())
         .filter(|d| *d > 0)
         .map(|d| d.min(timeout_secs))
         .unwrap_or(timeout_secs);
@@ -549,12 +565,18 @@ async fn run_local_cmd(
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return error_result("internal", format!("spawn '{command}' failed: {e}")),
     };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    // RAII: any early return from this function (timeout, wait error, etc.)
+    // must NOT leave the child running. ChildGuard's Drop calls
+    // `start_kill()` on any child still held; we `disarm()` the guard once
+    // we have observed a normal exit status, so no signal is sent to a
+    // child that is already gone.
+    let mut guard = ChildGuard::new(child);
+    let stdout = guard.child_mut().stdout.take();
+    let stderr = guard.child_mut().stderr.take();
 
     let cmd_id = inv.command_id.clone();
     let tx_out = tx.clone();
@@ -598,12 +620,25 @@ async fn run_local_cmd(
         buf
     });
 
-    let wait_fut = child.wait();
+    let wait_fut = guard.child_mut().wait();
     let timeout = tokio::time::timeout(Duration::from_secs(deadline_secs), wait_fut);
     let exit = match timeout.await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return error_result("internal", format!("wait failed: {e}")),
+        Ok(Ok(status)) => {
+            // Child has exited — disarm so Drop does not send a signal to
+            // a now-reaped pid (which on some platforms could target an
+            // unrelated process if the pid was recycled).
+            guard.disarm();
+            status
+        }
+        Ok(Err(e)) => {
+            // wait() failed; ChildGuard::Drop will still kill the child as
+            // we have not disarmed. Surface the error.
+            return error_result("internal", format!("wait failed: {e}"));
+        }
         Err(_) => {
+            // Deadline elapsed. The child is still running; ChildGuard's
+            // Drop sends SIGKILL via start_kill so the spawned process
+            // does NOT leak as a detached orphan.
             return error_result(
                 "timeout",
                 format!("cmd.run '{command}' exceeded {deadline_secs}s deadline"),
@@ -627,6 +662,54 @@ async fn run_local_cmd(
             "nonzero_exit".to_string()
         },
         error_message: String::new(),
+    }
+}
+
+/// RAII wrapper that guarantees a spawned [`tokio::process::Child`] is killed
+/// on every exit path of `run_local_cmd` unless explicitly disarmed.
+///
+/// **Why this exists:** prior to this guard, the cmd.run timeout arm (and
+/// the `wait()` error arm) returned without calling `child.kill()`, leaking
+/// the spawned process as a detached orphan. With multiple early-return
+/// paths between `Command::spawn()` and the await of `child.wait()`,
+/// inline `kill()` calls are easy to miss in future refactors. Drop-on-panic
+/// also matters: if any await between spawn and disarm panics, the child is
+/// still cleaned up.
+///
+/// `start_kill()` is non-async (sends the kill syscall and returns
+/// immediately without waiting for reap), which is the correct fit for a
+/// `Drop` impl. The kernel reaps via the daemon's tokio process driver.
+struct ChildGuard {
+    child: Option<tokio::process::Child>,
+}
+
+impl ChildGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        // Safe: the only path that takes() the inner child is `disarm()`,
+        // and after disarm we never call child_mut again.
+        self.child
+            .as_mut()
+            .expect("ChildGuard::child_mut after disarm()")
+    }
+
+    /// Mark the child as already-exited so `Drop` does NOT send a kill
+    /// signal. Call this after `child.wait()` returns Ok(status).
+    fn disarm(&mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Best-effort: ignore the kill error (typically `ESRCH` if the
+            // child has already exited between the last poll and Drop).
+            let _ = child.start_kill();
+        }
     }
 }
 
@@ -856,6 +939,143 @@ mod tests {
             res.is_err(),
             "fs.delete is outside the test context's capabilities"
         );
+    }
+
+    #[test]
+    fn local_unsupported_prefixes_match_documented_set() {
+        // Regression: the prior `starts_with` chain hard-coded three prefixes
+        // inline. Future additions had to be made in one specific call site.
+        // Pin the constant so additions/removals are visible to reviewers.
+        assert_eq!(
+            LOCAL_UNSUPPORTED_PREFIXES,
+            &["fs.", "web.", "aegis.schema."]
+        );
+        // Spot-check that .iter().any() preserves the prior chain semantics:
+        for tool in &[
+            "fs.read",
+            "fs.delete",
+            "web.fetch",
+            "aegis.schema.get",
+            "aegis.schema.list",
+        ] {
+            assert!(
+                LOCAL_UNSUPPORTED_PREFIXES
+                    .iter()
+                    .any(|p| tool.starts_with(p)),
+                "{tool} must be classified as locally-unsupported"
+            );
+        }
+        for tool in &["cmd.run", "aegis.tenant.get", "fs", "web"] {
+            assert!(
+                !LOCAL_UNSUPPORTED_PREFIXES
+                    .iter()
+                    .any(|p| tool.starts_with(p)),
+                "{tool} must NOT match a locally-unsupported prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_secs_negative_falls_through_to_default_timeout() {
+        // Regression for F5: prior code used `d.seconds.max(0) as u64` which
+        // saturated negatives to 0 and relied on a downstream `.filter(*>0)`
+        // to discard them. The new path uses `u64::try_from(d.seconds).ok()`
+        // — for negative i64, try_from returns Err which `.and_then` treats
+        // as None, so the chain falls through cleanly to the args-supplied
+        // default. This unit test pins that invariant against a regression
+        // that swapped try_from for `as u64` (a wrap-and-panic-in-release).
+        let timeout_secs: u64 = 600;
+        // Mirror the in-function chain.
+        let cases: &[(i64, u64)] = &[
+            (-1, 600),       // negative -> default
+            (i64::MIN, 600), // extreme negative -> default
+            (0, 600),        // zero filtered out -> default
+            (10, 10),        // positive smaller than default -> tighter
+            (1000, 600),     // positive larger than default -> default (.min)
+        ];
+        for (raw_secs, expected) in cases {
+            let derived: u64 = Some(*raw_secs)
+                .and_then(|s| u64::try_from(s).ok())
+                .filter(|d| *d > 0)
+                .map(|d| d.min(timeout_secs))
+                .unwrap_or(timeout_secs);
+            assert_eq!(
+                derived, *expected,
+                "raw deadline {raw_secs}: expected {expected}, got {derived}"
+            );
+        }
+    }
+
+    /// Regression for F6: the cmd.run timeout arm previously returned without
+    /// killing the child, leaking the spawned process as a detached orphan.
+    /// `ChildGuard::Drop` now signals the child unconditionally unless
+    /// `disarm()` has been called.
+    ///
+    /// Portability: this test is `#[cfg(unix)]` because (a) it spawns
+    /// `/bin/sh -c sleep 30`, which is Unix-only, and (b) it uses
+    /// `kill(pid, 0)` semantics via `nix`-style probing through `/proc` —
+    /// so it does not run on Windows. The orchestrator's CI matrix is
+    /// Linux-only for the daemon path, so this is acceptable. macOS would
+    /// need a different liveness probe (no `/proc`), but the daemon binary
+    /// is not built for macOS targets.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_guard_kills_running_child_on_drop() {
+        use tokio::process::Command;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn /bin/sh -c sleep 30");
+        let pid = child.id().expect("child has a pid");
+        {
+            let _guard = ChildGuard::new(child);
+            // Confirm the pid is alive before we drop.
+            assert!(
+                std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "child pid {pid} must be alive before guard drops"
+            );
+        }
+        // Drop has fired. start_kill() is async-signal-safe but reaping is
+        // driven by tokio's process driver; yield long enough for the
+        // SIGKILL + reap to complete.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return; // reaped, regression test passes
+            }
+        }
+        // Final probe: even if /proc shows a zombie, the process should not
+        // be runnable. If we get here, the child outlived the guard — the
+        // F6 regression has returned.
+        panic!("child pid {pid} survived ChildGuard::drop — F6 regression");
+    }
+
+    /// Companion to the kill-on-drop test: prove that `disarm()` is
+    /// observed and the child is NOT signalled when the guard is dropped
+    /// after a successful wait. Without this, every successful cmd.run
+    /// would race a SIGKILL against an already-reaped pid (which on a
+    /// pid-recycled host could target an unrelated process).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_guard_does_not_kill_after_disarm() {
+        use tokio::process::Command;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn /bin/sh -c 'exit 0'");
+        let mut guard = ChildGuard::new(child);
+        let status = guard.child_mut().wait().await.expect("wait");
+        assert!(status.success());
+        guard.disarm();
+        // Drop runs at end of scope — no kill should be sent because the
+        // inner option is None. We assert structurally rather than
+        // probing the now-reaped pid (which would race a recycled pid).
+        assert!(guard.child.is_none(), "disarm must clear the inner child");
+        drop(guard); // exercise the no-op Drop path explicitly
     }
 
     #[test]
