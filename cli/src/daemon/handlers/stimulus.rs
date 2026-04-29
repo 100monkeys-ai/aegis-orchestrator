@@ -49,6 +49,77 @@ pub(crate) struct IngestStimulusBody {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Maximum allowed clock skew between the Stripe webhook timestamp and our clock.
+/// Matches Stripe's recommended 5-minute tolerance (see Finding 4.12).
+pub(crate) const STRIPE_SIGNATURE_TOLERANCE_SECS: i64 = 300;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StripeSigError {
+    /// Header missing required `t=` or `v1=` components, or t was not a valid integer.
+    Malformed,
+    /// HMAC could not be initialised with the provided secret.
+    InvalidSecret,
+    /// `|now - t| > STRIPE_SIGNATURE_TOLERANCE_SECS` — replay window exceeded.
+    OutsideTolerance,
+    /// Constant-time signature comparison failed.
+    Mismatch,
+}
+
+/// Verify a Stripe webhook signature header against `body` using `secret`.
+///
+/// Implements Stripe's `Stripe-Signature` scheme:
+///   `t=<unix-ts>,v1=<hex-hmac>`  — HMAC-SHA256 over `"<t>.<body>"`.
+///
+/// Hardening applied here (Findings 4.12 / 4.32):
+/// 1. Signature compare uses [`subtle::ConstantTimeEq`] (no timing oracle).
+/// 2. Timestamp must be within [`STRIPE_SIGNATURE_TOLERANCE_SECS`] of `now_unix`
+///    (replay protection).
+pub(crate) fn verify_stripe_signature(
+    header: &str,
+    body: &[u8],
+    secret: &str,
+    now_unix: i64,
+) -> Result<(), StripeSigError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use subtle::ConstantTimeEq;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut timestamp = "";
+    let mut sig_v1 = "";
+    for part in header.split(',') {
+        if let Some(t) = part.strip_prefix("t=") {
+            timestamp = t;
+        } else if let Some(v) = part.strip_prefix("v1=") {
+            sig_v1 = v;
+        }
+    }
+
+    if timestamp.is_empty() || sig_v1.is_empty() {
+        return Err(StripeSigError::Malformed);
+    }
+
+    let ts: i64 = timestamp.parse().map_err(|_| StripeSigError::Malformed)?;
+
+    if (now_unix - ts).abs() > STRIPE_SIGNATURE_TOLERANCE_SECS {
+        return Err(StripeSigError::OutsideTolerance);
+    }
+
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| StripeSigError::InvalidSecret)?;
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    let expected = hex::encode(mac.finalize().into_bytes());
+
+    // Constant-time compare on the hex bytes. Length mismatch yields ct_eq == 0.
+    if expected.as_bytes().ct_eq(sig_v1.as_bytes()).into() {
+        Ok(())
+    } else {
+        Err(StripeSigError::Mismatch)
+    }
+}
+
 fn axum_headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
@@ -210,52 +281,40 @@ pub(crate) async fn webhook_handler(
             }
         };
 
-        // Parse Stripe-Signature: t=TIMESTAMP,v1=SIGNATURE
-        let mut timestamp = "";
-        let mut sig_v1 = "";
-        for part in stripe_sig.split(',') {
-            if let Some(t) = part.strip_prefix("t=") {
-                timestamp = t;
-            } else if let Some(v) = part.strip_prefix("v1=") {
-                sig_v1 = v;
+        // Verify Stripe signature with constant-time compare and replay tolerance.
+        let now_unix = chrono::Utc::now().timestamp();
+        match verify_stripe_signature(&stripe_sig, &body_bytes, &webhook_secret, now_unix) {
+            Ok(()) => {}
+            Err(StripeSigError::Malformed) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Malformed Stripe-Signature header" })),
+                )
+                    .into_response();
             }
-        }
-
-        if timestamp.is_empty() || sig_v1.is_empty() {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "Malformed Stripe-Signature header" })),
-            )
-                .into_response();
-        }
-
-        // Compute expected signature: HMAC-SHA256(webhook_secret, "TIMESTAMP.BODY")
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        type HmacSha256 = Hmac<Sha256>;
-
-        let mut mac = match HmacSha256::new_from_slice(webhook_secret.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => {
+            Err(StripeSigError::InvalidSecret) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": "Invalid webhook secret" })),
                 )
                     .into_response();
             }
-        };
-        mac.update(timestamp.as_bytes());
-        mac.update(b".");
-        mac.update(&body_bytes);
-        let expected = hex::encode(mac.finalize().into_bytes());
-
-        if expected != sig_v1 {
-            warn!("Stripe webhook signature mismatch");
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "Invalid Stripe signature" })),
-            )
-                .into_response();
+            Err(StripeSigError::OutsideTolerance) => {
+                warn!("Stripe webhook timestamp outside tolerance window — possible replay");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Stripe signature timestamp outside tolerance" })),
+                )
+                    .into_response();
+            }
+            Err(StripeSigError::Mismatch) => {
+                warn!("Stripe webhook signature mismatch");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Invalid Stripe signature" })),
+                )
+                    .into_response();
+            }
         }
 
         // Signature verified — process Stripe event
@@ -329,5 +388,170 @@ pub(crate) async fn webhook_handler(
             let (status, body) = stimulus_error_response(e);
             (status, body).into_response()
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Regression tests — Findings 4.12 / 4.32 (security-audits/002 §4.12, §4.32)
+// ──────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod stripe_signature_tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    const SECRET: &str = "whsec_test_signing_key";
+
+    fn sign(ts: i64, body: &[u8], secret: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(ts.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        let v1 = hex::encode(mac.finalize().into_bytes());
+        format!("t={ts},v1={v1}")
+    }
+
+    /// A correctly-signed envelope inside the tolerance window must verify.
+    #[test]
+    fn valid_signature_inside_window_is_accepted() {
+        let now = 1_700_000_000;
+        let body = br#"{"type":"checkout.session.completed"}"#;
+        let header = sign(now, body, SECRET);
+        assert_eq!(verify_stripe_signature(&header, body, SECRET, now), Ok(()));
+    }
+
+    /// 4.12 regression: an envelope older than `STRIPE_SIGNATURE_TOLERANCE_SECS`
+    /// must be rejected even though the HMAC is still arithmetically valid.
+    /// Before the fix this returned Ok and enabled webhook replay.
+    #[test]
+    fn replay_outside_tolerance_window_is_rejected() {
+        let signed_at = 1_700_000_000;
+        let body = br#"{"type":"customer.subscription.updated"}"#;
+        let header = sign(signed_at, body, SECRET);
+        let now = signed_at + STRIPE_SIGNATURE_TOLERANCE_SECS + 1;
+        assert_eq!(
+            verify_stripe_signature(&header, body, SECRET, now),
+            Err(StripeSigError::OutsideTolerance)
+        );
+        let now_future = signed_at - STRIPE_SIGNATURE_TOLERANCE_SECS - 1;
+        assert_eq!(
+            verify_stripe_signature(&header, body, SECRET, now_future),
+            Err(StripeSigError::OutsideTolerance)
+        );
+    }
+
+    /// 4.12 regression: a captured (header, body) pair re-sent inside the
+    /// tolerance window verifies successfully (idempotency is the downstream
+    /// handler's responsibility); but **outside** the window it is rejected.
+    #[test]
+    fn replay_inside_window_verifies_outside_window_does_not() {
+        let signed_at = 1_700_000_000;
+        let body = br#"{"type":"checkout.session.completed","id":"evt_1"}"#;
+        let header = sign(signed_at, body, SECRET);
+
+        assert_eq!(
+            verify_stripe_signature(&header, body, SECRET, signed_at + 30),
+            Ok(())
+        );
+
+        assert_eq!(
+            verify_stripe_signature(&header, body, SECRET, signed_at + 600),
+            Err(StripeSigError::OutsideTolerance)
+        );
+    }
+
+    /// 4.12 regression: tampering with the body invalidates the signature even
+    /// when the original `(t, v1)` header is replayed inside the window.
+    #[test]
+    fn tampered_body_with_valid_old_signature_is_rejected() {
+        let signed_at = 1_700_000_000;
+        let original = br#"{"amount":1000}"#;
+        let header = sign(signed_at, original, SECRET);
+        let tampered = br#"{"amount":9999}"#;
+        assert_eq!(
+            verify_stripe_signature(&header, tampered, SECRET, signed_at),
+            Err(StripeSigError::Mismatch)
+        );
+    }
+
+    /// 4.32 regression: a signature differing by a single trailing character
+    /// must be rejected. Constant-time compare handles this; this test pins
+    /// behaviour against a tampered v1.
+    #[test]
+    fn tampered_signature_is_rejected_constant_time() {
+        let signed_at = 1_700_000_000;
+        let body = b"payload";
+        let valid = sign(signed_at, body, SECRET);
+        let mut bytes: Vec<u8> = valid.into_bytes();
+        let last = bytes.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            verify_stripe_signature(&tampered, body, SECRET, signed_at),
+            Err(StripeSigError::Mismatch)
+        );
+    }
+
+    /// 4.32 regression: signatures of the wrong length must be rejected
+    /// (and must not panic in the constant-time compare).
+    #[test]
+    fn wrong_length_signature_is_rejected() {
+        let signed_at = 1_700_000_000;
+        let body = b"payload";
+        let header_short = format!("t={signed_at},v1=deadbeef");
+        let header_long = format!("t={signed_at},v1={}", "a".repeat(128));
+        assert_eq!(
+            verify_stripe_signature(&header_short, body, SECRET, signed_at),
+            Err(StripeSigError::Mismatch)
+        );
+        assert_eq!(
+            verify_stripe_signature(&header_long, body, SECRET, signed_at),
+            Err(StripeSigError::Mismatch)
+        );
+    }
+
+    /// Malformed headers (no `t=`, no `v1=`, non-numeric `t=`) are rejected
+    /// without crashing.
+    #[test]
+    fn malformed_header_is_rejected() {
+        let body = b"payload";
+        assert_eq!(
+            verify_stripe_signature("v1=deadbeef", body, SECRET, 0),
+            Err(StripeSigError::Malformed)
+        );
+        assert_eq!(
+            verify_stripe_signature("t=1700000000", body, SECRET, 1_700_000_000),
+            Err(StripeSigError::Malformed)
+        );
+        assert_eq!(
+            verify_stripe_signature("t=not-a-number,v1=deadbeef", body, SECRET, 0),
+            Err(StripeSigError::Malformed)
+        );
+    }
+
+    /// 4.32 CI gate: the Stripe verification path MUST NOT use raw `==` / `!=`
+    /// on signature byte sequences. Grep our own source as a guard against
+    /// future regressions.
+    #[test]
+    fn no_raw_eq_compare_in_stripe_verify_path() {
+        let src = include_str!("stimulus.rs");
+        let fn_start = src
+            .find("pub(crate) fn verify_stripe_signature")
+            .expect("verify_stripe_signature must exist");
+        let fn_body = &src[fn_start..];
+        let fn_end = fn_body
+            .find("\nfn axum_headers_to_map")
+            .or_else(|| fn_body.find("\n}\n\nfn "))
+            .unwrap_or(fn_body.len());
+        let fn_body = &fn_body[..fn_end];
+        assert!(
+            fn_body.contains("ct_eq("),
+            "verify_stripe_signature must use ConstantTimeEq::ct_eq for signature compare"
+        );
+        assert!(
+            !fn_body.contains("expected != sig_v1") && !fn_body.contains("expected == sig_v1"),
+            "verify_stripe_signature must NOT use raw == / != on signature bytes"
+        );
     }
 }
