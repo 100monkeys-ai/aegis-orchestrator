@@ -46,7 +46,7 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 axum.workspace = true
 tower.workspace = true
-tokio-stream = "0.1.18"
+tokio-stream = { version = "0.1.18", features = ["net"] }
 tokio-util = "0.7"
 tower-http.workspace = true
 hostname = "0.4"

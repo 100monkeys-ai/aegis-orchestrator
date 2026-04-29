@@ -3164,9 +3164,11 @@ mod gateway_timeout_regression {
         InvokeCliResponse, InvokeWorkflowRequest as PbInvokeWorkflowRequest,
         InvokeWorkflowResponse, ListToolsRequest as PbListToolsRequest, ListToolsResponse,
     };
-    use std::net::{SocketAddr, TcpListener as StdTcpListener};
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
 
     /// Stub SEAL gateway whose `list_tools` blocks forever; all other RPCs
     /// likewise hang. Used to simulate the production hang condition.
@@ -3244,25 +3246,30 @@ mod gateway_timeout_regression {
     where
         S: GrpcGatewayInvocationService,
     {
-        // Use a std listener to discover a free port, then drop it and bind
-        // tonic to that address. (Avoids needing tokio-stream/net features.)
-        let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
-        drop(std_listener);
+        // Bind a tokio listener once and hand it to tonic via
+        // `serve_with_incoming_shutdown`. This eliminates the drop-then-rebind
+        // window that allowed another process to claim the port and made the
+        // helper flaky under parallel test execution.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
         let url = format!("http://{addr}");
 
         let (tx, rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
+            let incoming = TcpListenerStream::new(listener);
             let _ = tonic::transport::Server::builder()
                 .add_service(GatewayInvocationServiceServer::new(svc))
-                .serve_with_shutdown(addr, async {
+                .serve_with_incoming_shutdown(incoming, async {
                     let _ = rx.await;
                 })
                 .await;
         });
 
         // Wait briefly for the server to be ready to accept connections.
+        // With TcpListenerStream the kernel accept queue is open as soon as
+        // `bind` returns, so this is effectively immediate — but we keep the
+        // assertion as an explicit readiness gate.
         let mut ready = false;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
