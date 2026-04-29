@@ -301,13 +301,47 @@ pub(super) fn html_to_markdown_or_fallback(html: &str) -> (String, &'static str)
     if html.trim().is_empty() {
         return (html.to_string(), "html");
     }
-    let markdown = html2md::parse_html(html);
+    let cleaned = strip_non_visible_tags(html);
+    let markdown = html2md::parse_html(&cleaned);
     if markdown.trim().is_empty() {
         warn!("HTML to Markdown conversion produced empty output; returning original HTML content");
         (html.to_string(), "html")
     } else {
         (markdown, "markdown")
     }
+}
+
+/// Strip `<script>` and `<style>` blocks (and their contents) from an HTML
+/// string before markdown conversion. Recent versions of the `html2md` crate
+/// will otherwise extract the raw JS/CSS body verbatim, polluting the
+/// extracted markdown with code that was never visible to a human reader.
+///
+/// We also strip HTML comments because `html2md` occasionally emits them
+/// inline and they are never useful in extracted-content contexts.
+///
+/// This is intentionally a regex-based pass rather than a full HTML parse:
+/// the orchestrator does not pull in `scraper`/`html5ever` and the fetch
+/// path is already lossy (we ultimately hand the result to `html2md`).
+/// `(?is)` enables case-insensitive matching with `.` matching newlines,
+/// which is required to span multi-line script/style bodies.
+fn strip_non_visible_tags(html: &str) -> String {
+    use std::sync::OnceLock;
+    static SCRIPT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static STYLE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static COMMENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+    let script = SCRIPT_RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)<script\b[^>]*>.*?</script\s*>").expect("static regex compiles")
+    });
+    let style = STYLE_RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)<style\b[^>]*>.*?</style\s*>").expect("static regex compiles")
+    });
+    let comment = COMMENT_RE
+        .get_or_init(|| regex::Regex::new(r"(?s)<!--.*?-->").expect("static regex compiles"));
+
+    let stage1 = script.replace_all(html, "");
+    let stage2 = style.replace_all(&stage1, "");
+    comment.replace_all(&stage2, "").into_owned()
 }
 
 #[cfg(test)]
@@ -644,16 +678,15 @@ mod tests {
             "valid HTML must produce non-empty markdown"
         );
 
-        // HTML that html2md collapses to empty (script-only). The fallback
-        // must preserve the original HTML and report content_format = "html".
+        // Script-only HTML must NOT leak its JS body into the extracted
+        // markdown. After stripping <script> blocks the body is empty, so
+        // the conversion collapses to empty and the fallback path triggers,
+        // preserving the original HTML and reporting content_format = "html".
         let script_only = "<script>var x = 1;</script>";
-        let html2md_output = html2md::parse_html(script_only);
-        // Sanity: confirm html2md actually emits empty for this input on the
-        // current dependency version. If this assertion ever fails the test
-        // becomes vacuous — adjust the script_only fixture.
+        let stripped = strip_non_visible_tags(script_only);
         assert!(
-            html2md_output.trim().is_empty(),
-            "fixture invariant: html2md is expected to produce empty markdown for script-only HTML; got {html2md_output:?}"
+            stripped.trim().is_empty(),
+            "strip_non_visible_tags must remove <script> blocks entirely; got {stripped:?}"
         );
         let (content, fmt) = html_to_markdown_or_fallback(script_only);
         assert_eq!(
@@ -663,6 +696,53 @@ mod tests {
         assert_eq!(
             content, script_only,
             "fallback must preserve the original HTML byte-for-byte"
+        );
+    }
+
+    /// Regression: the previous implementation handed raw HTML to
+    /// `html2md::parse_html`, which (on the current dependency version)
+    /// extracts `<script>` and `<style>` bodies verbatim. The fix strips
+    /// those tags before conversion so JS/CSS source never appears in the
+    /// extracted markdown — even when the surrounding page has visible
+    /// content that prevents the empty-output fallback from kicking in.
+    #[test]
+    fn web_fetch_html_to_markdown_strips_script_and_style_bodies() {
+        let html = "<style>.x { color: red; }</style>\
+                    <script>alert('pwn');var leaked = 1;</script>\
+                    <h1>Visible Title</h1><p>Visible body.</p>\
+                    <script>var more = 2;</script>";
+        let (content, fmt) = html_to_markdown_or_fallback(html);
+        assert_eq!(fmt, "markdown", "page has visible content → markdown");
+        assert!(
+            !content.contains("alert"),
+            "JS body must not leak into extracted markdown: {content}"
+        );
+        assert!(
+            !content.contains("var leaked"),
+            "JS variable declarations must not appear: {content}"
+        );
+        assert!(
+            !content.contains("var more"),
+            "trailing script bodies must also be stripped: {content}"
+        );
+        assert!(
+            !content.contains("color: red"),
+            "CSS rules must not leak into extracted markdown: {content}"
+        );
+        assert!(
+            content.contains("Visible Title"),
+            "visible content must survive the strip: {content}"
+        );
+    }
+
+    /// Regression: HTML comments must not leak into extracted markdown.
+    #[test]
+    fn web_fetch_html_to_markdown_strips_html_comments() {
+        let html = "<h1>Title</h1><!-- secret tracking pixel --><p>body</p>";
+        let (content, _fmt) = html_to_markdown_or_fallback(html);
+        assert!(
+            !content.contains("secret tracking pixel"),
+            "HTML comments must be stripped: {content}"
         );
     }
 

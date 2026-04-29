@@ -97,6 +97,17 @@ struct KeycloakClaims {
     extra: HashMap<String, serde_json::Value>,
 }
 
+/// TCP connect timeout (seconds) for JWKS fetches. A non-responsive
+/// Keycloak host (dropped SYNs, dead route) must surface as a
+/// `JwksFetchFailed` error within a few seconds rather than hanging the
+/// verify path until the kernel TCP timeout (~75s+) elapses.
+const JWKS_CONNECT_TIMEOUT_SECS: u64 = 5;
+
+/// Total request timeout (seconds) for JWKS fetches, covering the
+/// connect + TLS handshake + headers + body. JWKS payloads are tiny,
+/// so anything beyond this bound indicates a frozen peer.
+const JWKS_REQUEST_TIMEOUT_SECS: u64 = 8;
+
 /// Production implementation of [`IdentityProvider`].
 ///
 /// Validates JWTs against Keycloak realm JWKS endpoints with in-memory caching.
@@ -143,11 +154,25 @@ impl StandardIamService {
             realms.len()
         );
 
+        // JWKS fetches MUST have explicit timeouts. A naked
+        // `reqwest::Client::new()` inherits no implicit total/connect timeout,
+        // which means a non-responsive Keycloak host (dropped SYNs, dead
+        // route, frozen TLS handshake) hangs the verify path indefinitely
+        // and stalls every dependent request. The values here are tight
+        // enough that a hung peer surfaces as `JwksFetchFailed` within a
+        // few seconds and the (Err, None) arm of `get_jwks` propagates the
+        // underlying reqwest error to the caller.
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(JWKS_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(JWKS_REQUEST_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| IamError::Configuration(format!("build JWKS http client: {e}")))?;
+
         Ok(Self {
             realms,
             issuer_to_realm,
             jwks_cache: Arc::new(RwLock::new(HashMap::new())),
-            http_client: reqwest::Client::new(),
+            http_client,
             claims_config: config.claims.clone(),
             event_bus,
             cache_ttl: Duration::from_secs(config.jwks_cache_ttl_seconds),
