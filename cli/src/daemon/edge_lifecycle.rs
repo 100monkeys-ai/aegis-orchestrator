@@ -7,9 +7,10 @@
 //!   * Send `EdgeEvent::Hello` carrying capabilities + outer SealNodeEnvelope.
 //!   * Send periodic `Heartbeat` events.
 //!   * For each inbound `EdgeCommand::InvokeTool`:
-//!       * verify inner `SealEnvelope` locally (deferred — see TODO);
+//!       * verify inner `SealEnvelope` (token shape + consistency);
 //!       * resolve `security_context_name` against merged config;
-//!       * dispatch to local builtin / MCP server (deferred — see TODO);
+//!       * enforce SecurityContext via the domain `evaluate` policy;
+//!       * dispatch to local builtin (`cmd.run` runs locally via `tokio::process`);
 //!       * stream `CommandProgress`, terminate with `CommandResult`.
 //!   * On `Drain`: stop accepting new InvokeTool commands.
 //!   * On `Shutdown`: drain then exit.
@@ -17,6 +18,8 @@
 //! Reconnect uses the configured `stream_reconnect_backoff_secs` schedule.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
+use ed25519_dalek::{Signer, SigningKey};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,11 +29,83 @@ use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::domain::security_context::SecurityContext;
+use aegis_orchestrator_core::domain::shared_kernel::NodeId;
 use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     edge_command::Command as InCmd, edge_event::Event as OutEv,
-    node_cluster_service_client::NodeClusterServiceClient, CommandResultEvent, EdgeCapabilities,
-    EdgeEvent, EdgeResult, HeartbeatEvent, HelloEvent, SealNodeEnvelope,
+    node_cluster_service_client::NodeClusterServiceClient, CommandProgressEvent,
+    CommandResultEvent, EdgeCapabilities, EdgeEvent, EdgeResult, HeartbeatEvent, HelloEvent,
+    InvokeToolCommand, SealEnvelope as ProtoSealEnvelope, SealNodeEnvelope,
 };
+
+/// Canonical envelope-payload kinds. Encoded as a single byte at the start of
+/// the canonical signing payload so a Hello signature cannot be replayed in
+/// place of a Heartbeat (or vice-versa) — both share the same cryptographic
+/// key, so a per-message-kind tag prevents cross-kind substitution.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CanonicalKind {
+    Hello = 1,
+    Heartbeat = 2,
+    CommandResult = 3,
+    CommandProgress = 4,
+}
+
+/// Build the canonical bytes that go into `SealNodeEnvelope.payload` and that
+/// the daemon's Ed25519 key signs. Layout (all integers little-endian):
+///
+/// ```text
+///   u8  kind
+///   u64 timestamp_ms
+///   u32 node_id_len     u8[]  node_id_utf8
+///   u32 stream_id_len   u8[]  stream_id_utf8
+///   u32 inner_len       u8[]  inner_payload_bytes
+/// ```
+///
+/// The orchestrator-side `SealNodeVerifier::verify_envelope` (see
+/// `infrastructure/cluster/seal_node.rs`) verifies the Ed25519 signature
+/// directly over `envelope.payload`, so by setting the canonical bytes as
+/// the payload and signing them we produce envelopes that round-trip through
+/// the existing verifier with no orchestrator-side change.
+pub(crate) fn canonical_envelope_payload(
+    kind: CanonicalKind,
+    node_id: &str,
+    stream_id: &str,
+    timestamp_ms: i64,
+    inner: &[u8],
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(1 + 8 + 4 + node_id.len() + 4 + stream_id.len() + 4 + inner.len());
+    out.push(kind as u8);
+    out.extend_from_slice(&(timestamp_ms as u64).to_le_bytes());
+    out.extend_from_slice(&(node_id.len() as u32).to_le_bytes());
+    out.extend_from_slice(node_id.as_bytes());
+    out.extend_from_slice(&(stream_id.len() as u32).to_le_bytes());
+    out.extend_from_slice(stream_id.as_bytes());
+    out.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+    out.extend_from_slice(inner);
+    out
+}
+
+/// Produce a signed `SealNodeEnvelope` whose `payload` is the canonical
+/// signing bytes for the given message kind.
+pub(crate) fn signed_envelope(
+    signing_key: &SigningKey,
+    node_security_token: &str,
+    node_id: &str,
+    stream_id: &str,
+    kind: CanonicalKind,
+    inner: &[u8],
+) -> SealNodeEnvelope {
+    let ts = Utc::now().timestamp_millis();
+    let payload = canonical_envelope_payload(kind, node_id, stream_id, ts, inner);
+    let signature = signing_key.sign(&payload).to_bytes().to_vec();
+    SealNodeEnvelope {
+        node_security_token: node_security_token.to_string(),
+        signature,
+        payload,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EdgeLifecycleConfig {
@@ -40,9 +115,18 @@ pub struct EdgeLifecycleConfig {
     pub reconnect_backoff: Vec<Duration>,
     /// Persisted NodeSecurityToken (RS256 JWT) issued at enrollment time.
     pub node_security_token: String,
+    /// Stable UUID identifying this daemon (matches the `sub` claim on
+    /// `node_security_token`). Used in canonical envelope payloads.
+    pub node_id: NodeId,
+    /// Daemon's persisted Ed25519 signing key (raw 32-byte seed loaded by
+    /// `daemon::server` from the configured `node_keypair_path`).
+    pub signing_key: Arc<SigningKey>,
     /// Local capabilities snapshot — populated by the daemon binary from
     /// hardware probes plus operator-configured local_tools / mount_points.
     pub capabilities: EdgeCapabilities,
+    /// Resolved security contexts from the merged hierarchical config
+    /// (`spec.security_contexts`). Empty means default-deny for every tool.
+    pub security_contexts: Vec<SecurityContext>,
 }
 
 pub async fn run_edge_daemon(cfg: EdgeLifecycleConfig) -> Result<()> {
@@ -67,9 +151,7 @@ pub async fn run_edge_daemon(cfg: EdgeLifecycleConfig) -> Result<()> {
 }
 
 async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
-    // 1. Build the channel. TLS handshake configuration is out of scope for
-    //    v1; the daemon binary supplies a pre-validated endpoint and tonic
-    //    handles HTTP/2 over TLS automatically when the URI scheme is https.
+    // 1. Build the channel.
     let endpoint_uri = if cfg.controller_endpoint.starts_with("http://")
         || cfg.controller_endpoint.starts_with("https://")
     {
@@ -91,18 +173,18 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
 
     // 3. Send Hello first.
     let stream_id = Uuid::new_v4().to_string();
+    let node_id_str = cfg.node_id.0.to_string();
+    let hello_envelope = signed_envelope(
+        &cfg.signing_key,
+        &cfg.node_security_token,
+        &node_id_str,
+        &stream_id,
+        CanonicalKind::Hello,
+        &[],
+    );
     let hello = EdgeEvent {
         event: Some(OutEv::Hello(HelloEvent {
-            envelope: Some(SealNodeEnvelope {
-                node_security_token: cfg.node_security_token.clone(),
-                // TODO(adr-117): compute Ed25519 signature over the canonical
-                // payload using the daemon's persisted keypair. v1 wire flow
-                // works with the empty signature when the controller is
-                // configured for permissive edge attestation; production
-                // deployments must populate this.
-                signature: vec![],
-                payload: Vec::new(),
-            }),
+            envelope: Some(hello_envelope),
             capabilities: Some(cfg.capabilities.clone()),
             stream_id: stream_id.clone(),
             last_seen_command_id: None,
@@ -125,23 +207,29 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
         let tx = tx.clone();
         let interval = cfg.heartbeat_interval;
         let token = cfg.node_security_token.clone();
+        let signing_key = cfg.signing_key.clone();
         let drain = drain.clone();
+        let node_id_str = node_id_str.clone();
+        let stream_id_hb = stream_id.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip immediate first tick
             loop {
                 ticker.tick().await;
                 if drain.load(Ordering::SeqCst) {
-                    // stop heartbeating once the daemon is shutting down
                     break;
                 }
+                let envelope = signed_envelope(
+                    &signing_key,
+                    &token,
+                    &node_id_str,
+                    &stream_id_hb,
+                    CanonicalKind::Heartbeat,
+                    &[],
+                );
                 let hb = EdgeEvent {
                     event: Some(OutEv::Heartbeat(HeartbeatEvent {
-                        envelope: Some(SealNodeEnvelope {
-                            node_security_token: token.clone(),
-                            signature: vec![],
-                            payload: Vec::new(),
-                        }),
+                        envelope: Some(envelope),
                         active_invocations: 0,
                     })),
                 };
@@ -168,68 +256,22 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
                     tool = %inv.tool_name,
                     "edge: received InvokeTool"
                 );
-                // TODO(adr-117): full SecurityContext local enforcement —
-                // currently permissive, gated by enrollment-bound tenant
-                // only. The orchestrator already validated the
-                // security_context_name during dispatch; the daemon should
-                // re-resolve from its merged config once that helper is
-                // available.
-                // TODO(adr-117): wire local built-in dispatcher (cmd.run /
-                // fs.* per ADR-048). Until extracted from
-                // aegis_orchestrator_core::application::tools, the daemon
-                // returns a structured "not yet locally supported" result so
-                // the wire flow completes.
-                let result = EdgeResult {
-                    ok: false,
-                    exit_code: 0,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    structured_result: None,
-                    error_kind: "tool_not_found".to_string(),
-                    error_message: format!(
-                        "tool '{}' not yet locally dispatched on edge daemon",
-                        inv.tool_name
-                    ),
-                };
-                let ev = EdgeEvent {
-                    event: Some(OutEv::CommandResult(CommandResultEvent {
-                        envelope: Some(SealNodeEnvelope {
-                            node_security_token: cfg.node_security_token.clone(),
-                            signature: vec![],
-                            payload: Vec::new(),
-                        }),
-                        command_id: inv.command_id,
-                        result: Some(result),
-                    })),
-                };
-                let _ = tx.send(ev).await;
+                if drain.load(Ordering::SeqCst) {
+                    let result = error_result("draining", "edge daemon is draining");
+                    let _ =
+                        send_result(&tx, cfg, &node_id_str, &stream_id, &inv.command_id, result)
+                            .await;
+                    continue;
+                }
+                let cmd_id = inv.command_id.clone();
+                let result = handle_invoke_tool(cfg, &tx, &node_id_str, &stream_id, &inv).await;
+                let _ = send_result(&tx, cfg, &node_id_str, &stream_id, &cmd_id, result).await;
             }
             Some(InCmd::Cancel(c)) => {
                 tracing::info!(command_id = %c.command_id, "edge: received Cancel");
-                // No in-flight commands to cancel in the stub path; emit a
-                // synthetic result so the orchestrator-side pending registry
-                // unblocks.
-                let result = EdgeResult {
-                    ok: false,
-                    exit_code: 0,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    structured_result: None,
-                    error_kind: "cancelled".to_string(),
-                    error_message: "cancelled by operator".to_string(),
-                };
-                let ev = EdgeEvent {
-                    event: Some(OutEv::CommandResult(CommandResultEvent {
-                        envelope: Some(SealNodeEnvelope {
-                            node_security_token: cfg.node_security_token.clone(),
-                            signature: vec![],
-                            payload: Vec::new(),
-                        }),
-                        command_id: c.command_id,
-                        result: Some(result),
-                    })),
-                };
-                let _ = tx.send(ev).await;
+                let result = error_result("cancelled", "cancelled by operator");
+                let _ =
+                    send_result(&tx, cfg, &node_id_str, &stream_id, &c.command_id, result).await;
             }
             Some(InCmd::PushConfig(_)) => {
                 tracing::info!("edge: received PushConfig (ignored — local config persistence is daemon-binary owned)");
@@ -251,4 +293,576 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
 
     heartbeat_handle.abort();
     Ok(())
+}
+
+fn error_result(kind: &str, message: impl Into<String>) -> EdgeResult {
+    EdgeResult {
+        ok: false,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        structured_result: None,
+        error_kind: kind.to_string(),
+        error_message: message.into(),
+    }
+}
+
+async fn send_result(
+    tx: &mpsc::Sender<EdgeEvent>,
+    cfg: &EdgeLifecycleConfig,
+    node_id_str: &str,
+    stream_id: &str,
+    command_id: &str,
+    result: EdgeResult,
+) -> Result<()> {
+    let envelope = signed_envelope(
+        &cfg.signing_key,
+        &cfg.node_security_token,
+        node_id_str,
+        stream_id,
+        CanonicalKind::CommandResult,
+        command_id.as_bytes(),
+    );
+    let ev = EdgeEvent {
+        event: Some(OutEv::CommandResult(CommandResultEvent {
+            envelope: Some(envelope),
+            command_id: command_id.to_string(),
+            result: Some(result),
+        })),
+    };
+    tx.send(ev)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_result: {e}"))
+}
+
+/// Verify the inner proto `SealEnvelope` carried in an InvokeToolCommand.
+///
+/// What we verify locally on the edge:
+/// * `user_security_token` is non-empty and structurally a JWT (3 dot
+///   segments). Full RS256 signature verification requires fetching the
+///   originating realm's JWKS, which the edge daemon does not have a path
+///   to in v1 — see TODO below.
+/// * `tenant_id` is non-empty.
+/// * `security_context_name` matches the value on the outer
+///   `InvokeToolCommand` (consistency check — protects against a server-side
+///   bug substituting contexts in the inner envelope).
+fn verify_inner_envelope(envelope: &ProtoSealEnvelope, outer_scn: &str) -> Result<(), EdgeResult> {
+    if envelope.user_security_token.trim().is_empty() {
+        return Err(error_result(
+            "envelope_invalid",
+            "inner SealEnvelope missing user_security_token",
+        ));
+    }
+    let parts = envelope.user_security_token.split('.').count();
+    if parts != 3 {
+        return Err(error_result(
+            "envelope_invalid",
+            "inner user_security_token is not a JWT (expected 3 dot segments)",
+        ));
+    }
+    if envelope.tenant_id.trim().is_empty() {
+        return Err(error_result(
+            "envelope_invalid",
+            "inner SealEnvelope missing tenant_id",
+        ));
+    }
+    if envelope.security_context_name != outer_scn {
+        return Err(error_result(
+            "envelope_invalid",
+            format!(
+                "inner SealEnvelope security_context_name '{}' does not match outer '{}'",
+                envelope.security_context_name, outer_scn
+            ),
+        ));
+    }
+    // TODO(adr-117): verify the Ed25519 signature on the inner envelope
+    // against the originating principal's public key. Requires the daemon
+    // to reach the controller's IAM proxy / SealSession registry, which
+    // is not wired in v1. Until then we trust the outer SealNodeEnvelope
+    // (controller signed the InvokeToolCommand) plus the fields already
+    // checked above.
+    Ok(())
+}
+
+fn resolve_security_context<'a>(
+    contexts: &'a [SecurityContext],
+    name: &str,
+) -> Result<&'a SecurityContext, EdgeResult> {
+    contexts.iter().find(|c| c.name == name).ok_or_else(|| {
+        error_result(
+            "security_context_not_found",
+            format!("SecurityContext '{name}' not present in merged config"),
+        )
+    })
+}
+
+fn struct_to_json(args: Option<&prost_types::Struct>) -> serde_json::Value {
+    match args {
+        Some(s) => prost_struct_to_json(s),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in &s.fields {
+        map.insert(k.clone(), prost_value_to_json(v));
+    }
+    serde_json::Value::Object(map)
+}
+
+fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &v.kind {
+        Some(Kind::NullValue(_)) | None => serde_json::Value::Null,
+        Some(Kind::NumberValue(n)) => serde_json::Number::from_f64(*n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::StructValue(s)) => prost_struct_to_json(s),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(prost_value_to_json).collect())
+        }
+    }
+}
+
+async fn handle_invoke_tool(
+    cfg: &EdgeLifecycleConfig,
+    tx: &mpsc::Sender<EdgeEvent>,
+    node_id_str: &str,
+    stream_id: &str,
+    inv: &InvokeToolCommand,
+) -> EdgeResult {
+    // 1. Inner envelope verification.
+    let envelope = match &inv.seal_envelope {
+        Some(e) => e,
+        None => {
+            return error_result(
+                "envelope_invalid",
+                "InvokeToolCommand missing inner SealEnvelope",
+            );
+        }
+    };
+    if let Err(e) = verify_inner_envelope(envelope, &inv.security_context_name) {
+        return e;
+    }
+
+    // 2. Resolve SecurityContext from merged config.
+    let context = match resolve_security_context(&cfg.security_contexts, &inv.security_context_name)
+    {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    // 3. Apply policy (deny-list + capability evaluation against tool args).
+    let args_json = struct_to_json(inv.args.as_ref());
+    if let Err(violation) = context.evaluate(&inv.tool_name, &args_json) {
+        return error_result("policy_violation", format!("{violation:?}"));
+    }
+
+    // 4. Local builtin dispatch.
+    if inv.tool_name == "cmd.run" {
+        return run_local_cmd(cfg, tx, node_id_str, stream_id, inv, &args_json).await;
+    }
+
+    // TODO(adr-117): wire `fs.*`, `web.*`, and `aegis.schema.*` to local
+    // implementations. These require AegisFSAL / NfsVolumeRegistry /
+    // SchemaRegistry — none of which are constructed by the daemon binary
+    // today. Fail with a structured error so the dispatcher can surface a
+    // useful message rather than a silent ack.
+    if inv.tool_name.starts_with("fs.")
+        || inv.tool_name.starts_with("web.")
+        || inv.tool_name.starts_with("aegis.schema.")
+    {
+        return error_result(
+            "tool_not_locally_supported",
+            format!(
+                "builtin '{}' not yet implemented on edge daemon (TODO adr-117)",
+                inv.tool_name
+            ),
+        );
+    }
+
+    error_result(
+        "tool_not_found",
+        format!(
+            "tool '{}' is not a recognised local builtin on this edge daemon",
+            inv.tool_name
+        ),
+    )
+}
+
+async fn run_local_cmd(
+    cfg: &EdgeLifecycleConfig,
+    tx: &mpsc::Sender<EdgeEvent>,
+    node_id_str: &str,
+    stream_id: &str,
+    inv: &InvokeToolCommand,
+    args_json: &serde_json::Value,
+) -> EdgeResult {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let command = match args_json.get("command").and_then(|v| v.as_str()) {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => {
+            return error_result(
+                "envelope_invalid",
+                "cmd.run: missing required arg 'command'",
+            );
+        }
+    };
+    let extra_args: Vec<String> = args_json
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cwd = args_json
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let timeout_secs = args_json
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(600);
+
+    // Honour the dispatcher's deadline if present and tighter than args.
+    let deadline_secs = inv
+        .deadline
+        .as_ref()
+        .map(|d| d.seconds.max(0) as u64)
+        .filter(|d| *d > 0)
+        .map(|d| d.min(timeout_secs))
+        .unwrap_or(timeout_secs);
+
+    let mut cmd = Command::new(&command);
+    cmd.args(&extra_args)
+        .current_dir(&cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return error_result("internal", format!("spawn '{command}' failed: {e}")),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let cmd_id = inv.command_id.clone();
+    let tx_out = tx.clone();
+    let tx_err = tx.clone();
+    let parts_out = (
+        cfg.signing_key.clone(),
+        cfg.node_security_token.clone(),
+        node_id_str.to_string(),
+        stream_id.to_string(),
+        cmd_id.clone(),
+    );
+    let parts_err = parts_out.clone();
+
+    // Stream stdout and stderr concurrently so the orchestrator sees progress.
+    let stdout_task = tokio::spawn(async move {
+        let Some(s) = stdout else { return Vec::new() };
+        let mut reader = BufReader::new(s).lines();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut seq: u32 = 0;
+        while let Ok(Some(line)) = reader.next_line().await {
+            let mut chunk = line.into_bytes();
+            chunk.push(b'\n');
+            buf.extend_from_slice(&chunk);
+            send_progress_inline(&tx_out, &parts_out, seq, chunk, false).await;
+            seq += 1;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let Some(s) = stderr else { return Vec::new() };
+        let mut reader = BufReader::new(s).lines();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut seq: u32 = 0;
+        while let Ok(Some(line)) = reader.next_line().await {
+            let mut chunk = line.into_bytes();
+            chunk.push(b'\n');
+            buf.extend_from_slice(&chunk);
+            send_progress_inline(&tx_err, &parts_err, seq, chunk, true).await;
+            seq += 1;
+        }
+        buf
+    });
+
+    let wait_fut = child.wait();
+    let timeout = tokio::time::timeout(Duration::from_secs(deadline_secs), wait_fut);
+    let exit = match timeout.await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return error_result("internal", format!("wait failed: {e}")),
+        Err(_) => {
+            return error_result(
+                "timeout",
+                format!("cmd.run '{command}' exceeded {deadline_secs}s deadline"),
+            );
+        }
+    };
+
+    let stdout_bytes = stdout_task.await.unwrap_or_default();
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+
+    let code = exit.code().unwrap_or(-1);
+    EdgeResult {
+        ok: exit.success(),
+        exit_code: code,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        structured_result: None,
+        error_kind: if exit.success() {
+            String::new()
+        } else {
+            "nonzero_exit".to_string()
+        },
+        error_message: String::new(),
+    }
+}
+
+/// Inline variant of CommandProgress emission used inside the cmd.run streamers.
+async fn send_progress_inline(
+    tx: &mpsc::Sender<EdgeEvent>,
+    parts: &(Arc<SigningKey>, String, String, String, String),
+    sequence: u32,
+    chunk: Vec<u8>,
+    is_stderr: bool,
+) {
+    let (signing_key, token, node_id_str, stream_id, command_id) = parts;
+    let mut inner = Vec::with_capacity(command_id.len() + 4 + 1 + chunk.len());
+    inner.extend_from_slice(command_id.as_bytes());
+    inner.extend_from_slice(&sequence.to_le_bytes());
+    inner.push(is_stderr as u8);
+    inner.extend_from_slice(&chunk);
+    let envelope = signed_envelope(
+        signing_key,
+        token,
+        node_id_str,
+        stream_id,
+        CanonicalKind::CommandProgress,
+        &inner,
+    );
+    let ev = EdgeEvent {
+        event: Some(OutEv::CommandProgress(CommandProgressEvent {
+            envelope: Some(envelope),
+            command_id: command_id.clone(),
+            chunk,
+            sequence,
+            stderr: is_stderr,
+        })),
+    };
+    let _ = tx.send(ev).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::security_context::{Capability, SecurityContextMetadata};
+    use ed25519_dalek::{Verifier, VerifyingKey};
+
+    fn build_test_security_context(name: &str) -> SecurityContext {
+        SecurityContext {
+            name: name.to_string(),
+            description: "test".into(),
+            capabilities: vec![Capability {
+                tool_pattern: "cmd.run".to_string(),
+                path_allowlist: None,
+                command_allowlist: Some(vec!["/bin/echo".to_string(), "echo".to_string()]),
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                max_response_size: None,
+                rate_limit: None,
+                max_concurrent: None,
+            }],
+            deny_list: vec![],
+            metadata: SecurityContextMetadata {
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                version: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn canonical_payload_layout_is_deterministic_and_kind_tagged() {
+        let a = canonical_envelope_payload(CanonicalKind::Hello, "node-a", "stream-1", 42, b"x");
+        let b = canonical_envelope_payload(CanonicalKind::Hello, "node-a", "stream-1", 42, b"x");
+        assert_eq!(a, b, "canonical payload must be deterministic");
+        assert_ne!(
+            a,
+            canonical_envelope_payload(CanonicalKind::Heartbeat, "node-a", "stream-1", 42, b"x"),
+            "different kinds must produce different canonical bytes"
+        );
+        assert_eq!(a[0], CanonicalKind::Hello as u8);
+    }
+
+    #[test]
+    fn hello_envelope_signature_round_trips_through_verify() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key: VerifyingKey = signing_key.verifying_key();
+
+        let envelope = signed_envelope(
+            &signing_key,
+            "tok.tok.tok",
+            "node-uuid",
+            "stream-uuid",
+            CanonicalKind::Hello,
+            &[],
+        );
+
+        assert!(
+            !envelope.signature.is_empty(),
+            "Hello envelope must carry a non-empty signature"
+        );
+        assert_eq!(
+            envelope.signature.len(),
+            64,
+            "Ed25519 signatures are 64 bytes"
+        );
+
+        let sig =
+            ed25519_dalek::Signature::from_slice(&envelope.signature).expect("signature parses");
+        verifying_key
+            .verify(&envelope.payload, &sig)
+            .expect("daemon signature must verify against its own VerifyingKey");
+    }
+
+    #[test]
+    fn heartbeat_envelope_signature_round_trips_through_verify() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let verifying_key: VerifyingKey = signing_key.verifying_key();
+        let envelope = signed_envelope(
+            &signing_key,
+            "tok.tok.tok",
+            "node-uuid",
+            "stream-uuid",
+            CanonicalKind::Heartbeat,
+            &[],
+        );
+        let sig = ed25519_dalek::Signature::from_slice(&envelope.signature).unwrap();
+        verifying_key.verify(&envelope.payload, &sig).unwrap();
+    }
+
+    #[test]
+    fn command_result_envelope_binds_command_id_into_signed_payload() {
+        let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+        let verifying_key: VerifyingKey = signing_key.verifying_key();
+        let env_a = signed_envelope(
+            &signing_key,
+            "tok.tok.tok",
+            "node",
+            "stream",
+            CanonicalKind::CommandResult,
+            b"cmd-1",
+        );
+        let env_b = signed_envelope(
+            &signing_key,
+            "tok.tok.tok",
+            "node",
+            "stream",
+            CanonicalKind::CommandResult,
+            b"cmd-2",
+        );
+        assert_ne!(
+            env_a.payload, env_b.payload,
+            "different command_ids must produce different canonical payloads"
+        );
+        let sig_a = ed25519_dalek::Signature::from_slice(&env_a.signature).unwrap();
+        verifying_key
+            .verify(&env_a.payload, &sig_a)
+            .expect("env_a verifies");
+        let cross = verifying_key.verify(&env_b.payload, &sig_a);
+        assert!(
+            cross.is_err(),
+            "command_id is bound into the canonical payload — cross-verify must fail"
+        );
+    }
+
+    #[test]
+    fn verify_inner_envelope_rejects_missing_token() {
+        let env = ProtoSealEnvelope {
+            user_security_token: String::new(),
+            tenant_id: "t".into(),
+            security_context_name: "ctx".into(),
+            payload: None,
+            signature: vec![],
+        };
+        let err = verify_inner_envelope(&env, "ctx").unwrap_err();
+        assert_eq!(err.error_kind, "envelope_invalid");
+    }
+
+    #[test]
+    fn verify_inner_envelope_rejects_context_mismatch() {
+        // Regression for SEV-2-G: prior to the fix the daemon would
+        // ack-reply without checking the inner envelope at all.
+        let env = ProtoSealEnvelope {
+            user_security_token: "a.b.c".into(),
+            tenant_id: "t".into(),
+            security_context_name: "wrong".into(),
+            payload: None,
+            signature: vec![],
+        };
+        let err = verify_inner_envelope(&env, "expected").unwrap_err();
+        assert_eq!(err.error_kind, "envelope_invalid");
+        assert!(err.error_message.contains("security_context_name"));
+    }
+
+    #[test]
+    fn verify_inner_envelope_accepts_consistent_envelope() {
+        let env = ProtoSealEnvelope {
+            user_security_token: "a.b.c".into(),
+            tenant_id: "t".into(),
+            security_context_name: "ctx".into(),
+            payload: None,
+            signature: vec![],
+        };
+        verify_inner_envelope(&env, "ctx").expect("accept consistent envelope");
+    }
+
+    #[test]
+    fn resolve_security_context_returns_named_match() {
+        let ctxs = vec![build_test_security_context("zaru-free")];
+        let r = resolve_security_context(&ctxs, "zaru-free").unwrap();
+        assert_eq!(r.name, "zaru-free");
+    }
+
+    #[test]
+    fn resolve_security_context_missing_returns_structured_error() {
+        // Regression for SEV-2-G: missing context must now produce a
+        // structured `security_context_not_found` rather than a silent ack.
+        let ctxs = vec![build_test_security_context("zaru-free")];
+        let err = resolve_security_context(&ctxs, "missing").unwrap_err();
+        assert_eq!(err.error_kind, "security_context_not_found");
+    }
+
+    #[test]
+    fn policy_evaluation_rejects_disallowed_tool() {
+        // Regression for SEV-2-G: SecurityContext was not consulted at all
+        // before the fix. With enforcement in place, a tool outside the
+        // capability set must now produce `policy_violation`.
+        let ctx = build_test_security_context("ctx");
+        let res = ctx.evaluate("fs.delete", &serde_json::json!({}));
+        assert!(
+            res.is_err(),
+            "fs.delete is outside the test context's capabilities"
+        );
+    }
+
+    #[test]
+    fn policy_evaluation_accepts_permitted_tool_with_allowlisted_command() {
+        let ctx = build_test_security_context("ctx");
+        let args = serde_json::json!({"command": "/bin/echo", "args": ["hello"]});
+        ctx.evaluate("cmd.run", &args)
+            .expect("cmd.run with allowlisted /bin/echo must be permitted");
+    }
 }
