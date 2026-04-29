@@ -223,30 +223,25 @@ impl StandardIamService {
         }
 
         // Cache miss or expired — attempt refresh, fall back to stale keys on transient failure
-        match self.refresh_jwks(realm).await {
-            Ok(()) => {
-                let cache = self.jwks_cache.read().await;
-                cache
-                    .get(&realm.realm_slug)
-                    .map(|c| c.keys.clone())
-                    .ok_or_else(|| IamError::JwksFetchFailed {
-                        realm: realm.realm_slug.clone(),
-                        reason: "Cache empty after refresh".to_string(),
-                    })
+        let refresh_result = self.refresh_jwks(realm).await;
+        let cache = self.jwks_cache.read().await;
+        let cached = cache.get(&realm.realm_slug);
+
+        match (refresh_result, cached) {
+            (Ok(()), Some(cached)) => Ok(cached.keys.clone()),
+            (Ok(()), None) => Err(IamError::JwksFetchFailed {
+                realm: realm.realm_slug.clone(),
+                reason: "Cache empty after refresh".to_string(),
+            }),
+            (Err(e), Some(stale)) => {
+                warn!(
+                    realm = %realm.realm_slug,
+                    error = %e,
+                    "JWKS refresh failed, serving stale keys"
+                );
+                Ok(stale.keys.clone())
             }
-            Err(e) => {
-                let cache = self.jwks_cache.read().await;
-                if let Some(stale) = cache.get(&realm.realm_slug) {
-                    warn!(
-                        realm = %realm.realm_slug,
-                        error = %e,
-                        "JWKS refresh failed, serving stale keys"
-                    );
-                    Ok(stale.keys.clone())
-                } else {
-                    Err(e)
-                }
-            }
+            (Err(e), None) => Err(e),
         }
     }
 
@@ -456,6 +451,7 @@ impl IdentityProvider for StandardIamService {
         validation.set_issuer(&[&realm.issuer_url]);
         validation.set_audience(&[&realm.audience]);
         validation.validate_exp = true;
+        validation.validate_nbf = true;
 
         let token_data =
             decode::<KeycloakClaims>(raw_jwt, &decoding_key, &validation).map_err(|e| {
@@ -509,7 +505,23 @@ impl IdentityProvider for StandardIamService {
         // Reconstruct raw claims including standard + custom claims for audit trail
         let mut raw_claims = serde_json::to_value(&claims.extra).unwrap_or_default();
         if let Some(obj) = raw_claims.as_object_mut() {
+            obj.insert(
+                "iss".to_string(),
+                serde_json::Value::String(claims.iss.clone()),
+            );
+            obj.insert(
+                "sub".to_string(),
+                serde_json::Value::String(claims.sub.clone()),
+            );
             obj.insert("aud".to_string(), claims.aud.clone());
+            obj.insert(
+                "iat".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(claims.iat)),
+            );
+            obj.insert(
+                "exp".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(claims.exp)),
+            );
         }
 
         Ok(ValidatedIdentityToken {
@@ -577,15 +589,23 @@ fn realm_from_config(config: &IamRealmConfig) -> IdentityRealm {
     let realm_kind = match config.kind.as_str() {
         "system" => RealmKind::System,
         "consumer" => RealmKind::Consumer,
-        _ => {
-            // Assume "tenant" kind — extract slug from realm slug
+        "tenant" => {
             let slug = config
                 .slug
                 .strip_prefix("tenant-")
-                .unwrap_or(&config.slug)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Invalid tenant realm slug '{}': expected prefix 'tenant-' for kind 'tenant'",
+                        config.slug
+                    )
+                })
                 .to_string();
             RealmKind::Tenant { slug }
         }
+        other => panic!(
+            "Unknown realm kind '{}'; expected one of: system, consumer, tenant",
+            other
+        ),
     };
 
     IdentityRealm {
@@ -1027,6 +1047,243 @@ mod tests {
                 assert_ne!(tenant_id, crate::domain::tenant::TenantId::consumer());
             }
             other => panic!("expected ConsumerUser, got {other:?}"),
+        }
+    }
+
+    // ── Fix 4 regression tests: realm_from_config fail-fast ──────────────────
+
+    #[test]
+    #[should_panic(expected = "Invalid tenant realm slug 'foo'")]
+    fn realm_from_config_panics_on_malformed_tenant_slug() {
+        let config = IamRealmConfig {
+            slug: "foo".to_string(),
+            issuer_url: "https://auth.example.com/realms/foo".to_string(),
+            jwks_uri: "https://auth.example.com/realms/foo/protocol/openid-connect/certs"
+                .to_string(),
+            audience: "aegis-orchestrator".to_string(),
+            kind: "tenant".to_string(),
+        };
+        let _ = realm_from_config(&config);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown realm kind 'bogus'")]
+    fn realm_from_config_panics_on_unknown_kind() {
+        let config = IamRealmConfig {
+            slug: "tenant-acme".to_string(),
+            issuer_url: "https://auth.example.com/realms/tenant-acme".to_string(),
+            jwks_uri: "https://auth.example.com/realms/tenant-acme/protocol/openid-connect/certs"
+                .to_string(),
+            audience: "aegis-orchestrator".to_string(),
+            kind: "bogus".to_string(),
+        };
+        let _ = realm_from_config(&config);
+    }
+
+    // ── Fix 1/2/3 regression tests: validate_token integration ──────────────
+    //
+    // These tests sign tokens with a test RSA key, pre-populate the JWKS
+    // cache (avoiding HTTP), and exercise the full validate_token path.
+    //
+    // - Fix 1 covered indirectly: existing stale-keys-on-refresh-failure
+    //   behavior is preserved by the refactor; the (Err, None) arm is
+    //   tested below via `get_jwks_returns_underlying_error_when_cache_empty`.
+    // - Fix 2 covered by `nbf_in_future_token_is_rejected`.
+    // - Fix 3 covered by `validated_token_raw_claims_includes_all_standard_claims`.
+
+    const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N6BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoEIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1VkY2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPxTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----";
+
+    // JWK components derived from the public half of TEST_RSA_PRIVATE_PEM.
+    const TEST_JWK_N: &str = "mWtpvUNARl-B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfxHfOe50KqxX6AJzvHIaEWyOPM_J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQnrY2A_L1GaVWx2rDjZqtldjJiuOI6CdsDT-GF-Twd1O4H2OMhYk6iATQqGzJQxKndHEMdQqFa2NhDpuyEl9xhcUUVUboQR0-a8hfdoNTqhedK2ImTQ0JDFwt5e1c_XCLTj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ__4kPyI0ik5AZAOZ0o2RSEZn0GeiW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQ";
+    const TEST_JWK_E: &str = "AQAB";
+    const TEST_KID: &str = "test-kid-1";
+    const TEST_ISSUER: &str = "https://auth.example.com/realms/zaru-consumer";
+    const TEST_AUDIENCE: &str = "aegis-orchestrator";
+
+    fn test_service_with_consumer_realm() -> StandardIamService {
+        let config = IamConfig {
+            realms: vec![IamRealmConfig {
+                slug: "zaru-consumer".to_string(),
+                issuer_url: TEST_ISSUER.to_string(),
+                jwks_uri:
+                    "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
+                        .to_string(),
+                audience: TEST_AUDIENCE.to_string(),
+                kind: "consumer".to_string(),
+            }],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        StandardIamService::new(&config, event_bus)
+    }
+
+    async fn populate_jwks_cache(service: &StandardIamService) {
+        let jwks = JwksResponse {
+            keys: vec![JwkKey {
+                kty: "RSA".to_string(),
+                kid: TEST_KID.to_string(),
+                n: TEST_JWK_N.to_string(),
+                e: TEST_JWK_E.to_string(),
+                alg: Some("RS256".to_string()),
+                key_use: Some("sig".to_string()),
+            }],
+        };
+        let mut cache = service.jwks_cache.write().await;
+        cache.insert(
+            "zaru-consumer".to_string(),
+            CachedJwks {
+                keys: jwks,
+                fetched_at: Instant::now(),
+                ttl: Duration::from_secs(300),
+            },
+        );
+    }
+
+    fn sign_test_jwt(claims_json: serde_json::Value) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).unwrap();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_KID.to_string());
+        encode(&header, &claims_json, &encoding_key).unwrap()
+    }
+
+    fn now_secs() -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[tokio::test]
+    async fn nbf_in_future_token_is_rejected() {
+        // Regression for Fix 2: prior to enabling validate_nbf, a token with
+        // nbf set to a future timestamp would be accepted. After the fix,
+        // the validator MUST reject such tokens.
+        let service = test_service_with_consumer_realm();
+        populate_jwks_cache(&service).await;
+
+        let now = now_secs();
+        let nbf_future = now + 3600; // not valid for another hour
+        let claims = serde_json::json!({
+            "sub": "user-future-nbf",
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "iat": now,
+            "exp": now + 7200,
+            "nbf": nbf_future,
+            "zaru_tier": "free",
+            "tenant_id": "u-userfuturenbf",
+        });
+        let token = sign_test_jwt(claims);
+
+        let result = service.validate_token(&token).await;
+        let err = result.expect_err(
+            "token with nbf in the future MUST be rejected; \
+             validate_nbf was previously disabled",
+        );
+        assert!(
+            matches!(err, IamError::SignatureInvalid(_)),
+            "expected SignatureInvalid (jsonwebtoken nbf failure), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_token_raw_claims_includes_all_standard_claims() {
+        // Regression for Fix 3: previously raw_claims contained only `aud`
+        // among the standard claims. After the fix, iss/sub/aud/iat/exp
+        // MUST all be present in raw_claims for full audit context.
+        let service = test_service_with_consumer_realm();
+        populate_jwks_cache(&service).await;
+
+        let now = now_secs();
+        let exp = now + 3600;
+        let sub = "abc-def-123";
+        let claims = serde_json::json!({
+            "sub": sub,
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "iat": now,
+            "exp": exp,
+            "zaru_tier": "free",
+            "tenant_id": "u-abcdef123",
+        });
+        let token = sign_test_jwt(claims);
+
+        let validated = service
+            .validate_token(&token)
+            .await
+            .expect("token should validate");
+        let raw = &validated.raw_claims;
+        let obj = raw.as_object().expect("raw_claims should be a JSON object");
+
+        assert_eq!(
+            obj.get("iss").and_then(|v| v.as_str()),
+            Some(TEST_ISSUER),
+            "raw_claims must include iss"
+        );
+        assert_eq!(
+            obj.get("sub").and_then(|v| v.as_str()),
+            Some(sub),
+            "raw_claims must include sub"
+        );
+        assert_eq!(
+            obj.get("aud").and_then(|v| v.as_str()),
+            Some(TEST_AUDIENCE),
+            "raw_claims must include aud"
+        );
+        assert_eq!(
+            obj.get("iat").and_then(|v| v.as_i64()),
+            Some(now),
+            "raw_claims must include iat"
+        );
+        assert_eq!(
+            obj.get("exp").and_then(|v| v.as_i64()),
+            Some(exp),
+            "raw_claims must include exp"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_jwks_returns_underlying_error_when_cache_empty() {
+        // Regression for Fix 1: the (Err, None) arm of the refactored
+        // get_jwks should propagate the underlying refresh error rather
+        // than masking it with a "Cache empty after refresh" message.
+        // The realm's jwks_uri points at a non-routable address so the
+        // refresh fails quickly with a JwksFetchFailed error.
+        let config = IamConfig {
+            realms: vec![IamRealmConfig {
+                slug: "zaru-consumer".to_string(),
+                issuer_url: TEST_ISSUER.to_string(),
+                // RFC 5737 TEST-NET-1: guaranteed-non-routable
+                jwks_uri: "http://192.0.2.1:1/jwks".to_string(),
+                audience: TEST_AUDIENCE.to_string(),
+                kind: "consumer".to_string(),
+            }],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus);
+        let realm = service.realms[0].clone();
+
+        // Cache is empty AND refresh will fail. Expect the underlying
+        // JwksFetchFailed error, NOT "Cache empty after refresh".
+        let result = tokio::time::timeout(Duration::from_secs(10), service.get_jwks(&realm)).await;
+        let result = result.expect("get_jwks should not hang");
+        let err = result.expect_err("refresh fails and cache is empty → must error");
+        match err {
+            IamError::JwksFetchFailed { reason, .. } => {
+                assert!(
+                    !reason.contains("Cache empty after refresh"),
+                    "Fix 1: (Err, None) arm must propagate the underlying refresh error, \
+                     not the 'Cache empty after refresh' string. Got reason: {reason}"
+                );
+            }
+            other => panic!("expected JwksFetchFailed, got {other:?}"),
         }
     }
 
