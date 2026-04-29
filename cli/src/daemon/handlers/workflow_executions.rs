@@ -639,10 +639,48 @@ pub(crate) struct WorkflowSignalRequest {
 pub(crate) async fn signal_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<String>,
     Json(request): Json<WorkflowSignalRequest>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:signal")?;
+    // Audit 002 §4.7: tenant-scoped ownership check before forwarding the
+    // signal. Cross-tenant signal injection (any caller with workflow:signal
+    // and a known execution UUID) was previously possible. Return 404 on
+    // mismatch — never 403 — to avoid leaking the existence of another
+    // tenant's execution.
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let exec_uuid = match Uuid::parse_str(&execution_id) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "workflow execution not found"})),
+            )
+                .into_response());
+        }
+    };
+    match state
+        .workflow_execution_repo
+        .find_by_id_for_tenant(&tenant_id, ExecutionId(exec_uuid))
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "workflow execution not found"})),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response());
+        }
+    }
     let guard = state.temporal_client_container.read().await;
     let client = match guard.as_ref() {
         Some(c) => c.clone(),
@@ -877,9 +915,36 @@ pub(crate) async fn stream_workflow_logs_handler(
 pub(crate) async fn cancel_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:cancel")?;
+    // Audit 002 §4.5: tenant-scoped ownership check before issuing the cancel.
+    // Cross-tenant denial of service (any caller with workflow:cancel could
+    // cancel any tenant's running workflow given the UUID) was previously
+    // possible. Return 404 on mismatch — never 403.
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .workflow_execution_repo
+        .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "workflow execution not found"})),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response());
+        }
+    }
     let namespace = match temporal_namespace(&state.config) {
         Ok(namespace) => namespace,
         Err(error) => {
@@ -932,9 +997,36 @@ pub(crate) async fn cancel_workflow_execution_handler(
 pub(crate) async fn remove_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:cancel")?;
+    // Audit 002 §4.6: tenant-scoped ownership check before issuing a
+    // destructive DELETE. Previously the DELETE statement carried no tenant
+    // predicate so any caller with workflow:cancel scope plus a UUID could
+    // wipe another tenant's workflow execution row. Return 404 on mismatch.
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .workflow_execution_repo
+        .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "workflow execution not found"})),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response());
+        }
+    }
     let namespace = match temporal_namespace(&state.config) {
         Ok(namespace) => namespace,
         Err(error) => {
@@ -984,11 +1076,14 @@ pub(crate) async fn remove_workflow_execution_handler(
             .connect(&database_url)
             .await
         {
-            Ok(pool) => sqlx::query("DELETE FROM workflow_executions WHERE id = $1")
-                .bind(execution_id)
-                .execute(&pool)
-                .await
-                .map(|_| ()),
+            Ok(pool) => {
+                sqlx::query("DELETE FROM workflow_executions WHERE id = $1 AND tenant_id = $2")
+                    .bind(execution_id)
+                    .bind(tenant_id.as_str())
+                    .execute(&pool)
+                    .await
+                    .map(|_| ())
+            }
             Err(error) => Err(error),
         }
     } else {

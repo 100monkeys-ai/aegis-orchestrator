@@ -78,12 +78,14 @@ pub(crate) async fn execute_temporal_workflow_handler(
     Json(mut request): Json<StartWorkflowExecutionRequest>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:run")?;
-    let tenant_id = request
-        .tenant_id
-        .get_or_insert_with(|| {
-            tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0))
-        })
-        .clone();
+    // Audit 002 §4.8: NEVER trust body-supplied `tenant_id`. The authenticated
+    // JWT identity is the only source of truth for the executing tenant.
+    // A body that carries `tenant_id` for tenant-B while the JWT belongs to
+    // tenant-A previously executed under tenant-B's quota and security
+    // context — a cross-tenant privilege escalation. Overwrite
+    // unconditionally with the JWT-derived tenant.
+    let tenant_id =
+        resolve_execute_tenant(identity.as_ref().map(|identity| &identity.0), &mut request);
     match state
         .start_workflow_execution_use_case
         .start_execution_for_tenant(&tenant_id, request, identity.as_ref().map(|ext| &ext.0))
@@ -106,6 +108,22 @@ pub(crate) async fn execute_temporal_workflow_handler(
                 .into_response())
         }
     }
+}
+
+/// Resolve the executing tenant for `execute_temporal_workflow_handler`.
+///
+/// Audit 002 §4.8: The JWT identity's tenant is the only source of truth.
+/// Any `tenant_id` carried in the request body is *unconditionally
+/// overwritten* with the JWT-derived tenant. Returning early without
+/// overwriting (e.g. via `get_or_insert_with`) lets a tenant-A caller
+/// execute under tenant-B's quota and security context.
+fn resolve_execute_tenant(
+    identity: Option<&UserIdentity>,
+    request: &mut StartWorkflowExecutionRequest,
+) -> TenantId {
+    let tenant_id = tenant_id_from_identity(identity);
+    request.tenant_id = Some(tenant_id.clone());
+    tenant_id
 }
 
 /// POST /v1/workflows/:name/run - Execute a workflow (Legacy endpoint for CLI)
@@ -522,5 +540,115 @@ pub(crate) async fn update_workflow_scope_handler(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Audit 002 §4.8 regression tests: `execute_temporal_workflow_handler`
+    //! must NEVER trust body-supplied `tenant_id`. The JWT identity is the
+    //! only source of truth.
+
+    use super::*;
+    use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+
+    fn tenant_user_identity(slug: &str) -> UserIdentity {
+        UserIdentity {
+            sub: format!("user-{slug}"),
+            realm_slug: format!("tenant-{slug}"),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: slug.into(),
+            },
+        }
+    }
+
+    fn consumer_user_identity(sub: &str) -> UserIdentity {
+        UserIdentity {
+            sub: sub.into(),
+            realm_slug: "zaru-consumer".into(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Free,
+                tenant_id: TenantId::consumer(),
+            },
+        }
+    }
+
+    fn empty_request_with_body_tenant(t: TenantId) -> StartWorkflowExecutionRequest {
+        StartWorkflowExecutionRequest {
+            workflow_id: "wf-x".into(),
+            input: serde_json::json!({}),
+            blackboard: None,
+            version: None,
+            tenant_id: Some(t),
+            security_context_name: None,
+            intent: None,
+        }
+    }
+
+    /// Audit 002 §4.8: tenant-A caller submits a body claiming tenant-B.
+    /// The handler MUST overwrite the body's tenant_id with tenant-A
+    /// (the JWT-derived tenant) and MUST return tenant-A as the dispatch
+    /// tenant. Before the fix, `get_or_insert_with` accepted the body
+    /// value and tenant-A would have executed against tenant-B's quota.
+    #[test]
+    fn execute_handler_ignores_body_tenant_id_when_jwt_is_tenant_user() {
+        let identity = tenant_user_identity("acme");
+        let attacker_target = TenantId::from_realm_slug("victim").unwrap();
+        let mut request = empty_request_with_body_tenant(attacker_target.clone());
+        // Sanity: the body claims tenant-B.
+        assert_eq!(request.tenant_id.as_ref().unwrap(), &attacker_target);
+
+        let resolved = resolve_execute_tenant(Some(&identity), &mut request);
+
+        // Resolved dispatch tenant is tenant-A (from JWT), not tenant-B (from body).
+        assert_eq!(resolved.as_str(), "acme");
+        // Body's tenant_id has been *overwritten* with tenant-A — downstream
+        // `start_execution_for_tenant` MUST receive only the JWT tenant.
+        assert_eq!(request.tenant_id.as_ref().unwrap().as_str(), "acme");
+        assert_ne!(request.tenant_id.as_ref().unwrap(), &attacker_target);
+    }
+
+    /// Audit 002 §4.8: tenant-A consumer caller submits a body claiming
+    /// another consumer's per-user tenant. The handler MUST overwrite with
+    /// the JWT-derived per-user tenant (ADR-097) — never the body value.
+    #[test]
+    fn execute_handler_ignores_body_tenant_id_when_jwt_is_consumer() {
+        let identity = consumer_user_identity("user-alice");
+        let alice_tenant = TenantId::for_consumer_user("user-alice").unwrap();
+        let bob_tenant = TenantId::for_consumer_user("user-bob").unwrap();
+        let mut request = empty_request_with_body_tenant(bob_tenant.clone());
+
+        let resolved = resolve_execute_tenant(Some(&identity), &mut request);
+
+        assert_eq!(resolved, alice_tenant);
+        assert_eq!(request.tenant_id.as_ref().unwrap(), &alice_tenant);
+        assert_ne!(request.tenant_id.as_ref().unwrap(), &bob_tenant);
+    }
+
+    /// Audit 002 §4.8: even when the body carries no tenant_id at all, the
+    /// handler must populate it from the JWT (so the inner use case never
+    /// hits its `tenant_id is required` guard for an authenticated path).
+    #[test]
+    fn execute_handler_populates_tenant_from_jwt_when_body_is_missing() {
+        let identity = tenant_user_identity("acme");
+        let mut request = StartWorkflowExecutionRequest {
+            workflow_id: "wf-x".into(),
+            input: serde_json::json!({}),
+            blackboard: None,
+            version: None,
+            tenant_id: None,
+            security_context_name: None,
+            intent: None,
+        };
+
+        let resolved = resolve_execute_tenant(Some(&identity), &mut request);
+
+        assert_eq!(resolved.as_str(), "acme");
+        assert_eq!(request.tenant_id.as_ref().unwrap().as_str(), "acme");
     }
 }
