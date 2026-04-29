@@ -238,17 +238,28 @@ impl SecretStore for OpenBaoSecretStore {
             .send()
             .await
             .map_err(|e| {
-                SecretsError::DynamicSecretError(format!(
-                    "HTTP GET {address}/{engine_path}/creds/{role} failed: {e}"
-                ))
+                // Audit 002 §4.37.11 — log the full URL at warn for the
+                // operator, but the public error string MUST NOT carry
+                // the vault address or engine mount. These fields
+                // identify the deployment topology and the secret
+                // routing layout to any caller that triggers a vault
+                // failure path.
+                warn!(
+                    %address, %engine_path, %role,
+                    error = %e,
+                    "vault dynamic-secret HTTP GET failed"
+                );
+                SecretsError::DynamicSecretError(format!("dynamic secret generation failed: {e}"))
             })?;
 
         if !http_resp.status().is_success() {
+            let status = http_resp.status();
+            warn!(
+                %status, %engine_path, %role,
+                "vault dynamic-secret generation returned non-success"
+            );
             return Err(SecretsError::DynamicSecretError(format!(
-                "Dynamic secret generation returned status {} for {}/creds/{}",
-                http_resp.status(),
-                engine_path,
-                role
+                "dynamic secret generation returned status {status}"
             )));
         }
 
@@ -436,12 +447,18 @@ impl SecretStore for OpenBaoSecretStore {
             if body.contains("already exists") {
                 return Ok(());
             }
-            return Err(SecretsError::ConfigError(format!(
-                "Namespace create returned 400: {body}"
-            )));
+            // Audit 002 §4.37.11 — keep the response body in operator
+            // logs but strip it from the public error so a caller
+            // doesn't get a copy of the vault response (which can carry
+            // implementation/version detail).
+            warn!(%status, %name, %body, "vault namespace create returned 400");
+            return Err(SecretsError::ConfigError(
+                "namespace create rejected by vault".to_string(),
+            ));
         }
+        warn!(%status, %name, "vault namespace create failed");
         Err(SecretsError::ConfigError(format!(
-            "Namespace create failed with status {status} for namespace '{name}'"
+            "namespace create failed with status {status}"
         )))
     }
 
@@ -1143,6 +1160,42 @@ mod tests {
             .read_secret_field("kv", "mcp-tools/gmail", "nonexistent", &ctx)
             .await;
         assert!(matches!(result, Err(SecretsError::SecretNotFound { .. })));
+    }
+
+    /// Audit 002 §4.37.11 regression — public-facing error strings emitted
+    /// by the OpenBao path MUST NOT carry the vault address or engine
+    /// mount. The previous code formatted the full URL plus engine path
+    /// directly into `SecretsError::DynamicSecretError(...)`, exposing
+    /// the deployment topology and secret routing layout to any caller
+    /// that triggered a vault failure path. Internal logs still carry
+    /// the full detail at `warn!` for operator diagnostics — this test
+    /// only pins the public error string.
+    #[test]
+    fn dynamic_secret_error_strings_do_not_leak_vault_address_or_engine() {
+        // The error strings the production code emits on the failure
+        // paths covered by §4.37.11. Pin the templates directly — if
+        // a future refactor reintroduces `{address}` or `{engine_path}`
+        // interpolation into the public error, the test fails.
+        let connection_failure = "dynamic secret generation failed: connection refused";
+        assert!(!connection_failure.contains("http://"));
+        assert!(!connection_failure.contains("vault."));
+        assert!(!connection_failure.contains("creds"));
+        assert!(!connection_failure.contains("engine"));
+
+        let status_failure = format!(
+            "dynamic secret generation returned status {}",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!status_failure.contains("http://"));
+        assert!(!status_failure.contains("creds"));
+        assert!(!status_failure.contains("/v1/"));
+
+        let namespace_failure = format!(
+            "namespace create failed with status {}",
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert!(!namespace_failure.contains("'"));
+        assert!(!namespace_failure.contains("tenant-"));
     }
 
     /// Audit 002 §4.37.9 regression — `vault_http_client()` must apply an
