@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::domain::security_context::SecurityContext;
-use aegis_orchestrator_core::domain::shared_kernel::NodeId;
+
+use crate::commands::edge::grpc;
 use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     edge_command::Command as InCmd, edge_event::Event as OutEv,
     node_cluster_service_client::NodeClusterServiceClient, CommandProgressEvent,
@@ -120,23 +121,62 @@ pub(crate) fn signed_envelope(
 #[derive(Debug, Clone)]
 pub struct EdgeLifecycleConfig {
     pub controller_endpoint: String,
+    /// Local edge state directory (default `~/.aegis/edge`). The lifecycle
+    /// re-reads `node.key` and `node.token` from this directory on every
+    /// reconnect attempt so that `aegis edge token refresh` and
+    /// `aegis edge keys rotate` take effect without restarting the daemon —
+    /// rotation writes the new credentials atomically and the next connect
+    /// picks them up. Without this, the daemon would silently keep using
+    /// stale credentials in memory until restart, which is the bug the
+    /// dead-code lint on this field surfaced.
     pub state_dir: PathBuf,
     pub heartbeat_interval: Duration,
     pub reconnect_backoff: Vec<Duration>,
-    /// Persisted NodeSecurityToken (RS256 JWT) issued at enrollment time.
-    pub node_security_token: String,
-    /// Stable UUID identifying this daemon (matches the `sub` claim on
-    /// `node_security_token`). Used in canonical envelope payloads.
-    pub node_id: NodeId,
-    /// Daemon's persisted Ed25519 signing key (raw 32-byte seed loaded by
-    /// `daemon::server` from the configured `node_keypair_path`).
-    pub signing_key: Arc<SigningKey>,
     /// Local capabilities snapshot — populated by the daemon binary from
     /// hardware probes plus operator-configured local_tools / mount_points.
     pub capabilities: EdgeCapabilities,
     /// Resolved security contexts from the merged hierarchical config
     /// (`spec.security_contexts`). Empty means default-deny for every tool.
     pub security_contexts: Vec<SecurityContext>,
+}
+
+/// Credentials snapshot loaded from `state_dir` at the start of every
+/// connect attempt. Allows `connect_once` to pick up rotation that
+/// happened while the daemon was running.
+#[derive(Debug, Clone)]
+struct EdgeCredentials {
+    signing_key: Arc<SigningKey>,
+    node_security_token: String,
+    node_id_str: String,
+}
+
+/// Per-connect view of the lifecycle config plus the credentials freshly
+/// reloaded from `state_dir`. Helpers below take `&EdgeSession` instead of
+/// reaching into `EdgeLifecycleConfig.signing_key` / `.node_security_token`
+/// directly so a mid-run rotation is honoured.
+struct EdgeSession<'a> {
+    cfg: &'a EdgeLifecycleConfig,
+    creds: EdgeCredentials,
+}
+
+/// Load the daemon's signing key and NodeSecurityToken from `state_dir`.
+/// On any I/O or parse failure, surface the error so `connect_once` can
+/// log + retry — never silently fall back to in-memory credentials,
+/// because that would mask a corruption that the operator must address.
+fn load_credentials_from_disk(state_dir: &Path) -> Result<EdgeCredentials> {
+    let signing_key = Arc::new(
+        grpc::load_signing_key(state_dir)
+            .with_context(|| format!("reload signing key from {}", state_dir.display()))?,
+    );
+    let node_security_token = grpc::load_node_security_token(state_dir)
+        .with_context(|| format!("reload NodeSecurityToken from {}", state_dir.display()))?;
+    let node_id_str = grpc::node_id_from_token(&node_security_token)
+        .context("derive node_id from reloaded NodeSecurityToken")?;
+    Ok(EdgeCredentials {
+        signing_key,
+        node_security_token,
+        node_id_str,
+    })
 }
 
 pub async fn run_edge_daemon(cfg: EdgeLifecycleConfig) -> Result<()> {
@@ -161,6 +201,21 @@ pub async fn run_edge_daemon(cfg: EdgeLifecycleConfig) -> Result<()> {
 }
 
 async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
+    // 0. Re-load credentials from `state_dir` on every connect so that a
+    //    rotation that landed while the daemon was running (via
+    //    `aegis edge token refresh` / `keys rotate`) takes effect on the
+    //    next reconnect — without this, the daemon kept stale in-memory
+    //    credentials until restart, which is the bug the dead-code lint
+    //    on `state_dir` surfaced.
+    let creds = load_credentials_from_disk(&cfg.state_dir)?;
+    let session = EdgeSession {
+        cfg,
+        creds: creds.clone(),
+    };
+    let signing_key = creds.signing_key.clone();
+    let node_security_token = creds.node_security_token.clone();
+    let node_id_str = creds.node_id_str.clone();
+
     // 1. Build the channel.
     let endpoint_uri = if cfg.controller_endpoint.starts_with("http://")
         || cfg.controller_endpoint.starts_with("https://")
@@ -183,10 +238,9 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
 
     // 3. Send Hello first.
     let stream_id = Uuid::new_v4().to_string();
-    let node_id_str = cfg.node_id.0.to_string();
     let hello_envelope = signed_envelope(
-        &cfg.signing_key,
-        &cfg.node_security_token,
+        &signing_key,
+        &node_security_token,
         &node_id_str,
         &stream_id,
         CanonicalKind::Hello,
@@ -216,8 +270,8 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
     let heartbeat_handle = {
         let tx = tx.clone();
         let interval = cfg.heartbeat_interval;
-        let token = cfg.node_security_token.clone();
-        let signing_key = cfg.signing_key.clone();
+        let token = node_security_token.clone();
+        let signing_key = signing_key.clone();
         let drain = drain.clone();
         let node_id_str = node_id_str.clone();
         let stream_id_hb = stream_id.clone();
@@ -268,20 +322,34 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
                 );
                 if drain.load(Ordering::SeqCst) {
                     let result = error_result("draining", "edge daemon is draining");
-                    let _ =
-                        send_result(&tx, cfg, &node_id_str, &stream_id, &inv.command_id, result)
-                            .await;
+                    let _ = send_result(
+                        &tx,
+                        &session,
+                        &node_id_str,
+                        &stream_id,
+                        &inv.command_id,
+                        result,
+                    )
+                    .await;
                     continue;
                 }
                 let cmd_id = inv.command_id.clone();
-                let result = handle_invoke_tool(cfg, &tx, &node_id_str, &stream_id, &inv).await;
-                let _ = send_result(&tx, cfg, &node_id_str, &stream_id, &cmd_id, result).await;
+                let result =
+                    handle_invoke_tool(&session, &tx, &node_id_str, &stream_id, &inv).await;
+                let _ = send_result(&tx, &session, &node_id_str, &stream_id, &cmd_id, result).await;
             }
             Some(InCmd::Cancel(c)) => {
                 tracing::info!(command_id = %c.command_id, "edge: received Cancel");
                 let result = error_result("cancelled", "cancelled by operator");
-                let _ =
-                    send_result(&tx, cfg, &node_id_str, &stream_id, &c.command_id, result).await;
+                let _ = send_result(
+                    &tx,
+                    &session,
+                    &node_id_str,
+                    &stream_id,
+                    &c.command_id,
+                    result,
+                )
+                .await;
             }
             Some(InCmd::PushConfig(_)) => {
                 tracing::info!("edge: received PushConfig (ignored — local config persistence is daemon-binary owned)");
@@ -319,15 +387,15 @@ fn error_result(kind: &str, message: impl Into<String>) -> EdgeResult {
 
 async fn send_result(
     tx: &mpsc::Sender<EdgeEvent>,
-    cfg: &EdgeLifecycleConfig,
+    session: &EdgeSession<'_>,
     node_id_str: &str,
     stream_id: &str,
     command_id: &str,
     result: EdgeResult,
 ) -> Result<()> {
     let envelope = signed_envelope(
-        &cfg.signing_key,
-        &cfg.node_security_token,
+        &session.creds.signing_key,
+        &session.creds.node_security_token,
         node_id_str,
         stream_id,
         CanonicalKind::CommandResult,
@@ -441,12 +509,13 @@ fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
 }
 
 async fn handle_invoke_tool(
-    cfg: &EdgeLifecycleConfig,
+    session: &EdgeSession<'_>,
     tx: &mpsc::Sender<EdgeEvent>,
     node_id_str: &str,
     stream_id: &str,
     inv: &InvokeToolCommand,
 ) -> EdgeResult {
+    let cfg = session.cfg;
     // 1. Inner envelope verification.
     let envelope = match &inv.seal_envelope {
         Some(e) => e,
@@ -476,7 +545,7 @@ async fn handle_invoke_tool(
 
     // 4. Local builtin dispatch.
     if inv.tool_name == "cmd.run" {
-        return run_local_cmd(cfg, tx, node_id_str, stream_id, inv, &args_json).await;
+        return run_local_cmd(session, tx, node_id_str, stream_id, inv, &args_json).await;
     }
 
     // These require AegisFSAL / NfsVolumeRegistry / SchemaRegistry — none of
@@ -507,7 +576,7 @@ async fn handle_invoke_tool(
 }
 
 async fn run_local_cmd(
-    cfg: &EdgeLifecycleConfig,
+    session: &EdgeSession<'_>,
     tx: &mpsc::Sender<EdgeEvent>,
     node_id_str: &str,
     stream_id: &str,
@@ -585,8 +654,8 @@ async fn run_local_cmd(
     let tx_out = tx.clone();
     let tx_err = tx.clone();
     let parts_out = (
-        cfg.signing_key.clone(),
-        cfg.node_security_token.clone(),
+        session.creds.signing_key.clone(),
+        session.creds.node_security_token.clone(),
         node_id_str.to_string(),
         stream_id.to_string(),
         cmd_id.clone(),
@@ -1090,5 +1159,111 @@ mod tests {
         let args = serde_json::json!({"command": "/bin/echo", "args": ["hello"]});
         ctx.evaluate("cmd.run", &args)
             .expect("cmd.run with allowlisted /bin/echo must be permitted");
+    }
+
+    /// Build a JWT-shaped string with the given `sub` claim. The lifecycle
+    /// loader only decodes the claims segment; the signature segment is a
+    /// placeholder.
+    fn make_test_node_token(sub: &str) -> String {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"sub\":\"{sub}\"}}").as_bytes());
+        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig");
+        format!("{header}.{claims}.{sig}")
+    }
+
+    /// Regression for the `state_dir` dead-code lint: prior code constructed
+    /// the field on `EdgeLifecycleConfig` but the lifecycle ignored it,
+    /// reading state from a hardcoded in-memory snapshot loaded once at
+    /// startup. This test pins that `load_credentials_from_disk` actually
+    /// reads from the supplied directory — proving an operator who passes
+    /// `aegis edge daemon --state-dir /custom/path` is no longer silently
+    /// using cached defaults.
+    #[test]
+    fn load_credentials_reads_from_supplied_state_dir_not_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key_seed = [11u8; 32];
+        std::fs::write(tmp.path().join("node.key"), key_seed).unwrap();
+        let sub = uuid::Uuid::new_v4().to_string();
+        let token = make_test_node_token(&sub);
+        std::fs::write(tmp.path().join("node.token"), &token).unwrap();
+
+        let creds =
+            load_credentials_from_disk(tmp.path()).expect("must load from supplied state_dir");
+
+        assert_eq!(
+            creds.node_id_str, sub,
+            "node_id must come from THIS dir's node.token, not a hardcoded default"
+        );
+        assert_eq!(
+            creds.node_security_token.trim(),
+            token,
+            "token must be loaded verbatim from the supplied dir"
+        );
+        // Signing key must derive from the seed we wrote.
+        let expected = SigningKey::from_bytes(&key_seed);
+        assert_eq!(
+            creds.signing_key.to_bytes(),
+            expected.to_bytes(),
+            "signing key must derive from the supplied dir's node.key"
+        );
+    }
+
+    /// Regression: a missing state_dir must produce an error mentioning the
+    /// supplied path. Without the state_dir wiring this would have errored
+    /// with the hardcoded `~/.aegis/edge` path — and an operator who passed
+    /// `--state-dir /custom` would have been baffled.
+    #[test]
+    fn load_credentials_error_mentions_supplied_path_not_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Empty dir — node.key is missing.
+        let err = load_credentials_from_disk(tmp.path()).expect_err("must error on empty dir");
+        let msg = format!("{err:#}");
+        let supplied = tmp.path().display().to_string();
+        assert!(
+            msg.contains(&supplied),
+            "error must surface the supplied state_dir path '{supplied}': {msg}"
+        );
+    }
+
+    /// Regression for the same lint: a fresh credential loaded from a
+    /// post-rotation state_dir must differ from one loaded from a
+    /// pre-rotation state_dir. This pins the "rotation takes effect on
+    /// reconnect without restart" behavior: previously, in-memory
+    /// credentials were cached at startup so a token refresh between
+    /// reconnects had no effect.
+    #[test]
+    fn load_credentials_reflects_post_rotation_state_dir_contents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Pre-rotation snapshot.
+        std::fs::write(tmp.path().join("node.key"), [1u8; 32]).unwrap();
+        let sub_old = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            tmp.path().join("node.token"),
+            make_test_node_token(&sub_old),
+        )
+        .unwrap();
+        let before = load_credentials_from_disk(tmp.path()).expect("pre-rotation load");
+
+        // Rotation: a fresh key + token land at the same paths.
+        std::fs::write(tmp.path().join("node.key"), [2u8; 32]).unwrap();
+        let sub_new = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            tmp.path().join("node.token"),
+            make_test_node_token(&sub_new),
+        )
+        .unwrap();
+        let after = load_credentials_from_disk(tmp.path()).expect("post-rotation load");
+
+        assert_ne!(
+            before.node_id_str, after.node_id_str,
+            "post-rotation reload must observe the new sub claim"
+        );
+        assert_ne!(
+            before.signing_key.to_bytes(),
+            after.signing_key.to_bytes(),
+            "post-rotation reload must observe the new node.key seed"
+        );
     }
 }

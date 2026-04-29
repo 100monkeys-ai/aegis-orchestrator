@@ -21,12 +21,10 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn};
 
-use aegis_orchestrator_core::domain::cluster::NodeId;
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 use aegis_orchestrator_core::domain::security_context::{
     Capability, SecurityContext, SecurityContextMetadata,
@@ -88,14 +86,17 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
         .unwrap_or_else(|| grpc::load_controller_endpoint(&state_dir))
         .context("resolve controller endpoint")?;
 
-    // 3. Load the daemon's persisted Ed25519 signing key + NodeSecurityToken.
-    let signing_key = Arc::new(grpc::load_signing_key(&state_dir)?);
+    // 3. Validate that the daemon's persisted signing key + NodeSecurityToken
+    //    are present and well-formed. The lifecycle re-reads these from
+    //    `state_dir` on every reconnect (so rotation takes effect without
+    //    restart), but we still want a fast-fail at startup if state is
+    //    missing or corrupt — otherwise the operator would only learn about
+    //    it from reconnect-loop log spam.
+    let _signing_key = grpc::load_signing_key(&state_dir)?;
     let node_security_token = grpc::load_node_security_token(&state_dir)?;
     let node_id_str = grpc::node_id_from_token(&node_security_token)?;
-    let node_id =
-        NodeId(uuid::Uuid::parse_str(&node_id_str).with_context(|| {
-            format!("NodeSecurityToken sub claim is not a UUID: {node_id_str}")
-        })?);
+    uuid::Uuid::parse_str(&node_id_str)
+        .with_context(|| format!("NodeSecurityToken sub claim is not a UUID: {node_id_str}"))?;
 
     // 4. Resolve EdgeConfig knobs (heartbeat, reconnect backoff, capabilities).
     let cluster = config.spec.cluster.as_ref().ok_or_else(|| {
@@ -173,9 +174,6 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
         state_dir: state_dir.clone(),
         heartbeat_interval,
         reconnect_backoff,
-        node_security_token,
-        node_id,
-        signing_key,
         capabilities,
         security_contexts,
     };
