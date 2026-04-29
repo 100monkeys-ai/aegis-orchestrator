@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # IAM & Identity Federation Domain Types (BC-13, ADR-041)
 //!
-//! OIDC is the single trusted OIDC issuer for all human and service-account
-//! authentication on the AEGIS platform. This module defines the aggregate roots,
-//! entities, value objects, domain service traits, and error types for BC-13.
+//! The OIDC provider is the single trusted issuer for all human and
+//! service-account authentication on the AEGIS platform. This module defines
+//! the aggregate roots, entities, value objects, domain service traits, and
+//! error types for BC-13.
 //!
 //! ## Key Types
 //!
@@ -162,7 +163,8 @@ pub enum IdentityKind {
 }
 
 /// ZaruTier is owned by BC-13 (IAM) and sourced from an OIDC custom claim.
-/// Maps to SEAL SecurityContext names consumed by ZaruAuthMiddleware → AttestationService.
+/// Maps to SEAL SecurityContext names consumed by the OIDC-authenticated
+/// IAM → AttestationService flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ZaruTier {
     Free,
@@ -172,7 +174,8 @@ pub enum ZaruTier {
 }
 
 impl ZaruTier {
-    /// Map to SEAL SecurityContext name (consumed by ZaruAuthMiddleware → AttestationService).
+    /// Map to SEAL SecurityContext name (consumed by the
+    /// OIDC-authenticated IAM → AttestationService flow).
     pub fn to_security_context_name(&self) -> &'static str {
         match self {
             ZaruTier::Free => "zaru-free",
@@ -303,10 +306,16 @@ pub trait IdentityProvider: Send + Sync {
 
     /// Resolve the ZaruTier for a consumer user (extracts zaru_tier claim).
     /// Only valid for tokens from the zaru-consumer realm or a tenant realm.
+    /// Implementations MUST validate the token realm and return `Err(IamError)`
+    /// when called with an incompatible realm (for example, `aegis-system`).
     fn resolve_tier(&self, token: &ValidatedIdentityToken) -> Result<ZaruTier, IamError>;
 
-    /// Resolve the AegisRole for an operator (extracts aegis_role claim).
-    /// Only valid for tokens from the aegis-system realm.
+    /// Resolve the AegisRole for an operator (extracts `aegis_role` claim).
+    /// Implementations MUST validate that the token originates from the
+    /// `aegis-system` realm (issuer) before resolving the role.
+    /// If called with a token from any other realm, implementations MUST
+    /// return an `IamError` (for example `InvalidClaimValue` or `UnknownIssuer`)
+    /// and MUST NOT resolve a role.
     fn resolve_role(&self, token: &ValidatedIdentityToken) -> Result<AegisRole, IamError>;
 
     /// List all configured realms (used for JWKS cache warm-up on startup).

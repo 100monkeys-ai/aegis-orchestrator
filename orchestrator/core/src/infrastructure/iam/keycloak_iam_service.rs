@@ -521,40 +521,49 @@ impl IdentityProvider for StandardIamService {
     }
 
     fn resolve_tier(&self, token: &ValidatedIdentityToken) -> Result<ZaruTier, IamError> {
+        // Realm enforcement: ZaruTier is only meaningful for consumer or
+        // tenant identities. An aegis-system Operator or ServiceAccount token
+        // MUST NOT be allowed to resolve a tier — even if a `zaru_tier` claim
+        // is somehow present in the raw JWT — because that would let a
+        // privileged system identity be silently downgraded into a consumer
+        // billing tier and routed through the consumer SecurityContext.
         match &token.identity.identity_kind {
             IdentityKind::ConsumerUser { zaru_tier, .. } => Ok(zaru_tier.clone()),
             IdentityKind::TenantUser { .. } => {
                 // Tenant users always get enterprise tier
                 Ok(ZaruTier::Enterprise)
             }
-            _ => {
-                // Try extracting from raw claims as a fallback
-                token
-                    .raw_claims
-                    .get(&self.claims_config.zaru_tier)
-                    .and_then(|v| v.as_str())
-                    .and_then(ZaruTier::from_claim)
-                    .ok_or(IamError::MissingClaim {
-                        claim: self.claims_config.zaru_tier.clone(),
-                    })
+            IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => {
+                Err(IamError::InvalidClaimValue {
+                    claim: self.claims_config.zaru_tier.clone(),
+                    value: format!(
+                        "resolve_tier called with aegis-system identity (realm '{}'); \
+                         tier resolution is only valid for zaru-consumer or tenant realms",
+                        token.identity.realm_slug
+                    ),
+                })
             }
         }
     }
 
     fn resolve_role(&self, token: &ValidatedIdentityToken) -> Result<AegisRole, IamError> {
+        // Realm enforcement: AegisRole is only meaningful for aegis-system
+        // human operators. ConsumerUser, TenantUser, and ServiceAccount
+        // tokens MUST NOT resolve a role — even if an `aegis_role` claim is
+        // forged into their JWT — because that is a privilege-escalation
+        // surface (a consumer token granting itself `aegis:admin`).
         match &token.identity.identity_kind {
             IdentityKind::Operator { aegis_role } => Ok(aegis_role.clone()),
-            _ => {
-                // Try extracting from raw claims as a fallback
-                token
-                    .raw_claims
-                    .get(&self.claims_config.aegis_role)
-                    .and_then(|v| v.as_str())
-                    .and_then(AegisRole::from_claim)
-                    .ok_or(IamError::MissingClaim {
-                        claim: self.claims_config.aegis_role.clone(),
-                    })
-            }
+            IdentityKind::ConsumerUser { .. }
+            | IdentityKind::TenantUser { .. }
+            | IdentityKind::ServiceAccount { .. } => Err(IamError::InvalidClaimValue {
+                claim: self.claims_config.aegis_role.clone(),
+                value: format!(
+                    "resolve_role called with non-operator identity (realm '{}'); \
+                     role resolution is only valid for aegis-system operator tokens",
+                    token.identity.realm_slug
+                ),
+            }),
         }
     }
 
@@ -741,6 +750,193 @@ mod tests {
 
         let role = service.resolve_role(&token).unwrap();
         assert_eq!(role, AegisRole::Admin);
+    }
+
+    // ── Realm-enforcement regression tests ───────────────────────────────────
+    //
+    // `resolve_tier` and `resolve_role` previously had a permissive raw-claims
+    // fallback in the `_` arm: an aegis-system Operator token with a
+    // `zaru_tier` claim would silently resolve to a consumer tier, and a
+    // consumer token with a forged `aegis_role` claim would silently resolve
+    // to a privileged role. These tests pin the realm-enforcement contract
+    // documented on the `IdentityProvider` trait.
+
+    fn raw_claims_with(claim: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({ claim: value })
+    }
+
+    #[test]
+    fn resolve_tier_rejects_operator_identity_even_with_zaru_tier_claim() {
+        let config = IamConfig {
+            realms: vec![],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus);
+
+        let token = ValidatedIdentityToken {
+            identity: UserIdentity {
+                sub: "operator-sub".to_string(),
+                realm_slug: "aegis-system".to_string(),
+                email: None,
+                name: None,
+                identity_kind: IdentityKind::Operator {
+                    aegis_role: AegisRole::Admin,
+                },
+            },
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            // Forged claim: even if a `zaru_tier` claim is present, an
+            // aegis-system identity MUST NOT resolve a tier.
+            raw_claims: raw_claims_with("zaru_tier", "enterprise"),
+        };
+
+        let err = service.resolve_tier(&token).expect_err(
+            "resolve_tier on an Operator identity must fail; falling back to raw claims is a \
+             realm-crossing leak",
+        );
+        assert!(
+            matches!(err, IamError::InvalidClaimValue { .. }),
+            "expected InvalidClaimValue, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_tier_rejects_service_account_identity() {
+        let config = IamConfig {
+            realms: vec![],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus);
+
+        let token = ValidatedIdentityToken {
+            identity: UserIdentity {
+                sub: "sa-sub".to_string(),
+                realm_slug: "aegis-system".to_string(),
+                email: None,
+                name: None,
+                identity_kind: IdentityKind::ServiceAccount {
+                    client_id: "aegis-sdk-python".to_string(),
+                },
+            },
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            raw_claims: raw_claims_with("zaru_tier", "pro"),
+        };
+
+        let err = service
+            .resolve_tier(&token)
+            .expect_err("ServiceAccount identities have no consumer tier");
+        assert!(matches!(err, IamError::InvalidClaimValue { .. }));
+    }
+
+    #[test]
+    fn resolve_role_rejects_consumer_identity_even_with_aegis_role_claim() {
+        let config = IamConfig {
+            realms: vec![],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus);
+
+        let token = ValidatedIdentityToken {
+            identity: UserIdentity {
+                sub: "consumer-sub".to_string(),
+                realm_slug: "zaru-consumer".to_string(),
+                email: None,
+                name: None,
+                identity_kind: IdentityKind::ConsumerUser {
+                    zaru_tier: ZaruTier::Free,
+                    tenant_id: crate::domain::tenant::TenantId::consumer(),
+                },
+            },
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            // Privilege-escalation attempt: a consumer token carrying a
+            // forged `aegis_role: aegis:admin` claim. resolve_role MUST
+            // reject this and never extract the role from raw claims.
+            raw_claims: raw_claims_with("aegis_role", "aegis:admin"),
+        };
+
+        let err = service.resolve_role(&token).expect_err(
+            "resolve_role on a ConsumerUser must fail — granting admin to a consumer token is a \
+             privilege-escalation surface",
+        );
+        assert!(
+            matches!(err, IamError::InvalidClaimValue { .. }),
+            "expected InvalidClaimValue, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_role_rejects_tenant_user_identity() {
+        let config = IamConfig {
+            realms: vec![],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus);
+
+        let token = ValidatedIdentityToken {
+            identity: UserIdentity {
+                sub: "tenant-user-sub".to_string(),
+                realm_slug: "tenant-acme".to_string(),
+                email: None,
+                name: None,
+                identity_kind: IdentityKind::TenantUser {
+                    tenant_slug: "acme".to_string(),
+                },
+            },
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            raw_claims: raw_claims_with("aegis_role", "aegis:operator"),
+        };
+
+        let err = service
+            .resolve_role(&token)
+            .expect_err("TenantUser identities are not aegis-system operators");
+        assert!(matches!(err, IamError::InvalidClaimValue { .. }));
+    }
+
+    #[test]
+    fn resolve_role_rejects_service_account_identity() {
+        let config = IamConfig {
+            realms: vec![],
+            jwks_cache_ttl_seconds: 300,
+            claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
+        };
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardIamService::new(&config, event_bus);
+
+        let token = ValidatedIdentityToken {
+            identity: UserIdentity {
+                sub: "sa-sub".to_string(),
+                realm_slug: "aegis-system".to_string(),
+                email: None,
+                name: None,
+                identity_kind: IdentityKind::ServiceAccount {
+                    client_id: "aegis-sdk-python".to_string(),
+                },
+            },
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            raw_claims: raw_claims_with("aegis_role", "aegis:admin"),
+        };
+
+        let err = service
+            .resolve_role(&token)
+            .expect_err("ServiceAccounts are not human operators and cannot resolve a role");
+        assert!(matches!(err, IamError::InvalidClaimValue { .. }));
     }
 
     // ── ADR-097 footgun #1 regression tests ──────────────────────────────────
