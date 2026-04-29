@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # SEAL Replay-Nonce Store (Audit 002 §4.17)
 //!
-//! A SEAL envelope is fresh for at most 30 seconds (see
-//! [`crate::infrastructure::seal::envelope::SealEnvelope::signed_message`]).
-//! Without per-envelope nonce tracking an attacker who passively captures a
-//! signed envelope can replay it any number of times within that window.
+//! A SEAL envelope is fresh for at most 30 seconds (enforced by the freshness
+//! check inside [`crate::infrastructure::seal::envelope::SealEnvelope`] during
+//! signature verification). Without per-envelope nonce tracking an attacker
+//! who passively captures a signed envelope can replay it any number of times
+//! within that window.
 //!
 //! This module provides a small, dependency-free in-memory store keyed by the
 //! envelope's [`crate::domain::seal_session::EnvelopeVerifier::replay_nonce`]

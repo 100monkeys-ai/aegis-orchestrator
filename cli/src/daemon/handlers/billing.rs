@@ -4904,23 +4904,39 @@ mod tests {
 // ──────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod stripe_error_leak_tests {
+    /// Returns true if the match at `start` is inside a `//` line-comment
+    /// (i.e., the line's first non-whitespace token is `//`). This skips
+    /// the test module's own documentation lines that mention the pattern
+    /// being scanned for, without false-negatives on real source code.
+    fn match_is_in_line_comment(src: &str, start: usize) -> bool {
+        let line_start = src[..start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_prefix = &src[line_start..start];
+        let trimmed = line_prefix.trim_start();
+        trimmed.starts_with("//")
+    }
+
     /// 4.25 regression: no HTTP error body in this handler interpolates the
     /// raw error value (`{e}`) into the response JSON. SDK errors must be
     /// logged at warn/error and replaced with a static public message.
     #[test]
     fn no_format_e_in_http_error_bodies() {
         let src = include_str!("billing.rs");
-        // Walk the source and assert that no `Json(json!({"error": format!(`
-        // call contains a `{e}` interpolation. We allow `format!` for
-        // non-error fields (e.g. constructing identifiers) and we allow
+        // Walk the source and assert that no real call site contains a
+        // `{e}` interpolation. Matches inside `//` line-comments (e.g. this
+        // test module's own documentation) are skipped. We allow `format!`
+        // for non-error fields (e.g. constructing identifiers) and we allow
         // `format!` strings that DO NOT contain `{e}` (the two remaining
-        // sites at the time of writing interpolate static config inputs —
-        // tier name and billing interval — not SDK errors).
+        // real sites interpolate static config inputs — tier name and
+        // billing interval — not SDK errors).
         let needle = "Json(json!({\"error\": format!(";
         let mut idx = 0usize;
         let mut offenders: Vec<String> = Vec::new();
         while let Some(pos) = src[idx..].find(needle) {
             let start = idx + pos;
+            if match_is_in_line_comment(src, start) {
+                idx = start + needle.len();
+                continue;
+            }
             // Take up to the next `)})),` to bound the call.
             let tail = &src[start..];
             let end = tail.find(")}))").unwrap_or(tail.len().min(400));
@@ -4942,16 +4958,21 @@ mod stripe_error_leak_tests {
 
     /// 4.25 regression: no HTTP error body uses `Display` of an error type
     /// via `{e}`/`{err}` even outside a `format!(` (catches multi-line
-    /// `json!({"error": format!(\n...\n)})` blocks).
+    /// `json!({"error": format!(\n...\n)})` blocks). Matches inside `//`
+    /// line-comments are skipped to avoid false positives on this module's
+    /// own documentation.
     #[test]
     fn no_e_interpolation_in_json_error_bodies() {
         let src = include_str!("billing.rs");
-        // Find every `"error": format!(` and look forward for `{e}`.
         let needle = "\"error\": format!(";
         let mut idx = 0usize;
         let mut offenders: Vec<usize> = Vec::new();
         while let Some(pos) = src[idx..].find(needle) {
             let start = idx + pos;
+            if match_is_in_line_comment(src, start) {
+                idx = start + needle.len();
+                continue;
+            }
             let tail = &src[start..];
             let end = tail.find("))").unwrap_or(tail.len().min(400));
             let snippet = &tail[..end];
