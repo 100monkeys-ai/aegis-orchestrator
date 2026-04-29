@@ -904,6 +904,13 @@ fn classify_seal_error(e: &crate::domain::seal_session::SealSessionError) -> Sea
             SealErrorClass::PolicyFeedback
         }
 
+        // Transient external-service failure (e.g. Brave Search HTTP 429,
+        // remote fetch transport error). The LLM should see this as a normal
+        // tool error and decide whether to retry, change query, or give up —
+        // it MUST NOT terminate the inner loop. Listed explicitly so the
+        // contract is grep-able and survives future enum additions.
+        SealSessionError::UpstreamUnavailable(_) => SealErrorClass::Recoverable,
+
         // Everything else (MalformedPayload, SessionExpired, etc.) is recoverable.
         _ => SealErrorClass::Recoverable,
     }
@@ -986,5 +993,47 @@ mod tests {
     fn session_expired_is_recoverable() {
         let err = SealSessionError::SessionExpired;
         assert_eq!(classify_seal_error(&err), SealErrorClass::Recoverable);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: Bug 2 — a transient upstream failure (e.g. Brave Search
+    // returning HTTP 429 Too Many Requests) MUST be classified as
+    // `Recoverable`, never as `Fatal`. Prior to the fix, web_tools.rs wrapped
+    // the 429 in `SealSessionError::SignatureVerificationFailed`, which the
+    // classifier then routed to `Fatal`, terminating the inner loop and
+    // returning HTTP 500 to the bootstrap caller. After the fix, transient
+    // upstream failures use `SealSessionError::UpstreamUnavailable` and are
+    // fed back to the LLM so it can adapt (ADR-005 iterative refinement).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn upstream_unavailable_is_recoverable_not_fatal() {
+        let err = SealSessionError::UpstreamUnavailable(
+            "web.search Brave API returned 429 Too Many Requests".to_string(),
+        );
+        let class = classify_seal_error(&err);
+        assert_eq!(
+            class,
+            SealErrorClass::Recoverable,
+            "Brave 429 (UpstreamUnavailable) must be Recoverable so the inner loop continues, got {class:?}"
+        );
+        assert_ne!(
+            class,
+            SealErrorClass::Fatal,
+            "Brave 429 (UpstreamUnavailable) must NOT be Fatal — terminating the inner loop on a transient upstream rate-limit is the bug we are guarding against"
+        );
+    }
+
+    #[test]
+    fn upstream_unavailable_display_does_not_mention_signature() {
+        // Companion to the web_tools test: the Display impl for the new
+        // variant must not contain the phrase "Signature verification" so
+        // operators reading logs are not misled into chasing a SEAL bug.
+        let err =
+            SealSessionError::UpstreamUnavailable("web.search Brave API returned 429".to_string());
+        let s = err.to_string();
+        assert!(
+            !s.contains("Signature verification"),
+            "UpstreamUnavailable must not be displayed as a signature failure: {s}"
+        );
     }
 }

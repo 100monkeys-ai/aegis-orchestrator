@@ -8,11 +8,20 @@ use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::seal_session::SealSessionError;
 use async_trait::async_trait;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::log_sanitizer::sanitize_url;
 
 const MAX_SEARCH_RESULTS: u32 = 20;
+
+/// Maximum number of attempts for a Brave Search request when the upstream
+/// returns a transient failure (HTTP 429 / 5xx). The first attempt counts
+/// as attempt 1, so total attempts (initial + retries) equals this value.
+const BRAVE_MAX_ATTEMPTS: u32 = 3;
+
+/// Base backoff in milliseconds between Brave Search retries. The delay
+/// before retry `n` (1-indexed) is `BRAVE_RETRY_BACKOFF_MS * 2^(n-1)`.
+const BRAVE_RETRY_BACKOFF_MS: u64 = 250;
 
 pub struct ReqwestWebToolAdapter {
     api_key: Option<String>,
@@ -76,30 +85,78 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
         let url = format!("{}/res/v1/web/search", self.brave_base_url);
 
         let client = reqwest::Client::new();
-        let response = client
-            .get(&url)
-            .query(&[("q", &request.query), ("count", &count.to_string())])
-            .header("Accept", "application/json")
-            .header("X-Subscription-Token", &api_key)
-            .send()
-            .await
-            .map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!(
-                    "web.search request failed: {e}"
-                ))
-            })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            return Err(SealSessionError::SignatureVerificationFailed(format!(
-                "web.search Brave API returned {status}"
-            )));
+        // Retry transient upstream failures (HTTP 429, 5xx, transport errors)
+        // with exponential backoff. Permanent failures (4xx other than 429)
+        // are surfaced immediately. Per ADR-005 a transient external-service
+        // error MUST be classified as recoverable so the inner loop can
+        // continue (see `classify_seal_error`).
+        let mut last_transient_err: Option<SealSessionError> = None;
+        let mut response_opt = None;
+        for attempt in 1..=BRAVE_MAX_ATTEMPTS {
+            let send_result = client
+                .get(&url)
+                .query(&[("q", &request.query), ("count", &count.to_string())])
+                .header("Accept", "application/json")
+                .header("X-Subscription-Token", &api_key)
+                .send()
+                .await;
+
+            match send_result {
+                Err(e) => {
+                    // Transport-level failure: retryable.
+                    last_transient_err = Some(SealSessionError::UpstreamUnavailable(format!(
+                        "web.search request failed (attempt {attempt}/{BRAVE_MAX_ATTEMPTS}): {e}"
+                    )));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        response_opt = Some(resp);
+                        break;
+                    }
+                    if status.as_u16() == 429 || status.is_server_error() {
+                        // Transient — eligible for retry.
+                        last_transient_err = Some(SealSessionError::UpstreamUnavailable(format!(
+                            "web.search Brave API returned {status} (attempt {attempt}/{BRAVE_MAX_ATTEMPTS})"
+                        )));
+                    } else {
+                        // Permanent client error (e.g. 401 invalid key, 400
+                        // bad request) — do not retry. Surface as
+                        // UpstreamUnavailable so the LLM sees the failure
+                        // class without it being mislabeled as a SEAL
+                        // signature problem.
+                        return Err(SealSessionError::UpstreamUnavailable(format!(
+                            "web.search Brave API returned {status}"
+                        )));
+                    }
+                }
+            }
+
+            if attempt < BRAVE_MAX_ATTEMPTS {
+                let backoff = BRAVE_RETRY_BACKOFF_MS.saturating_mul(1u64 << (attempt - 1));
+                warn!(
+                    attempt,
+                    backoff_ms = backoff,
+                    "web.search transient failure — retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+            }
         }
 
+        let response = match response_opt {
+            Some(r) => r,
+            None => {
+                return Err(last_transient_err.unwrap_or_else(|| {
+                    SealSessionError::UpstreamUnavailable(
+                        "web.search exhausted retries with no recorded error".to_string(),
+                    )
+                }));
+            }
+        };
+
         let brave_resp: BraveSearchResponse = response.json().await.map_err(|e| {
-            SealSessionError::SignatureVerificationFailed(format!(
-                "web.search response parse failed: {e}"
-            ))
+            SealSessionError::UpstreamUnavailable(format!("web.search response parse failed: {e}"))
         })?;
 
         let results: Vec<serde_json::Value> = brave_resp
@@ -159,7 +216,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
                     "content": content
                 })))
             }
-            Err(e) => Err(SealSessionError::SignatureVerificationFailed(format!(
+            Err(e) => Err(SealSessionError::UpstreamUnavailable(format!(
                 "Web fetch failed: {e}"
             ))),
         }
@@ -291,6 +348,135 @@ mod tests {
         assert!(result.is_err(), "non-2xx must return Err");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("401"), "error must include status code: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: Bug 1 — Brave HTTP 429 (or any upstream HTTP failure) MUST
+    // NOT be reported as a SEAL "Signature verification failed" error.
+    // Prior to the fix, web_tools.rs wrapped every upstream failure (transport
+    // error, non-2xx, JSON parse error) in
+    // `SealSessionError::SignatureVerificationFailed`, which both produced a
+    // misleading error message AND caused the inner-loop classifier to mark
+    // the failure as Fatal (terminating the inner loop).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_search_brave_429_is_not_reported_as_signature_failure() {
+        let mut server = mockito::Server::new_async().await;
+        // 429 returned by every attempt — the retry path should also produce
+        // an UpstreamUnavailable error, never a signature-verification one.
+        let _mock = server
+            .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(429)
+            .with_body(r#"{"message":"Too Many Requests"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let adapter =
+            ReqwestWebToolAdapter::with_base_url(Some("test-key".to_string()), server.url());
+        let result = adapter
+            .search(WebSearchRequest {
+                query: "Zion National Park Angels Landing hike".to_string(),
+                max_results: 5,
+            })
+            .await;
+        assert!(result.is_err(), "429 must surface as Err");
+        let err = result.unwrap_err();
+        // Bug 1 assertion: the displayed string MUST NOT contain
+        // "Signature verification failed".
+        let err_str = err.to_string();
+        assert!(
+            !err_str.contains("Signature verification"),
+            "429 must not be reported as signature verification failure, got: {err_str}"
+        );
+        // The error variant MUST be UpstreamUnavailable so the inner-loop
+        // classifier routes it to Recoverable (not Fatal).
+        assert!(
+            matches!(err, SealSessionError::UpstreamUnavailable(_)),
+            "429 must be UpstreamUnavailable, got: {err:?}"
+        );
+        assert!(
+            err_str.contains("429"),
+            "error must include the upstream status: {err_str}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: 429 from Brave should be retried with backoff before
+    // surfacing as an error. If the upstream becomes available on a retry,
+    // the call must succeed.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_search_brave_429_is_retried_then_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        // First call: 429. Second call: 200.
+        let mock_429 = server
+            .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(429)
+            .with_body(r#"{"message":"Too Many Requests"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let mock_ok = server
+            .mock("GET", "/res/v1/web/search")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"web":{"results":[{"title":"OK","url":"https://x","description":"d"}]}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let adapter =
+            ReqwestWebToolAdapter::with_base_url(Some("test-key".to_string()), server.url());
+        let result = adapter
+            .search(WebSearchRequest {
+                query: "test".to_string(),
+                max_results: 5,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "429 followed by 200 must succeed via retry: {:?}",
+            result
+        );
+        mock_429.assert_async().await;
+        mock_ok.assert_async().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a transport-level failure (e.g. unreachable host) MUST
+    // also surface as UpstreamUnavailable, never as a signature failure.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_search_transport_error_is_upstream_unavailable() {
+        // Point at a port that's not listening. reqwest will fail with a
+        // connection error after a short timeout.
+        let adapter = ReqwestWebToolAdapter::with_base_url(
+            Some("test-key".to_string()),
+            // Reserved test port range, nothing listening.
+            "http://127.0.0.1:1".to_string(),
+        );
+        let result = adapter
+            .search(WebSearchRequest {
+                query: "test".to_string(),
+                max_results: 5,
+            })
+            .await;
+        assert!(result.is_err(), "transport failure must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SealSessionError::UpstreamUnavailable(_)),
+            "transport failure must be UpstreamUnavailable, got: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("Signature verification"),
+            "transport failure must not mention signature verification: {err}"
+        );
     }
 
     #[tokio::test]
