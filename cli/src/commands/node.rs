@@ -229,6 +229,10 @@ async fn join_cluster(
             aegis_orchestrator_core::domain::node_config::NodeRole::Hybrid => {
                 NodeRole::Hybrid.into()
             }
+            aegis_orchestrator_core::domain::node_config::NodeRole::Edge => NodeRole::Edge.into(),
+            aegis_orchestrator_core::domain::node_config::NodeRole::RelayCoordinator => {
+                NodeRole::RelayCoordinator.into()
+            }
         },
         public_key: signing_key.verifying_key().to_bytes().to_vec(),
         capabilities: Some(NodeCapabilities {

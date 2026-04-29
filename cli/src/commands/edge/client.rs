@@ -19,7 +19,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::auth::profile::load_store;
+use crate::auth::load_store;
 
 pub struct EdgeApiClient {
     base_url: String,

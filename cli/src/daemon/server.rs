@@ -2634,6 +2634,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                             aegis_orchestrator_core::infrastructure::aegis_cluster_proto::NodeRole::Hybrid
                                                 as i32
                                         }
+                                        NodeRole::Edge => {
+                                            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::NodeRole::Edge
+                                                as i32
+                                        }
+                                        NodeRole::RelayCoordinator => {
+                                            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::NodeRole::RelayCoordinator
+                                                as i32
+                                        }
                                     };
 
                                     let capabilities =
