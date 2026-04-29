@@ -31,6 +31,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 use crate::domain::cluster::MergedConfig;
 
@@ -507,6 +508,20 @@ pub struct NetworkConfig {
     /// Network bind address (e.g. "0.0.0.0" or "127.0.0.1")
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+
+    /// Operator-acknowledged opt-out of the security audit 002 §4.27 gate
+    /// that refuses to start when `bind_address` is non-loopback and `tls`
+    /// is unset.
+    ///
+    /// Set `true` only when TLS is terminated UPSTREAM of this pod by a
+    /// trusted-network ingress (e.g. Caddy in the `aegis-zaru-edge` pod) and
+    /// the bound endpoint is therefore only reachable from inside the
+    /// trusted pod-network. The validator emits a `WARN`-level entry on
+    /// every boot so the override is visible in startup logs and audit
+    /// trails. Setting this `true` on a publicly-exposed host is a serious
+    /// security regression.
+    #[serde(default)]
+    pub allow_insecure_bind: bool,
 
     /// HTTP API port
     #[serde(default = "default_api_port")]
@@ -1973,6 +1988,7 @@ impl NodeConfigManifest {
                     orchestrator_endpoint: None,
                     heartbeat_interval_seconds: default_heartbeat(),
                     tls: None,
+                    allow_insecure_bind: false,
                 });
                 if network.port == default_api_port() {
                     network.port = port;
@@ -1990,6 +2006,7 @@ impl NodeConfigManifest {
                     orchestrator_endpoint: None,
                     heartbeat_interval_seconds: default_heartbeat(),
                     tls: None,
+                    allow_insecure_bind: false,
                 });
                 if network.bind_address == default_bind_address() {
                     network.bind_address = host;
@@ -2190,15 +2207,31 @@ impl NodeConfigManifest {
 
         // Security audit 002 §4.27: refuse to start when a non-loopback HTTP
         // bind has no TLS configured. Loopback (127.0.0.1, ::1, localhost)
-        // remains permissive for local development.
+        // remains permissive for local development. Operators terminating TLS
+        // upstream of this pod (Caddy ingress in the trusted pod-network)
+        // can opt out via `spec.network.allow_insecure_bind: true`; doing so
+        // emits a startup WARN every boot for audit-trail visibility.
         if let Some(network) = &self.spec.network {
             if !is_loopback_bind(&network.bind_address) && network.tls.is_none() {
-                anyhow::bail!(
-                    "spec.network.bind_address '{}' is non-loopback but spec.network.tls is not configured. \
-                     Bind to '127.0.0.1' for local development, or configure TLS to expose externally \
-                     (security audit 002 §4.27).",
-                    network.bind_address
-                );
+                if network.allow_insecure_bind {
+                    warn!(
+                        bind_address = %network.bind_address,
+                        "spec.network.allow_insecure_bind is set: this pod is bound to a \
+                         non-loopback interface ('{}') without TLS. Operator-acknowledged for \
+                         trusted-network deployments where TLS is terminated upstream (e.g. \
+                         Caddy ingress). DO NOT set this on a publicly-exposed host \
+                         (security audit 002 §4.27).",
+                        network.bind_address
+                    );
+                } else {
+                    anyhow::bail!(
+                        "spec.network.bind_address '{}' is non-loopback but spec.network.tls is not configured. \
+                         Bind to '127.0.0.1' for local development, configure TLS to expose externally, \
+                         or set spec.network.allow_insecure_bind: true to acknowledge that TLS is \
+                         terminated upstream of this pod (security audit 002 §4.27).",
+                        network.bind_address
+                    );
+                }
             }
         }
 
@@ -2709,6 +2742,14 @@ path: "/metrics"
     }
 
     fn manifest_with_network(bind: &str, tls: Option<TlsConfig>) -> NodeConfigManifest {
+        manifest_with_network_full(bind, tls, false)
+    }
+
+    fn manifest_with_network_full(
+        bind: &str,
+        tls: Option<TlsConfig>,
+        allow_insecure_bind: bool,
+    ) -> NodeConfigManifest {
         let mut manifest = NodeConfigManifest::default();
         // Required scalar; default leaves empty in test path.
         manifest.spec.node.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
@@ -2719,6 +2760,7 @@ path: "/metrics"
             bind_address: bind.to_string(),
             port: default_api_port(),
             grpc_port: default_grpc_port(),
+            allow_insecure_bind,
         });
         // Minimal LLM provider so unrelated validate() checks pass.
         manifest.spec.llm_providers = vec![LLMProviderConfig {
@@ -2776,6 +2818,51 @@ path: "/metrics"
         manifest
             .validate()
             .expect("external bind WITH TLS must validate");
+    }
+
+    /// Audit 002 §4.27 escape-hatch regression: when `allow_insecure_bind` is
+    /// `true`, the validator must accept a non-loopback bind without TLS.
+    /// This is the SaaS topology where Caddy (in the trusted pod-network)
+    /// terminates TLS upstream of the pod. Default behaviour (flag absent or
+    /// `false`) MUST continue to fail closed.
+    #[test]
+    fn validate_accepts_external_bind_without_tls_when_allow_insecure_bind() {
+        let manifest = manifest_with_network_full("0.0.0.0", None, true);
+        manifest
+            .validate()
+            .expect("non-loopback bind without TLS must validate when allow_insecure_bind is true");
+    }
+
+    /// Audit 002 §4.27 default-fail regression: explicit `allow_insecure_bind: false`
+    /// must behave identically to the field being absent — fail closed when bind
+    /// is non-loopback and TLS is unset.
+    #[test]
+    fn validate_rejects_external_bind_without_tls_when_allow_insecure_bind_false() {
+        let manifest = manifest_with_network_full("0.0.0.0", None, false);
+        let err = manifest
+            .validate()
+            .expect_err("explicit allow_insecure_bind=false must keep fail-closed default");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-loopback") && msg.contains("§4.27"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Audit 002 §4.27 default-deserialization regression: a YAML manifest
+    /// that omits `allow_insecure_bind` MUST default to `false` so the
+    /// fail-closed gate remains the default for any operator who has not
+    /// explicitly opted out.
+    #[test]
+    fn network_config_yaml_without_allow_insecure_bind_defaults_to_false() {
+        let yaml = r#"
+heartbeat_interval_seconds: 30
+bind_address: "0.0.0.0"
+port: 8088
+grpc_port: 50051
+"#;
+        let cfg: NetworkConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert!(!cfg.allow_insecure_bind);
     }
 
     /// Audit 002 §4.9 regression: a non-loopback bind with cluster mode
