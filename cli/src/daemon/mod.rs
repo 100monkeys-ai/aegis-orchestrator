@@ -32,6 +32,7 @@ pub mod edge_lifecycle;
 pub mod handlers;
 #[cfg(unix)]
 pub mod install;
+pub(crate) mod log_sanitize;
 pub mod operator_read_models;
 pub(crate) mod ports;
 pub(crate) mod router;

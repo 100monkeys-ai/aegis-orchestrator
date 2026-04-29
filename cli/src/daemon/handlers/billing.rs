@@ -497,6 +497,19 @@ fn product_name_to_tier(name: &str) -> Option<(&'static str, u32)> {
     }
 }
 
+/// Build the structured-log field set emitted when a Stripe Checkout session
+/// is created.
+///
+/// Audit 002 finding 4.37.15: this helper exists specifically so the absence
+/// of `tenant_id` in the field list can be unit-tested. Per-user-tenant IDs
+/// are quasi-PII under ADR-097; pairing them with a price ID on the same
+/// log line lets a log reader infer a specific human user's intended
+/// subscription tier. Only `price_id` belongs in operational logs — the
+/// tenant is recoverable from Stripe session metadata for reconciliation.
+fn checkout_session_created_log_fields(price_id: &str) -> Vec<(&'static str, String)> {
+    vec![("price_id", price_id.to_string())]
+}
+
 /// Extract the tier prefix from a seat add-on product name.
 ///
 /// Per ADR-111: Pro is personal-only and has no seat add-on. Only Business
@@ -1241,7 +1254,14 @@ pub(crate) async fn create_checkout_handler(
     match params.send(&stripe).await {
         Ok(session) => {
             let url = session.url.unwrap_or_default();
-            info!(tenant_id = %tenant_id, price_id = %body.price_id, "Checkout session created");
+            let fields = checkout_session_created_log_fields(&body.price_id);
+            // Audit 002 finding 4.37.15: do NOT co-log `tenant_id` with
+            // `price_id`. The field set is built by
+            // `checkout_session_created_log_fields` which is unit-tested
+            // to never include `tenant_id`.
+            let (price_id_key, price_id_value) = &fields[0];
+            debug_assert_eq!(*price_id_key, "price_id");
+            info!(price_id = %price_id_value, "Checkout session created");
             (StatusCode::OK, Json(json!({"url": url}))).into_response()
         }
         Err(e) => {
@@ -2524,15 +2544,19 @@ async fn handle_checkout_completed(
         }
     };
 
-    let tenant_id = match aegis_orchestrator_core::domain::tenant::TenantId::from_string(
-        tenant_id_str,
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %e, tenant_id = tenant_id_str, "Invalid tenant_id in checkout metadata");
-            return;
-        }
-    };
+    let tenant_id =
+        match aegis_orchestrator_core::domain::tenant::TenantId::from_string(tenant_id_str) {
+            Ok(id) => id,
+            Err(e) => {
+                // Audit 002 finding 4.37.16: `tenant_id_str` originates from
+                // attacker-controlled Stripe webhook metadata. Sanitize before
+                // logging to prevent CR/LF log-injection that could forge a
+                // second log entry in the daemon's structured-log pipeline.
+                let safe = crate::daemon::log_sanitize::sanitize_for_log(tenant_id_str);
+                warn!(error = %e, tenant_id = %safe, "Invalid tenant_id in checkout metadata");
+                return;
+            }
+        };
 
     let tier_str = obj
         .get("metadata")
@@ -3531,6 +3555,31 @@ mod tests {
     #[ignore = "create_checkout_handler / create_portal_handler require AppState scaffolding and TenantProvisioningService has no trait seam; backstop is covered by integration tests"]
     #[test]
     fn create_checkout_handler_calls_provisioning_when_consumer_user_has_missing_tenant() {}
+
+    /// Audit 002 finding 4.37.15 — regression.
+    ///
+    /// The "Checkout session created" log line previously co-logged
+    /// `tenant_id` with `price_id`, leaking a quasi-PII pairing. The
+    /// fix removed `tenant_id` from the field set; this test pins that.
+    #[test]
+    fn checkout_session_created_log_does_not_include_tenant_id() {
+        let fields = checkout_session_created_log_fields("price_test_xyz");
+        let keys: Vec<&'static str> = fields.iter().map(|(k, _)| *k).collect();
+        assert!(
+            !keys.contains(&"tenant_id"),
+            "tenant_id MUST NOT appear on the same log line as price_id \
+             (audit 002 finding 4.37.15). Fields: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"price_id"),
+            "price_id is the only retained field"
+        );
+        assert_eq!(
+            fields.len(),
+            1,
+            "field set should be just price_id; got {fields:?}"
+        );
+    }
 
     #[test]
     fn product_name_to_tier_maps_base_plans() {
