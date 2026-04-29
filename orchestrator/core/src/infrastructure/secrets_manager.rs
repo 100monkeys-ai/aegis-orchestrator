@@ -564,8 +564,23 @@ impl SecretStore for TestSecretStore {
         data: &[u8],
         signature: &str,
     ) -> Result<bool, SecretsError> {
+        // Audit 002 §4.37.8 — even the in-memory test store must use a
+        // constant-time compare. Although `TestSecretStore` is intended for
+        // unit tests, its `impl SecretStore` is callable from any code path
+        // that ends up wired to it (e.g. dev/CI startup with the no-op
+        // store). A non-CT `==` compiled into the production binary, even
+        // dormant, is a timing-side-channel landmine that a future config
+        // change can detonate. Use the same `subtle::ConstantTimeEq` the
+        // OpenBao path implicitly relies on through `vaultrs`.
+        use subtle::ConstantTimeEq;
         let expected = self.transit_sign(key_name, data).await?;
-        Ok(signature == expected)
+        let presented = signature.as_bytes();
+        let stored = expected.as_bytes();
+        let length_match = (presented.len() == stored.len()) as u8;
+        // Mask to a stable length so `ct_eq` runs identically regardless
+        // of whether the lengths actually match.
+        let lhs = if length_match == 1 { presented } else { stored };
+        Ok((lhs.ct_eq(stored).unwrap_u8() & length_match) == 1)
     }
 
     async fn transit_encrypt(
@@ -1125,6 +1140,51 @@ mod tests {
         let sig = manager.sign("agent-identity", data).await.unwrap();
         let valid = manager.verify("agent-identity", data, &sig).await.unwrap();
         assert!(valid);
+    }
+
+    /// Audit 002 §4.37.8 regression — `TestSecretStore::transit_verify` must
+    /// reject mismatched signatures via constant-time comparison. The
+    /// previous implementation used a plain `signature == expected`, which
+    /// short-circuits on the first differing byte and leaks per-byte timing
+    /// to any caller that can measure verification latency. Even though
+    /// this store is intended for tests, its `impl SecretStore` ships in
+    /// the production binary, so a future config change wiring it up in a
+    /// dev/CI deployment would expose the side channel. Pin the behavioural
+    /// contract: equal signatures must verify, unequal-but-same-length and
+    /// length-mismatched signatures must both reject.
+    #[tokio::test]
+    async fn test_secret_store_transit_verify_constant_time_contract() {
+        let store = TestSecretStore::new();
+
+        // Happy path: a signature produced by `transit_sign` must verify.
+        let sig = store.transit_sign("k", b"payload").await.unwrap();
+        assert!(store.transit_verify("k", b"payload", &sig).await.unwrap());
+
+        // Same length, different bytes — must NOT verify.
+        // Replace the final ASCII char with a different ASCII char of the
+        // same length so the resulting signature has identical byte length
+        // but differs at one position.
+        let mut chars: Vec<char> = sig.chars().collect();
+        if let Some(last) = chars.last_mut() {
+            *last = if *last == 'A' { 'B' } else { 'A' };
+        }
+        let tampered: String = chars.into_iter().collect();
+        assert_eq!(tampered.len(), sig.len(), "tampered must match length");
+        assert_ne!(tampered, sig, "tampered must differ from original");
+        assert!(!store
+            .transit_verify("k", b"payload", &tampered)
+            .await
+            .unwrap());
+
+        // Length mismatch — must also NOT verify and must not panic.
+        assert!(!store.transit_verify("k", b"payload", "").await.unwrap());
+        assert!(!store
+            .transit_verify("k", b"payload", &format!("{sig}-extra"))
+            .await
+            .unwrap());
+
+        // Different payload, same key — must NOT verify.
+        assert!(!store.transit_verify("k", b"different", &sig).await.unwrap());
     }
 
     #[tokio::test]
