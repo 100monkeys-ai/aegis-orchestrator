@@ -179,7 +179,17 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
         return true;
     }
     if let Some(stripped) = pattern.strip_prefix("*.") {
-        return value.ends_with(stripped);
+        // Audit 002 §4.37.1: the documented contract for `*.example.com` is
+        // "matches any immediate-or-deeper subdomain; does NOT match the bare
+        // `example.com`". A naïve `value.ends_with(stripped)` accepts the bare
+        // domain, contradicting the doc and silently widening the allowlist.
+        // Require the matched suffix to be preceded by a `.` so only true
+        // subdomains pass.
+        if value.len() <= stripped.len() {
+            return false;
+        }
+        let split_at = value.len() - stripped.len();
+        return value.as_bytes()[split_at - 1] == b'.' && &value[split_at..] == stripped;
     }
     false
 }
@@ -209,8 +219,18 @@ mod tests {
         let policy = NetworkPolicy::new(PolicyMode::Allow, vec!["*.example.com".to_string()]);
         assert!(policy.allows("api.example.com"));
         assert!(policy.allows("db.example.com"));
-        // The wildcard `ends_with` check also matches the bare domain
-        assert!(policy.allows("example.com"));
+        // Audit 002 §4.37.1 regression: the doc-comment for `allows`
+        // explicitly says `*.example.com` does NOT match the bare
+        // `example.com`. Prior to the fix, the wildcard was implemented
+        // via a naïve `ends_with` and silently matched the apex domain,
+        // widening the allowlist beyond what the manifest declared.
+        assert!(!policy.allows("example.com"));
+        // Suffix-overlap attack: `evilexample.com` must not match
+        // `*.example.com`. Without the leading-dot guard, `ends_with`
+        // would have admitted it.
+        assert!(!policy.allows("evilexample.com"));
+        // Deep subdomains are still permitted.
+        assert!(policy.allows("a.b.example.com"));
         assert!(!policy.allows("evil.com"));
     }
 
