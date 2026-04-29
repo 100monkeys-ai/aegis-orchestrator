@@ -1277,10 +1277,12 @@ fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
     // 5_000 chars is intentionally much larger than normal schema/manifest snippets.
     const LARGE_CONTENT_REPEAT_LEN: usize = 5_000;
     // Regression guardrail for semantic-judge payload compactness.
-    // This bound should remain aligned with semantic judge input-size expectations in production;
-    // if upstream limits change, update this threshold and its rationale accordingly.
+    // 15_000 bytes is a conservative ceiling for this fixture to stay comfortably below
+    // semantic-judge input-size budgets while still catching compaction regressions early.
+    // If upstream limits change, update this threshold and keep this rationale in sync.
     const MAX_SERIALIZED_PAYLOAD_LEN: usize = 15_000;
-    // Validate that large repeated raw content is redacted/truncated from the serialized payload.
+    // Use a 1KB repeated-character sentinel so leaked raw schema/manifest blocks are obvious;
+    // sanitized payloads should not contain uninterrupted runs of this length.
     const REDACTION_CHECK_REPEAT_LEN: usize = 1024;
 
     let execution_id = ExecutionId::new();
@@ -3256,7 +3258,12 @@ mod gateway_timeout_regression {
         // `serve_with_incoming_shutdown`. This eliminates the drop-then-rebind
         // window that allowed another process to claim the port and made the
         // helper flaky under parallel test execution.
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        // Prefer IPv4 loopback, but fall back to IPv6 loopback for environments
+        // where IPv4 localhost is unavailable (for example, IPv6-only CI).
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(_) => TcpListener::bind("[::1]:0").await.expect("bind loopback"),
+        };
         let addr: SocketAddr = listener.local_addr().expect("local_addr");
         let url = format!("http://{addr}");
 
