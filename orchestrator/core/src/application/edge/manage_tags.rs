@@ -2,11 +2,20 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! ADR-117 §D — operator-managed tag mutation.
 
-use anyhow::Result;
 use std::sync::Arc;
 
 use crate::domain::edge::EdgeDaemonRepository;
 use crate::domain::shared_kernel::{NodeId, TenantId};
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq)]
+pub enum ManageTagsError {
+    #[error("edge daemon not found")]
+    NotFound,
+    #[error("cross-tenant tag mutation refused")]
+    Forbidden,
+    #[error("repository error: {0}")]
+    Repo(String),
+}
 
 pub struct ManageTagsService {
     edge_repo: Arc<dyn EdgeDaemonRepository>,
@@ -22,14 +31,15 @@ impl ManageTagsService {
         tenant: &TenantId,
         node_id: NodeId,
         tags: Vec<String>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<String>, ManageTagsError> {
         let edge = self
             .edge_repo
             .get(&node_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("edge {node_id} not found"))?;
+            .await
+            .map_err(|e| ManageTagsError::Repo(e.to_string()))?
+            .ok_or(ManageTagsError::NotFound)?;
         if &edge.tenant_id != tenant {
-            anyhow::bail!("cross-tenant tag mutation refused");
+            return Err(ManageTagsError::Forbidden);
         }
         let mut current = edge.capabilities.tags;
         for t in tags {
@@ -37,7 +47,10 @@ impl ManageTagsService {
                 current.push(t);
             }
         }
-        self.edge_repo.update_tags(&node_id, &current).await?;
+        self.edge_repo
+            .update_tags(&node_id, &current)
+            .await
+            .map_err(|e| ManageTagsError::Repo(e.to_string()))?;
         Ok(current)
     }
 
@@ -46,14 +59,15 @@ impl ManageTagsService {
         tenant: &TenantId,
         node_id: NodeId,
         tags: Vec<String>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<String>, ManageTagsError> {
         let edge = self
             .edge_repo
             .get(&node_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("edge {node_id} not found"))?;
+            .await
+            .map_err(|e| ManageTagsError::Repo(e.to_string()))?
+            .ok_or(ManageTagsError::NotFound)?;
         if &edge.tenant_id != tenant {
-            anyhow::bail!("cross-tenant tag mutation refused");
+            return Err(ManageTagsError::Forbidden);
         }
         let current: Vec<String> = edge
             .capabilities
@@ -61,7 +75,10 @@ impl ManageTagsService {
             .into_iter()
             .filter(|t| !tags.contains(t))
             .collect();
-        self.edge_repo.update_tags(&node_id, &current).await?;
+        self.edge_repo
+            .update_tags(&node_id, &current)
+            .await
+            .map_err(|e| ManageTagsError::Repo(e.to_string()))?;
         Ok(current)
     }
 }
