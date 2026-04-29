@@ -1388,14 +1388,15 @@ impl ToolInvocationService {
         let node_id = resolved_node?;
 
         // Build args struct.
-        let args_struct: prost_types::Struct = match serde_json::from_value(args.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                return Some(Err(SealSessionError::MalformedPayload(format!(
-                    "args must be a JSON object for edge dispatch: {e}"
-                ))));
-            }
-        };
+        let args_struct: prost_types::Struct =
+            match crate::application::edge::json_value_to_prost_struct(args.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Some(Err(SealSessionError::MalformedPayload(format!(
+                        "args must be a JSON object for edge dispatch: {e}"
+                    ))));
+                }
+            };
 
         let dispatch_req = crate::application::edge::dispatch_to_edge::DispatchRequest {
             node_id,
@@ -1485,8 +1486,9 @@ impl ToolInvocationService {
             .ok_or_else(|| SealSessionError::MalformedPayload("missing tool_name".to_string()))?
             .to_string();
         let inner_args = args.get("args").cloned().unwrap_or(serde_json::json!({}));
-        let args_struct: prost_types::Struct = serde_json::from_value(inner_args)
-            .map_err(|e| SealSessionError::MalformedPayload(format!("args: {e}")))?;
+        let args_struct: prost_types::Struct =
+            crate::application::edge::json_value_to_prost_struct(inner_args)
+                .map_err(|e| SealSessionError::MalformedPayload(format!("args: {e}")))?;
 
         let resolved = resolver
             .resolve(&tenant_scope.authenticated_tenant, &target)

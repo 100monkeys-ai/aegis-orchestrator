@@ -152,6 +152,7 @@ impl FleetDispatcher {
                         break;
                     }
                     let outcome = self
+                        .clone()
                         .dispatch_one(&inv, *node_id, tx.clone(), cancel_tx.subscribe())
                         .await;
                     if !accumulate(&mut summary, &outcome, &inv.policy.failure_policy) {

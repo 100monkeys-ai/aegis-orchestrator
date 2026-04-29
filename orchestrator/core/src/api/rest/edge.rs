@@ -503,7 +503,7 @@ async fn fleet_invoke(
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let policy = build_policy(&req)?;
-    let args_struct: Struct = serde_json::from_value(req.args)
+    let args_struct: Struct = crate::application::edge::json_value_to_prost_struct(req.args)
         .map_err(|e| ApiError::bad_request(format!("args must be JSON object: {e}")))?;
     let inv = FleetInvocation {
         fleet_command_id: FleetCommandId::new(),
