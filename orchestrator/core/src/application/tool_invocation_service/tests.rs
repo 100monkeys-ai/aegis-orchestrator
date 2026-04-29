@@ -3240,14 +3240,20 @@ mod gateway_timeout_regression {
         });
 
         // Wait briefly for the server to be ready to accept connections.
+        let mut ready = false;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(20))
                 .is_ok()
             {
+                ready = true;
                 break;
             }
         }
+        assert!(
+            ready,
+            "gateway server did not become ready at {addr} after 50 retries"
+        );
         (url, tx)
     }
 
