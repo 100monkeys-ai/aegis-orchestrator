@@ -1,0 +1,28 @@
+[Unit]
+Description=AEGIS Edge Daemon (ADR-117)
+Documentation=https://github.com/100monkeys-ai/aegis-orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{BINARY_PATH}} --daemon --config %h/.aegis/edge/aegis-config.yaml
+Restart=on-failure
+RestartSec=5s
+
+# Hardening per ADR-117 §B.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=%h/.aegis/edge
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

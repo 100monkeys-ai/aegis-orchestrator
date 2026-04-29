@@ -14,6 +14,7 @@ pub mod config;
 pub mod credential;
 pub mod daemon;
 pub mod down;
+pub mod edge;
 pub mod fuse_daemon;
 pub mod init;
 pub mod node;

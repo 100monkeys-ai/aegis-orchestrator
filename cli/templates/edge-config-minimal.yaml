@@ -1,0 +1,22 @@
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+metadata:
+  name: edge
+spec:
+  node:
+    id: ""
+    type: edge
+  cluster:
+    enabled: true
+    role: edge
+    controller:
+      endpoint: "{{CONTROLLER_ENDPOINT}}"
+      tls:
+        enabled: true
+    node_keypair_path: ~/.aegis/edge/node.key
+    edge:
+      enrollment_token_path: ~/.aegis/edge/enrollment.jwt
+      node_security_token_path: ~/.aegis/edge/node.token
+      capabilities:
+        local_tools: [shell]
+        mount_points: ["/"]

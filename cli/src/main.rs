@@ -118,6 +118,10 @@ enum Commands {
         command: NodeCommand,
     },
 
+    /// AEGIS Edge Mode (ADR-117): user-installed daemons enrolled to a tenant
+    #[command(name = "edge")]
+    Edge(commands::edge::EdgeArgs),
+
     /// Configuration management
     #[command(name = "config")]
     Config {
@@ -265,6 +269,7 @@ async fn main() -> Result<()> {
             commands::node::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
                 .await
         }
+        Some(Commands::Edge(args)) => commands::edge::run(args).await,
         Some(Commands::Config { command }) => {
             commands::config::handle_command(command, cli.config, cli.output).await
         }

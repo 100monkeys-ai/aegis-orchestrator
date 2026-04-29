@@ -28,6 +28,7 @@ pub mod billing_service;
 pub mod client;
 pub(crate) mod cluster_helpers;
 pub(crate) mod container_helpers;
+pub mod edge_lifecycle;
 pub mod handlers;
 #[cfg(unix)]
 pub mod install;
