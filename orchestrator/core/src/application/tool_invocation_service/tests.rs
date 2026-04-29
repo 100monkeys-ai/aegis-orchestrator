@@ -3261,9 +3261,15 @@ mod gateway_timeout_regression {
         let url = format!("http://{addr}");
 
         let (tx, rx) = oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
             let incoming = TcpListenerStream::new(listener);
+            // With TcpListenerStream the kernel accept queue is open as soon
+            // as `bind` returns, so signaling here is effectively immediate;
+            // we keep it as an explicit readiness gate so callers never race
+            // the server task.
+            let _ = ready_tx.send(());
             let _ = tonic::transport::Server::builder()
                 .add_service(GatewayInvocationServiceServer::new(svc))
                 .serve_with_incoming_shutdown(incoming, async {
@@ -3272,24 +3278,9 @@ mod gateway_timeout_regression {
                 .await;
         });
 
-        // Wait briefly for the server to be ready to accept connections.
-        // With TcpListenerStream the kernel accept queue is open as soon as
-        // `bind` returns, so this is effectively immediate — but we keep the
-        // assertion as an explicit readiness gate.
-        let mut ready = false;
-        for _ in 0..50 {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(20))
-                .is_ok()
-            {
-                ready = true;
-                break;
-            }
-        }
-        assert!(
-            ready,
-            "gateway server did not become ready at {addr} after 50 retries"
-        );
+        ready_rx
+            .await
+            .expect("gateway server task dropped before signaling readiness");
         (url, tx)
     }
 
