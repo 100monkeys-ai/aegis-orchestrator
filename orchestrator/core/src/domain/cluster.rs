@@ -21,6 +21,14 @@ use uuid::Uuid;
 
 pub use crate::domain::shared_kernel::NodeId;
 
+pub use crate::domain::edge::{
+    EdgeCapabilities, EdgeConnectionState, EdgeDaemon, EdgeGroup, EdgeGroupId, EdgeRouterError,
+    EdgeSelector, EdgeTarget, EnrollmentToken, EnrollmentTokenClaims, LabelMatch, TagMatch,
+};
+pub use crate::domain::edge_fleet::{
+    FailurePolicy, FleetCommand, FleetCommandId, FleetDispatchPolicy, FleetExecutionResult,
+    FleetMode, FleetSummary, PerNodeOutcome, SkipReason,
+};
 pub use crate::domain::node_config::NodeRole;
 use crate::domain::shared_kernel::{ExecutionId, StimulusId, TenantId};
 use base64::Engine;
@@ -53,6 +61,9 @@ pub struct NodeCluster {
     pub id: ClusterId,
     pub controller_node_id: NodeId,
     pub peers: HashMap<NodeId, NodePeer>,
+    /// ADR-117: edge daemons enrolled against this controller. Tenant-bound;
+    /// access filtered via [`NodeCluster::edges_for_tenant`].
+    pub edges: HashMap<NodeId, EdgeDaemon>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -62,8 +73,25 @@ impl NodeCluster {
             id: ClusterId::new(),
             controller_node_id,
             peers: HashMap::new(),
+            edges: HashMap::new(),
             created_at: Utc::now(),
         }
+    }
+
+    /// ADR-117: edges visible to the given tenant.
+    pub fn edges_for_tenant(&self, tenant: &TenantId) -> Vec<&EdgeDaemon> {
+        self.edges
+            .values()
+            .filter(|e| &e.tenant_id == tenant)
+            .collect()
+    }
+
+    pub fn upsert_edge(&mut self, edge: EdgeDaemon) {
+        self.edges.insert(edge.node_id, edge);
+    }
+
+    pub fn remove_edge(&mut self, node_id: &NodeId) -> Option<EdgeDaemon> {
+        self.edges.remove(node_id)
     }
 
     pub fn register_peer(&mut self, peer: NodePeer) -> Result<(), String> {
@@ -339,6 +367,68 @@ pub enum ClusterEvent {
         node_id: NodeId,
         config_version: String, // SHA-256 hash of config delta
         pushed_at: DateTime<Utc>,
+    },
+    // ── Edge Mode (ADR-117) ────────────────────────────────────────────────
+    EdgeEnrolled {
+        node_id: NodeId,
+        tenant_id: TenantId,
+        enrolled_at: DateTime<Utc>,
+    },
+    EdgeConnected {
+        node_id: NodeId,
+        tenant_id: TenantId,
+        stream_id: String,
+        connected_at: DateTime<Utc>,
+    },
+    EdgeDisconnected {
+        node_id: NodeId,
+        disconnected_at: DateTime<Utc>,
+    },
+    EdgeCommandDispatched {
+        node_id: NodeId,
+        command_id: Uuid,
+        tool_name: String,
+        dispatched_at: DateTime<Utc>,
+    },
+    EdgeRevoked {
+        node_id: NodeId,
+        revoked_at: DateTime<Utc>,
+    },
+    EdgeTagsChanged {
+        node_id: NodeId,
+        tags: Vec<String>,
+        changed_at: DateTime<Utc>,
+    },
+    EdgeGroupCreated {
+        group_id: EdgeGroupId,
+        tenant_id: TenantId,
+        name: String,
+        created_at: DateTime<Utc>,
+    },
+    EdgeGroupUpdated {
+        group_id: EdgeGroupId,
+        updated_at: DateTime<Utc>,
+    },
+    EdgeGroupDeleted {
+        group_id: EdgeGroupId,
+        deleted_at: DateTime<Utc>,
+    },
+    FleetCommandStarted {
+        fleet_command_id: FleetCommandId,
+        tenant_id: TenantId,
+        tool_name: String,
+        targets: Vec<NodeId>,
+        started_at: DateTime<Utc>,
+    },
+    FleetCommandCompleted {
+        fleet_command_id: FleetCommandId,
+        ok: usize,
+        err: usize,
+        completed_at: DateTime<Utc>,
+    },
+    FleetCommandCancelled {
+        fleet_command_id: FleetCommandId,
+        cancelled_at: DateTime<Utc>,
     },
 }
 
@@ -844,6 +934,30 @@ mod tests {
             err.to_string().contains("Cannot activate"),
             "Expected 'Cannot activate' error, got: {err}"
         );
+    }
+
+    #[test]
+    fn edges_for_tenant_filters_by_tenant() {
+        let mut cluster = NodeCluster::new(NodeId::new());
+        let tenant_a = TenantId::new("tenant-a").unwrap();
+        let tenant_b = TenantId::new("tenant-b").unwrap();
+
+        let mk = |tid: TenantId| EdgeDaemon {
+            node_id: NodeId::new(),
+            tenant_id: tid,
+            public_key: vec![],
+            capabilities: EdgeCapabilities::default(),
+            status: NodePeerStatus::Active,
+            connection: EdgeConnectionState::Disconnected { since: Utc::now() },
+            last_heartbeat_at: None,
+            enrolled_at: Utc::now(),
+        };
+        cluster.upsert_edge(mk(tenant_a.clone()));
+        cluster.upsert_edge(mk(tenant_a.clone()));
+        cluster.upsert_edge(mk(tenant_b.clone()));
+
+        assert_eq!(cluster.edges_for_tenant(&tenant_a).len(), 2);
+        assert_eq!(cluster.edges_for_tenant(&tenant_b).len(), 1);
     }
 
     #[test]

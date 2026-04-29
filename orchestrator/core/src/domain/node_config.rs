@@ -1211,6 +1211,47 @@ pub struct ClusterConfig {
     pub sweep_interval_secs: Option<u64>,
     /// TLS configuration for NodeClusterService.
     pub tls: Option<ClusterTlsConfig>,
+    /// ADR-117: edge-mode block. Required when `role = edge`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<EdgeConfig>,
+    /// ADR-117: ingress config for `role = relay-coordinator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<RelayIngressConfig>,
+}
+
+impl ClusterConfig {
+    /// ADR-117 role-aware validator. Independent of [`NodeConfigManifest::validate`]
+    /// so it can be unit-tested without constructing a full manifest.
+    pub fn validate_roles(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        match self.role {
+            NodeRole::Edge => {
+                if self.edge.is_none() {
+                    anyhow::bail!("cluster.edge block required for role=edge");
+                }
+                if self.controller.is_none() {
+                    anyhow::bail!("cluster.controller.endpoint required for role=edge");
+                }
+                // edge does NOT bind a server.
+                if self.cluster_grpc_port != default_cluster_grpc_port() {
+                    anyhow::bail!(
+                        "cluster.cluster_grpc_port must not be set for role=edge (edge does not bind a server)"
+                    );
+                }
+            }
+            NodeRole::RelayCoordinator => {
+                if self.ingress.is_none() {
+                    anyhow::bail!(
+                        "cluster.ingress.public_endpoint required for role=relay-coordinator"
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1222,12 +1263,71 @@ pub struct ClusterControllerConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum NodeRole {
     Controller,
     Worker,
     #[default]
     Hybrid,
+    /// ADR-117: User-installed daemon that connects via long-lived ConnectEdge
+    /// stream and is excluded from worker selection.
+    Edge,
+    /// ADR-117: Multi-tenant SaaS deployment of NodeClusterService specialized
+    /// for edge enrollment and routing (e.g. relay.myzaru.com).
+    RelayCoordinator,
+}
+
+/// ADR-117 edge-mode configuration. Required when `cluster.role = edge`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeConfig {
+    /// Tenant id binding written by `aegis edge enroll`. Immutable post-enrollment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_token_path: Option<PathBuf>,
+    #[serde(default = "default_node_security_token_path")]
+    pub node_security_token_path: PathBuf,
+    #[serde(default = "default_stream_reconnect_backoff")]
+    pub stream_reconnect_backoff_secs: Vec<u64>,
+    #[serde(default)]
+    pub capabilities: EdgeCapabilitiesConfig,
+}
+
+impl Default for EdgeConfig {
+    fn default() -> Self {
+        Self {
+            tenant_id: None,
+            enrollment_token_path: None,
+            node_security_token_path: default_node_security_token_path(),
+            stream_reconnect_backoff_secs: default_stream_reconnect_backoff(),
+            capabilities: EdgeCapabilitiesConfig::default(),
+        }
+    }
+}
+
+fn default_node_security_token_path() -> PathBuf {
+    PathBuf::from("~/.aegis/edge/node.token")
+}
+
+fn default_stream_reconnect_backoff() -> Vec<u64> {
+    vec![1, 2, 5, 15, 60]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EdgeCapabilitiesConfig {
+    #[serde(default)]
+    pub local_tools: Vec<String>,
+    #[serde(default)]
+    pub mount_points: Vec<String>,
+    #[serde(default)]
+    pub custom_labels: std::collections::HashMap<String, String>,
+}
+
+/// ADR-117 ingress configuration — required for `role = relay-coordinator`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayIngressConfig {
+    /// Public endpoint advertised in enrollment tokens via the `cep` claim.
+    pub public_endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2044,6 +2144,10 @@ impl NodeConfigManifest {
             }
         }
 
+        if let Some(cluster) = &self.spec.cluster {
+            cluster.validate_roles()?;
+        }
+
         if self.is_production() {
             if self.spec.database.is_none() {
                 anyhow::bail!("Production nodes must configure spec.database");
@@ -2398,5 +2502,86 @@ mod tests {
         manifest.apply_merged_overlay(&merged).unwrap();
         assert!(manifest.spec.deploy_builtins);
         assert_eq!(manifest.spec.node.id, original_id);
+    }
+
+    // ── ADR-117: NodeRole::Edge / RelayCoordinator + EdgeConfig validator ──
+
+    #[test]
+    fn node_role_edge_serde_kebab_case() {
+        let yaml = serde_yaml::to_string(&NodeRole::Edge).unwrap();
+        assert!(yaml.contains("edge"));
+        let parsed: NodeRole = serde_yaml::from_str("edge\n").unwrap();
+        assert_eq!(parsed, NodeRole::Edge);
+    }
+
+    #[test]
+    fn node_role_relay_coordinator_serde_kebab_case() {
+        let yaml = serde_yaml::to_string(&NodeRole::RelayCoordinator).unwrap();
+        assert!(yaml.contains("relay-coordinator"));
+        let parsed: NodeRole = serde_yaml::from_str("relay-coordinator\n").unwrap();
+        assert_eq!(parsed, NodeRole::RelayCoordinator);
+    }
+
+    #[test]
+    fn cluster_config_edge_role_requires_edge_block_and_controller() {
+        let cfg = ClusterConfig {
+            enabled: true,
+            role: NodeRole::Edge,
+            controller: None,
+            cluster_grpc_port: default_cluster_grpc_port(),
+            peers: vec![],
+            node_keypair_path: default_keypair_path(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            token_refresh_margin_secs: default_token_refresh_margin(),
+            stale_threshold_secs: None,
+            sweep_interval_secs: None,
+            tls: None,
+            edge: None,
+            ingress: None,
+        };
+        assert!(cfg.validate_roles().is_err());
+    }
+
+    #[test]
+    fn cluster_config_edge_role_accepts_complete_block() {
+        let cfg = ClusterConfig {
+            enabled: true,
+            role: NodeRole::Edge,
+            controller: Some(ClusterControllerConfig {
+                endpoint: "relay.myzaru.com:443".into(),
+                token: None,
+            }),
+            cluster_grpc_port: default_cluster_grpc_port(),
+            peers: vec![],
+            node_keypair_path: default_keypair_path(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            token_refresh_margin_secs: default_token_refresh_margin(),
+            stale_threshold_secs: None,
+            sweep_interval_secs: None,
+            tls: None,
+            edge: Some(EdgeConfig::default()),
+            ingress: None,
+        };
+        assert!(cfg.validate_roles().is_ok());
+    }
+
+    #[test]
+    fn cluster_config_relay_coordinator_requires_ingress() {
+        let cfg = ClusterConfig {
+            enabled: true,
+            role: NodeRole::RelayCoordinator,
+            controller: None,
+            cluster_grpc_port: default_cluster_grpc_port(),
+            peers: vec![],
+            node_keypair_path: default_keypair_path(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            token_refresh_margin_secs: default_token_refresh_margin(),
+            stale_threshold_secs: None,
+            sweep_interval_secs: None,
+            tls: None,
+            edge: None,
+            ingress: None,
+        };
+        assert!(cfg.validate_roles().is_err());
     }
 }

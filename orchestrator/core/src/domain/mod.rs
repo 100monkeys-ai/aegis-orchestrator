@@ -55,6 +55,8 @@ pub mod cluster;
 pub mod credential;
 pub mod discovery;
 pub mod dispatch;
+pub mod edge;
+pub mod edge_fleet;
 pub mod env_guard;
 pub mod events;
 pub mod execution;
