@@ -3328,9 +3328,11 @@ mod gateway_timeout_regression {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fetch_gateway_tools_grpc_returns_empty_when_gateway_hangs() {
         // The production code applies a 5s internal `list_tools` timeout.
-        // Both the outer test guard and the elapsed assertion sit just above
-        // that, leaving slack for scheduling without masking a hang.
-        const MAX_ELAPSED_SECS: u64 = 7;
+        // We assert elapsed lands within a tolerance window around that 5s so
+        // the test proves the *internal* timeout fired (not some faster path
+        // and not a runaway hang). The outer guard is a backstop only.
+        const EXPECTED_INTERNAL_TIMEOUT_SECS: u64 = 5;
+        const TIMEOUT_TOLERANCE_MILLIS: u64 = 1500;
         const OUTER_TIMEOUT_SECS: u64 = 7;
 
         let observed = Arc::new(AtomicBool::new(false));
@@ -3359,9 +3361,22 @@ mod gateway_timeout_regression {
             observed.load(Ordering::SeqCst),
             "stub gateway should have received the list_tools call"
         );
+        let min_expected = std::time::Duration::from_millis(
+            EXPECTED_INTERNAL_TIMEOUT_SECS * 1000 - TIMEOUT_TOLERANCE_MILLIS,
+        );
+        let max_expected = std::time::Duration::from_millis(
+            EXPECTED_INTERNAL_TIMEOUT_SECS * 1000 + TIMEOUT_TOLERANCE_MILLIS,
+        );
         assert!(
-            elapsed < std::time::Duration::from_secs(MAX_ELAPSED_SECS),
-            "gateway enumeration must respect the 5s list_tools timeout (took {:?})",
+            elapsed >= min_expected,
+            "gateway enumeration returned too quickly for timeout path (expected >= {:?}, got {:?})",
+            min_expected,
+            elapsed
+        );
+        assert!(
+            elapsed <= max_expected,
+            "gateway enumeration exceeded expected 5s timeout window (expected <= {:?}, got {:?})",
+            max_expected,
             elapsed
         );
     }
