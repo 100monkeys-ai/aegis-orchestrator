@@ -438,7 +438,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let event_bus = Arc::new(EventBus::new(100));
     let operator_read_model = OperatorReadModelStore::spawn_collector(event_bus.clone());
-    let swarm_service = Arc::new(StandardSwarmService::new());
+    let swarm_service =
+        Arc::new(StandardSwarmService::new().with_execution_repository(execution_repo.clone()));
     swarm_service.start_gc_task();
     let iam_service: Option<Arc<dyn IdentityProvider>> = match config.spec.iam.as_ref() {
         Some(iam) => {

@@ -1,16 +1,22 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 //! Swarm handlers and view types.
+//!
+//! All swarm reads are tenant-scoped (audit 002, finding 4.34). Handlers
+//! resolve the caller's tenant via [`resolved_tenant`] and pass it into
+//! every `SwarmService` / inherent method that takes a `SwarmId`.
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
+use axum::Extension;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 use aegis_orchestrator_swarm::application::SwarmService;
 
-use crate::daemon::handlers::{bounded_limit, LimitQuery};
+use crate::daemon::handlers::{bounded_limit, resolved_tenant, LimitQuery};
 use crate::daemon::state::AppState;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -45,18 +51,27 @@ pub(crate) struct SwarmView {
 pub(crate) async fn list_swarms_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
     Query(query): Query<LimitQuery>,
+    request: Request,
 ) -> Result<
     impl axum::response::IntoResponse,
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("swarm:list")?;
-    let swarms = state.swarm_service.list_swarms().await;
+    let tenant_id = resolved_tenant(&request, identity.as_ref().map(|e| &e.0));
+    let swarms = state.swarm_service.list_swarms(&tenant_id).await;
     let limit = bounded_limit(query.limit, swarms.len().max(1), 500);
     let mut items = Vec::new();
     for swarm in swarms.into_iter().take(limit) {
-        let messages = state.swarm_service.messages_for_swarm(swarm.id).await;
-        let locks = state.swarm_service.locks_for_swarm(swarm.id).await;
+        let messages = state
+            .swarm_service
+            .messages_for_swarm(&tenant_id, swarm.id)
+            .await;
+        let locks = state
+            .swarm_service
+            .locks_for_swarm(&tenant_id, swarm.id)
+            .await;
         items.push(SwarmView {
             swarm_id: swarm.id.0.to_string(),
             parent_execution_id: swarm.parent_execution_id.0.to_string(),
@@ -80,17 +95,26 @@ pub(crate) async fn list_swarms_handler(
 pub(crate) async fn get_swarm_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
     Path(swarm_id): Path<Uuid>,
+    request: Request,
 ) -> Result<
     impl axum::response::IntoResponse,
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("swarm:read")?;
+    let tenant_id = resolved_tenant(&request, identity.as_ref().map(|e| &e.0));
     let swarm_id = aegis_orchestrator_swarm::domain::SwarmId(swarm_id);
-    match state.swarm_service.get_swarm(swarm_id).await {
+    match state.swarm_service.get_swarm(&tenant_id, swarm_id).await {
         Ok(Some(swarm)) => {
-            let messages = state.swarm_service.messages_for_swarm(swarm_id).await;
-            let locks = state.swarm_service.locks_for_swarm(swarm_id).await;
+            let messages = state
+                .swarm_service
+                .messages_for_swarm(&tenant_id, swarm_id)
+                .await;
+            let locks = state
+                .swarm_service
+                .locks_for_swarm(&tenant_id, swarm_id)
+                .await;
             let view = SwarmView {
                 swarm_id: swarm.id.0.to_string(),
                 parent_execution_id: swarm.parent_execution_id.0.to_string(),

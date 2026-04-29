@@ -517,7 +517,7 @@ impl StandardExecutionService {
 
         // Cascade cancellation to any child swarm associated with this execution (BC-6).
         if let Some(ref port) = self.swarm_cancellation {
-            if let Err(e) = port.cascade_cancel_for_execution(id).await {
+            if let Err(e) = port.cascade_cancel_for_execution(tenant_id, id).await {
                 tracing::warn!(
                     "swarm cascade cancellation failed for execution {:?}: {}",
                     id,
