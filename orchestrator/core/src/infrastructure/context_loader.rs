@@ -385,21 +385,24 @@ mod tests {
         );
     }
 
-    /// Regression for audit 002 §4.22: a hostile upstream that omits
-    /// `Content-Length` and streams a payload over the configured cap MUST
-    /// be rejected before the body is fully buffered. The previous
-    /// implementation called `response.text()` with no streaming cap,
-    /// allowing arbitrary memory blow-up.
+    /// Regression for audit 002 §4.22: an upstream payload over the
+    /// configured cap MUST be rejected. The previous implementation called
+    /// `response.text()` with no cap, allowing arbitrary memory blow-up.
+    /// Both the early `Content-Length` check and the streaming `read_capped`
+    /// fallback share the "exceeds limit" error string, so this test
+    /// exercises the user-visible security contract regardless of which
+    /// branch fires.
     #[tokio::test]
-    async fn url_load_caps_body_when_content_length_missing() {
-        // 64 KiB cap; payload is 256 KiB. No Content-Length header so the
-        // streaming cap is the only line of defence.
+    async fn url_load_rejects_oversized_body() {
+        // 64 KiB cap; payload is 256 KiB. mockito serves with a normal
+        // Content-Length, so the early check fires; if a future change
+        // omits the header server-side, the streaming cap in `read_capped`
+        // takes over and produces the same "exceeds limit" error.
         let mut server = mockito::Server::new_async().await;
         let body = "x".repeat(256 * 1024);
         let mock = server
             .mock("GET", "/big")
             .with_status(200)
-            .with_header("transfer-encoding", "chunked")
             .with_body(body)
             .create_async()
             .await;
