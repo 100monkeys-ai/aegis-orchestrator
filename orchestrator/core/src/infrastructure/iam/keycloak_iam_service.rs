@@ -459,6 +459,10 @@ impl IdentityProvider for StandardIamService {
         validation.set_issuer(&[&realm.issuer_url]);
         validation.set_audience(&[&realm.audience]);
         validation.validate_exp = true;
+        // Security-critical: enforce `nbf` so tokens are rejected before their
+        // validity window. Do not remove without updating ADR-041 and regression
+        // coverage (the `nbf_in_future_token_is_rejected` test asserts this
+        // behavior).
         validation.validate_nbf = true;
 
         let token_data =
@@ -471,10 +475,11 @@ impl IdentityProvider for StandardIamService {
                         attempted_at: Utc::now(),
                     });
 
-                // Pattern-match on the typed ErrorKind rather than searching
-                // the Display string. The Display impl is not part of
-                // jsonwebtoken's public API contract and could change between
-                // versions, silently breaking expired-token handling.
+                // Match the typed kind variant rather than the Display string.
+                // The Display impl is not part of jsonwebtoken's public API
+                // contract and could change between versions, silently breaking
+                // expired-token handling. Regression coverage:
+                // `expired_token_returns_token_expired_not_signature_invalid`.
                 if matches!(e.kind(), ErrorKind::ExpiredSignature) {
                     IamError::TokenExpired {
                         // The token was already known invalid at this point;
@@ -535,7 +540,16 @@ impl IdentityProvider for StandardIamService {
         })?;
 
         // Reconstruct raw claims including standard + custom claims for audit trail
-        let mut raw_claims = serde_json::to_value(&claims.extra).unwrap_or_default();
+        let mut raw_claims = match serde_json::to_value(&claims.extra) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "Failed to serialize custom JWT claims for audit trail; using empty claims object"
+                );
+                serde_json::Value::default()
+            }
+        };
         if let Some(obj) = raw_claims.as_object_mut() {
             obj.insert(
                 "iss".to_string(),
