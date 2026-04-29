@@ -583,9 +583,15 @@ impl GitRepoService {
         let owned_volumes = self.volume_service.list_volumes(tenant_id, owner).await?;
         let owned_volume_ids: std::collections::HashSet<_> =
             owned_volumes.into_iter().map(|v| v.id).collect();
+        // Audit 002 §4.37.13 — wipe the transient cleartext webhook_secret on
+        // any read path. See `get_binding` for the full rationale.
         Ok(bindings
             .into_iter()
             .filter(|b| owned_volume_ids.contains(&b.volume_id))
+            .map(|mut b| {
+                b.webhook_secret = None;
+                b
+            })
             .collect())
     }
 
@@ -596,7 +602,7 @@ impl GitRepoService {
         tenant_id: &TenantId,
         owner: &str,
     ) -> Result<GitRepoBinding, GitRepoError> {
-        let binding = self
+        let mut binding = self
             .repo
             .find_by_id(id)
             .await?
@@ -608,6 +614,14 @@ impl GitRepoService {
         if !owned_volumes.iter().any(|v| v.id == binding.volume_id) {
             return Err(GitRepoError::BindingNotFound);
         }
+        // Audit 002 §4.37.13 — `webhook_secret` is a transient cleartext slot
+        // surfaced only on initial create/auto-refresh so the caller can
+        // configure the upstream provider. On any subsequent read it MUST be
+        // wiped to enforce the at-rest contract (only `webhook_secret_ciphertext`
+        // + `webhook_lookup_hash` are persisted). Wipe at the service boundary
+        // so this holds regardless of the underlying repository impl (Postgres
+        // never stores it; in-memory repos and tests would otherwise leak it).
+        binding.webhook_secret = None;
         Ok(binding)
     }
 
