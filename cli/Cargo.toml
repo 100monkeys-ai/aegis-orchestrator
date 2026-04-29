@@ -85,6 +85,7 @@ keyring = "3"
 aes-gcm = "0.10"
 tonic = { workspace = true }
 prost = { workspace = true }
+prost-types = "0.14"
 parking_lot = { workspace = true }
 
 # Stripe billing (optional at runtime — feature-gated by STRIPE_SECRET_KEY env)
