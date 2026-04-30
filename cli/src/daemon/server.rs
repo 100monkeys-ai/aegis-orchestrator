@@ -2149,7 +2149,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 fleet_cancel,
             )| {
                 use aegis_orchestrator_core::application::edge::issue_enrollment_token::{
-                    EnrollmentTokenIssuer, IssueEnrollmentToken, RelayProxyEnrollmentTokenIssuer,
+                    EnrollmentTokenIssuer, IssueEnrollmentToken, RelayGrpcEnrollmentTokenIssuer,
                     EDGE_ENROLLMENT_SIGNING_KEY,
                 };
                 use aegis_orchestrator_core::application::edge::manage_groups::ManageGroupsService;
@@ -2198,9 +2198,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         tracing::info!(
                             role = ?cluster_role,
                             relay = %endpoint,
-                            "edge enrollment-token issuer: proxy to relay-coordinator (ADR-117)"
+                            "edge enrollment-token issuer: gRPC to relay-coordinator (ADR-117)"
                         );
-                        Arc::new(RelayProxyEnrollmentTokenIssuer::new(endpoint))
+                        Arc::new(
+                            RelayGrpcEnrollmentTokenIssuer::connect_lazy(endpoint).expect(
+                                "construct RelayGrpcEnrollmentTokenIssuer from configured \
+                                 relay_coordinator_endpoint",
+                            ),
+                        )
                     }
                     None => {
                         tracing::info!(
@@ -2535,7 +2540,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
             );
 
-            let handler = NodeClusterServiceHandler::new(
+            let mut handler = NodeClusterServiceHandler::new(
                 attest_uc,
                 challenge_uc,
                 register_uc,
@@ -2546,6 +2551,64 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 push_config_uc,
                 cluster_repo.clone(),
             );
+
+            // ADR-117: the relay-coordinator (and Hybrid / Controller-without-relay
+            // deployments) hold the OpenBao policy
+            // `transit/sign/edge-enrollment-token` and serve
+            // `IssueEnrollmentToken` directly. Controllers that delegate to a
+            // peer relay leave this absent; the RPC then returns
+            // FailedPrecondition. The dispatch is keyed on the *absence* of
+            // `relay_coordinator_endpoint` — when set, this process proxies
+            // outbound and does not sign.
+            if config
+                .spec
+                .cluster
+                .as_ref()
+                .and_then(|c| c.relay_coordinator_endpoint.clone())
+                .is_none()
+            {
+                use aegis_orchestrator_core::application::edge::issue_enrollment_token::{
+                    IssueEnrollmentToken, EDGE_ENROLLMENT_SIGNING_KEY,
+                };
+                let issuer_url = config
+                    .spec
+                    .zaru
+                    .as_ref()
+                    .and_then(|z| resolve_env_value(&z.public_url).ok())
+                    .unwrap_or_else(|| "aegis-controller".to_string());
+                let cluster_public_endpoint = config
+                    .spec
+                    .cluster
+                    .as_ref()
+                    .and_then(|c| c.ingress.as_ref())
+                    .and_then(|i| resolve_env_value(&i.public_endpoint).ok())
+                    .unwrap_or_else(|| cluster_addr_str.clone());
+                let local_signer = Arc::new(IssueEnrollmentToken::new(
+                    secrets_manager.secret_store(),
+                    issuer_url,
+                    cluster_public_endpoint,
+                    EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+                ));
+                let cluster_grpc_auth = match (&iam_service, config.spec.grpc_auth.clone()) {
+                    (Some(iam), Some(cfg)) if cfg.enabled => Some(
+                        aegis_orchestrator_core::presentation::grpc::auth_interceptor::GrpcIamAuthInterceptor::new(
+                            iam.clone(),
+                            &cfg,
+                        ),
+                    ),
+                    (Some(iam), None) => Some(
+                        aegis_orchestrator_core::presentation::grpc::auth_interceptor::GrpcIamAuthInterceptor::new(
+                            iam.clone(),
+                            &aegis_orchestrator_core::domain::node_config::GrpcAuthConfig {
+                                enabled: true,
+                                exempt_methods: vec![],
+                            },
+                        ),
+                    ),
+                    _ => None,
+                };
+                handler = handler.with_issue_enrollment_token(local_signer, cluster_grpc_auth);
+            }
 
             // Remote storage gRPC handler (ADR-064)
             // Route through AegisFSAL for path sanitization, volume authorization,
@@ -3015,6 +3078,27 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         info!("Built-in template deployment complete");
     } else {
         info!("Built-in template deployment disabled (spec.deploy_builtins = false)");
+    }
+
+    // ADR-117: the relay-coordinator deployment exposes only gRPC on
+    // 50056 — it has no REST surface (the legacy `/v1/edge/enrollment-tokens`
+    // proxy is now `NodeClusterService.IssueEnrollmentToken` over gRPC).
+    // Skip the HTTP listener entirely on this role and idle on the gRPC
+    // server task above.
+    let is_relay = matches!(
+        config.spec.cluster.as_ref().map(|c| c.role),
+        Some(aegis_orchestrator_core::domain::node_config::NodeRole::RelayCoordinator)
+    );
+    if is_relay {
+        info!(
+            "RelayCoordinator role: skipping HTTP listener — gRPC NodeClusterService is the only \
+             ingress (ADR-117)"
+        );
+        // Park here; the gRPC server task owns the lifetime of the
+        // process. SIGTERM is observed via the gRPC shutdown wiring
+        // upstream of this branch.
+        std::future::pending::<()>().await;
+        return Ok(());
     }
 
     let addr = format!("{bind_addr}:{final_port}");

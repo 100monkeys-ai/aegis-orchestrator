@@ -12,10 +12,15 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tonic::metadata::MetadataValue;
+use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::domain::secrets::SecretStore;
 use crate::domain::shared_kernel::TenantId;
+use crate::infrastructure::aegis_cluster_proto::{
+    node_cluster_service_client::NodeClusterServiceClient, IssueEnrollmentTokenRequest,
+};
 
 /// OpenBao Transit signing key name for edge enrollment tokens.
 ///
@@ -38,8 +43,10 @@ pub const EDGE_ENROLLMENT_SIGNING_KEY: &str = "edge-enrollment-token";
 /// Two impls exist:
 /// * [`IssueEnrollmentToken`] — local signer, used by Relay Coordinator,
 ///   Hybrid (single-node), and Controller-without-relay-peer deployments.
-/// * [`RelayProxyEnrollmentTokenIssuer`] — internal HTTP proxy used by
-///   Controller deployments configured with a `relay_coordinator_endpoint`.
+/// * [`RelayGrpcEnrollmentTokenIssuer`] — gRPC client used by Controller
+///   deployments configured with a `relay_coordinator_endpoint`. Calls
+///   `NodeClusterService.IssueEnrollmentToken` on the Relay over the
+///   trusted in-pod network.
 #[async_trait]
 pub trait EnrollmentTokenIssuer: Send + Sync {
     async fn issue(
@@ -184,96 +191,93 @@ impl EnrollmentTokenIssuer for IssueEnrollmentToken {
     }
 }
 
-/// HTTP proxy that forwards enrollment-token requests from a Controller
-/// process to a co-located Relay Coordinator.
+/// gRPC client that forwards enrollment-token requests from a Controller
+/// process to a co-located Relay Coordinator via
+/// `NodeClusterService.IssueEnrollmentToken`.
 ///
 /// ADR-117: only the `relay-coordinator` AppRole holds the OpenBao policy
 /// `transit/sign/edge-enrollment-token`. In SaaS deployments the core
 /// orchestrator pod sits alongside a separate `aegis-relay-coordinator` pod
-/// reachable on the trusted Podman pod-network. The user's Bearer token is
-/// forwarded so the Relay's IAM middleware can authenticate the request
-/// against the same `UserIdentity`/`effective_tenant`.
-pub struct RelayProxyEnrollmentTokenIssuer {
-    http: reqwest::Client,
-    /// Base URL of the Relay Coordinator's REST surface, e.g.
-    /// `http://aegis-relay-coordinator:8088`.
-    endpoint: String,
+/// reachable on the trusted Podman pod-network at port 50056. The user's
+/// Bearer token is forwarded in the `authorization` metadata key and the
+/// resolved tenant in `x-aegis-tenant` so the Relay's per-handler IAM
+/// validation authenticates against the same `UserIdentity` /
+/// `effective_tenant`.
+pub struct RelayGrpcEnrollmentTokenIssuer {
+    client: NodeClusterServiceClient<Channel>,
 }
 
-impl RelayProxyEnrollmentTokenIssuer {
-    pub fn new(endpoint: String) -> Self {
+impl RelayGrpcEnrollmentTokenIssuer {
+    /// Build a lazy-connected client against `endpoint` (e.g.
+    /// `http://aegis-relay-coordinator:50056`). The TCP/HTTP2 connection is
+    /// established on first RPC; constructor does not block on the network.
+    pub fn connect_lazy(endpoint: impl Into<String>) -> Result<Self> {
+        let ep = Endpoint::from_shared(endpoint.into())
+            .map_err(|e| anyhow::anyhow!("invalid relay endpoint: {e}"))?
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5));
+        let channel = ep.connect_lazy();
+        Ok(Self {
+            client: NodeClusterServiceClient::new(channel),
+        })
+    }
+
+    /// Construct directly from an existing channel — primarily for tests
+    /// using in-process tonic transports.
+    pub fn from_channel(channel: Channel) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("build reqwest client"),
-            endpoint,
+            client: NodeClusterServiceClient::new(channel),
         }
     }
-
-    pub fn with_client(endpoint: String, http: reqwest::Client) -> Self {
-        Self { http, endpoint }
-    }
-}
-
-#[derive(Serialize)]
-struct ProxyRequest<'a> {
-    issued_to: &'a str,
-}
-
-#[derive(Deserialize)]
-struct ProxyResponse {
-    token: String,
-    expires_at: String,
-    controller_endpoint: String,
-    qr_payload: String,
-    command_hint: String,
 }
 
 #[async_trait]
-impl EnrollmentTokenIssuer for RelayProxyEnrollmentTokenIssuer {
+impl EnrollmentTokenIssuer for RelayGrpcEnrollmentTokenIssuer {
     async fn issue(
         &self,
         tenant_id: &TenantId,
         issued_to_sub: &str,
         bearer_token: Option<&str>,
     ) -> Result<IssuedEnrollmentToken> {
-        let url = format!(
-            "{}/v1/edge/enrollment-tokens",
-            self.endpoint.trim_end_matches('/')
-        );
-        let mut req = self
-            .http
-            .post(&url)
-            .json(&ProxyRequest {
-                issued_to: issued_to_sub,
-            })
-            .header("X-Tenant-Id", tenant_id.as_str());
+        let mut req = tonic::Request::new(IssueEnrollmentTokenRequest {
+            issued_to: issued_to_sub.to_string(),
+        });
         if let Some(tok) = bearer_token {
-            req = req.bearer_auth(tok);
+            let header = format!("Bearer {tok}");
+            let value: MetadataValue<_> = header
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid bearer token for metadata: {e}"))?;
+            req.metadata_mut().insert("authorization", value);
         }
-        let resp = req
-            .send()
+        let tenant_value: MetadataValue<_> = tenant_id
+            .as_str()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid tenant id for metadata: {e}"))?;
+        req.metadata_mut().insert("x-aegis-tenant", tenant_value);
+
+        let resp = self
+            .client
+            .clone()
+            .issue_enrollment_token(req)
             .await
-            .map_err(|e| anyhow::anyhow!("relay proxy request failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("relay proxy returned {}: {}", status, body);
-        }
-        let body: ProxyResponse = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("relay proxy response decode: {e}"))?;
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
-            .map_err(|e| anyhow::anyhow!("relay proxy expires_at parse: {e}"))?
+            .map_err(|s| {
+                anyhow::anyhow!(
+                    "relay IssueEnrollmentToken failed ({:?}): {}",
+                    s.code(),
+                    s.message()
+                )
+            })?
+            .into_inner();
+
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&resp.expires_at)
+            .map_err(|e| anyhow::anyhow!("relay expires_at parse: {e}"))?
             .with_timezone(&Utc);
         Ok(IssuedEnrollmentToken {
-            token: body.token,
+            token: resp.token,
             expires_at,
-            controller_endpoint: body.controller_endpoint,
-            qr_payload: body.qr_payload,
-            command_hint: body.command_hint,
+            controller_endpoint: resp.controller_endpoint,
+            qr_payload: resp.qr_payload,
+            command_hint: resp.command_hint,
         })
     }
 }
@@ -353,48 +357,6 @@ mod tests {
         );
     }
 
-    /// Regression: ADR-117 SaaS topology. The Relay proxy issuer MUST
-    /// hit `/v1/edge/enrollment-tokens` on the configured endpoint and
-    /// forward both the user's Bearer token and the resolved tenant id
-    /// so the Relay can run the same IAM/tenant middleware against the
-    /// same identity.
-    #[tokio::test]
-    async fn relay_proxy_forwards_bearer_and_tenant_to_v1_path() {
-        use crate::domain::shared_kernel::TenantId;
-
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("POST", "/v1/edge/enrollment-tokens")
-            .match_header("authorization", "Bearer caller-jwt")
-            .match_header("x-tenant-id", "t-consumer")
-            .match_body(mockito::Matcher::JsonString(
-                r#"{"issued_to":"alice"}"#.into(),
-            ))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{
-                    "token": "proxied-token",
-                    "expires_at": "2099-01-01T00:00:00Z",
-                    "controller_endpoint": "relay.myzaru.com:443",
-                    "qr_payload": "aegis edge enroll proxied-token",
-                    "command_hint": "aegis edge enroll proxied-token"
-                }"#,
-            )
-            .create_async()
-            .await;
-
-        let issuer = RelayProxyEnrollmentTokenIssuer::new(server.url());
-        let tenant = TenantId::new("t-consumer").unwrap();
-        let issued = issuer
-            .issue(&tenant, "alice", Some("caller-jwt"))
-            .await
-            .expect("proxy must succeed");
-        assert_eq!(issued.token, "proxied-token");
-        assert_eq!(issued.controller_endpoint, "relay.myzaru.com:443");
-        mock.assert_async().await;
-    }
-
     /// Regression: ADR-117 audit pass 3 SEV-2-C — `IssueEnrollmentToken::issue`
     /// must reject malformed Vault transit envelopes. Prior code silently
     /// fell through to base64-decode garbage.
@@ -422,5 +384,204 @@ mod tests {
                 "unexpected error for {malformed:?}: {msg}"
             );
         }
+    }
+
+    /// Regression: ADR-117 SaaS topology over gRPC. The Relay client MUST
+    /// invoke `NodeClusterService.IssueEnrollmentToken` and forward the
+    /// caller's Bearer token in the `authorization` metadata key plus the
+    /// resolved tenant slug in `x-aegis-tenant` — these are the metadata
+    /// keys the Relay's per-handler `validate_grpc_request` reads.
+    ///
+    /// Replaces the prior REST-proxy test
+    /// `relay_proxy_forwards_bearer_and_tenant_to_v1_path`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_grpc_client_forwards_bearer_and_tenant() {
+        use crate::infrastructure::aegis_cluster_proto::{
+            node_cluster_service_server::{NodeClusterService, NodeClusterServiceServer},
+            AttestNodeRequest, AttestNodeResponse, ChallengeNodeRequest, ChallengeNodeResponse,
+            DeregisterNodeRequest, DeregisterNodeResponse, EdgeCommand, EdgeEvent,
+            ForwardExecutionRequest, IssueEnrollmentTokenResponse, ListPeersRequest,
+            ListPeersResponse, NodeHeartbeatRequest, NodeHeartbeatResponse, PushConfigRequest,
+            PushConfigResponse, RegisterNodeRequest, RegisterNodeResponse, RotateEdgeKeyRequest,
+            RotateEdgeKeyResponse, RouteExecutionRequest, RouteExecutionResponse,
+            SyncConfigRequest, SyncConfigResponse,
+        };
+        use crate::infrastructure::aegis_runtime_proto::ExecutionEvent;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+        use tokio_stream::Stream;
+        use tonic::{transport::Server, Request, Response, Status, Streaming};
+
+        struct CapturingService {
+            captured:
+                Arc<Mutex<Option<(Option<String>, Option<String>, IssueEnrollmentTokenRequest)>>>,
+        }
+        #[tonic::async_trait]
+        impl NodeClusterService for CapturingService {
+            async fn issue_enrollment_token(
+                &self,
+                request: Request<IssueEnrollmentTokenRequest>,
+            ) -> Result<Response<IssueEnrollmentTokenResponse>, Status> {
+                let auth = request
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let tenant = request
+                    .metadata()
+                    .get("x-aegis-tenant")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let inner = request.into_inner();
+                *self.captured.lock().unwrap() = Some((auth, tenant, inner));
+                Ok(Response::new(IssueEnrollmentTokenResponse {
+                    token: "stub-token".into(),
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                    controller_endpoint: "relay.myzaru.com:443".into(),
+                    qr_payload: "aegis edge enroll stub-token".into(),
+                    command_hint: "aegis edge enroll stub-token".into(),
+                }))
+            }
+            // Unused RPCs — return Unimplemented.
+            async fn attest_node(
+                &self,
+                _: Request<AttestNodeRequest>,
+            ) -> Result<Response<AttestNodeResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn challenge_node(
+                &self,
+                _: Request<ChallengeNodeRequest>,
+            ) -> Result<Response<ChallengeNodeResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn register_node(
+                &self,
+                _: Request<RegisterNodeRequest>,
+            ) -> Result<Response<RegisterNodeResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn heartbeat(
+                &self,
+                _: Request<NodeHeartbeatRequest>,
+            ) -> Result<Response<NodeHeartbeatResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn deregister_node(
+                &self,
+                _: Request<DeregisterNodeRequest>,
+            ) -> Result<Response<DeregisterNodeResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn route_execution(
+                &self,
+                _: Request<RouteExecutionRequest>,
+            ) -> Result<Response<RouteExecutionResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            type ForwardExecutionStream =
+                Pin<Box<dyn Stream<Item = Result<ExecutionEvent, Status>> + Send>>;
+            async fn forward_execution(
+                &self,
+                _: Request<ForwardExecutionRequest>,
+            ) -> Result<Response<Self::ForwardExecutionStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn sync_config(
+                &self,
+                _: Request<SyncConfigRequest>,
+            ) -> Result<Response<SyncConfigResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn push_config(
+                &self,
+                _: Request<PushConfigRequest>,
+            ) -> Result<Response<PushConfigResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn list_peers(
+                &self,
+                _: Request<ListPeersRequest>,
+            ) -> Result<Response<ListPeersResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            type ConnectEdgeStream =
+                Pin<Box<dyn Stream<Item = Result<EdgeCommand, Status>> + Send>>;
+            async fn connect_edge(
+                &self,
+                _: Request<Streaming<EdgeEvent>>,
+            ) -> Result<Response<Self::ConnectEdgeStream>, Status> {
+                Err(Status::unimplemented(""))
+            }
+            async fn rotate_edge_key(
+                &self,
+                _: Request<RotateEdgeKeyRequest>,
+            ) -> Result<Response<RotateEdgeKeyResponse>, Status> {
+                Err(Status::unimplemented(""))
+            }
+        }
+
+        // Loopback TCP transport — see tests/edge_mode_grpc.rs for the
+        // canonical in-process tonic pattern. We bind 127.0.0.1:0 (with a
+        // ::1 fallback) so concurrent test runs don't fight over a port.
+        let captured = Arc::new(Mutex::new(None));
+        let svc = CapturingService {
+            captured: captured.clone(),
+        };
+
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(_) => tokio::net::TcpListener::bind("[::1]:0")
+                .await
+                .expect("loopback bind"),
+        };
+        let addr = listener.local_addr().expect("local_addr");
+        let url = format!("http://{addr}");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let _ = Server::builder()
+                .add_service(NodeClusterServiceServer::new(svc))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let channel = Channel::from_shared(url)
+            .unwrap()
+            .connect()
+            .await
+            .expect("connect to in-process server");
+
+        let issuer = RelayGrpcEnrollmentTokenIssuer::from_channel(channel);
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let issued = issuer
+            .issue(&tenant, "alice", Some("caller-jwt"))
+            .await
+            .expect("rpc must succeed");
+
+        assert_eq!(issued.token, "stub-token");
+        assert_eq!(issued.controller_endpoint, "relay.myzaru.com:443");
+
+        let (auth, tenant_meta, inner) = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("server must have observed the call");
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer caller-jwt"),
+            "Bearer token must propagate over the metadata `authorization` key"
+        );
+        assert_eq!(
+            tenant_meta.as_deref(),
+            Some("t-consumer"),
+            "tenant slug must propagate over `x-aegis-tenant`"
+        );
+        assert_eq!(inner.issued_to, "alice");
+
+        let _ = shutdown_tx.send(());
     }
 }

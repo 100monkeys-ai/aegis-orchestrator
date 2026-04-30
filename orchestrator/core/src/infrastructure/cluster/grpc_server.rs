@@ -36,11 +36,14 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::application::edge::connect_edge::ConnectEdgeService;
+use crate::application::edge::issue_enrollment_token::IssueEnrollmentToken;
 use crate::application::edge::rotate_edge_key::RotateEdgeKeyService;
 use crate::infrastructure::aegis_cluster_proto::{
-    EdgeCommand, EdgeEvent, RotateEdgeKeyRequest, RotateEdgeKeyResponse,
+    EdgeCommand, EdgeEvent, IssueEnrollmentTokenRequest, IssueEnrollmentTokenResponse,
+    RotateEdgeKeyRequest, RotateEdgeKeyResponse,
 };
 use crate::infrastructure::edge::grpc_stream::{handle_connect_edge, handle_rotate_edge_key};
+use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
 
 pub struct NodeClusterServiceHandler {
     attest_node_use_case: Arc<AttestNodeUseCase>,
@@ -57,6 +60,17 @@ pub struct NodeClusterServiceHandler {
     /// returns FailedPrecondition.
     connect_edge_service: Option<Arc<ConnectEdgeService>>,
     rotate_edge_key_service: Option<Arc<RotateEdgeKeyService>>,
+    /// ADR-117: present on RelayCoordinator deployments — the relay holds
+    /// the OpenBao policy `transit/sign/edge-enrollment-token` and is the
+    /// canonical signer. Absent elsewhere; calling IssueEnrollmentToken
+    /// returns FailedPrecondition.
+    issue_enrollment_token_use_case: Option<Arc<IssueEnrollmentToken>>,
+    /// Per-handler IAM bearer-JWT validator for the IssueEnrollmentToken
+    /// RPC. The cluster gRPC server has no global interceptor (node-IAM
+    /// RPCs use SealNodeEnvelope), so this validator is plumbed through
+    /// the handler struct and invoked only inside the user-facing
+    /// IssueEnrollmentToken handler. None when grpc_auth is disabled.
+    grpc_auth: Option<GrpcIamAuthInterceptor>,
 }
 
 impl NodeClusterServiceHandler {
@@ -84,6 +98,8 @@ impl NodeClusterServiceHandler {
             cluster_repo,
             connect_edge_service: None,
             rotate_edge_key_service: None,
+            issue_enrollment_token_use_case: None,
+            grpc_auth: None,
         }
     }
 
@@ -96,6 +112,20 @@ impl NodeClusterServiceHandler {
     ) -> Self {
         self.connect_edge_service = Some(connect_edge);
         self.rotate_edge_key_service = Some(rotate);
+        self
+    }
+
+    /// ADR-117: enable IssueEnrollmentToken on the RelayCoordinator. The
+    /// relay is the sole holder of the OpenBao Transit policy
+    /// `transit/sign/edge-enrollment-token`; other deployments leave the
+    /// use-case absent and the RPC returns FailedPrecondition.
+    pub fn with_issue_enrollment_token(
+        mut self,
+        use_case: Arc<IssueEnrollmentToken>,
+        grpc_auth: Option<GrpcIamAuthInterceptor>,
+    ) -> Self {
+        self.issue_enrollment_token_use_case = Some(use_case);
+        self.grpc_auth = grpc_auth;
         self
     }
 
@@ -628,5 +658,58 @@ impl NodeClusterService for NodeClusterServiceHandler {
             .ok_or_else(|| Status::failed_precondition("edge mode disabled on this node"))?
             .clone();
         handle_rotate_edge_key(svc, request).await
+    }
+
+    /// ADR-117: SaaS deployment mints edge enrollment tokens here.
+    ///
+    /// Auth is per-handler (the cluster gRPC server has no global
+    /// interceptor): the bearer JWT is read from the `authorization`
+    /// metadata key and the tenant slug from `x-aegis-tenant`, both via
+    /// `validate_grpc_request`. The Relay Coordinator is the sole holder
+    /// of the OpenBao policy `transit/sign/edge-enrollment-token`; on any
+    /// other deployment the use-case is absent and the RPC returns
+    /// FailedPrecondition.
+    async fn issue_enrollment_token(
+        &self,
+        request: Request<IssueEnrollmentTokenRequest>,
+    ) -> Result<Response<IssueEnrollmentTokenResponse>, Status> {
+        let interceptor = self.grpc_auth.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "IssueEnrollmentToken requires grpc_auth on the cluster server",
+            )
+        })?;
+        let (_identity, tenant, _scope) = validate_grpc_request(
+            interceptor,
+            &request,
+            "/aegis.cluster.v1.NodeClusterService/IssueEnrollmentToken",
+        )
+        .await?
+        .ok_or_else(|| {
+            Status::unauthenticated("IssueEnrollmentToken cannot be marked exempt from auth")
+        })?;
+
+        let signer = self
+            .issue_enrollment_token_use_case
+            .as_ref()
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "edge enrollment-token signing is not enabled on this node",
+                )
+            })?;
+
+        let inner = request.into_inner();
+
+        let issued = signer
+            .issue(&tenant, &inner.issued_to)
+            .await
+            .map_err(|e| Status::internal(format!("issue enrollment token: {e}")))?;
+
+        Ok(Response::new(IssueEnrollmentTokenResponse {
+            token: issued.token,
+            expires_at: issued.expires_at.to_rfc3339(),
+            controller_endpoint: issued.controller_endpoint,
+            qr_payload: issued.qr_payload,
+            command_hint: issued.command_hint,
+        }))
     }
 }

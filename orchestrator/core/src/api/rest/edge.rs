@@ -149,10 +149,11 @@ async fn post_enrollment_token(
     Json(req): Json<IssueTokenRequest>,
 ) -> Result<Json<IssueTokenResponse>, ApiError> {
     // ADR-117: when this process is a Controller without local signing
-    // capability, `issue_token` is a `RelayProxyEnrollmentTokenIssuer` that
-    // forwards the request to the Relay Coordinator. The user's Bearer
-    // token must be propagated so the Relay's IAM middleware authenticates
-    // the request against the same `UserIdentity` / `effective_tenant`.
+    // capability, `issue_token` is a `RelayGrpcEnrollmentTokenIssuer` that
+    // calls `NodeClusterService.IssueEnrollmentToken` on the Relay
+    // Coordinator. The user's Bearer token is forwarded as gRPC metadata
+    // so the Relay's per-handler `validate_grpc_request` authenticates the
+    // same `UserIdentity` / `effective_tenant`.
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -611,7 +612,6 @@ mod tests {
     use crate::application::edge::fleet::{CancelFleetService, EdgeFleetResolver};
     use crate::application::edge::issue_enrollment_token::{
         EnrollmentTokenIssuer, IssueEnrollmentToken, IssuedEnrollmentToken,
-        RelayProxyEnrollmentTokenIssuer,
     };
     use crate::application::edge::manage_groups::ManageGroupsService;
     use crate::application::edge::manage_tags::ManageTagsService;
@@ -930,18 +930,5 @@ mod tests {
             "Bearer token must be forwarded to the issuer for IAM continuity \
              across the in-pod proxy hop (ADR-117)"
         );
-    }
-
-    /// Regression: the proxy issuer constructor must accept the
-    /// in-pod Relay endpoint and target the canonical `/v1/edge/...`
-    /// path. This is a contract test for the path string used over
-    /// the trusted in-pod hop.
-    #[test]
-    fn relay_proxy_issuer_constructs_with_endpoint() {
-        let _issuer =
-            RelayProxyEnrollmentTokenIssuer::new("http://aegis-relay-coordinator:8088".into());
-        // Smoke test — actual HTTP behavior is covered by integration
-        // tests that stand up a mock Relay (out of scope for unit tests
-        // that must not bind sockets).
     }
 }
