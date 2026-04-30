@@ -76,6 +76,7 @@ A local AEGIS setup gives you an orchestrator API, a gRPC surface, and supportin
 
 - Orchestrator API: `http://localhost:8088`
 - gRPC: `localhost:50051`
+- Prometheus metrics: `http://localhost:9091/metrics` (bound to `127.0.0.1` by default; deployments must set `METRICS_BIND=0.0.0.0` for cross-pod scraping)
 - Temporal UI: `http://localhost:8233`
 
 This is enough to start understanding the operator model: the orchestrator owns lifecycle, policy enforcement, and execution visibility, while agents run inside controlled runtimes. Local defaults are tuned for development bring-up rather than full production hardening.
