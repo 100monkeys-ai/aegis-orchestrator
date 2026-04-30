@@ -29,7 +29,6 @@ pub enum Action {
     EnsurePerms { path: PathBuf, mode: u32 },
     GenerateConfig { path: PathBuf, minimal: bool },
     GenerateKeypair { path: PathBuf },
-    WriteToken { path: PathBuf },
     InstallService { path: PathBuf, kind: ServiceKind },
 }
 
@@ -74,9 +73,12 @@ impl BootstrapPlan {
                 minimal: false,
             });
         }
-        actions.push(Action::WriteToken {
-            path: dir.join("node.token"),
-        });
+        // Note: node.token is intentionally NOT in the bootstrap plan. The
+        // bootstrap step only prepares local FS state; the wire-side
+        // attest+challenge handshake (see `enroll::run` → `handshake.rs`) is
+        // what actually mints the NodeSecurityToken. Persisting `node.token`
+        // before the handshake completes would leave a half-written
+        // identity on disk that the daemon would happily try to use.
         if cfg!(target_os = "linux") {
             actions.push(Action::InstallService {
                 path: systemd_unit_path(),

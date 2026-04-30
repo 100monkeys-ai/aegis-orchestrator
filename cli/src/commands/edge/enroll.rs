@@ -5,11 +5,15 @@
 //! NodeSecurityToken, then exit. The long-lived bidi stream is started
 //! separately by the daemon process (see `cli::daemon::edge_lifecycle`).
 
+use anyhow::{Context, Result};
 use clap::Args;
+use std::path::Path;
 
 use super::bootstrap::{
     run_bootstrap, BootstrapPlan, BootstrapPolicy, OutputFormat as BootstrapOutputFormat,
 };
+use super::grpc;
+use super::handshake::{run_attest_and_challenge, HandshakeOutcome};
 use crate::output::OutputFormat;
 
 #[derive(Debug, Args)]
@@ -52,7 +56,106 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
         OutputFormat::Json => BootstrapOutputFormat::Json,
         _ => BootstrapOutputFormat::Text,
     };
-    let state_dir = args.state_dir.clone();
-    let plan = BootstrapPlan::detect(state_dir, &args.token, &policy)?;
-    run_bootstrap(plan, &policy, bootstrap_output, &args.token).await
+
+    // Step 1 (local FS): generate keypair, persist enrollment.jwt, write
+    // aegis-config.yaml. Returns Ok before any network I/O.
+    let plan = BootstrapPlan::detect(args.state_dir.clone(), &args.token, &policy)?;
+    let resolved_state_dir = plan.state_dir.clone();
+    run_bootstrap(plan, &policy, bootstrap_output, &args.token).await?;
+
+    // --dry-run terminates before the wire flow per BootstrapPolicy contract.
+    if policy.dry_run {
+        return Ok(());
+    }
+
+    // --keep-existing short-circuit: if a valid node.token is already on
+    // disk, the bootstrap step has already verified the existing identity is
+    // safe to reuse (config endpoint matches, node.key is a valid 32-byte
+    // seed). Calling AttestNode + ChallengeNode again would burn the
+    // enrollment JWT for no reason and the server would refuse the redeemed
+    // jti. Treat enrollment as already complete.
+    let node_token_path = resolved_state_dir.join("node.token");
+    if policy.keep_existing && node_token_path.exists() {
+        let outcome = build_outcome_from_existing(&resolved_state_dir, &args.token)?;
+        emit_output(&outcome, &node_token_path, output, /*reused=*/ true)?;
+        return Ok(());
+    }
+
+    // Steps 2-4 (wire): AttestNode → ChallengeNode → persist NodeSecurityToken.
+    let signing_key = grpc::load_signing_key(&resolved_state_dir)
+        .context("load freshly-bootstrapped node.key")?;
+
+    // The cep claim of the enrollment JWT pins which controller to dial.
+    // The bootstrap step already validated the JWT is well-formed; we
+    // re-decode here rather than threading the value through to keep the
+    // bootstrap and handshake stages independent.
+    let claims = super::handshake::decode_enrollment_claims(&args.token)?;
+
+    let outcome = run_attest_and_challenge(&claims.cep, &signing_key, &args.token).await?;
+
+    // Persist node.token AFTER the handshake succeeds. Atomic-write +
+    // mode-0600 mirrors how `bootstrap.rs` and `keys.rs` treat secrets — a
+    // partial write would corrupt the daemon's identity.
+    grpc::atomic_write_secret(&node_token_path, outcome.node_security_token.as_bytes())
+        .context("persist NodeSecurityToken to node.token")?;
+
+    emit_output(&outcome, &node_token_path, output, /*reused=*/ false)?;
+    Ok(())
+}
+
+/// When `--keep-existing` short-circuits the wire flow, synthesise a
+/// HandshakeOutcome from the on-disk artifacts so the operator still sees
+/// a structured success block.
+fn build_outcome_from_existing(state_dir: &Path, enrollment_jwt: &str) -> Result<HandshakeOutcome> {
+    let token = grpc::load_node_security_token(state_dir)?;
+    let claims = super::handshake::decode_enrollment_claims(enrollment_jwt)?;
+    Ok(HandshakeOutcome {
+        node_id: claims.sub.clone(),
+        tenant_id: claims.tid,
+        controller_endpoint: claims.cep,
+        node_security_token: token,
+        // We deliberately do not parse the existing token's `exp` here — the
+        // caller path emits this only as informational metadata, and the
+        // daemon's `token refresh` command is the authoritative expiry source.
+        expires_at: None,
+    })
+}
+
+fn emit_output(
+    outcome: &HandshakeOutcome,
+    node_token_path: &Path,
+    output: OutputFormat,
+    reused: bool,
+) -> Result<()> {
+    let path_str = node_token_path.display().to_string();
+    let expires_str = outcome.expires_at.map(|t| t.to_rfc3339());
+    match output {
+        OutputFormat::Json => {
+            let body = serde_json::json!({
+                "ok": true,
+                "reused_existing_token": reused,
+                "node_id": outcome.node_id,
+                "tenant_id": outcome.tenant_id,
+                "controller_endpoint": outcome.controller_endpoint,
+                "node_token_path": path_str,
+                "expires_at": expires_str,
+            });
+            println!("{}", serde_json::to_string(&body)?);
+        }
+        _ => {
+            if reused {
+                println!("aegis edge: enrollment already complete (reused existing node.token)");
+            } else {
+                println!("aegis edge: enrollment complete");
+            }
+            println!("  node_id:             {}", outcome.node_id);
+            println!("  tenant_id:           {}", outcome.tenant_id);
+            println!("  controller_endpoint: {}", outcome.controller_endpoint);
+            println!("  node_token_path:     {path_str}");
+            if let Some(exp) = expires_str {
+                println!("  expires_at:          {exp}");
+            }
+        }
+    }
+    Ok(())
 }
