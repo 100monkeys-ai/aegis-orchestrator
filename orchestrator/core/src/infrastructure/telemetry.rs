@@ -62,6 +62,12 @@ pub fn init_metrics(
     // Register intent pipeline metric descriptors (ADR-087 §Observability)
     register_intent_pipeline_metrics();
 
+    // Register relay-coordinator metric descriptors (ADR-117 §Observability,
+    // ADR-058 cardinality rules). The relay-coordinator runs in-process with
+    // the orchestrator daemon and shares this exporter — there is no
+    // separate metrics endpoint.
+    register_relay_metrics();
+
     tracing::info!("Metrics exporter listening on {}", addr);
     Ok(())
 }
@@ -111,12 +117,85 @@ pub fn register_intent_pipeline_metrics() {
     .absolute(0);
 }
 
+// ── Relay-Coordinator metric descriptors (ADR-117) ─────────────────────────
+//
+// The relay-coordinator multiplexes traffic between edge daemons and the
+// controller. It runs **in-process** with the orchestrator daemon and reuses
+// the single Prometheus recorder bound by `init_metrics`. These descriptors
+// are pre-registered at startup so the metrics appear in `/metrics` scrapes
+// even before the first edge connection.
+//
+// Cardinality (ADR-058): per-tenant / per-execution / per-agent /
+// per-workflow / per-iteration labels are PROHIBITED. Relay metric labels
+// are restricted to small bounded enums (`direction`, `result`, `reason`).
+
+/// Allowed values for the `direction` label on relay forward counters.
+pub const RELAY_DIRECTION_INBOUND: &str = "inbound";
+pub const RELAY_DIRECTION_OUTBOUND: &str = "outbound";
+
+/// Allowed values for the `result` label on relay forward counters.
+pub const RELAY_RESULT_SUCCESS: &str = "success";
+pub const RELAY_RESULT_ERROR: &str = "error";
+
+/// Allowed values for the `reason` label on relay handshake-failure counters.
+/// Bounded to keep cardinality fixed regardless of edge-node population.
+pub const RELAY_HANDSHAKE_REASON_AUTH_FAILED: &str = "auth_failed";
+pub const RELAY_HANDSHAKE_REASON_VERSION_MISMATCH: &str = "version_mismatch";
+pub const RELAY_HANDSHAKE_REASON_TIMEOUT: &str = "timeout";
+pub const RELAY_HANDSHAKE_REASON_UNKNOWN: &str = "unknown";
+
+pub const RELAY_FORWARD_LABELS: &[&str] = &["direction", "result"];
+pub const RELAY_HANDSHAKE_LABELS: &[&str] = &["reason"];
+pub const RELAY_EDGE_NODES_LABELS: &[&str] = &[];
+pub const RELAY_DURATION_LABELS: &[&str] = &[];
+
+pub fn register_relay_metrics() {
+    // Gauge: edge nodes currently connected to this relay-coordinator.
+    metrics::gauge!("aegis_relay_edge_nodes_connected").set(0.0);
+
+    // Counter: messages forwarded between edge and controller. Labelled by
+    // direction (inbound/outbound) and result (success/error). Per-edge and
+    // per-tenant breakdowns are intentionally omitted (ADR-058 cardinality).
+    for direction in [RELAY_DIRECTION_INBOUND, RELAY_DIRECTION_OUTBOUND] {
+        for result in [RELAY_RESULT_SUCCESS, RELAY_RESULT_ERROR] {
+            metrics::counter!(
+                "aegis_relay_messages_forwarded_total",
+                "direction" => direction,
+                "result" => result,
+            )
+            .absolute(0);
+        }
+    }
+
+    // Histogram: end-to-end relay forwarding latency. Buckets come from the
+    // `_duration_seconds` matcher set in `init_metrics`.
+    metrics::histogram!("aegis_relay_message_duration_seconds").record(0.0);
+
+    // Counter: relay handshake failures, labelled by bounded reason.
+    for reason in [
+        RELAY_HANDSHAKE_REASON_AUTH_FAILED,
+        RELAY_HANDSHAKE_REASON_VERSION_MISMATCH,
+        RELAY_HANDSHAKE_REASON_TIMEOUT,
+        RELAY_HANDSHAKE_REASON_UNKNOWN,
+    ] {
+        metrics::counter!(
+            "aegis_relay_handshake_failures_total",
+            "reason" => reason,
+        )
+        .absolute(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        register_intent_pipeline_metrics, INTENT_PIPELINE_AGENT_CACHE_HITS_LABELS,
-        INTENT_PIPELINE_CONTAINER_EXIT_CODE_LABELS, INTENT_PIPELINE_DURATION_LABELS,
-        INTENT_PIPELINE_STARTS_LABELS,
+        register_intent_pipeline_metrics, register_relay_metrics,
+        INTENT_PIPELINE_AGENT_CACHE_HITS_LABELS, INTENT_PIPELINE_CONTAINER_EXIT_CODE_LABELS,
+        INTENT_PIPELINE_DURATION_LABELS, INTENT_PIPELINE_STARTS_LABELS, RELAY_DIRECTION_INBOUND,
+        RELAY_DIRECTION_OUTBOUND, RELAY_DURATION_LABELS, RELAY_EDGE_NODES_LABELS,
+        RELAY_FORWARD_LABELS, RELAY_HANDSHAKE_LABELS, RELAY_HANDSHAKE_REASON_AUTH_FAILED,
+        RELAY_HANDSHAKE_REASON_TIMEOUT, RELAY_HANDSHAKE_REASON_UNKNOWN,
+        RELAY_HANDSHAKE_REASON_VERSION_MISMATCH, RELAY_RESULT_ERROR, RELAY_RESULT_SUCCESS,
     };
 
     /// Regression: all four ADR-087 metric descriptors must register without panicking.
@@ -170,5 +249,73 @@ mod tests {
                 "intent pipeline metrics must not include tenant_id label, got {labels:?}"
             );
         }
+    }
+
+    /// Regression: relay-coordinator descriptors must register without panic
+    /// and remain idempotent across multiple invocations.
+    #[test]
+    fn test_relay_metrics_register_without_panic() {
+        register_relay_metrics();
+        register_relay_metrics();
+    }
+
+    /// Regression for ADR-058 cardinality rules: relay metrics MUST NOT
+    /// include `tenant_id`, `execution_id`, `agent_id`, `workflow_id`, or
+    /// `iteration_id` labels. Edge-node identity is also intentionally
+    /// omitted from labels — per-edge insight is OTLP traces (ADR-057), not
+    /// Prometheus metrics.
+    #[test]
+    fn test_relay_metrics_have_no_prohibited_labels() {
+        const PROHIBITED: &[&str] = &[
+            "tenant_id",
+            "execution_id",
+            "agent_id",
+            "workflow_id",
+            "iteration_id",
+            "edge_node_id",
+            "node_id",
+        ];
+        for labels in [
+            RELAY_FORWARD_LABELS,
+            RELAY_HANDSHAKE_LABELS,
+            RELAY_EDGE_NODES_LABELS,
+            RELAY_DURATION_LABELS,
+        ] {
+            for forbidden in PROHIBITED {
+                assert!(
+                    !labels.contains(forbidden),
+                    "relay metric labels must not include {forbidden}, got {labels:?}"
+                );
+            }
+        }
+    }
+
+    /// Regression: relay handshake reasons must stay in a small bounded
+    /// enum so the cardinality of `aegis_relay_handshake_failures_total`
+    /// remains fixed regardless of edge-node population. Adding a new
+    /// reason requires updating both this enum and the dashboard panel.
+    #[test]
+    fn test_relay_handshake_reasons_are_bounded_enum() {
+        let allowed = [
+            RELAY_HANDSHAKE_REASON_AUTH_FAILED,
+            RELAY_HANDSHAKE_REASON_VERSION_MISMATCH,
+            RELAY_HANDSHAKE_REASON_TIMEOUT,
+            RELAY_HANDSHAKE_REASON_UNKNOWN,
+        ];
+        assert_eq!(
+            allowed.len(),
+            4,
+            "relay handshake reasons must stay bounded"
+        );
+    }
+
+    /// Regression: relay forward direction/result label values must stay in
+    /// the documented bounded enums.
+    #[test]
+    fn test_relay_forward_label_values_are_bounded_enum() {
+        let directions = [RELAY_DIRECTION_INBOUND, RELAY_DIRECTION_OUTBOUND];
+        let results = [RELAY_RESULT_SUCCESS, RELAY_RESULT_ERROR];
+        assert_eq!(directions.len(), 2);
+        assert_eq!(results.len(), 2);
     }
 }

@@ -139,23 +139,15 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
         };
         emit_decision_metrics(&decision, &resource_label, scope_label);
 
-        // Emit remaining-quota gauge for each bucket (ADR-072 §10)
-        let scope_id = match scope {
-            RateLimitScope::User { tenant_id, user_id } => {
-                format!("{}:{}", tenant_id.as_str(), user_id)
-            }
-            RateLimitScope::Tenant { tenant_id } => tenant_id.to_string(),
-        };
-        for (bucket, remaining_value) in &decision.remaining {
-            metrics::gauge!(
-                "aegis_rate_limit_remaining",
-                "resource_type" => resource_label.clone(),
-                "bucket" => format!("{bucket:?}"),
-                "scope_type" => scope_label.to_owned(),
-                "scope_id" => scope_id.clone(),
-            )
-            .set(*remaining_value as f64);
-        }
+        // ADR-058 cardinality rules prohibit per-tenant Prometheus labels.
+        // The previous `aegis_rate_limit_remaining` gauge required a
+        // `scope_id` label that embedded tenant_id (and tenant:user_id);
+        // stripping that label collapsed the gauge to last-writer-wins
+        // across all scopes, destroying the metric's meaning. Per-scope
+        // remaining-quota visibility is provided through OTLP-exported
+        // tracing fields below and through the `aegis_rate_limit_warnings_total`
+        // / `aegis_rate_limit_rejections_total` counters which are already
+        // bounded by the `resource_type` × `scope_type` × `bucket` enums.
 
         // Check for 80% threshold warning on allowed decisions
         for (bucket, remaining_count) in &decision.remaining {
@@ -286,6 +278,59 @@ fn emit_decision_metrics(decision: &RateLimitDecision, resource_label: &str, sco
             bucket = ?decision.exhausted_bucket,
             retry_after_seconds = ?decision.retry_after_seconds,
             "rate limit exceeded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression for ADR-058 cardinality audit (2026-04-29): the
+    /// `aegis_rate_limit_remaining` gauge was dropped because its only
+    /// distinguishing label, `scope_id`, embedded `tenant_id` (and
+    /// `tenant_id:user_id`), which is a prohibited high-cardinality label.
+    /// Stripping `scope_id` would have collapsed the gauge to last-writer-
+    /// wins across all scopes, destroying its meaning, so the metric was
+    /// removed entirely. Per-scope visibility is preserved via
+    /// `RateLimitEvent::Warning`/`Exceeded` domain events and the existing
+    /// `tracing::warn!` records.
+    ///
+    /// This test fails if anyone reintroduces a metric emission carrying a
+    /// `scope_id` label (which would re-encode tenant identity into a
+    /// Prometheus series). It scans for `"scope_id" =>` only inside lines
+    /// that are part of `metrics::counter!` / `gauge!` / `histogram!`
+    /// macro invocations, so the test's own commentary cannot self-match.
+    #[test]
+    fn no_scope_id_label_on_metrics_in_composite_enforcer() {
+        let source = include_str!("composite_enforcer.rs");
+        // Build the needle dynamically so this test's own source text
+        // does not contain the literal sequence `"scope_id" =>`.
+        let needle = format!("{}{}{} =>", "\"", "scope_id", "\"");
+
+        // Walk the source looking for any `metrics::` macro invocation
+        // (counter!, gauge!, histogram!) whose argument list contains the
+        // forbidden label.
+        let mut offending: Vec<&str> = Vec::new();
+        let mut idx = 0;
+        while let Some(start) = source[idx..].find("metrics::") {
+            let abs_start = idx + start;
+            // Take a window large enough to span typical multi-line
+            // metric macro calls.
+            let window_end = (abs_start + 400).min(source.len());
+            let window = &source[abs_start..window_end];
+            // Truncate the window at the closing `;` of the statement to
+            // avoid running over into an adjacent statement.
+            let window = window.split_once(';').map(|(s, _)| s).unwrap_or(window);
+            if window.contains(&needle) {
+                offending.push(window);
+            }
+            idx = abs_start + "metrics::".len();
+        }
+
+        assert!(
+            offending.is_empty(),
+            "metrics emissions in composite_enforcer.rs must not carry a \
+             scope_id label — it embeds tenant_id and violates ADR-058 \
+             cardinality rules. Offending sites: {offending:#?}"
         );
     }
 }
