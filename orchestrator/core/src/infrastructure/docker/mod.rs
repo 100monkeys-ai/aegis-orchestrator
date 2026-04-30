@@ -6,4 +6,4 @@
 //! used during SEAL attestation (ADR-035 §4.1).
 
 mod container_verifier;
-pub use container_verifier::BollardContainerVerifier;
+pub use container_verifier::{BollardContainerVerifier, VERIFIER_TIMEOUT_SECS};
