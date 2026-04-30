@@ -132,16 +132,67 @@ pub fn load_controller_endpoint(state_dir: &Path) -> Result<String> {
     ))
 }
 
-/// Build a `tonic::transport::Channel` to the controller. Mirrors the daemon
-/// edge_lifecycle endpoint normalisation: bare host:port becomes `http://…`.
-pub async fn connect_controller(endpoint: &str) -> Result<tonic::transport::Channel> {
-    let uri = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
+/// Promote a user-supplied controller endpoint to a fully-qualified URI,
+/// defaulting scheme-less endpoints to TLS for public hostnames and to
+/// plaintext for loopback / explicit non-443 ports.
+///
+/// The SaaS topology terminates TLS at Caddy on `relay.myzaru.com:443` and
+/// h2c-proxies upstream to the relay's gRPC port (ADR-117). Edge daemons
+/// therefore MUST dial `https://` against public endpoints; OSS deployments
+/// commonly dial `localhost:50056` plaintext.
+///
+/// Rule (applied only when the endpoint is scheme-less):
+///
+/// - port missing OR port == 443 → `https://`
+/// - any other explicit port → `http://`
+///
+/// Endpoints that already carry a `http://` or `https://` scheme are
+/// returned unchanged — explicit user choice always wins.
+pub fn promote_endpoint_uri(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return endpoint.to_string();
+    }
+
+    // Find the host:port boundary. `host_part` is everything up to the first
+    // `/`, `?`, or `#`; the port lives after the LAST `:` in the host segment
+    // (to keep IPv6 literals like `[::1]:50056` working).
+    let host_part = endpoint
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or(endpoint);
+    let port_str: Option<&str> = if let Some(rest) = host_part.strip_prefix('[') {
+        // Bracketed IPv6: `[addr]:port` — split on `]:`.
+        rest.split_once("]:").map(|(_, p)| p)
+    } else {
+        host_part.rsplit_once(':').map(|(_, p)| p)
+    };
+
+    let use_tls = match port_str {
+        None => true,
+        Some(p) => p.parse::<u16>().map(|n| n == 443).unwrap_or(false),
+    };
+    if use_tls {
+        format!("https://{endpoint}")
     } else {
         format!("http://{endpoint}")
-    };
-    tonic::transport::Channel::from_shared(uri.clone())
-        .with_context(|| format!("invalid controller endpoint URI: {uri}"))?
+    }
+}
+
+/// Build a `tonic::transport::Channel` to the controller. Scheme-less
+/// endpoints are promoted via [`promote_endpoint_uri`]; `https://` endpoints
+/// get a `ClientTlsConfig` with native roots so the dial completes the TLS
+/// handshake before tonic starts speaking HTTP/2.
+pub async fn connect_controller(endpoint: &str) -> Result<tonic::transport::Channel> {
+    let uri = promote_endpoint_uri(endpoint);
+    let mut channel = tonic::transport::Channel::from_shared(uri.clone())
+        .with_context(|| format!("invalid controller endpoint URI: {uri}"))?;
+    if uri.starts_with("https://") {
+        let tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
+        channel = channel
+            .tls_config(tls)
+            .with_context(|| format!("configure TLS for controller {uri}"))?;
+    }
+    channel
         .connect()
         .await
         .with_context(|| format!("connect to controller {uri}"))
@@ -308,6 +359,67 @@ mod tests {
         assert!(parse_duration("").is_err());
         assert!(parse_duration("nope").is_err());
         assert!(parse_duration("10y").is_err());
+    }
+
+    #[test]
+    fn promote_endpoint_uri_defaults_to_tls_for_public_hostnames() {
+        // Regression: connect_controller used to hardcode http:// for any
+        // scheme-less endpoint, causing plaintext h2c dials against
+        // relay.myzaru.com (which terminates TLS at Caddy on :443) and
+        // returning `h2 protocol error: http2 error`.
+        assert_eq!(
+            promote_endpoint_uri("relay.myzaru.com"),
+            "https://relay.myzaru.com",
+            "scheme-less, port-less public hostname must default to TLS"
+        );
+        assert_eq!(
+            promote_endpoint_uri("relay.myzaru.com:443"),
+            "https://relay.myzaru.com:443",
+            "scheme-less host:443 must default to TLS"
+        );
+    }
+
+    #[test]
+    fn promote_endpoint_uri_keeps_loopback_and_nonstandard_ports_plaintext() {
+        // OSS / dev deployments dial scheme-less localhost over plaintext;
+        // operators dialing a non-443 port have explicitly opted out of the
+        // standard TLS port and must not be silently TLS-promoted.
+        assert_eq!(
+            promote_endpoint_uri("localhost:50056"),
+            "http://localhost:50056"
+        );
+        assert_eq!(
+            promote_endpoint_uri("127.0.0.1:50056"),
+            "http://127.0.0.1:50056"
+        );
+        assert_eq!(
+            promote_endpoint_uri("[::1]:50056"),
+            "http://[::1]:50056",
+            "IPv6 loopback with explicit non-443 port stays plaintext"
+        );
+        assert_eq!(
+            promote_endpoint_uri("relay.myzaru.com:50056"),
+            "http://relay.myzaru.com:50056",
+            "non-443 port on a public hostname stays plaintext (operator opt-out)"
+        );
+    }
+
+    #[test]
+    fn promote_endpoint_uri_preserves_explicit_schemes() {
+        // Explicit user choice always wins — never rewrite a scheme.
+        assert_eq!(
+            promote_endpoint_uri("http://localhost:50056"),
+            "http://localhost:50056"
+        );
+        assert_eq!(
+            promote_endpoint_uri("https://relay.myzaru.com"),
+            "https://relay.myzaru.com"
+        );
+        assert_eq!(
+            promote_endpoint_uri("http://relay.myzaru.com"),
+            "http://relay.myzaru.com",
+            "explicit http:// against a public host stays plaintext"
+        );
     }
 
     #[test]
