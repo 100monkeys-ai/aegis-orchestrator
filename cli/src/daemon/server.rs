@@ -2610,6 +2610,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 handler = handler.with_issue_enrollment_token(local_signer, cluster_grpc_auth);
             }
 
+            // ADR-117 §B/§C: wire ConnectEdge / RotateEdgeKey into the cluster
+            // gRPC handler. Without this, both RPCs return
+            // FailedPrecondition("edge mode disabled on this node") and edge
+            // daemons can enroll but never open the bidi stream. The wiring
+            // is NOT gated on `relay_coordinator_endpoint`: that gate is
+            // specific to enrollment-token signing (only the Relay holds the
+            // OpenBao policy). ConnectEdge handling is for "edges connect
+            // directly to this cluster server" — every node that runs the
+            // cluster gRPC server (Controller / Hybrid / RelayCoordinator)
+            // must accept ConnectEdge. Pure-worker nodes have no
+            // edge_components bundle (no DB pool) and naturally skip this.
+            if let Some((edge_repo, _, conn_registry, _, _, _, _)) = edge_components.as_ref() {
+                use aegis_orchestrator_core::application::edge::connect_edge::ConnectEdgeService;
+                use aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY;
+                use aegis_orchestrator_core::application::edge::rotate_edge_key::RotateEdgeKeyService;
+                let connect_edge_service = Arc::new(ConnectEdgeService::new(
+                    edge_repo.clone(),
+                    conn_registry.clone(),
+                ));
+                let rotate_edge_key_service = Arc::new(RotateEdgeKeyService::with_default_ttl(
+                    edge_repo.clone(),
+                    secrets_manager.secret_store(),
+                    EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+                ));
+                handler = handler.with_edge_services(connect_edge_service, rotate_edge_key_service);
+            }
+
             // Remote storage gRPC handler (ADR-064)
             // Route through AegisFSAL for path sanitization, volume authorization,
             // quota enforcement, and audit trail with cross-node provenance.
