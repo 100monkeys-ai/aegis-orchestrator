@@ -117,6 +117,19 @@ impl NodeClusterService for ScriptedStub {
         request: Request<AttestNodeRequest>,
     ) -> Result<Response<AttestNodeResponse>, Status> {
         let req = request.into_inner();
+        // Pin the production server contract: AttestNode `node_id` MUST parse
+        // as a UUID — `grpc_server::attest_node` returns
+        // `Status::invalid_argument("Invalid NodeId")` otherwise. If the CLI
+        // ever leaks the enrollment JWT's `sub` (an operator display label
+        // like "BEASTLY1") into `node_id` again, this guard turns the
+        // regression into a loud test failure instead of a silent server-side
+        // 400 in production.
+        if Uuid::parse_str(&req.node_id).is_err() {
+            return Err(Status::invalid_argument(format!(
+                "Invalid NodeId: '{}' (must be a UUID — JWT sub claim must NOT be used as node_id)",
+                req.node_id
+            )));
+        }
         let scripted = {
             let mut s = self.state.lock();
             s.attest_calls += 1;
@@ -137,6 +150,14 @@ impl NodeClusterService for ScriptedStub {
         request: Request<ChallengeNodeRequest>,
     ) -> Result<Response<ChallengeNodeResponse>, Status> {
         let req = request.into_inner();
+        // Same strict-UUID guard as attest_node — pins the production
+        // server's `Status::invalid_argument("Invalid node_id")` contract.
+        if Uuid::parse_str(&req.node_id).is_err() {
+            return Err(Status::invalid_argument(format!(
+                "Invalid node_id: '{}' (must be a UUID)",
+                req.node_id
+            )));
+        }
         let scripted = {
             let mut s = self.state.lock();
             s.challenge_calls += 1;
@@ -310,8 +331,18 @@ fn assert_mode_0600(path: &Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enroll_writes_node_token_after_successful_handshake() {
     let stub = ScriptedStub::default();
-    let node_id = Uuid::new_v4().to_string();
-    let issued = make_node_security_token(&node_id, "tenant-a");
+    // Use a non-UUID JWT `sub` — operator-supplied display label like the one
+    // Zaru's `AddEdgeHostDialog` actually emits. The CLI must NOT use this as
+    // `node_id`; it must mint a fresh UUID at bootstrap and present that on
+    // the wire instead. The strict-UUID stub guard above turns any regression
+    // (JWT-sub leaking into node_id) into a hard test failure.
+    let jwt_sub = "BEASTLY1";
+    // The issued NodeSecurityToken's `sub` is the minted UUID (the daemon's
+    // node_id). We don't know the minted UUID up front; pre-script a stable
+    // UUID here and assert it round-trips into the persisted token. The
+    // handshake decodes this value and uses it as `outcome.node_id`.
+    let issued_node_id = Uuid::new_v4().to_string();
+    let issued = make_node_security_token(&issued_node_id, "tenant-a");
     stub.script_attest(Ok(AttestNodeResponse {
         challenge_nonce: vec![7u8; 32],
         challenge_id: Uuid::new_v4().to_string(),
@@ -326,7 +357,7 @@ async fn enroll_writes_node_token_after_successful_handshake() {
     let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let token = make_enrollment_jwt(&node_id, "tenant-a", &endpoint);
+    let token = make_enrollment_jwt(jwt_sub, "tenant-a", &endpoint);
     enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
         .await
         .expect("enroll must succeed");
@@ -341,6 +372,19 @@ async fn enroll_writes_node_token_after_successful_handshake() {
     );
     #[cfg(unix)]
     assert_mode_0600(&token_path);
+
+    // The CLI must mint a UUID at bootstrap and persist it in
+    // `aegis-config.yaml` `spec.node.id`. Read it back and assert the wire
+    // calls used THAT value — not the operator-supplied JWT `sub`.
+    let minted_node_id = read_persisted_node_id(tmp.path());
+    assert!(
+        Uuid::parse_str(&minted_node_id).is_ok(),
+        "spec.node.id must be a UUID, got '{minted_node_id}'"
+    );
+    assert_ne!(
+        minted_node_id, jwt_sub,
+        "minted node_id must not be the JWT sub claim"
+    );
 
     // Pin the wire contract: edge daemons attest as NODE_ROLE_EDGE and present
     // the enrollment JWT as bootstrap_proof on ChallengeNode.
@@ -362,11 +406,30 @@ async fn enroll_writes_node_token_after_successful_handshake() {
         snap.last_challenge_proof.is_some(),
         "ChallengeNode must carry an enrollment_token bootstrap_proof"
     );
-    assert_eq!(snap.last_attest_node_id.as_deref(), Some(node_id.as_str()));
+    assert_eq!(
+        snap.last_attest_node_id.as_deref(),
+        Some(minted_node_id.as_str()),
+        "AttestNode must use the minted UUID, not the JWT sub"
+    );
     assert_eq!(
         snap.last_challenge_node_id.as_deref(),
-        Some(node_id.as_str())
+        Some(minted_node_id.as_str()),
+        "ChallengeNode must use the minted UUID, not the JWT sub"
     );
+}
+
+/// Read the `spec.node.id` field that bootstrap minted into
+/// `aegis-config.yaml`. Fails the test if the field is absent or not a string.
+fn read_persisted_node_id(state_dir: &Path) -> String {
+    let body = std::fs::read_to_string(state_dir.join("aegis-config.yaml"))
+        .expect("read aegis-config.yaml");
+    let doc: serde_yaml::Value = serde_yaml::from_str(&body).expect("parse aegis-config.yaml");
+    doc.get("spec")
+        .and_then(|v| v.get("node"))
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .expect("spec.node.id must be present in aegis-config.yaml after bootstrap")
 }
 
 /// AttestNode rate-limit must surface a user-friendly error mentioning the
@@ -379,7 +442,7 @@ async fn enroll_surfaces_attest_rate_limit_error() {
     let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let token = make_enrollment_jwt(&Uuid::new_v4().to_string(), "tenant-a", &endpoint);
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
     let err = enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
         .await
         .expect_err("attest rate-limit must propagate");
@@ -409,7 +472,7 @@ async fn enroll_surfaces_challenge_invalid_token_error() {
     let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let token = make_enrollment_jwt(&Uuid::new_v4().to_string(), "tenant-a", &endpoint);
+    let token = make_enrollment_jwt("edge-abc12345", "tenant-a", &endpoint);
     let err = enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
         .await
         .expect_err("challenge must propagate");
@@ -432,7 +495,7 @@ async fn enroll_surfaces_network_unreachable_error() {
     let endpoint = format!("127.0.0.1:{port}");
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let token = make_enrollment_jwt(&Uuid::new_v4().to_string(), "tenant-a", &endpoint);
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
     let err = enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
         .await
         .expect_err("must fail when no controller listens");
@@ -460,7 +523,7 @@ async fn enroll_does_not_write_node_token_on_handshake_failure() {
     let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let token = make_enrollment_jwt(&Uuid::new_v4().to_string(), "tenant-a", &endpoint);
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
     let _ = enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
         .await
         .expect_err("challenge denied");
@@ -488,7 +551,7 @@ async fn enroll_dry_run_skips_network() {
     let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let token = make_enrollment_jwt(&Uuid::new_v4().to_string(), "tenant-a", &endpoint);
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
     let mut args = enroll_args(token, tmp.path());
     args.dry_run = true;
     enroll_run(args, OutputFormat::Text)
@@ -528,7 +591,12 @@ async fn enroll_keep_existing_skips_handshake_when_node_token_present() {
     let cfg = format!("spec:\n  cluster:\n    controller:\n      endpoint: \"{endpoint}\"\n");
     std::fs::write(tmp.path().join("aegis-config.yaml"), cfg).unwrap();
 
-    let token = make_enrollment_jwt(&node_id, "tenant-a", &endpoint);
+    // JWT `sub` is operator display metadata, NOT the node_id. Use a
+    // non-UUID label here to prove the keep-existing path doesn't conflate
+    // them either: outcome.node_id is read from the persisted node.token's
+    // `sub` claim (the minted UUID), not from the enrollment JWT.
+    let _persisted_uuid = node_id; // shown for clarity — same UUID inside node.token
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
     let mut args = enroll_args(token, tmp.path());
     args.keep_existing = true;
     args.non_interactive = false; // keep_existing is the explicit flag
@@ -562,8 +630,8 @@ async fn enroll_keep_existing_skips_handshake_when_node_token_present() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enroll_json_output_succeeds_and_persists_token() {
     let stub = ScriptedStub::default();
-    let node_id = Uuid::new_v4().to_string();
-    let issued = make_node_security_token(&node_id, "tenant-x");
+    let issued_node_id = Uuid::new_v4().to_string();
+    let issued = make_node_security_token(&issued_node_id, "tenant-x");
     stub.script_attest(Ok(AttestNodeResponse {
         challenge_nonce: vec![9u8; 32],
         challenge_id: Uuid::new_v4().to_string(),
@@ -575,10 +643,162 @@ async fn enroll_json_output_succeeds_and_persists_token() {
     let (endpoint, _shutdown) = spawn_scripted_server(stub).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let token = make_enrollment_jwt(&node_id, "tenant-x", &endpoint);
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-x", &endpoint);
     enroll_run(enroll_args(token, tmp.path()), OutputFormat::Json)
         .await
         .expect("json enroll must succeed");
     let on_disk = std::fs::read_to_string(tmp.path().join("node.token")).unwrap();
     assert_eq!(on_disk.trim(), issued.trim());
+}
+
+// ---------------------------------------------------------------------------
+// node_id contract regression coverage (ADR-117 §C)
+//
+// These tests pin the post-fix contract: the daemon mints a UUID at bootstrap
+// and presents it on the wire. The enrollment JWT's `sub` claim is operator
+// display metadata only and must NEVER be sent as `node_id`.
+// ---------------------------------------------------------------------------
+
+/// Bootstrap on a fresh state-dir must populate `aegis-config.yaml`
+/// `spec.node.id` with a parseable UUID. The CLI mints this client-side; it
+/// is unrelated to the enrollment JWT's `sub`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_writes_node_id_to_config_on_first_run() {
+    let stub = ScriptedStub::default();
+    let issued_node_id = Uuid::new_v4().to_string();
+    let issued = make_node_security_token(&issued_node_id, "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![5u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued,
+        expires_at: None,
+    }));
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
+        .await
+        .expect("first-run enroll must succeed");
+
+    let cfg = tmp.path().join("aegis-config.yaml");
+    assert!(cfg.exists(), "aegis-config.yaml must exist after first run");
+    let persisted = read_persisted_node_id(tmp.path());
+    Uuid::parse_str(&persisted).unwrap_or_else(|_| {
+        panic!("spec.node.id must be a UUID, got '{persisted}'");
+    });
+}
+
+/// Operator-supplied JWT `sub` (Zaru's friendly name like "BEASTLY1") is NOT
+/// a UUID. Enrollment must succeed — the CLI mints its own UUID `node_id`
+/// and presents it on the wire. The strict-UUID stub guard turns any
+/// regression into a hard test failure here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_with_non_uuid_jwt_sub_succeeds_when_node_id_is_minted_uuid() {
+    let stub = ScriptedStub::default();
+    let issued_node_id = Uuid::new_v4().to_string();
+    let issued = make_node_security_token(&issued_node_id, "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![6u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued,
+        expires_at: None,
+    }));
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The exact label Zaru's `AddEdgeHostDialog` puts in `issued_to` — never
+    // a UUID. The bug this test pins: prior CLI sent this string verbatim as
+    // `node_id`, so the server's strict UUID parse rejected the request.
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
+        .await
+        .expect("enroll with non-UUID JWT sub must succeed (CLI mints its own UUID)");
+
+    let persisted = read_persisted_node_id(tmp.path());
+    Uuid::parse_str(&persisted).unwrap_or_else(|_| {
+        panic!("spec.node.id must be a UUID, got '{persisted}'");
+    });
+    assert_ne!(
+        persisted, "BEASTLY1",
+        "the operator label must NEVER be persisted as node_id"
+    );
+
+    // Wire contract: AttestNode + ChallengeNode were called with the minted
+    // UUID, not with "BEASTLY1". (The strict-UUID stub guard would have
+    // rejected the call otherwise; assert here for explicitness.)
+    let snap = stub.snapshot();
+    assert_eq!(
+        snap.last_attest_node_id.as_deref(),
+        Some(persisted.as_str())
+    );
+    assert_eq!(
+        snap.last_challenge_node_id.as_deref(),
+        Some(persisted.as_str())
+    );
+}
+
+/// Persistence contract: a re-enroll on the same host MUST reuse the
+/// previously-minted `node_id`. The bootstrap step reads back the existing
+/// `spec.node.id` rather than minting a new one — so the daemon's identity
+/// is stable across re-enrollments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_persisted_node_id_survives_reenroll() {
+    let stub = ScriptedStub::default();
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Run 1 — fresh state-dir, mint a UUID.
+    let issued_1 = make_node_security_token(&Uuid::new_v4().to_string(), "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![1u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued_1,
+        expires_at: None,
+    }));
+    let token_1 = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    enroll_run(enroll_args(token_1, tmp.path()), OutputFormat::Text)
+        .await
+        .expect("first enroll must succeed");
+    let minted = read_persisted_node_id(tmp.path());
+    let snap_1 = stub.snapshot();
+    assert_eq!(snap_1.last_attest_node_id.as_deref(), Some(minted.as_str()));
+
+    // Run 2 — same state-dir, --force to re-run the wire flow. The minted
+    // UUID must be reused, not regenerated.
+    let issued_2 = make_node_security_token(&Uuid::new_v4().to_string(), "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![2u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued_2,
+        expires_at: None,
+    }));
+    let token_2 = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    let mut args_2 = enroll_args(token_2, tmp.path());
+    args_2.force = true;
+    args_2.non_interactive = false;
+    enroll_run(args_2, OutputFormat::Text)
+        .await
+        .expect("re-enroll with --force must succeed");
+
+    let after = read_persisted_node_id(tmp.path());
+    assert_eq!(
+        after, minted,
+        "persisted node_id must survive re-enroll: was '{minted}', now '{after}'"
+    );
+    let snap_2 = stub.snapshot();
+    assert_eq!(
+        snap_2.last_attest_node_id.as_deref(),
+        Some(minted.as_str()),
+        "re-enroll must present the SAME minted UUID on the wire"
+    );
 }

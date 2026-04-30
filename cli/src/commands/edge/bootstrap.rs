@@ -232,7 +232,19 @@ pub async fn run_bootstrap(
 
     // Emit a minimal or annotated config if missing — or, if present,
     // consult policy to decide whether to overwrite or reuse.
+    //
+    // Node identity contract: the daemon's `node_id` is a UUID v4 minted
+    // here at first enrollment and persisted in `aegis-config.yaml`
+    // `spec.node.id`. On re-enroll (config exists + reuse path) we read the
+    // existing UUID back so the daemon keeps the same identity across
+    // re-enrollments. The enrollment JWT's `sub` claim is operator display
+    // metadata and is NEVER used as `node_id`.
     let cfg_path = plan.state_dir.join("aegis-config.yaml");
+    let existing_node_id = if cfg_path.exists() {
+        read_node_id_from_config(&cfg_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let should_write_cfg = if cfg_path.exists() {
         let cfg_path_for_check = cfg_path.clone();
         let expected_endpoint = plan.controller_endpoint.clone();
@@ -273,7 +285,16 @@ pub async fn run_bootstrap(
         } else {
             include_str!("../../../templates/edge-config-with-examples.yaml")
         };
-        let body = body.replace("{{CONTROLLER_ENDPOINT}}", &plan.controller_endpoint);
+        // Reuse an existing UUID if present (re-enroll persistence contract);
+        // otherwise mint a fresh one for first enrollment.
+        let node_id = if !existing_node_id.is_empty() {
+            existing_node_id
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        let body = body
+            .replace("{{CONTROLLER_ENDPOINT}}", &plan.controller_endpoint)
+            .replace("{{NODE_ID}}", &node_id);
         fs::write(&cfg_path, body).with_context(|| format!("write {}", cfg_path.display()))?;
         set_file_perms(&cfg_path, 0o600)?;
     }
@@ -325,6 +346,29 @@ fn launchd_plist_path() -> PathBuf {
     } else {
         PathBuf::from("io.aegis.edge.plist")
     }
+}
+
+/// Best-effort read of a previously persisted `spec.node.id` from
+/// `aegis-config.yaml`. Returns an empty string when the file is malformed,
+/// missing the field, or the value isn't a UUID — the caller treats that as
+/// "mint a fresh one". A strict, error-returning reader lives in
+/// `grpc::load_node_id_from_config` for the handshake-time path that MUST
+/// have a valid UUID present.
+fn read_node_id_from_config(cfg_path: &Path) -> Option<String> {
+    let body = fs::read_to_string(cfg_path).ok()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&body).ok()?;
+    let id = doc
+        .get("spec")?
+        .get("node")?
+        .get("id")?
+        .as_str()?
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return None;
+    }
+    uuid::Uuid::parse_str(&id).ok()?;
+    Some(id)
 }
 
 fn extract_cep_claim(token: &str) -> Result<String> {

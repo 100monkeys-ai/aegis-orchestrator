@@ -91,7 +91,17 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
     // bootstrap and handshake stages independent.
     let claims = super::handshake::decode_enrollment_claims(&args.token)?;
 
-    let outcome = run_attest_and_challenge(&claims.cep, &signing_key, &args.token).await?;
+    // The daemon's node_id is a UUID minted client-side at bootstrap and
+    // persisted in `aegis-config.yaml` (`spec.node.id`). It is decoupled
+    // from the enrollment JWT's `sub` claim (which is operator display
+    // metadata, e.g. "BEASTLY1"). Loading from config also pins the
+    // persistence contract: a re-enroll on the same host re-uses the same
+    // node_id rather than minting a new one.
+    let node_id = grpc::load_node_id_from_config(&resolved_state_dir)
+        .context("read minted node_id from aegis-config.yaml after bootstrap")?;
+
+    let outcome =
+        run_attest_and_challenge(&claims.cep, &node_id, &signing_key, &args.token).await?;
 
     // Persist node.token AFTER the handshake succeeds. Atomic-write +
     // mode-0600 mirrors how `bootstrap.rs` and `keys.rs` treat secrets — a
@@ -109,8 +119,12 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
 fn build_outcome_from_existing(state_dir: &Path, enrollment_jwt: &str) -> Result<HandshakeOutcome> {
     let token = grpc::load_node_security_token(state_dir)?;
     let claims = super::handshake::decode_enrollment_claims(enrollment_jwt)?;
+    // The persisted node_id is the `sub` claim of the issued NodeSecurityToken
+    // — the daemon's UUID. The enrollment JWT's `sub` is unrelated operator
+    // display metadata and must not be confused with the node identity.
+    let node_id = grpc::node_id_from_token(&token)?;
     Ok(HandshakeOutcome {
-        node_id: claims.sub.clone(),
+        node_id,
         tenant_id: claims.tid,
         controller_endpoint: claims.cep,
         node_security_token: token,

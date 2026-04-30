@@ -49,10 +49,10 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     DeregisterNodeRequest, DeregisterNodeResponse, EdgeCapabilities as ProtoEdgeCapabilities,
     EdgeCommand, EdgeEvent, EdgeResult, ForwardExecutionRequest, HelloEvent, InvokeToolCommand,
     IssueEnrollmentTokenRequest, IssueEnrollmentTokenResponse, ListPeersRequest, ListPeersResponse,
-    NodeHeartbeatRequest, NodeHeartbeatResponse, PushConfigRequest, PushConfigResponse,
-    RegisterNodeRequest, RegisterNodeResponse, RotateEdgeKeyRequest, RotateEdgeKeyResponse,
-    RouteExecutionRequest, RouteExecutionResponse, SealEnvelope, SealNodeEnvelope,
-    SyncConfigRequest, SyncConfigResponse,
+    NodeCapabilities as ProtoNodeCapabilities, NodeHeartbeatRequest, NodeHeartbeatResponse,
+    NodeRole as ProtoNodeRole, PushConfigRequest, PushConfigResponse, RegisterNodeRequest,
+    RegisterNodeResponse, RotateEdgeKeyRequest, RotateEdgeKeyResponse, RouteExecutionRequest,
+    RouteExecutionResponse, SealEnvelope, SealNodeEnvelope, SyncConfigRequest, SyncConfigResponse,
 };
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::ExecutionEvent;
 use aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry;
@@ -1209,4 +1209,94 @@ async fn rotate_edge_key_returns_failed_precondition_without_edge_services() {
         "expected FailedPrecondition, got {err:?}"
     );
     assert_eq!(err.message(), "edge mode disabled on this node");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// node_id strict-UUID contract regression coverage
+//
+// `NodeClusterServiceHandler::attest_node` / `challenge_node` parse `node_id`
+// via `NodeId::from_string` → `Uuid::parse_str` and reject anything that
+// isn't a UUID with `Status::invalid_argument`. Pinning the contract here
+// prevents a future contributor from loosening the parse to accept arbitrary
+// strings (which would re-enable the CLI bug where the operator's friendly
+// name like "BEASTLY1" was sent verbatim as `node_id`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AttestNode rejects a non-UUID `node_id` with InvalidArgument before any
+/// use-case dispatch. Operator-supplied display labels (Zaru "BEASTLY1",
+/// auto-generated "edge-abc12345") are NOT identifiers and must not pass
+/// the parse boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attest_node_rejects_non_uuid_node_id() {
+    let edge_repo: Arc<dyn EdgeDaemonRepository> = Arc::new(StubEdgeRepo::default());
+    let registry = EdgeConnectionRegistry::new();
+    let (url, _shutdown) =
+        spawn_prod_handler_server(edge_repo, registry, /* wire_edge */ false).await;
+    let channel = tonic::transport::Channel::from_shared(url)
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to in-process server");
+    let mut client = NodeClusterServiceClient::new(channel);
+
+    let req = AttestNodeRequest {
+        node_id: "BEASTLY1".to_string(),
+        role: ProtoNodeRole::Edge as i32,
+        public_key: vec![0u8; 32],
+        capabilities: Some(ProtoNodeCapabilities::default()),
+        grpc_address: String::new(),
+        enrolment_token: String::new(),
+    };
+    let err = client
+        .attest_node(tonic::Request::new(req))
+        .await
+        .expect_err("AttestNode must reject a non-UUID node_id");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "expected InvalidArgument, got {err:?}"
+    );
+    assert!(
+        err.message().contains("Invalid NodeId"),
+        "error must surface 'Invalid NodeId', got: {}",
+        err.message()
+    );
+}
+
+/// ChallengeNode rejects a non-UUID `node_id` with InvalidArgument. Mirrors
+/// the AttestNode guard — both handlers are gates on the same UUID contract
+/// and the pair must never drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn challenge_node_rejects_non_uuid_node_id() {
+    let edge_repo: Arc<dyn EdgeDaemonRepository> = Arc::new(StubEdgeRepo::default());
+    let registry = EdgeConnectionRegistry::new();
+    let (url, _shutdown) =
+        spawn_prod_handler_server(edge_repo, registry, /* wire_edge */ false).await;
+    let channel = tonic::transport::Channel::from_shared(url)
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to in-process server");
+    let mut client = NodeClusterServiceClient::new(channel);
+
+    let req = ChallengeNodeRequest {
+        challenge_id: Uuid::new_v4().to_string(),
+        node_id: "edge-abc12345".to_string(),
+        challenge_signature: vec![0u8; 64],
+        bootstrap_proof: None,
+    };
+    let err = client
+        .challenge_node(tonic::Request::new(req))
+        .await
+        .expect_err("ChallengeNode must reject a non-UUID node_id");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "expected InvalidArgument, got {err:?}"
+    );
+    assert!(
+        err.message().contains("Invalid node_id"),
+        "error must surface 'Invalid node_id', got: {}",
+        err.message()
+    );
 }

@@ -37,9 +37,10 @@ use super::grpc::connect_controller;
 /// Decoded result of a successful attest+challenge handshake.
 #[derive(Debug, Clone)]
 pub struct HandshakeOutcome {
-    /// Node UUID (the `sub` claim of the issued NodeSecurityToken). Equal to
-    /// the `sub` claim of the enrollment JWT — the server pins the binding
-    /// during ChallengeNode.
+    /// Node UUID — the `sub` claim of the issued `NodeSecurityToken`. This is
+    /// the daemon's identity, minted client-side at bootstrap time and
+    /// persisted in `aegis-config.yaml` (`spec.node.id`). It is unrelated to
+    /// the enrollment JWT's `sub` claim, which is operator display metadata.
     pub node_id: String,
     /// Tenant id the daemon is bound to (the `tid` claim of the enrollment
     /// JWT, echoed in the issued NodeSecurityToken).
@@ -61,8 +62,11 @@ pub struct HandshakeOutcome {
 /// signature during ChallengeNode.
 #[derive(Debug, Clone)]
 pub struct EnrollmentClaims {
-    /// `sub` — node UUID. The server pins `node_id ↔ public_key ↔ tenant_id`
-    /// at ChallengeNode time. We use this as the AttestNode `node_id`.
+    /// `sub` — operator-supplied display label (Zaru friendly name or auto-
+    /// generated `edge-<short>`). NOT a node identifier. The daemon's
+    /// `node_id` is a UUID minted at bootstrap time and stored in
+    /// `aegis-config.yaml` `spec.node.id`; the JWT's `sub` is consumed only
+    /// by the server as audit metadata.
     pub sub: String,
     /// `tid` — tenant id binding.
     pub tid: String,
@@ -123,6 +127,7 @@ fn decode_issued_token(jwt: &str) -> Result<(String, String)> {
 /// caller's responsibility.
 pub async fn run_attest_and_challenge(
     controller_endpoint: &str,
+    node_id: &str,
     signing_key: &SigningKey,
     enrollment_jwt: &str,
 ) -> Result<HandshakeOutcome> {
@@ -144,7 +149,7 @@ pub async fn run_attest_and_challenge(
     // edge daemons leave it empty and present the JWT on ChallengeNode
     // instead.
     let attest_req = AttestNodeRequest {
-        node_id: claims.sub.clone(),
+        node_id: node_id.to_string(),
         role: NodeRole::Edge.into(),
         public_key: signing_key.verifying_key().to_bytes().to_vec(),
         capabilities: Some(NodeCapabilities::default()),
@@ -168,7 +173,7 @@ pub async fn run_attest_and_challenge(
         .to_vec();
     let challenge_req = ChallengeNodeRequest {
         challenge_id: attest_resp.challenge_id,
-        node_id: claims.sub.clone(),
+        node_id: node_id.to_string(),
         challenge_signature: signature,
         bootstrap_proof: Some(BootstrapProof::EnrollmentToken(enrollment_jwt.to_string())),
     };
@@ -178,18 +183,13 @@ pub async fn run_attest_and_challenge(
         .map_err(map_challenge_status)?
         .into_inner();
 
-    // The issued token's `sub` MUST match the enrollment JWT's `sub` (the
-    // server pins the binding). If they ever drift, surface the mismatch
-    // rather than silently accepting it — a corrupted server response would
-    // otherwise persist an unusable token.
+    // The issued token's `sub` IS the daemon's node_id (the UUID we minted at
+    // bootstrap and just presented on the wire). Decode it to surface the
+    // bound tenant + node identity in the CLI output. We deliberately do NOT
+    // compare against `claims.sub` from the enrollment JWT: those are
+    // unrelated values by contract — the JWT `sub` is operator display
+    // metadata, the issued token `sub` is the daemon's node UUID.
     let (issued_sub, issued_tid) = decode_issued_token(&challenge_resp.node_security_token)?;
-    if issued_sub != claims.sub {
-        anyhow::bail!(
-            "issued NodeSecurityToken sub claim '{}' does not match enrollment-JWT sub '{}'",
-            issued_sub,
-            claims.sub
-        );
-    }
     let tenant_id = if !issued_tid.is_empty() {
         issued_tid
     } else {
@@ -201,7 +201,7 @@ pub async fn run_attest_and_challenge(
     });
 
     Ok(HandshakeOutcome {
-        node_id: claims.sub,
+        node_id: issued_sub,
         tenant_id,
         controller_endpoint: claims.cep,
         node_security_token: challenge_resp.node_security_token,
