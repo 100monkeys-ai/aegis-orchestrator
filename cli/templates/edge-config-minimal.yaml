@@ -4,7 +4,7 @@ metadata:
   name: edge
 spec:
   node:
-    id: ""
+    id: "{{NODE_ID}}"
     type: edge
   cluster:
     enabled: true

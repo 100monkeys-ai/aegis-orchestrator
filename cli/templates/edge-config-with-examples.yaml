@@ -9,7 +9,7 @@ metadata:
 
 spec:
   node:
-    id: ""               # populated on first enrollment
+    id: "{{NODE_ID}}"    # UUID v4 minted by `aegis edge enroll` on first run; reused on subsequent runs
     type: edge
   cluster:
     enabled: true

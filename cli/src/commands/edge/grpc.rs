@@ -88,6 +88,45 @@ pub fn node_id_from_token(jwt: &str) -> Result<String> {
     Ok(c.sub)
 }
 
+/// Read the daemon's persisted `node_id` (UUID) from
+/// `aegis-config.yaml` `spec.node.id`. The CLI mints this UUID at bootstrap
+/// time and writes it into the config; subsequent enrollments and the
+/// AttestNode/ChallengeNode wire flow read it back here.
+///
+/// Errors if the config is missing, malformed, or the field is empty / not a
+/// well-formed UUID. The strict-UUID check matches the server's
+/// `NodeId::from_string` contract — surfacing a malformed value here gives
+/// the operator a clearer error than "Invalid NodeId" from the server.
+pub fn load_node_id_from_config(state_dir: &Path) -> Result<String> {
+    let cfg_path = state_dir.join("aegis-config.yaml");
+    let body =
+        fs::read_to_string(&cfg_path).with_context(|| format!("read {}", cfg_path.display()))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&body).with_context(|| format!("parse {}", cfg_path.display()))?;
+    let id = doc
+        .get("spec")
+        .and_then(|v| v.get("node"))
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        anyhow::bail!(
+            "{} `spec.node.id` is empty; bootstrap must mint a UUID before handshake",
+            cfg_path.display()
+        );
+    }
+    uuid::Uuid::parse_str(&id).with_context(|| {
+        format!(
+            "{} `spec.node.id` ('{}') is not a valid UUID",
+            cfg_path.display(),
+            id
+        )
+    })?;
+    Ok(id)
+}
+
 /// Resolve the controller endpoint from the daemon's `aegis-config.yaml`.
 /// Falls back to the `cep` claim of `enrollment.jwt` if config is missing.
 pub fn load_controller_endpoint(state_dir: &Path) -> Result<String> {
