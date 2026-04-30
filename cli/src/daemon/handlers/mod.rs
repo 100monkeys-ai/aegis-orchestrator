@@ -140,10 +140,14 @@ pub(crate) fn resolved_tenant(
         .unwrap_or_else(|| tenant_id_from_identity(identity))
 }
 
+pub(crate) fn bounded_limit(limit: Option<usize>, default: usize, maximum: usize) -> usize {
+    limit.unwrap_or(default).min(maximum).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_orchestrator_core::domain::iam::{AegisRole, ZaruTier};
+    use aegis_orchestrator_core::domain::iam::ZaruTier;
 
     fn service_account_identity() -> UserIdentity {
         UserIdentity {
@@ -226,8 +230,4 @@ mod tests {
         let result = tenant_id_from_request(None, Some("u-abc"));
         assert_eq!(result, TenantId::default());
     }
-}
-
-pub(crate) fn bounded_limit(limit: Option<usize>, default: usize, maximum: usize) -> usize {
-    limit.unwrap_or(default).min(maximum).max(1)
 }

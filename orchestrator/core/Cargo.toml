@@ -51,7 +51,7 @@ tokio-util = "0.7"
 tower-http.workspace = true
 hostname = "0.4"
 dirs = "6.0"
-reqwest = { version = "0.13", features = ["json", "multipart", "query", "form"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "query", "form", "stream"] }
 walkdir = "2.4"
 aegis_orchestrator_proto = { path = "../../../aegis-proto", package = "aegis-orchestrator-proto", version = "0.15.0-pre-alpha" }
 tonic = { workspace = true }

@@ -195,10 +195,7 @@ pub fn promote_endpoint_uri(endpoint: &str) -> String {
     // Find the host:port boundary. `host_part` is everything up to the first
     // `/`, `?`, or `#`; the port lives after the LAST `:` in the host segment
     // (to keep IPv6 literals like `[::1]:50056` working).
-    let host_part = endpoint
-        .split(|c| c == '/' || c == '?' || c == '#')
-        .next()
-        .unwrap_or(endpoint);
+    let host_part = endpoint.split(['/', '?', '#']).next().unwrap_or(endpoint);
     let port_str: Option<&str> = if let Some(rest) = host_part.strip_prefix('[') {
         // Bracketed IPv6: `[addr]:port` — split on `]:`.
         rest.split_once("]:").map(|(_, p)| p)

@@ -602,9 +602,9 @@ mod tests {
             .as_mapping()
             .expect("workflow states should be a mapping");
 
-        assert!(states.contains_key(&serde_yaml::Value::from("PLAN")));
-        assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_MISSING_AGENTS")));
-        assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_AND_REGISTER_WORKFLOW")));
+        assert!(states.contains_key(serde_yaml::Value::from("PLAN")));
+        assert!(states.contains_key(serde_yaml::Value::from("GENERATE_MISSING_AGENTS")));
+        assert!(states.contains_key(serde_yaml::Value::from("GENERATE_AND_REGISTER_WORKFLOW")));
     }
 
     #[test]

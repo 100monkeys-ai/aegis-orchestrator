@@ -60,14 +60,16 @@ pub struct HandshakeOutcome {
 /// Sourced directly from the JWT payload segment without signature
 /// verification — the server validates `iss`, `aud`, `exp`, `nbf`, and the
 /// signature during ChallengeNode.
+///
+/// The JWT's `sub` claim (operator display label, e.g. "BEASTLY1" or
+/// `edge-<short>`) is intentionally NOT decoded here. It is consumed only
+/// server-side as audit metadata at redemption time
+/// (`enroll_edge::redeem(... &claims.sub ...)`); the daemon's identity is the
+/// UUID minted client-side at bootstrap and stored in `aegis-config.yaml`
+/// `spec.node.id`. Surfacing the JWT `sub` in the CLI would invite the same
+/// "use sub as node_id" confusion this module exists to prevent.
 #[derive(Debug, Clone)]
 pub struct EnrollmentClaims {
-    /// `sub` — operator-supplied display label (Zaru friendly name or auto-
-    /// generated `edge-<short>`). NOT a node identifier. The daemon's
-    /// `node_id` is a UUID minted at bootstrap time and stored in
-    /// `aegis-config.yaml` `spec.node.id`; the JWT's `sub` is consumed only
-    /// by the server as audit metadata.
-    pub sub: String,
     /// `tid` — tenant id binding.
     pub tid: String,
     /// `cep` — controller endpoint to dial.
@@ -86,14 +88,11 @@ pub fn decode_enrollment_claims(jwt: &str) -> Result<EnrollmentClaims> {
         .context("base64-decode enrollment-JWT payload")?;
     #[derive(serde::Deserialize)]
     struct C {
-        sub: String,
         tid: String,
         cep: String,
     }
-    let c: C =
-        serde_json::from_slice(&payload).context("parse enrollment-JWT claims (sub/tid/cep)")?;
+    let c: C = serde_json::from_slice(&payload).context("parse enrollment-JWT claims (tid/cep)")?;
     Ok(EnrollmentClaims {
-        sub: c.sub,
         tid: c.tid,
         cep: c.cep,
     })
@@ -264,12 +263,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_enrollment_claims_extracts_sub_tid_cep() {
+    fn decode_enrollment_claims_extracts_tid_cep_and_ignores_sub() {
+        // The JWT carries an operator display label ("BEASTLY1") in `sub` —
+        // this is NOT a node identifier and the CLI must not surface it.
+        // Only `tid` + `cep` are needed to drive the handshake; the daemon's
+        // node_id comes from `aegis-config.yaml` `spec.node.id`.
         let jwt = make_jwt(
-            r#"{"sub":"00000000-0000-0000-0000-000000000001","tid":"tenant-a","cep":"controller.example:443","jti":"x","iss":"y","aud":"edge-enrollment","exp":9999999999,"nbf":0}"#,
+            r#"{"sub":"BEASTLY1","tid":"tenant-a","cep":"controller.example:443","jti":"x","iss":"y","aud":"edge-enrollment","exp":9999999999,"nbf":0}"#,
         );
         let c = decode_enrollment_claims(&jwt).expect("decode");
-        assert_eq!(c.sub, "00000000-0000-0000-0000-000000000001");
         assert_eq!(c.tid, "tenant-a");
         assert_eq!(c.cep, "controller.example:443");
     }

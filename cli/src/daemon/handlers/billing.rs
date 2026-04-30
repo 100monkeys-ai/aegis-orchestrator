@@ -3729,7 +3729,7 @@ mod tests {
         assert!(items[1].id.is_none());
         assert_eq!(items[1].price.as_deref(), Some("price_business_seat"));
         assert_eq!(items[1].quantity, Some(5));
-        assert!(items[1].deleted.unwrap_or(false) == false);
+        assert!(!items[1].deleted.unwrap_or(false));
     }
 
     #[test]
@@ -4777,7 +4777,7 @@ mod tests {
         use aegis_orchestrator_core::domain::events::DriftEvent;
         use aegis_orchestrator_core::domain::tenancy::TenantTier;
         use aegis_orchestrator_core::domain::tenant::TenantId;
-        use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
+        use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
 
         /// The checkout session metadata hash must include `user_sub` so
         /// the post-checkout webhook can re-anchor on identity.

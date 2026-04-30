@@ -393,6 +393,6 @@ mod tests {
         map.insert("abc".to_string(), ReapAttemptState::new(t0));
         // Simulate the success branch in cleanup_orphaned_agent_containers.
         map.remove("abc");
-        assert!(map.get("abc").is_none());
+        assert!(!map.contains_key("abc"));
     }
 }
