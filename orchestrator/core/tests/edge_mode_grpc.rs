@@ -891,12 +891,12 @@ mod prod_handler_stubs {
                 Box<
                     dyn tokio_stream::Stream<
                             Item = anyhow::Result<
-                                aegis_orchestrator_core::infrastructure::aegis_runtime_proto::ExecutionEvent,
+                                aegis_orchestrator_core::domain::events::ExecutionEvent,
                             >,
                         > + Send,
                 >,
             >,
-        >{
+        > {
             unimplemented!("test stub")
         }
         async fn stream_agent_events(
