@@ -48,10 +48,11 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     AttestNodeRequest, AttestNodeResponse, ChallengeNodeRequest, ChallengeNodeResponse,
     DeregisterNodeRequest, DeregisterNodeResponse, EdgeCapabilities as ProtoEdgeCapabilities,
     EdgeCommand, EdgeEvent, EdgeResult, ForwardExecutionRequest, HelloEvent, InvokeToolCommand,
-    ListPeersRequest, ListPeersResponse, NodeHeartbeatRequest, NodeHeartbeatResponse,
-    PushConfigRequest, PushConfigResponse, RegisterNodeRequest, RegisterNodeResponse,
-    RotateEdgeKeyRequest, RotateEdgeKeyResponse, RouteExecutionRequest, RouteExecutionResponse,
-    SealEnvelope, SealNodeEnvelope, SyncConfigRequest, SyncConfigResponse,
+    IssueEnrollmentTokenRequest, IssueEnrollmentTokenResponse, ListPeersRequest, ListPeersResponse,
+    NodeHeartbeatRequest, NodeHeartbeatResponse, PushConfigRequest, PushConfigResponse,
+    RegisterNodeRequest, RegisterNodeResponse, RotateEdgeKeyRequest, RotateEdgeKeyResponse,
+    RouteExecutionRequest, RouteExecutionResponse, SealEnvelope, SealNodeEnvelope,
+    SyncConfigRequest, SyncConfigResponse,
 };
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::ExecutionEvent;
 use aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry;
@@ -202,6 +203,15 @@ impl NodeClusterService for EdgeOnlyClusterService {
         _r: Request<RotateEdgeKeyRequest>,
     ) -> Result<Response<RotateEdgeKeyResponse>, Status> {
         Err(Status::unimplemented("rotate_edge_key"))
+    }
+
+    async fn issue_enrollment_token(
+        &self,
+        _r: Request<IssueEnrollmentTokenRequest>,
+    ) -> Result<Response<IssueEnrollmentTokenResponse>, Status> {
+        Err(Status::unimplemented(
+            "test mock does not implement issue_enrollment_token",
+        ))
     }
 }
 
