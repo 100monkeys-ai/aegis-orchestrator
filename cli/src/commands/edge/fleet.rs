@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::client::EdgeApiClient;
 use super::selector;
+use crate::output::OutputFormat;
 
 #[derive(Debug, Subcommand)]
 pub enum FleetCommand {
@@ -38,10 +39,7 @@ pub enum FleetCommand {
     Cancel {
         fleet_command_id: String,
     },
-    Runs {
-        #[arg(long, default_value = "table")]
-        output: String,
-    },
+    Runs {},
 }
 
 #[derive(Serialize)]
@@ -68,7 +66,7 @@ struct InvokeBody {
     deadline_secs: Option<u64>,
 }
 
-pub async fn run(cmd: FleetCommand) -> Result<()> {
+pub async fn run(cmd: FleetCommand, output: OutputFormat) -> Result<()> {
     let client = EdgeApiClient::from_env()?;
     match cmd {
         FleetCommand::Preview { target } => {
@@ -150,11 +148,12 @@ pub async fn run(cmd: FleetCommand) -> Result<()> {
                 return Err(anyhow::anyhow!("{status}: {txt}"));
             }
         }
-        FleetCommand::Runs { output } => {
+        FleetCommand::Runs {} => {
             let runs: serde_json::Value = client.get("/v1/edge/fleet/runs").await?;
-            match output.as_str() {
-                "json" => println!("{}", serde_json::to_string_pretty(&runs)?),
-                _ => println!("{runs}"),
+            match output {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&runs)?),
+                OutputFormat::Yaml => print!("{}", serde_yaml::to_string(&runs)?),
+                OutputFormat::Text | OutputFormat::Table => println!("{runs}"),
             }
         }
     }

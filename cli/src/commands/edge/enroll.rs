@@ -7,7 +7,10 @@
 
 use clap::Args;
 
-use super::bootstrap::{run_bootstrap, BootstrapPlan, BootstrapPolicy, OutputFormat};
+use super::bootstrap::{
+    run_bootstrap, BootstrapPlan, BootstrapPolicy, OutputFormat as BootstrapOutputFormat,
+};
+use crate::output::OutputFormat;
 
 #[derive(Debug, Args)]
 pub struct EnrollArgs {
@@ -31,12 +34,9 @@ pub struct EnrollArgs {
     /// Emit a minimal config rather than the annotated default.
     #[arg(long)]
     pub minimal: bool,
-    /// Output format (`text` | `json`).
-    #[arg(long, default_value = "text")]
-    pub output: String,
 }
 
-pub async fn run(args: EnrollArgs) -> anyhow::Result<()> {
+pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
     let policy = BootstrapPolicy {
         non_interactive: args.non_interactive,
         force: args.force,
@@ -44,11 +44,15 @@ pub async fn run(args: EnrollArgs) -> anyhow::Result<()> {
         dry_run: args.dry_run,
         minimal_config: args.minimal,
     };
-    let output = match args.output.as_str() {
-        "json" => OutputFormat::Json,
-        _ => OutputFormat::Text,
+    // Convert from the global OutputFormat (Text|Table|Json|Yaml) to the
+    // bootstrap-local OutputFormat (Text|Json). Table/Yaml are not
+    // meaningful renderers for the bootstrap progress / plan output, so
+    // they collapse to Text.
+    let bootstrap_output = match output {
+        OutputFormat::Json => BootstrapOutputFormat::Json,
+        _ => BootstrapOutputFormat::Text,
     };
     let state_dir = args.state_dir.clone();
     let plan = BootstrapPlan::detect(state_dir, &args.token, &policy)?;
-    run_bootstrap(plan, &policy, output, &args.token).await
+    run_bootstrap(plan, &policy, bootstrap_output, &args.token).await
 }

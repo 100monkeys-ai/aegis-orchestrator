@@ -5,6 +5,7 @@ use clap::Args;
 use serde::Deserialize;
 
 use super::client::EdgeApiClient;
+use crate::output::OutputFormat;
 
 #[derive(Debug, Args)]
 pub struct LsArgs {
@@ -14,8 +15,6 @@ pub struct LsArgs {
     pub label: Vec<String>,
     #[arg(long)]
     pub connected: bool,
-    #[arg(long, default_value = "table")]
-    pub output: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,7 +27,7 @@ struct EdgeHostView {
     arch: String,
 }
 
-pub async fn run(args: LsArgs) -> Result<()> {
+pub async fn run(args: LsArgs, output: OutputFormat) -> Result<()> {
     let _ = (&args.label, &args.connected); // ADR-117: server-side filters TBD
     let client = EdgeApiClient::from_env()?;
     let hosts: Vec<EdgeHostView> = client.get("/v1/edge/hosts").await?;
@@ -38,9 +37,10 @@ pub async fn run(args: LsArgs) -> Result<()> {
         .filter(|h| args.tag.iter().all(|t| h.tags.contains(t)))
         .collect();
 
-    match args.output.as_str() {
-        "json" => println!("{}", serde_json::to_string_pretty(&filtered)?),
-        _ => {
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&filtered)?),
+        OutputFormat::Yaml => print!("{}", serde_yaml::to_string(&filtered)?),
+        OutputFormat::Text | OutputFormat::Table => {
             println!(
                 "{:<40} {:<24} {:<12} {:<8} {:<8} TAGS",
                 "NODE_ID", "TENANT", "STATUS", "OS", "ARCH"

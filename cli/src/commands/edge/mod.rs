@@ -4,6 +4,8 @@
 
 use clap::{Args, Subcommand};
 
+use crate::output::OutputFormat;
+
 pub mod bootstrap;
 pub mod client;
 pub mod daemon;
@@ -54,16 +56,16 @@ pub enum EdgeCommand {
     Token(token::TokenCommand),
 }
 
-pub async fn run(args: EdgeArgs) -> anyhow::Result<()> {
+pub async fn run(args: EdgeArgs, output: OutputFormat) -> anyhow::Result<()> {
     match args.command {
-        EdgeCommand::Enroll(a) => enroll::run(a).await,
+        EdgeCommand::Enroll(a) => enroll::run(a, output).await,
         EdgeCommand::Daemon(a) => daemon::run(a).await,
-        EdgeCommand::Status(a) => status::run(a).await,
+        EdgeCommand::Status(a) => status::run(a, output).await,
         EdgeCommand::Logout => logout::run().await,
-        EdgeCommand::Ls(a) => ls::run(a).await,
+        EdgeCommand::Ls(a) => ls::run(a, output).await,
         EdgeCommand::Tag(c) => tag::run(c).await,
         EdgeCommand::Group(c) => group::run(c).await,
-        EdgeCommand::Fleet(c) => fleet::run(c).await,
+        EdgeCommand::Fleet(c) => fleet::run(c, output).await,
         EdgeCommand::Keys(c) => keys::run(c).await,
         EdgeCommand::Token(c) => token::run(c).await,
     }

@@ -269,7 +269,7 @@ async fn main() -> Result<()> {
             commands::node::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
                 .await
         }
-        Some(Commands::Edge(args)) => commands::edge::run(args).await,
+        Some(Commands::Edge(args)) => commands::edge::run(args, cli.output).await,
         Some(Commands::Config { command }) => {
             commands::config::handle_command(command, cli.config, cli.output).await
         }
