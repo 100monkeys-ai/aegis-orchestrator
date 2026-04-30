@@ -1245,11 +1245,12 @@ pub struct ClusterConfig {
     pub ingress: Option<RelayIngressConfig>,
     /// ADR-117 SaaS topology. Set on a Controller pod that sits next to
     /// a separate Relay Coordinator pod. When present, the core
-    /// orchestrator's `POST /v1/edge/enrollment-tokens` handler proxies
-    /// to this URL over the trusted in-pod network rather than
-    /// attempting to sign locally (only the relay-coordinator AppRole
-    /// holds the OpenBao policy on `transit/sign/edge-enrollment-token`).
-    /// Format: full base URL, e.g. `http://aegis-relay-coordinator:8088`.
+    /// orchestrator's `POST /v1/edge/enrollment-tokens` handler calls
+    /// `NodeClusterService.IssueEnrollmentToken` on this endpoint over
+    /// the trusted in-pod network rather than attempting to sign locally
+    /// (only the relay-coordinator AppRole holds the OpenBao policy on
+    /// `transit/sign/edge-enrollment-token`). Format: full base URL,
+    /// e.g. `http://aegis-relay-coordinator:50056`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_coordinator_endpoint: Option<String>,
 }
