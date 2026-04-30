@@ -1475,7 +1475,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_gateway_client(attestation_gateway_client)
         .with_agent_manifest_tools(execution_service.clone(), agent_service.clone());
 
-    match aegis_orchestrator_core::infrastructure::docker::BollardContainerVerifier::new() {
+    match aegis_orchestrator_core::infrastructure::docker::BollardContainerVerifier::new(
+        config.spec.runtime.container_socket_path.as_deref(),
+    ) {
         Ok(v) => {
             attestation_service_builder =
                 attestation_service_builder.with_container_verifier(std::sync::Arc::new(v));
