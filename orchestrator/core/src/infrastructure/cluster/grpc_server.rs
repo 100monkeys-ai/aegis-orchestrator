@@ -51,7 +51,11 @@ pub struct NodeClusterServiceHandler {
     register_node_use_case: Arc<RegisterNodeUseCase>,
     heartbeat_use_case: Arc<HeartbeatUseCase>,
     route_execution_use_case: Arc<RouteExecutionUseCase>,
-    forward_execution_use_case: Arc<ForwardExecutionUseCase>,
+    /// ADR-117: present on nodes that host agent execution (Controller /
+    /// Worker / Hybrid). Absent on RelayCoordinator (the relay never
+    /// dispatches forwarded executions — it brokers edge daemon streams);
+    /// calling ForwardExecution in that case returns FailedPrecondition.
+    forward_execution_use_case: Option<Arc<ForwardExecutionUseCase>>,
     sync_config_use_case: Arc<SyncConfigUseCase>,
     push_config_use_case: Arc<PushConfigUseCase>,
     cluster_repo: Arc<dyn NodeClusterRepository>,
@@ -81,7 +85,7 @@ impl NodeClusterServiceHandler {
         register_node_use_case: Arc<RegisterNodeUseCase>,
         heartbeat_use_case: Arc<HeartbeatUseCase>,
         route_execution_use_case: Arc<RouteExecutionUseCase>,
-        forward_execution_use_case: Arc<ForwardExecutionUseCase>,
+        forward_execution_use_case: Option<Arc<ForwardExecutionUseCase>>,
         sync_config_use_case: Arc<SyncConfigUseCase>,
         push_config_use_case: Arc<PushConfigUseCase>,
         cluster_repo: Arc<dyn NodeClusterRepository>,
@@ -459,8 +463,12 @@ impl NodeClusterService for NodeClusterServiceHandler {
             security_context_name: inner.security_context_name,
         };
 
-        let stream = self
-            .forward_execution_use_case
+        let forward_uc = self.forward_execution_use_case.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "ForwardExecution disabled on this node (relay-coordinator role does not host agent execution; ADR-117)",
+            )
+        })?;
+        let stream = forward_uc
             .execute(app_req)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

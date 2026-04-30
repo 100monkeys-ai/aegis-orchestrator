@@ -980,7 +980,7 @@ fn build_prod_handler(
         register_uc,
         heartbeat_uc,
         route_uc,
-        forward_uc,
+        Some(forward_uc),
         sync_config_uc,
         push_config_uc,
         cluster_repo,

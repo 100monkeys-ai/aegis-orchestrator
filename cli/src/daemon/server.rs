@@ -506,6 +506,25 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     }
 
+    // ADR-117: dispatch on cluster role. The relay-coordinator deployment
+    // hosts neither agent execution nor FSAL/NFS volume infrastructure;
+    // booting the full daemon stack is incorrect (and historically panicked
+    // at storage init because `spec.storage` is absent from a relay's
+    // config). Branch into a self-contained relay-only boot path here.
+    let is_relay = matches!(
+        config.spec.cluster.as_ref().map(|c| c.role),
+        Some(NodeRole::RelayCoordinator)
+    );
+    if is_relay {
+        return crate::daemon::relay_server::run_relay_coordinator(
+            config,
+            db_pool,
+            event_bus,
+            iam_service,
+        )
+        .await;
+    }
+
     info!("Initializing LLM registry...");
     let llm_registry = Arc::new(
         ProviderRegistry::from_config(&config).context("Failed to initialize LLM providers")?,
@@ -2546,7 +2565,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 register_uc,
                 heartbeat_uc,
                 route_uc,
-                forward_uc,
+                Some(forward_uc),
                 sync_config_uc,
                 push_config_uc,
                 cluster_repo.clone(),
@@ -3107,26 +3126,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         info!("Built-in template deployment disabled (spec.deploy_builtins = false)");
     }
 
-    // ADR-117: the relay-coordinator deployment exposes only gRPC on
-    // 50056 — it has no REST surface (the legacy `/v1/edge/enrollment-tokens`
-    // proxy is now `NodeClusterService.IssueEnrollmentToken` over gRPC).
-    // Skip the HTTP listener entirely on this role and idle on the gRPC
-    // server task above.
-    let is_relay = matches!(
-        config.spec.cluster.as_ref().map(|c| c.role),
-        Some(aegis_orchestrator_core::domain::node_config::NodeRole::RelayCoordinator)
-    );
-    if is_relay {
-        info!(
-            "RelayCoordinator role: skipping HTTP listener — gRPC NodeClusterService is the only \
-             ingress (ADR-117)"
-        );
-        // Park here; the gRPC server task owns the lifetime of the
-        // process. SIGTERM is observed via the gRPC shutdown wiring
-        // upstream of this branch.
-        std::future::pending::<()>().await;
-        return Ok(());
-    }
+    // ADR-117: the relay-coordinator role is dispatched to its own
+    // self-contained boot path early in `start_daemon` (see
+    // `crate::daemon::relay_server::run_relay_coordinator`). Reaching this
+    // point implies role ∈ { Controller, Worker, Hybrid, Edge } — all of
+    // which serve the full HTTP surface below.
 
     let addr = format!("{bind_addr}:{final_port}");
     debug!(address = %addr, "Binding to address");

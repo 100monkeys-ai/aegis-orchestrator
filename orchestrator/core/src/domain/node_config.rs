@@ -2739,6 +2739,90 @@ mod tests {
         assert!(cfg.validate_roles().is_err());
     }
 
+    /// Regression for relay-coordinator startup crash-loop:
+    /// `cli/src/daemon/server.rs` previously hard-required `spec.storage` for
+    /// every role and panicked ~1s after boot when the relay's config — which
+    /// has no `spec.storage` block — was loaded. The fix dispatches the
+    /// RelayCoordinator role to a self-contained boot path that skips storage
+    /// init entirely (the relay brokers gRPC streams and has no FSAL/NFS use).
+    /// This test pins the canonical relay config shape: cluster.role =
+    /// relay-coordinator AND `spec.storage = None`. If a future change re-adds
+    /// a hard storage requirement on this role, this test must be updated
+    /// alongside the fix.
+    #[test]
+    fn relay_coordinator_config_has_no_storage_block() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+metadata:
+  name: "aegis-relay-coordinator-1"
+  version: "1.0.0"
+spec:
+  node:
+    id: "aegis-relay-coordinator-1"
+    type: "orchestrator"
+  cluster:
+    enabled: true
+    role: "relay-coordinator"
+    cluster_grpc_port: 50056
+    ingress:
+      public_endpoint: "https://relay.myzaru.com"
+"#;
+        let manifest: NodeConfigManifest =
+            serde_yaml::from_str(yaml).expect("relay-coordinator YAML must parse");
+        assert!(
+            manifest.spec.storage.is_none(),
+            "relay-coordinator config must NOT carry a spec.storage block — \
+             the relay has no FSAL/NFS use; requiring it caused a startup panic"
+        );
+        assert_eq!(
+            manifest.spec.cluster.as_ref().map(|c| c.role),
+            Some(NodeRole::RelayCoordinator),
+            "role must round-trip as RelayCoordinator so the daemon dispatches to relay_server::run_relay_coordinator"
+        );
+    }
+
+    /// Complementary positive test: storage remains required for execution-
+    /// hosting roles. A Controller config with no `spec.storage` block parses
+    /// fine (storage is `Option`) but the daemon's volume service init still
+    /// errors when it tries to read `spec.storage`. We pin the latter at the
+    /// shape level: parsing a Controller manifest without `spec.storage`
+    /// produces `spec.storage == None`, which the daemon's non-relay path
+    /// treats as a fatal misconfiguration (preserving the existing safety
+    /// guarantee for Controller / Worker / Hybrid).
+    #[test]
+    fn controller_config_without_storage_block_parses_but_storage_is_none() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+metadata:
+  name: "aegis-controller-1"
+  version: "1.0.0"
+spec:
+  node:
+    id: "aegis-controller-1"
+    type: "orchestrator"
+  cluster:
+    enabled: true
+    role: "controller"
+    cluster_grpc_port: 50056
+    controller:
+      endpoint: "controller.example.com:50056"
+"#;
+        let manifest: NodeConfigManifest =
+            serde_yaml::from_str(yaml).expect("controller YAML must parse");
+        assert!(manifest.spec.storage.is_none());
+        assert_eq!(
+            manifest.spec.cluster.as_ref().map(|c| c.role),
+            Some(NodeRole::Controller),
+        );
+        // The daemon's non-relay path ungates `spec.storage` and returns an
+        // error if it's absent; this preserves the Controller safety guarantee.
+        // We assert the precondition (storage is None) so a future change that
+        // accidentally defaults `storage` to `Some(...)` will fail this test
+        // and force a deliberate decision.
+    }
+
     // ── Security audit 002 §4.27 — default bind + TLS gate ────────────────────
 
     /// Audit 002 §4.27 regression: the default bind address must be the

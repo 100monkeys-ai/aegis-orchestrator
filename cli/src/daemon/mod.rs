@@ -35,6 +35,7 @@ pub mod install;
 pub(crate) mod log_sanitize;
 pub mod operator_read_models;
 pub(crate) mod ports;
+pub mod relay_server;
 pub(crate) mod router;
 pub mod server;
 pub(crate) mod state;
