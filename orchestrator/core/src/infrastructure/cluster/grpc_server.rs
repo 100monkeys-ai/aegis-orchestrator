@@ -204,7 +204,15 @@ impl NodeClusterService for NodeClusterServiceHandler {
                 crate::infrastructure::aegis_cluster_proto::NodeRole::Hybrid => {
                     DomainNodeRole::Hybrid
                 }
-                _ => DomainNodeRole::Worker,
+                crate::infrastructure::aegis_cluster_proto::NodeRole::Edge => DomainNodeRole::Edge,
+                crate::infrastructure::aegis_cluster_proto::NodeRole::RelayCoordinator => {
+                    DomainNodeRole::RelayCoordinator
+                }
+                crate::infrastructure::aegis_cluster_proto::NodeRole::Unspecified => {
+                    return Err(Status::invalid_argument(
+                        "invalid NodeRole: Unspecified is not a valid attestation role",
+                    ));
+                }
             },
             public_key: req.public_key,
             capabilities: if let Some(cap) = req.capabilities {

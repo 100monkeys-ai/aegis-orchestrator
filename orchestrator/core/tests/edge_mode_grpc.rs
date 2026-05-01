@@ -1300,3 +1300,355 @@ async fn challenge_node_rejects_non_uuid_node_id() {
         err.message()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NodeRole proto-to-domain mapping regression coverage
+//
+// `NodeClusterServiceHandler::attest_node` translates the inbound proto
+// `NodeRole` to the domain enum before constructing `AppAttestNodeRequest`.
+// Prior to this commit the `match` had explicit arms only for
+// Controller / Worker / Hybrid; Edge, RelayCoordinator, and Unspecified all
+// fell through `_ => DomainNodeRole::Worker`. That silently rewrote Edge to
+// Worker, so the admission gate at `attest_node.rs:49-53` (which exempts
+// Edge from the enrolment-token requirement per ADR-117) never saw the real
+// role and rejected legitimate edge daemons with PermissionDenied.
+//
+// These tests pin all three paths: Edge passes the gate without an enrolment
+// token, Worker still requires one, and Unspecified is rejected at the
+// adapter boundary.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod node_role_mapping_stubs {
+    //! Variant of `prod_handler_stubs` that swaps in working in-memory
+    //! `NodeChallengeRepository` and `ClusterEnrolmentTokenRepository`
+    //! implementations, so `AttestNodeUseCase::execute` can run end-to-end
+    //! without panicking on a `NoOpChallengeRepo`.
+
+    use async_trait::async_trait;
+    use parking_lot::Mutex as ParkingMutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use aegis_orchestrator_core::application::cluster::{
+        AttestNodeUseCase, ChallengeNodeUseCase, ForwardExecutionUseCase, HeartbeatUseCase,
+        PushConfigUseCase, RegisterNodeUseCase, RouteExecutionUseCase, SyncConfigUseCase,
+    };
+    use aegis_orchestrator_core::domain::cluster::{
+        ClusterEnrolmentTokenError, ClusterEnrolmentTokenRepository, NodeChallenge,
+        NodeChallengeRepository, NodeClusterRepository,
+    };
+    use aegis_orchestrator_core::domain::shared_kernel::NodeId;
+
+    use super::prod_handler_stubs;
+
+    /// In-memory challenge repo: stores challenges in a `Mutex<HashMap>`.
+    /// Required for the AttestNode happy-path tests because the use case
+    /// calls `save_challenge` once admission passes.
+    pub struct InMemoryChallengeRepo {
+        pub saved: ParkingMutex<HashMap<uuid::Uuid, NodeChallenge>>,
+    }
+
+    impl Default for InMemoryChallengeRepo {
+        fn default() -> Self {
+            Self {
+                saved: ParkingMutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NodeChallengeRepository for InMemoryChallengeRepo {
+        async fn save_challenge(&self, challenge: &NodeChallenge) -> anyhow::Result<()> {
+            self.saved
+                .lock()
+                .insert(challenge.challenge_id, challenge.clone());
+            Ok(())
+        }
+        async fn get_challenge(
+            &self,
+            challenge_id: &uuid::Uuid,
+        ) -> anyhow::Result<Option<NodeChallenge>> {
+            Ok(self.saved.lock().get(challenge_id).cloned())
+        }
+        async fn delete_challenge(&self, challenge_id: &uuid::Uuid) -> anyhow::Result<()> {
+            self.saved.lock().remove(challenge_id);
+            Ok(())
+        }
+    }
+
+    /// In-memory enrolment-token repo. Only the AttestNode Worker-path test
+    /// invokes it indirectly; the empty-token branch in the use case
+    /// short-circuits before touching this repo so `redeem` always returns
+    /// `NotFound`.
+    pub struct InMemoryEnrolmentRepo;
+
+    #[async_trait]
+    impl ClusterEnrolmentTokenRepository for InMemoryEnrolmentRepo {
+        async fn redeem(
+            &self,
+            _token: &str,
+            _presented_node_id: &NodeId,
+        ) -> Result<NodeId, ClusterEnrolmentTokenError> {
+            Err(ClusterEnrolmentTokenError::NotFound)
+        }
+    }
+
+    /// Aggregate of cluster use cases plus the underlying in-memory challenge
+    /// repo handle, returned from `build_use_cases_with_real_attest`. Modeled
+    /// as a struct rather than a tuple to keep clippy's `type_complexity`
+    /// lint happy.
+    pub struct RealAttestUseCases {
+        pub attest_uc: Arc<AttestNodeUseCase>,
+        pub challenge_uc: Arc<ChallengeNodeUseCase>,
+        pub register_uc: Arc<RegisterNodeUseCase>,
+        pub heartbeat_uc: Arc<HeartbeatUseCase>,
+        pub route_uc: Arc<RouteExecutionUseCase>,
+        pub forward_uc: Arc<ForwardExecutionUseCase>,
+        pub sync_config_uc: Arc<SyncConfigUseCase>,
+        pub push_config_uc: Arc<PushConfigUseCase>,
+        pub cluster_repo: Arc<dyn NodeClusterRepository>,
+        pub challenge_repo: Arc<InMemoryChallengeRepo>,
+    }
+
+    /// Build a fully-wired bundle of cluster use cases where AttestNode has
+    /// a working challenge repo + enrolment-token repo. Other use cases keep
+    /// the no-op stubs from `prod_handler_stubs` since they are never
+    /// reached by the NodeRole-mapping tests.
+    pub fn build_use_cases_with_real_attest() -> RealAttestUseCases {
+        use aegis_orchestrator_core::domain::cluster::{
+            ConfigLayerRepository, NodeRegistryRepository, NodeRouter,
+        };
+        use aegis_orchestrator_core::domain::secrets::SecretStore;
+
+        let cluster_repo: Arc<dyn NodeClusterRepository> =
+            Arc::new(prod_handler_stubs::NoOpClusterRepo);
+        let challenge_repo_concrete: Arc<InMemoryChallengeRepo> =
+            Arc::new(InMemoryChallengeRepo::default());
+        let challenge_repo: Arc<dyn NodeChallengeRepository> = challenge_repo_concrete.clone();
+        let enrolment_token_repo: Arc<dyn ClusterEnrolmentTokenRepository> =
+            Arc::new(InMemoryEnrolmentRepo);
+        let registry_repo: Arc<dyn NodeRegistryRepository> =
+            Arc::new(prod_handler_stubs::NoOpRegistryRepo);
+        let router: Arc<dyn NodeRouter> = Arc::new(prod_handler_stubs::NoOpRouter);
+        let config_repo: Arc<dyn ConfigLayerRepository> =
+            Arc::new(prod_handler_stubs::NoOpConfigRepo);
+        let secret_store: Arc<dyn SecretStore> = Arc::new(prod_handler_stubs::NoOpSecretStore);
+        let controller_node_id = NodeId::new();
+
+        let attest_uc = Arc::new(AttestNodeUseCase::new(
+            challenge_repo.clone(),
+            enrolment_token_repo,
+        ));
+        let challenge_uc = Arc::new(ChallengeNodeUseCase::new(
+            challenge_repo,
+            cluster_repo.clone(),
+            secret_store,
+        ));
+        let register_uc = Arc::new(RegisterNodeUseCase::new(
+            cluster_repo.clone(),
+            registry_repo,
+            controller_node_id,
+        ));
+        let heartbeat_uc = Arc::new(HeartbeatUseCase::new(cluster_repo.clone()));
+        let route_uc = Arc::new(RouteExecutionUseCase::new(
+            cluster_repo.clone(),
+            router,
+            controller_node_id,
+        ));
+        let exec_svc: Arc<dyn aegis_orchestrator_core::application::execution::ExecutionService> =
+            Arc::new(prod_handler_stubs::NoOpExecutionService);
+        let forward_uc = Arc::new(ForwardExecutionUseCase::new(exec_svc));
+        let sync_config_uc = Arc::new(SyncConfigUseCase::new(
+            Arc::new(prod_handler_stubs::NoOpConfigRepo),
+            cluster_repo.clone(),
+        ));
+        let push_config_uc = Arc::new(PushConfigUseCase::new(config_repo));
+
+        RealAttestUseCases {
+            attest_uc,
+            challenge_uc,
+            register_uc,
+            heartbeat_uc,
+            route_uc,
+            forward_uc,
+            sync_config_uc,
+            push_config_uc,
+            cluster_repo,
+            challenge_repo: challenge_repo_concrete,
+        }
+    }
+}
+
+/// Build a `NodeClusterServiceHandler` with a real in-memory challenge repo
+/// behind `AttestNodeUseCase`. Returns the handler plus a handle to the
+/// challenge repo so tests can assert on persisted challenges.
+fn build_handler_with_real_attest() -> (
+    aegis_orchestrator_core::infrastructure::cluster::grpc_server::NodeClusterServiceHandler,
+    Arc<node_role_mapping_stubs::InMemoryChallengeRepo>,
+) {
+    use aegis_orchestrator_core::infrastructure::cluster::grpc_server::NodeClusterServiceHandler;
+
+    let bundle = node_role_mapping_stubs::build_use_cases_with_real_attest();
+
+    let handler = NodeClusterServiceHandler::new(
+        bundle.attest_uc,
+        bundle.challenge_uc,
+        bundle.register_uc,
+        bundle.heartbeat_uc,
+        bundle.route_uc,
+        Some(bundle.forward_uc),
+        bundle.sync_config_uc,
+        bundle.push_config_uc,
+        bundle.cluster_repo,
+    );
+    (handler, bundle.challenge_repo)
+}
+
+async fn spawn_attest_server() -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<node_role_mapping_stubs::InMemoryChallengeRepo>,
+) {
+    use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::NodeClusterServiceServer;
+
+    let (handler, challenge_repo) = build_handler_with_real_attest();
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(v4_err) => match TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(v6_err) => panic!("failed to bind 127.0.0.1:0 ({v4_err}) and [::1]:0 ({v6_err})"),
+        },
+    };
+    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    let url = format!("http://{addr}");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let incoming = TcpListenerStream::new(listener);
+        let _ = Server::builder()
+            .add_service(NodeClusterServiceServer::new(handler))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (url, tx, challenge_repo)
+}
+
+/// Regression: an Edge daemon hitting `AttestNode` with an empty
+/// enrolment_token must NOT be rejected by the cluster admission gate. Prior
+/// to this commit, `grpc_server.rs:197-208` translated proto NodeRole::Edge
+/// to DomainNodeRole::Worker via a catch-all arm; the admission gate at
+/// `attest_node.rs:49-53` exempts Edge but never saw the real role and
+/// rejected the request with PermissionDenied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attest_node_accepts_edge_role_without_enrolment_token() {
+    let (url, _shutdown, challenge_repo) = spawn_attest_server().await;
+    let channel = tonic::transport::Channel::from_shared(url)
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to in-process server");
+    let mut client = NodeClusterServiceClient::new(channel);
+
+    let node_id = NodeId::new();
+    let req = AttestNodeRequest {
+        node_id: node_id.0.to_string(),
+        role: ProtoNodeRole::Edge as i32,
+        public_key: vec![0u8; 32],
+        capabilities: Some(ProtoNodeCapabilities::default()),
+        grpc_address: String::new(),
+        enrolment_token: String::new(),
+    };
+    let resp = client
+        .attest_node(tonic::Request::new(req))
+        .await
+        .expect("Edge attest must succeed without enrolment_token");
+    let inner = resp.into_inner();
+    assert_eq!(
+        inner.challenge_nonce.len(),
+        32,
+        "challenge_nonce must be 32 bytes (two UUIDv4 concatenated)"
+    );
+    assert!(
+        !challenge_repo.saved.lock().is_empty(),
+        "AttestNode must persist a challenge for Edge role"
+    );
+}
+
+/// Regression: pins the worker admission gate. A Worker-role attest with an
+/// empty enrolment_token must surface `PermissionDenied("missing
+/// enrolment_token")`. Prior to the inbound-mapping fix this path was
+/// already correct; the test exists to ensure the gate stays in place after
+/// the fix and that fixing the Edge mapping did not loosen the Worker path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attest_node_rejects_worker_role_without_enrolment_token() {
+    let (url, _shutdown, _challenge_repo) = spawn_attest_server().await;
+    let channel = tonic::transport::Channel::from_shared(url)
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to in-process server");
+    let mut client = NodeClusterServiceClient::new(channel);
+
+    let node_id = NodeId::new();
+    let req = AttestNodeRequest {
+        node_id: node_id.0.to_string(),
+        role: ProtoNodeRole::Worker as i32,
+        public_key: vec![0u8; 32],
+        capabilities: Some(ProtoNodeCapabilities::default()),
+        grpc_address: String::new(),
+        enrolment_token: String::new(),
+    };
+    let err = client
+        .attest_node(tonic::Request::new(req))
+        .await
+        .expect_err("Worker attest must reject empty enrolment_token");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "expected PermissionDenied, got {err:?}"
+    );
+    assert!(
+        err.message().contains("missing enrolment_token"),
+        "error must surface 'missing enrolment_token', got: {}",
+        err.message()
+    );
+}
+
+/// Regression: the gRPC adapter must reject `NodeRole::Unspecified` at the
+/// proto-to-domain mapping boundary with InvalidArgument. Replaces the
+/// pre-fix silent fallback that mapped Unspecified to DomainNodeRole::Worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attest_node_rejects_unspecified_role() {
+    let (url, _shutdown, _challenge_repo) = spawn_attest_server().await;
+    let channel = tonic::transport::Channel::from_shared(url)
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to in-process server");
+    let mut client = NodeClusterServiceClient::new(channel);
+
+    let node_id = NodeId::new();
+    let req = AttestNodeRequest {
+        node_id: node_id.0.to_string(),
+        role: ProtoNodeRole::Unspecified as i32,
+        public_key: vec![0u8; 32],
+        capabilities: Some(ProtoNodeCapabilities::default()),
+        grpc_address: String::new(),
+        enrolment_token: String::new(),
+    };
+    let err = client
+        .attest_node(tonic::Request::new(req))
+        .await
+        .expect_err("Unspecified role must be rejected at the adapter boundary");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "expected InvalidArgument, got {err:?}"
+    );
+    assert!(
+        err.message().contains("invalid NodeRole"),
+        "error must surface 'invalid NodeRole', got: {}",
+        err.message()
+    );
+}
