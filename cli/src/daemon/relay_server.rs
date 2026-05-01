@@ -137,6 +137,7 @@ pub async fn run_relay_coordinator(
         challenge_repo.clone(),
         cluster_repo.clone(),
         secrets_manager.secret_store(),
+        aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
     ));
     let registry_repo: Arc<dyn aegis_orchestrator_core::domain::cluster::NodeRegistryRepository> =
         Arc::new(PgNodeRegistryRepository::new(pool.clone()));

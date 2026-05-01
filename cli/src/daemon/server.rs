@@ -2511,6 +2511,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     challenge_repo.clone(),
                     cluster_repo.clone(),
                     secret_store,
+                    aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
                 ),
             );
             let registry_repo: Arc<

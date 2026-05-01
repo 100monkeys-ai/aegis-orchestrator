@@ -38,6 +38,12 @@ pub struct ChallengeNodeUseCase {
     challenge_repo: Arc<dyn NodeChallengeRepository>,
     cluster_repo: Arc<dyn NodeClusterRepository>,
     secret_store: Arc<dyn SecretStore>,
+    /// OpenBao Transit signing key path used to sign the issued
+    /// `NodeSecurityToken`. ADR-117 §120 prescribes that the enrollment JWT
+    /// and the `NodeSecurityToken` share the same Transit key — callers wire
+    /// this from `EDGE_ENROLLMENT_SIGNING_KEY` so the relay-coordinator
+    /// AppRole's `transit/sign/<key>` policy grant covers both signatures.
+    signing_key_path: String,
     /// ADR-117: when present, edge daemons supplying a `BootstrapProof::
     /// EnrollmentToken` are validated and persisted via this service before
     /// minting their NodeSecurityToken. None on pure-worker controllers that
@@ -50,11 +56,13 @@ impl ChallengeNodeUseCase {
         challenge_repo: Arc<dyn NodeChallengeRepository>,
         cluster_repo: Arc<dyn NodeClusterRepository>,
         secret_store: Arc<dyn SecretStore>,
+        signing_key_path: String,
     ) -> Self {
         Self {
             challenge_repo,
             cluster_repo,
             secret_store,
+            signing_key_path,
             enroll_edge_service: None,
         }
     }
@@ -173,17 +181,19 @@ impl ChallengeNodeUseCase {
             .encode(serde_json::to_string(&claims)?);
         let signing_input = format!("{}.{}", header_b64, claims_b64);
 
-        // Sign with OpenBao Transit
-        let signature_b64 = self
+        // Sign with OpenBao Transit. ADR-117: shares the
+        // `EDGE_ENROLLMENT_SIGNING_KEY` Transit key with the enrollment JWT
+        // so a single relay-coordinator AppRole policy grant covers both.
+        let raw_sig = self
             .secret_store
-            .transit_sign("aegis-node-controller-key", signing_input.as_bytes())
-            .await?;
-
-        // Note: Transit returns the signature, but we need to ensure it's in the right format for JWT.
-        // Transit often returns it as "vault:v1:base64...". We need to strip the prefix if it exists.
-        let signature_b64 = signature_b64
-            .strip_prefix("vault:v1:")
-            .unwrap_or(&signature_b64)
+            .transit_sign(&self.signing_key_path, signing_input.as_bytes())
+            .await
+            .map_err(|e| anyhow!("transit_sign failed: {e}"))?;
+        // Vault Transit returns `vault:v<version>:<base64sig>` — use the
+        // shared strict parser so arbitrary version numbers and malformed
+        // envelopes are handled identically to `IssueEnrollmentToken`.
+        let signature_b64 = crate::application::edge::transit::parse_vault_signature(&raw_sig)
+            .map_err(|e| anyhow!("transit_sign parse: {e}"))?
             .to_string();
 
         let token = format!("{}.{}", signing_input, signature_b64);
@@ -214,5 +224,234 @@ impl ChallengeNodeUseCase {
             node_security_token: token,
             expires_at: Utc::now() + chrono::Duration::hours(1),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for ADR-117 OpenBao policy alignment on the
+    //! `NodeSecurityToken` signing key. A prior implementation hardcoded
+    //! `transit_sign("aegis-node-controller-key", ...)` — a Transit key that
+    //! does not exist in OpenBao and is not granted by any AppRole policy.
+    //! Every `ChallengeNode` RPC against a real OpenBao backend therefore
+    //! returned 403, breaking edge enrollment and worker join. These tests
+    //! pin the contract that the signing key flows through the constructor
+    //! so future regressions fail the build instead of silently 403-ing in
+    //! production.
+    use super::*;
+    use crate::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY;
+    use crate::domain::cluster::{
+        NodeCapabilityAdvertisement, NodeChallenge, NodeChallengeRepository, NodeClusterRepository,
+        NodePeer, NodePeerStatus, NodeRole, ResourceSnapshot,
+    };
+    use crate::domain::secrets::{SecretStore, SecretsError, SensitiveString};
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    /// Captures the `key_path` argument passed to `transit_sign` so the
+    /// test can assert the use case forwards its configured signing key
+    /// rather than re-hardcoding a literal.
+    struct CapturingSecretStore {
+        captured_key: Mutex<Option<String>>,
+    }
+
+    impl CapturingSecretStore {
+        fn new() -> Self {
+            Self {
+                captured_key: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SecretStore for CapturingSecretStore {
+        async fn read(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
+            unimplemented!()
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &str,
+            _: HashMap<String, SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            unimplemented!()
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::domain::secrets::DomainDynamicSecret, SecretsError> {
+            unimplemented!()
+        }
+        async fn renew_lease(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<std::time::Duration, SecretsError> {
+            unimplemented!()
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            unimplemented!()
+        }
+        async fn transit_sign(&self, key: &str, _: &[u8]) -> Result<String, SecretsError> {
+            *self.captured_key.lock().unwrap() = Some(key.to_string());
+            // Return a well-formed Vault transit envelope so
+            // `parse_vault_signature` succeeds and the use case proceeds.
+            Ok("vault:v1:c2lnbmF0dXJl".to_string())
+        }
+        async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+            Ok(true)
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(String::new())
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            Ok(vec![])
+        }
+    }
+
+    /// In-memory `NodeChallengeRepository` storing one challenge.
+    struct InMemoryChallengeRepo {
+        challenge: Mutex<Option<NodeChallenge>>,
+    }
+
+    #[async_trait]
+    impl NodeChallengeRepository for InMemoryChallengeRepo {
+        async fn save_challenge(&self, c: &NodeChallenge) -> anyhow::Result<()> {
+            *self.challenge.lock().unwrap() = Some(c.clone());
+            Ok(())
+        }
+        async fn get_challenge(&self, id: &Uuid) -> anyhow::Result<Option<NodeChallenge>> {
+            let c = self.challenge.lock().unwrap().clone();
+            Ok(c.filter(|c| &c.challenge_id == id))
+        }
+        async fn delete_challenge(&self, _: &Uuid) -> anyhow::Result<()> {
+            *self.challenge.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    /// `NodeClusterRepository` accepting all upserts.
+    struct InMemoryClusterRepo;
+
+    #[async_trait]
+    impl NodeClusterRepository for InMemoryClusterRepo {
+        async fn upsert_peer(&self, _: &NodePeer) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_peer(&self, _: &NodeId) -> anyhow::Result<Option<NodePeer>> {
+            Ok(None)
+        }
+        async fn list_peers_by_status(&self, _: NodePeerStatus) -> anyhow::Result<Vec<NodePeer>> {
+            Ok(vec![])
+        }
+        async fn record_heartbeat(&self, _: &NodeId, _: ResourceSnapshot) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn mark_unhealthy(&self, _: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start_drain(&self, _: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn deregister(&self, _: &NodeId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_config_version(&self, _: &NodeId) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn record_config_version(&self, _: &NodeId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_all_peers(&self) -> anyhow::Result<Vec<NodePeer>> {
+            Ok(vec![])
+        }
+        async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// Regression: `ChallengeNodeUseCase` MUST forward its constructor-supplied
+    /// `signing_key_path` to `transit_sign`. The prior implementation hardcoded
+    /// `"aegis-node-controller-key"` — a key that does not exist in OpenBao and
+    /// is not granted by any AppRole policy. This test pins the wiring so the
+    /// "let's just hardcode it" regression fails CI.
+    #[tokio::test]
+    async fn challenge_node_signs_with_configured_key() {
+        // Build a Worker-role challenge (Edge would require an
+        // EnrollEdgeService stub; Worker exercises the same signing path).
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let challenge_id = Uuid::new_v4();
+        let node_id = NodeId::new();
+        let nonce: Vec<u8> = (0..32u8).collect();
+
+        let challenge = NodeChallenge {
+            challenge_id,
+            node_id,
+            nonce: nonce.clone(),
+            public_key: verifying_key.to_bytes().to_vec(),
+            role: NodeRole::Worker,
+            capabilities: NodeCapabilityAdvertisement::default(),
+            grpc_address: "127.0.0.1:50050".to_string(),
+            created_at: Utc::now(),
+        };
+
+        let challenge_repo: Arc<dyn NodeChallengeRepository> = Arc::new(InMemoryChallengeRepo {
+            challenge: Mutex::new(Some(challenge.clone())),
+        });
+        let cluster_repo: Arc<dyn NodeClusterRepository> = Arc::new(InMemoryClusterRepo);
+        let capturing = Arc::new(CapturingSecretStore::new());
+        let secret_store: Arc<dyn SecretStore> = capturing.clone();
+
+        let configured_key = EDGE_ENROLLMENT_SIGNING_KEY.to_string();
+        let uc = ChallengeNodeUseCase::new(
+            challenge_repo,
+            cluster_repo,
+            secret_store,
+            configured_key.clone(),
+        );
+
+        // Sign the challenge nonce with the matching ed25519 private key.
+        let signature = signing_key.sign(&nonce);
+
+        let resp = uc
+            .execute(ChallengeNodeRequest {
+                challenge_id,
+                node_id,
+                challenge_signature: signature.to_bytes().to_vec(),
+                bootstrap_proof: None,
+            })
+            .await
+            .expect("challenge must succeed for happy-path Worker role");
+
+        assert!(
+            !resp.node_security_token.is_empty(),
+            "issued token must be non-empty"
+        );
+
+        let captured = capturing
+            .captured_key
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transit_sign must have been called");
+        assert_eq!(
+            captured, configured_key,
+            "transit_sign must receive the constructor-supplied signing_key_path \
+             (ADR-117: NodeSecurityToken and enrollment JWT share the same Transit key)"
+        );
+        assert_ne!(
+            captured, "aegis-node-controller-key",
+            "must NOT regress to the hardcoded literal — that key is not provisioned in OpenBao"
+        );
     }
 }

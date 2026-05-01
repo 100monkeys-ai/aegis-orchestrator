@@ -789,6 +789,7 @@ mod prod_handler_stubs {
             challenge_repo,
             cluster_repo.clone(),
             secret_store,
+            "edge-enrollment-token".to_string(),
         ));
         let register_uc = Arc::new(RegisterNodeUseCase::new(
             cluster_repo.clone(),
@@ -1443,6 +1444,7 @@ mod node_role_mapping_stubs {
             challenge_repo,
             cluster_repo.clone(),
             secret_store,
+            "edge-enrollment-token".to_string(),
         ));
         let register_uc = Arc::new(RegisterNodeUseCase::new(
             cluster_repo.clone(),
