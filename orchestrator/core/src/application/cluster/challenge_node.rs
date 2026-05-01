@@ -454,4 +454,360 @@ mod tests {
             "must NOT regress to the hardcoded literal — that key is not provisioned in OpenBao"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ADR-117 EnrollEdgeService wiring regression
+    //
+    // `ChallengeNodeUseCase::with_enroll_edge_service` was a builder method
+    // that no production boot path ever called. Both the relay-coordinator
+    // (`cli/src/daemon/relay_server.rs`) and the controller/hybrid path
+    // (`cli/src/daemon/server.rs`) constructed the use case without it, so
+    // every ChallengeNode(role=Edge) RPC fell into the
+    // `enroll_edge_service.is_some()` guard at line 122 and returned
+    // `"Edge enrollment not enabled on this controller"`. The
+    // `edge_daemons` row was therefore never written and the host stayed
+    // invisible to Zaru and to every tenant-scoped /v1/edge/* API.
+    //
+    // These tests pin two contracts:
+    //   1. When wired with an `EnrollEdgeService`, a successful Edge
+    //      ChallengeNode persists the `EdgeDaemon` row via
+    //      `EdgeDaemonRepository::upsert` AND skips the worker
+    //      `NodePeer` upsert (Edge daemons live in `edge_daemons`, not
+    //      `node_peers` — ADR-117 §C).
+    //   2. The use case returns the JTI-already-redeemed error when the
+    //      enrollment-token repo refuses the second redemption attempt;
+    //      the upstream gRPC adapter maps this onto a non-OK status.
+    // ────────────────────────────────────────────────────────────────────
+    use crate::application::edge::enroll_edge::EnrollEdgeService;
+    use crate::domain::edge::{
+        EdgeCapabilities, EdgeDaemon, EdgeDaemonRepository, EnrollmentTokenError,
+        EnrollmentTokenRepository,
+    };
+    use crate::domain::shared_kernel::TenantId;
+    use chrono::DateTime;
+
+    /// EdgeDaemonRepository capturing the most recent upsert so the test
+    /// can assert that the fix actually persisted the daemon.
+    struct CapturingEdgeRepo {
+        upserted: Mutex<Option<EdgeDaemon>>,
+    }
+
+    impl CapturingEdgeRepo {
+        fn new() -> Self {
+            Self {
+                upserted: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EdgeDaemonRepository for CapturingEdgeRepo {
+        async fn upsert(&self, edge: &EdgeDaemon) -> anyhow::Result<()> {
+            *self.upserted.lock().unwrap() = Some(edge.clone());
+            Ok(())
+        }
+        async fn get(&self, _: &NodeId) -> anyhow::Result<Option<EdgeDaemon>> {
+            Ok(None)
+        }
+        async fn list_by_tenant(&self, _: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
+        async fn update_status(&self, _: &NodeId, _: NodePeerStatus) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_tags(&self, _: &NodeId, _: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_capabilities(
+            &self,
+            _: &NodeId,
+            _: &EdgeCapabilities,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// EnrollmentTokenRepository that succeeds the first redeem and refuses
+    /// every subsequent attempt with `AlreadyRedeemed`. Captures call count.
+    struct OneShotTokenRepo {
+        calls: Mutex<u32>,
+    }
+
+    impl OneShotTokenRepo {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EnrollmentTokenRepository for OneShotTokenRepo {
+        async fn redeem(
+            &self,
+            _: uuid::Uuid,
+            _: &TenantId,
+            _: &str,
+            _: DateTime<Utc>,
+        ) -> Result<(), EnrollmentTokenError> {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Ok(())
+            } else {
+                Err(EnrollmentTokenError::AlreadyRedeemed)
+            }
+        }
+    }
+
+    /// SecretStore for the Edge happy-path: `transit_verify` returns true
+    /// (we are not testing OpenBao here), `transit_sign` returns a
+    /// well-formed Vault transit envelope.
+    struct EdgeStubSecretStore;
+    #[async_trait]
+    impl SecretStore for EdgeStubSecretStore {
+        async fn read(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
+            unimplemented!()
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &str,
+            _: HashMap<String, SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            unimplemented!()
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::domain::secrets::DomainDynamicSecret, SecretsError> {
+            unimplemented!()
+        }
+        async fn renew_lease(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<std::time::Duration, SecretsError> {
+            unimplemented!()
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            unimplemented!()
+        }
+        async fn transit_sign(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok("vault:v1:c2lnbmF0dXJl".to_string())
+        }
+        async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+            Ok(true)
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Ok(String::new())
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Build a fake edge enrollment JWT whose payload deserializes into
+    /// `EnrollmentTokenClaims`. Header and signature are placeholder bytes —
+    /// `EdgeStubSecretStore::transit_verify` accepts them unconditionally.
+    fn fake_edge_jwt(issuer: &str, tenant: &str) -> String {
+        let header = serde_json::json!({ "alg": "RS256", "typ": "JWT" });
+        let now = Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "tid": tenant,
+            "sub": "operator-sub",
+            "jti": uuid::Uuid::new_v4(),
+            "exp": now + 3600,
+            "nbf": now - 60,
+            "aud": "edge-enrollment",
+            "iss": issuer,
+            "cep": "relay.example:50056",
+        });
+        let h = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&header).unwrap());
+        let p = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&claims).unwrap());
+        // Signature byte payload is irrelevant — `transit_verify` is stubbed.
+        let s = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"fake-signature");
+        format!("{h}.{p}.{s}")
+    }
+
+    /// Regression: with `with_enroll_edge_service` wired, a successful Edge
+    /// ChallengeNode MUST upsert into `EdgeDaemonRepository`. This is the
+    /// exact wiring that production was missing — the use case had the
+    /// builder, but no boot path called it.
+    #[tokio::test]
+    async fn challenge_node_edge_role_persists_edge_daemon_via_enroll_service() {
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let challenge_id = Uuid::new_v4();
+        let node_id = NodeId::new();
+        let nonce: Vec<u8> = (0..32u8).collect();
+
+        let challenge = NodeChallenge {
+            challenge_id,
+            node_id,
+            nonce: nonce.clone(),
+            public_key: verifying_key.to_bytes().to_vec(),
+            role: NodeRole::Edge,
+            capabilities: NodeCapabilityAdvertisement::default(),
+            grpc_address: String::new(),
+            created_at: Utc::now(),
+        };
+
+        let challenge_repo: Arc<dyn NodeChallengeRepository> = Arc::new(InMemoryChallengeRepo {
+            challenge: Mutex::new(Some(challenge.clone())),
+        });
+        let cluster_repo: Arc<dyn NodeClusterRepository> = Arc::new(InMemoryClusterRepo);
+        let secret_store: Arc<dyn SecretStore> = Arc::new(EdgeStubSecretStore);
+
+        let edge_repo_concrete = Arc::new(CapturingEdgeRepo::new());
+        let edge_repo: Arc<dyn EdgeDaemonRepository> = edge_repo_concrete.clone();
+        let token_repo: Arc<dyn EnrollmentTokenRepository> = Arc::new(OneShotTokenRepo::new());
+
+        let issuer = "https://relay.example".to_string();
+        let enroll_edge_service = Arc::new(EnrollEdgeService::new(
+            edge_repo,
+            token_repo,
+            secret_store.clone(),
+            EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+            issuer.clone(),
+        ));
+
+        let uc = ChallengeNodeUseCase::new(
+            challenge_repo,
+            cluster_repo,
+            secret_store,
+            EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+        )
+        .with_enroll_edge_service(enroll_edge_service);
+
+        let signature = signing_key.sign(&nonce);
+        let jwt = fake_edge_jwt(&issuer, "tenant-abc");
+
+        let resp = uc
+            .execute(ChallengeNodeRequest {
+                challenge_id,
+                node_id,
+                challenge_signature: signature.to_bytes().to_vec(),
+                bootstrap_proof: Some(BootstrapProof::EnrollmentToken(jwt)),
+            })
+            .await
+            .expect("Edge ChallengeNode must succeed when EnrollEdgeService is wired");
+
+        assert!(
+            !resp.node_security_token.is_empty(),
+            "issued NodeSecurityToken must be non-empty"
+        );
+
+        let upserted = edge_repo_concrete.upserted.lock().unwrap().clone().expect(
+            "EdgeDaemonRepository::upsert MUST be called for a successful Edge \
+                 ChallengeNode — this is the wiring the fix restores",
+        );
+        assert_eq!(
+            upserted.node_id, node_id,
+            "persisted EdgeDaemon must carry the challenge's node_id"
+        );
+        assert_eq!(
+            upserted.tenant_id.as_str(),
+            "tenant-abc",
+            "persisted EdgeDaemon must carry the JWT's `tid` claim"
+        );
+    }
+
+    /// Regression: a wired `ChallengeNodeUseCase` MUST refuse to mint a
+    /// NodeSecurityToken when the enrollment token has already been
+    /// redeemed — the `EnrollmentTokenRepository::redeem` call surfaces
+    /// `AlreadyRedeemed` and the use case returns it as a domain error
+    /// rather than silently re-issuing.
+    #[tokio::test]
+    async fn challenge_node_edge_role_rejects_replayed_enrollment_token() {
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let challenge_id = Uuid::new_v4();
+        let node_id = NodeId::new();
+        let nonce: Vec<u8> = (0..32u8).collect();
+
+        let challenge = NodeChallenge {
+            challenge_id,
+            node_id,
+            nonce: nonce.clone(),
+            public_key: verifying_key.to_bytes().to_vec(),
+            role: NodeRole::Edge,
+            capabilities: NodeCapabilityAdvertisement::default(),
+            grpc_address: String::new(),
+            created_at: Utc::now(),
+        };
+
+        let challenge_repo: Arc<dyn NodeChallengeRepository> = Arc::new(InMemoryChallengeRepo {
+            challenge: Mutex::new(Some(challenge)),
+        });
+        let cluster_repo: Arc<dyn NodeClusterRepository> = Arc::new(InMemoryClusterRepo);
+        let secret_store: Arc<dyn SecretStore> = Arc::new(EdgeStubSecretStore);
+
+        // Token repo that ALWAYS reports AlreadyRedeemed: simulates a JWT
+        // whose JTI is already in the ledger.
+        struct ReplayedTokenRepo;
+        #[async_trait]
+        impl EnrollmentTokenRepository for ReplayedTokenRepo {
+            async fn redeem(
+                &self,
+                _: uuid::Uuid,
+                _: &TenantId,
+                _: &str,
+                _: DateTime<Utc>,
+            ) -> Result<(), EnrollmentTokenError> {
+                Err(EnrollmentTokenError::AlreadyRedeemed)
+            }
+        }
+
+        let edge_repo: Arc<dyn EdgeDaemonRepository> = Arc::new(CapturingEdgeRepo::new());
+        let token_repo: Arc<dyn EnrollmentTokenRepository> = Arc::new(ReplayedTokenRepo);
+
+        let issuer = "https://relay.example".to_string();
+        let enroll_edge_service = Arc::new(EnrollEdgeService::new(
+            edge_repo,
+            token_repo,
+            secret_store.clone(),
+            EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+            issuer.clone(),
+        ));
+
+        let uc = ChallengeNodeUseCase::new(
+            challenge_repo,
+            cluster_repo,
+            secret_store,
+            EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+        )
+        .with_enroll_edge_service(enroll_edge_service);
+
+        let signature = signing_key.sign(&nonce);
+        let jwt = fake_edge_jwt(&issuer, "tenant-abc");
+
+        let result = uc
+            .execute(ChallengeNodeRequest {
+                challenge_id,
+                node_id,
+                challenge_signature: signature.to_bytes().to_vec(),
+                bootstrap_proof: Some(BootstrapProof::EnrollmentToken(jwt)),
+            })
+            .await;
+        let err = match result {
+            Ok(_) => panic!("replayed JWT must fail ChallengeNode"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already redeemed"),
+            "error must surface AlreadyRedeemed, got: {msg}"
+        );
+    }
 }

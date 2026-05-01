@@ -114,11 +114,15 @@ pub async fn run_relay_coordinator(
         AttestNodeUseCase, ChallengeNodeUseCase, HeartbeatUseCase, PushConfigUseCase,
         RegisterNodeUseCase, RouteExecutionUseCase, SyncConfigUseCase,
     };
+    use aegis_orchestrator_core::application::edge::enroll_edge::EnrollEdgeService;
     use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::NodeClusterServiceServer;
     use aegis_orchestrator_core::infrastructure::cluster::{
         NodeClusterServiceHandler, PgClusterEnrolmentTokenRepository, PgConfigLayerRepository,
         PgNodeChallengeRepository, PgNodeClusterRepository, PgNodeRegistryRepository,
         RoundRobinNodeRouter,
+    };
+    use aegis_orchestrator_core::infrastructure::edge::{
+        EdgeConnectionRegistry, PgEdgeDaemonRepository, PgEnrollmentTokenRepository,
     };
 
     let cluster_repo: Arc<dyn aegis_orchestrator_core::domain::cluster::NodeClusterRepository> =
@@ -129,16 +133,34 @@ pub async fn run_relay_coordinator(
         dyn aegis_orchestrator_core::domain::cluster::ClusterEnrolmentTokenRepository,
     > = Arc::new(PgClusterEnrolmentTokenRepository::new(pool.clone()));
 
+    // ADR-117: edge daemon registry — populated by `EnrollEdgeService` on
+    // ChallengeNode (Edge role) and read by ConnectEdge / RotateEdgeKey /
+    // the tenant `/v1/edge/*` REST surface. Constructed once and shared.
+    let edge_repo: Arc<dyn aegis_orchestrator_core::domain::edge::EdgeDaemonRepository> =
+        Arc::new(PgEdgeDaemonRepository::new(pool.clone()));
+
+    // ADR-117: enrollment-token-redemption ledger; the JTI uniqueness gate
+    // that prevents replayed edge bootstrap JWTs.
+    let enrollment_token_repo: Arc<
+        dyn aegis_orchestrator_core::domain::edge::EnrollmentTokenRepository,
+    > = Arc::new(PgEnrollmentTokenRepository::new(pool.clone()));
+
     let attest_uc = Arc::new(AttestNodeUseCase::new(
         challenge_repo.clone(),
         cluster_enrolment_repo.clone(),
     ));
-    let challenge_uc = Arc::new(ChallengeNodeUseCase::new(
-        challenge_repo.clone(),
-        cluster_repo.clone(),
-        secrets_manager.secret_store(),
-        aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
-    ));
+
+    // ADR-117: the relay holds the OpenBao policy
+    // `transit/{sign,verify}/edge-enrollment-token` and is the canonical
+    // edge-enrollment endpoint in the SaaS topology. The expected `iss`
+    // claim on enrollment JWTs MUST equal the `issuer_url` minted by
+    // `IssueEnrollmentToken` below — both flow from `spec.zaru.public_url`.
+    let issuer_url = config
+        .spec
+        .zaru
+        .as_ref()
+        .and_then(|z| resolve_env_value(&z.public_url).ok())
+        .unwrap_or_else(|| "aegis-relay-coordinator".to_string());
     let registry_repo: Arc<dyn aegis_orchestrator_core::domain::cluster::NodeRegistryRepository> =
         Arc::new(PgNodeRegistryRepository::new(pool.clone()));
     let register_uc = Arc::new(RegisterNodeUseCase::new(
@@ -164,6 +186,31 @@ pub async fn run_relay_coordinator(
     ));
     let push_config_uc = Arc::new(PushConfigUseCase::new(config_layer_repo));
 
+    // ADR-117: edge enrollment service — verifies the bootstrap JWT,
+    // atomically redeems its `jti`, and persists the EdgeDaemon row.
+    // Wired into ChallengeNodeUseCase so that ChallengeNode(role=Edge) on
+    // the relay actually populates `edge_daemons` instead of erroring with
+    // "Edge enrollment not enabled on this controller". Uses the same
+    // `EDGE_ENROLLMENT_SIGNING_KEY` Transit key as the issuer below — the
+    // relay's AppRole policy grants both `transit/sign/...` and
+    // `transit/verify/...` on this key.
+    let enroll_edge_service = Arc::new(EnrollEdgeService::new(
+        edge_repo.clone(),
+        enrollment_token_repo.clone(),
+        secrets_manager.secret_store(),
+        aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+        issuer_url.clone(),
+    ));
+    let challenge_uc = Arc::new(
+        ChallengeNodeUseCase::new(
+            challenge_repo.clone(),
+            cluster_repo.clone(),
+            secrets_manager.secret_store(),
+            aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+        )
+        .with_enroll_edge_service(enroll_edge_service),
+    );
+
     // ADR-117: ForwardExecution is intentionally absent on the relay — the
     // relay does not host agent execution and never dispatches forwarded
     // executions. Calling the RPC against this node returns
@@ -186,12 +233,7 @@ pub async fn run_relay_coordinator(
         IssueEnrollmentToken, EDGE_ENROLLMENT_SIGNING_KEY,
     };
     use aegis_orchestrator_core::application::edge::rotate_edge_key::RotateEdgeKeyService;
-    use aegis_orchestrator_core::infrastructure::edge::{
-        EdgeConnectionRegistry, PgEdgeDaemonRepository,
-    };
 
-    let edge_repo: Arc<dyn aegis_orchestrator_core::domain::edge::EdgeDaemonRepository> =
-        Arc::new(PgEdgeDaemonRepository::new(pool.clone()));
     let conn_registry = EdgeConnectionRegistry::new();
     let connect_edge_service = Arc::new(ConnectEdgeService::new(
         edge_repo.clone(),
@@ -204,12 +246,6 @@ pub async fn run_relay_coordinator(
     ));
     handler = handler.with_edge_services(connect_edge_service, rotate_edge_key_service);
 
-    let issuer_url = config
-        .spec
-        .zaru
-        .as_ref()
-        .and_then(|z| resolve_env_value(&z.public_url).ok())
-        .unwrap_or_else(|| "aegis-relay-coordinator".to_string());
     let cluster_public_endpoint = config
         .spec
         .cluster

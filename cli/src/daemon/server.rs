@@ -2506,14 +2506,46 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     cluster_enrolment_repo.clone(),
                 ),
             );
-            let challenge_uc = Arc::new(
+            // ADR-117: edge enrollment service — verifies the bootstrap JWT,
+            // atomically redeems its `jti`, and persists the EdgeDaemon row.
+            // Wired into ChallengeNodeUseCase so that ChallengeNode(role=Edge)
+            // populates `edge_daemons` instead of returning "Edge enrollment
+            // not enabled on this controller". Only attached when the
+            // edge_components bundle is present (i.e. a Postgres pool exists,
+            // which is required for both `edge_daemons` and the
+            // `enrollment_tokens` JTI ledger).
+            let enroll_edge_service = edge_components.as_ref().map(|(edge_repo, _, _, _, _, _, _)| {
+                use aegis_orchestrator_core::application::edge::enroll_edge::EnrollEdgeService;
+                use aegis_orchestrator_core::infrastructure::edge::PgEnrollmentTokenRepository;
+                let enrollment_token_repo: Arc<
+                    dyn aegis_orchestrator_core::domain::edge::EnrollmentTokenRepository,
+                > = Arc::new(PgEnrollmentTokenRepository::new(pool.clone()));
+                let issuer_url = config
+                    .spec
+                    .zaru
+                    .as_ref()
+                    .and_then(|z| resolve_env_value(&z.public_url).ok())
+                    .unwrap_or_else(|| "aegis-controller".to_string());
+                Arc::new(EnrollEdgeService::new(
+                    edge_repo.clone(),
+                    enrollment_token_repo,
+                    secret_store.clone(),
+                    aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+                    issuer_url,
+                ))
+            });
+
+            let mut challenge_uc_inner =
                 aegis_orchestrator_core::application::cluster::ChallengeNodeUseCase::new(
                     challenge_repo.clone(),
                     cluster_repo.clone(),
-                    secret_store,
+                    secret_store.clone(),
                     aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
-                ),
-            );
+                );
+            if let Some(svc) = enroll_edge_service.clone() {
+                challenge_uc_inner = challenge_uc_inner.with_enroll_edge_service(svc);
+            }
+            let challenge_uc = Arc::new(challenge_uc_inner);
             let registry_repo: Arc<
                 dyn aegis_orchestrator_core::domain::cluster::NodeRegistryRepository,
             > = Arc::new(PgNodeRegistryRepository::new(pool.clone()));
