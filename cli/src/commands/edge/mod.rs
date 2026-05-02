@@ -36,8 +36,8 @@ pub enum EdgeCommand {
     Daemon(daemon::DaemonArgs),
     /// Show local daemon status, tenant binding and capabilities.
     Status(status::StatusArgs),
-    /// Local revocation: delete node.token and key from disk.
-    Logout,
+    /// Local revocation: remove the entire edge state directory from disk.
+    Logout(logout::LogoutArgs),
     /// List edges visible to the current operator (operator-side).
     Ls(ls::LsArgs),
     /// Operator-managed tag mutation.
@@ -62,7 +62,7 @@ pub async fn run(args: EdgeArgs, output: OutputFormat) -> anyhow::Result<()> {
         EdgeCommand::Enroll(a) => enroll::run(a, output).await,
         EdgeCommand::Daemon(a) => daemon::run(a).await,
         EdgeCommand::Status(a) => status::run(a, output).await,
-        EdgeCommand::Logout => logout::run().await,
+        EdgeCommand::Logout(a) => logout::run(a).await,
         EdgeCommand::Ls(a) => ls::run(a, output).await,
         EdgeCommand::Tag(c) => tag::run(c).await,
         EdgeCommand::Group(c) => group::run(c).await,
