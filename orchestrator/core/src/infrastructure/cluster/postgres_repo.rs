@@ -11,11 +11,35 @@ use crate::domain::cluster::{
     NodePeerStatus, NodeRole, ResourceSnapshot, StimulusIdempotencyRepository,
 };
 use crate::domain::stimulus::StimulusId;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Parse the lowercased `Debug` form of [`NodeRole`] back into the enum.
+///
+/// The serializer side uses `format!("{:?}", role).to_lowercase()`, which
+/// produces `"controller"`, `"worker"`, `"hybrid"`, `"edge"`, and
+/// `"relaycoordinator"` (no underscore — `Debug` prints `RelayCoordinator`
+/// and `to_lowercase()` collapses it). Any other input means stale or
+/// corrupted data; we return an error rather than silently downgrading
+/// to `Worker`, which previously caused Edge daemons to be persisted into
+/// `cluster_nodes` (worker tier) instead of `edge_daemons`.
+pub(crate) fn parse_role_str(s: &str) -> anyhow::Result<NodeRole> {
+    match s {
+        "controller" => Ok(NodeRole::Controller),
+        "worker" => Ok(NodeRole::Worker),
+        "hybrid" => Ok(NodeRole::Hybrid),
+        "edge" => Ok(NodeRole::Edge),
+        "relaycoordinator" => Ok(NodeRole::RelayCoordinator),
+        other => Err(anyhow!(
+            "unknown NodeRole serialization in database: {other:?} \
+             (expected one of: controller, worker, hybrid, edge, relaycoordinator)"
+        )),
+    }
+}
 
 pub struct PgNodeClusterRepository {
     pool: PgPool,
@@ -83,7 +107,7 @@ impl NodeClusterRepository for PgNodeClusterRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| row_to_node_peer(&r)))
+        row.map(|r| row_to_node_peer(&r)).transpose()
     }
 
     async fn list_peers_by_status(&self, status: NodePeerStatus) -> anyhow::Result<Vec<NodePeer>> {
@@ -101,7 +125,7 @@ impl NodeClusterRepository for PgNodeClusterRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.iter().map(row_to_node_peer).collect())
+        rows.iter().map(row_to_node_peer).collect()
     }
 
     async fn record_heartbeat(
@@ -182,7 +206,7 @@ impl NodeClusterRepository for PgNodeClusterRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.iter().map(row_to_node_peer).collect())
+        rows.iter().map(row_to_node_peer).collect()
     }
 
     async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>> {
@@ -212,17 +236,12 @@ impl NodeClusterRepository for PgNodeClusterRepository {
     }
 }
 
-fn row_to_node_peer(r: &sqlx::postgres::PgRow) -> NodePeer {
+fn row_to_node_peer(r: &sqlx::postgres::PgRow) -> anyhow::Result<NodePeer> {
     let role_str: String = r.get("role");
     let status_str: String = r.get("status");
-    NodePeer {
+    Ok(NodePeer {
         node_id: NodeId(r.get("node_id")),
-        role: match role_str.as_str() {
-            "controller" => NodeRole::Controller,
-            "worker" => NodeRole::Worker,
-            "hybrid" => NodeRole::Hybrid,
-            _ => NodeRole::Worker,
-        },
+        role: parse_role_str(&role_str)?,
         public_key: r.get("public_key"),
         capabilities: NodeCapabilityAdvertisement {
             gpu_count: r.get::<i32, _>("gpu_count") as u32,
@@ -237,11 +256,16 @@ fn row_to_node_peer(r: &sqlx::postgres::PgRow) -> NodePeer {
             "active" => NodePeerStatus::Active,
             "draining" => NodePeerStatus::Draining,
             "unhealthy" => NodePeerStatus::Unhealthy,
-            _ => NodePeerStatus::Active,
+            other => {
+                return Err(anyhow!(
+                    "unknown NodePeerStatus serialization in database: {other:?} \
+                     (expected one of: active, draining, unhealthy)"
+                ));
+            }
         },
         last_heartbeat_at: r.get("last_heartbeat_at"),
         registered_at: r.get("registered_at"),
-    }
+    })
 }
 
 pub struct PgNodeChallengeRepository {
@@ -303,19 +327,14 @@ impl NodeChallengeRepository for PgNodeChallengeRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| {
+        row.map(|r| {
             let role_str: String = r.get("role");
-            NodeChallenge {
+            Ok(NodeChallenge {
                 challenge_id: r.get("challenge_id"),
                 node_id: NodeId(r.get("node_id")),
                 nonce: r.get("nonce"),
                 public_key: r.get("public_key"),
-                role: match role_str.as_str() {
-                    "controller" => NodeRole::Controller,
-                    "worker" => NodeRole::Worker,
-                    "hybrid" => NodeRole::Hybrid,
-                    _ => NodeRole::Worker,
-                },
+                role: parse_role_str(&role_str)?,
                 capabilities: NodeCapabilityAdvertisement {
                     gpu_count: r.get::<i32, _>("gpu_count") as u32,
                     vram_gb: r.get::<i32, _>("vram_gb") as u32,
@@ -326,8 +345,9 @@ impl NodeChallengeRepository for PgNodeChallengeRepository {
                 },
                 grpc_address: r.get("grpc_address"),
                 created_at: r.get("created_at"),
-            }
-        }))
+            })
+        })
+        .transpose()
     }
 
     async fn delete_challenge(&self, challenge_id: &Uuid) -> anyhow::Result<()> {
@@ -360,5 +380,94 @@ impl StimulusIdempotencyRepository for PgStimulusIdempotencyRepository {
         .await?;
 
         Ok(res.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip every `NodeRole` variant through the serializer
+    /// (`format!("{:?}", role).to_lowercase()`) and the deserializer
+    /// (`parse_role_str`). Pins the bug where `Edge` and `RelayCoordinator`
+    /// silently downgraded to `Worker` on load — Edge daemons completed
+    /// AttestNode, the challenge persisted with `role = "edge"`, but the
+    /// loader's `_ => NodeRole::Worker` fallback bypassed the Edge gate in
+    /// `ChallengeNodeUseCase::execute` and dropped the daemon into
+    /// `cluster_nodes` instead of `edge_daemons`.
+    #[test]
+    fn parse_role_str_round_trip_all_variants() {
+        for role in [
+            NodeRole::Controller,
+            NodeRole::Worker,
+            NodeRole::Hybrid,
+            NodeRole::Edge,
+            NodeRole::RelayCoordinator,
+        ] {
+            let serialized = format!("{:?}", role).to_lowercase();
+            let parsed = parse_role_str(&serialized).unwrap_or_else(|e| {
+                panic!("round-trip failed for {role:?} -> {serialized:?}: {e}")
+            });
+            assert_eq!(
+                parsed, role,
+                "round-trip mismatch for {role:?}: serialized as {serialized:?} but parsed as {parsed:?}"
+            );
+        }
+    }
+
+    /// Edge specifically — this is the variant the orchestrator gate keys on.
+    #[test]
+    fn parse_role_str_edge_maps_to_edge_not_worker() {
+        assert_eq!(parse_role_str("edge").unwrap(), NodeRole::Edge);
+    }
+
+    /// `RelayCoordinator` Debug-prints as `"RelayCoordinator"`, which
+    /// `.to_lowercase()` collapses to `"relaycoordinator"` — no underscore.
+    /// The deserializer arm must match that exact spelling.
+    #[test]
+    fn parse_role_str_relay_coordinator_serializes_without_underscore() {
+        let serialized = format!("{:?}", NodeRole::RelayCoordinator).to_lowercase();
+        assert_eq!(serialized, "relaycoordinator");
+        assert_eq!(
+            parse_role_str(&serialized).unwrap(),
+            NodeRole::RelayCoordinator
+        );
+    }
+
+    /// Unknown role strings used to silently become `Worker`. They now
+    /// surface as a hard error so corrupted DB rows get caught instead of
+    /// being misrouted into the worker tier.
+    #[test]
+    fn parse_role_str_unknown_returns_error() {
+        let err = parse_role_str("relay_coordinator").expect_err(
+            "underscored form is NOT what the serializer emits and must not be accepted",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("relay_coordinator"),
+            "error should quote the offending value, got: {msg}"
+        );
+
+        parse_role_str("garbage").expect_err("garbage role string must error");
+        parse_role_str("").expect_err("empty role string must error");
+    }
+
+    /// Regression test for the bug where the challenge loader downgraded
+    /// `Edge` -> `Worker`. We can't construct a real `PgRow` in unit tests,
+    /// but we can exercise the exact serialize -> parse path the loader
+    /// uses, asserting the role survives the round trip.
+    #[test]
+    fn edge_node_challenge_role_survives_db_round_trip() {
+        // What `save_challenge` writes:
+        let serialized = format!("{:?}", NodeRole::Edge).to_lowercase();
+        assert_eq!(serialized, "edge");
+
+        // What `get_challenge` reads:
+        let role = parse_role_str(&serialized).expect("edge must deserialize");
+        assert_eq!(
+            role,
+            NodeRole::Edge,
+            "Edge daemon role must survive DB round-trip; downgrade to Worker bypasses ChallengeNodeUseCase Edge gate"
+        );
     }
 }
