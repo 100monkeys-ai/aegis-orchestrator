@@ -175,7 +175,7 @@ async fn post_enrollment_token(
 
 // ── Hosts ──────────────────────────────────────────────────────────────
 
-/// Wire-format projection of [`EdgeDaemon`] for the `/v1/edge/hosts` REST
+/// Wire-format projection of [`crate::domain::edge::EdgeDaemon`] for the `/v1/edge/hosts` REST
 /// surface. Field names mirror Zaru's `EdgeHost` interface in
 /// `zaru-client/lib/api/edge.ts` so the proxy is a passthrough — the
 /// orchestrator owns the canonical shape.
