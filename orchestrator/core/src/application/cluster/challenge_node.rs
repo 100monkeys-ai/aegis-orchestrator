@@ -518,6 +518,9 @@ mod tests {
         async fn update_tags(&self, _: &NodeId, _: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn update_display_name(&self, _: &NodeId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn update_capabilities(
             &self,
             _: &NodeId,

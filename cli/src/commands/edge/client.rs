@@ -28,6 +28,19 @@ pub struct EdgeApiClient {
 }
 
 impl EdgeApiClient {
+    /// Test-only constructor: build a client pointed at an arbitrary base
+    /// URL with no auth/tenant headers. Used by the `aegis edge logout`
+    /// regression suite to drive an in-process mock orchestrator without
+    /// depending on env vars or the operator auth store.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            inner: reqwest::Client::new(),
+            headers: HeaderMap::new(),
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
         let base_url = std::env::var("AEGIS_API_URL")
             .or_else(|_| std::env::var("AEGIS_CONTROLLER_ENDPOINT"))

@@ -95,6 +95,16 @@ impl EdgeDaemonRepository for StubEdgeRepo {
         }
         Ok(())
     }
+    async fn update_display_name(
+        &self,
+        node_id: &NodeId,
+        display_name: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(e) = self.edges.lock().await.get_mut(node_id) {
+            e.display_name = display_name.to_string();
+        }
+        Ok(())
+    }
     async fn update_capabilities(
         &self,
         node_id: &NodeId,
@@ -247,6 +257,7 @@ fn make_test_edge(node_id: NodeId, tenant: &TenantId) -> EdgeDaemon {
         connection: EdgeConnectionState::Disconnected { since: Utc::now() },
         last_heartbeat_at: None,
         enrolled_at: Utc::now(),
+        display_name: String::new(),
     }
 }
 

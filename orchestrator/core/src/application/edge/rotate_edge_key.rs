@@ -260,6 +260,9 @@ mod tests {
         async fn update_tags(&self, _: &NodeId, _: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn update_display_name(&self, _: &NodeId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn update_capabilities(
             &self,
             _: &NodeId,
@@ -377,6 +380,7 @@ mod tests {
             },
             last_heartbeat_at: None,
             enrolled_at: chrono::Utc::now(),
+            display_name: String::new(),
         })
         .await
         .unwrap();
@@ -502,6 +506,7 @@ mod tests {
                 },
                 last_heartbeat_at: None,
                 enrolled_at: chrono::Utc::now(),
+                display_name: String::new(),
             })
             .await
             .unwrap();
@@ -533,6 +538,7 @@ mod tests {
                 },
                 last_heartbeat_at: None,
                 enrolled_at: chrono::Utc::now(),
+                display_name: String::new(),
             })
             .await
             .unwrap();
@@ -638,6 +644,7 @@ mod tests {
                 },
                 last_heartbeat_at: None,
                 enrolled_at: chrono::Utc::now(),
+                display_name: String::new(),
             })
             .await
             .unwrap();

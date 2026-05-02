@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 use anyhow::Result;
 use clap::Subcommand;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::client::EdgeApiClient;
 
@@ -20,6 +20,13 @@ struct PatchHost {
     remove_tags: Option<Vec<String>>,
 }
 
+/// Subset of the orchestrator's `EdgeHostView` response that this command
+/// needs — only `tags` is consumed for the user-facing summary.
+#[derive(Deserialize)]
+struct EdgeHostResponse {
+    tags: Vec<String>,
+}
+
 pub async fn run(cmd: TagCommand) -> Result<()> {
     let client = EdgeApiClient::from_env()?;
     match cmd {
@@ -28,20 +35,20 @@ pub async fn run(cmd: TagCommand) -> Result<()> {
                 add_tags: Some(tags),
                 remove_tags: None,
             };
-            let updated: Vec<String> = client
+            let updated: EdgeHostResponse = client
                 .patch(&format!("/v1/edge/hosts/{node_id}"), &body)
                 .await?;
-            println!("tags: {}", updated.join(","));
+            println!("tags: {}", updated.tags.join(","));
         }
         TagCommand::Rm { node_id, tags } => {
             let body = PatchHost {
                 add_tags: None,
                 remove_tags: Some(tags),
             };
-            let updated: Vec<String> = client
+            let updated: EdgeHostResponse = client
                 .patch(&format!("/v1/edge/hosts/{node_id}"), &body)
                 .await?;
-            println!("tags: {}", updated.join(","));
+            println!("tags: {}", updated.tags.join(","));
         }
     }
     Ok(())

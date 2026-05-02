@@ -175,14 +175,42 @@ async fn post_enrollment_token(
 
 // ── Hosts ──────────────────────────────────────────────────────────────
 
+/// Wire-format projection of [`EdgeDaemon`] for the `/v1/edge/hosts` REST
+/// surface. Field names mirror Zaru's `EdgeHost` interface in
+/// `zaru-client/lib/api/edge.ts` so the proxy is a passthrough — the
+/// orchestrator owns the canonical shape.
 #[derive(Serialize)]
 struct EdgeHostView {
-    node_id: String,
+    id: String,
+    name: String,
     tenant_id: String,
     status: String,
     tags: Vec<String>,
     os: String,
     arch: String,
+    enrolled_at: String,
+    last_seen_at: Option<String>,
+}
+
+fn host_view(edge: &crate::domain::edge::EdgeDaemon) -> EdgeHostView {
+    let display = if edge.display_name.is_empty() {
+        // Fallback for rows from before display_name was persisted: short
+        // node-id slug so the UI has something stable to render.
+        format!("edge-{}", &edge.node_id.to_string()[..8])
+    } else {
+        edge.display_name.clone()
+    };
+    EdgeHostView {
+        id: edge.node_id.to_string(),
+        name: display,
+        tenant_id: edge.tenant_id.as_str().to_string(),
+        status: format!("{:?}", edge.status).to_lowercase(),
+        tags: edge.capabilities.tags.clone(),
+        os: edge.capabilities.os.clone(),
+        arch: edge.capabilities.arch.clone(),
+        enrolled_at: edge.enrolled_at.to_rfc3339(),
+        last_seen_at: edge.last_heartbeat_at.map(|t| t.to_rfc3339()),
+    }
 }
 
 async fn list_hosts(
@@ -194,19 +222,7 @@ async fn list_hosts(
         .list_by_tenant(&tenant)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(
-        edges
-            .into_iter()
-            .map(|e| EdgeHostView {
-                node_id: e.node_id.to_string(),
-                tenant_id: e.tenant_id.as_str().to_string(),
-                status: format!("{:?}", e.status).to_lowercase(),
-                tags: e.capabilities.tags,
-                os: e.capabilities.os,
-                arch: e.capabilities.arch,
-            })
-            .collect(),
-    ))
+    Ok(Json(edges.iter().map(host_view).collect()))
 }
 
 async fn get_host(
@@ -224,18 +240,20 @@ async fn get_host(
     if edge.tenant_id != tenant {
         return Err(ApiError::not_found("edge"));
     }
-    Ok(Json(EdgeHostView {
-        node_id: edge.node_id.to_string(),
-        tenant_id: edge.tenant_id.as_str().to_string(),
-        status: format!("{:?}", edge.status).to_lowercase(),
-        tags: edge.capabilities.tags,
-        os: edge.capabilities.os,
-        arch: edge.capabilities.arch,
-    }))
+    Ok(Json(host_view(&edge)))
 }
 
 #[derive(Deserialize)]
 struct PatchHost {
+    /// Operator-mutable display label. Zaru's hosts list and detail page
+    /// surface this as the host's name; falls back to `edge-<short>` when
+    /// blank.
+    name: Option<String>,
+    /// Replace-semantics tag update — the supplied array becomes the row's
+    /// new tag set. Used by Zaru's `TagEditor`, which sends the final
+    /// computed array after each user edit. Mutually exclusive with
+    /// `add_tags` / `remove_tags`.
+    tags: Option<Vec<String>>,
     add_tags: Option<Vec<String>>,
     remove_tags: Option<Vec<String>>,
 }
@@ -245,24 +263,61 @@ async fn patch_host(
     Extension(tenant): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<PatchHost>,
-) -> Result<Json<Vec<String>>, ApiError> {
+) -> Result<Json<EdgeHostView>, ApiError> {
     let nid = parse_node_id(&id)?;
-    let mut tags = Vec::new();
+
+    // Fetch + tenant-gate up front so cross-tenant requests 404 even when
+    // the only field being mutated is the display name.
+    let mut edge = s
+        .edge_repo
+        .get(&nid)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("edge"))?;
+    if edge.tenant_id != tenant {
+        return Err(ApiError::not_found("edge"));
+    }
+
+    if let Some(name) = body.name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::bad_request("name must not be empty"));
+        }
+        s.edge_repo
+            .update_display_name(&nid, trimmed)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        edge.display_name = trimmed.to_string();
+    }
+
+    // Replace-semantics tag update from Zaru's TagEditor; bypasses the
+    // tag service's add/remove helpers because the client has already
+    // computed the final array.
+    if let Some(replacement) = body.tags {
+        s.edge_repo
+            .update_tags(&nid, &replacement)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        edge.capabilities.tags = replacement;
+    }
     if let Some(add) = body.add_tags {
-        tags = s
+        let tags = s
             .tag_service
             .add_tags(&tenant, nid, add)
             .await
             .map_err(map_tags_err)?;
+        edge.capabilities.tags = tags;
     }
     if let Some(rm) = body.remove_tags {
-        tags = s
+        let tags = s
             .tag_service
             .remove_tags(&tenant, nid, rm)
             .await
             .map_err(map_tags_err)?;
+        edge.capabilities.tags = tags;
     }
-    Ok(Json(tags))
+
+    Ok(Json(host_view(&edge)))
 }
 
 fn map_tags_err(e: crate::application::edge::manage_tags::ManageTagsError) -> ApiError {
@@ -652,6 +707,13 @@ mod tests {
         async fn update_tags(&self, _node_id: &NodeId, _tags: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn update_display_name(
+            &self,
+            _node_id: &NodeId,
+            _display_name: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn update_capabilities(
             &self,
             _node_id: &NodeId,
@@ -929,6 +991,306 @@ mod tests {
             Some("caller-jwt"),
             "Bearer token must be forwarded to the issuer for IAM continuity \
              across the in-pod proxy hop (ADR-117)"
+        );
+    }
+
+    // ── Display-name regression suite ──────────────────────────────────
+    //
+    // Bug: PATCH /v1/edge/hosts/:id ignored a `name` field. Zaru's hosts
+    // list and detail page both surface the host display name, so the
+    // rename UX silently no-op'd before this fix. These tests pin the new
+    // contract: PATCH `{ "name": "new" }` updates the row, the next GET
+    // reflects the change, and the response shape carries `name` (not the
+    // legacy `node_id` / `tenant_id` only projection).
+
+    /// In-memory EdgeDaemonRepository for round-trip + handler integration
+    /// — separate from the trivial `StubEdgeRepo` above (which always
+    /// returns empty / None) so existing tests that depend on the empty
+    /// behavior keep working.
+    struct InMemoryEdgeRepo {
+        edges: tokio::sync::Mutex<std::collections::HashMap<NodeId, EdgeDaemon>>,
+    }
+
+    impl InMemoryEdgeRepo {
+        fn new() -> Self {
+            Self {
+                edges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+        async fn seed(&self, edge: EdgeDaemon) {
+            self.edges.lock().await.insert(edge.node_id, edge);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeDaemonRepository for InMemoryEdgeRepo {
+        async fn upsert(&self, edge: &EdgeDaemon) -> anyhow::Result<()> {
+            self.edges.lock().await.insert(edge.node_id, edge.clone());
+            Ok(())
+        }
+        async fn get(&self, node_id: &NodeId) -> anyhow::Result<Option<EdgeDaemon>> {
+            Ok(self.edges.lock().await.get(node_id).cloned())
+        }
+        async fn list_by_tenant(&self, tenant: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(self
+                .edges
+                .lock()
+                .await
+                .values()
+                .filter(|e| &e.tenant_id == tenant)
+                .cloned()
+                .collect())
+        }
+        async fn update_status(&self, id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
+            if let Some(e) = self.edges.lock().await.get_mut(id) {
+                e.status = status;
+            }
+            Ok(())
+        }
+        async fn update_tags(&self, id: &NodeId, tags: &[String]) -> anyhow::Result<()> {
+            if let Some(e) = self.edges.lock().await.get_mut(id) {
+                e.capabilities.tags = tags.to_vec();
+            }
+            Ok(())
+        }
+        async fn update_display_name(&self, id: &NodeId, name: &str) -> anyhow::Result<()> {
+            if let Some(e) = self.edges.lock().await.get_mut(id) {
+                e.display_name = name.to_string();
+            }
+            Ok(())
+        }
+        async fn update_capabilities(
+            &self,
+            id: &NodeId,
+            caps: &crate::domain::edge::EdgeCapabilities,
+        ) -> anyhow::Result<()> {
+            if let Some(e) = self.edges.lock().await.get_mut(id) {
+                e.capabilities = caps.clone();
+            }
+            Ok(())
+        }
+        async fn delete(&self, id: &NodeId) -> anyhow::Result<()> {
+            self.edges.lock().await.remove(id);
+            Ok(())
+        }
+    }
+
+    fn build_state_with_repo(edge_repo: Arc<dyn EdgeDaemonRepository>) -> EdgeApiState {
+        let group_repo: Arc<dyn EdgeGroupRepository> = Arc::new(StubGroupRepo);
+        let conn_registry = EdgeConnectionRegistry::new();
+        let fleet_registry = FleetRegistry::new();
+        let secret_store = Arc::new(TestSecretStore::new());
+        let issue_token: Arc<dyn EnrollmentTokenIssuer> = Arc::new(IssueEnrollmentToken::new(
+            secret_store,
+            "test-issuer".into(),
+            "test-controller:443".into(),
+            "test-key".into(),
+        ));
+        let group_service = Arc::new(ManageGroupsService::new(group_repo.clone()));
+        let tag_service = Arc::new(ManageTagsService::new(edge_repo.clone()));
+        let revoke_service = Arc::new(RevokeEdgeService::new(
+            edge_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let resolver = Arc::new(EdgeFleetResolver::new(
+            edge_repo.clone(),
+            group_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let dispatch_service = Arc::new(DispatchToEdgeService::new(
+            edge_repo.clone(),
+            conn_registry.clone(),
+        ));
+        let fleet_dispatcher = Arc::new(FleetDispatcher::new(
+            dispatch_service.clone(),
+            fleet_registry.clone(),
+        ));
+        let fleet_cancel = Arc::new(CancelFleetService::new(
+            fleet_registry,
+            conn_registry.clone(),
+        ));
+        EdgeApiState {
+            issue_token,
+            edge_repo,
+            group_service,
+            tag_service,
+            revoke_service,
+            resolver,
+            fleet_dispatcher,
+            fleet_cancel,
+            dispatch_service,
+        }
+    }
+
+    fn router_with_repo(repo: Arc<dyn EdgeDaemonRepository>) -> Router {
+        let state = build_state_with_repo(repo);
+        router(state).layer(from_fn(
+            |req: axum::extract::Request, next: Next| async move {
+                let tenant = req
+                    .headers()
+                    .get("X-Tenant-Id")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| TenantId::new(s).ok());
+                let mut req = req;
+                if let Some(t) = tenant {
+                    req.extensions_mut().insert(t);
+                }
+                next.run(req).await
+            },
+        ))
+    }
+
+    fn seed_edge(node_id: NodeId, tenant: &TenantId, display_name: &str) -> EdgeDaemon {
+        EdgeDaemon {
+            node_id,
+            tenant_id: tenant.clone(),
+            public_key: vec![0; 32],
+            capabilities: crate::domain::edge::EdgeCapabilities::default(),
+            status: NodePeerStatus::Active,
+            connection: crate::domain::edge::EdgeConnectionState::Disconnected {
+                since: chrono::Utc::now(),
+            },
+            last_heartbeat_at: None,
+            enrolled_at: chrono::Utc::now(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    /// Regression: ADR-117 friendly-name UX. PATCH `/v1/edge/hosts/:id`
+    /// with `{"name":"new"}` MUST persist the new display name and
+    /// reflect it in subsequent GETs / list responses. Before this fix
+    /// the handler accepted only `add_tags` / `remove_tags` and silently
+    /// ignored `name`.
+    #[tokio::test]
+    async fn patch_host_renames_via_name_field() {
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let node_id = NodeId::new();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        repo.seed(seed_edge(node_id, &tenant, "old-name")).await;
+        let app = router_with_repo(repo.clone());
+
+        let req = HttpRequest::builder()
+            .method("PATCH")
+            .uri(format!("/v1/edge/hosts/{}", node_id.0))
+            .header("X-Tenant-Id", "t-consumer")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"name":"renamed-laptop"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            v.get("name").and_then(|x| x.as_str()),
+            Some("renamed-laptop"),
+            "PATCH response must echo the new display name"
+        );
+
+        let stored = repo.get(&node_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.display_name, "renamed-laptop",
+            "PATCH must persist the new display name to the repo"
+        );
+    }
+
+    /// Regression: hosts list MUST emit Zaru's canonical `id` + `name`
+    /// fields. Before this fix the projection emitted `node_id` only and
+    /// had no friendly-name field at all, so the UI rendered every host
+    /// as undefined.
+    #[tokio::test]
+    async fn list_hosts_emits_id_and_name_fields() {
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let nid = NodeId::new();
+        repo.seed(seed_edge(nid, &tenant, "home-laptop")).await;
+        let app = router_with_repo(repo);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/v1/edge/hosts")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let arr = v.as_array().expect("hosts list is an array");
+        assert_eq!(arr.len(), 1);
+        let h = &arr[0];
+        assert_eq!(
+            h.get("id").and_then(|x| x.as_str()),
+            Some(nid.0.to_string().as_str()),
+            "list_hosts must emit canonical `id` (Zaru EdgeHost.id contract)"
+        );
+        assert_eq!(
+            h.get("name").and_then(|x| x.as_str()),
+            Some("home-laptop"),
+            "list_hosts must emit operator-supplied display name"
+        );
+    }
+
+    /// Regression: blank `display_name` must surface a stable
+    /// node-id-derived fallback so the UI never renders an empty label.
+    #[tokio::test]
+    async fn list_hosts_falls_back_to_short_node_id_when_name_blank() {
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let nid = NodeId::new();
+        repo.seed(seed_edge(nid, &tenant, "")).await;
+        let app = router_with_repo(repo);
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/v1/edge/hosts")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let name = v[0].get("name").and_then(|x| x.as_str()).unwrap();
+        assert!(
+            name.starts_with("edge-"),
+            "blank display_name must fall back to edge-<short> (got {name:?})"
+        );
+        assert_eq!(name.len(), "edge-".len() + 8);
+    }
+
+    /// Regression: cross-tenant rename must 404 (not silently rename
+    /// another tenant's host).
+    #[tokio::test]
+    async fn patch_host_cross_tenant_returns_404() {
+        let tenant_a = TenantId::new("t-a").unwrap();
+        let tenant_b = TenantId::new("t-b").unwrap();
+        let node_id = NodeId::new();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        repo.seed(seed_edge(node_id, &tenant_a, "a-laptop")).await;
+        let app = router_with_repo(repo.clone());
+
+        let req = HttpRequest::builder()
+            .method("PATCH")
+            .uri(format!("/v1/edge/hosts/{}", node_id.0))
+            .header("X-Tenant-Id", "t-b")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"name":"hostile-rename"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "tenant_b must not see — let alone rename — tenant_a's host"
+        );
+        let stored = repo.get(&node_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.display_name, "a-laptop",
+            "cross-tenant PATCH must not mutate the row"
         );
     }
 }

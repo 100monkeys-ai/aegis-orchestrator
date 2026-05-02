@@ -189,6 +189,10 @@ pub struct EdgeDaemon {
     pub connection: EdgeConnectionState,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub enrolled_at: DateTime<Utc>,
+    /// Operator-supplied display label captured at enrollment via Zaru's
+    /// friendly-name field (or auto-generated `edge-<short>`). Mutable
+    /// post-enrollment via `PATCH /v1/edge/hosts/:id`.
+    pub display_name: String,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -250,6 +254,8 @@ pub trait EdgeDaemonRepository: Send + Sync {
     async fn list_by_tenant(&self, tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>>;
     async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()>;
     async fn update_tags(&self, node_id: &NodeId, tags: &[String]) -> anyhow::Result<()>;
+    async fn update_display_name(&self, node_id: &NodeId, display_name: &str)
+        -> anyhow::Result<()>;
     async fn update_capabilities(
         &self,
         node_id: &NodeId,

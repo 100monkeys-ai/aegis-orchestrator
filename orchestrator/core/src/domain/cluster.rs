@@ -1020,6 +1020,7 @@ mod tests {
             connection: EdgeConnectionState::Disconnected { since: Utc::now() },
             last_heartbeat_at: None,
             enrolled_at: Utc::now(),
+            display_name: String::new(),
         };
         cluster.upsert_edge(mk(tenant_a.clone()));
         cluster.upsert_edge(mk(tenant_a.clone()));

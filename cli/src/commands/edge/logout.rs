@@ -1,29 +1,155 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! `aegis edge logout` — remove the entire local edge state directory.
+//! `aegis edge logout` — revoke server-side and remove the entire local
+//! edge state directory.
 //!
 //! Logout means logout: the whole `~/.aegis/edge` directory (or the override
 //! supplied via `--state-dir`) is removed, not just a hand-picked subset of
 //! credential files. Leaving `aegis-config.yaml` or `node.pub` behind would
 //! pin the next enrollment to the previous (orphaned) `spec.node.id`, which
 //! defeats the purpose of logging out.
+//!
+//! Server-side revocation is best-effort: if an operator profile is
+//! configured (i.e. `EdgeApiClient::from_env` resolves), this command
+//! first issues `DELETE /v1/edge/hosts/{node_id}` before clearing local
+//! state. When no operator credentials are available, or the request
+//! fails for a reason other than 404, the user must opt-in (`--force`)
+//! to skip the server hop and proceed with local-only cleanup. The
+//! orchestrator's REST surface requires a `UserIdentity` (Keycloak JWT)
+//! for `/v1/edge/*`, so a daemon authenticating only with its own
+//! NodeSecurityToken cannot self-revoke today — see the docs for the
+//! operator-side path.
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
+
+use super::client::EdgeApiClient;
+use super::grpc;
 
 #[derive(Debug, Args, Default)]
 pub struct LogoutArgs {
     /// Override the local edge state directory (default: `~/.aegis/edge`).
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+    /// Skip the server-side revoke hop and only clear local state.
+    #[arg(long)]
+    pub no_server: bool,
+    /// Proceed with local cleanup even when the server-side revoke fails
+    /// for a reason other than 404 (already revoked).
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub async fn run(args: LogoutArgs) -> Result<()> {
-    let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
+    let state_dir = args.state_dir.clone().unwrap_or_else(default_state_dir);
+
+    // Server-side revoke (best-effort; gated by --no-server and --force).
+    if !args.no_server && state_dir.exists() {
+        match revoke_server_side(&state_dir).await {
+            ServerRevokeOutcome::Skipped(reason) => {
+                println!("aegis edge logout: skipping server revoke ({reason})");
+            }
+            ServerRevokeOutcome::Succeeded(node_id) => {
+                println!(
+                    "aegis edge logout: server revoke succeeded for node {node_id}; \
+                     proceeding to local cleanup"
+                );
+            }
+            ServerRevokeOutcome::AlreadyGone(node_id) => {
+                println!(
+                    "aegis edge logout: server already has no record of node \
+                     {node_id}; proceeding to local cleanup"
+                );
+            }
+            ServerRevokeOutcome::Failed { node_id, error } => {
+                eprintln!("aegis edge logout: server revoke for node {node_id} failed: {error}");
+                if !args.force {
+                    bail!(
+                        "refusing to clear local state while server still believes \
+                         the daemon is enrolled. Re-run with --force to skip the \
+                         server hop, or revoke from Zaru's hosts list and retry."
+                    );
+                }
+                eprintln!(
+                    "aegis edge logout: --force supplied; proceeding with local-only cleanup"
+                );
+            }
+        }
+    }
+
     let message = logout(&state_dir)?;
     println!("{message}");
     Ok(())
+}
+
+/// Outcome of the optional server-side revoke hop.
+#[derive(Debug)]
+pub(crate) enum ServerRevokeOutcome {
+    /// No server hop attempted (no node id, no credentials, etc.).
+    Skipped(String),
+    Succeeded(String),
+    AlreadyGone(String),
+    Failed {
+        node_id: String,
+        error: String,
+    },
+}
+
+async fn revoke_server_side(state_dir: &Path) -> ServerRevokeOutcome {
+    // Resolve node id from the persisted aegis-config.yaml. A missing /
+    // malformed config means we have nothing to revoke against the
+    // orchestrator — proceed straight to local cleanup.
+    let node_id = match grpc::load_node_id_from_config(state_dir) {
+        Ok(id) => id,
+        Err(e) => {
+            return ServerRevokeOutcome::Skipped(format!(
+                "no usable node id in aegis-config.yaml: {e}"
+            ));
+        }
+    };
+
+    // The orchestrator REST surface authenticates via Keycloak operator
+    // identity; the daemon's NodeSecurityToken is NOT accepted here. We
+    // reuse the standard operator-profile resolution (auth.json + env
+    // vars) so a logged-in operator on the same machine can drive the
+    // revoke. When that resolution fails, surface the reason and skip.
+    let client = match EdgeApiClient::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerRevokeOutcome::Skipped(format!(
+                "no operator credentials available ({e}); revoke from Zaru's \
+                 hosts list to disable the daemon server-side"
+            ));
+        }
+    };
+
+    revoke_via_client(&client, &node_id).await
+}
+
+/// Test-friendly seam: drives the actual REST DELETE against the supplied
+/// `EdgeApiClient`. Test code provides a client pointing at an in-process
+/// mock orchestrator (see [`tests::logout_calls_delete_against_orchestrator`]).
+pub(crate) async fn revoke_via_client(
+    client: &EdgeApiClient,
+    node_id: &str,
+) -> ServerRevokeOutcome {
+    match client.delete(&format!("/v1/edge/hosts/{node_id}")).await {
+        Ok(()) => ServerRevokeOutcome::Succeeded(node_id.to_string()),
+        Err(e) => {
+            let s = e.to_string();
+            // EdgeApiClient::delete surfaces the upstream status code in
+            // the error message; a 404 means the row is already gone.
+            if s.contains(" 404 ") || s.starts_with("404") {
+                ServerRevokeOutcome::AlreadyGone(node_id.to_string())
+            } else {
+                ServerRevokeOutcome::Failed {
+                    node_id: node_id.to_string(),
+                    error: s,
+                }
+            }
+        }
+    }
 }
 
 fn default_state_dir() -> PathBuf {
@@ -144,5 +270,80 @@ mod tests {
 
         assert!(!state_dir.exists());
         assert!(sibling.exists(), "sibling outside state_dir must survive");
+    }
+
+    /// Regression: `aegis edge logout` must call
+    /// `DELETE /v1/edge/hosts/{node_id}` against the orchestrator before
+    /// clearing local state. Prior to this fix the command was local-only
+    /// and the orchestrator was left believing the daemon was still
+    /// enrolled — which kept dispatching to a host that no longer existed
+    /// and required an out-of-band revoke from Zaru's hosts list.
+    #[tokio::test]
+    async fn logout_calls_delete_against_orchestrator() {
+        let mut server = mockito::Server::new_async().await;
+        let node_uuid = uuid::Uuid::new_v4().to_string();
+        let m = server
+            .mock("DELETE", format!("/v1/edge/hosts/{node_uuid}").as_str())
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = EdgeApiClient::new_for_test(server.url());
+        let outcome = revoke_via_client(&client, &node_uuid).await;
+        assert!(
+            matches!(outcome, ServerRevokeOutcome::Succeeded(ref n) if n == &node_uuid),
+            "expected Succeeded({node_uuid}), got {outcome:?}"
+        );
+        m.assert_async().await;
+    }
+
+    /// Regression: a 404 from the orchestrator (the row is already gone)
+    /// is NOT a logout failure — the local state should still be cleared.
+    #[tokio::test]
+    async fn logout_treats_404_as_already_gone() {
+        let mut server = mockito::Server::new_async().await;
+        let node_uuid = uuid::Uuid::new_v4().to_string();
+        let m = server
+            .mock("DELETE", format!("/v1/edge/hosts/{node_uuid}").as_str())
+            .with_status(404)
+            .with_body(r#"{"error":"not_found"}"#)
+            .create_async()
+            .await;
+
+        let client = EdgeApiClient::new_for_test(server.url());
+        let outcome = revoke_via_client(&client, &node_uuid).await;
+        assert!(
+            matches!(outcome, ServerRevokeOutcome::AlreadyGone(ref n) if n == &node_uuid),
+            "expected AlreadyGone({node_uuid}), got {outcome:?}"
+        );
+        m.assert_async().await;
+    }
+
+    /// Regression: any non-404 server error must surface as Failed so the
+    /// outer `run` can refuse to proceed unless --force is supplied.
+    #[tokio::test]
+    async fn logout_surfaces_non_404_server_error_as_failed() {
+        let mut server = mockito::Server::new_async().await;
+        let node_uuid = uuid::Uuid::new_v4().to_string();
+        let _m = server
+            .mock("DELETE", format!("/v1/edge/hosts/{node_uuid}").as_str())
+            .with_status(500)
+            .with_body(r#"{"error":"internal"}"#)
+            .create_async()
+            .await;
+
+        let client = EdgeApiClient::new_for_test(server.url());
+        let outcome = revoke_via_client(&client, &node_uuid).await;
+        match outcome {
+            ServerRevokeOutcome::Failed { node_id, error } => {
+                assert_eq!(node_id, node_uuid);
+                assert!(
+                    error.contains("500"),
+                    "error should mention status: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

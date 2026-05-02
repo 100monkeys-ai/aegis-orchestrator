@@ -50,6 +50,7 @@ fn row_to_edge(row: &sqlx::postgres::PgRow) -> anyhow::Result<EdgeDaemon> {
     let status: String = row.try_get("status")?;
     let enrolled_at: DateTime<Utc> = row.try_get("enrolled_at")?;
     let last_heartbeat_at: Option<DateTime<Utc>> = row.try_get("last_heartbeat_at")?;
+    let display_name: String = row.try_get("display_name")?;
     Ok(EdgeDaemon {
         node_id: NodeId(node_id),
         tenant_id: TenantId::new(tenant_id_str)
@@ -60,6 +61,7 @@ fn row_to_edge(row: &sqlx::postgres::PgRow) -> anyhow::Result<EdgeDaemon> {
         connection: EdgeConnectionState::Disconnected { since: Utc::now() },
         last_heartbeat_at,
         enrolled_at,
+        display_name,
     })
 }
 
@@ -71,15 +73,16 @@ impl EdgeDaemonRepository for PgEdgeDaemonRepository {
             r#"
             INSERT INTO edge_daemons (
                 node_id, tenant_id, public_key, capabilities_json, tags, status,
-                enrolled_at, last_heartbeat_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                enrolled_at, last_heartbeat_at, display_name
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (node_id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 public_key = EXCLUDED.public_key,
                 capabilities_json = EXCLUDED.capabilities_json,
                 tags = EXCLUDED.tags,
                 status = EXCLUDED.status,
-                last_heartbeat_at = EXCLUDED.last_heartbeat_at
+                last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+                display_name = EXCLUDED.display_name
             "#,
         )
         .bind(edge.node_id.0)
@@ -90,6 +93,7 @@ impl EdgeDaemonRepository for PgEdgeDaemonRepository {
         .bind(status_to_str(edge.status))
         .bind(edge.enrolled_at)
         .bind(edge.last_heartbeat_at)
+        .bind(&edge.display_name)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -99,7 +103,7 @@ impl EdgeDaemonRepository for PgEdgeDaemonRepository {
         let row = sqlx::query(
             r#"
             SELECT node_id, tenant_id, public_key, capabilities_json, tags, status,
-                   enrolled_at, last_heartbeat_at
+                   enrolled_at, last_heartbeat_at, display_name
             FROM edge_daemons WHERE node_id = $1
             "#,
         )
@@ -113,7 +117,7 @@ impl EdgeDaemonRepository for PgEdgeDaemonRepository {
         let rows = sqlx::query(
             r#"
             SELECT node_id, tenant_id, public_key, capabilities_json, tags, status,
-                   enrolled_at, last_heartbeat_at
+                   enrolled_at, last_heartbeat_at, display_name
             FROM edge_daemons WHERE tenant_id = $1
             "#,
         )
@@ -135,6 +139,19 @@ impl EdgeDaemonRepository for PgEdgeDaemonRepository {
     async fn update_tags(&self, node_id: &NodeId, tags: &[String]) -> anyhow::Result<()> {
         sqlx::query("UPDATE edge_daemons SET tags = $1 WHERE node_id = $2")
             .bind(tags)
+            .bind(node_id.0)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_display_name(
+        &self,
+        node_id: &NodeId,
+        display_name: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE edge_daemons SET display_name = $1 WHERE node_id = $2")
+            .bind(display_name)
             .bind(node_id.0)
             .execute(&self.pool)
             .await?;
