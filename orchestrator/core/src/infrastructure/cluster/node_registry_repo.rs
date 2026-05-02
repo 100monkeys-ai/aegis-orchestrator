@@ -8,9 +8,10 @@
 //! transient `cluster_nodes` peer state).
 
 use crate::domain::cluster::{
-    ConfigScope, ConfigType, NodeConfigAssignment, NodeId, NodeRegistryRepository, NodeRole,
-    RegisteredNode, RegistryStatus, RuntimeRegistryAssignment,
+    ConfigScope, ConfigType, NodeConfigAssignment, NodeId, NodeRegistryRepository, RegisteredNode,
+    RegistryStatus, RuntimeRegistryAssignment,
 };
+use crate::infrastructure::cluster::postgres_repo::parse_role_str;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
@@ -46,7 +47,7 @@ impl NodeRegistryRepository for PgNodeRegistryRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| row_to_registered_node(&r)))
+        row.map(|r| row_to_registered_node(&r)).transpose()
     }
 
     async fn list_registered_nodes(&self) -> anyhow::Result<Vec<RegisteredNode>> {
@@ -62,7 +63,7 @@ impl NodeRegistryRepository for PgNodeRegistryRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.iter().map(row_to_registered_node).collect())
+        rows.iter().map(row_to_registered_node).collect()
     }
 
     async fn upsert_registered_node(&self, node: &RegisteredNode) -> anyhow::Result<()> {
@@ -218,7 +219,7 @@ impl NodeRegistryRepository for PgNodeRegistryRepository {
     }
 }
 
-fn row_to_registered_node(r: &sqlx::postgres::PgRow) -> RegisteredNode {
+fn row_to_registered_node(r: &sqlx::postgres::PgRow) -> anyhow::Result<RegisteredNode> {
     let role_str: String = r.get("role");
     let status_str: String = r.get("registry_status");
     let hostname: String = r.get("hostname");
@@ -236,25 +237,27 @@ fn row_to_registered_node(r: &sqlx::postgres::PgRow) -> RegisteredNode {
         })
         .unwrap_or_default();
 
-    RegisteredNode {
+    let registry_status = match status_str.as_str() {
+        "pending" => RegistryStatus::Pending,
+        "active" => RegistryStatus::Active,
+        "decommissioned" => RegistryStatus::Decommissioned,
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown RegistryStatus serialization in database: {other:?} \
+                 (expected one of: pending, active, decommissioned)"
+            ));
+        }
+    };
+
+    Ok(RegisteredNode {
         node_id: NodeId(r.get("node_id")),
         hostname,
-        role: match role_str.as_str() {
-            "controller" => NodeRole::Controller,
-            "worker" => NodeRole::Worker,
-            "hybrid" => NodeRole::Hybrid,
-            _ => NodeRole::Worker,
-        },
-        registry_status: match status_str.as_str() {
-            "pending" => RegistryStatus::Pending,
-            "active" => RegistryStatus::Active,
-            "decommissioned" => RegistryStatus::Decommissioned,
-            _ => RegistryStatus::Pending,
-        },
+        role: parse_role_str(&role_str)?,
+        registry_status,
         software_version,
         metadata,
         config_version,
         registered_at: r.get("registered_at"),
         decommissioned_at,
-    }
+    })
 }
