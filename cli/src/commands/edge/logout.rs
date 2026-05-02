@@ -129,7 +129,7 @@ async fn revoke_server_side(state_dir: &Path) -> ServerRevokeOutcome {
 
 /// Test-friendly seam: drives the actual REST DELETE against the supplied
 /// `EdgeApiClient`. Test code provides a client pointing at an in-process
-/// mock orchestrator (see [`tests::logout_calls_delete_against_orchestrator`]).
+/// mock orchestrator (see `logout_calls_delete_against_orchestrator` in the test module).
 pub(crate) async fn revoke_via_client(
     client: &EdgeApiClient,
     node_id: &str,
