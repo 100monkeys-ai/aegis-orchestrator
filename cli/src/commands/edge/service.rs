@@ -12,7 +12,7 @@
 //! ## Trait-based seam
 //!
 //! `ServiceManager` is the seam unit tests poke. Production binds to one of
-//! [`SystemdUserManager`] / [`LaunchdManager`] / [`NssmManager`]; tests bind
+//! `SystemdUserManager` / `LaunchdManager` / `NssmManager`; tests bind
 //! to a `MockServiceManager` that records invocations without spawning shell
 //! commands. This is how we cover install / uninstall / status without
 //! requiring systemd, launchd, or NSSM to be present in CI.
@@ -434,10 +434,8 @@ pub fn parse_systemd_show(output: &str) -> ServiceStatus {
                 "ActiveState" => active_state = v.to_string(),
                 "SubState" => sub_state = v.to_string(),
                 "MainPID" => main_pid = v.trim().parse().ok().filter(|p: &u32| *p != 0),
-                "ActiveEnterTimestamp" => {
-                    if !v.trim().is_empty() {
-                        active_enter = Some(v.trim().to_string());
-                    }
+                "ActiveEnterTimestamp" if !v.trim().is_empty() => {
+                    active_enter = Some(v.trim().to_string());
                 }
                 _ => {}
             }

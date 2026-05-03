@@ -53,7 +53,7 @@ pub struct HostDetection {
 impl HostDetection {
     /// Detect the current host via `std::env::consts::OS` /
     /// `std::env::consts::ARCH` and the system `which` lookup. Used by the
-    /// bootstrap path; tests use [`detect_with`] with an injected lookup so
+    /// bootstrap path; tests use [`Self::detect_with`] with an injected lookup so
     /// they don't depend on what is installed on the CI runner.
     pub fn detect() -> Self {
         Self::detect_with(std::env::consts::OS, std::env::consts::ARCH, |tool| {
