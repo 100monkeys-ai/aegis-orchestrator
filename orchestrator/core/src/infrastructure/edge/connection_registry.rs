@@ -45,6 +45,13 @@ impl EdgeConnectionRegistry {
         self.inner.get(node_id).map(|r| r.clone())
     }
 
+    /// True iff a `ConnectEdge` stream is currently registered for `node_id`.
+    /// Backed by the in-memory `DashMap`, so callers get an instant, drift-free
+    /// view of liveness without depending on heartbeat-staleness derivation.
+    pub fn is_connected(&self, node_id: &NodeId) -> bool {
+        self.inner.contains_key(node_id)
+    }
+
     pub fn pending(&self) -> &PendingEdgeCalls {
         &self.pending
     }

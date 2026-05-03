@@ -253,6 +253,14 @@ pub trait EdgeDaemonRepository: Send + Sync {
     async fn get(&self, node_id: &NodeId) -> anyhow::Result<Option<EdgeDaemon>>;
     async fn list_by_tenant(&self, tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>>;
     async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()>;
+    /// Atomically stamp `last_heartbeat_at = NOW()` and force `status = active`
+    /// for `node_id`. Called from the bidi `ConnectEdge` stream every time the
+    /// daemon emits a `Heartbeat` event so the operator UX can show a live
+    /// "last seen" timestamp and never report a stale `unhealthy` status while
+    /// the stream is open. Combining the two updates is intentional — the
+    /// existence of an inbound heartbeat is the canonical evidence that the
+    /// daemon is alive.
+    async fn record_heartbeat(&self, node_id: &NodeId) -> anyhow::Result<()>;
     async fn update_tags(&self, node_id: &NodeId, tags: &[String]) -> anyhow::Result<()>;
     async fn update_display_name(&self, node_id: &NodeId, display_name: &str)
         -> anyhow::Result<()>;
