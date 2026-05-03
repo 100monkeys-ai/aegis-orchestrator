@@ -1405,6 +1405,101 @@ mod tests {
         );
     }
 
+    // ── Revoke regression suite ────────────────────────────────────────
+    //
+    // Bug: clicking "Revoke" in Zaru's `/vault/edge-hosts` page surfaced
+    // a 204 from the orchestrator, but the host stayed in the list. The
+    // root cause was in `RevokeEdgeService`: it set `status = Unhealthy`
+    // instead of deleting the row, and `list_by_tenant` has no status
+    // filter — so the revoked host kept appearing in the UI and the
+    // operator perceived Revoke as a no-op. The fix hard-deletes the row
+    // and evicts any live `ConnectEdge` stream sender from
+    // `EdgeConnectionRegistry`; these tests pin the new contract end-to-
+    // end through the REST handler.
+
+    /// Regression: `DELETE /v1/edge/hosts/:id` MUST 204 and remove the
+    /// host from the next `GET /v1/edge/hosts` projection.
+    #[tokio::test]
+    async fn delete_host_removes_row_from_subsequent_list_by_tenant() {
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let nid = NodeId::new();
+        repo.seed(seed_edge(nid, &tenant, "to-be-revoked")).await;
+        let app = router_with_repo(repo.clone());
+
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "DELETE /v1/edge/hosts/:id must 204 on success"
+        );
+
+        // Repo round-trip: the row must be gone — not merely flagged as
+        // Unhealthy. A status flag would not help the UI because the
+        // list projection has no status filter.
+        assert!(
+            repo.get(&nid).await.unwrap().is_none(),
+            "DELETE must hard-delete the edge_daemons row"
+        );
+
+        // Wire-shape round-trip: the next GET /v1/edge/hosts must omit
+        // the revoked host. This is what Zaru's React Query cache
+        // refetches after the mutation invalidates `["edge","hosts"]`.
+        let list_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/v1/edge/hosts")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let list_resp = app.oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(list_resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = v.as_array().unwrap();
+        assert!(
+            arr.is_empty(),
+            "revoked host MUST disappear from GET /v1/edge/hosts \
+             (got {arr:?}) — Zaru's UI relies on the row being absent, \
+             not on a status string"
+        );
+    }
+
+    /// Regression: cross-tenant DELETE MUST 404 without mutating the
+    /// foreign tenant's row. Tenant isolation parity with PATCH.
+    #[tokio::test]
+    async fn delete_host_cross_tenant_returns_404_and_keeps_row() {
+        let tenant_a = TenantId::new("t-a").unwrap();
+        let nid = NodeId::new();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        repo.seed(seed_edge(nid, &tenant_a, "a-laptop")).await;
+        let app = router_with_repo(repo.clone());
+
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-b")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "tenant_b must not be able to revoke tenant_a's host"
+        );
+        assert!(
+            repo.get(&nid).await.unwrap().is_some(),
+            "cross-tenant DELETE MUST NOT remove the foreign tenant's row"
+        );
+    }
+
     /// Regression: hosts with no live ConnectEdge stream must report
     /// `connected: false` so the UI can render the wifi-cross icon.
     #[tokio::test]
