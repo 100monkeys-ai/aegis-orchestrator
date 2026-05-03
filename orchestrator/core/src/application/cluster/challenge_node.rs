@@ -515,6 +515,9 @@ mod tests {
         async fn update_status(&self, _: &NodeId, _: NodePeerStatus) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn record_heartbeat(&self, _: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn update_tags(&self, _: &NodeId, _: &[String]) -> anyhow::Result<()> {
             Ok(())
         }

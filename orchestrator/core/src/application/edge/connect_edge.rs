@@ -13,7 +13,6 @@
 //!      to `PendingEdgeCalls`; persist `CapabilityUpdate`; update heartbeats.
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -105,10 +104,12 @@ impl ConnectEdgeService {
                 return Err(anyhow!("unexpected Hello mid-stream"));
             }
             InboundEvent::Heartbeat(_h) => {
-                let _ = self
-                    .edge_repo
-                    .update_status(&node_id, NodePeerStatus::Active)
-                    .await;
+                // Persist `last_heartbeat_at = NOW()` and `status = active` in
+                // a single UPDATE so the operator UX can render an accurate
+                // "last seen" timestamp. Previously the handler only touched
+                // `status`, leaving `last_heartbeat_at` permanently null on
+                // every connected daemon.
+                let _ = self.edge_repo.record_heartbeat(&node_id).await;
             }
             InboundEvent::CommandResult(r) => {
                 let cid =
@@ -132,7 +133,6 @@ impl ConnectEdgeService {
                 }
             }
         }
-        let _ = Utc::now();
         Ok(())
     }
 }
@@ -165,5 +165,152 @@ fn proto_caps_to_domain(
         mount_points: p.mount_points.clone(),
         custom_labels: p.custom_labels.clone(),
         tags: vec![], // ignored from daemon; server is source of truth
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Regression: ADR-117 §B — `Heartbeat` event handling.
+    //!
+    //! Bug: `handle_event::Heartbeat` only updated `status` and never touched
+    //! `last_heartbeat_at`, so `edge_daemons.last_heartbeat_at` stayed `null`
+    //! forever even when the bidi stream was open and heartbeats were
+    //! arriving. Zaru's UI rendered "Last seen = —" and the wifi-cross icon
+    //! for every connected daemon. The fix swaps the call to
+    //! `record_heartbeat`, which stamps `NOW()` AND forces `status = active`
+    //! in a single UPDATE.
+    use super::*;
+    use crate::domain::edge::{
+        EdgeCapabilities, EdgeConnectionState, EdgeDaemon, EdgeDaemonRepository,
+    };
+    use crate::domain::shared_kernel::TenantId;
+    use crate::infrastructure::aegis_cluster_proto::{
+        edge_event::Event as InboundEvent, EdgeEvent, HeartbeatEvent,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    /// In-memory `EdgeDaemonRepository` that records every `record_heartbeat`
+    /// call, including a stamped timestamp, so the test can assert the bug
+    /// is gone.
+    struct RecordingRepo {
+        edges: Mutex<HashMap<NodeId, EdgeDaemon>>,
+        heartbeats: Mutex<u32>,
+    }
+
+    impl RecordingRepo {
+        fn new(seed: EdgeDaemon) -> Self {
+            let mut m = HashMap::new();
+            m.insert(seed.node_id, seed);
+            Self {
+                edges: Mutex::new(m),
+                heartbeats: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EdgeDaemonRepository for RecordingRepo {
+        async fn upsert(&self, edge: &EdgeDaemon) -> anyhow::Result<()> {
+            self.edges.lock().await.insert(edge.node_id, edge.clone());
+            Ok(())
+        }
+        async fn get(&self, node_id: &NodeId) -> anyhow::Result<Option<EdgeDaemon>> {
+            Ok(self.edges.lock().await.get(node_id).cloned())
+        }
+        async fn list_by_tenant(&self, _: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
+        async fn update_status(&self, id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
+            if let Some(e) = self.edges.lock().await.get_mut(id) {
+                e.status = status;
+            }
+            Ok(())
+        }
+        async fn record_heartbeat(&self, id: &NodeId) -> anyhow::Result<()> {
+            *self.heartbeats.lock().await += 1;
+            if let Some(e) = self.edges.lock().await.get_mut(id) {
+                e.last_heartbeat_at = Some(chrono::Utc::now());
+                e.status = NodePeerStatus::Active;
+            }
+            Ok(())
+        }
+        async fn update_tags(&self, _: &NodeId, _: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_display_name(&self, _: &NodeId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_capabilities(
+            &self,
+            _: &NodeId,
+            _: &EdgeCapabilities,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn seed_edge(node_id: NodeId) -> EdgeDaemon {
+        EdgeDaemon {
+            node_id,
+            tenant_id: TenantId::new("t-test").unwrap(),
+            public_key: vec![0u8; 32],
+            capabilities: EdgeCapabilities::default(),
+            // Start `unhealthy` so the test can also pin that an inbound
+            // heartbeat snaps the row back to `active`.
+            status: NodePeerStatus::Unhealthy,
+            connection: EdgeConnectionState::Disconnected {
+                since: chrono::Utc::now(),
+            },
+            last_heartbeat_at: None,
+            enrolled_at: chrono::Utc::now(),
+            display_name: "test-host".to_string(),
+        }
+    }
+
+    /// Regression: an inbound `Heartbeat` event MUST persist
+    /// `last_heartbeat_at` and reset `status` to `active`. Before this fix
+    /// the handler only invoked `update_status`, leaving
+    /// `last_heartbeat_at` permanently null and Zaru's "Last seen" cell
+    /// stuck on `—`.
+    #[tokio::test]
+    async fn heartbeat_event_persists_last_seen_and_marks_active() {
+        let node_id = NodeId::new();
+        let repo = Arc::new(RecordingRepo::new(seed_edge(node_id)));
+        let svc = ConnectEdgeService::new(repo.clone(), EdgeConnectionRegistry::new());
+
+        let ev = EdgeEvent {
+            event: Some(InboundEvent::Heartbeat(HeartbeatEvent {
+                envelope: None,
+                active_invocations: 0,
+            })),
+        };
+        svc.handle_event(node_id, ev)
+            .await
+            .expect("heartbeat handler must not error");
+
+        // record_heartbeat called exactly once.
+        assert_eq!(*repo.heartbeats.lock().await, 1);
+
+        let stored = repo.get(&node_id).await.unwrap().unwrap();
+        assert!(
+            stored.last_heartbeat_at.is_some(),
+            "last_heartbeat_at must be stamped after a Heartbeat event \
+             — Zaru renders this as the host's 'Last seen' timestamp"
+        );
+        assert_eq!(
+            stored.status,
+            NodePeerStatus::Active,
+            "an inbound heartbeat must reset status to Active so a daemon \
+             that briefly went unhealthy recovers without manual intervention"
+        );
     }
 }

@@ -136,6 +136,20 @@ impl EdgeDaemonRepository for PgEdgeDaemonRepository {
         Ok(())
     }
 
+    async fn record_heartbeat(&self, node_id: &NodeId) -> anyhow::Result<()> {
+        // ADR-117: an inbound heartbeat is the canonical proof of liveness.
+        // Stamp `last_heartbeat_at` and reset status to `active` in one
+        // round-trip so a host that briefly went `unhealthy` recovers as soon
+        // as its next heartbeat arrives.
+        sqlx::query(
+            "UPDATE edge_daemons SET last_heartbeat_at = NOW(), status = 'active' WHERE node_id = $1",
+        )
+        .bind(node_id.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn update_tags(&self, node_id: &NodeId, tags: &[String]) -> anyhow::Result<()> {
         sqlx::query("UPDATE edge_daemons SET tags = $1 WHERE node_id = $2")
             .bind(tags)

@@ -51,6 +51,7 @@ use crate::application::edge::revoke_edge::RevokeEdgeService;
 use crate::domain::cluster::{FailurePolicy, FleetCommandId, FleetDispatchPolicy, FleetMode};
 use crate::domain::edge::{EdgeGroupId, EdgeSelector, EdgeTarget};
 use crate::domain::shared_kernel::{NodeId, TenantId};
+use crate::infrastructure::edge::EdgeConnectionRegistry;
 
 /// Bundle of edge services consumed by the router.
 #[derive(Clone)]
@@ -64,6 +65,11 @@ pub struct EdgeApiState {
     pub fleet_dispatcher: Arc<FleetDispatcher>,
     pub fleet_cancel: Arc<CancelFleetService>,
     pub dispatch_service: Arc<DispatchToEdgeService>,
+    /// In-memory registry of currently-connected `ConnectEdge` streams.
+    /// Used by the host projection to surface a live `connected` flag in
+    /// `EdgeHostView` — instant and drift-free, independent of the
+    /// `last_heartbeat_at` staleness window.
+    pub connection_registry: EdgeConnectionRegistry,
 }
 
 /// Mount the `/v1/edge` router.
@@ -185,6 +191,11 @@ struct EdgeHostView {
     name: String,
     tenant_id: String,
     status: String,
+    /// True iff a `ConnectEdge` bidi stream is currently registered for this
+    /// node in `EdgeConnectionRegistry`. Drives the wifi-cross icon in Zaru
+    /// directly — instant and drift-free, independent of `last_seen_at`
+    /// staleness derivation.
+    connected: bool,
     tags: Vec<String>,
     os: String,
     arch: String,
@@ -192,7 +203,10 @@ struct EdgeHostView {
     last_seen_at: Option<String>,
 }
 
-fn host_view(edge: &crate::domain::edge::EdgeDaemon) -> EdgeHostView {
+fn host_view(
+    edge: &crate::domain::edge::EdgeDaemon,
+    registry: &EdgeConnectionRegistry,
+) -> EdgeHostView {
     let display = if edge.display_name.is_empty() {
         // Fallback for rows from before display_name was persisted: short
         // node-id slug so the UI has something stable to render.
@@ -205,6 +219,7 @@ fn host_view(edge: &crate::domain::edge::EdgeDaemon) -> EdgeHostView {
         name: display,
         tenant_id: edge.tenant_id.as_str().to_string(),
         status: format!("{:?}", edge.status).to_lowercase(),
+        connected: registry.is_connected(&edge.node_id),
         tags: edge.capabilities.tags.clone(),
         os: edge.capabilities.os.clone(),
         arch: edge.capabilities.arch.clone(),
@@ -222,7 +237,12 @@ async fn list_hosts(
         .list_by_tenant(&tenant)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(edges.iter().map(host_view).collect()))
+    Ok(Json(
+        edges
+            .iter()
+            .map(|e| host_view(e, &s.connection_registry))
+            .collect(),
+    ))
 }
 
 async fn get_host(
@@ -240,7 +260,7 @@ async fn get_host(
     if edge.tenant_id != tenant {
         return Err(ApiError::not_found("edge"));
     }
-    Ok(Json(host_view(&edge)))
+    Ok(Json(host_view(&edge, &s.connection_registry)))
 }
 
 #[derive(Deserialize)]
@@ -317,7 +337,7 @@ async fn patch_host(
         edge.capabilities.tags = tags;
     }
 
-    Ok(Json(host_view(&edge)))
+    Ok(Json(host_view(&edge, &s.connection_registry)))
 }
 
 fn map_tags_err(e: crate::application::edge::manage_tags::ManageTagsError) -> ApiError {
@@ -704,6 +724,9 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn record_heartbeat(&self, _node_id: &NodeId) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn update_tags(&self, _node_id: &NodeId, _tags: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
@@ -796,6 +819,7 @@ mod tests {
             fleet_dispatcher,
             fleet_cancel,
             dispatch_service,
+            connection_registry: conn_registry,
         }
     }
 
@@ -1047,6 +1071,13 @@ mod tests {
             }
             Ok(())
         }
+        async fn record_heartbeat(&self, id: &NodeId) -> anyhow::Result<()> {
+            if let Some(e) = self.edges.lock().await.get_mut(id) {
+                e.last_heartbeat_at = Some(chrono::Utc::now());
+                e.status = NodePeerStatus::Active;
+            }
+            Ok(())
+        }
         async fn update_tags(&self, id: &NodeId, tags: &[String]) -> anyhow::Result<()> {
             if let Some(e) = self.edges.lock().await.get_mut(id) {
                 e.capabilities.tags = tags.to_vec();
@@ -1076,8 +1107,14 @@ mod tests {
     }
 
     fn build_state_with_repo(edge_repo: Arc<dyn EdgeDaemonRepository>) -> EdgeApiState {
+        build_state_with_repo_and_registry(edge_repo, EdgeConnectionRegistry::new())
+    }
+
+    fn build_state_with_repo_and_registry(
+        edge_repo: Arc<dyn EdgeDaemonRepository>,
+        conn_registry: EdgeConnectionRegistry,
+    ) -> EdgeApiState {
         let group_repo: Arc<dyn EdgeGroupRepository> = Arc::new(StubGroupRepo);
-        let conn_registry = EdgeConnectionRegistry::new();
         let fleet_registry = FleetRegistry::new();
         let secret_store = Arc::new(TestSecretStore::new());
         let issue_token: Arc<dyn EnrollmentTokenIssuer> = Arc::new(IssueEnrollmentToken::new(
@@ -1119,6 +1156,7 @@ mod tests {
             fleet_dispatcher,
             fleet_cancel,
             dispatch_service,
+            connection_registry: conn_registry,
         }
     }
 
@@ -1291,6 +1329,108 @@ mod tests {
         assert_eq!(
             stored.display_name, "a-laptop",
             "cross-tenant PATCH must not mutate the row"
+        );
+    }
+
+    // ── Connected-flag regression suite ────────────────────────────────
+    //
+    // Bug: Zaru's hosts list rendered every host with the wifi-cross icon
+    // even while the daemon's bidi `ConnectEdge` stream was open. The
+    // previous projection had no `connected` field at all and the UI
+    // derived liveness from `status === "connected"` — but the orchestrator
+    // emits `NodePeerStatus` ("active" / "draining" / "unhealthy"), never
+    // the literal string `"connected"`. The fix surfaces the in-memory
+    // `EdgeConnectionRegistry::is_connected` lookup directly in the wire
+    // shape so the UI gets an instant, drift-free liveness signal.
+
+    fn router_with_repo_and_registry(
+        repo: Arc<dyn EdgeDaemonRepository>,
+        registry: EdgeConnectionRegistry,
+    ) -> Router {
+        let state = build_state_with_repo_and_registry(repo, registry);
+        router(state).layer(from_fn(
+            |req: axum::extract::Request, next: Next| async move {
+                let tenant = req
+                    .headers()
+                    .get("X-Tenant-Id")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| TenantId::new(s).ok());
+                let mut req = req;
+                if let Some(t) = tenant {
+                    req.extensions_mut().insert(t);
+                }
+                next.run(req).await
+            },
+        ))
+    }
+
+    /// Regression: the host projection MUST emit `connected: true` when the
+    /// node has an active `ConnectEdge` stream registered, and `false`
+    /// otherwise. Previously the field did not exist at all, so the UI
+    /// fell back to `status === "connected"` — a comparison that always
+    /// failed because the orchestrator emits `active`/`draining`/`unhealthy`.
+    #[tokio::test]
+    async fn list_hosts_reports_connected_true_for_registered_node() {
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let nid = NodeId::new();
+        repo.seed(seed_edge(nid, &tenant, "live-host")).await;
+
+        let registry = EdgeConnectionRegistry::new();
+        // Simulate a live ConnectEdge stream by registering a sender; the
+        // returned guard is leaked for the duration of the test so the
+        // entry stays in the registry while the request is served.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<
+            crate::infrastructure::aegis_cluster_proto::EdgeCommand,
+        >(4);
+        let _guard = registry.register(nid, tx);
+
+        let app = router_with_repo_and_registry(repo, registry);
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/v1/edge/hosts")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v[0].get("connected").and_then(|x| x.as_bool()),
+            Some(true),
+            "registered ConnectEdge stream MUST surface as connected:true"
+        );
+    }
+
+    /// Regression: hosts with no live ConnectEdge stream must report
+    /// `connected: false` so the UI can render the wifi-cross icon.
+    #[tokio::test]
+    async fn list_hosts_reports_connected_false_for_unregistered_node() {
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let nid = NodeId::new();
+        repo.seed(seed_edge(nid, &tenant, "offline-host")).await;
+
+        // Empty registry — no daemon connected.
+        let app = router_with_repo_and_registry(repo, EdgeConnectionRegistry::new());
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/v1/edge/hosts")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v[0].get("connected").and_then(|x| x.as_bool()),
+            Some(false),
+            "absent ConnectEdge stream MUST surface as connected:false"
         );
     }
 }

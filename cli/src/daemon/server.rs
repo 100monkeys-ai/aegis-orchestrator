@@ -2256,6 +2256,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     fleet_dispatcher: fleet_dispatcher.clone(),
                     fleet_cancel: fleet_cancel.clone(),
                     dispatch_service: dispatch_service.clone(),
+                    connection_registry: conn_registry.clone(),
                 }
             },
         );
