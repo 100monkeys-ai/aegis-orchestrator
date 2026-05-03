@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use super::client::EdgeApiClient;
 use super::grpc;
+use super::service::{self as svc, ServiceManager, UninstallOutcome};
 
 #[derive(Debug, Args, Default)]
 pub struct LogoutArgs {
@@ -39,6 +40,11 @@ pub struct LogoutArgs {
     /// for a reason other than 404 (already revoked).
     #[arg(long)]
     pub force: bool,
+    /// Skip the OS service uninstall step. By default `aegis edge logout`
+    /// stops + removes the supervisor unit so the daemon does not get
+    /// relaunched against the now-empty state directory.
+    #[arg(long)]
+    pub no_service: bool,
 }
 
 pub async fn run(args: LogoutArgs) -> Result<()> {
@@ -78,9 +84,49 @@ pub async fn run(args: LogoutArgs) -> Result<()> {
         }
     }
 
+    // Stop + uninstall the supervisor unit BEFORE wiping local state, so the
+    // service doesn't restart against half-deleted state. Failure of the
+    // uninstall is informational — it must not block local cleanup
+    // (logout means logout). Honor `--no-service` for users who manage the
+    // supervisor outside of the `aegis` CLI.
+    if !args.no_service {
+        match svc::detect_service_manager() {
+            Ok(mgr) => match uninstall_service_for_logout(&*mgr) {
+                Ok(UninstallOutcome::Removed { unit_path }) => {
+                    println!(
+                        "aegis edge logout: removed service unit at {}",
+                        unit_path.display()
+                    );
+                }
+                Ok(UninstallOutcome::NotInstalled) => {
+                    println!("aegis edge logout: no service unit installed; skipping uninstall");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "aegis edge logout: service uninstall failed ({e:#}); \
+                         continuing with local cleanup"
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "aegis edge logout: no supported service supervisor on this host \
+                     ({e:#}); skipping uninstall"
+                );
+            }
+        }
+    }
+
     let message = logout(&state_dir)?;
     println!("{message}");
     Ok(())
+}
+
+/// Test-friendly seam: drives the service uninstall against the supplied
+/// `ServiceManager`. Tests pass a mock; production invokes via
+/// `svc::detect_service_manager`.
+pub(crate) fn uninstall_service_for_logout(mgr: &dyn ServiceManager) -> Result<UninstallOutcome> {
+    svc::uninstall(mgr)
 }
 
 /// Outcome of the optional server-side revoke hop.
@@ -345,5 +391,103 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Service uninstall on logout (regression for the missing wiring).
+    // -----------------------------------------------------------------
+
+    use super::svc::{
+        InstallOutcome, ServiceKind, ServiceManager as SvcMgr, ServiceState, ServiceStatus,
+        UninstallOutcome,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct CountingMgr {
+        installed: Rc<RefCell<bool>>,
+        uninstall_calls: Rc<RefCell<usize>>,
+        unit_path: PathBuf,
+    }
+
+    impl CountingMgr {
+        fn new(installed: bool, unit_path: PathBuf) -> Self {
+            Self {
+                installed: Rc::new(RefCell::new(installed)),
+                uninstall_calls: Rc::new(RefCell::new(0)),
+                unit_path,
+            }
+        }
+    }
+
+    impl SvcMgr for CountingMgr {
+        fn kind(&self) -> ServiceKind {
+            ServiceKind::SystemdUser
+        }
+        fn unit_name(&self) -> &str {
+            "test"
+        }
+        fn unit_path(&self) -> PathBuf {
+            self.unit_path.clone()
+        }
+        fn install(&self, _content: &str, _f: bool, _k: bool) -> Result<InstallOutcome> {
+            *self.installed.borrow_mut() = true;
+            Ok(InstallOutcome::Installed {
+                unit_path: self.unit_path.clone(),
+            })
+        }
+        fn uninstall(&self) -> Result<UninstallOutcome> {
+            *self.uninstall_calls.borrow_mut() += 1;
+            if !*self.installed.borrow() {
+                return Ok(UninstallOutcome::NotInstalled);
+            }
+            *self.installed.borrow_mut() = false;
+            Ok(UninstallOutcome::Removed {
+                unit_path: self.unit_path.clone(),
+            })
+        }
+        fn status(&self) -> Result<ServiceStatus> {
+            Ok(ServiceStatus {
+                state: ServiceState::Active,
+                pid: None,
+                uptime: None,
+                recent_logs: Vec::new(),
+            })
+        }
+        fn restart(&self) -> Result<()> {
+            Ok(())
+        }
+        fn logs(&self, _f: bool, _l: usize) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression: prior to the wiring, `aegis edge logout` left the
+    /// supervisor unit installed and running. The supervisor would then try
+    /// to restart against the now-empty state directory and emit error spam.
+    /// `uninstall_service_for_logout` is the seam the logout flow drives;
+    /// asserting it removes when installed and is idempotent when not.
+    #[test]
+    fn logout_invokes_service_uninstall_when_installed() {
+        let mgr = CountingMgr::new(
+            /*installed=*/ true,
+            PathBuf::from("/tmp/aegis-edge.service"),
+        );
+        let outcome =
+            uninstall_service_for_logout(&mgr).expect("uninstall must not error in happy path");
+        assert!(matches!(outcome, UninstallOutcome::Removed { .. }));
+        assert_eq!(*mgr.uninstall_calls.borrow(), 1);
+        assert!(!*mgr.installed.borrow());
+    }
+
+    #[test]
+    fn logout_service_uninstall_is_idempotent_when_not_installed() {
+        let mgr = CountingMgr::new(
+            /*installed=*/ false,
+            PathBuf::from("/tmp/aegis-edge.service"),
+        );
+        let outcome = uninstall_service_for_logout(&mgr).expect("not-installed must not error");
+        assert_eq!(outcome, UninstallOutcome::NotInstalled);
+        assert_eq!(*mgr.uninstall_calls.borrow(), 1);
     }
 }

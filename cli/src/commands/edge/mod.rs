@@ -55,6 +55,9 @@ pub enum EdgeCommand {
     /// NodeSecurityToken refresh.
     #[command(subcommand)]
     Token(token::TokenCommand),
+    /// OS-level service unit management (install/uninstall/status/restart/logs).
+    #[command(subcommand)]
+    Service(service::ServiceCommand),
 }
 
 pub async fn run(args: EdgeArgs, output: OutputFormat) -> anyhow::Result<()> {
@@ -69,5 +72,6 @@ pub async fn run(args: EdgeArgs, output: OutputFormat) -> anyhow::Result<()> {
         EdgeCommand::Fleet(c) => fleet::run(c, output).await,
         EdgeCommand::Keys(c) => keys::run(c).await,
         EdgeCommand::Token(c) => token::run(c).await,
+        EdgeCommand::Service(c) => service::run(c).await,
     }
 }

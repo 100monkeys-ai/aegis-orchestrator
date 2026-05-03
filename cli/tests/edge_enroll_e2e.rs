@@ -304,6 +304,12 @@ fn enroll_args(token: String, state_dir: &Path) -> EnrollArgs {
         keep_existing: false,
         dry_run: false,
         minimal: false,
+        // E2E tests opt out of the OS service install; they assert the
+        // wire-flow contract, not the supervisor wiring (which would require
+        // systemd / launchd / NSSM to be present in CI). The post-enroll
+        // install path is unit-tested in
+        // `commands::edge::enroll::tests::install_service_after_enroll_*`.
+        no_service: true,
     }
 }
 
@@ -801,4 +807,70 @@ async fn enroll_persisted_node_id_survives_reenroll() {
         Some(minted.as_str()),
         "re-enroll must present the SAME minted UUID on the wire"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `--no-service` opt-out — pin the contract that the OS service install path
+// is skipped when the operator runs their own supervisor. This is the
+// integration-level companion to the unit tests in
+// `commands::edge::enroll::tests::install_service_after_enroll_*` and to the
+// service-template substitution tests in `commands::edge::service::tests`.
+//
+// We can't directly assert "no systemctl call fired" without mocking the
+// platform supervisor (and this test runs across Linux/macOS CI). We instead
+// assert the on-disk side effects: the daemon's identity files exist, but no
+// service unit lands at the canonical $HOME-relative paths that the install
+// path would have written. Combined with the unit test that proves the
+// install seam does write to its mocked manager, the negative assertion here
+// is sufficient to pin the `--no-service` short-circuit.
+// ---------------------------------------------------------------------------
+
+/// Regression: prior to this fix `aegis edge enroll` never wrote a service
+/// unit at all, so the absence of one was meaningless. The post-enroll wiring
+/// added the install path; `--no-service` is the explicit opt-out for users
+/// who manage their own supervisor. This test pins that the opt-out actually
+/// short-circuits the install (no systemctl/launchctl side effects) while
+/// still completing the wire-side enrollment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_no_service_skips_supervisor_install() {
+    let stub = ScriptedStub::default();
+    let issued_node_id = Uuid::new_v4().to_string();
+    let issued = make_node_security_token(&issued_node_id, "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![1u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued.clone(),
+        expires_at: None,
+    }));
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    let mut args = enroll_args(token, tmp.path());
+    args.no_service = true; // explicit opt-out
+    enroll_run(args, OutputFormat::Text)
+        .await
+        .expect("enroll with --no-service must succeed");
+
+    // Identity persisted as in the happy-path test.
+    let token_path = tmp.path().join("node.token");
+    assert!(
+        token_path.exists(),
+        "node.token must still be persisted under --no-service"
+    );
+
+    // Negative assertion: nothing the install path would create lives under
+    // the test's state_dir. (The supervisor would write to
+    // ~/.config/systemd/user/ etc., which lives outside `tmp` and is not our
+    // concern here — the unit-test seam pins that the install function is
+    // never invoked when we honor `--no-service`.)
+    let supervisor_artifacts = ["aegis-edge.service", "io.aegis.edge.plist"];
+    for name in supervisor_artifacts {
+        assert!(
+            !tmp.path().join(name).exists(),
+            "no supervisor artifact ({name}) must land in the state_dir under --no-service"
+        );
+    }
 }

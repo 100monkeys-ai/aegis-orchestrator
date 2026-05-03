@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={{BINARY_PATH}} --daemon --config %h/.aegis/edge/aegis-config.yaml
+ExecStart={{BINARY_PATH}} edge daemon --state-dir %h/.aegis/edge
 Restart=on-failure
 RestartSec=5s
 

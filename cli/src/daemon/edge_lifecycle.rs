@@ -187,7 +187,16 @@ pub async fn run_edge_daemon(cfg: EdgeLifecycleConfig) -> Result<()> {
                 attempt = 0;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "edge stream disconnected; will reconnect");
+                // Use anyhow's flat-chain `{:#}` formatter so the full error
+                // chain (including the underlying `tonic::Status` code +
+                // message) reaches operators. Prior `error = %e` only printed
+                // the top-level Display, swallowing the gRPC status that is
+                // the actual cause of most disconnects ("ConnectEdge RPC
+                // failed" with no code/message visible).
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "edge stream disconnected; will reconnect"
+                );
             }
         }
         let delay = cfg
@@ -1304,6 +1313,41 @@ mod tests {
             "https://relay.myzaru.com",
             "SaaS edge daemon MUST dial relay.myzaru.com over TLS — \
              plaintext h2c hits Caddy on :80 and the bidi stream never opens"
+        );
+    }
+
+    /// Regression: prior reconnect-loop log used `error = %e` (Display only),
+    /// which dropped the source chain. When ConnectEdge wraps a
+    /// `tonic::Status` in an `anyhow::Context`, only the outer "ConnectEdge
+    /// RPC failed" surfaced — the gRPC code/message that is the actual
+    /// disconnect cause was hidden. The fix uses anyhow's `{:#}` flat-chain
+    /// format so the entire chain reaches the operator. This test pins that
+    /// the formatter we now use surfaces both the outer context AND the
+    /// nested cause.
+    #[test]
+    fn reconnect_warn_format_preserves_full_error_chain() {
+        let inner = anyhow::anyhow!("status: Unavailable, message: \"connection refused\"");
+        let wrapped = inner.context("ConnectEdge RPC failed");
+        // What the prior code produced (Display only): just the outer.
+        let display_only = format!("{wrapped}");
+        assert!(
+            display_only.contains("ConnectEdge RPC failed"),
+            "outer context expected: {display_only}"
+        );
+        assert!(
+            !display_only.contains("connection refused"),
+            "Display formatter would silently drop the cause; got: {display_only}"
+        );
+        // What the fix produces: outer + every nested cause via `{:#}`.
+        let chain = format!("{wrapped:#}");
+        assert!(
+            chain.contains("ConnectEdge RPC failed"),
+            "flat-chain format must include the outer context: {chain}"
+        );
+        assert!(
+            chain.contains("connection refused"),
+            "flat-chain format MUST include the underlying cause so operators \
+             can see the gRPC status: {chain}"
         );
     }
 }

@@ -7,9 +7,10 @@
     <key>ProgramArguments</key>
     <array>
       <string>{{BINARY_PATH}}</string>
-      <string>--daemon</string>
-      <string>--config</string>
-      <string>{{HOME}}/.aegis/edge/aegis-config.yaml</string>
+      <string>edge</string>
+      <string>daemon</string>
+      <string>--state-dir</string>
+      <string>{{HOME}}/.aegis/edge</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
