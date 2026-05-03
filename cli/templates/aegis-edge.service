@@ -14,7 +14,11 @@ RestartSec=5s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+# `ProtectHome=tmpfs` masks /home with an empty tmpfs so the daemon can't see
+# other users' files, but `ReadWritePaths` below punches through to expose just
+# the daemon's own state dir (read AND write). `ProtectHome=true` would make
+# the path entirely inaccessible — ReadWritePaths cannot un-mask a hidden path.
+ProtectHome=tmpfs
 ReadWritePaths=%h/.aegis/edge
 ProtectKernelTunables=true
 ProtectKernelModules=true
