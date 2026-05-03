@@ -407,7 +407,7 @@ mod tests {
             .create_async()
             .await;
 
-        let loader = ContextLoader::with_limits(1 * 1024 * 1024, 64 * 1024);
+        let loader = ContextLoader::with_limits(1024 * 1024, 64 * 1024);
         let attachments = vec![ContextItem::Url {
             url: format!("{}/big", server.url()),
             description: None,

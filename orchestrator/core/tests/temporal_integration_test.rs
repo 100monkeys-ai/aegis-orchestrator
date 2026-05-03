@@ -762,7 +762,7 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
         .start_workflow(
             aegis_orchestrator_core::application::ports::StartWorkflowParams {
                 workflow_id: "workflow-alpha",
-                execution_id: execution_id.clone(),
+                execution_id,
                 tenant_id: "aegis-system",
                 input: input.clone(),
                 blackboard: None,

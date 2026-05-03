@@ -590,11 +590,8 @@ async fn webhook_accepts_valid_signature() {
     // HMAC verification succeeds, refresh then fails because there's no
     // cloned tree — we only assert the authentication layer accepted it.
     let res = fx.service.handle_webhook(&secret, &auth, body).await;
-    match res {
-        Err(GitRepoError::WebhookRejected(m)) => {
-            panic!("valid sig must not be rejected: {m}")
-        }
-        _ => {}
+    if let Err(GitRepoError::WebhookRejected(m)) = res {
+        panic!("valid sig must not be rejected: {m}")
     }
 }
 

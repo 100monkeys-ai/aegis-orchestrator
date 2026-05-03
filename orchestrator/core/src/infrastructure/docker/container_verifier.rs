@@ -123,11 +123,8 @@ mod tests {
             // Hold accepted streams open without writing so the client-side
             // HTTP read blocks until the verifier's timeout fires.
             let mut held = Vec::new();
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => held.push(stream),
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
             }
         });
     }

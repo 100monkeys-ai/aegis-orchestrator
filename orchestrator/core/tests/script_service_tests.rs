@@ -43,8 +43,11 @@ struct InMemoryScriptRepository {
     current: RwLock<HashMap<ScriptId, Script>>,
     /// Version history by (script_id, version). Corresponds to the
     /// `script_versions` table.
-    history: RwLock<HashMap<ScriptId, BTreeMap<u32, (Script, chrono::DateTime<chrono::Utc>)>>>,
+    history: RwLock<HashMap<ScriptId, BTreeMap<u32, ScriptHistoryEntry>>>,
 }
+
+/// (script body, recorded timestamp) — paired in the version-history map.
+type ScriptHistoryEntry = (Script, chrono::DateTime<chrono::Utc>);
 
 #[async_trait]
 impl ScriptRepository for InMemoryScriptRepository {

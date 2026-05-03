@@ -57,6 +57,12 @@ impl EdgeDaemonRepository for StubRepo {
         }
         Ok(())
     }
+    async fn record_heartbeat(&self, node_id: &NodeId) -> anyhow::Result<()> {
+        if let Some(e) = self.edges.lock().await.get_mut(node_id) {
+            e.status = NodePeerStatus::Active;
+        }
+        Ok(())
+    }
     async fn update_tags(&self, node_id: &NodeId, tags: &[String]) -> anyhow::Result<()> {
         if let Some(e) = self.edges.lock().await.get_mut(node_id) {
             e.capabilities.tags = tags.to_vec();

@@ -27,7 +27,6 @@ use aegis_orchestrator_core::domain::canvas::{
 };
 use aegis_orchestrator_core::domain::git_repo::{
     CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId, GitRepoBindingRepository,
-    GitRepoStatus,
 };
 use aegis_orchestrator_core::domain::iam::ZaruTier;
 use aegis_orchestrator_core::domain::repository::RepositoryError;

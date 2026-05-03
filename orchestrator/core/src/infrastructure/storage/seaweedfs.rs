@@ -827,7 +827,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         // 1 MiB body, 256 KiB cap. The cap-exceeded check must fire well
         // before the full body is consumed.
-        let body = vec![0u8; 1 * 1024 * 1024];
+        let body = vec![0u8; 1024 * 1024];
         let cap: u64 = 256 * 1024;
         let _mock = server
             .mock("GET", "/big")
@@ -838,7 +838,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client
-            .get(&format!("{}/big", server.url()))
+            .get(format!("{}/big", server.url()))
             .send()
             .await
             .expect("request");
@@ -868,7 +868,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client
-            .get(&format!("{}/small", server.url()))
+            .get(format!("{}/small", server.url()))
             .send()
             .await
             .expect("request");

@@ -1306,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn patch_host_cross_tenant_returns_404() {
         let tenant_a = TenantId::new("t-a").unwrap();
-        let tenant_b = TenantId::new("t-b").unwrap();
+        let _tenant_b = TenantId::new("t-b").unwrap();
         let node_id = NodeId::new();
         let repo = Arc::new(InMemoryEdgeRepo::new());
         repo.seed(seed_edge(node_id, &tenant_a, "a-laptop")).await;

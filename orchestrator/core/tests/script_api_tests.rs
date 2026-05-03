@@ -41,10 +41,13 @@ use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 // per-file copies).
 // ============================================================================
 
+/// (script body, recorded timestamp) — paired in the version-history map.
+type ScriptHistoryEntry = (Script, chrono::DateTime<chrono::Utc>);
+
 #[derive(Default)]
 struct InMemoryScriptRepository {
     current: RwLock<HashMap<ScriptId, Script>>,
-    history: RwLock<HashMap<ScriptId, BTreeMap<u32, (Script, chrono::DateTime<chrono::Utc>)>>>,
+    history: RwLock<HashMap<ScriptId, BTreeMap<u32, ScriptHistoryEntry>>>,
 }
 
 #[async_trait]
