@@ -28,16 +28,64 @@ spec:
       node_security_token_path: ~/.aegis/edge/node.token
       stream_reconnect_backoff_secs: [1, 2, 5, 15, 60]
       capabilities:
-        # Tools the daemon is willing to dispatch locally. The default set
-        # is host-aware (detected from `which`).
-        local_tools:
-          - shell
-        # POSIX mount points exposed to fs.* tools.
-        mount_points:
-          - "/"
+        # Detected at bootstrap time from `std::env::consts::OS` /
+        # `std::env::consts::ARCH`. Advertised to the controller in the
+        # ConnectEdge Hello frame; used by selectors with `os=` / `arch=`.
+        os: "{{OS}}"
+        arch: "{{ARCH}}"
+        # Tools the daemon is willing to dispatch locally. Detected at
+        # bootstrap time by probing the canonical list (shell, bash, zsh, sh,
+        # docker, podman, kubectl, helm, git, curl, jq, terraform, ansible)
+        # via `which`. Edit to add or remove entries; the daemon re-reads
+        # this on every connect.
+        local_tools: {{LOCAL_TOOLS}}
+        # POSIX mount points exposed to fs.* tools. Defaults are OS-aware
+        # (linux: /, /home, /etc, /var/log; macos: /, /Users, /Library,
+        # /var/log; windows: C:\). Operators MUST tighten these before
+        # exposing the daemon to untrusted callers.
+        mount_points: {{MOUNT_POINTS}}
         # Daemon-advertised k/v labels (region, gpu, etc.). Operator-managed
         # tags are kept server-side and never authored from this file.
         custom_labels: {}
 
-  # SecurityContexts (ADR-083) applied locally on edge for InvokeTool calls.
-  security_contexts: []
+  # SecurityContexts (ADR-035) applied locally on edge for InvokeTool calls.
+  #
+  # The daemon's resolver looks up an inbound `InvokeToolCommand` by the
+  # `security_context_name` the controller dispatches with. For consumer-realm
+  # users, the controller derives that name from
+  # `ZaruTier::to_security_context_name()` — i.e. one of `zaru-free`,
+  # `zaru-pro`, `zaru-business`, `zaru-enterprise`. An empty list means every
+  # InvokeTool is rejected with `security_context_not_found`.
+  #
+  # The seeded contexts below are PERMISSIVE (`tool_pattern: "*"`). This is
+  # the right starting point for a personal edge daemon where the operator IS
+  # the caller — but you SHOULD tighten them before exposing the daemon to
+  # untrusted dispatchers. Replace `"*"` with explicit `tool_pattern` entries
+  # (e.g. `fs.read`, `cmd.run` with `command_allowlist`) once your use case
+  # is known.
+  security_contexts:
+    - name: zaru-free
+      description: |
+        Permissive default for ZaruTier::Free dispatches. Edit to constrain
+        the toolset before exposing this daemon to untrusted callers.
+      capabilities:
+        - tool_pattern: "*"
+      deny_list: []
+    - name: zaru-pro
+      description: |
+        Permissive default for ZaruTier::Pro dispatches.
+      capabilities:
+        - tool_pattern: "*"
+      deny_list: []
+    - name: zaru-business
+      description: |
+        Permissive default for ZaruTier::Business dispatches.
+      capabilities:
+        - tool_pattern: "*"
+      deny_list: []
+    - name: zaru-enterprise
+      description: |
+        Permissive default for ZaruTier::Enterprise dispatches.
+      capabilities:
+        - tool_pattern: "*"
+      deny_list: []

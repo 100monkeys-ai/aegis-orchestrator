@@ -292,9 +292,34 @@ pub async fn run_bootstrap(
         } else {
             uuid::Uuid::new_v4().to_string()
         };
-        let body = body
-            .replace("{{CONTROLLER_ENDPOINT}}", &plan.controller_endpoint)
-            .replace("{{NODE_ID}}", &node_id);
+        // Host-aware capability detection (BUG 3 fix). The minimal template
+        // intentionally skips probing — operators who pass `--minimal` know
+        // what they're doing and the template ships static `[shell]` /
+        // `["/"]` defaults. The annotated template gets the full probe so a
+        // first-time operator's daemon advertises real capabilities instead
+        // of a static lie.
+        let body = if policy.minimal_config {
+            // Minimal: still substitute OS/arch so the wire frame carries
+            // truthful values, but local_tools / mount_points stay static.
+            body.replace("{{CONTROLLER_ENDPOINT}}", &plan.controller_endpoint)
+                .replace("{{NODE_ID}}", &node_id)
+                .replace("{{OS}}", std::env::consts::OS)
+                .replace("{{ARCH}}", std::env::consts::ARCH)
+        } else {
+            let det = super::host_detection::HostDetection::detect();
+            body.replace("{{CONTROLLER_ENDPOINT}}", &plan.controller_endpoint)
+                .replace("{{NODE_ID}}", &node_id)
+                .replace("{{OS}}", &det.os)
+                .replace("{{ARCH}}", &det.arch)
+                .replace(
+                    "{{LOCAL_TOOLS}}",
+                    &yaml_inline_string_list(&det.local_tools),
+                )
+                .replace(
+                    "{{MOUNT_POINTS}}",
+                    &yaml_inline_string_list(&det.mount_points),
+                )
+        };
         fs::write(&cfg_path, body).with_context(|| format!("write {}", cfg_path.display()))?;
         set_file_perms(&cfg_path, 0o600)?;
     }
@@ -369,6 +394,20 @@ fn read_node_id_from_config(cfg_path: &Path) -> Option<String> {
     }
     uuid::Uuid::parse_str(&id).ok()?;
     Some(id)
+}
+
+/// Render a list of strings as a YAML flow-sequence (e.g. `["a", "b"]`).
+/// Used to inject host-detected `local_tools` / `mount_points` into the
+/// bootstrap template via the `{{LOCAL_TOOLS}}` / `{{MOUNT_POINTS}}`
+/// placeholders. Each element is wrapped in double quotes and inner quotes
+/// are escaped — sufficient for the values we produce (tool names and
+/// filesystem paths).
+fn yaml_inline_string_list(items: &[String]) -> String {
+    let escaped: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", escaped.join(", "))
 }
 
 fn extract_cep_claim(token: &str) -> Result<String> {

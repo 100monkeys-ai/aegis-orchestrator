@@ -15,8 +15,20 @@ spec:
         enabled: true
     node_keypair_path: ~/.aegis/edge/node.key
     edge:
+      tenant_id: null
       enrollment_token_path: ~/.aegis/edge/enrollment.jwt
       node_security_token_path: ~/.aegis/edge/node.token
       capabilities:
+        os: "{{OS}}"
+        arch: "{{ARCH}}"
         local_tools: [shell]
         mount_points: ["/"]
+  # Minimal seed: a single permissive `zaru-free` context so the daemon can
+  # actually serve InvokeTool calls. Tighten or replace before exposing the
+  # daemon to untrusted callers.
+  security_contexts:
+    - name: zaru-free
+      description: "Permissive minimal default; edit before production use."
+      capabilities:
+        - tool_pattern: "*"
+      deny_list: []

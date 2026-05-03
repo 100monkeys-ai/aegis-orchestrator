@@ -14,7 +14,9 @@ use super::bootstrap::{
     run_bootstrap, BootstrapPlan, BootstrapPolicy, OutputFormat as BootstrapOutputFormat,
 };
 use super::grpc;
-use super::handshake::{run_attest_and_challenge, HandshakeOutcome};
+use super::handshake::{
+    persist_handshake_outcome_to_config, run_attest_and_challenge, HandshakeOutcome,
+};
 use super::service::{
     self as svc, InstallArgs as ServiceInstallArgs, InstallOutcome, ServiceManager, ServiceState,
 };
@@ -86,6 +88,14 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
     let node_token_path = resolved_state_dir.join("node.token");
     if policy.keep_existing && node_token_path.exists() {
         let outcome = build_outcome_from_existing(&resolved_state_dir, &args.token)?;
+        // BUG 1 fix: even on the keep-existing short-circuit, ensure the
+        // config carries the tenant_id derived from the on-disk identity.
+        // This heals legacy configs left over from before the
+        // post-handshake persist step existed (where tenant_id stayed null).
+        persist_handshake_outcome_to_config(&resolved_state_dir, &outcome).context(
+            "persist handshake outcome (tenant_id, controller_endpoint) to aegis-config.yaml \
+             on keep-existing reuse",
+        )?;
         emit_output(&outcome, &node_token_path, output, /*reused=*/ true)?;
         // Even on the keep-existing short-circuit, the supervisor may not be
         // installed yet (the bug being fixed: prior CLI never installed it).
@@ -123,6 +133,15 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
     // partial write would corrupt the daemon's identity.
     grpc::atomic_write_secret(&node_token_path, outcome.node_security_token.as_bytes())
         .context("persist NodeSecurityToken to node.token")?;
+
+    // BUG 1 fix: write the tenant_id and (re-affirm) the controller endpoint
+    // into aegis-config.yaml. Without this the daemon starts with
+    // `tenant_id: null` and is functionally inert — the bidi opens but every
+    // dispatch fails the tenant-ownership check. Idempotent: re-running
+    // enroll replaces the values rather than appending.
+    persist_handshake_outcome_to_config(&resolved_state_dir, &outcome).context(
+        "persist handshake outcome (tenant_id, controller_endpoint) to aegis-config.yaml",
+    )?;
 
     emit_output(&outcome, &node_token_path, output, /*reused=*/ false)?;
 
