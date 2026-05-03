@@ -18,8 +18,17 @@ ProtectSystem=strict
 # other users' files, but `ReadWritePaths` below punches through to expose just
 # the daemon's own state dir (read AND write). `ProtectHome=true` would make
 # the path entirely inaccessible — ReadWritePaths cannot un-mask a hidden path.
+#
+# The leading `-` on ReadWritePaths makes systemd silently skip the bind-mount
+# if `%h/.aegis/edge` does not exist when the unit's namespace is set up (e.g.
+# `systemctl --user start aegis-edge.service` issued before `aegis edge enroll`,
+# or after the dir was removed). Without the `-`, namespace setup fails with
+# `status=226/NAMESPACE` and the unit refuses to launch — even though the
+# daemon's own startup code creates the dir as its first action. With the `-`,
+# the daemon starts, creates the dir, exits cleanly on the missing-config
+# fast-fail (or runs normally), and the next start picks up the bind-mount.
 ProtectHome=tmpfs
-ReadWritePaths=%h/.aegis/edge
+ReadWritePaths=-%h/.aegis/edge
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

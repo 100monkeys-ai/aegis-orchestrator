@@ -59,6 +59,18 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
         .config
         .unwrap_or_else(|| state_dir.join("aegis-config.yaml"));
 
+    // 0. Materialize the state directory before any other I/O. The systemd
+    //    unit declares `ReadWritePaths=-%h/.aegis/edge` (note the `-`), which
+    //    silently skips the namespace bind-mount when the path is missing
+    //    rather than failing the unit with `status=226/NAMESPACE`. To make
+    //    that behavior self-healing, the daemon must (re)create the dir as
+    //    its first action so the *next* start finds the path and binds it.
+    //    If the user has not yet run `aegis edge enroll` we still create the
+    //    dir, then fall through to the load_or_default / fast-fail path
+    //    below which surfaces a clear "missing config / node.key" error.
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("create edge state dir {}", state_dir.display()))?;
+
     info!(
         state_dir = %state_dir.display(),
         config = %config_path.display(),
@@ -396,6 +408,38 @@ mod tests {
         assert_eq!(v[3], Duration::from_secs(3600));
         let fallback = validate_reconnect_backoff(&[]).expect("empty list falls back");
         assert_eq!(fallback, vec![Duration::from_secs(60)]);
+    }
+
+    #[tokio::test]
+    async fn daemon_run_creates_state_dir_before_loading_config() {
+        // Regression for systemd `status=226/NAMESPACE`: the unit declares
+        // `ReadWritePaths=-%h/.aegis/edge` so namespace setup tolerates a
+        // missing state dir, but the daemon must then create the dir on
+        // startup so the *next* start finds the path and binds it. This
+        // pins that the very first thing `run()` does (before it tries to
+        // load `aegis-config.yaml`, `node.key`, or the NodeSecurityToken)
+        // is `fs::create_dir_all(state_dir)`. We point `state_dir` at a
+        // path inside a tempdir that does NOT yet exist, run the daemon,
+        // and assert the path was materialized even though the run errors
+        // out on the missing config below.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("does-not-exist-yet").join("edge");
+        assert!(
+            !nested.exists(),
+            "precondition: the nested state dir must not exist"
+        );
+        let args = DaemonArgs {
+            state_dir: Some(nested.clone()),
+            config: Some(nested.join("aegis-config.yaml")),
+            once: true,
+        };
+        let _ = run(args).await; // must error on missing config below
+        assert!(
+            nested.is_dir(),
+            "daemon::run must create {} as its first action so the \
+             systemd `ReadWritePaths=-` bind picks up on the next start",
+            nested.display()
+        );
     }
 
     #[tokio::test]

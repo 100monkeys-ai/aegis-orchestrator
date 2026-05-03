@@ -326,11 +326,38 @@ pub fn template_for(kind: ServiceKind) -> &'static str {
 
 /// Install the service unit using the supplied manager. Renders the platform
 /// template against the current `aegis` binary path and the user's home dir.
+///
+/// Belt-and-suspenders to the systemd template's `ReadWritePaths=-` prefix:
+/// before handing the rendered unit to the manager (which on Linux issues
+/// `systemctl --user enable --now`), we ensure the daemon's state directory
+/// exists so the very first start picks up the bind-mount cleanly. The `-`
+/// prefix on `ReadWritePaths` makes systemd tolerate a *missing* path without
+/// failing the unit, but it does NOT auto-rebind once the path appears later
+/// — a restart is required. By creating the dir here we avoid that restart on
+/// the post-enroll install path. The daemon itself also creates the dir on
+/// startup (see `commands::edge::daemon::run`), so a manual `systemctl start`
+/// before enrollment still self-heals on the next start.
 pub fn install(mgr: &dyn ServiceManager, args: &InstallArgs) -> Result<InstallOutcome> {
+    if let Some(state_dir) = edge_state_dir() {
+        std::fs::create_dir_all(&state_dir).with_context(|| {
+            format!(
+                "create edge state dir {} prior to service install",
+                state_dir.display()
+            )
+        })?;
+    }
     let binary = current_binary_path();
     let home = home_dir_string();
     let content = render_unit_template(template_for(mgr.kind()), &binary, &home);
     mgr.install(&content, args.force, args.keep_existing)
+}
+
+/// Resolve the on-disk edge state directory (`$HOME/.aegis/edge`). Returns
+/// `None` when `$HOME` cannot be determined — in that case the install path
+/// proceeds without pre-creating the dir (the manager's downstream calls will
+/// surface the missing-home failure with a clearer error).
+fn edge_state_dir() -> Option<PathBuf> {
+    dirs_next::home_dir().map(|h| h.join(".aegis").join("edge"))
 }
 
 /// Uninstall the service unit using the supplied manager. Idempotent.
@@ -1143,6 +1170,70 @@ mod tests {
             out,
             "/usr/local/bin/aegis edge daemon --state-dir /home/jeshua/.aegis/edge"
         );
+    }
+
+    #[test]
+    fn systemd_template_marks_state_dir_bind_mount_tolerant_of_missing_path() {
+        // Regression: production was crash-looping with
+        //   aegis-edge.service: Failed to set up mount namespacing:
+        //   /home/<user>/.aegis/edge: No such file or directory
+        //   Main process exited, code=exited, status=226/NAMESPACE
+        // because `ReadWritePaths=%h/.aegis/edge` (no `-` prefix) hard-fails
+        // namespace setup if the path doesn't exist when the unit starts —
+        // even though the daemon creates the dir on startup. The `-` prefix
+        // makes systemd silently skip the bind when the path is missing.
+        let body = render_unit_template(
+            template_for(ServiceKind::SystemdUser),
+            "/usr/local/bin/aegis",
+            "/home/jeshua",
+        );
+        assert!(
+            body.contains("ReadWritePaths=-%h/.aegis/edge"),
+            "ReadWritePaths must use the `-` prefix to tolerate a missing \
+             state dir at unit-start time; got: {body}"
+        );
+        // Negative: the unprefixed form must NOT appear (otherwise the
+        // tolerant entry above could coexist with a hard-fail entry and
+        // namespace setup would still fail).
+        assert!(
+            !body.contains("\nReadWritePaths=%h/.aegis/edge"),
+            "no untolerated `ReadWritePaths=%h/.aegis/edge` may remain in the \
+             unit; only the `-`-prefixed form is permitted: {body}"
+        );
+    }
+
+    #[test]
+    fn install_creates_edge_state_dir_before_handing_to_manager() {
+        // Regression: the install path must materialize `$HOME/.aegis/edge`
+        // before the systemd unit is enabled+started, otherwise the very
+        // first start hits the `ReadWritePaths=-` skip and the daemon needs
+        // an extra restart to pick up the bind. We point `$HOME` at a temp
+        // dir, run install via the mock manager, and assert the directory
+        // exists afterwards.
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: tests in this module are not run concurrently with other
+        // tests that mutate $HOME; cargo test serializes within a process
+        // for `#[test]` fns sharing process-global env at our scale.
+        std::env::set_var("HOME", tmp.path());
+        let mock = MockServiceManager::new(
+            ServiceKind::SystemdUser,
+            tmp.path().join("aegis-edge.service"),
+        );
+        let outcome = install(&mock, &InstallArgs::default()).expect("install ok");
+        assert!(matches!(outcome, InstallOutcome::Installed { .. }));
+        let state_dir = tmp.path().join(".aegis").join("edge");
+        assert!(
+            state_dir.is_dir(),
+            "install must pre-create {} so the first systemd start \
+             binds the path cleanly",
+            state_dir.display()
+        );
+        // Restore $HOME for any sibling tests.
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
