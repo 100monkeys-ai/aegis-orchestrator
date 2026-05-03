@@ -59,6 +59,26 @@ impl EdgeConnectionRegistry {
     pub fn connected_node_ids(&self) -> Vec<NodeId> {
         self.inner.iter().map(|r| *r.key()).collect()
     }
+
+    /// Forcibly evict a node's live `ConnectEdge` stream by removing its
+    /// sender from the registry. Dropping the sender closes the underlying
+    /// `mpsc` channel, which causes the `ReceiverStream` wrapping it in
+    /// `handle_connect_edge` to terminate — the daemon then observes its
+    /// gRPC stream being closed by the server. Any pending oneshots tagged
+    /// with this node are failed with `EdgeDisconnected`.
+    ///
+    /// Used by [`crate::application::edge::revoke_edge::RevokeEdgeService`]
+    /// to enforce ADR-117 §C revocation: once an operator revokes a host,
+    /// the daemon's bidi stream must drop immediately so it stops trying
+    /// to use the now-invalid `NodeSecurityToken`.
+    ///
+    /// Returns `true` if a sender was registered (and removed), `false`
+    /// when the node had no live stream.
+    pub fn evict(&self, node_id: &NodeId) -> bool {
+        let removed = self.inner.remove(node_id).is_some();
+        self.pending.disconnect_node(node_id);
+        removed
+    }
 }
 
 pub struct EdgeConnectionGuard {
