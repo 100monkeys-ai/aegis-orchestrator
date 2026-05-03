@@ -25,6 +25,8 @@
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
+use std::fs;
+use std::path::Path;
 use tonic::{Request, Status};
 
 use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
@@ -250,6 +252,97 @@ fn map_challenge_status(status: Status) -> anyhow::Error {
     }
 }
 
+/// Persist the handshake outcome into `aegis-config.yaml` (BUG 1 fix).
+///
+/// After a successful enrollment the daemon's local config must reflect the
+/// tenant binding minted by the controller — without this, the daemon starts
+/// with `tenant_id: null` and dispatches that fail tenant-ownership checks
+/// surface as silent inertness ("enrolled but does nothing").
+///
+/// Updates two fields:
+///
+/// * `spec.cluster.edge.tenant_id` ← outcome's `tenant_id` (the `tid` claim
+///   of the issued NodeSecurityToken, falling back to the enrollment JWT's
+///   `tid` if the issued token omits it).
+/// * `spec.cluster.controller.endpoint` ← outcome's `controller_endpoint`
+///   (the `cep` claim of the enrollment JWT). Bootstrap already set this from
+///   the same source, but we re-write it here to make the post-handshake
+///   step idempotent on re-enrollment.
+///
+/// Writes are atomic (same-directory tempfile + `rename`) and re-runnable —
+/// running enroll a second time replaces the values rather than duplicating
+/// them.
+pub fn persist_handshake_outcome_to_config(
+    state_dir: &Path,
+    outcome: &HandshakeOutcome,
+) -> Result<()> {
+    let cfg_path = state_dir.join("aegis-config.yaml");
+    let body =
+        fs::read_to_string(&cfg_path).with_context(|| format!("read {}", cfg_path.display()))?;
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(&body).with_context(|| format!("parse {}", cfg_path.display()))?;
+
+    // Walk to spec.cluster, creating intermediate maps if they're absent.
+    // The bootstrap step writes a complete document so the maps should
+    // already exist; this is defensive in case an operator hand-edits the
+    // config and removes a section.
+    let root = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("aegis-config.yaml root is not a mapping"))?;
+    let spec = ensure_child_mapping(root, "spec")?;
+    let cluster = ensure_child_mapping(spec, "cluster")?;
+
+    // controller.endpoint — set the endpoint on a freshly-resolved mapping
+    // ref. Re-resolve from `cluster` between the two writes so we never hold
+    // overlapping mutable borrows of the same parent.
+    {
+        let controller = ensure_child_mapping(cluster, "controller")?;
+        controller.insert(
+            serde_yaml::Value::String("endpoint".to_string()),
+            serde_yaml::Value::String(outcome.controller_endpoint.clone()),
+        );
+    }
+
+    // edge.tenant_id
+    {
+        let edge = ensure_child_mapping(cluster, "edge")?;
+        edge.insert(
+            serde_yaml::Value::String("tenant_id".to_string()),
+            serde_yaml::Value::String(outcome.tenant_id.clone()),
+        );
+    }
+
+    let new_body = serde_yaml::to_string(&doc)
+        .with_context(|| format!("serialize updated {}", cfg_path.display()))?;
+    super::grpc::atomic_write_secret(&cfg_path, new_body.as_bytes()).with_context(|| {
+        format!(
+            "atomically rewrite {} with handshake outcome",
+            cfg_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Mutate-or-create a child entry on a YAML mapping, returning a mutable
+/// reference to its value as a mapping. Errors if `key` exists but is not a
+/// mapping (which would indicate a hand-edit that violated the schema —
+/// surface rather than silently overwrite).
+fn ensure_child_mapping<'a>(
+    parent: &'a mut serde_yaml::Mapping,
+    key: &str,
+) -> Result<&'a mut serde_yaml::Mapping> {
+    let k = serde_yaml::Value::String(key.to_string());
+    if !parent.contains_key(&k) {
+        parent.insert(
+            k.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+    let val = parent.get_mut(&k).expect("just inserted if missing");
+    val.as_mapping_mut()
+        .ok_or_else(|| anyhow!("'{key}' exists but is not a mapping; refusing to overwrite"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +399,159 @@ mod tests {
         assert!(
             msg.contains("bootstrap_proof") && msg.contains("expired"),
             "must surface server detail: {msg}"
+        );
+    }
+
+    /// Build a representative `aegis-config.yaml` matching what `bootstrap.rs`
+    /// emits, with `tenant_id: null` and a placeholder controller endpoint —
+    /// this is exactly the state BUG 1 leaves on disk before the fix runs.
+    fn write_pre_handshake_config(dir: &Path, controller_endpoint: &str) {
+        let body = format!(
+            "spec:\n  cluster:\n    controller:\n      endpoint: \"{controller_endpoint}\"\n    edge:\n      tenant_id: null\n      capabilities:\n        local_tools: [shell]\n"
+        );
+        std::fs::write(dir.join("aegis-config.yaml"), body).unwrap();
+    }
+
+    fn make_outcome(tenant_id: &str, controller_endpoint: &str) -> HandshakeOutcome {
+        HandshakeOutcome {
+            node_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            tenant_id: tenant_id.to_string(),
+            controller_endpoint: controller_endpoint.to_string(),
+            node_security_token: "header.payload.sig".to_string(),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn persist_handshake_outcome_writes_tenant_id_and_endpoint() {
+        // Regression for BUG 1: post-handshake the daemon's config must carry
+        // the JWT's tid claim and the resolved controller endpoint. Before
+        // the fix, the bootstrap-time `tenant_id: null` was never replaced
+        // and every InvokeTool dispatch failed the tenant-ownership check.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pre_handshake_config(tmp.path(), "controller.example:443");
+        let outcome = make_outcome(
+            "u-d7f8170035d349b6b237c391ccc19035",
+            "controller.example:443",
+        );
+        persist_handshake_outcome_to_config(tmp.path(), &outcome)
+            .expect("persist must succeed on a well-formed config");
+
+        let body = std::fs::read_to_string(tmp.path().join("aegis-config.yaml")).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        let tid = doc
+            .get("spec")
+            .and_then(|v| v.get("cluster"))
+            .and_then(|v| v.get("edge"))
+            .and_then(|v| v.get("tenant_id"))
+            .and_then(|v| v.as_str())
+            .expect("tenant_id must be a string after persist");
+        assert_eq!(tid, "u-d7f8170035d349b6b237c391ccc19035");
+
+        let endpoint = doc
+            .get("spec")
+            .and_then(|v| v.get("cluster"))
+            .and_then(|v| v.get("controller"))
+            .and_then(|v| v.get("endpoint"))
+            .and_then(|v| v.as_str())
+            .expect("controller.endpoint must be present");
+        assert_eq!(endpoint, "controller.example:443");
+    }
+
+    #[test]
+    fn persist_handshake_outcome_is_idempotent_on_re_enroll() {
+        // Pin re-enrollment safety: running the persist step twice with the
+        // same outcome must produce the same final document, not append a
+        // duplicate `tenant_id` entry or grow the file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pre_handshake_config(tmp.path(), "controller.example:443");
+        let outcome = make_outcome("u-abc", "controller.example:443");
+        persist_handshake_outcome_to_config(tmp.path(), &outcome).unwrap();
+        let after_first = std::fs::read_to_string(tmp.path().join("aegis-config.yaml")).unwrap();
+        persist_handshake_outcome_to_config(tmp.path(), &outcome).unwrap();
+        let after_second = std::fs::read_to_string(tmp.path().join("aegis-config.yaml")).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "re-running persist must be a no-op when the outcome is unchanged"
+        );
+
+        // And applying a *different* outcome must replace, not append.
+        let outcome_2 = make_outcome("u-def", "new-controller.example:8443");
+        persist_handshake_outcome_to_config(tmp.path(), &outcome_2).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("aegis-config.yaml")).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        let tid = doc
+            .get("spec")
+            .and_then(|v| v.get("cluster"))
+            .and_then(|v| v.get("edge"))
+            .and_then(|v| v.get("tenant_id"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(tid, "u-def", "tenant_id must be replaced, not appended");
+        let endpoint = doc
+            .get("spec")
+            .and_then(|v| v.get("cluster"))
+            .and_then(|v| v.get("controller"))
+            .and_then(|v| v.get("endpoint"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(endpoint, "new-controller.example:8443");
+    }
+
+    #[test]
+    fn persist_handshake_outcome_creates_missing_intermediate_maps() {
+        // Defensive: an operator hand-edit might have removed the `edge`
+        // section. The persist step must re-create the path rather than
+        // panic, so the daemon has a sane post-handshake config.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("aegis-config.yaml"),
+            "spec:\n  cluster:\n    role: edge\n",
+        )
+        .unwrap();
+        let outcome = make_outcome("u-xyz", "controller.example:443");
+        persist_handshake_outcome_to_config(tmp.path(), &outcome).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("aegis-config.yaml")).unwrap();
+        assert!(body.contains("u-xyz"));
+        assert!(body.contains("controller.example:443"));
+    }
+
+    #[test]
+    fn persist_handshake_outcome_preserves_other_fields() {
+        // Pin that the rewrite preserves unrelated fields — capabilities,
+        // backoff, custom_labels — so an operator's edits aren't clobbered
+        // by enrollment.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("aegis-config.yaml"),
+            "spec:\n  cluster:\n    controller:\n      endpoint: \"old:443\"\n      tls:\n        enabled: true\n    edge:\n      tenant_id: null\n      capabilities:\n        os: linux\n        local_tools:\n          - shell\n          - docker\n        custom_labels:\n          region: home\n",
+        )
+        .unwrap();
+        let outcome = make_outcome("u-pqr", "new:443");
+        persist_handshake_outcome_to_config(tmp.path(), &outcome).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("aegis-config.yaml")).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        // Updated values
+        assert_eq!(
+            doc["spec"]["cluster"]["controller"]["endpoint"].as_str(),
+            Some("new:443")
+        );
+        assert_eq!(
+            doc["spec"]["cluster"]["edge"]["tenant_id"].as_str(),
+            Some("u-pqr")
+        );
+        // Preserved values
+        assert_eq!(
+            doc["spec"]["cluster"]["controller"]["tls"]["enabled"].as_bool(),
+            Some(true)
+        );
+        let tools = doc["spec"]["cluster"]["edge"]["capabilities"]["local_tools"]
+            .as_sequence()
+            .expect("local_tools sequence preserved");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            doc["spec"]["cluster"]["edge"]["capabilities"]["custom_labels"]["region"].as_str(),
+            Some("home")
         );
     }
 }

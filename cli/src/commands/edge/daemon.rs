@@ -110,10 +110,13 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
     let reconnect_backoff: Vec<Duration> =
         validate_reconnect_backoff(&edge_cfg.stream_reconnect_backoff_secs)?;
 
-    // 5. Capabilities snapshot. v1: surface the operator-configured
-    //    local_tools / mount_points / custom_labels verbatim. Hardware
-    //    probes are a follow-up (TODO adr-117).
+    // 5. Capabilities snapshot. The os/arch/local_tools/mount_points block
+    //    is populated at bootstrap time by host detection (see
+    //    `commands::edge::host_detection`); we surface those persisted
+    //    values verbatim on the wire here.
     let capabilities = EdgeCapabilities {
+        os: edge_cfg.capabilities.os.clone(),
+        arch: edge_cfg.capabilities.arch.clone(),
         local_tools: edge_cfg.capabilities.local_tools.clone(),
         mount_points: edge_cfg.capabilities.mount_points.clone(),
         custom_labels: edge_cfg.capabilities.custom_labels.clone(),

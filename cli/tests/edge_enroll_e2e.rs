@@ -742,6 +742,239 @@ async fn enroll_with_non_uuid_jwt_sub_succeeds_when_node_id_is_minted_uuid() {
     );
 }
 
+/// Read the persisted `spec.cluster.edge.tenant_id` from `aegis-config.yaml`.
+/// Returns `None` if the field is missing or null. Used by BUG-1 regression
+/// tests below.
+fn read_persisted_tenant_id(state_dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(state_dir.join("aegis-config.yaml")).ok()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&body).ok()?;
+    doc.get("spec")?
+        .get("cluster")?
+        .get("edge")?
+        .get("tenant_id")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Read `spec.cluster.controller.endpoint` from `aegis-config.yaml`.
+fn read_persisted_controller_endpoint(state_dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(state_dir.join("aegis-config.yaml")).ok()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&body).ok()?;
+    doc.get("spec")?
+        .get("cluster")?
+        .get("controller")?
+        .get("endpoint")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// BUG 1 regression: after a successful enrollment, the daemon's
+/// `aegis-config.yaml` must carry the JWT's `tid` claim in
+/// `spec.cluster.edge.tenant_id`. Before the fix this stayed `null` and
+/// every dispatch failed the tenant-ownership check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_persists_tenant_id_to_aegis_config_after_handshake() {
+    let stub = ScriptedStub::default();
+    let issued_node_id = Uuid::new_v4().to_string();
+    let issued = make_node_security_token(&issued_node_id, "u-d7f8170035d349b6b237c391ccc19035");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![11u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued,
+        expires_at: None,
+    }));
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let token = make_enrollment_jwt("BEASTLY1", "u-d7f8170035d349b6b237c391ccc19035", &endpoint);
+    enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
+        .await
+        .expect("enroll must succeed");
+
+    let tid = read_persisted_tenant_id(tmp.path())
+        .expect("tenant_id must be present (not null) after successful enrollment");
+    assert_eq!(
+        tid, "u-d7f8170035d349b6b237c391ccc19035",
+        "persisted tenant_id must equal the JWT's tid claim"
+    );
+    let cep = read_persisted_controller_endpoint(tmp.path())
+        .expect("controller.endpoint must be present after enrollment");
+    assert_eq!(
+        cep, endpoint,
+        "persisted controller endpoint must match the resolved JWT cep claim"
+    );
+}
+
+/// BUG 1 idempotency: re-running enrollment must replace `tenant_id` with
+/// the new value, not append a duplicate or leave the old one in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_replaces_tenant_id_on_reenroll_idempotently() {
+    let stub = ScriptedStub::default();
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Run 1 — tenant-a
+    let issued_1 = make_node_security_token(&Uuid::new_v4().to_string(), "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![21u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued_1,
+        expires_at: None,
+    }));
+    let token_1 = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    enroll_run(enroll_args(token_1, tmp.path()), OutputFormat::Text)
+        .await
+        .expect("first enroll must succeed");
+    assert_eq!(
+        read_persisted_tenant_id(tmp.path()).as_deref(),
+        Some("tenant-a")
+    );
+
+    // Run 2 — same state-dir, --force, tenant-b. The minted node_id must
+    // survive (covered by enroll_persisted_node_id_survives_reenroll) AND
+    // the persisted tenant_id must now be tenant-b — not tenant-a, not
+    // appended-as-list, not null.
+    let issued_2 = make_node_security_token(&Uuid::new_v4().to_string(), "tenant-b");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![22u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued_2,
+        expires_at: None,
+    }));
+    let token_2 = make_enrollment_jwt("BEASTLY1", "tenant-b", &endpoint);
+    let mut args_2 = enroll_args(token_2, tmp.path());
+    args_2.force = true;
+    args_2.non_interactive = false;
+    enroll_run(args_2, OutputFormat::Text)
+        .await
+        .expect("re-enroll with --force must succeed");
+    assert_eq!(
+        read_persisted_tenant_id(tmp.path()).as_deref(),
+        Some("tenant-b"),
+        "re-enroll must replace tenant_id with the new tid"
+    );
+
+    // Sanity: the YAML must remain parseable (no append-as-text or
+    // duplicate-key corruption).
+    let body = std::fs::read_to_string(tmp.path().join("aegis-config.yaml")).unwrap();
+    let _doc: serde_yaml::Value = serde_yaml::from_str(&body)
+        .expect("aegis-config.yaml must remain parseable after re-enroll");
+}
+
+/// BUG 2 regression: the bootstrap template must seed at least one
+/// `SecurityContext` whose `name` matches what the controller dispatches —
+/// and the deserializer must accept the YAML shape we ship.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_seeds_security_contexts_that_match_consumer_tier_names() {
+    use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+
+    let stub = ScriptedStub::default();
+    let issued = make_node_security_token(&Uuid::new_v4().to_string(), "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![31u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued,
+        expires_at: None,
+    }));
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
+        .await
+        .expect("enroll must succeed");
+
+    // Round-trip through the production deserializer — if the template's
+    // YAML shape ever drifts from `SecurityContextDefinition`, this fails.
+    let cfg_path = tmp.path().join("aegis-config.yaml");
+    let cfg = NodeConfigManifest::load_or_default(Some(cfg_path.clone()))
+        .expect("template must round-trip through NodeConfigManifest");
+    let contexts = cfg
+        .spec
+        .security_contexts
+        .as_ref()
+        .expect("template must seed a non-null security_contexts list");
+    assert!(
+        !contexts.is_empty(),
+        "template must seed at least one SecurityContext (BUG 2 was that this list was empty)"
+    );
+    let names: Vec<&str> = contexts.iter().map(|c| c.name.as_str()).collect();
+    for required in ["zaru-free", "zaru-pro", "zaru-business", "zaru-enterprise"] {
+        assert!(
+            names.contains(&required),
+            "template must seed '{required}' (matches ZaruTier::to_security_context_name); found {names:?}"
+        );
+    }
+    let zaru_free = contexts.iter().find(|c| c.name == "zaru-free").unwrap();
+    assert!(
+        zaru_free.capabilities.iter().any(|c| c.tool_pattern == "*"),
+        "zaru-free seed must include a permissive '*' tool_pattern as the starting point"
+    );
+}
+
+/// BUG 3 regression: bootstrap must populate `spec.cluster.edge.capabilities`
+/// with detected `os` and `arch`, and at minimum a `shell` entry in
+/// `local_tools`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_writes_host_aware_capabilities_to_aegis_config() {
+    use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+
+    let stub = ScriptedStub::default();
+    let issued = make_node_security_token(&Uuid::new_v4().to_string(), "tenant-a");
+    stub.script_attest(Ok(AttestNodeResponse {
+        challenge_nonce: vec![41u8; 32],
+        challenge_id: Uuid::new_v4().to_string(),
+    }));
+    stub.script_challenge(Ok(ChallengeNodeResponse {
+        node_security_token: issued,
+        expires_at: None,
+    }));
+    let (endpoint, _shutdown) = spawn_scripted_server(stub.clone()).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let token = make_enrollment_jwt("BEASTLY1", "tenant-a", &endpoint);
+    enroll_run(enroll_args(token, tmp.path()), OutputFormat::Text)
+        .await
+        .expect("enroll must succeed");
+
+    let cfg = NodeConfigManifest::load_or_default(Some(tmp.path().join("aegis-config.yaml")))
+        .expect("config must round-trip");
+    let edge = cfg
+        .spec
+        .cluster
+        .as_ref()
+        .and_then(|c| c.edge.as_ref())
+        .expect("edge config must be present");
+    let caps = &edge.capabilities;
+    assert_eq!(
+        caps.os,
+        std::env::consts::OS,
+        "os must be populated from std::env::consts::OS"
+    );
+    assert_eq!(
+        caps.arch,
+        std::env::consts::ARCH,
+        "arch must be populated from std::env::consts::ARCH"
+    );
+    assert!(
+        caps.local_tools.iter().any(|t| t == "shell"),
+        "local_tools must include 'shell' (always-present special case): got {:?}",
+        caps.local_tools
+    );
+    assert!(
+        !caps.mount_points.is_empty(),
+        "mount_points must have at least one entry"
+    );
+}
+
 /// Persistence contract: a re-enroll on the same host MUST reuse the
 /// previously-minted `node_id`. The bootstrap step reads back the existing
 /// `spec.node.id` rather than minting a new one — so the daemon's identity

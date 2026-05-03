@@ -14,6 +14,7 @@ pub mod fleet;
 pub mod group;
 pub mod grpc;
 pub mod handshake;
+pub mod host_detection;
 pub mod keys;
 pub mod logout;
 pub mod ls;

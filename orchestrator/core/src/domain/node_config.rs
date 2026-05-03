@@ -1349,6 +1349,16 @@ fn default_stream_reconnect_backoff() -> Vec<u64> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EdgeCapabilitiesConfig {
+    /// Detected OS identifier ("linux", "macos", "windows"). Populated by
+    /// `aegis edge enroll` at bootstrap time via host detection
+    /// (`std::env::consts::OS`). Operators may override; advertised to the
+    /// controller in the `EdgeCapabilities` Hello frame.
+    #[serde(default)]
+    pub os: String,
+    /// Detected CPU architecture ("x86_64", "aarch64", …). Populated by
+    /// `aegis edge enroll` at bootstrap time (`std::env::consts::ARCH`).
+    #[serde(default)]
+    pub arch: String,
     #[serde(default)]
     pub local_tools: Vec<String>,
     #[serde(default)]
