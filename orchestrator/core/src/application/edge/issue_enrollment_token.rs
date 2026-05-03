@@ -412,9 +412,9 @@ mod tests {
         use tokio_stream::Stream;
         use tonic::{transport::Server, Request, Response, Status, Streaming};
 
+        type CapturedRequest = (Option<String>, Option<String>, IssueEnrollmentTokenRequest);
         struct CapturingService {
-            captured:
-                Arc<Mutex<Option<(Option<String>, Option<String>, IssueEnrollmentTokenRequest)>>>,
+            captured: Arc<Mutex<Option<CapturedRequest>>>,
         }
         #[tonic::async_trait]
         impl NodeClusterService for CapturingService {

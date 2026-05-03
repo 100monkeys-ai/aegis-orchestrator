@@ -373,6 +373,7 @@ mod tests {
     }
 
     impl DummyEnvelope {
+        #[allow(dead_code)]
         fn new(
             signature_result: Result<(), SealSessionError>,
             tool_name: Option<String>,
@@ -388,6 +389,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
             self.nonce = nonce.into();
             self

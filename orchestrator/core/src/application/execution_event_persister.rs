@@ -250,11 +250,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::RwLock;
 
+    /// Recorded event tuple: (execution_id, sequence, event_type, payload,
+    /// iteration). Aliased to keep the field type below the clippy
+    /// `type_complexity` threshold.
+    type RecordedEvent = (ExecutionId, i64, String, serde_json::Value, Option<u8>);
+
     /// Minimal recording repository — only `append_event` is exercised by the
     /// persister. All other methods return `Ok(...)` defaults.
     #[derive(Default)]
     struct RecordingRepo {
-        events: RwLock<Vec<(ExecutionId, i64, String, serde_json::Value, Option<u8>)>>,
+        events: RwLock<Vec<RecordedEvent>>,
         fail_after: AtomicUsize,
         call_count: AtomicUsize,
     }

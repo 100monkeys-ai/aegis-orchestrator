@@ -698,7 +698,7 @@ mod tests {
         let delta = exp - iat;
         // Allow small slack (clock granularity / wall-clock between reads).
         assert!(
-            delta <= 35 && delta >= 25,
+            (25..=35).contains(&delta),
             "exp-iat={delta} expected ~30s for ttl=30; service ignored configured TTL"
         );
     }

@@ -20,9 +20,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
+use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
-use std::process::Command;
 
 const SYSTEMD_SERVICE_TEMPLATE: &str = include_str!("../../../templates/aegis-edge.service");
 const LAUNCHD_PLIST_TEMPLATE: &str = include_str!("../../../templates/io.aegis.edge.plist");
@@ -30,9 +30,13 @@ const NSSM_TEMPLATE: &str = include_str!("../../../templates/aegis-edge.nssm.jso
 
 /// systemd unit name used for the user-scoped `aegis-edge` service.
 pub const SYSTEMD_UNIT: &str = "aegis-edge.service";
-/// launchd label used for the macOS LaunchAgent.
+/// launchd label used for the macOS LaunchAgent. Referenced by the
+/// platform-gated `LaunchctlServiceManager` only — unused on Linux/Windows.
+#[allow(dead_code)]
 pub const LAUNCHD_LABEL: &str = "io.aegis.edge";
-/// NSSM service name used on Windows.
+/// NSSM service name used on Windows. Referenced by the platform-gated
+/// `NssmServiceManager` only — unused on Linux/macOS.
+#[allow(dead_code)]
 pub const NSSM_SERVICE_NAME: &str = "AegisEdge";
 
 #[derive(Debug, Subcommand)]
@@ -112,8 +116,12 @@ pub async fn run(cmd: ServiceCommand) -> Result<()> {
 // ServiceManager trait + outcomes
 // ---------------------------------------------------------------------------
 
-/// Service unit kind detected at runtime.
+/// Service unit kind detected at runtime. The `Launchd` and `Nssm` variants
+/// are constructed only on macOS and Windows respectively; on other targets
+/// they are dead but must remain present so the same `ServiceKind` type
+/// covers all platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ServiceKind {
     SystemdUser,
     Launchd,
@@ -177,6 +185,7 @@ pub enum UninstallOutcome {
 /// Each platform impl wraps a single supervisor (systemd-user, launchd, NSSM).
 /// The trait is the seam tests poke — `MockServiceManager` records calls
 /// without spawning subprocesses. See `tests` module below.
+#[allow(dead_code)]
 pub trait ServiceManager {
     fn kind(&self) -> ServiceKind;
     fn unit_name(&self) -> &str;
@@ -230,10 +239,52 @@ pub fn detect_service_manager_for_install() -> Result<Box<dyn ServiceManager>> {
 /// Substitute `{{BINARY_PATH}}` (and `{{HOME}}` for the launchd plist) in the
 /// service unit template, using the currently-running `aegis` binary path so
 /// the unit launches the right binary across reinstalls.
+///
+/// For JSON-bodied templates (NSSM), naive string substitution would inject
+/// raw Windows paths like `C:\Program Files\Aegis\aegis.exe` whose backslashes
+/// the JSON parser then rejects. We detect a JSON template by parsing it and,
+/// on success, rewrite the placeholder fields via `serde_json` so the binary
+/// path is emitted as a properly-escaped JSON string. Non-JSON templates
+/// (systemd unit, launchd plist) keep the literal string substitution path.
 pub fn render_unit_template(template: &str, binary_path: &str, home_dir: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(template) {
+        substitute_json_placeholders(&mut value, binary_path, home_dir);
+        // `serde_json::to_string_pretty` escapes embedded backslashes/quotes
+        // in `binary_path` automatically, so the rendered JSON is always
+        // round-trippable regardless of the OS path conventions.
+        return serde_json::to_string_pretty(&value)
+            .expect("serializing a serde_json::Value cannot fail");
+    }
     template
         .replace("{{BINARY_PATH}}", binary_path)
         .replace("{{HOME}}", home_dir)
+}
+
+/// Walk a `serde_json::Value` tree and replace `{{BINARY_PATH}}` / `{{HOME}}`
+/// occurrences inside any string leaf with the resolved values. Only string
+/// leaves are touched — keys, numbers, booleans, etc. are passed through.
+fn substitute_json_placeholders(value: &mut serde_json::Value, binary_path: &str, home_dir: &str) {
+    match value {
+        serde_json::Value::String(s) => {
+            // Whole-string replacements (the common case for `binary_path`)
+            // and embedded substitutions both work — `String::replace` is a
+            // substring rewrite.
+            *s = s
+                .replace("{{BINARY_PATH}}", binary_path)
+                .replace("{{HOME}}", home_dir);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                substitute_json_placeholders(item, binary_path, home_dir);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                substitute_json_placeholders(v, binary_path, home_dir);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Resolve the path to the currently-running `aegis` binary so the service
@@ -421,6 +472,9 @@ pub fn parse_systemd_show(output: &str) -> ServiceStatus {
 /// Parse `launchctl list io.aegis.edge` output. The command prints a small
 /// property-list-shaped record on success and a non-zero exit on
 /// "not-installed". Caller passes `None` for the latter.
+///
+/// Used by the macOS `LaunchctlServiceManager`; flagged unused on Linux/Windows.
+#[allow(dead_code)]
 pub fn parse_launchctl_list(output: Option<&str>) -> ServiceStatus {
     let Some(text) = output else {
         return ServiceStatus {
@@ -457,6 +511,9 @@ pub fn parse_launchctl_list(output: Option<&str>) -> ServiceStatus {
 /// Parse `sc.exe query AegisEdge` output. Output is `STATE : <code> <name>`
 /// where running == 4, stopped == 1, paused == 7. The CLI returns a non-zero
 /// exit and "service does not exist" message when not installed.
+///
+/// Used by the Windows `NssmServiceManager`; flagged unused on Linux/macOS.
+#[allow(dead_code)]
 pub fn parse_sc_query(output: Option<&str>) -> ServiceStatus {
     let Some(text) = output else {
         return ServiceStatus {
@@ -787,7 +844,14 @@ impl ServiceManager for LaunchdManager {
             .output()
             .context("invoke log show")?;
         let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().rev().take(lines).collect::<Vec<_>>().iter().rev() {
+        for line in text
+            .lines()
+            .rev()
+            .take(lines)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             println!("{line}");
         }
         Ok(())
@@ -937,10 +1001,7 @@ impl ServiceManager for NssmManager {
             bail!("aegis edge service not installed; nothing to tail");
         }
         let body = std::fs::read_to_string(&self.spec_path).with_context(|| {
-            format!(
-                "read nssm spec for log paths {}",
-                self.spec_path.display()
-            )
+            format!("read nssm spec for log paths {}", self.spec_path.display())
         })?;
         let spec: serde_json::Value = serde_json::from_str(&body)?;
         let stdout = spec

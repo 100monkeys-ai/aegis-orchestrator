@@ -1787,6 +1787,7 @@ impl AgentRuntime for ContainerRuntime {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         ContainerEngine, ContainerRuntime, AEGIS_CONTAINER_KIND_LABEL, AEGIS_EXECUTION_ID_LABEL,

@@ -1039,8 +1039,8 @@ mod tests {
             volume_id,
             "/workspace/test.txt",
             crate::domain::storage::OpenMode::ReadOnly,
-            Some(caller.clone()),
-            Some(host.clone()),
+            Some(caller),
+            Some(host),
         )
         .await
         .expect("open_file_for_node should succeed");
@@ -1198,8 +1198,8 @@ mod tests {
             RemoteStorageServiceHandler::sentinel_execution_id(),
             volume_id,
             "/workspace/closed.txt",
-            Some(caller.clone()),
-            Some(host.clone()),
+            Some(caller),
+            Some(host),
         )
         .await
         .expect("close_for_node should succeed");

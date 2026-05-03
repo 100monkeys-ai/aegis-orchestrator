@@ -698,6 +698,7 @@ impl StandardExecutionService {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::application::nfs_gateway::EventBusPublisher;
@@ -1219,19 +1220,13 @@ mod tests {
         receiver: &mut crate::infrastructure::event_bus::EventReceiver,
     ) -> ExecutionEvent {
         for _ in 0..200 {
-            if let Ok(event) =
+            if let Ok(Ok(crate::infrastructure::event_bus::DomainEvent::Execution(ev))) =
                 tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await
             {
-                if let Ok(domain_event) = event {
-                    if let crate::infrastructure::event_bus::DomainEvent::Execution(ev) =
-                        domain_event
-                    {
-                        match &ev {
-                            ExecutionEvent::ExecutionCompleted { .. }
-                            | ExecutionEvent::ExecutionFailed { .. } => return ev,
-                            _ => {}
-                        }
-                    }
+                match &ev {
+                    ExecutionEvent::ExecutionCompleted { .. }
+                    | ExecutionEvent::ExecutionFailed { .. } => return ev,
+                    _ => {}
                 }
             }
         }

@@ -9,10 +9,11 @@
 //!   * the local default `http://127.0.0.1:8080`.
 //!
 //! Authentication header (`Authorization: Bearer <access_key>`) is supplied by
-//! the active profile when present. The orchestrator's tenant middleware
-//! requires `X-Effective-Tenant` for every `/v1/edge/*` call; the helper
-//! injects it from `AEGIS_EFFECTIVE_TENANT` or fails with a typed error so
-//! the caller can surface a useful message.
+//! the active profile when present. The orchestrator's `tenant_context_middleware`
+//! reads the canonical `X-Tenant-Id` header (per ADR-100/-111); the helper
+//! injects it from `AEGIS_EFFECTIVE_TENANT` (kept as the env var name for
+//! operator ergonomics) or fails with a typed error so the caller can surface
+//! a useful message.
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
@@ -20,6 +21,23 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::auth::load_store;
+
+/// Canonical tenant header consumed by `tenant_context_middleware` per
+/// ADR-100/-111. Centralized so the value cannot drift between the request
+/// builder and the regression suite.
+pub(crate) const TENANT_HEADER: &str = "x-tenant-id";
+
+/// Insert the canonical tenant header into a `HeaderMap`. Extracted so the
+/// regression test can assert the exact header name without standing up the
+/// full `from_env` constructor.
+pub(crate) fn insert_tenant_header(headers: &mut HeaderMap, tenant: &str) -> Result<()> {
+    let name = HeaderName::from_static(TENANT_HEADER);
+    headers.insert(
+        name,
+        HeaderValue::from_str(tenant).context("invalid AEGIS_EFFECTIVE_TENANT")?,
+    );
+    Ok(())
+}
 
 pub struct EdgeApiClient {
     base_url: String,
@@ -72,11 +90,7 @@ impl EdgeApiClient {
         let tenant = std::env::var("AEGIS_EFFECTIVE_TENANT").map_err(|_| {
             anyhow!("AEGIS_EFFECTIVE_TENANT env var is required for /v1/edge/* calls")
         })?;
-        let name = HeaderName::from_static("x-effective-tenant");
-        headers.insert(
-            name,
-            HeaderValue::from_str(&tenant).context("invalid AEGIS_EFFECTIVE_TENANT")?,
-        );
+        insert_tenant_header(&mut headers, &tenant)?;
 
         Ok(Self {
             base_url,
@@ -171,5 +185,37 @@ impl EdgeApiClient {
         }
         serde_json::from_slice(&bytes)
             .with_context(|| format!("decode response: {}", String::from_utf8_lossy(&bytes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the CLI used to send `X-Effective-Tenant`, which the
+    /// orchestrator's `tenant_context_middleware` does not read — every
+    /// `aegis edge ls`/`tag` call produced a 400 from the missing-tenant
+    /// rejection path. The canonical contract per ADR-100/-111 is
+    /// `X-Tenant-Id`. This test pins the constant and the insertion helper
+    /// so a future "rename" cannot silently regress edge ops.
+    #[test]
+    fn tenant_header_uses_canonical_x_tenant_id() {
+        assert_eq!(TENANT_HEADER, "x-tenant-id");
+
+        let mut headers = HeaderMap::new();
+        insert_tenant_header(&mut headers, "t-consumer").expect("inject tenant header");
+
+        assert_eq!(
+            headers.get("x-tenant-id").and_then(|v| v.to_str().ok()),
+            Some("t-consumer"),
+            "must inject the canonical X-Tenant-Id header consumed by \
+             tenant_context_middleware"
+        );
+        assert!(
+            headers.get("x-effective-tenant").is_none(),
+            "must NOT emit the obsolete X-Effective-Tenant header — the \
+             orchestrator middleware ignores it and this header drift was \
+             the original bug"
+        );
     }
 }
