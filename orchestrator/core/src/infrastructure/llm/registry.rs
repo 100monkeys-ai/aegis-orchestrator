@@ -80,13 +80,17 @@ pub struct ProviderRegistry {
 /// Returns true for `LLMError` variants that are deterministic upstream
 /// rejections — retrying or swapping to a fallback provider with the same
 /// credentials/region won't change the answer.
+///
+/// NOTE: `ServiceUnavailable` (HTTP 503) is intentionally NOT in this list.
+/// 503 indicates transient upstream load (e.g. Gemini "high demand"); it must
+/// run through the exponential-backoff retry loop and, on exhaustion, fall
+/// back to the secondary provider — same as other retryable errors. This
+/// aligns with the SEAL classifier's `UpstreamUnavailable = Recoverable`
+/// pattern in `application::inner_loop_service`.
 fn is_non_retryable(e: &LLMError) -> bool {
     matches!(
         e,
-        LLMError::Authentication(_)
-            | LLMError::InvalidInput(_)
-            | LLMError::ModelNotFound(_)
-            | LLMError::ServiceUnavailable(_)
+        LLMError::Authentication(_) | LLMError::InvalidInput(_) | LLMError::ModelNotFound(_)
     )
 }
 
@@ -375,22 +379,6 @@ impl ProviderRegistry {
                                 attempt + 1,
                                 e
                             );
-                            if matches!(e, LLMError::ServiceUnavailable(_)) {
-                                if let Some((fallback_model, fallback)) = &self.fallback_provider {
-                                    info!(
-                                        "Service unavailable, trying fallback provider (model='{}')",
-                                        fallback_model
-                                    );
-                                    match fallback.generate_chat(messages, tools, options).await {
-                                        Ok(r) => return Ok(r),
-                                        Err(fe) => {
-                                            // Fallback also short-circuits on non-retryable
-                                            // errors (likely the same root cause).
-                                            return Err(fe);
-                                        }
-                                    }
-                                }
-                            }
                             return Err(e);
                         }
 
@@ -874,6 +862,99 @@ mod tests {
             .await;
         assert!(matches!(res, Err(LLMError::Authentication(_))));
         assert_eq!(primary.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_retries_with_backoff() {
+        // Regression: HTTP 503 ServiceUnavailable was wrongly classified as
+        // non-retryable, short-circuiting after attempt 1/3. It must run
+        // through the exponential-backoff retry loop and recover when the
+        // upstream becomes available again.
+        let primary = MockProvider::with_responses(vec![
+            Err(LLMError::ServiceUnavailable("503 high demand".into())),
+            Err(LLMError::ServiceUnavailable("503 high demand".into())),
+            Ok(ok_response()),
+        ]);
+        let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert!(
+            res.is_ok(),
+            "ServiceUnavailable must retry with backoff and succeed on 3rd attempt: {res:?}"
+        );
+        assert_eq!(
+            primary.call_count(),
+            3,
+            "primary must be retried max_retries times, not short-circuited after 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_falls_back_after_exhausting_primary_retries() {
+        // Regression: after the primary exhausts its retries on
+        // ServiceUnavailable, the registry must invoke the fallback provider
+        // (same path as other transient errors), not return the 503 directly.
+        let primary = MockProvider::with_responses(vec![
+            Err(LLMError::ServiceUnavailable("503 high demand".into())),
+            Err(LLMError::ServiceUnavailable("503 high demand".into())),
+            Err(LLMError::ServiceUnavailable("503 high demand".into())),
+        ]);
+        let fallback = MockProvider::with_responses(vec![Ok(ok_response())]);
+        let registry = make_registry(
+            primary.clone() as Arc<dyn LLMProvider>,
+            Some(fallback.clone() as Arc<dyn LLMProvider>),
+            30,
+        );
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert!(
+            res.is_ok(),
+            "fallback must serve the request after primary exhausts 503 retries: {res:?}"
+        );
+        assert_eq!(
+            primary.call_count(),
+            3,
+            "primary must be retried max_retries times before falling back"
+        );
+        assert_eq!(
+            fallback.call_count(),
+            1,
+            "fallback must be invoked exactly once after primary exhausts retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_returns_err_when_both_providers_exhausted() {
+        // Regression: when primary AND fallback both exhaust their retries
+        // on ServiceUnavailable, the final error returned must be
+        // ServiceUnavailable (not silently masked or transformed).
+        let primary = MockProvider::with_responses(vec![
+            Err(LLMError::ServiceUnavailable("503 primary".into())),
+            Err(LLMError::ServiceUnavailable("503 primary".into())),
+            Err(LLMError::ServiceUnavailable("503 primary".into())),
+        ]);
+        let fallback = MockProvider::with_responses(vec![Err(LLMError::ServiceUnavailable(
+            "503 fallback".into(),
+        ))]);
+        let registry = make_registry(
+            primary.clone() as Arc<dyn LLMProvider>,
+            Some(fallback.clone() as Arc<dyn LLMProvider>),
+            30,
+        );
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert!(
+            matches!(res, Err(LLMError::ServiceUnavailable(_))),
+            "expected ServiceUnavailable when both providers exhausted, got {res:?}"
+        );
+        assert_eq!(primary.call_count(), 3);
+        assert_eq!(fallback.call_count(), 1);
     }
 
     #[tokio::test]
