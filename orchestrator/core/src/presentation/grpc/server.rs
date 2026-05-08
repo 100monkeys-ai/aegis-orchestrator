@@ -336,17 +336,24 @@ impl AegisRuntime for AegisRuntimeService {
                 .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {e}")))?
         };
 
-        let resolved_intent = req
-            .intent
-            .filter(|s| !s.is_empty())
-            .or_else(|| Some(req.input.clone()).filter(|s| !s.is_empty()));
+        let resolved_intent = req.intent.filter(|s| !s.is_empty());
+
+        let mut input_payload = serde_json::Map::new();
+        input_payload.insert("context_overrides".to_string(), payload);
+        input_payload.insert(
+            "tenant_id".to_string(),
+            serde_json::Value::String(tenant_id.to_string()),
+        );
+        if !req.input.is_empty() {
+            input_payload.insert(
+                "workflow_input".to_string(),
+                serde_json::Value::String(req.input.clone()),
+            );
+        }
 
         let input = ExecutionInput {
             intent: resolved_intent,
-            input: serde_json::json!({
-                "context_overrides": payload,
-                "tenant_id": tenant_id.to_string(),
-            }),
+            input: serde_json::Value::Object(input_payload),
             workspace_volume_id: req
                 .workspace_volume_id
                 .filter(|s| !s.is_empty())
