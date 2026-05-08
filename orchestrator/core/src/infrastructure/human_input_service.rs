@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::domain::execution::ExecutionId;
+use crate::domain::tenant::TenantId;
 
 /// Status of a human input request
 #[derive(Debug, Clone)]
@@ -47,6 +48,10 @@ struct HumanInputRequest {
     id: Uuid,
     /// Associated workflow execution
     execution_id: ExecutionId,
+    /// Owning tenant — the tenant of the workflow execution that emitted
+    /// the approval request. Non-operator callers MUST only see/approve/
+    /// reject requests in their own tenant (ADR-097). Operators see all.
+    tenant_id: TenantId,
     /// Prompt to display to human
     prompt: String,
     /// When the request was created
@@ -70,9 +75,15 @@ impl HumanInputService {
         }
     }
 
-    /// Request human input and wait for response (with timeout)
+    /// Request human input and wait for response (with timeout).
+    ///
+    /// `tenant_id` is the owning tenant of the workflow execution that
+    /// emitted this approval request. It is propagated into the stored
+    /// `HumanInputRequest` so non-operator callers can be scoped to their
+    /// own tenant (ADR-097).
     pub async fn request_input(
         &self,
+        tenant_id: TenantId,
         execution_id: ExecutionId,
         prompt: String,
         timeout_seconds: u64,
@@ -83,6 +94,7 @@ impl HumanInputService {
         let request = HumanInputRequest {
             id: request_id,
             execution_id,
+            tenant_id,
             prompt: prompt.clone(),
             created_at: Utc::now(),
             timeout_seconds,
@@ -132,14 +144,31 @@ impl HumanInputService {
         }
     }
 
-    /// Submit approval for a pending request
-    pub async fn submit_approval(
+    /// Submit approval for a pending request.
+    ///
+    /// Pass `tenant_filter = None` for operator callers (cross-tenant); pass
+    /// `Some(tenant_id)` for non-operator callers — non-matching tenants
+    /// surface "not found" rather than the cross-tenant request.
+    pub async fn submit_approval_for_tenant(
         &self,
+        tenant_filter: Option<&TenantId>,
         request_id: Uuid,
         feedback: Option<String>,
         approved_by: Option<String>,
     ) -> Result<()> {
         let mut requests = self.pending_requests.write().await;
+
+        // Tenant gate: peek before removing so a tenant-mismatch leaves the
+        // request in place for the legitimate owner.
+        if let Some(tenant) = tenant_filter {
+            let belongs = requests
+                .get(&request_id)
+                .map(|r| &r.tenant_id == tenant)
+                .unwrap_or(false);
+            if !belongs {
+                anyhow::bail!("Request {request_id} not found or already completed");
+            }
+        }
 
         if let Some(request) = requests.remove(&request_id) {
             info!(
@@ -162,14 +191,38 @@ impl HumanInputService {
         }
     }
 
-    /// Submit rejection for a pending request
-    pub async fn submit_rejection(
+    /// Backwards-compatible wrapper used by tests; production callers use
+    /// `submit_approval_for_tenant` so tenant gating is explicit.
+    pub async fn submit_approval(
         &self,
+        request_id: Uuid,
+        feedback: Option<String>,
+        approved_by: Option<String>,
+    ) -> Result<()> {
+        self.submit_approval_for_tenant(None, request_id, feedback, approved_by)
+            .await
+    }
+
+    /// Submit rejection for a pending request. See `submit_approval_for_tenant`
+    /// for tenant-filter semantics.
+    pub async fn submit_rejection_for_tenant(
+        &self,
+        tenant_filter: Option<&TenantId>,
         request_id: Uuid,
         reason: String,
         rejected_by: Option<String>,
     ) -> Result<()> {
         let mut requests = self.pending_requests.write().await;
+
+        if let Some(tenant) = tenant_filter {
+            let belongs = requests
+                .get(&request_id)
+                .map(|r| &r.tenant_id == tenant)
+                .unwrap_or(false);
+            if !belongs {
+                anyhow::bail!("Request {request_id} not found or already completed");
+            }
+        }
 
         if let Some(request) = requests.remove(&request_id) {
             info!(
@@ -193,7 +246,20 @@ impl HumanInputService {
         }
     }
 
-    /// Get list of pending requests (for UI display)
+    /// Backwards-compatible rejection wrapper for tests.
+    pub async fn submit_rejection(
+        &self,
+        request_id: Uuid,
+        reason: String,
+        rejected_by: Option<String>,
+    ) -> Result<()> {
+        self.submit_rejection_for_tenant(None, request_id, reason, rejected_by)
+            .await
+    }
+
+    /// Get list of pending requests across every tenant (operator-only —
+    /// callers MUST verify operator privilege). Per-tenant callers MUST
+    /// use [`Self::list_pending_requests_for_tenant`].
     pub async fn list_pending_requests(&self) -> Vec<PendingRequestInfo> {
         let requests = self.pending_requests.read().await;
 
@@ -202,6 +268,7 @@ impl HumanInputService {
             .map(|req| PendingRequestInfo {
                 id: req.id,
                 execution_id: req.execution_id,
+                tenant_id: req.tenant_id.clone(),
                 prompt: req.prompt.clone(),
                 created_at: req.created_at,
                 timeout_seconds: req.timeout_seconds,
@@ -209,17 +276,53 @@ impl HumanInputService {
             .collect()
     }
 
-    /// Get a specific pending request by ID
-    pub async fn get_pending_request(&self, request_id: Uuid) -> Option<PendingRequestInfo> {
+    /// List pending requests scoped to a single tenant (ADR-097).
+    pub async fn list_pending_requests_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Vec<PendingRequestInfo> {
         let requests = self.pending_requests.read().await;
+        requests
+            .values()
+            .filter(|req| &req.tenant_id == tenant_id)
+            .map(|req| PendingRequestInfo {
+                id: req.id,
+                execution_id: req.execution_id,
+                tenant_id: req.tenant_id.clone(),
+                prompt: req.prompt.clone(),
+                created_at: req.created_at,
+                timeout_seconds: req.timeout_seconds,
+            })
+            .collect()
+    }
 
-        requests.get(&request_id).map(|req| PendingRequestInfo {
+    /// Fetch a specific pending request, optionally scoped to a tenant
+    /// (`None` for operator callers).
+    pub async fn get_pending_request_for_tenant(
+        &self,
+        tenant_filter: Option<&TenantId>,
+        request_id: Uuid,
+    ) -> Option<PendingRequestInfo> {
+        let requests = self.pending_requests.read().await;
+        let req = requests.get(&request_id)?;
+        if let Some(tenant) = tenant_filter {
+            if &req.tenant_id != tenant {
+                return None;
+            }
+        }
+        Some(PendingRequestInfo {
             id: req.id,
             execution_id: req.execution_id,
+            tenant_id: req.tenant_id.clone(),
             prompt: req.prompt.clone(),
             created_at: req.created_at,
             timeout_seconds: req.timeout_seconds,
         })
+    }
+
+    /// Backwards-compatible cross-tenant fetch for tests.
+    pub async fn get_pending_request(&self, request_id: Uuid) -> Option<PendingRequestInfo> {
+        self.get_pending_request_for_tenant(None, request_id).await
     }
 
     /// Cancel a pending request
@@ -246,11 +349,16 @@ impl Default for HumanInputService {
     }
 }
 
-/// Information about a pending request (for serialization/API)
+/// Information about a pending request (for serialization/API).
+///
+/// `tenant_id` is surfaced so operator-cross-tenant projections can label
+/// which tenant each request belongs to (ADR-097). Non-operator callers
+/// only ever see requests in their own tenant.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingRequestInfo {
     pub id: Uuid,
     pub execution_id: ExecutionId,
+    pub tenant_id: TenantId,
     pub prompt: String,
     pub created_at: DateTime<Utc>,
     pub timeout_seconds: u64,
@@ -287,7 +395,12 @@ mod tests {
 
         // Request input
         let result = service_clone
-            .request_input(execution_id, "Approve deployment?".to_string(), 5)
+            .request_input(
+                TenantId::system(),
+                execution_id,
+                "Approve deployment?".to_string(),
+                5,
+            )
             .await
             .unwrap();
 
@@ -332,7 +445,12 @@ mod tests {
 
         // Request input
         let result = service
-            .request_input(execution_id, "Deploy to production?".to_string(), 5)
+            .request_input(
+                TenantId::system(),
+                execution_id,
+                "Deploy to production?".to_string(),
+                5,
+            )
             .await
             .unwrap();
 
@@ -359,7 +477,12 @@ mod tests {
 
         // Request input with 1 second timeout (no response)
         let result = service
-            .request_input(execution_id, "Quick approval needed".to_string(), 1)
+            .request_input(
+                TenantId::system(),
+                execution_id,
+                "Quick approval needed".to_string(),
+                1,
+            )
             .await
             .unwrap();
 
@@ -378,7 +501,12 @@ mod tests {
         let service_clone = service.clone();
         tokio::spawn(async move {
             let _ = service_clone
-                .request_input(execution_id, "Test request".to_string(), 5)
+                .request_input(
+                    TenantId::system(),
+                    execution_id,
+                    "Test request".to_string(),
+                    5,
+                )
                 .await;
         });
 
@@ -388,5 +516,40 @@ mod tests {
         let pending = service.list_pending_requests().await;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].prompt, "Test request");
+    }
+
+    /// Regression: non-operator approval listing must not leak requests
+    /// from other tenants (ADR-097 §approvals).
+    #[tokio::test]
+    async fn list_pending_approvals_non_operator_does_not_leak_other_tenants() {
+        let service = Arc::new(HumanInputService::new());
+        let t_a = TenantId::new("t-a".to_string()).unwrap();
+        let t_b = TenantId::new("t-b".to_string()).unwrap();
+
+        let svc_a = service.clone();
+        let t_a_for_task = t_a.clone();
+        tokio::spawn(async move {
+            let _ = svc_a
+                .request_input(t_a_for_task, ExecutionId::new(), "tenant a".into(), 5)
+                .await;
+        });
+        let svc_b = service.clone();
+        let t_b_for_task = t_b.clone();
+        tokio::spawn(async move {
+            let _ = svc_b
+                .request_input(t_b_for_task, ExecutionId::new(), "tenant b".into(), 5)
+                .await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let cross = service.list_pending_requests().await;
+        assert_eq!(cross.len(), 2, "operator path must see both tenants");
+
+        let only_a = service.list_pending_requests_for_tenant(&t_a).await;
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].tenant_id, t_a);
+        let only_b = service.list_pending_requests_for_tenant(&t_b).await;
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].tenant_id, t_b);
     }
 }

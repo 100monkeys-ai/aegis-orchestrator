@@ -51,6 +51,9 @@ impl EdgeDaemonRepository for StubRepo {
             .cloned()
             .collect())
     }
+    async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+        Ok(self.edges.lock().await.values().cloned().collect())
+    }
     async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
         if let Some(e) = self.edges.lock().await.get_mut(node_id) {
             e.status = status;
@@ -130,6 +133,9 @@ impl EdgeGroupRepository for StubGroups {
             .filter(|g| &g.tenant_id == tenant_id)
             .cloned()
             .collect())
+    }
+    async fn list_all(&self) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
+        Ok(self.groups.lock().await.values().cloned().collect())
     }
     async fn update(&self, group: &EdgeGroup) -> Result<(), EdgeGroupRepoError> {
         self.groups.lock().await.insert(group.id, group.clone());

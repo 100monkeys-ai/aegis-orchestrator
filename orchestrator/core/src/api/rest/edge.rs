@@ -33,6 +33,19 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+
+use crate::domain::iam::{IdentityKind, UserIdentity};
+
+/// Local mirror of the daemon-layer `is_operator` helper. Edge handlers live
+/// in `orchestrator-core` rather than `cli`, so they cannot reference the
+/// daemon-layer copy. Kept in sync with that helper — both must agree on the
+/// definition of "operator" or operator-only branches diverge.
+fn is_operator(identity: Option<&UserIdentity>) -> bool {
+    matches!(
+        identity.map(|i| &i.identity_kind),
+        Some(IdentityKind::Operator { .. })
+    )
+}
 use prost_types::Struct;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -231,12 +244,21 @@ fn host_view(
 async fn list_hosts(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
 ) -> Result<Json<Vec<EdgeHostView>>, ApiError> {
-    let edges = s
-        .edge_repo
-        .list_by_tenant(&tenant)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Operator cross-tenant aggregation (ADR-097): each host already
+    // carries its `tenant_id` in [`EdgeHostView`].
+    let edges = if is_operator(identity.as_ref().map(|e| &e.0)) {
+        s.edge_repo
+            .list_all()
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        s.edge_repo
+            .list_by_tenant(&tenant)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     Ok(Json(
         edges
             .iter()
@@ -248,6 +270,7 @@ async fn list_hosts(
 async fn get_host(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
     Path(id): Path<String>,
 ) -> Result<Json<EdgeHostView>, ApiError> {
     let nid = parse_node_id(&id)?;
@@ -257,7 +280,9 @@ async fn get_host(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("edge"))?;
-    if edge.tenant_id != tenant {
+    // Operator cross-tenant detail fetch (ADR-097): operators bypass the
+    // tenant gate; the projection includes the host's own `tenant_id`.
+    if !is_operator(identity.as_ref().map(|e| &e.0)) && edge.tenant_id != tenant {
         return Err(ApiError::not_found("edge"));
     }
     Ok(Json(host_view(&edge, &s.connection_registry)))
@@ -384,6 +409,7 @@ struct CreateGroup {
 struct GroupView {
     id: String,
     name: String,
+    tenant_id: String,
     selector: EdgeSelector,
     pinned_members: Vec<String>,
     created_by: String,
@@ -394,6 +420,7 @@ fn group_view(g: &crate::domain::edge::EdgeGroup) -> GroupView {
     GroupView {
         id: g.id.to_string(),
         name: g.name.clone(),
+        tenant_id: g.tenant_id.as_str().to_string(),
         selector: g.selector.clone(),
         pinned_members: g.pinned_members.iter().map(|n| n.to_string()).collect(),
         created_by: g.created_by.clone(),
@@ -422,18 +449,40 @@ async fn create_group(
 async fn list_groups(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
 ) -> Result<Json<Vec<GroupView>>, ApiError> {
-    let gs = s.group_service.list(&tenant).await.map_err(map_group_err)?;
+    // Operator cross-tenant aggregation (ADR-097): bypass `group_service.list`
+    // (tenant-scoped) and use `list_all_unscoped`. Each group carries its
+    // own `tenant_id` in the projection.
+    let gs = if is_operator(identity.as_ref().map(|e| &e.0)) {
+        s.group_service
+            .list_all_unscoped()
+            .await
+            .map_err(map_group_err)?
+    } else {
+        s.group_service.list(&tenant).await.map_err(map_group_err)?
+    };
     Ok(Json(gs.iter().map(group_view).collect()))
 }
 
 async fn get_group(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
     Path(id): Path<String>,
 ) -> Result<Json<GroupView>, ApiError> {
     let gid =
         EdgeGroupId(uuid::Uuid::parse_str(&id).map_err(|e| ApiError::bad_request(e.to_string()))?);
+    if is_operator(identity.as_ref().map(|e| &e.0)) {
+        // Operator cross-tenant detail fetch (ADR-097): bypass the
+        // service-layer tenant gate.
+        let g = s
+            .group_service
+            .get_unscoped(gid)
+            .await
+            .map_err(map_group_err)?;
+        return Ok(Json(group_view(&g)));
+    }
     let g = s
         .group_service
         .get(&tenant, gid)
@@ -711,6 +760,9 @@ mod tests {
         async fn list_by_tenant(&self, _tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
             Ok(vec![])
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
         async fn update_status(
             &self,
             _node_id: &NodeId,
@@ -756,6 +808,9 @@ mod tests {
             &self,
             _tenant_id: &TenantId,
         ) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
+            Ok(vec![])
+        }
+        async fn list_all(&self) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
             Ok(vec![])
         }
         async fn update(&self, _group: &EdgeGroup) -> Result<(), EdgeGroupRepoError> {
@@ -1058,6 +1113,9 @@ mod tests {
                 .filter(|e| &e.tenant_id == tenant)
                 .cloned()
                 .collect())
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(self.edges.lock().await.values().cloned().collect())
         }
         async fn update_status(&self, id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
             if let Some(e) = self.edges.lock().await.get_mut(id) {

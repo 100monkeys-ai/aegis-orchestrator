@@ -10,11 +10,10 @@ use axum::response::IntoResponse;
 use axum::Json;
 use uuid::Uuid;
 
-use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
-use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::domain::iam::UserIdentity;
 
 use crate::daemon::cluster_helpers::cluster_status_view;
-use crate::daemon::handlers::{bounded_limit, LimitQuery};
+use crate::daemon::handlers::{bounded_limit, is_operator, LimitQuery};
 use crate::daemon::state::AppState;
 
 use super::super::operator_read_models::{
@@ -35,21 +34,47 @@ pub(crate) struct DashboardSummaryView {
     pub(crate) recent_workflow_execution_count: usize,
 }
 
+/// Reusable 403 body for non-operator callers hitting an operator-only
+/// observability endpoint. Each of these handlers aggregates platform-wide
+/// data and so MUST never be reachable by tenant or consumer users
+/// (ADR-097 §observability).
+fn operator_required_response(resource: &str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "operator_required",
+            "message": format!(
+                "{resource} aggregates across all tenants and is operator-restricted (ADR-097)."
+            ),
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) async fn list_stimuli_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Query(query): Query<LimitQuery>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    if !is_operator(identity.as_ref().map(|e| &e.0)) {
+        return operator_required_response("Stimuli list");
+    }
     let stimuli = state.operator_read_model.list_stimuli().await;
     let limit = bounded_limit(query.limit, stimuli.len().max(1), 500);
     Json(serde_json::json!({
         "items": stimuli.into_iter().take(limit).collect::<Vec<StimulusView>>(),
     }))
+    .into_response()
 }
 
 pub(crate) async fn get_stimulus_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(stimulus_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    if !is_operator(identity.as_ref().map(|e| &e.0)) {
+        return operator_required_response("Stimulus detail");
+    }
     match state
         .operator_read_model
         .get_stimulus(aegis_orchestrator_core::domain::stimulus::StimulusId(
@@ -57,26 +82,35 @@ pub(crate) async fn get_stimulus_handler(
         ))
         .await
     {
-        Some(stimulus) => Json(serde_json::json!({ "stimulus": stimulus })),
-        None => Json(serde_json::json!({"error": "stimulus not found"})),
+        Some(stimulus) => Json(serde_json::json!({ "stimulus": stimulus })).into_response(),
+        None => Json(serde_json::json!({"error": "stimulus not found"})).into_response(),
     }
 }
 
 pub(crate) async fn list_security_incidents_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Query(query): Query<LimitQuery>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    if !is_operator(identity.as_ref().map(|e| &e.0)) {
+        return operator_required_response("Security incidents");
+    }
     let incidents = state.operator_read_model.list_security_incidents().await;
     let limit = bounded_limit(query.limit, incidents.len().max(1), 500);
     Json(serde_json::json!({
         "items": incidents.into_iter().take(limit).collect::<Vec<SecurityIncidentView>>(),
     }))
+    .into_response()
 }
 
 pub(crate) async fn list_storage_violations_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Query(query): Query<LimitQuery>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    if !is_operator(identity.as_ref().map(|e| &e.0)) {
+        return operator_required_response("Storage violations");
+    }
     let violations = match state.storage_event_repo.find_violations(None).await {
         Ok(events) => events
             .into_iter()
@@ -86,39 +120,40 @@ pub(crate) async fn list_storage_violations_handler(
             return Json(serde_json::json!({
                 "error": e.to_string(),
                 "items": Vec::<StorageViolationView>::new(),
-            }));
+            }))
+            .into_response();
         }
     };
     let limit = bounded_limit(query.limit, violations.len().max(1), 500);
     Json(serde_json::json!({
         "items": violations.into_iter().take(limit).collect::<Vec<StorageViolationView>>(),
     }))
+    .into_response()
 }
 
 /// Operator-only cross-tenant observability dashboard.
 ///
-/// SCOPE (ADR-097 footgun #10): this handler intentionally aggregates data
-/// across ALL tenants — recent executions, workflow executions, swarms,
-/// stimuli, security incidents — by querying with `TenantId::system()`
-/// repository methods. The system-tenant query bypasses the per-tenant
-/// scoping applied to user-facing reads.
+/// SCOPE (ADR-097 §dashboard): this handler aggregates data across ALL
+/// tenants — recent executions, workflow executions, swarms, stimuli,
+/// security incidents — via the unscoped repository methods
+/// (`list_recent_all_paginated`, `list_paginated_all`,
+/// `list_swarms_unscoped`, `find_violations(None)`). It does NOT use
+/// `TenantId::system()` — that is a misleading sentinel that returns
+/// only the system tenant's rows, not aggregated cross-tenant data.
 ///
 /// SECURITY: this MUST only be reachable by operators. We gate on the
-/// authenticated identity's `IdentityKind::Operator` discriminant; any
-/// other identity (consumer user, tenant user, service account) gets a
-/// 403. Tenant context middleware does not enforce this on its own — it
-/// only resolves the caller's home tenant; it doesn't restrict who can
-/// invoke a system-tenant query.
+/// authenticated identity's `IdentityKind::Operator` discriminant via
+/// [`is_operator`]; any other identity (consumer user, tenant user,
+/// service account) gets a 403. Tenant context middleware does not
+/// enforce this on its own — it only resolves the caller's home tenant;
+/// it doesn't restrict who can invoke a cross-tenant query.
 pub(crate) async fn dashboard_summary_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
 ) -> axum::response::Response {
     // Operator gate.
-    let is_operator = matches!(
-        identity.as_ref().map(|e| &e.0.identity_kind),
-        Some(IdentityKind::Operator { .. })
-    );
-    if !is_operator {
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    if !is_operator(identity_ref) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -140,21 +175,20 @@ pub(crate) async fn dashboard_summary_handler(
         Ok(events) => events.len(),
         Err(_) => 0,
     };
-    // Use the system tenant explicitly: this is a deliberately
-    // cross-tenant aggregation for operator dashboards, NOT a fallback
-    // for a missing caller tenant. Per ADR-097 the only legitimate use
-    // of `TenantId::system()` is for system-initiated operations like
-    // this one.
-    let system_tenant = TenantId::system();
+    // Cross-tenant aggregation via the unscoped repo methods (ADR-097).
+    // The previous `find_recent_for_tenant(&TenantId::system())` /
+    // `list_paginated_for_tenant(&TenantId::system())` only returned the
+    // system tenant's rows — never aggregated platform-wide data — and
+    // therefore reported false counts to operator dashboards.
     let recent_execution_count = state
         .execution_repo
-        .find_recent_for_tenant(&system_tenant, 25)
+        .list_recent_all_paginated(25, 0)
         .await
         .map(|items| items.len())
         .unwrap_or_default();
     let recent_workflow_execution_count = state
         .workflow_execution_repo
-        .list_paginated_for_tenant(&system_tenant, 25, 0)
+        .list_paginated_all(25, 0)
         .await
         .map(|items| items.len())
         .unwrap_or_default();

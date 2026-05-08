@@ -83,6 +83,9 @@ impl EdgeDaemonRepository for StubEdgeRepo {
             .cloned()
             .collect())
     }
+    async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+        Ok(self.edges.lock().await.values().cloned().collect())
+    }
     async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
         if let Some(e) = self.edges.lock().await.get_mut(node_id) {
             e.status = status;

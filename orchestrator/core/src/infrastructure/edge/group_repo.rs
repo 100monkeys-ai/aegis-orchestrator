@@ -118,6 +118,14 @@ impl EdgeGroupRepository for PgEdgeGroupRepository {
         rows.iter().map(row_to_group).collect()
     }
 
+    async fn list_all(&self) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
+        let rows = sqlx::query("SELECT * FROM edge_groups")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| EdgeGroupRepoError::Other(e.into()))?;
+        rows.iter().map(row_to_group).collect()
+    }
+
     async fn update(&self, group: &EdgeGroup) -> Result<(), EdgeGroupRepoError> {
         let selector_json = serde_json::to_value(&group.selector)
             .map_err(|e| EdgeGroupRepoError::Other(e.into()))?;

@@ -82,6 +82,18 @@ impl ManageGroupsService {
         Ok(self.repo.list_by_tenant(tenant).await?)
     }
 
+    /// Cross-tenant list of every edge group. Operator-only (ADR-097) —
+    /// callers MUST verify operator privilege before invoking. Each group
+    /// carries its own `tenant_id`.
+    pub async fn list_all_unscoped(&self) -> Result<Vec<EdgeGroup>, ManageGroupError> {
+        Ok(self.repo.list_all().await?)
+    }
+
+    /// Cross-tenant fetch of a group by id. Operator-only (ADR-097).
+    pub async fn get_unscoped(&self, id: EdgeGroupId) -> Result<EdgeGroup, ManageGroupError> {
+        self.repo.get(&id).await?.ok_or(ManageGroupError::NotFound)
+    }
+
     pub async fn update(
         &self,
         tenant: &TenantId,

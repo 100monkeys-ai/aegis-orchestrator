@@ -21,7 +21,7 @@ use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
 use crate::daemon::state::AppState;
 
 #[derive(serde::Deserialize, Default)]
@@ -183,9 +183,21 @@ pub(crate) async fn list_workflows_handler(
     axum::extract::Query(query): axum::extract::Query<ListWorkflowsQuery>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:list")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let identity_ref = identity.as_ref().map(|identity| &identity.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
 
-    let workflows = if query.scope.as_deref() == Some("global") {
+    // Operator cross-tenant aggregation (ADR-097): when caller is an operator
+    // and no explicit scope filter is supplied, return every workflow across
+    // every tenant — each carries its own `tenant_id` in the projection.
+    let workflows = if is_operator(identity_ref) && query.scope.as_deref() != Some("global") {
+        match state.workflow_repo.list_all().await {
+            Ok(workflows) => workflows,
+            Err(err) => {
+                warn!("Failed to list all workflows (operator path): {}", err);
+                Vec::new()
+            }
+        }
+    } else if query.scope.as_deref() == Some("global") {
         match state.workflow_repo.list_global().await {
             Ok(workflows) => workflows,
             Err(err) => {
@@ -274,13 +286,25 @@ pub(crate) async fn get_workflow_handler(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:read")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let identity_ref = identity.as_ref().map(|identity| &identity.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
 
-    match state
-        .workflow_repo
-        .find_by_name_visible(&tenant_id, &name)
-        .await
-    {
+    // Operator cross-tenant fetch (ADR-097): scan `list_all` and find the
+    // first workflow whose name matches. A `find_by_name_unscoped` repo
+    // method can replace this in a follow-up if perf demands it.
+    let workflow_lookup = if is_operator(identity_ref) {
+        match state.workflow_repo.list_all().await {
+            Ok(workflows) => Ok(workflows.into_iter().find(|w| w.metadata.name == name)),
+            Err(e) => Err(e),
+        }
+    } else {
+        state
+            .workflow_repo
+            .find_by_name_visible(&tenant_id, &name)
+            .await
+    };
+
+    match workflow_lookup {
         Ok(Some(workflow)) => {
             let manifest_yaml = match WorkflowParser::to_yaml(&workflow) {
                 Ok(yaml) => yaml,

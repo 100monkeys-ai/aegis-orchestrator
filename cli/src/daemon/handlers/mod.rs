@@ -122,6 +122,21 @@ pub(crate) fn tenant_id_from_request(
     resolve_effective_tenant(identity, delegation_tenant_id)
 }
 
+/// Returns true iff the authenticated identity is an `IdentityKind::Operator`.
+///
+/// Cross-tenant aggregation MUST only be reachable to operators. Non-operator
+/// identities (`TenantUser`, `ConsumerUser`, `ServiceAccount`) and missing
+/// identities MUST get `false` so handlers fall through to their tenant-scoped
+/// path. Service accounts are deliberately NOT treated as operators here —
+/// they have their own tenant-delegation path (ADR-100); cross-tenant *reads*
+/// require explicit operator privilege.
+pub(crate) fn is_operator(identity: Option<&UserIdentity>) -> bool {
+    matches!(
+        identity.map(|i| &i.identity_kind),
+        Some(IdentityKind::Operator { .. })
+    )
+}
+
 /// Read the `TenantId` resolved by the `tenant_context_middleware` (ADR-056 /
 /// ADR-111) out of the request's extensions.
 ///
@@ -147,7 +162,17 @@ pub(crate) fn bounded_limit(limit: Option<usize>, default: usize, maximum: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_orchestrator_core::domain::iam::ZaruTier;
+    use aegis_orchestrator_core::domain::iam::{AegisRole, ZaruTier};
+
+    fn operator_identity(role: AegisRole) -> UserIdentity {
+        UserIdentity {
+            sub: "op-1".into(),
+            realm_slug: "aegis-system".into(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::Operator { aegis_role: role },
+        }
+    }
 
     fn service_account_identity() -> UserIdentity {
         UserIdentity {
@@ -229,5 +254,42 @@ mod tests {
         // Unauthenticated caller: header is meaningless, return default tenant.
         let result = tenant_id_from_request(None, Some("u-abc"));
         assert_eq!(result, TenantId::default());
+    }
+
+    // is_operator helper regression tests.
+
+    #[test]
+    fn is_operator_true_for_operator_identity() {
+        for role in [AegisRole::Admin, AegisRole::Operator, AegisRole::Readonly] {
+            let id = operator_identity(role);
+            assert!(is_operator(Some(&id)));
+        }
+    }
+
+    #[test]
+    fn is_operator_false_for_consumer_user() {
+        let id = consumer_user_identity();
+        assert!(!is_operator(Some(&id)));
+    }
+
+    #[test]
+    fn is_operator_false_for_tenant_user() {
+        let id = tenant_user_identity("acme");
+        assert!(!is_operator(Some(&id)));
+    }
+
+    #[test]
+    fn is_operator_false_for_service_account() {
+        // Deliberate: service accounts are not operators. ADR-100 governs
+        // service-account tenant delegation; cross-tenant reads still
+        // require explicit operator privilege.
+        let id = service_account_identity();
+        assert!(!is_operator(Some(&id)));
+    }
+
+    #[test]
+    fn is_operator_false_for_missing_identity() {
+        // Fail-closed: unauthenticated callers are never operators.
+        assert!(!is_operator(None));
     }
 }

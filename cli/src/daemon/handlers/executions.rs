@@ -17,7 +17,7 @@ use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
 use crate::daemon::state::AppState;
 
 pub(crate) use crate::daemon::handlers::DEFAULT_MAX_EXECUTION_LIST_LIMIT;
@@ -39,18 +39,34 @@ pub(crate) async fn get_execution_handler(
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("execution:read")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    match state
-        .execution_service
-        .get_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
-        .await
-    {
+    let identity_ref = identity.as_ref().map(|identity| &identity.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
+    let exec_result = if is_operator(identity_ref) {
+        // Operator cross-tenant fetch (ADR-097). Each Execution carries its
+        // own `tenant_id` for the projection.
+        match state
+            .execution_repo
+            .find_by_id_unscoped(ExecutionId(execution_id))
+            .await
+        {
+            Ok(Some(e)) => Ok(e),
+            Ok(None) => Err(anyhow::anyhow!("Execution not found")),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    } else {
+        state
+            .execution_service
+            .get_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
+            .await
+    };
+    match exec_result {
         Ok(exec) => Ok((
             StatusCode::OK,
             axum::Json(serde_json::json!({
                 "id": exec.id.0,
                 "agent_id": exec.agent_id.0,
                 "status": format!("{:?}", exec.status),
+                "tenant_id": exec.tenant_id.as_str(),
             })),
         )),
         // Audit 002 §4.37.6 — collapse not-found / not-visible to 404 instead
@@ -184,7 +200,8 @@ pub(crate) async fn list_executions_handler(
         .unwrap_or(DEFAULT_MAX_EXECUTION_LIST_LIMIT);
 
     let limit = query.limit.unwrap_or(20).min(max_limit);
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let identity_ref = identity.as_ref().map(|identity| &identity.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
 
     // Resolve workflow_name to a WorkflowId if provided
     let workflow_id = if let Some(ref wf_name) = query.workflow_name {
@@ -207,11 +224,25 @@ pub(crate) async fn list_executions_handler(
         None
     };
 
-    match state
-        .execution_service
-        .list_executions_for_tenant(&tenant_id, agent_id, workflow_id, limit)
-        .await
-    {
+    // Operator cross-tenant aggregation (ADR-097). When agent/workflow
+    // filters are present, fall through to the tenant-scoped path —
+    // operators wanting to filter cross-tenant by agent/workflow can use
+    // the future `?tenant=<slug>` pivot.
+    let executions_result =
+        if is_operator(identity_ref) && agent_id.is_none() && workflow_id.is_none() {
+            state
+                .execution_repo
+                .list_recent_all_paginated(limit, 0)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        } else {
+            state
+                .execution_service
+                .list_executions_for_tenant(&tenant_id, agent_id, workflow_id, limit)
+                .await
+        };
+
+    match executions_result {
         Ok(executions) => {
             let json_executions: Vec<serde_json::Value> = executions
                 .into_iter()
@@ -221,7 +252,8 @@ pub(crate) async fn list_executions_handler(
                         "agent_id": exec.agent_id.0,
                         "status": format!("{:?}", exec.status),
                         "started_at": exec.started_at,
-                        "ended_at": exec.ended_at
+                        "ended_at": exec.ended_at,
+                        "tenant_id": exec.tenant_id.as_str(),
                     })
                 })
                 .collect();

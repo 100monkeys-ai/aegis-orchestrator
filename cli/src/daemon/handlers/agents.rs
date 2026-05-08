@@ -22,7 +22,7 @@ use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::{
-    tenant_id_from_identity, tenant_id_from_request, TENANT_DELEGATION_HEADER,
+    is_operator, tenant_id_from_identity, tenant_id_from_request, TENANT_DELEGATION_HEADER,
 };
 use crate::daemon::state::AppState;
 
@@ -241,9 +241,17 @@ pub(crate) async fn list_agents_handler(
     let delegation = headers
         .get(TENANT_DELEGATION_HEADER)
         .and_then(|v| v.to_str().ok());
-    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_request(identity_ref, delegation);
 
-    let list_result = if query.scope.as_deref() == Some("global") {
+    // Operator cross-tenant aggregation (ADR-097): when the caller is an
+    // operator and no explicit `?scope=global` filter is supplied, return
+    // every agent across every tenant — each carries its own `tenant_id`
+    // in the projection below. Future `?tenant=<slug>` pivot composes
+    // cleanly onto the tenant-scoped branch.
+    let list_result = if is_operator(identity_ref) && query.scope.as_deref() != Some("global") {
+        state.agent_service.list_all_agents().await
+    } else if query.scope.as_deref() == Some("global") {
         state
             .agent_service
             .list_agents_for_tenant(&TenantId::system())
@@ -423,12 +431,23 @@ pub(crate) async fn get_agent_handler(
     let delegation = headers
         .get(TENANT_DELEGATION_HEADER)
         .and_then(|v| v.to_str().ok());
-    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
-    match state
-        .agent_service
-        .get_agent_visible(&tenant_id, AgentId(id))
-        .await
-    {
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let tenant_id = tenant_id_from_request(identity_ref, delegation);
+    let agent_result = if is_operator(identity_ref) {
+        // Operator cross-tenant fetch (ADR-097). Returns the agent regardless
+        // of which tenant owns it; projection includes `tenant_id`.
+        match state.agent_service.find_by_id_unscoped(AgentId(id)).await {
+            Ok(Some(a)) => Ok(a),
+            Ok(None) => Err(anyhow::anyhow!("Agent not found")),
+            Err(e) => Err(e),
+        }
+    } else {
+        state
+            .agent_service
+            .get_agent_visible(&tenant_id, AgentId(id))
+            .await
+    };
+    match agent_result {
         Ok(agent) => {
             let manifest_yaml = serde_yaml::to_string(&agent.manifest).unwrap_or_default();
             let mut response = serde_json::json!({

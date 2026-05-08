@@ -312,6 +312,13 @@ mod tests {
         ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
             Ok(vec![])
         }
+        async fn list_paginated_all(
+            &self,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            Ok(vec![])
+        }
         async fn count_by_workflow_for_tenant(
             &self,
             _tenant_id: &TenantId,

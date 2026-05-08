@@ -667,6 +667,17 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
         Ok(vec![])
     }
 
+    async fn list_paginated_all(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<
+        Vec<crate::domain::workflow::WorkflowExecution>,
+        crate::domain::repository::RepositoryError,
+    > {
+        Ok(vec![])
+    }
+
     async fn update_temporal_linkage_for_tenant(
         &self,
         _tenant_id: &TenantId,

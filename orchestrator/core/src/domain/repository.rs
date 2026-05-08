@@ -186,6 +186,18 @@ pub trait ExecutionRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Execution>, RepositoryError>;
 
+    /// List recent executions across every tenant, newest first.
+    ///
+    /// Used by `list_executions_handler` and `dashboard_summary_handler`
+    /// when the caller is an operator (cross-tenant aggregation, ADR-097).
+    /// Each returned [`Execution`] carries its own `tenant_id`; callers
+    /// MUST surface it in user-facing responses.
+    async fn list_recent_all_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Execution>, RepositoryError>;
+
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -369,6 +381,17 @@ pub trait WorkflowExecutionRepository: Send + Sync {
     async fn list_paginated_for_tenant(
         &self,
         tenant_id: &TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
+
+    /// List workflow executions across every tenant, newest first.
+    ///
+    /// Operator-only cross-tenant aggregation path (ADR-097). Each returned
+    /// [`WorkflowExecution`] carries its own `tenant_id`; callers MUST
+    /// surface it in user-facing responses.
+    async fn list_paginated_all(
+        &self,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;

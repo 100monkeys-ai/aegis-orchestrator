@@ -127,6 +127,19 @@ impl EdgeDaemonRepository for PgEdgeDaemonRepository {
         rows.iter().map(row_to_edge).collect()
     }
 
+    async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT node_id, tenant_id, public_key, capabilities_json, tags, status,
+                   enrolled_at, last_heartbeat_at, display_name
+            FROM edge_daemons
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_edge).collect()
+    }
+
     async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
         sqlx::query("UPDATE edge_daemons SET status = $1 WHERE node_id = $2")
             .bind(status_to_str(status))

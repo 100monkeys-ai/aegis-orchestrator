@@ -252,6 +252,10 @@ pub trait EdgeDaemonRepository: Send + Sync {
     async fn upsert(&self, edge: &EdgeDaemon) -> anyhow::Result<()>;
     async fn get(&self, node_id: &NodeId) -> anyhow::Result<Option<EdgeDaemon>>;
     async fn list_by_tenant(&self, tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>>;
+    /// List every edge daemon across every tenant. Operator-only
+    /// cross-tenant aggregation path (ADR-097). Each returned [`EdgeDaemon`]
+    /// carries its own `tenant_id`; callers MUST surface it.
+    async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>>;
     async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()>;
     /// Atomically stamp `last_heartbeat_at = NOW()` and force `status = active`
     /// for `node_id`. Called from the bidi `ConnectEdge` stream every time the
@@ -313,6 +317,9 @@ pub trait EdgeGroupRepository: Send + Sync {
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError>;
+    /// List every edge group across every tenant. Operator-only
+    /// cross-tenant aggregation path (ADR-097).
+    async fn list_all(&self) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError>;
     async fn update(&self, group: &EdgeGroup) -> Result<(), EdgeGroupRepoError>;
     async fn delete(&self, id: &EdgeGroupId) -> Result<(), EdgeGroupRepoError>;
 }
