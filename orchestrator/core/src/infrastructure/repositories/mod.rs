@@ -76,7 +76,7 @@ use crate::domain::agent::{Agent, AgentId, AgentScope};
 use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::repository::{
     AgentRepository, ExecutionRepository, RepositoryError, StorageEventRepository,
-    WorkflowExecutionRepository, WorkflowRepository,
+    WorkflowRepository,
 };
 use crate::domain::tenant::TenantId;
 use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};

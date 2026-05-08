@@ -388,8 +388,9 @@ pub trait WorkflowExecutionRepository: Send + Sync {
     /// List workflow executions across every tenant, newest first.
     ///
     /// Operator-only cross-tenant aggregation path (ADR-097). Each returned
-    /// [`WorkflowExecution`] carries its own `tenant_id`; callers MUST
-    /// surface it in user-facing responses.
+    /// [`WorkflowExecution`](crate::domain::workflow::WorkflowExecution)
+    /// carries its own `tenant_id`; callers MUST surface it in user-facing
+    /// responses.
     async fn list_paginated_all(
         &self,
         limit: usize,
