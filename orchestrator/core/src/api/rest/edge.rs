@@ -344,9 +344,6 @@ fn map_tags_err(e: crate::application::edge::manage_tags::ManageTagsError) -> Ap
     use crate::application::edge::manage_tags::ManageTagsError;
     match e {
         ManageTagsError::NotFound => ApiError::not_found("edge"),
-        ManageTagsError::Forbidden => {
-            ApiError::new(StatusCode::FORBIDDEN, "forbidden", "cross-tenant refused")
-        }
         ManageTagsError::Repo(msg) => ApiError::internal(msg),
     }
 }
@@ -355,9 +352,6 @@ fn map_revoke_err(e: crate::application::edge::revoke_edge::RevokeEdgeError) -> 
     use crate::application::edge::revoke_edge::RevokeEdgeError;
     match e {
         RevokeEdgeError::NotFound => ApiError::not_found("edge"),
-        RevokeEdgeError::Forbidden => {
-            ApiError::new(StatusCode::FORBIDDEN, "forbidden", "cross-tenant refused")
-        }
         RevokeEdgeError::Repo(msg) => ApiError::internal(msg),
     }
 }
@@ -1469,6 +1463,63 @@ mod tests {
             "revoked host MUST disappear from GET /v1/edge/hosts \
              (got {arr:?}) — Zaru's UI relies on the row being absent, \
              not on a status string"
+        );
+    }
+
+    /// Regression: cross-tenant tag mutation via PATCH MUST 404 without
+    /// mutating the foreign tenant's tags. Returning 403 leaks resource
+    /// existence to the wrong tenant — see ADR-083 §4.5–§4.8 and
+    /// security audit 002 findings 4.33 / 4.37.7. Sibling fence to the
+    /// DELETE-cross-tenant regression below.
+    #[tokio::test]
+    async fn tags_cross_tenant_returns_404_and_keeps_state() {
+        let tenant_a = TenantId::new("t-a").unwrap();
+        let nid = NodeId::new();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let mut seeded = seed_edge(nid, &tenant_a, "a-laptop");
+        seeded.capabilities.tags = vec!["prod".to_string()];
+        repo.seed(seeded).await;
+        let app = router_with_repo(repo.clone());
+
+        // Cross-tenant `add_tags` via PATCH MUST 404.
+        let req = HttpRequest::builder()
+            .method("PATCH")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-b")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"add_tags":["hostile"]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "cross-tenant add_tags must 404, not 403 — 403 leaks existence"
+        );
+        assert_eq!(
+            repo.get(&nid).await.unwrap().unwrap().capabilities.tags,
+            vec!["prod".to_string()],
+            "cross-tenant add_tags MUST NOT mutate the foreign tenant's tags"
+        );
+
+        // Cross-tenant `remove_tags` via PATCH MUST 404 too.
+        let app = router_with_repo(repo.clone());
+        let req = HttpRequest::builder()
+            .method("PATCH")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-b")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"remove_tags":["prod"]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "cross-tenant remove_tags must 404, not 403"
+        );
+        assert_eq!(
+            repo.get(&nid).await.unwrap().unwrap().capabilities.tags,
+            vec!["prod".to_string()],
+            "cross-tenant remove_tags MUST NOT mutate the foreign tenant's tags"
         );
     }
 

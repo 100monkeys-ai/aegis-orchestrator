@@ -11,8 +11,6 @@ use crate::domain::shared_kernel::{NodeId, TenantId};
 pub enum ManageTagsError {
     #[error("edge daemon not found")]
     NotFound,
-    #[error("cross-tenant tag mutation refused")]
-    Forbidden,
     #[error("repository error: {0}")]
     Repo(String),
 }
@@ -39,7 +37,12 @@ impl ManageTagsService {
             .map_err(|e| ManageTagsError::Repo(e.to_string()))?
             .ok_or(ManageTagsError::NotFound)?;
         if &edge.tenant_id != tenant {
-            return Err(ManageTagsError::Forbidden);
+            // Tenant isolation: cross-tenant tag mutation MUST surface
+            // as `NotFound` (HTTP 404) so the foreign tenant cannot
+            // probe for the existence of another tenant's host. See
+            // ADR-083 §4.5–§4.8 and security audit 002 findings
+            // 4.33 / 4.37.7.
+            return Err(ManageTagsError::NotFound);
         }
         let mut current = edge.capabilities.tags;
         for t in tags {
@@ -67,7 +70,9 @@ impl ManageTagsService {
             .map_err(|e| ManageTagsError::Repo(e.to_string()))?
             .ok_or(ManageTagsError::NotFound)?;
         if &edge.tenant_id != tenant {
-            return Err(ManageTagsError::Forbidden);
+            // Tenant isolation: see `add_tags` above — cross-tenant
+            // mutation MUST 404, never 403.
+            return Err(ManageTagsError::NotFound);
         }
         let current: Vec<String> = edge
             .capabilities

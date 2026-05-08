@@ -12,8 +12,6 @@ use crate::infrastructure::edge::EdgeConnectionRegistry;
 pub enum RevokeEdgeError {
     #[error("edge daemon not found")]
     NotFound,
-    #[error("cross-tenant revoke refused")]
-    Forbidden,
     #[error("repository error: {0}")]
     Repo(String),
 }
@@ -63,7 +61,13 @@ impl RevokeEdgeService {
             .map_err(|e| RevokeEdgeError::Repo(e.to_string()))?
             .ok_or(RevokeEdgeError::NotFound)?;
         if &edge.tenant_id != tenant {
-            return Err(RevokeEdgeError::Forbidden);
+            // Tenant isolation: a cross-tenant revoke MUST surface as
+            // `NotFound` (mapped to HTTP 404) so the foreign tenant
+            // cannot probe for the existence of another tenant's host.
+            // See ADR-083 §4.5–§4.8 and security audit 002 findings
+            // 4.33 / 4.37.7. The PATCH path on the same resource enforces
+            // the same contract via an inline tenant gate.
+            return Err(RevokeEdgeError::NotFound);
         }
         self.edge_repo
             .delete(&node_id)
@@ -260,11 +264,13 @@ mod tests {
         );
     }
 
-    /// Regression: cross-tenant revoke MUST 404 (mapped to NotFound by
-    /// the caller) without mutating the foreign tenant's row. Same
-    /// tenant-isolation contract as PATCH.
+    /// Regression: cross-tenant revoke MUST surface as `NotFound`
+    /// (HTTP 404) without mutating the foreign tenant's row. Returning
+    /// `Forbidden` (HTTP 403) leaks resource existence to the wrong
+    /// tenant — see ADR-083 §4.5–§4.8 and security audit 002 findings
+    /// 4.33 / 4.37.7. Same tenant-isolation contract as PATCH.
     #[tokio::test]
-    async fn revoke_cross_tenant_returns_forbidden_and_keeps_row() {
+    async fn revoke_cross_tenant_returns_not_found_and_keeps_row() {
         let tenant_a = TenantId::new("t-a").unwrap();
         let tenant_b = TenantId::new("t-b").unwrap();
         let nid = NodeId::new();
@@ -276,7 +282,7 @@ mod tests {
             .revoke(&tenant_b, nid)
             .await
             .expect_err("cross-tenant revoke must fail");
-        assert_eq!(err, RevokeEdgeError::Forbidden);
+        assert_eq!(err, RevokeEdgeError::NotFound);
         assert!(
             repo.get(&nid).await.unwrap().is_some(),
             "cross-tenant revoke MUST NOT delete the foreign tenant's row"

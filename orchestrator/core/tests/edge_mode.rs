@@ -177,8 +177,9 @@ async fn cross_tenant_revoke_refused() {
     repo.upsert(&edge).await.unwrap();
     let r = svc.revoke(&tenant_b, id).await;
     assert!(
-        matches!(r, Err(RevokeEdgeError::Forbidden)),
-        "expected cross-tenant revoke to fail with Forbidden, got {r:?}"
+        matches!(r, Err(RevokeEdgeError::NotFound)),
+        "expected cross-tenant revoke to fail with NotFound (HTTP 404), \
+         got {r:?} — see ADR-083 §4.5–§4.8 / audit 002 findings 4.33/4.37.7"
     );
 
     // Side-effect check: re-fetch the edge and assert it's still Active
@@ -204,11 +205,13 @@ async fn cross_tenant_tag_mutation_refused() {
     let id = edge.node_id;
     repo.upsert(&edge).await.unwrap();
 
-    // add_tags from foreign tenant must fail with Forbidden.
+    // add_tags from foreign tenant must surface as NotFound (HTTP 404),
+    // not Forbidden (HTTP 403): the latter would leak resource existence
+    // to the wrong tenant. See ADR-083 §4.5–§4.8 / audit 002 4.33/4.37.7.
     let r = svc.add_tags(&tenant_b, id, vec!["prod".into()]).await;
     assert!(
-        matches!(r, Err(ManageTagsError::Forbidden)),
-        "expected cross-tenant add_tags to fail with Forbidden, got {r:?}"
+        matches!(r, Err(ManageTagsError::NotFound)),
+        "expected cross-tenant add_tags to fail with NotFound, got {r:?}"
     );
 
     // Side-effect check: tags unchanged.
@@ -225,8 +228,8 @@ async fn cross_tenant_tag_mutation_refused() {
         .unwrap();
     let r = svc.remove_tags(&tenant_b, id, vec!["prod".into()]).await;
     assert!(
-        matches!(r, Err(ManageTagsError::Forbidden)),
-        "expected cross-tenant remove_tags to fail with Forbidden, got {r:?}"
+        matches!(r, Err(ManageTagsError::NotFound)),
+        "expected cross-tenant remove_tags to fail with NotFound, got {r:?}"
     );
 
     // Side-effect check: tags still contain "prod".
