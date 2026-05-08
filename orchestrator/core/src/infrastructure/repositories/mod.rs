@@ -1470,6 +1470,12 @@ impl crate::domain::repository::VolumeRepository for InMemoryVolumeRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Bring the trait into scope so trait methods (`save_for_tenant`,
+    // `list_paginated_all`, etc.) can be invoked on the in-memory repo
+    // structs in test bodies. The trait is only needed in test code; the
+    // production `impl` blocks live in sibling files where the trait is
+    // imported directly.
+    use crate::domain::repository::WorkflowExecutionRepository;
 
     #[tokio::test]
     async fn test_in_memory_agent_repository_basic() {
