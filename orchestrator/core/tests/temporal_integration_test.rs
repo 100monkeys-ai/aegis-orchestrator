@@ -443,6 +443,14 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
+
+    async fn list_paginated_all(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
 }
 
 struct FailingWorkflowExecRepo;
@@ -537,6 +545,14 @@ impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
     async fn list_paginated_for_tenant(
         &self,
         _tenant_id: &TenantId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn list_paginated_all(
+        &self,
         _limit: usize,
         _offset: usize,
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
