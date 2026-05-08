@@ -248,8 +248,11 @@ async fn invoke_agent_handler(
         .find(|a| a.name == agent_id_str || a.id.0.to_string() == agent_id_str)
         .ok_or_else(|| anyhow!("Output handler agent '{}' not found", agent_id_str))?;
 
-    // Build the execution input.
-    let input_value = if let Some(template) = input_template {
+    // Build the execution input. The synthetic payload must include `tenant_id`
+    // because `StandardExecutionService::resolve_tenant_from_payload` requires it,
+    // and the rendered prompt text is routed through `workflow_input` so
+    // `extract_user_input` returns it as a `Value::String` for `{{input}}` rendering.
+    let rendered_input = if let Some(template) = input_template {
         // Render the Handlebars template against `{ "output": final_output, "intent": ... }`.
         let mut hb = handlebars::Handlebars::new();
         hb.set_strict_mode(false);
@@ -257,13 +260,16 @@ async fn invoke_agent_handler(
             "output": final_output,
             "intent": intent.unwrap_or(""),
         });
-        let rendered = hb
-            .render_template(template, &ctx)
-            .unwrap_or_else(|_| final_output.to_string());
-        serde_json::Value::String(rendered)
+        hb.render_template(template, &ctx)
+            .unwrap_or_else(|_| final_output.to_string())
     } else {
-        serde_json::Value::String(final_output.to_string())
+        final_output.to_string()
     };
+
+    let input_value = serde_json::json!({
+        "tenant_id": tenant_id.to_string(),
+        "workflow_input": rendered_input,
+    });
 
     let exec_input = ExecutionInput {
         intent: None,
@@ -386,4 +392,397 @@ async fn invoke_webhook_handler(
     } else {
         Some(response_body)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the synthetic execution payload built by `invoke_agent_handler`.
+    //!
+    //! These tests exist to lock in the regression fix for the output handler bug
+    //! where `StandardExecutionService::resolve_tenant_from_payload` rejected the
+    //! synthetic input because the payload was a bare JSON string with no
+    //! `tenant_id` field. The current contract is that the synthetic payload is a
+    //! JSON object containing `tenant_id` (so tenant resolution succeeds) and
+    //! `workflow_input` (so the formatter agent receives the rendered prompt
+    //! through the same channel as workflow-driven executions).
+    use super::*;
+    use crate::application::agent::AgentLifecycleService;
+    use crate::domain::agent::{
+        Agent, AgentId, AgentManifest, AgentSpec, AgentStatus, ImagePullPolicy, ManifestMetadata,
+        RuntimeConfig, TaskConfig,
+    };
+    use crate::domain::execution::{Execution, ExecutionStatus, Iteration, IterationStatus};
+    use crate::domain::shared_kernel::TenantId;
+    use crate::infrastructure::event_bus::DomainEvent;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    fn test_agent(name: &str) -> Agent {
+        let manifest = AgentManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "Agent".to_string(),
+            metadata: ManifestMetadata {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                labels: std::collections::HashMap::new(),
+                annotations: std::collections::HashMap::new(),
+            },
+            spec: AgentSpec {
+                runtime: RuntimeConfig {
+                    language: Some("python".to_string()),
+                    version: Some("3.11".to_string()),
+                    image: None,
+                    image_pull_policy: ImagePullPolicy::IfNotPresent,
+                    isolation: "inherit".to_string(),
+                    model: "default".to_string(),
+                    temperature: None,
+                },
+                task: Some(TaskConfig {
+                    instruction: Some("noop".to_string()),
+                    prompt_template: None,
+                    input_data: None,
+                }),
+                context: vec![],
+                execution: None,
+                security: None,
+                schedule: None,
+                tools: vec![],
+                env: std::collections::HashMap::new(),
+                volumes: vec![],
+                advanced: None,
+                input_schema: None,
+                security_context: None,
+                output_handler: None,
+            },
+        };
+        let now = Utc::now();
+        Agent {
+            id: AgentId::new(),
+            tenant_id: TenantId::default(),
+            scope: crate::domain::agent::AgentScope::default(),
+            name: name.to_string(),
+            manifest,
+            status: AgentStatus::Active,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Lifecycle service that returns a single test agent matching `agent_name`.
+    struct OneAgentLifecycle {
+        agent: Agent,
+    }
+
+    #[async_trait]
+    impl AgentLifecycleService for OneAgentLifecycle {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _manifest: AgentManifest,
+            _force: bool,
+            _scope: crate::domain::agent::AgentScope,
+            _caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        ) -> Result<AgentId> {
+            unimplemented!("not exercised")
+        }
+        async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, _id: AgentId) -> Result<Agent> {
+            unimplemented!("not exercised")
+        }
+        async fn update_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: AgentId,
+            _manifest: AgentManifest,
+        ) -> Result<()> {
+            unimplemented!("not exercised")
+        }
+        async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, _id: AgentId) -> Result<()> {
+            unimplemented!("not exercised")
+        }
+        async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
+            Ok(vec![self.agent.clone()])
+        }
+        async fn list_agents_visible_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> Result<Vec<Agent>> {
+            Ok(vec![self.agent.clone()])
+        }
+        async fn lookup_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _name: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(Some(self.agent.id))
+        }
+        async fn lookup_agent_visible_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _name: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(Some(self.agent.id))
+        }
+        async fn list_versions_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _agent_id: AgentId,
+        ) -> Result<Vec<crate::domain::repository::AgentVersion>> {
+            Ok(vec![])
+        }
+        async fn lookup_agent_for_tenant_with_version(
+            &self,
+            _tenant_id: &TenantId,
+            _name: &str,
+            _version: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(Some(self.agent.id))
+        }
+    }
+
+    /// Captures the `ExecutionInput` passed to `start_execution` /
+    /// `start_child_execution`, then reports the spawned execution as
+    /// `Completed` so the polling loop in `invoke_agent_handler` exits
+    /// immediately.
+    struct CapturingExecutionService {
+        captured: Mutex<Vec<ExecutionInput>>,
+        exec_id: ExecutionId,
+        tenant_id: TenantId,
+        agent_id: Mutex<Option<AgentId>>,
+    }
+
+    impl CapturingExecutionService {
+        fn new(tenant_id: TenantId) -> Self {
+            Self {
+                captured: Mutex::new(Vec::new()),
+                exec_id: ExecutionId::new(),
+                tenant_id,
+                agent_id: Mutex::new(None),
+            }
+        }
+
+        fn captured_inputs(&self) -> Vec<ExecutionInput> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionService for CapturingExecutionService {
+        async fn start_execution(
+            &self,
+            agent_id: AgentId,
+            input: ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
+        ) -> Result<ExecutionId> {
+            *self.agent_id.lock().unwrap() = Some(agent_id);
+            self.captured.lock().unwrap().push(input);
+            Ok(self.exec_id)
+        }
+
+        async fn start_execution_with_id(
+            &self,
+            execution_id: ExecutionId,
+            agent_id: AgentId,
+            input: ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
+        ) -> Result<ExecutionId> {
+            *self.agent_id.lock().unwrap() = Some(agent_id);
+            self.captured.lock().unwrap().push(input);
+            Ok(execution_id)
+        }
+
+        async fn start_child_execution(
+            &self,
+            agent_id: AgentId,
+            input: ExecutionInput,
+            _parent_execution_id: ExecutionId,
+        ) -> Result<ExecutionId> {
+            *self.agent_id.lock().unwrap() = Some(agent_id);
+            self.captured.lock().unwrap().push(input);
+            Ok(self.exec_id)
+        }
+
+        async fn get_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: ExecutionId,
+        ) -> Result<Execution> {
+            let agent_id = self.agent_id.lock().unwrap().unwrap_or(AgentId::new());
+            let mut exec = Execution::new_with_id(
+                id,
+                agent_id,
+                ExecutionInput {
+                    intent: None,
+                    input: serde_json::Value::Null,
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                    attachments: Vec::new(),
+                },
+                1,
+                "aegis-system-operator".to_string(),
+            );
+            exec.tenant_id = self.tenant_id.clone();
+            exec.status = ExecutionStatus::Completed;
+            exec.iterations.push(Iteration {
+                number: 1,
+                status: IterationStatus::Success,
+                action: "format".to_string(),
+                output: Some("formatted-output".to_string()),
+                validation_results: None,
+                error: None,
+                code_changes: None,
+                started_at: Utc::now(),
+                ended_at: Some(Utc::now()),
+                llm_interactions: Vec::new(),
+                trajectory: None,
+                policy_violations: Vec::new(),
+            });
+            Ok(exec)
+        }
+
+        async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
+            self.get_execution_for_tenant(&self.tenant_id, id).await
+        }
+
+        async fn get_iterations_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _exec_id: ExecutionId,
+        ) -> Result<Vec<Iteration>> {
+            Ok(Vec::new())
+        }
+
+        async fn cancel_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            unimplemented!("not exercised")
+        }
+
+        async fn stream_execution(
+            &self,
+            _id: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<crate::domain::events::ExecutionEvent>> + Send>>>
+        {
+            unimplemented!("not exercised")
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _id: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            unimplemented!("not exercised")
+        }
+
+        async fn list_executions_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _agent_id: Option<AgentId>,
+            _workflow_id: Option<crate::domain::workflow::WorkflowId>,
+            _limit: usize,
+        ) -> Result<Vec<Execution>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            unimplemented!("not exercised")
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _interaction: crate::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression test for the bug where `OutputHandlerService::invoke_agent_handler`
+    /// produced an `ExecutionInput.input` of `Value::String(...)` with no
+    /// `tenant_id` field, causing `StandardExecutionService::start_execution` to
+    /// reject the synthetic payload with "Missing required tenant_id in
+    /// execution payload" and mark the parent workflow as Failed even though
+    /// the upstream EXECUTE_CODE state had succeeded (observed on workflow
+    /// execution f11d1b1e-7e38-4f99-977b-a0450e9e5a44).
+    ///
+    /// The fix wraps the rendered prompt in a JSON object carrying `tenant_id`
+    /// (so tenant resolution succeeds) and `workflow_input` (so
+    /// `extract_user_input` returns the prompt text verbatim for
+    /// `{{input}}` rendering).
+    #[tokio::test]
+    async fn invoke_agent_handler_embeds_tenant_id_and_workflow_input_in_synthetic_payload() {
+        let agent_name = "test-formatter";
+        let agent = test_agent(agent_name);
+        let lifecycle: Arc<dyn AgentLifecycleService> = Arc::new(OneAgentLifecycle { agent });
+        let tenant = TenantId::from_string("u-test-tenant-12345").expect("valid tenant");
+
+        let capturing = Arc::new(CapturingExecutionService::new(tenant.clone()));
+        let exec_svc: Arc<dyn ExecutionService> = capturing.clone();
+
+        let _ = invoke_agent_handler(
+            &exec_svc,
+            &lifecycle,
+            agent_name,
+            Some("Format this: {{output}} (intent: {{intent}})"),
+            "raw-final-output",
+            None,
+            Some(5),
+            Some("summarize"),
+            &tenant,
+        )
+        .await
+        .expect("invoke_agent_handler should succeed");
+
+        let inputs = capturing.captured_inputs();
+        assert_eq!(inputs.len(), 1, "exactly one execution should be started");
+        let captured = &inputs[0];
+
+        let payload = captured
+            .input
+            .as_object()
+            .expect("synthetic payload must be a JSON object, not a bare string");
+
+        let captured_tenant = payload
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .expect("synthetic payload must include tenant_id (regression)");
+        assert_eq!(
+            captured_tenant,
+            tenant.to_string(),
+            "tenant_id in synthetic payload must match the tenant passed into invoke_agent_handler"
+        );
+
+        let workflow_input = payload
+            .get("workflow_input")
+            .and_then(|v| v.as_str())
+            .expect("synthetic payload must include workflow_input carrying the rendered prompt");
+        assert_eq!(
+            workflow_input, "Format this: raw-final-output (intent: summarize)",
+            "workflow_input must contain the Handlebars-rendered prompt text"
+        );
+    }
 }
