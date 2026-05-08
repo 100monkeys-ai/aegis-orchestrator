@@ -1711,6 +1711,60 @@ mod tests {
         );
     }
 
+    /// REGRESSION: When the gRPC handler routes `ExecuteAgentRequest.input`
+    /// into `ExecutionInput.input` under the `workflow_input` key (per the
+    /// fix for the dropped-input bug — the validator state of the
+    /// builtin-intent-to-execution workflow lost its rendered "File:
+    /// /workspace/solution.py..." block because req.input was discarded),
+    /// the resulting string MUST flow verbatim into the rendered prompt
+    /// via `extract_user_input` (priority 1) and `PromptContext::input()`'s
+    /// `Value::String` pass-through branch.
+    #[test]
+    fn prepare_execution_input_routes_workflow_input_string_into_prompt() {
+        let service = make_test_service();
+        let mut agent = make_agent("validator-agent", None, None);
+        if let Some(task) = agent.manifest.spec.task.as_mut() {
+            task.instruction = Some("You validate code.".to_string());
+            task.prompt_template =
+                Some("{{instruction}}\n\n## Input context:\n{{input}}\n\nDONE".to_string());
+        }
+
+        let workflow_input =
+            "File: /workspace/solution.py\nRead /workspace/solution.py using fs.read and validate it.";
+
+        let input = ExecutionInput {
+            intent: Some("Validate /workspace/solution.py".to_string()),
+            input: serde_json::json!({
+                "context_overrides": {},
+                "tenant_id": "u-test",
+                "workflow_input": workflow_input,
+            }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+
+        let (_persisted, runtime) = service.prepare_execution_input(input, &agent).unwrap();
+        let rendered = runtime
+            .intent
+            .as_deref()
+            .expect("runtime intent carries rendered prompt");
+
+        assert!(
+            rendered.contains("File: /workspace/solution.py"),
+            "rendered prompt must contain the workflow_input string verbatim, got: {rendered}"
+        );
+        // And it must NOT have collapsed to a JSON dump that hides the path
+        // behind a `workflow_input` key — the Value::String pass-through is
+        // what makes `{{input}}` render as the raw text.
+        assert!(
+            !rendered.contains("\"workflow_input\""),
+            "rendered prompt must pass workflow_input through as a string, not JSON: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn cross_tenant_child_spawn_is_rejected() {
         let tenant_id = CoreTenantId::consumer();
