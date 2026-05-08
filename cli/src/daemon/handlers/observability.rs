@@ -10,11 +10,11 @@ use axum::response::IntoResponse;
 use axum::Json;
 use uuid::Uuid;
 
-use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
+use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 
 use crate::daemon::cluster_helpers::cluster_status_view;
-use crate::daemon::handlers::{bounded_limit, LimitQuery};
+use crate::daemon::handlers::{bounded_limit, is_operator, LimitQuery};
 use crate::daemon::state::AppState;
 
 use super::super::operator_read_models::{
@@ -114,11 +114,8 @@ pub(crate) async fn dashboard_summary_handler(
     identity: Option<Extension<UserIdentity>>,
 ) -> axum::response::Response {
     // Operator gate.
-    let is_operator = matches!(
-        identity.as_ref().map(|e| &e.0.identity_kind),
-        Some(IdentityKind::Operator { .. })
-    );
-    if !is_operator {
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    if !is_operator(identity_ref) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
