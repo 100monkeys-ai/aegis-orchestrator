@@ -673,6 +673,14 @@ mod tests {
         ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
             Ok(vec![])
         }
+
+        async fn list_paginated_all(
+            &self,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            Ok(vec![])
+        }
     }
 
     fn build_test_workflow(name: &str) -> Workflow {

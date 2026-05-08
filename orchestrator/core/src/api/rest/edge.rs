@@ -711,6 +711,9 @@ mod tests {
         async fn list_by_tenant(&self, _tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
             Ok(vec![])
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
         async fn update_status(
             &self,
             _node_id: &NodeId,
@@ -756,6 +759,9 @@ mod tests {
             &self,
             _tenant_id: &TenantId,
         ) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
+            Ok(vec![])
+        }
+        async fn list_all(&self) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
             Ok(vec![])
         }
         async fn update(&self, _group: &EdgeGroup) -> Result<(), EdgeGroupRepoError> {
@@ -1058,6 +1064,9 @@ mod tests {
                 .filter(|e| &e.tenant_id == tenant)
                 .cloned()
                 .collect())
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(self.edges.lock().await.values().cloned().collect())
         }
         async fn update_status(&self, id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
             if let Some(e) = self.edges.lock().await.get_mut(id) {

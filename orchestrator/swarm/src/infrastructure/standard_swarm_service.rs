@@ -601,6 +601,14 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn list_recent_all_paginated(
+            &self,
+            _limit: usize,
+            _offset: usize,
+        ) -> std::result::Result<Vec<Execution>, RepositoryError> {
+            Ok(Vec::new())
+        }
+
         async fn delete_for_tenant(
             &self,
             tenant_id: &TenantId,

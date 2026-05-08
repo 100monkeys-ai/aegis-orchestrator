@@ -573,6 +573,20 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         Ok(execution_list.into_iter().take(limit).collect())
     }
 
+    async fn list_recent_all_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let mut all: Vec<Execution> = executions
+            .values()
+            .flat_map(|tenant_execs| tenant_execs.values().cloned())
+            .collect();
+        all.sort_by_key(|e| Reverse(e.started_at));
+        Ok(all.into_iter().skip(offset).take(limit).collect())
+    }
+
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -1114,6 +1128,20 @@ impl crate::domain::repository::WorkflowExecutionRepository
         list.sort_by_key(|e| Reverse(e.started_at));
         Ok(list.into_iter().skip(offset).take(limit).collect())
     }
+
+    async fn list_paginated_all(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let mut list: Vec<crate::domain::workflow::WorkflowExecution> = executions
+            .values()
+            .flat_map(|tenant_execs| tenant_execs.values().cloned())
+            .collect();
+        list.sort_by_key(|e| Reverse(e.started_at));
+        Ok(list.into_iter().skip(offset).take(limit).collect())
+    }
 }
 
 // ============================================================================
@@ -1496,6 +1524,124 @@ mod tests {
         // Test deleting non-existent execution (should not error)
         let delete_result = repo.delete_for_tenant(&tenant, execution_id).await;
         assert!(delete_result.is_ok());
+    }
+
+    fn make_execution(tenant: &TenantId, started_secs: i64) -> Execution {
+        let mut exec = Execution::new(
+            AgentId::new(),
+            crate::domain::execution::ExecutionInput {
+                intent: Some("t".into()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            5,
+            "aegis-system-operator".into(),
+        );
+        exec.tenant_id = tenant.clone();
+        exec.started_at = chrono::DateTime::from_timestamp(started_secs, 0).unwrap();
+        exec
+    }
+
+    #[tokio::test]
+    async fn list_recent_all_paginated_returns_rows_from_multiple_tenants() {
+        let repo = InMemoryExecutionRepository::new();
+        let t_a = TenantId::new("t-a".to_string()).unwrap();
+        let t_b = TenantId::new("t-b".to_string()).unwrap();
+        let e_a = make_execution(&t_a, 1000);
+        let e_b = make_execution(&t_b, 2000);
+        repo.save_for_tenant(&t_a, &e_a).await.unwrap();
+        repo.save_for_tenant(&t_b, &e_b).await.unwrap();
+
+        let rows = repo.list_recent_all_paginated(100, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let tenants: Vec<_> = rows.iter().map(|e| e.tenant_id.clone()).collect();
+        assert!(tenants.contains(&t_a));
+        assert!(tenants.contains(&t_b));
+    }
+
+    #[tokio::test]
+    async fn list_recent_all_paginated_orders_newest_first() {
+        let repo = InMemoryExecutionRepository::new();
+        let t_a = TenantId::new("t-a".to_string()).unwrap();
+        let t_b = TenantId::new("t-b".to_string()).unwrap();
+        let older = make_execution(&t_a, 1000);
+        let newer = make_execution(&t_b, 2000);
+        repo.save_for_tenant(&t_a, &older).await.unwrap();
+        repo.save_for_tenant(&t_b, &newer).await.unwrap();
+
+        let rows = repo.list_recent_all_paginated(100, 0).await.unwrap();
+        assert_eq!(rows[0].id, newer.id);
+        assert_eq!(rows[1].id, older.id);
+    }
+
+    #[tokio::test]
+    async fn list_recent_all_paginated_respects_offset_and_limit() {
+        let repo = InMemoryExecutionRepository::new();
+        let t = TenantId::new("t-a".to_string()).unwrap();
+        for i in 0..5 {
+            let e = make_execution(&t, 1000 + i);
+            repo.save_for_tenant(&t, &e).await.unwrap();
+        }
+        let page1 = repo.list_recent_all_paginated(2, 0).await.unwrap();
+        let page2 = repo.list_recent_all_paginated(2, 2).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 2);
+        assert_ne!(page1[0].id, page2[0].id);
+    }
+
+    fn make_workflow_exec(
+        tenant: &TenantId,
+        started_secs: i64,
+    ) -> crate::domain::workflow::WorkflowExecution {
+        use crate::domain::workflow::{Blackboard, WorkflowExecution, WorkflowId};
+        WorkflowExecution {
+            id: ExecutionId::new(),
+            workflow_id: WorkflowId::new(),
+            tenant_id: tenant.clone(),
+            status: crate::domain::execution::ExecutionStatus::Running,
+            current_state: crate::domain::workflow::StateName::new("start").unwrap(),
+            blackboard: Blackboard::new(),
+            input: serde_json::json!({}),
+            state_outputs: std::collections::HashMap::new(),
+            final_output: None,
+            started_at: chrono::DateTime::from_timestamp(started_secs, 0).unwrap(),
+            last_transition_at: chrono::DateTime::from_timestamp(started_secs, 0).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_paginated_all_workflow_executions_aggregates_across_tenants() {
+        let repo = InMemoryWorkflowExecutionRepository::new();
+        let t_a = TenantId::new("t-a".to_string()).unwrap();
+        let t_b = TenantId::new("t-b".to_string()).unwrap();
+        let older = make_workflow_exec(&t_a, 1000);
+        let newer = make_workflow_exec(&t_b, 2000);
+        repo.save_for_tenant(&t_a, &older).await.unwrap();
+        repo.save_for_tenant(&t_b, &newer).await.unwrap();
+
+        let rows = repo.list_paginated_all(100, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, newer.id);
+        assert_eq!(rows[1].id, older.id);
+    }
+
+    #[tokio::test]
+    async fn list_paginated_all_workflow_executions_respects_pagination() {
+        let repo = InMemoryWorkflowExecutionRepository::new();
+        let t = TenantId::new("t-a".to_string()).unwrap();
+        for i in 0..5 {
+            let e = make_workflow_exec(&t, 1000 + i);
+            repo.save_for_tenant(&t, &e).await.unwrap();
+        }
+        let p1 = repo.list_paginated_all(2, 0).await.unwrap();
+        let p2 = repo.list_paginated_all(2, 2).await.unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p2.len(), 2);
+        assert_ne!(p1[0].id, p2[0].id);
     }
 
     #[tokio::test]

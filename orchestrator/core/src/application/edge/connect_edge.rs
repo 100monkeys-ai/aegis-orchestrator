@@ -226,6 +226,9 @@ mod tests {
         async fn list_by_tenant(&self, _: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
             Ok(vec![])
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
         async fn update_status(&self, id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
             if let Some(e) = self.edges.lock().await.get_mut(id) {
                 e.status = status;
