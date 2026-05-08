@@ -16,7 +16,7 @@ use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 use aegis_orchestrator_swarm::application::SwarmService;
 
-use crate::daemon::handlers::{bounded_limit, resolved_tenant, LimitQuery};
+use crate::daemon::handlers::{bounded_limit, is_operator, resolved_tenant, LimitQuery};
 use crate::daemon::state::AppState;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -39,6 +39,7 @@ pub(crate) struct SwarmLockView {
 pub(crate) struct SwarmView {
     pub(crate) swarm_id: String,
     pub(crate) parent_execution_id: String,
+    pub(crate) tenant_id: String,
     pub(crate) member_ids: Vec<String>,
     pub(crate) member_count: usize,
     pub(crate) status: String,
@@ -59,22 +60,44 @@ pub(crate) async fn list_swarms_handler(
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("swarm:list")?;
-    let tenant_id = resolved_tenant(&request, identity.as_ref().map(|e| &e.0));
-    let swarms = state.swarm_service.list_swarms(&tenant_id).await;
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let caller_is_operator = is_operator(identity_ref);
+    let tenant_id = resolved_tenant(&request, identity_ref);
+    // Operator cross-tenant aggregation (ADR-097): each swarm carries its
+    // own `tenant_id`; messages/locks lookups for the operator path use
+    // the swarm's own tenant rather than the caller's resolved tenant.
+    let swarms = if caller_is_operator {
+        state.swarm_service.list_swarms_unscoped().await
+    } else {
+        state.swarm_service.list_swarms(&tenant_id).await
+    };
     let limit = bounded_limit(query.limit, swarms.len().max(1), 500);
     let mut items = Vec::new();
     for swarm in swarms.into_iter().take(limit) {
-        let messages = state
-            .swarm_service
-            .messages_for_swarm(&tenant_id, swarm.id)
-            .await;
-        let locks = state
-            .swarm_service
-            .locks_for_swarm(&tenant_id, swarm.id)
-            .await;
+        let (messages, locks) = if caller_is_operator {
+            (
+                state
+                    .swarm_service
+                    .messages_for_swarm_unscoped(swarm.id)
+                    .await,
+                state.swarm_service.locks_for_swarm_unscoped(swarm.id).await,
+            )
+        } else {
+            (
+                state
+                    .swarm_service
+                    .messages_for_swarm(&tenant_id, swarm.id)
+                    .await,
+                state
+                    .swarm_service
+                    .locks_for_swarm(&tenant_id, swarm.id)
+                    .await,
+            )
+        };
         items.push(SwarmView {
             swarm_id: swarm.id.0.to_string(),
             parent_execution_id: swarm.parent_execution_id.0.to_string(),
+            tenant_id: swarm.tenant_id.as_str().to_string(),
             member_ids: swarm
                 .member_ids()
                 .into_iter()
@@ -103,21 +126,41 @@ pub(crate) async fn get_swarm_handler(
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("swarm:read")?;
-    let tenant_id = resolved_tenant(&request, identity.as_ref().map(|e| &e.0));
+    let identity_ref = identity.as_ref().map(|e| &e.0);
+    let caller_is_operator = is_operator(identity_ref);
+    let tenant_id = resolved_tenant(&request, identity_ref);
     let swarm_id = aegis_orchestrator_swarm::domain::SwarmId(swarm_id);
-    match state.swarm_service.get_swarm(&tenant_id, swarm_id).await {
+    let swarm_lookup: Result<Option<_>, anyhow::Error> = if caller_is_operator {
+        Ok(state.swarm_service.get_swarm_unscoped(swarm_id).await)
+    } else {
+        state.swarm_service.get_swarm(&tenant_id, swarm_id).await
+    };
+    match swarm_lookup {
         Ok(Some(swarm)) => {
-            let messages = state
-                .swarm_service
-                .messages_for_swarm(&tenant_id, swarm_id)
-                .await;
-            let locks = state
-                .swarm_service
-                .locks_for_swarm(&tenant_id, swarm_id)
-                .await;
+            let (messages, locks) = if caller_is_operator {
+                (
+                    state
+                        .swarm_service
+                        .messages_for_swarm_unscoped(swarm_id)
+                        .await,
+                    state.swarm_service.locks_for_swarm_unscoped(swarm_id).await,
+                )
+            } else {
+                (
+                    state
+                        .swarm_service
+                        .messages_for_swarm(&tenant_id, swarm_id)
+                        .await,
+                    state
+                        .swarm_service
+                        .locks_for_swarm(&tenant_id, swarm_id)
+                        .await,
+                )
+            };
             let view = SwarmView {
                 swarm_id: swarm.id.0.to_string(),
                 parent_execution_id: swarm.parent_execution_id.0.to_string(),
+                tenant_id: swarm.tenant_id.as_str().to_string(),
                 member_ids: swarm
                     .member_ids()
                     .into_iter()

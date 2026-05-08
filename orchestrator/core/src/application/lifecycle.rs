@@ -62,6 +62,27 @@ impl StandardAgentLifecycleService {
         self.quota_service = Some(quota_service);
         self
     }
+
+    /// Cross-tenant agent list (ADR-097). Operator-only — callers MUST gate
+    /// on [`crate::domain::iam::IdentityKind::Operator`]. Each returned
+    /// [`Agent`] carries its own `tenant_id`; surface it in projections.
+    pub async fn list_all_agents(&self) -> Result<Vec<Agent>> {
+        self.repository
+            .list_all()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
+    }
+
+    /// Cross-tenant agent fetch by ID. Operator-only — callers MUST gate on
+    /// the operator identity kind before calling. Returns `Ok(None)` if no
+    /// agent exists with the given id in any tenant.
+    pub async fn find_by_id_unscoped(&self, id: AgentId) -> Result<Option<Agent>> {
+        // Iterate `list_all` and filter; the cardinality is small enough for
+        // the operator detail-fetch path. A repo-level `find_by_id_unscoped`
+        // can replace this in a follow-up if perf demands it.
+        let agents = self.list_all_agents().await?;
+        Ok(agents.into_iter().find(|a| a.id == id))
+    }
 }
 
 #[async_trait]

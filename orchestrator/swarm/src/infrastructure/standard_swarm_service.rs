@@ -89,6 +89,38 @@ impl StandardSwarmService {
         swarms
     }
 
+    /// Cross-tenant fetch of a swarm by id. Operator-only (ADR-097) —
+    /// callers MUST verify operator privilege before invoking. Mirrors the
+    /// `find_by_id_unscoped` repo convention.
+    pub async fn get_swarm_unscoped(&self, swarm_id: SwarmId) -> Option<Swarm> {
+        let state = self.state.read().await;
+        state.swarms.get(&swarm_id).cloned()
+    }
+
+    /// Cross-tenant read of recent messages on a swarm. Operator-only
+    /// (ADR-097). Returns an empty vector if the swarm does not exist.
+    pub async fn messages_for_swarm_unscoped(&self, swarm_id: SwarmId) -> Vec<MessageEnvelope> {
+        let state = self.state.read().await;
+        state.messages.get(&swarm_id).cloned().unwrap_or_default()
+    }
+
+    /// Cross-tenant read of resource locks held by members of a swarm.
+    /// Operator-only (ADR-097). Returns an empty vector if the swarm does
+    /// not exist.
+    pub async fn locks_for_swarm_unscoped(&self, swarm_id: SwarmId) -> Vec<ResourceLock> {
+        let state = self.state.read().await;
+        let Some(swarm) = state.swarms.get(&swarm_id) else {
+            return Vec::new();
+        };
+        let member_ids = swarm.member_ids();
+        state
+            .locks
+            .values()
+            .filter(|lock| member_ids.contains(&lock.held_by))
+            .cloned()
+            .collect()
+    }
+
     /// Tenant-scoped list of swarms.
     pub async fn list_swarms(&self, tenant_id: &TenantId) -> Vec<Swarm> {
         let state = self.state.read().await;

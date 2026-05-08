@@ -25,7 +25,7 @@ use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::work
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
 use crate::daemon::state::AppState;
 use crate::daemon::temporal_helpers::{connect_temporal_workflow_client, temporal_namespace};
 
@@ -498,7 +498,8 @@ pub(crate) async fn list_workflow_executions_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:list")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let identity_ref = identity.as_ref().map(|identity| &identity.0);
+    let tenant_id = tenant_id_from_identity(identity_ref);
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -512,7 +513,15 @@ pub(crate) async fn list_workflow_executions_handler(
         .and_then(|value| Uuid::parse_str(value).ok())
         .map(aegis_orchestrator_core::domain::workflow::WorkflowId);
 
-    let repo_result = if let Some(workflow_id) = workflow_id {
+    // Operator cross-tenant aggregation (ADR-097): when no workflow_id
+    // filter is supplied, return executions across every tenant — each
+    // carries its own `tenant_id` in the projection.
+    let repo_result = if is_operator(identity_ref) && workflow_id.is_none() {
+        state
+            .workflow_execution_repo
+            .list_paginated_all(limit, offset)
+            .await
+    } else if let Some(workflow_id) = workflow_id {
         state
             .workflow_execution_repo
             .find_by_workflow_for_tenant(&tenant_id, workflow_id, limit, offset)
@@ -545,6 +554,7 @@ pub(crate) async fn list_workflow_executions_handler(
                         "current_state": e.current_state.as_str(),
                         "started_at": e.started_at,
                         "last_transition_at": e.last_transition_at,
+                        "tenant_id": e.tenant_id.as_str(),
                     })
                 })
                 .collect();
