@@ -254,6 +254,9 @@ mod tests {
         async fn list_by_tenant(&self, _t: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
             Ok(vec![])
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(self.edges.lock().await.values().cloned().collect())
+        }
         async fn update_status(&self, _: &NodeId, _: NodePeerStatus) -> anyhow::Result<()> {
             Ok(())
         }

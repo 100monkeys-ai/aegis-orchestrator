@@ -208,6 +208,9 @@ mod tests {
         ) -> anyhow::Result<Vec<crate::domain::edge::EdgeDaemon>> {
             Ok(vec![])
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::domain::edge::EdgeDaemon>> {
+            Ok(self.last.lock().await.clone().into_iter().collect())
+        }
         async fn update_status(&self, _: &NodeId, _: NodePeerStatus) -> anyhow::Result<()> {
             Ok(())
         }
