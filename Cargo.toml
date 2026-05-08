@@ -91,6 +91,7 @@ rust-guardian = "0.1"
 
 [patch.crates-io]
 bollard-stubs = { path = "orchestrator/vendor/bollard-stubs" }
+aegis-orchestrator-proto = { path = "../aegis-proto" }
 
 [profile.release]
 opt-level = 3
