@@ -256,6 +256,11 @@ async fn invoke_agent_handler(
         // Render the Handlebars template against `{ "output": final_output, "intent": ... }`.
         let mut hb = handlebars::Handlebars::new();
         hb.set_strict_mode(false);
+        // Disable HTML escaping: the rendered template is fed to an LLM as plain
+        // text, so backticks, quotes, and angle brackets in `{{output}}` /
+        // `{{intent}}` must reach the agent verbatim. Mirrors the configuration
+        // in `PromptTemplateEngine`.
+        hb.register_escape_fn(handlebars::no_escape);
         let ctx = serde_json::json!({
             "output": final_output,
             "intent": intent.unwrap_or(""),
@@ -341,6 +346,10 @@ async fn invoke_webhook_handler(
     let body = if let Some(template) = body_template {
         let mut hb = handlebars::Handlebars::new();
         hb.set_strict_mode(false);
+        // Disable HTML escaping: webhook bodies are typically JSON or plain
+        // text and must not have backticks/quotes/angle brackets mangled into
+        // HTML entities.
+        hb.register_escape_fn(handlebars::no_escape);
         let ctx = serde_json::json!({ "output": final_output });
         hb.render_template(template, &ctx)
             .unwrap_or_else(|_| final_output.to_string())
@@ -783,6 +792,101 @@ mod tests {
         assert_eq!(
             workflow_input, "Format this: raw-final-output (intent: summarize)",
             "workflow_input must contain the Handlebars-rendered prompt text"
+        );
+    }
+
+    /// Regression: the local Handlebars instance in `invoke_agent_handler`
+    /// must NOT HTML-escape the rendered template. The rendered string is
+    /// fed to a downstream LLM agent as plain text, so backticks, double
+    /// quotes, and angle brackets in `{{output}}` / `{{intent}}` must reach
+    /// the agent verbatim. Previously, the Handlebars default escape function
+    /// turned ``` ``` ``` into `&#x60;&#x60;&#x60;` and `"status"` into
+    /// `&quot;status&quot;`, corrupting the formatter agent's input.
+    #[tokio::test]
+    async fn invoke_agent_handler_does_not_html_escape_rendered_template() {
+        let agent_name = "test-formatter";
+        let agent = test_agent(agent_name);
+        let lifecycle: Arc<dyn AgentLifecycleService> = Arc::new(OneAgentLifecycle { agent });
+        let tenant = TenantId::from_string("u-test-tenant-12345").expect("valid tenant");
+
+        let capturing = Arc::new(CapturingExecutionService::new(tenant.clone()));
+        let exec_svc: Arc<dyn ExecutionService> = capturing.clone();
+
+        // Output containing every character that Handlebars' default
+        // html_escape would mangle: backticks, double quotes, `<`, `>`, `&`.
+        let raw_output = "```json\n{\"status\":\"ok\",\"x\":1,\"html\":\"<b>&amp;</b>\"}\n```";
+
+        let _ = invoke_agent_handler(
+            &exec_svc,
+            &lifecycle,
+            agent_name,
+            Some("Render: {{output}} ({{intent}})"),
+            raw_output,
+            None,
+            Some(5),
+            Some("format & emit"),
+            &tenant,
+        )
+        .await
+        .expect("invoke_agent_handler should succeed");
+
+        let inputs = capturing.captured_inputs();
+        assert_eq!(inputs.len(), 1, "exactly one execution should be started");
+        let captured = &inputs[0];
+
+        let workflow_input = captured
+            .input
+            .as_object()
+            .and_then(|p| p.get("workflow_input"))
+            .and_then(|v| v.as_str())
+            .expect("synthetic payload must include workflow_input");
+
+        // Literal characters from the raw output must survive rendering.
+        assert!(
+            workflow_input.contains("```"),
+            "rendered template must preserve raw backticks, got: {workflow_input}"
+        );
+        assert!(
+            workflow_input.contains("\"status\""),
+            "rendered template must preserve raw double quotes, got: {workflow_input}"
+        );
+        assert!(
+            workflow_input.contains("<b>"),
+            "rendered template must preserve raw angle brackets, got: {workflow_input}"
+        );
+        // Intent containing `&` must also survive verbatim.
+        assert!(
+            workflow_input.contains("format & emit"),
+            "rendered template must preserve raw ampersand from intent, got: {workflow_input}"
+        );
+
+        // None of the HTML-entity escapes Handlebars would emit may appear,
+        // unless they were literally in the input. (`&amp;` was in the raw
+        // input, so it is allowed; the others were not.)
+        assert!(
+            !workflow_input.contains("&#x60;"),
+            "backticks must not be HTML-escaped, got: {workflow_input}"
+        );
+        assert!(
+            !workflow_input.contains("&quot;"),
+            "double quotes must not be HTML-escaped, got: {workflow_input}"
+        );
+        assert!(
+            !workflow_input.contains("&lt;"),
+            "`<` must not be HTML-escaped, got: {workflow_input}"
+        );
+        assert!(
+            !workflow_input.contains("&gt;"),
+            "`>` must not be HTML-escaped, got: {workflow_input}"
+        );
+        // The intent's literal `&` must not be escaped to `&amp;`. The raw
+        // output had a literal `&amp;` in it, so we count occurrences: the
+        // input had exactly one `&amp;`, and the renderer must not introduce
+        // additional `&amp;` sequences from the literal `&` in the intent.
+        assert_eq!(
+            workflow_input.matches("&amp;").count(),
+            1,
+            "no extra `&amp;` entities may be introduced by the renderer, got: {workflow_input}"
         );
     }
 }
