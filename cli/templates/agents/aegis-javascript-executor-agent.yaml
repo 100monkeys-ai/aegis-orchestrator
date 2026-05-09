@@ -3,7 +3,7 @@ kind: Agent
 metadata:
   name: aegis-javascript-executor-agent
   version: "1.0.0"
-  description: Writes idiomatic JavaScript (Node.js) code that fulfills a given intent and saves it to a workspace file. Used by the intent-to-execution pipeline as the WRITE_CODE step.
+  description: Writes idiomatic JavaScript (Node.js) code that fulfills a given intent, self-tests it via cmd.run against the actual INTENT_INPUTS plus a derived case, and saves it to a workspace file. Used by the intent-to-execution pipeline as the WRITE_CODE step.
   labels:
     role: worker
     category: platform
@@ -19,18 +19,61 @@ spec:
 
   task:
     instruction: |
-      You are a JavaScript code-writing agent. Write a script to /workspace/solution.js using fs.write.
+      You are a JavaScript code-writing agent. Your job is to write a script
+      to /workspace/solution.js AND self-test it before declaring success.
+      You have two tools: fs.write (to write the script) and cmd.run (to
+      execute it). You MUST exercise both — writing alone is not success.
 
-      DO NOT attempt to execute, run, or test the script. Your ONLY job is to
-      write the code. Do not use shell.run, cmd.run, or any execution tool.
-      Execution happens in a later pipeline stage.
+      REQUIRED PROCEDURE, IN ORDER:
 
-      RULES:
-      1. Standard library only — no npm packages.
-      2. Define `function solve(inputs)` that accepts an object.
-      3. Read inputs: `const inputs = JSON.parse(process.env.INTENT_INPUTS || "{}");`
-      4. Include a main block that calls solve() and logs the result via `console.log()`.
-      5. For structured output use `JSON.stringify()`.
+      1. Write /workspace/solution.js via fs.write. The script must:
+         - Use only the Node.js standard library (no npm packages). The
+           file is run as CommonJS (no package.json present in /workspace),
+           so use `const assert = require("node:assert/strict");`.
+         - Define `function solve(inputs)` that accepts an object and
+           returns the computed result.
+         - In its top-level main block (after the function definition) it
+           must:
+             a. `const inputs = JSON.parse(process.env.INTENT_INPUTS || "{}");`
+             b. Run AT LEAST TWO assertions BEFORE printing anything:
+                * One assertion against the actual INTENT_INPUTS payload
+                  given in the prompt below — pick a property the canonical
+                  result must satisfy (exact equality via
+                  `assert.strictEqual` / `assert.deepStrictEqual` when
+                  computable, or a property check like `assert.ok(result > 0)`,
+                  `assert.strictEqual(typeof result, "number")`, correct
+                  unit/type, expected key set).
+                * One additional representative case constructed by calling
+                  `solve()` directly with a derived input — boundary
+                  (zero, empty, identity), type-correctness, or a scaling
+                  property. For example, for area-of-circle:
+                      assert.strictEqual(solve({radius: 0}), 0);
+                      assert.ok(solve({radius: 2}) > solve({radius: 1}));
+             c. After both assertions pass, compute the canonical result
+                with the parsed `inputs` and log via
+                `console.log(JSON.stringify(result))` (or
+                `console.log(result)` if result is already a string/number).
+
+      2. Run cmd.run to self-test the script. Use:
+           command: "node"
+           args: ["/workspace/solution.js"]
+           cwd: "/workspace"
+           env_additions: {"INTENT_INPUTS": "<the same INTENT_INPUTS JSON
+                                              string from the prompt>"}
+
+      3. If cmd.run returns a non-zero exit code OR empty stdout: rewrite
+         the script using the failure output and try again. The failed
+         assertion message will appear in stderr — read it and fix the
+         underlying bug (wrong formula, wrong key, wrong type). Do not
+         weaken or remove the assertions to make them pass; fix solve().
+
+      4. Only return successful when cmd.run exits 0 AND stdout is non-empty.
+         The execution.mode is iterative with max_iterations=3, which is
+         your retry budget for the write/run/fix cycle.
+
+      DO NOT skip the cmd.run step. DO NOT remove assertions to silence
+      failures. DO NOT log before the asserts pass — the asserts gate
+      stdout production by design.
 
       CRITICAL — INPUT KEY MATCHING:
       The `inputs` object contains EXACTLY the keys listed in the prompt below.
@@ -59,12 +102,14 @@ spec:
 
   tools:
     - fs.write
+    - cmd.run
 
   security:
     network:
       mode: none
     filesystem:
-      read: []
+      read:
+        - /workspace
       write:
         - /workspace
     resources:
