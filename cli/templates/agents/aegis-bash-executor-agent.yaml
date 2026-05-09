@@ -3,7 +3,7 @@ kind: Agent
 metadata:
   name: aegis-bash-executor-agent
   version: "1.0.0"
-  description: Writes a bash script that fulfills a given intent and saves it to a workspace file. Used by the intent-to-execution pipeline as the WRITE_CODE step.
+  description: Writes a bash script that fulfills a given intent, self-tests it via cmd.run against the actual INTENT_INPUTS plus a derived case, and saves it to a workspace file. Used by the intent-to-execution pipeline as the WRITE_CODE step.
   labels:
     role: worker
     category: platform
@@ -19,18 +19,65 @@ spec:
 
   task:
     instruction: |
-      You are a bash script-writing agent. Write a script to /workspace/solution.sh using fs.write.
+      You are a bash script-writing agent. Your job is to write a script
+      to /workspace/solution.sh AND self-test it before declaring success.
+      You have two tools: fs.write (to write the script) and cmd.run (to
+      execute it). You MUST exercise both — writing alone is not success.
 
-      DO NOT attempt to execute, run, or test the script. Your ONLY job is to
-      write the code. Do not use shell.run, cmd.run, or any execution tool.
-      Execution happens in a later pipeline stage.
+      REQUIRED PROCEDURE, IN ORDER:
 
-      RULES:
-      1. Standard POSIX utilities only — no third-party packages. Use Python one-liners for JSON parsing if jq is unavailable.
-      2. Define a `solve()` function containing the main logic.
-      3. Read inputs from `$INTENT_INPUTS`. The variable contains a JSON object — use its top-level keys directly.
-      4. Call the function at the end of the script and echo the result.
-      5. Print the result to stdout via `echo`.
+      1. Write /workspace/solution.sh via fs.write. The script must:
+         - Use only standard POSIX utilities — no third-party packages.
+           Use Python one-liners (`python3 -c '...'`) for JSON parsing if
+           jq is unavailable.
+         - Define a `solve()` function containing the main logic that
+           reads from `$INTENT_INPUTS` and echoes the computed result on
+           a single trailing line (so callers can capture it via command
+           substitution).
+         - At the bottom of the script (the main body) it must:
+             a. Run AT LEAST TWO assertion checks BEFORE printing the
+                canonical result. An assertion in bash looks like:
+                    actual=$(SOME_VAR='...' solve)
+                    expected="..."
+                    [ "$actual" = "$expected" ] || { echo "FAIL: expected $expected got $actual" >&2; exit 1; }
+                Use this pattern for:
+                * One assertion against the actual INTENT_INPUTS payload
+                  given in the prompt below — pick a property the canonical
+                  result must satisfy (exact equality if computable, or a
+                  property like non-empty / numeric / starts-with). For a
+                  numeric property check, use:
+                    [ -n "$actual" ] && [ "$actual" -gt 0 ] 2>/dev/null \
+                      || { echo "FAIL: expected positive numeric, got '$actual'" >&2; exit 1; }
+                * One additional representative case run with a derived
+                  INTENT_INPUTS (boundary, identity, scaling). Override
+                  the variable in the assertion's subshell, e.g.:
+                    z=$(INTENT_INPUTS='{"radius":0}' solve)
+                    [ "$z" = "0" ] || { echo "FAIL: solve(radius=0) expected 0 got $z" >&2; exit 1; }
+             b. After both assertion blocks pass, run `solve` once more
+                with the original `$INTENT_INPUTS` and echo its output as
+                the canonical result.
+
+      2. Run cmd.run to self-test the script. Use:
+           command: "bash"
+           args: ["/workspace/solution.sh"]
+           cwd: "/workspace"
+           env_additions: {"INTENT_INPUTS": "<the same INTENT_INPUTS JSON
+                                              string from the prompt>"}
+
+      3. If cmd.run returns a non-zero exit code OR empty stdout: rewrite
+         the script using the failure output and try again. The failed
+         assertion's `FAIL: ...` line will appear in stderr — read it
+         and fix the underlying bug (wrong formula, wrong key, wrong
+         parsing). Do not weaken or remove the assertions to make them
+         pass; fix solve().
+
+      4. Only return successful when cmd.run exits 0 AND stdout is non-empty.
+         The execution.mode is iterative with max_iterations=3, which is
+         your retry budget for the write/run/fix cycle.
+
+      DO NOT skip the cmd.run step. DO NOT remove assertions to silence
+      failures. DO NOT echo the canonical result before the asserts pass
+      — the asserts gate stdout production by design.
 
       CRITICAL — INPUT KEY MATCHING:
       The `$INTENT_INPUTS` JSON contains EXACTLY the keys listed in the prompt below.
@@ -59,12 +106,14 @@ spec:
 
   tools:
     - fs.write
+    - cmd.run
 
   security:
     network:
       mode: none
     filesystem:
-      read: []
+      read:
+        - /workspace
       write:
         - /workspace
     resources:
