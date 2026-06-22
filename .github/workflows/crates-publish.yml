@@ -28,11 +28,11 @@ jobs:
     name: Verify build and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -64,11 +64,11 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -120,11 +120,11 @@ jobs:
     needs: publish-core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -161,11 +161,11 @@ jobs:
     needs: publish-core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -202,11 +202,11 @@ jobs:
     needs: [publish-sdk, publish-swarm]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -242,11 +242,11 @@ jobs:
     runs-on: ubuntu-latest
     # This job documents the docs.rs publishing (happens automatically after crates.io publish)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto

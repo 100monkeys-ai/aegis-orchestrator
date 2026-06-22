@@ -27,11 +27,11 @@ jobs:
     name: Format
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -60,11 +60,11 @@ jobs:
     name: Clippy
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -93,11 +93,11 @@ jobs:
     name: Test
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -126,11 +126,11 @@ jobs:
     env:
       RUSTDOCFLAGS: "--cfg docsrs -D warnings"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -177,12 +177,12 @@ jobs:
       - name: Ensure TMPDIR
         run: mkdir -p /home/runner/_work/_tmp
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
           clean: false
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
