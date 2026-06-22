@@ -30,11 +30,11 @@ jobs:
     runs-on: ubuntu-22.04
     
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -83,11 +83,11 @@ jobs:
   #   runs-on: macos-latest
   #
   #   steps:
-  #     - uses: actions/checkout@v6
+  #     - uses: actions/checkout@v7
   #       with:
   #         path: aegis-orchestrator
   #
-  #     - uses: actions/checkout@v6
+  #     - uses: actions/checkout@v7
   #       with:
   #         repository: 100monkeys-ai/aegis-proto
   #         path: aegis-proto
@@ -133,11 +133,11 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
