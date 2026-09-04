@@ -1603,25 +1603,27 @@ async fn tier_change_context(
         stripe_billing::Subscription,
         SubscriptionId,
     ),
-    axum::response::Response,
+    Box<axum::response::Response>,
 > {
     let billing = match &state.billing_config {
         Some(c) => c,
-        None => return Err(not_implemented()),
+        None => return Err(Box::new(not_implemented())),
     };
     let stripe = match stripe_client_from_config(billing) {
         Some(c) => c,
-        None => return Err(not_implemented()),
+        None => return Err(Box::new(not_implemented())),
     };
 
     let identity = match identity {
         Some(Extension(id)) => id,
         None => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "Authentication required"})),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "Authentication required"})),
+                )
+                    .into_response(),
+            ));
         }
     };
 
@@ -1645,40 +1647,48 @@ async fn tier_change_context(
     let billing_repo = match &state.billing_repo {
         Some(r) => r.clone(),
         None => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "Billing repository not configured"})),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "Billing repository not configured"})),
+                )
+                    .into_response(),
+            ));
         }
     };
 
     let sub = match billing_repo.get_subscription(&tenant_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "No subscription found. Please subscribe first."})),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "No subscription found. Please subscribe first."})),
+                )
+                    .into_response(),
+            ));
         }
         Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            ));
         }
     };
 
     let stripe_sub_id: SubscriptionId = match sub.stripe_subscription_id.as_deref() {
         Some(id) => id.parse().expect("SubscriptionId parse is infallible"),
         None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "No active Stripe subscription found."})),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "No active Stripe subscription found."})),
+                )
+                    .into_response(),
+            ));
         }
     };
 
@@ -1689,11 +1699,13 @@ async fn tier_change_context(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "Failed to retrieve Stripe subscription");
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "Failed to retrieve subscription from Stripe"})),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "Failed to retrieve subscription from Stripe"})),
+                )
+                    .into_response(),
+            ));
         }
     };
 
@@ -1775,7 +1787,7 @@ pub(crate) async fn preview_tier_change_handler(
     let (stripe, _tenant_id, _billing_repo, _sub, stripe_sub, stripe_sub_id) =
         match tier_change_context(&state, identity).await {
             Ok(ctx) => ctx,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
 
     let current = current_sub_items_from(&stripe_sub);
@@ -1964,7 +1976,7 @@ pub(crate) async fn change_tier_handler(
     let (stripe, tenant_id, _billing_repo, _sub, stripe_sub, stripe_sub_id) =
         match tier_change_context(&state, identity).await {
             Ok(ctx) => ctx,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
 
     let current = current_sub_items_from(&stripe_sub);

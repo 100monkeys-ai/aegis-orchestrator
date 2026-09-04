@@ -254,36 +254,44 @@ async fn resolve_active_team(
     state: &AppState,
     tenant_kind: TenantKind,
     tenant_slug: &str,
-) -> Result<Option<Team>, axum::response::Response> {
+) -> Result<Option<Team>, Box<axum::response::Response>> {
     if tenant_kind != TenantKind::Team {
         return Ok(None);
     }
     let team_repo = state.team_repo.clone().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "teams_not_configured"})),
+        Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "teams_not_configured"})),
+            )
+                .into_response(),
         )
-            .into_response()
     })?;
     let slug = TeamSlug::parse(tenant_slug).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_team_slug", "message": e})),
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_team_slug", "message": e})),
+            )
+                .into_response(),
         )
-            .into_response()
     })?;
     match team_repo.find_by_slug(&slug).await {
         Ok(Some(t)) => Ok(Some(t)),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "team_not_found"})),
-        )
-            .into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response()),
+        Ok(None) => Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "team_not_found"})),
+            )
+                .into_response(),
+        )),
+        Err(e) => Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        )),
     }
 }
 
@@ -292,20 +300,24 @@ async fn caller_role(
     state: &AppState,
     team_id: TeamId,
     user_id: &str,
-) -> Result<Option<(MembershipRole, MembershipStatus)>, axum::response::Response> {
+) -> Result<Option<(MembershipRole, MembershipStatus)>, Box<axum::response::Response>> {
     let repo = state.membership_repo.clone().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "teams_not_configured"})),
+        Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "teams_not_configured"})),
+            )
+                .into_response(),
         )
-            .into_response()
     })?;
     let members = repo.find_by_team(&team_id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+        Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
         )
-            .into_response()
     })?;
     Ok(members
         .into_iter()
@@ -567,7 +579,7 @@ pub(crate) async fn list_members(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     };
 
     // Authorization: caller must be an Active member.
@@ -580,7 +592,7 @@ pub(crate) async fn list_members(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     }
 
     let repo = match state.membership_repo.clone() {
@@ -691,7 +703,7 @@ pub(crate) async fn create_invitation(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     };
 
     let svc = match team_service(&state) {
@@ -770,7 +782,7 @@ pub(crate) async fn list_invitations(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     };
 
     // Gate: must be a member.
@@ -783,7 +795,7 @@ pub(crate) async fn list_invitations(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     }
 
     let svc = match team_service(&state) {
@@ -910,7 +922,7 @@ pub(crate) async fn remove_member(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let svc = match team_service(&state) {
         Ok(s) => s,
@@ -992,7 +1004,7 @@ pub(crate) async fn update_role(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     };
 
     let new_role = match MembershipRole::from_str(&payload.role) {
@@ -1043,7 +1055,7 @@ pub(crate) async fn get_saml_config(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !matches!(team.tier, TenantTier::Enterprise) {
         return (
@@ -1133,7 +1145,7 @@ pub(crate) async fn set_saml_config(
             )
                 .into_response()
         }
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !matches!(team.tier, TenantTier::Enterprise) {
         return (
@@ -1260,7 +1272,7 @@ pub(crate) async fn get_subscription(
                 )
                     .into_response()
             }
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         let repo = match state.membership_repo.clone() {
             Some(r) => r,
