@@ -1,0 +1,22 @@
+# Pins the Rust toolchain for this repository.
+#
+# Why this file exists: `.github/workflows/pipeline.yml` installed
+# `dtolnay/rust-toolchain@stable` with no toolchain file, so the toolchain was
+# whatever `stable` resolved to on the day a run happened and `main`'s CI verdict
+# was a function of the calendar. The identical tree passed Pipeline on
+# 2026-05-09 (run 25590016717) and failed it on 2026-09-04 (run 33909474652) with
+# four clippy errors, because clippy had gained those lints in between.
+#
+# `components` is load-bearing: rustup treats `stable` and `1.98.1` as separate
+# toolchain installations, so a component installed into `stable` is not visible
+# to `1.98.1`. Without these two entries `cargo clippy` and `cargo fmt` would
+# fail to find their components under the pin.
+#
+# Raising this version is a deliberate act: bump it, run
+# `cargo clippy --workspace --locked -- -D warnings`, and fix what the new
+# toolchain reports in the same change.
+
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
