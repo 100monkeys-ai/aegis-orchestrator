@@ -67,12 +67,42 @@ pub fn create_storage_provider(
             Ok(Arc::new(provider))
         }
         StorageBackend::OpenDal { provider, options } => {
-            let scheme_name = provider.clone();
-            let scheme: opendal::Scheme = provider
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid OpenDAL scheme: '{scheme_name}'"))?;
-            let op = Operator::via_iter(scheme, options).with_context(|| {
-                format!("Failed to create OpenDAL operator for scheme '{scheme_name}'")
+            // Validate the operator-supplied scheme against the schemes this
+            // build can actually construct, and do it before anything is built.
+            //
+            // Why the registry and not a parse: OpenDAL removed the `Scheme`
+            // enum, and `Operator::via_iter` now dispatches through
+            // `OperatorRegistry`, whose `schemes()` is documented as exactly the
+            // set `from_uri` can construct for the compiled-in `services-*`
+            // features. The old `provider.parse::<opendal::Scheme>()` validated
+            // against every scheme OpenDAL has ever known regardless of
+            // features, so `provider = "s3"` passed the check and then failed
+            // one line later with a different sentence. This validates against
+            // the set that can be built.
+            //
+            // It also keeps a URI-shaped value rejected. `via_iter` on a string
+            // containing "://" is parsed as a URI, so a `provider` of
+            // "s3://bucket" would be silently accepted as scheme "s3" with
+            // authority "bucket" — a change in what a config file means, not in
+            // an error message. It is not a registered scheme, so it is refused
+            // here exactly as it is today.
+            //
+            // `register`/`OperatorUri` both lower-case, so the comparison does.
+            opendal::init_default_registry();
+            let mut available: Vec<String> = opendal::OperatorRegistry::get()
+                .schemes()
+                .into_iter()
+                .collect();
+            available.sort();
+            let requested = provider.to_ascii_lowercase();
+            if !available.contains(&requested) {
+                anyhow::bail!(
+                    "Invalid OpenDAL scheme: '{provider}'. This build registers: {}",
+                    available.join(", ")
+                );
+            }
+            let op = Operator::via_iter(&provider, options).with_context(|| {
+                format!("Failed to create OpenDAL operator for scheme '{provider}'")
             })?;
             Ok(Arc::new(OpenDalStorageProvider::new(op)))
         }
@@ -248,23 +278,126 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_factory_invalid_opendal_scheme_returns_error() {
+    fn opendal_factory_error(provider: &str) -> String {
         let result = create_storage_provider(StorageBackend::OpenDal {
-            provider: "not-a-real-scheme".to_string(),
+            provider: provider.to_string(),
             options: std::collections::HashMap::new(),
         });
         assert!(
             result.is_err(),
-            "invalid OpenDAL scheme should return Err, not panic"
+            "provider '{provider}' should return Err, not panic and not succeed"
         );
-        let err_msg = result
+        result
             .err()
-            .expect("invalid OpenDAL scheme should return Err")
-            .to_string();
+            .expect("provider should return Err")
+            .to_string()
+    }
+
+    #[test]
+    fn test_factory_invalid_opendal_scheme_returns_error() {
+        let err_msg = opendal_factory_error("not-a-real-scheme");
         assert!(
             err_msg.contains("not-a-real-scheme"),
             "error message should identify the bad scheme; got: {err_msg}"
         );
+        assert!(
+            err_msg.starts_with("Invalid OpenDAL scheme: 'not-a-real-scheme'"),
+            "the rejection sentence operators key on must be preserved; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("This build registers: "),
+            "the rejection must name what this build can construct; got: {err_msg}"
+        );
+    }
+
+    /// A scheme OpenDAL knows but this build does not compile in is rejected by
+    /// the same sentence as an unknown one, because an operator can act on
+    /// neither differently. Before the registry guard this string passed the
+    /// scheme check and failed one line later with a different sentence.
+    #[test]
+    fn test_factory_rejects_a_scheme_this_build_does_not_register() {
+        let err_msg = opendal_factory_error("s3");
+        assert!(
+            err_msg.starts_with("Invalid OpenDAL scheme: 's3'"),
+            "an unregistered-but-known scheme must be refused by the scheme \
+             sentence, not by the operator-construction sentence; got: {err_msg}"
+        );
+    }
+
+    /// A URI-shaped provider value must stay rejected. `Operator::via_iter`
+    /// parses a string containing "://" as a URI, so without this guard
+    /// "memory://x" would be silently accepted as scheme "memory" — a change in
+    /// what a configuration file means, not in an error message.
+    #[test]
+    fn test_factory_rejects_uri_shaped_provider() {
+        let err_msg = opendal_factory_error("memory://some-authority");
+        assert!(
+            err_msg.starts_with("Invalid OpenDAL scheme: 'memory://some-authority'"),
+            "a URI-shaped provider must be refused as a scheme, not parsed as a \
+             URI; got: {err_msg}"
+        );
+    }
+
+    /// The scheme comparison is case-insensitive because OpenDAL's registry and
+    /// its URI parser both lower-case. This is the positive control for the two
+    /// rejection tests above: without it they would pass against a guard that
+    /// rejects everything.
+    // ------------------------------------------------------------------
+    // The three StorageProvider implementations disagree about deleting a
+    // path that is not there, and nothing said so until now. Each test below
+    // asserts one provider's CURRENT behaviour, by name. The OpenDAL half is
+    // `delete_directory_on_a_missing_path_returns_ok_unlike_the_other_providers`
+    // in `opendal_provider`'s test module. Reconciling the three is a
+    // behaviour change and is deliberately not made here.
+    // ------------------------------------------------------------------
+
+    /// `LocalHostStorageProvider` refuses a delete of an absent path.
+    #[tokio::test]
+    async fn test_local_host_delete_directory_on_a_missing_path_returns_not_found() {
+        let tmp = tempfile::TempDir::new().expect("scratch root");
+        let provider = LocalHostStorageProvider::new(tmp.path())
+            .expect("provider over an existing scratch root");
+
+        let result = provider.delete_directory("/never-existed").await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::domain::storage::StorageError::NotFound(_))
+            ),
+            "local host returns NotFound where OpenDAL returns Ok; got {result:?}"
+        );
+    }
+
+    /// The in-repo test double refuses it too, which is why every mocked test
+    /// of `delete_directory` in this repository agrees with local host and
+    /// disagrees with the provider that actually ships for OpenDAL backends.
+    #[tokio::test]
+    async fn test_mock_delete_directory_on_a_missing_path_returns_not_found() {
+        let provider = test_support::TestStorageProvider::new();
+
+        let result = provider.delete_directory("/never-existed").await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::domain::storage::StorageError::NotFound(_))
+            ),
+            "the test double returns NotFound where OpenDAL returns Ok; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_factory_accepts_the_registered_scheme_case_insensitively() {
+        for provider in ["memory", "MEMORY", "Memory"] {
+            let result = create_storage_provider(StorageBackend::OpenDal {
+                provider: provider.to_string(),
+                options: std::collections::HashMap::new(),
+            });
+            assert!(
+                result.is_ok(),
+                "'{provider}' is registered by this build and must be accepted"
+            );
+        }
     }
 }

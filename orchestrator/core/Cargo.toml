@@ -82,7 +82,7 @@ ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-opendal = "0.55.0"
+opendal = "0.58"
 vaultrs = "0.7"
 
 # Secrets Manager (ADR-034)
@@ -95,6 +95,13 @@ git2 = { version = "0.20.4", default-features = false, features = ["https", "ssh
 scopeguard = "1.2"
 
 [dev-dependencies]
+# `services-fs` is dev-only: under resolver 2 a feature enabled through a
+# dev-dependency is not enabled for the normal build, so the shipped binary
+# still registers only the `memory` scheme. It exists so the OpenDAL storage
+# provider can be exercised against a real local filesystem under a scratch
+# root, which is the only way a behaviour difference in `delete_directory` is
+# measurable rather than mocked away.
+opendal = { version = "0.58", features = ["services-fs"] }
 tokio-test = "0.4"
 tempfile = "3.27"
 mockito = "1"
