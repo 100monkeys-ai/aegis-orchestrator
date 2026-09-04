@@ -182,7 +182,6 @@ impl OutputHandlerService for StandardOutputHandlerService {
                 headers,
                 body_template,
                 timeout_seconds,
-                retry: _,
                 ..
             } => invoke_webhook_handler(
                 url,

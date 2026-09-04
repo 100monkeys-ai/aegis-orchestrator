@@ -171,11 +171,8 @@ pub fn extract_json_from_text(text: &str) -> Option<String> {
     let after_all_backticks = after_backticks + extra_backticks;
 
     // Skip optional language tag + whitespace up to (and including) the first newline.
-    let content_start = if let Some(nl_offset) = text[after_all_backticks..].find('\n') {
-        after_all_backticks + nl_offset + 1
-    } else {
-        return None;
-    };
+    let nl_offset = text[after_all_backticks..].find('\n')?;
+    let content_start = after_all_backticks + nl_offset + 1;
 
     // Find the closing ``` fence
     let closing_fence = text[content_start..].find("```")?;
@@ -323,12 +320,9 @@ impl OutputGradientValidator {
 
         // Skip optional language tag + whitespace up to (and including) the first newline.
         // The language tag is everything between the backticks and the first newline.
-        let content_start = if let Some(nl_offset) = text[after_all_backticks..].find('\n') {
-            after_all_backticks + nl_offset + 1
-        } else {
-            // No newline after opening fence — no valid fence block
-            return None;
-        };
+        // No newline after the opening fence means no valid fence block.
+        let nl_offset = text[after_all_backticks..].find('\n')?;
+        let content_start = after_all_backticks + nl_offset + 1;
 
         // Find the closing ``` fence
         let closing_fence = text[content_start..].find("```")?;

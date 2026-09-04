@@ -238,13 +238,7 @@ impl AttestationServiceImpl {
                 .clone()
                 .unwrap_or_else(|| execution_id.0.to_string()),
             tenant_id: Some(request.tenant_id.to_string()),
-            task_summary: request.task_summary.clone().and_then(|s| {
-                if s.len() <= 256 {
-                    Some(s)
-                } else {
-                    None
-                }
-            }),
+            task_summary: request.task_summary.clone().filter(|s| s.len() <= 256),
         };
 
         // 3. Issue Token
@@ -715,5 +709,69 @@ mod tests {
             .await;
 
         assert!(response.is_ok());
+    }
+    /// The `task_summary` claim is dropped when it exceeds 256 characters and kept
+    /// at exactly 256. Both sides of the boundary are asserted because the
+    /// predicate is a `<=` and an off-by-one there silently changes what is
+    /// embedded in every issued token.
+    #[tokio::test]
+    async fn attest_drops_task_summary_over_256_chars_and_keeps_256() {
+        async fn issued_task_summary(summary: String) -> Option<String> {
+            let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
+            security_context_repo
+                .save(test_context("zaru-pro"))
+                .await
+                .unwrap();
+            let seal_session_repo = Arc::new(InMemorySealSessionRepository::new());
+            let issuer = Arc::new(
+                SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap(),
+            );
+            let verifier = SecurityTokenVerifier::new(
+                TEST_RSA_PUBLIC_PEM,
+                "aegis-orchestrator",
+                &["aegis-agents"],
+            )
+            .unwrap();
+            let service =
+                AttestationServiceImpl::new(security_context_repo, seal_session_repo, issuer);
+
+            let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+            let response = service
+                .attest(AttestationRequest {
+                    agent_id: None,
+                    execution_id: None,
+                    container_id: None,
+                    public_key_pem: STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                    security_context: Some("zaru-pro".to_string()),
+                    principal_subject: None,
+                    user_id: None,
+                    workload_id: None,
+                    zaru_tier: None,
+                    tenant_id: TenantId::consumer(),
+                    realm: RealmKind::Consumer,
+                    task_summary: Some(summary),
+                })
+                .await
+                .unwrap();
+
+            verifier
+                .verify(&response.security_token)
+                .unwrap()
+                .claims
+                .task_summary
+        }
+
+        let at_limit = "a".repeat(256);
+        assert_eq!(
+            issued_task_summary(at_limit.clone()).await,
+            Some(at_limit),
+            "a 256-character task_summary is at the limit and must be kept"
+        );
+
+        assert_eq!(
+            issued_task_summary("b".repeat(257)).await,
+            None,
+            "a 257-character task_summary is over the limit and must be dropped"
+        );
     }
 }
