@@ -502,3 +502,105 @@ async fn sparse_checkout_prunes_working_tree() {
         "sparse-excluded path should be pruned"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Remote-URL reconciliation (git2 0.21 `Remote::url()` Option -> Result)
+//
+// `blocking_fetch_and_checkout` decides whether an existing checkout's `origin`
+// still points at the binding's `repo_url` and rewrites it if not. Both arms of
+// that decision were previously unexercised: the existing fetch tests only ever
+// reach the equal path, so a wrong translation of the comparison would not have
+// been caught by anything.
+// ---------------------------------------------------------------------------
+
+/// `origin` pointing somewhere else must be rewritten to the binding's URL, and
+/// the fetch must then come from the binding's repository rather than the stale
+/// one. Watches the `remote_set_url` arm.
+#[tokio::test]
+async fn fetch_and_checkout_rewrites_a_stale_origin_url() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Fixture A: what the checkout currently points at.
+    let stale_dir = tmp.path().join("stale");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    let stale_url = build_bare_fixture(&stale_dir);
+
+    // Fixture B: what the binding says it should point at. Built in its own
+    // directory so the two bare repos are genuinely different objects.
+    let fresh_dir = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh_dir).unwrap();
+    let fresh_url = build_bare_fixture(&fresh_dir);
+    assert_ne!(stale_url, fresh_url, "precondition: two distinct fixtures");
+
+    // Clone from the stale fixture, so `origin` is the stale URL.
+    let target = tmp.path().join("cloned");
+    let executor = test_executor();
+    executor
+        .clone_libgit2(&test_binding(&stale_url), &target, None, true)
+        .await
+        .expect("initial clone from the stale fixture");
+    {
+        let repo = git2::Repository::open(&target).unwrap();
+        let origin = repo.find_remote("origin").unwrap();
+        assert_eq!(
+            origin.url().ok(),
+            Some(stale_url.as_str()),
+            "precondition: origin starts out pointing at the stale fixture"
+        );
+    }
+
+    // Now fetch with a binding that names the OTHER repository.
+    executor
+        .fetch_and_checkout(&test_binding(&fresh_url), &target, None)
+        .await
+        .expect("fetch_and_checkout against a rewritten remote should succeed");
+
+    let repo = git2::Repository::open(&target).unwrap();
+    let origin = repo.find_remote("origin").unwrap();
+    assert_eq!(
+        origin.url().ok(),
+        Some(fresh_url.as_str()),
+        "a stale origin URL must be rewritten to the binding's repo_url"
+    );
+}
+
+/// A checkout with no `origin` at all must have one created. Watches the
+/// `Err(_) => repo.remote(..)` arm, which nothing previously reached.
+#[tokio::test]
+async fn fetch_and_checkout_creates_origin_when_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let url = build_bare_fixture(tmp.path());
+    let target = tmp.path().join("cloned");
+    let executor = test_executor();
+    let binding = test_binding(&url);
+
+    executor
+        .clone_libgit2(&binding, &target, None, true)
+        .await
+        .expect("initial clone");
+
+    // Remove origin so the lookup fails.
+    {
+        let repo = git2::Repository::open(&target).unwrap();
+        repo.remote_delete("origin").unwrap();
+        assert!(
+            repo.find_remote("origin").is_err(),
+            "precondition: origin is genuinely absent"
+        );
+    }
+
+    executor
+        .fetch_and_checkout(&binding, &target, None)
+        .await
+        .expect("fetch_and_checkout should recreate a missing origin and succeed");
+
+    let repo = git2::Repository::open(&target).unwrap();
+    let origin = repo
+        .find_remote("origin")
+        .expect("origin must have been recreated");
+    assert_eq!(
+        origin.url().ok(),
+        Some(url.as_str()),
+        "the recreated origin must point at the binding's repo_url"
+    );
+}

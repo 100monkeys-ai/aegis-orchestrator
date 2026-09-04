@@ -632,6 +632,157 @@ async fn push_to_local_bare_remote_succeeds() {
     assert_eq!(bare_head, work_head, "bare remote advanced to new HEAD");
 }
 
+/// Settles, by running it rather than by reading libgit2, what a detached HEAD
+/// actually does on the `ref_name: None` push path.
+///
+/// `blocking_push` resolves the ref from `repo.head()?.shorthand()`, and the
+/// doc comment used to claim a detached HEAD produced
+/// `GitRepoError::NoHeadBranch`. It does not: libgit2's `git_repository_head`
+/// returns the direct `HEAD` reference when HEAD is detached, and
+/// `git_reference__shorthand` returns the full name when no `refs/` prefix
+/// matches, so the shorthand is the literal string "HEAD". The push therefore
+/// proceeds and pushes a ref named `HEAD`.
+///
+/// This test asserts the discriminant, not a message, so it distinguishes
+/// "no head branch" from "git failed" from "succeeded". If the behaviour is
+/// ever corrected to return `NoHeadBranch`, this test fails and says so, which
+/// is the point: it is the instrument that decides whether the variant has a
+/// producer.
+#[tokio::test]
+async fn push_with_detached_head_reports_which_error() {
+    let fx = build_fixture();
+    let tenant = TenantId::consumer();
+
+    let (binding, workdir) = ready_binding(&fx, "alice", "canvas-detached").await;
+
+    // A real local bare remote, so any failure is about HEAD rather than
+    // about the remote being unreachable.
+    let bare_dir = fx._tmp.path().join("detached-fixture.git");
+    let src_url = format!("file://{}", workdir.display());
+    clone_as_bare(&src_url, &bare_dir);
+    let bare_url = format!("file://{}", bare_dir.display());
+
+    let repo = git2::Repository::open(&workdir).unwrap();
+    let _ = repo.remote_delete("origin");
+    repo.remote("origin", &bare_url).unwrap();
+
+    // Detach HEAD at the current commit.
+    let head_oid = repo.head().unwrap().target().unwrap();
+    repo.set_head_detached(head_oid).unwrap();
+    assert!(
+        repo.head_detached().unwrap(),
+        "precondition: HEAD is genuinely detached"
+    );
+    assert_eq!(
+        repo.head().unwrap().shorthand().ok(),
+        Some("HEAD"),
+        "precondition: libgit2 reports the shorthand of a detached HEAD as \"HEAD\", \
+         which is why NoHeadBranch has no producer on this path"
+    );
+
+    let res = fx
+        .service
+        .push(&binding.id, &tenant, "alice", None, None)
+        .await;
+
+    assert!(
+        !matches!(res, Err(GitRepoError::NoHeadBranch)),
+        "NoHeadBranch has no producer on this path; a detached HEAD does not \
+         reach it. If this now fires, the behaviour was corrected and the \
+         known-defects row for it should be closed. Got {res:?}"
+    );
+    // What actually happens: the ref resolves to the literal "HEAD", the
+    // refspec becomes `refs/heads/HEAD:refs/heads/HEAD`, and no such local ref
+    // exists, so libgit2 refuses and the user gets `GitFailed` (HTTP 502) for a
+    // condition the code intended to report as `NoHeadBranch` (HTTP 400).
+    assert!(
+        matches!(res, Err(GitRepoError::GitFailed(_))),
+        "a detached HEAD surfaces as GitFailed, because the ref resolves to \
+         \"HEAD\" and there is no refs/heads/HEAD to push; got {res:?}"
+    );
+}
+
+/// Watches the one line git2 0.21 actually forced a decision on: what a failing
+/// `Reference::shorthand()` maps to.
+///
+/// That call fails on exactly one condition in both 0.20 and 0.21 — the
+/// reference name is not valid UTF-8 — and the old code mapped it to
+/// `NoHeadBranch`, reporting a git failure as "no current branch" (HTTP 400)
+/// instead of "git operation failed" (HTTP 502). Nothing in the suite reached
+/// that branch, so the change would otherwise have shipped unwatched: the
+/// detached-HEAD test above exercises `shorthand()` SUCCEEDING.
+///
+/// The state is built at the byte level because no libgit2 API will create it:
+/// a loose ref file whose *name* contains 0xFF, and a `HEAD` pointing at it.
+#[cfg(unix)]
+#[tokio::test]
+async fn push_with_a_non_utf8_ref_name_reports_git_failed_not_no_head_branch() {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let fx = build_fixture();
+    let tenant = TenantId::consumer();
+
+    let (binding, workdir) = ready_binding(&fx, "alice", "canvas-bad-refname").await;
+
+    // A real reachable remote, so a failure cannot be about the remote.
+    let bare_dir = fx._tmp.path().join("badref-fixture.git");
+    let src_url = format!("file://{}", workdir.display());
+    clone_as_bare(&src_url, &bare_dir);
+    let bare_url = format!("file://{}", bare_dir.display());
+    let head_oid = {
+        let repo = git2::Repository::open(&workdir).unwrap();
+        let _ = repo.remote_delete("origin");
+        repo.remote("origin", &bare_url).unwrap();
+        let oid = repo.head().unwrap().target().unwrap();
+        oid
+    };
+
+    // Point HEAD at a branch whose name is not valid UTF-8.
+    let gitdir = workdir.join(".git");
+    let mut refname = b"refs/heads/br".to_vec();
+    refname.push(0xFF);
+    let refpath = gitdir.join(std::ffi::OsString::from_vec(refname.clone()));
+    std::fs::create_dir_all(refpath.parent().unwrap()).unwrap();
+    std::fs::write(&refpath, format!("{head_oid}\n")).unwrap();
+    let mut head_file = std::fs::File::create(gitdir.join("HEAD")).unwrap();
+    head_file.write_all(b"ref: ").unwrap();
+    head_file.write_all(&refname).unwrap();
+    head_file.write_all(b"\n").unwrap();
+    drop(head_file);
+
+    // Precondition: the state really does make `shorthand()` fail, and it fails
+    // for the reason this test is about. Expressed in terms the mapping under
+    // test does not touch.
+    {
+        let repo = git2::Repository::open(&workdir).unwrap();
+        let head = repo.head().expect("HEAD still resolves");
+        let err = head
+            .shorthand()
+            .expect_err("precondition: shorthand must fail on a non-UTF-8 name");
+        assert!(
+            err.message().contains("invalid utf-8"),
+            "precondition: the failure must be the UTF-8 one; got {err}"
+        );
+    }
+
+    let res = fx
+        .service
+        .push(&binding.id, &tenant, "alice", None, None)
+        .await;
+
+    assert!(
+        !matches!(res, Err(GitRepoError::NoHeadBranch)),
+        "a non-UTF-8 reference name is a git failure, not a detached HEAD; \
+         mapping it to NoHeadBranch reports HTTP 400 for an HTTP 502 condition. \
+         Got {res:?}"
+    );
+    assert!(
+        matches!(res, Err(GitRepoError::GitFailed(_))),
+        "a non-UTF-8 reference name must surface as GitFailed; got {res:?}"
+    );
+}
+
 #[tokio::test]
 async fn push_with_bad_remote_fails_cleanly() {
     let fx = build_fixture();

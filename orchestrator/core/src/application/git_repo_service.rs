@@ -178,6 +178,18 @@ pub enum GitRepoError {
 
     /// Canvas git-write: HEAD is detached (no current branch), so `push`
     /// cannot auto-resolve a ref_name. Maps to HTTP `400 Bad Request`.
+    ///
+    /// **This variant currently has no producer**, and that is a recorded
+    /// defect rather than an oversight in this file. `blocking_push` used to
+    /// reach it from `Reference::shorthand()` returning `None`, but libgit2
+    /// returns the direct `HEAD` reference for a detached head and its
+    /// shorthand is the string `"HEAD"`, so the branch never fired; the only
+    /// thing that produced `None` there was a non-UTF-8 reference name, which
+    /// is a git failure and is now reported as [`Self::GitFailed`]. Making a
+    /// detached head actually reach this variant needs an explicit
+    /// `Repository::head_detached()` check and changes the HTTP status a client
+    /// sees, so it is left to the owner. Pinned by
+    /// `push_with_detached_head_reports_which_error`.
     #[error("repository HEAD is detached; no current branch to push")]
     NoHeadBranch,
 
@@ -711,7 +723,7 @@ impl GitRepoService {
     ///
     /// Defaults: `remote = "origin"`. When `ref_name` is `None` we read
     /// the working tree's current branch via
-    /// `repo.head()?.shorthand()?`. Detached HEAD → [`GitRepoError::NoHeadBranch`].
+    /// `repo.head()?.shorthand()?`. A non-UTF-8 reference name → [`GitRepoError::GitFailed`].
     #[instrument(skip(self), fields(binding_id = %id, owner = %owner))]
     pub async fn push(
         &self,
@@ -1177,8 +1189,8 @@ fn blocking_commit(
 
 /// Blocking libgit2 push against `target_dir`.
 ///
-/// Resolves `ref_name` to the current branch when `None`. Detached HEAD
-/// returns [`GitRepoError::NoHeadBranch`]. Credentials map the
+/// Resolves `ref_name` to the shorthand of HEAD when `None`; a reference name
+/// that is not valid UTF-8 returns [`GitRepoError::GitFailed`]. Credentials map the
 /// [`ResolvedCredential`] surface onto the libgit2 callback — HTTPS-PAT
 /// via `Cred::userpass_plaintext`, SSH via the shared
 /// [`attach_ssh_credentials`] helper (mode-`0600` tempfile, zeroize-on-
@@ -1195,8 +1207,18 @@ fn blocking_push(
 
     let repo = Repository::open(target_dir).map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
 
-    // Resolve the ref to push: explicit value wins, else current
-    // branch. Detached HEAD (no shorthand) is a hard error.
+    // Resolve the ref to push: explicit value wins, else the shorthand of
+    // whatever HEAD resolves to.
+    //
+    // `Reference::shorthand()` fails on exactly one condition — the reference
+    // name is not valid UTF-8 — in git2 0.20 (`None`) and 0.21 (`Err`) alike.
+    // It does NOT fail on a detached HEAD: libgit2's `git_repository_head`
+    // returns the direct `HEAD` reference in that case and
+    // `git_reference__shorthand` returns the full name when no `refs/` prefix
+    // matches, so the shorthand is the string "HEAD". The previous code mapped
+    // this failure to `NoHeadBranch`, which reported every such git failure as
+    // "no current branch"; a UTF-8 failure is a git failure and is reported as
+    // one. See the arc note on `NoHeadBranch` having no producer on this path.
     let resolved_ref = match ref_name {
         Some(r) => r,
         None => {
@@ -1204,7 +1226,7 @@ fn blocking_push(
                 .head()
                 .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
             head.shorthand()
-                .ok_or(GitRepoError::NoHeadBranch)?
+                .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
                 .to_string()
         }
     };

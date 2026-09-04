@@ -56,23 +56,6 @@
 # Re-check on: the next lock regeneration — run `cargo tree -i spin` and see
 # whether flume, lazy_static or multer has released a version that has moved
 # off 0.9.8.
-#
-# NOT AN IGNORE ENTRY, DELIBERATELY: git2 0.20.4.
-# RUSTSEC-2026-0183 (null pointer to `slice::from_raw_parts` in `Remote::list()`)
-# and RUSTSEC-2026-0184 (`Signature`s built on null pointers from a
-# buffer-created `BlameHunk`). Both are `unsound`, so neither gates this check.
-# BOTH HAVE A FIX: git2 >= 0.21.0. It is not taken yet because 0.21 changes
-# `Remote::url()` and `Reference::shorthand()` from `Option<&str>` to
-# `Result<&str, git2::Error>`, and the two call sites
-# (`git_clone_executor.rs:868`, `git_repo_service.rs:1207`) need a decision
-# about what an `Err` means, not a mechanical edit — one of them governs whether
-# a repository is re-cloned.
-# These are deliberately NOT added to `ignore` below. An advisory with an
-# available fix should keep showing up in every audit run until it is taken;
-# silencing it would turn "not done yet" into "gone". Only advisories with no
-# fix in existence are ignored here.
-# Re-check on: any work touching git clone or repo services — take the 0.21
-# migration with it.
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2026-0098",

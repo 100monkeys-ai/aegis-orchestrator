@@ -865,7 +865,15 @@ fn blocking_fetch_and_checkout(
         let origin = repo.find_remote("origin");
         match origin {
             Ok(r) => {
-                if r.url() != Some(repo_url) {
+                // git2 0.21 changed `Remote::url()` from `Option<&str>` to
+                // `Result<&str, git2::Error>`. The condition is unchanged:
+                // `url_bytes()` is identical in both versions and returns `&[]`
+                // for an unset url, so 0.20's `None` and 0.21's `Err` denote the
+                // same single case — the bytes are not UTF-8 — and `.ok()` maps
+                // it back. Every remote state produces the same branch as before:
+                // matching url -> no rewrite; differing, unset, or non-UTF-8 ->
+                // rewrite.
+                if r.url().ok() != Some(repo_url) {
                     drop(r);
                     repo.remote_set_url("origin", repo_url)?;
                 }
