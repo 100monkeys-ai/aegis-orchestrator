@@ -1,12 +1,81 @@
 # Cargo audit configuration
 # See: https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# EVERY ENTRY BELOW IS A RECORDED ACCEPTANCE, NOT A FIX. The advisory is still
+# true of this lockfile; we have decided to carry it. Each entry therefore
+# carries three things and is not valid without all three: the advisory id, the
+# reason it is being carried, and a RE-CHECK TRIGGER written as something a
+# person or a script can actually evaluate. "Revisit later" is not a trigger.
+#
+# An entry whose trigger has fired is removed and the advisory dealt with, not
+# re-justified. If you are adding an entry, add the trigger in the same edit.
 
 [advisories]
-# RUSTSEC-2023-0071: rsa timing sidechannel (Marvin Attack)
-# This is a transitive dependency via sqlx-mysql. We only use PostgreSQL,
-# so this crate is never exercised. No fix is available upstream.
+# RUSTSEC-2023-0071 — rsa: Marvin Attack timing sidechannel.
+# Reason: transitive via sqlx-mysql. This workspace uses PostgreSQL only
+# (`sqlx` features are runtime-tokio, postgres, uuid, chrono), so the MySQL
+# authentication path that reaches `rsa` is never compiled into a running
+# binary. No fixed version exists upstream.
+# Re-check when: `cargo tree -i rsa` shows a path that does not pass through
+# sqlx-mysql, or the `mysql` feature is enabled on sqlx anywhere in the
+# workspace, or the advisory gains a patched version.
 #
-# RUSTSEC-2026-0098, RUSTSEC-2026-0099: rustls-webpki name constraint issues
-# Transitive via async-stripe → hyper-rustls 0.24 → rustls 0.21 → rustls-webpki 0.101.
-# Requires misissuance to exploit. Fix depends on async-stripe upgrading their TLS stack.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0098", "RUSTSEC-2026-0099"]
+# RUSTSEC-2026-0098, RUSTSEC-2026-0099 — rustls-webpki: name-constraint issues.
+# Reason: transitive via async-stripe -> hyper-rustls 0.24 -> rustls 0.21 ->
+# rustls-webpki 0.101. Exploitation requires a misissued certificate from a
+# trusted CA. The fix is not ours to make: it depends on async-stripe moving
+# its TLS stack off rustls 0.21.
+# Re-check when: async-stripe publishes a release depending on hyper-rustls
+# >= 0.25 (equivalently, when `cargo tree -i rustls-webpki` no longer shows a
+# 0.101.x), or on any bump of the async-stripe dependency.
+#
+# RUSTSEC-2025-0141 — bincode 1.3.3: unmaintained.
+# Reason: NO FIX EXISTS. The bincode team ceased development permanently and
+# considers 1.3.3 complete; there will be no 1.3.4. This is an unmaintained
+# warning, not a vulnerability — no exploit is described. `bincode` is a direct
+# dependency of aegis-orchestrator-core. Replacing it (the advisory names
+# wincode, postcard, bitcode, rkyv) changes the on-disk and on-wire encoding of
+# everything currently serialised with it, which is a behaviour change and a
+# decision rather than a version bump. It is recorded as a decision to be made,
+# with its ripening clause, on the AEGIS ADR backlog:
+# https://100monkeys-ai.cortex.page/aegis-architecture/p/adrs/backlog/index
+# Re-check when: any direct dependency drops bincode (evaluate with
+# `cargo tree -i bincode` showing only aegis-orchestrator-core), or the backlog
+# row ripens and a replacement decision is recorded, or the crate is adopted by
+# a new maintainer and publishes above 1.3.3.
+#
+# NOT AN IGNORE ENTRY, AND IT CANNOT BE ONE: spin 0.9.8.
+# `spin` 0.9.8 was yanked from crates.io. cargo-audit reports a yanked crate as
+# a warning with a NULL advisory, so it has no RUSTSEC id and there is nothing
+# to put in `ignore` — the list below is keyed by advisory id. It does not gate
+# the check either. It is recorded here because a yanked dependency that nobody
+# wrote down is one nobody looks at again.
+# Reason: reached only transitively, through flume, lazy_static and multer.
+# Nothing in this workspace depends on it directly, so there is no declaration
+# here to change; it moves when one of those three moves.
+# Re-check on: the next lock regeneration — run `cargo tree -i spin` and see
+# whether flume, lazy_static or multer has released a version that has moved
+# off 0.9.8.
+#
+# NOT AN IGNORE ENTRY, DELIBERATELY: git2 0.20.4.
+# RUSTSEC-2026-0183 (null pointer to `slice::from_raw_parts` in `Remote::list()`)
+# and RUSTSEC-2026-0184 (`Signature`s built on null pointers from a
+# buffer-created `BlameHunk`). Both are `unsound`, so neither gates this check.
+# BOTH HAVE A FIX: git2 >= 0.21.0. It is not taken yet because 0.21 changes
+# `Remote::url()` and `Reference::shorthand()` from `Option<&str>` to
+# `Result<&str, git2::Error>`, and the two call sites
+# (`git_clone_executor.rs:868`, `git_repo_service.rs:1207`) need a decision
+# about what an `Err` means, not a mechanical edit — one of them governs whether
+# a repository is re-cloned.
+# These are deliberately NOT added to `ignore` below. An advisory with an
+# available fix should keep showing up in every audit run until it is taken;
+# silencing it would turn "not done yet" into "gone". Only advisories with no
+# fix in existence are ignored here.
+# Re-check on: any work touching git clone or repo services — take the 0.21
+# migration with it.
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2025-0141",
+]
