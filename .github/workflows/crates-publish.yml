@@ -28,11 +28,11 @@ jobs:
     name: Verify build and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -43,10 +43,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
+        with:
+          toolchain: "1.98.1"
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: aegis-orchestrator -> target
 
@@ -64,11 +66,11 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -79,10 +81,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
+        with:
+          toolchain: "1.98.1"
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: aegis-orchestrator -> target
 
@@ -120,11 +124,11 @@ jobs:
     needs: publish-core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -135,10 +139,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
+        with:
+          toolchain: "1.98.1"
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: aegis-orchestrator -> target
 
@@ -161,11 +167,11 @@ jobs:
     needs: publish-core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -176,10 +182,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
+        with:
+          toolchain: "1.98.1"
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: aegis-orchestrator -> target
 
@@ -202,11 +210,11 @@ jobs:
     needs: [publish-sdk, publish-swarm]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -217,10 +225,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
+        with:
+          toolchain: "1.98.1"
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: aegis-orchestrator -> target
 
@@ -242,11 +252,11 @@ jobs:
     runs-on: ubuntu-latest
     # This job documents the docs.rs publishing (happens automatically after crates.io publish)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: aegis-orchestrator
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
@@ -257,10 +267,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
+        with:
+          toolchain: "1.98.1"
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: aegis-orchestrator -> target
 
