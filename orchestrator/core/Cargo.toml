@@ -86,7 +86,7 @@ opendal = "0.55.0"
 vaultrs = "0.7"
 
 # Secrets Manager (ADR-034)
-lru = "0.16"
+lru = "0.18"
 
 # Git Repository Volumes (ADR-081).
 # Vendored features keep the build self-contained and consistent with the
