@@ -1554,12 +1554,23 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             validate_oauth_provider_registry(&registry)
                 .context("OAuth provider registry failed startup validation")?;
             let oauth_providers = Arc::new(registry);
-            Some(Arc::new(StandardCredentialManagementService::new(
-                repo,
-                secrets_manager.clone(),
-                event_bus.clone(),
-                oauth_providers,
-            )) as Arc<dyn CredentialManagementService>)
+            // Team-scoped bindings are authorised against ADR-111
+            // memberships (security audit 003 F-1).
+            let memberships = Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PgMembershipRepository::new(
+                    pool.clone(),
+                ),
+            )
+                as Arc<dyn aegis_orchestrator_core::domain::team::MembershipRepository>;
+            Some(Arc::new(
+                StandardCredentialManagementService::new(
+                    repo,
+                    secrets_manager.clone(),
+                    event_bus.clone(),
+                    oauth_providers,
+                )
+                .with_membership_repo(memberships),
+            ) as Arc<dyn CredentialManagementService>)
         }
     };
 

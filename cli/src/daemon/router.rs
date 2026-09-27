@@ -48,10 +48,9 @@ use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
 use crate::daemon::handlers::credentials::{
-    add_grant_handler, delete_secret_handler, device_poll_handler, get_credential_handler,
-    get_secret_handler, list_credentials_handler, list_grants_handler, list_secrets_handler,
-    oauth_callback_handler, oauth_initiate_handler, revoke_credential_handler,
-    revoke_grant_handler, rotate_credential_handler, store_api_key_handler, write_secret_handler,
+    credentials_by_id_router, delete_secret_handler, device_poll_handler, get_secret_handler,
+    list_credentials_handler, list_secrets_handler, oauth_callback_handler, oauth_initiate_handler,
+    store_api_key_handler, write_secret_handler, CredentialsByIdState,
 };
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
@@ -250,22 +249,6 @@ pub(crate) fn create_router(
             "/v1/credentials/oauth/device/poll",
             post(device_poll_handler),
         )
-        .route(
-            "/v1/credentials/{id}",
-            get(get_credential_handler).delete(revoke_credential_handler),
-        )
-        .route(
-            "/v1/credentials/{id}/rotate",
-            post(rotate_credential_handler),
-        )
-        .route(
-            "/v1/credentials/{id}/grants",
-            get(list_grants_handler).post(add_grant_handler),
-        )
-        .route(
-            "/v1/credentials/{id}/grants/{grant_id}",
-            delete(revoke_grant_handler),
-        )
         // BC-11 Secrets admin (ADR-034)
         .route("/v1/secrets", get(list_secrets_handler))
         .route(
@@ -399,6 +382,13 @@ pub(crate) fn create_router(
     // middleware stack by the handler tests.
     let router = router.merge(approvals_router(ApprovalsState {
         human_input_service: app_state.human_input_service.clone(),
+    }));
+
+    // Credential bindings by id (ADR-078; security audit 003 F-1), over
+    // their own narrow state so the service-side reach rule is driven
+    // through the real middleware stack by the handler tests.
+    let router = router.merge(credentials_by_id_router(CredentialsByIdState {
+        credential_service: app_state.credential_service.clone(),
     }));
 
     // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed

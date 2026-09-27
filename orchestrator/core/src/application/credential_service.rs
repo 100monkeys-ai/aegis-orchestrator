@@ -27,6 +27,7 @@ use crate::domain::credential::{
 };
 use crate::domain::events::CredentialEvent;
 use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString};
+use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::secrets_manager::SecretsManager;
@@ -268,6 +269,42 @@ pub struct OAuthInitiation {
 }
 
 // ============================================================================
+// Who may reach a binding by id
+// ============================================================================
+
+/// The caller of a by-id credential operation, as the presentation layer
+/// derived it from the authenticated identity.
+///
+/// A binding is reachable by (a) its owner; (b) where its scope is
+/// `team:<uuid>`, an active member of that team to read it, and an active
+/// member with a membership-managing role (owner or admin) to rotate it,
+/// change its grants or revoke it; (c) an operator — every role reads, only
+/// `aegis:admin` and `aegis:operator` write (ADR-073 §3e). Every other
+/// caller gets exactly the answer for a binding that does not exist, so an
+/// id cannot be probed. Security audit 003, finding F-1; ADR-078.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialActor {
+    /// A consumer or tenant-realm user acting as themselves.
+    User {
+        /// Keycloak `sub` of the caller.
+        user_id: String,
+        /// The caller's own tenant, as derived from its identity.
+        tenant_id: TenantId,
+    },
+    /// A platform operator. `may_write` is false for `aegis:readonly`.
+    Operator { may_write: bool },
+}
+
+/// What a by-id operation does to a binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingAccess {
+    /// Read the binding's metadata or its grants.
+    Read,
+    /// Rotate the secret, change the grants, or revoke the binding.
+    Manage,
+}
+
+// ============================================================================
 // Service Trait
 // ============================================================================
 
@@ -315,6 +352,7 @@ pub trait CredentialManagementService: Send + Sync {
     /// The [`CredentialBindingId`] is stable; only the stored secret value changes.
     async fn rotate_credential(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
         new_value: SensitiveString,
     ) -> anyhow::Result<()>;
@@ -324,6 +362,7 @@ pub trait CredentialManagementService: Send + Sync {
     /// Returns the new [`CredentialGrantId`].
     async fn add_grant(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
         target: GrantTarget,
         granted_by: String,
@@ -332,13 +371,18 @@ pub trait CredentialManagementService: Send + Sync {
     /// Revoke a single grant by id.
     async fn revoke_grant(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
         grant_id: &CredentialGrantId,
     ) -> anyhow::Result<()>;
 
     /// Revoke the entire binding: clears all grants, deletes the secret from
     /// OpenBao, and marks the binding `Revoked`.
-    async fn revoke_binding(&self, binding_id: &CredentialBindingId) -> anyhow::Result<()>;
+    async fn revoke_binding(
+        &self,
+        actor: &CredentialActor,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<()>;
 
     /// List all bindings owned by `owner_user_id` within `tenant_id`.
     async fn list_bindings(
@@ -347,9 +391,11 @@ pub trait CredentialManagementService: Send + Sync {
         owner_user_id: &str,
     ) -> anyhow::Result<Vec<UserCredentialBinding>>;
 
-    /// Load a single binding by id, or `None` if not found.
+    /// Load a single binding by id, or `None` if it does not exist or
+    /// `actor` may not read it (see [`CredentialActor`]).
     async fn get_binding(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<Option<UserCredentialBinding>>;
 }
@@ -391,6 +437,10 @@ pub struct StandardCredentialManagementService {
     event_bus: Arc<EventBus>,
     http: reqwest::Client,
     oauth_providers: Arc<OAuthProviderRegistry>,
+    /// Answers "is this caller an active member (or manager) of the team a
+    /// `team:<uuid>` binding is scoped to". `None` denies every team-scope
+    /// reach, leaving owner and operator access.
+    membership_repo: Option<Arc<dyn MembershipRepository>>,
 }
 
 impl StandardCredentialManagementService {
@@ -418,6 +468,7 @@ impl StandardCredentialManagementService {
                 .build()
                 .expect("default reqwest client must build"),
             oauth_providers,
+            membership_repo: None,
         }
     }
 
@@ -437,6 +488,70 @@ impl StandardCredentialManagementService {
             event_bus,
             http,
             oauth_providers,
+            membership_repo: None,
+        }
+    }
+
+    /// Wire the team-membership repository that team-scoped bindings are
+    /// authorised against (ADR-111 memberships).
+    pub fn with_membership_repo(mut self, repo: Arc<dyn MembershipRepository>) -> Self {
+        self.membership_repo = Some(repo);
+        self
+    }
+
+    /// Whether `actor` may perform `access` on `binding`.
+    async fn may_access(
+        &self,
+        actor: &CredentialActor,
+        binding: &UserCredentialBinding,
+        access: BindingAccess,
+    ) -> anyhow::Result<bool> {
+        let (user_id, tenant_id) = match actor {
+            CredentialActor::Operator { may_write } => {
+                return Ok(access == BindingAccess::Read || *may_write)
+            }
+            CredentialActor::User { user_id, tenant_id } => (user_id, tenant_id),
+        };
+        if &binding.owner_user_id == user_id && &binding.tenant_id == tenant_id {
+            return Ok(true);
+        }
+        let CredentialScope::Team { team_id } = binding.scope else {
+            return Ok(false);
+        };
+        let Some(memberships) = self.membership_repo.as_ref() else {
+            return Ok(false);
+        };
+        let member = memberships
+            .find_by_team(&TeamId(team_id))
+            .await
+            .map_err(|e| anyhow!("team membership lookup failed: {e}"))?
+            .into_iter()
+            .find(|m| &m.user_id == user_id && m.status == MembershipStatus::Active);
+        Ok(match (member, access) {
+            (Some(_), BindingAccess::Read) => true,
+            (Some(m), BindingAccess::Manage) => m.role.can_manage_membership(),
+            (None, _) => false,
+        })
+    }
+
+    /// Load `binding_id` for `actor`. A binding that does not exist and one
+    /// the actor may not reach produce the same error, word for word.
+    async fn load_for(
+        &self,
+        actor: &CredentialActor,
+        binding_id: &CredentialBindingId,
+        access: BindingAccess,
+    ) -> anyhow::Result<UserCredentialBinding> {
+        let not_found = || anyhow!("Credential binding not found: {}", binding_id);
+        let binding = self
+            .repo
+            .find_by_id(binding_id)
+            .await?
+            .ok_or_else(not_found)?;
+        if self.may_access(actor, &binding, access).await? {
+            Ok(binding)
+        } else {
+            Err(not_found())
         }
     }
 
@@ -823,14 +938,13 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
     async fn rotate_credential(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
         new_value: SensitiveString,
     ) -> anyhow::Result<()> {
         let binding = self
-            .repo
-            .find_by_id(binding_id)
-            .await?
-            .ok_or_else(|| anyhow!("Credential binding not found: {}", binding_id))?;
+            .load_for(actor, binding_id, BindingAccess::Manage)
+            .await?;
 
         let mut secret_data = HashMap::new();
         secret_data.insert("value".to_string(), new_value);
@@ -858,15 +972,14 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
     async fn add_grant(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
         target: GrantTarget,
         granted_by: String,
     ) -> anyhow::Result<CredentialGrantId> {
         let mut binding = self
-            .repo
-            .find_by_id(binding_id)
-            .await?
-            .ok_or_else(|| anyhow!("Credential binding not found: {}", binding_id))?;
+            .load_for(actor, binding_id, BindingAccess::Manage)
+            .await?;
 
         let grant_id = binding.add_grant(target.clone(), granted_by.clone());
         self.repo.save(&binding).await?;
@@ -888,14 +1001,13 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
     async fn revoke_grant(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
         grant_id: &CredentialGrantId,
     ) -> anyhow::Result<()> {
         let mut binding = self
-            .repo
-            .find_by_id(binding_id)
-            .await?
-            .ok_or_else(|| anyhow!("Credential binding not found: {}", binding_id))?;
+            .load_for(actor, binding_id, BindingAccess::Manage)
+            .await?;
 
         if !binding.revoke_grant(grant_id) {
             return Err(anyhow!("Grant not found: {}", grant_id));
@@ -916,12 +1028,14 @@ impl CredentialManagementService for StandardCredentialManagementService {
     // revoke_binding
     // -----------------------------------------------------------------------
 
-    async fn revoke_binding(&self, binding_id: &CredentialBindingId) -> anyhow::Result<()> {
+    async fn revoke_binding(
+        &self,
+        actor: &CredentialActor,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<()> {
         let mut binding = self
-            .repo
-            .find_by_id(binding_id)
-            .await?
-            .ok_or_else(|| anyhow!("Credential binding not found: {}", binding_id))?;
+            .load_for(actor, binding_id, BindingAccess::Manage)
+            .await?;
 
         let tenant_id = binding.tenant_id.clone();
 
@@ -967,8 +1081,19 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
     async fn get_binding(
         &self,
+        actor: &CredentialActor,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<Option<UserCredentialBinding>> {
-        self.repo.find_by_id(binding_id).await
+        let Some(binding) = self.repo.find_by_id(binding_id).await? else {
+            return Ok(None);
+        };
+        if self
+            .may_access(actor, &binding, BindingAccess::Read)
+            .await?
+        {
+            Ok(Some(binding))
+        } else {
+            Ok(None)
+        }
     }
 }

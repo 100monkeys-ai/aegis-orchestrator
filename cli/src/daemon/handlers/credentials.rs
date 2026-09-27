@@ -10,22 +10,29 @@
 //! |----------------|-------------------|----------------|
 //! | `GET /v1/credentials` | ConsumerUser \| TenantUser | `CredentialList` |
 //! | `POST /v1/credentials/api-keys` | ConsumerUser \| TenantUser | `CredentialCreate` |
-//! | `GET /v1/credentials/{id}` | ConsumerUser \| TenantUser | `CredentialRead` |
-//! | `DELETE /v1/credentials/{id}` | ConsumerUser \| TenantUser | `CredentialDelete` |
-//! | `POST /v1/credentials/{id}/rotate` | ConsumerUser \| TenantUser | `CredentialRotate` |
-//! | `GET /v1/credentials/{id}/grants` | ConsumerUser \| TenantUser | `CredentialRead` |
-//! | `POST /v1/credentials/{id}/grants` | ConsumerUser \| TenantUser | `CredentialGrant` |
-//! | `DELETE /v1/credentials/{id}/grants/{grant_id}` | ConsumerUser \| TenantUser | `CredentialGrant` |
+//! | `GET /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialRead` |
+//! | `DELETE /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialDelete` |
+//! | `POST /v1/credentials/{id}/rotate` | ConsumerUser \| TenantUser \| Operator | `CredentialRotate` |
+//! | `GET /v1/credentials/{id}/grants` | ConsumerUser \| TenantUser \| Operator | `CredentialRead` |
+//! | `POST /v1/credentials/{id}/grants` | ConsumerUser \| TenantUser \| Operator | `CredentialGrant` |
+//! | `DELETE /v1/credentials/{id}/grants/{grant_id}` | ConsumerUser \| TenantUser \| Operator | `CredentialGrant` |
 //! | `POST /v1/credentials/oauth/initiate` | ConsumerUser \| TenantUser | `CredentialCreate` |
 //! | `GET /v1/credentials/oauth/callback` | — (state token) | — |
 //! | `POST /v1/credentials/oauth/device/poll` | ConsumerUser \| TenantUser | `CredentialCreate` |
 //! | `/v1/secrets/*` | Operator \| Admin | — |
 //!
+//! The `{id}` routes additionally pass the caller to the service as a
+//! [`CredentialActor`]; the service decides whether that caller may reach
+//! the binding (owner, member of the team it is scoped to, operator) and
+//! answers everyone else exactly as for a binding that does not exist.
+//!
 //! No business logic lives here — all work is delegated to
 //! `CredentialManagementService` and `SecretsManager`.
 
 use crate::daemon::state::AppState;
-use aegis_orchestrator_core::application::credential_service::StoreApiKeyCommand;
+use aegis_orchestrator_core::application::credential_service::{
+    CredentialActor, CredentialManagementService, StoreApiKeyCommand,
+};
 use aegis_orchestrator_core::domain::api_scope::ApiScope;
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialScope, CredentialType,
@@ -38,7 +45,8 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -87,6 +95,75 @@ fn require_credential_scope(
         )
             .into_response()),
     }
+}
+
+/// Resolve the caller of a by-id credential route into the
+/// [`CredentialActor`] the service authorises, with the caller's `sub`.
+///
+/// A missing identity is 401. Consumer and tenant users act as themselves
+/// in their own tenant; operators act as operators, writing only when their
+/// role is `aegis:admin` or `aegis:operator`; service accounts are refused
+/// as before.
+#[allow(clippy::result_large_err)]
+fn credential_actor(
+    extensions: &axum::http::Extensions,
+) -> Result<(CredentialActor, String), Response> {
+    let identity = extensions.get::<UserIdentity>().ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Authentication required"})),
+        )
+            .into_response()
+    })?;
+    match &identity.identity_kind {
+        IdentityKind::Operator { aegis_role } => Ok((
+            CredentialActor::Operator {
+                may_write: !matches!(aegis_role, AegisRole::Readonly),
+            },
+            identity.sub.clone(),
+        )),
+        _ => {
+            let (user_id, tenant_id) =
+                require_credential_scope(extensions, ApiScope::CredentialRead)?;
+            Ok((
+                CredentialActor::User {
+                    user_id: user_id.clone(),
+                    tenant_id,
+                },
+                user_id,
+            ))
+        }
+    }
+}
+
+/// State of the by-id credential sub-router.
+#[derive(Clone)]
+pub(crate) struct CredentialsByIdState {
+    pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+}
+
+/// The `/v1/credentials/{id}*` routes (ADR-078). Merged into the daemon
+/// router by `router::create_router`, beneath the same authentication
+/// layers as every other route.
+pub(crate) fn credentials_by_id_router(state: CredentialsByIdState) -> Router {
+    Router::new()
+        .route(
+            "/v1/credentials/{id}",
+            get(get_credential_handler).delete(revoke_credential_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/rotate",
+            post(rotate_credential_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/grants",
+            get(list_grants_handler).post(add_grant_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/grants/{grant_id}",
+            axum::routing::delete(revoke_grant_handler),
+        )
+        .with_state(state)
 }
 
 /// Require that the caller holds `Operator` or `Admin` role.
@@ -433,13 +510,14 @@ pub(crate) async fn store_api_key_handler(
 
 /// `GET /v1/credentials/{id}` — fetch a single credential binding.
 pub(crate) async fn get_credential_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<CredentialsByIdState>,
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    if let Err(r) = require_credential_scope(request.extensions(), ApiScope::CredentialRead) {
-        return r;
-    }
+    let (actor, _sub) = match credential_actor(request.extensions()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
     let binding_id = match parse_binding_id(&id) {
         Ok(b) => b,
@@ -457,7 +535,7 @@ pub(crate) async fn get_credential_handler(
         }
     };
 
-    match svc.get_binding(&binding_id).await {
+    match svc.get_binding(&actor, &binding_id).await {
         Ok(Some(binding)) => (StatusCode::OK, Json(json!({"credential": binding}))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -474,13 +552,14 @@ pub(crate) async fn get_credential_handler(
 
 /// `DELETE /v1/credentials/{id}` — revoke a credential binding.
 pub(crate) async fn revoke_credential_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<CredentialsByIdState>,
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    if let Err(r) = require_credential_scope(request.extensions(), ApiScope::CredentialDelete) {
-        return r;
-    }
+    let (actor, _sub) = match credential_actor(request.extensions()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
     let binding_id = match parse_binding_id(&id) {
         Ok(b) => b,
@@ -498,7 +577,7 @@ pub(crate) async fn revoke_credential_handler(
         }
     };
 
-    match svc.revoke_binding(&binding_id).await {
+    match svc.revoke_binding(&actor, &binding_id).await {
         Ok(()) => (StatusCode::OK, Json(json!({"status": "revoked", "id": id}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -510,13 +589,14 @@ pub(crate) async fn revoke_credential_handler(
 
 /// `POST /v1/credentials/{id}/rotate` — rotate the underlying secret value.
 pub(crate) async fn rotate_credential_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<CredentialsByIdState>,
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    if let Err(r) = require_credential_scope(request.extensions(), ApiScope::CredentialRotate) {
-        return r;
-    }
+    let (actor, _sub) = match credential_actor(request.extensions()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
     let binding_id = match parse_binding_id(&id) {
         Ok(b) => b,
@@ -557,7 +637,7 @@ pub(crate) async fn rotate_credential_handler(
     };
 
     match svc
-        .rotate_credential(&binding_id, SensitiveString::new(&payload.value))
+        .rotate_credential(&actor, &binding_id, SensitiveString::new(&payload.value))
         .await
     {
         Ok(()) => (StatusCode::OK, Json(json!({"status": "rotated", "id": id}))).into_response(),
@@ -571,13 +651,14 @@ pub(crate) async fn rotate_credential_handler(
 
 /// `GET /v1/credentials/{id}/grants` — list grants for a binding.
 pub(crate) async fn list_grants_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<CredentialsByIdState>,
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    if let Err(r) = require_credential_scope(request.extensions(), ApiScope::CredentialRead) {
-        return r;
-    }
+    let (actor, _sub) = match credential_actor(request.extensions()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
     let binding_id = match parse_binding_id(&id) {
         Ok(b) => b,
@@ -595,7 +676,7 @@ pub(crate) async fn list_grants_handler(
         }
     };
 
-    match svc.get_binding(&binding_id).await {
+    match svc.get_binding(&actor, &binding_id).await {
         Ok(Some(binding)) => {
             let count = binding.grants.len();
             (
@@ -622,15 +703,14 @@ pub(crate) async fn list_grants_handler(
 
 /// `POST /v1/credentials/{id}/grants` — add a grant to a binding.
 pub(crate) async fn add_grant_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<CredentialsByIdState>,
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    let (user_id, _tenant_id) =
-        match require_credential_scope(request.extensions(), ApiScope::CredentialGrant) {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
+    let (actor, user_id) = match credential_actor(request.extensions()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
     let binding_id = match parse_binding_id(&id) {
         Ok(b) => b,
@@ -675,7 +755,7 @@ pub(crate) async fn add_grant_handler(
         }
     };
 
-    match svc.add_grant(&binding_id, target, user_id).await {
+    match svc.add_grant(&actor, &binding_id, target, user_id).await {
         Ok(grant_id) => (
             StatusCode::CREATED,
             Json(json!({"grant_id": grant_id.to_string()})),
@@ -691,13 +771,14 @@ pub(crate) async fn add_grant_handler(
 
 /// `DELETE /v1/credentials/{id}/grants/{grant_id}` — revoke a single grant.
 pub(crate) async fn revoke_grant_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<CredentialsByIdState>,
     Path((id, grant_id_str)): Path<(String, String)>,
     request: axum::extract::Request,
 ) -> Response {
-    if let Err(r) = require_credential_scope(request.extensions(), ApiScope::CredentialGrant) {
-        return r;
-    }
+    let (actor, _sub) = match credential_actor(request.extensions()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
     let binding_id = match parse_binding_id(&id) {
         Ok(b) => b,
@@ -720,7 +801,7 @@ pub(crate) async fn revoke_grant_handler(
         }
     };
 
-    match svc.revoke_grant(&binding_id, &grant_id).await {
+    match svc.revoke_grant(&actor, &binding_id, &grant_id).await {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({"status": "revoked", "grant_id": grant_id_str})),
@@ -1088,5 +1169,469 @@ pub(crate) async fn delete_secret_handler(
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Who may reach a credential binding by id (ADR-078; security audit
+    //! 003 F-1): its owner; for a `team:<uuid>` binding, an active member of
+    //! that team to read and an active owner or admin of it to manage; an
+    //! operator, reading at every role and writing only as `aegis:admin` or
+    //! `aegis:operator`. Everyone else is answered exactly as for a binding
+    //! that does not exist. Driven through the daemon's real authentication
+    //! stack against the real `StandardCredentialManagementService`, with
+    //! in-memory binding and membership stores.
+
+    use super::{credentials_by_id_router, CredentialsByIdState};
+    use crate::daemon::handlers::test_support::{
+        consumer, identity_provider, operator, send, serve, tenant_user,
+    };
+    use aegis_orchestrator_core::application::credential_service::{
+        CredentialActor, CredentialManagementService, OAuthProviderRegistry,
+        StandardCredentialManagementService, StoreApiKeyCommand,
+    };
+    use aegis_orchestrator_core::domain::credential::{
+        CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialProvider,
+        CredentialScope, CredentialType, GrantTarget, OAuthPendingState, UserCredentialBinding,
+    };
+    use aegis_orchestrator_core::domain::iam::{AegisRole, UserIdentity};
+    use aegis_orchestrator_core::domain::repository::RepositoryError;
+    use aegis_orchestrator_core::domain::secrets::SensitiveString;
+    use aegis_orchestrator_core::domain::team::{
+        Membership, MembershipRepository, MembershipRole, MembershipStatus, TeamId,
+    };
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::secrets_manager::{
+        SecretsManager, TestSecretStore,
+    };
+    use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[derive(Default)]
+    struct InMemoryBindings {
+        rows: RwLock<HashMap<CredentialBindingId, UserCredentialBinding>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialBindingRepository for InMemoryBindings {
+        async fn save(&self, binding: &UserCredentialBinding) -> anyhow::Result<()> {
+            self.rows.write().await.insert(binding.id, binding.clone());
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            id: &CredentialBindingId,
+        ) -> anyhow::Result<Option<UserCredentialBinding>> {
+            Ok(self.rows.read().await.get(id).cloned())
+        }
+        async fn find_by_owner(
+            &self,
+            tenant_id: &TenantId,
+            owner_user_id: &str,
+        ) -> anyhow::Result<Vec<UserCredentialBinding>> {
+            Ok(self
+                .rows
+                .read()
+                .await
+                .values()
+                .filter(|b| &b.tenant_id == tenant_id && b.owner_user_id == owner_user_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_active_grants_for_target(
+            &self,
+            _tenant_id: &TenantId,
+            _owner_user_id: &str,
+            _provider: &CredentialProvider,
+            _target: &GrantTarget,
+        ) -> anyhow::Result<Vec<CredentialGrant>> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, id: &CredentialBindingId) -> anyhow::Result<()> {
+            self.rows.write().await.remove(id);
+            Ok(())
+        }
+        async fn save_oauth_state(
+            &self,
+            _state: &str,
+            _binding_id: &CredentialBindingId,
+            _pkce_verifier: &str,
+            _redirect_uri: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_oauth_state(
+            &self,
+            _state: &str,
+        ) -> anyhow::Result<Option<OAuthPendingState>> {
+            Ok(None)
+        }
+        async fn delete_oauth_state(&self, _state: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_expired_oauth_states(
+            &self,
+            _older_than: DateTime<Utc>,
+        ) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[derive(Default)]
+    struct InMemoryMemberships {
+        rows: RwLock<Vec<Membership>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MembershipRepository for InMemoryMemberships {
+        async fn save(&self, membership: &Membership) -> Result<(), RepositoryError> {
+            self.rows.write().await.push(membership.clone());
+            Ok(())
+        }
+        async fn find_by_team(&self, team_id: &TeamId) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .rows
+                .read()
+                .await
+                .iter()
+                .filter(|m| &m.team_id == team_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_by_user(&self, user_id: &str) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .rows
+                .read()
+                .await
+                .iter()
+                .filter(|m| m.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn find_active_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<Membership>, RepositoryError> {
+            Ok(self
+                .find_by_user(user_id)
+                .await?
+                .into_iter()
+                .filter(|m| m.status == MembershipStatus::Active)
+                .collect())
+        }
+        async fn find_active_team_tenants_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<String>, RepositoryError> {
+            Ok(Vec::new())
+        }
+        async fn is_active_member(
+            &self,
+            user_id: &str,
+            team_id: &TeamId,
+        ) -> Result<bool, RepositoryError> {
+            Ok(self
+                .find_by_team(team_id)
+                .await?
+                .iter()
+                .any(|m| m.user_id == user_id && m.status == MembershipStatus::Active))
+        }
+        async fn count_active(&self, team_id: &TeamId) -> Result<u32, RepositoryError> {
+            Ok(self
+                .find_by_team(team_id)
+                .await?
+                .iter()
+                .filter(|m| m.status == MembershipStatus::Active)
+                .count() as u32)
+        }
+        async fn revoke(&self, _team_id: &TeamId, _user_id: &str) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    const OWNER: &str = "binding-owner-sub";
+    const SCOPES: &str = "credential:read credential:delete credential:rotate credential:grant";
+
+    struct Fixture {
+        base: String,
+        bindings: Arc<InMemoryBindings>,
+        binding_id: CredentialBindingId,
+        grant_id: String,
+    }
+
+    /// One binding owned by `OWNER`, scoped as `scope`, carrying one grant;
+    /// the team (when there is one) has an active member and an active admin.
+    async fn fixture(scope: CredentialScope, callers: &[(&str, UserIdentity)]) -> Fixture {
+        let bindings = Arc::new(InMemoryBindings::default());
+        let memberships = Arc::new(InMemoryMemberships::default());
+        if let CredentialScope::Team { team_id } = scope {
+            for (user, role) in [
+                ("team-member-sub", MembershipRole::Member),
+                ("team-admin-sub", MembershipRole::Admin),
+            ] {
+                memberships
+                    .save(&Membership::new_active(TeamId(team_id), user.into(), role))
+                    .await
+                    .expect("seed membership");
+            }
+        }
+        let event_bus = Arc::new(EventBus::new(16));
+        let service = Arc::new(
+            StandardCredentialManagementService::new(
+                bindings.clone(),
+                Arc::new(SecretsManager::from_store(
+                    Arc::new(TestSecretStore::new()),
+                    event_bus.clone(),
+                )),
+                event_bus,
+                Arc::new(OAuthProviderRegistry::new()),
+            )
+            .with_membership_repo(memberships),
+        );
+        let owner_tenant = TenantId::for_consumer_user(OWNER).expect("owner tenant");
+        let binding_id = service
+            .store_api_key(StoreApiKeyCommand {
+                owner_user_id: OWNER.into(),
+                tenant_id: owner_tenant.clone(),
+                provider: CredentialProvider::OpenAI,
+                label: "owner's key".into(),
+                scope,
+                api_key_value: SensitiveString::new("sk-original"),
+                credential_type: CredentialType::Secret,
+            })
+            .await
+            .expect("seed binding");
+        let grant_id = service
+            .add_grant(
+                &CredentialActor::User {
+                    user_id: OWNER.into(),
+                    tenant_id: owner_tenant,
+                },
+                &binding_id,
+                GrantTarget::AllAgents,
+                OWNER.into(),
+            )
+            .await
+            .expect("seed grant")
+            .to_string();
+        let rows: Vec<(&str, UserIdentity, &str)> = callers
+            .iter()
+            .map(|(token, id)| (*token, id.clone(), SCOPES))
+            .collect();
+        let base = serve(
+            credentials_by_id_router(CredentialsByIdState {
+                credential_service: Some(service as Arc<dyn CredentialManagementService>),
+            }),
+            Some(identity_provider(&rows)),
+            None,
+        )
+        .await;
+        Fixture {
+            base,
+            bindings,
+            binding_id,
+            grant_id,
+        }
+    }
+
+    /// The six by-id operations: (label, manages?, method, path suffix, body).
+    fn operations() -> Vec<(
+        &'static str,
+        bool,
+        reqwest::Method,
+        String,
+        Option<serde_json::Value>,
+    )> {
+        vec![
+            (
+                "read binding",
+                false,
+                reqwest::Method::GET,
+                String::new(),
+                None,
+            ),
+            (
+                "list grants",
+                false,
+                reqwest::Method::GET,
+                "/grants".into(),
+                None,
+            ),
+            (
+                "rotate",
+                true,
+                reqwest::Method::POST,
+                "/rotate".into(),
+                Some(serde_json::json!({ "value": "sk-attacker" })),
+            ),
+            (
+                "add grant",
+                true,
+                reqwest::Method::POST,
+                "/grants".into(),
+                Some(serde_json::json!({ "target_type": "all_agents" })),
+            ),
+            (
+                "revoke grant",
+                true,
+                reqwest::Method::DELETE,
+                "/grants/{grant}".to_string(),
+                None,
+            ),
+            (
+                "revoke binding",
+                true,
+                reqwest::Method::DELETE,
+                String::new(),
+                None,
+            ),
+        ]
+    }
+
+    /// Run every operation as every caller on a fresh fixture and compare
+    /// the answer with `expect(caller, manages)`: `true` means served,
+    /// `false` means answered as for a binding that does not exist.
+    async fn check(
+        scope: CredentialScope,
+        callers: &[(&str, UserIdentity, bool, bool)],
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        let tokens: Vec<(&str, UserIdentity)> = callers
+            .iter()
+            .map(|(t, id, _, _)| (*t, id.clone()))
+            .collect();
+        for (token, _, may_read, may_manage) in callers {
+            for (label, manages, method, suffix, body) in operations() {
+                let fx = fixture(scope.clone(), &tokens).await;
+                let suffix = suffix.replace("{grant}", &fx.grant_id);
+                let (status, answer) = send(
+                    &fx.base,
+                    &method,
+                    &format!("/v1/credentials/{}{suffix}", fx.binding_id.0),
+                    &body,
+                    Some(token),
+                )
+                .await;
+                let allowed = if manages { *may_manage } else { *may_read };
+                let after = fx
+                    .bindings
+                    .find_by_id(&fx.binding_id)
+                    .await
+                    .expect("read store");
+                if allowed {
+                    if !(200..300).contains(&status) {
+                        failures.push(format!(
+                            "{label} by {token} answered {status} {answer}; expected success"
+                        ));
+                    }
+                    continue;
+                }
+                // Refused: the same answer as for an id that was never issued,
+                // and the binding untouched.
+                let missing = uuid::Uuid::new_v4();
+                let (m_status, m_answer) = send(
+                    &fx.base,
+                    &method,
+                    &format!("/v1/credentials/{missing}{}", suffix),
+                    &body,
+                    Some(token),
+                )
+                .await;
+                let normalise = |v: &serde_json::Value, id: &str| v.to_string().replace(id, "<id>");
+                if status != m_status
+                    || normalise(&answer, &fx.binding_id.0.to_string())
+                        != normalise(&m_answer, &missing.to_string())
+                {
+                    failures.push(format!(
+                        "{label} by {token} answered {status} {answer}, but a missing binding answers {m_status} {m_answer}"
+                    ));
+                }
+                match after {
+                    Some(b) if b.grants.len() == 1 => {}
+                    other => failures.push(format!(
+                        "{label} by {token} changed the binding: now {:?}",
+                        other.map(|b| b.grants.len())
+                    )),
+                }
+            }
+        }
+        failures
+    }
+
+    #[tokio::test]
+    async fn credential_bindings_by_id_answer_outsiders_as_missing() {
+        let personal = check(
+            CredentialScope::Personal,
+            &[
+                ("another-consumer", consumer("other-sub"), false, false),
+                (
+                    "acme-tenant-user",
+                    tenant_user("acme-sub", "acme"),
+                    false,
+                    false,
+                ),
+                (
+                    "readonly-operator",
+                    operator(AegisRole::Readonly),
+                    true,
+                    false,
+                ),
+            ],
+        )
+        .await;
+        let team = check(
+            CredentialScope::Team {
+                team_id: uuid::Uuid::new_v4(),
+            },
+            &[
+                ("non-member", consumer("outsider-sub"), false, false),
+                ("team-member", consumer("team-member-sub"), true, false),
+            ],
+        )
+        .await;
+        let failures: Vec<String> = personal.into_iter().chain(team).collect();
+        assert!(
+            failures.is_empty(),
+            "a caller reached a credential binding it does not own:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_bindings_by_id_serve_owner_team_managers_and_writing_operators() {
+        let personal = check(
+            CredentialScope::Personal,
+            &[
+                ("owner", consumer(OWNER), true, true),
+                ("admin-operator", operator(AegisRole::Admin), true, true),
+                (
+                    "operator-operator",
+                    operator(AegisRole::Operator),
+                    true,
+                    true,
+                ),
+            ],
+        )
+        .await;
+        let team = check(
+            CredentialScope::Team {
+                team_id: uuid::Uuid::new_v4(),
+            },
+            &[
+                ("owner", consumer(OWNER), true, true),
+                ("team-admin", consumer("team-admin-sub"), true, true),
+            ],
+        )
+        .await;
+        let failures: Vec<String> = personal.into_iter().chain(team).collect();
+        assert!(
+            failures.is_empty(),
+            "a caller entitled to a credential binding was refused:\n{}",
+            failures.join("\n")
+        );
     }
 }
