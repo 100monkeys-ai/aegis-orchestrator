@@ -75,6 +75,7 @@ impl FleetDispatcher {
         let (cancel_tx, _) = broadcast::channel::<()>(8);
         let handle = FleetCommandHandle {
             fleet_command_id: inv.fleet_command_id,
+            tenant_id: inv.tenant_id.clone(),
             cancel_tx: cancel_tx.clone(),
             per_node_command_ids: dashmap::DashMap::new(),
         };

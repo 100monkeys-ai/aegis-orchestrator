@@ -7,7 +7,7 @@ pub mod dispatcher;
 pub mod registry;
 pub mod resolver;
 
-pub use cancel::CancelFleetService;
+pub use cancel::{CancelFleetService, FleetCancelAuthority};
 pub use dispatcher::{FleetDispatcher, FleetEvent};
 pub use registry::{FleetCommandHandle, FleetRegistry};
 pub use resolver::EdgeFleetResolver;

@@ -28,6 +28,8 @@ pub mod billing_service;
 pub mod client;
 pub(crate) mod cluster_helpers;
 pub(crate) mod container_helpers;
+#[cfg(test)]
+mod edge_fleet_cancel_tests;
 pub mod edge_lifecycle;
 pub mod handlers;
 #[cfg(unix)]

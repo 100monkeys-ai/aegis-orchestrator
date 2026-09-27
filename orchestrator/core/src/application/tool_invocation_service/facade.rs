@@ -1152,7 +1152,10 @@ impl ToolInvocationService {
                 self.invoke_aegis_edge_fleet_invoke_tool(args, security_context, tenant_scope)
                     .await,
             ),
-            "aegis.edge.fleet.cancel" => Some(self.invoke_aegis_edge_fleet_cancel_tool(args).await),
+            "aegis.edge.fleet.cancel" => Some(
+                self.invoke_aegis_edge_fleet_cancel_tool(args, tenant_scope)
+                    .await,
+            ),
             "aegis.tools.list" => Some(self.invoke_aegis_tools_list(args, security_context).await),
             "aegis.tools.search" => {
                 Some(self.invoke_aegis_tools_search(args, security_context).await)
@@ -1543,9 +1546,15 @@ impl ToolInvocationService {
     }
 
     /// `aegis.edge.fleet.cancel` — cancel a running fleet operation.
+    ///
+    /// Only the tenant that invoked the command, or an operator whose role
+    /// may write, may cancel it (ADR-117 §F; ADR-073 §3e, §12). Any other
+    /// caller gets `cancelled: false`, the answer for a command that does
+    /// not exist.
     async fn invoke_aegis_edge_fleet_cancel_tool(
         &self,
         args: &Value,
+        tenant_scope: &TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let cancel = self.edge_fleet_cancel.as_ref().ok_or_else(|| {
             SealSessionError::InternalError(
@@ -1560,9 +1569,17 @@ impl ToolInvocationService {
             })?;
         let uuid = uuid::Uuid::parse_str(id_str)
             .map_err(|e| SealSessionError::MalformedPayload(format!("fleet_command_id: {e}")))?;
-        let cancelled = cancel
-            .cancel(crate::domain::cluster::FleetCommandId(uuid))
-            .await;
+        let cancelled = match crate::application::edge::fleet::FleetCancelAuthority::for_identity(
+            &tenant_scope.identity_kind,
+            &tenant_scope.authenticated_tenant,
+        ) {
+            Some(authority) => {
+                cancel
+                    .cancel(crate::domain::cluster::FleetCommandId(uuid), authority)
+                    .await
+            }
+            None => false,
+        };
         Ok(ToolInvocationResult::Direct(serde_json::json!({
             "cancelled": cancelled,
         })))

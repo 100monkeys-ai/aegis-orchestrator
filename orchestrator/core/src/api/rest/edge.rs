@@ -56,7 +56,9 @@ use tokio_stream::StreamExt;
 
 use crate::application::edge::dispatch_to_edge::DispatchToEdgeService;
 use crate::application::edge::fleet::dispatcher::{FleetDispatcher, FleetInvocation};
-use crate::application::edge::fleet::{CancelFleetService, EdgeFleetResolver};
+use crate::application::edge::fleet::{
+    CancelFleetService, EdgeFleetResolver, FleetCancelAuthority,
+};
 use crate::application::edge::issue_enrollment_token::EnrollmentTokenIssuer;
 use crate::application::edge::manage_groups::ManageGroupsService;
 use crate::application::edge::manage_tags::ManageTagsService;
@@ -123,6 +125,12 @@ impl ApiError {
             code: code.into(),
             message: msg.into(),
         }
+    }
+    fn unauthorized(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", msg)
+    }
+    fn forbidden(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", msg)
     }
     fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", msg)
@@ -661,15 +669,26 @@ fn build_policy(req: &FleetInvokeRequest) -> Result<FleetDispatchPolicy, ApiErro
     })
 }
 
+/// Cancel a fleet command. Only the tenant that invoked it, or an
+/// operator whose role may write, may cancel it (ADR-117 §F; ADR-073 §3e,
+/// §12); anyone else is answered as for a command that does not exist.
 async fn fleet_cancel(
     State(s): State<EdgeApiState>,
-    Extension(_tenant): Extension<TenantId>,
+    Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    let Some(Extension(identity)) = identity.as_ref() else {
+        return Err(ApiError::unauthorized("Authentication required"));
+    };
+    let Some(authority) = FleetCancelAuthority::for_identity(&identity.identity_kind, &tenant)
+    else {
+        return Err(ApiError::forbidden("Operator or Admin role required"));
+    };
     let fleet_id = FleetCommandId(
         uuid::Uuid::parse_str(&id).map_err(|e| ApiError::bad_request(e.to_string()))?,
     );
-    let cancelled = s.fleet_cancel.cancel(fleet_id).await;
+    let cancelled = s.fleet_cancel.cancel(fleet_id, authority).await;
     if cancelled {
         Ok(StatusCode::NO_CONTENT)
     } else {

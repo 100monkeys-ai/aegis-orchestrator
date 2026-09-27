@@ -8,10 +8,13 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::domain::cluster::FleetCommandId;
-use crate::domain::shared_kernel::NodeId;
+use crate::domain::shared_kernel::{NodeId, TenantId};
 
 pub struct FleetCommandHandle {
     pub fleet_command_id: FleetCommandId,
+    /// The tenant that invoked the fleet command. Cancellation is authorised
+    /// against it (ADR-117 §F; ADR-073 §3e for the operator exception).
+    pub tenant_id: TenantId,
     /// Broadcast channel used to fan out cancel signals to every per-node
     /// task driving an in-flight `InvokeToolCommand`.
     pub cancel_tx: broadcast::Sender<()>,
