@@ -539,18 +539,15 @@ mod tests {
     // ------------------------------------------------------------------
 
     use super::{admin_rate_limit_router, AdminRateLimitState, RateLimitOverrideStore};
-    use crate::daemon::router::apply_request_auth_layers;
-    use aegis_orchestrator_core::domain::iam::{
-        AegisRole, IamError, IdentityKind, IdentityProvider, IdentityRealm, UserIdentity,
-        ValidatedIdentityToken, ZaruTier,
+    use crate::daemon::handlers::test_support::{
+        consumer, identity_provider, operator, send, service_account, tenant_user,
     };
-    use aegis_orchestrator_core::domain::shared_kernel::TenantId;
-    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::domain::iam::{
+        AegisRole, IdentityKind, IdentityProvider, UserIdentity,
+    };
     use aegis_orchestrator_core::infrastructure::rate_limit::override_repository::{
         CreateOverrideRequest, RateLimitOverrideRow, UsageRow,
     };
-    use aegis_orchestrator_core::presentation::tenant_middleware::TenantMiddlewareState;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -607,90 +604,6 @@ mod tests {
         }
     }
 
-    /// Resolves a bearer token to a fixed identity, the way
-    /// `StandardIamService` resolves a validated JWT. Unknown tokens fail
-    /// validation.
-    struct TokenTableIdentityProvider {
-        identities: HashMap<String, UserIdentity>,
-    }
-
-    #[async_trait::async_trait]
-    impl IdentityProvider for TokenTableIdentityProvider {
-        async fn validate_token(&self, raw_jwt: &str) -> Result<ValidatedIdentityToken, IamError> {
-            let identity =
-                self.identities
-                    .get(raw_jwt)
-                    .cloned()
-                    .ok_or_else(|| IamError::MissingClaim {
-                        claim: "sub".to_string(),
-                    })?;
-            Ok(ValidatedIdentityToken {
-                identity,
-                issued_at: chrono::Utc::now(),
-                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
-                raw_claims: serde_json::json!({}),
-            })
-        }
-        fn resolve_tier(&self, _token: &ValidatedIdentityToken) -> Result<ZaruTier, IamError> {
-            Ok(ZaruTier::Free)
-        }
-        fn resolve_role(&self, _token: &ValidatedIdentityToken) -> Result<AegisRole, IamError> {
-            Err(IamError::MissingClaim {
-                claim: "aegis_role".to_string(),
-            })
-        }
-        fn known_realms(&self) -> Vec<IdentityRealm> {
-            Vec::new()
-        }
-    }
-
-    fn operator(role: AegisRole) -> UserIdentity {
-        UserIdentity {
-            sub: format!("op-{}", role.as_claim_str()),
-            realm_slug: "aegis-system".into(),
-            email: None,
-            name: None,
-            identity_kind: IdentityKind::Operator { aegis_role: role },
-        }
-    }
-
-    fn free_consumer() -> UserIdentity {
-        UserIdentity {
-            sub: "consumer-sub".into(),
-            realm_slug: "zaru-consumer".into(),
-            email: None,
-            name: None,
-            identity_kind: IdentityKind::ConsumerUser {
-                zaru_tier: ZaruTier::Free,
-                tenant_id: TenantId::for_consumer_user("consumer-sub").expect("per-user tenant id"),
-            },
-        }
-    }
-
-    fn tenant_user() -> UserIdentity {
-        UserIdentity {
-            sub: "tenant-user-sub".into(),
-            realm_slug: "tenant-acme".into(),
-            email: None,
-            name: None,
-            identity_kind: IdentityKind::TenantUser {
-                tenant_slug: "acme".into(),
-            },
-        }
-    }
-
-    fn service_account() -> UserIdentity {
-        UserIdentity {
-            sub: "svc-sub".into(),
-            realm_slug: "aegis-system".into(),
-            email: None,
-            name: None,
-            identity_kind: IdentityKind::ServiceAccount {
-                client_id: "aegis-temporal-worker".into(),
-            },
-        }
-    }
-
     /// The four admin routes, each as (label, method, path, json body).
     fn admin_routes() -> Vec<(
         &'static str,
@@ -735,76 +648,39 @@ mod tests {
         *method != reqwest::Method::GET
     }
 
-    /// Serve the admin sub-router beneath the daemon's authentication stack
-    /// on a loopback port. `iam` of `None` reproduces a node configured
-    /// without `spec.iam`, where no authentication layer is mounted.
+    /// Serve the admin sub-router over `store` beneath the daemon's
+    /// authentication stack (see `test_support::serve`).
     async fn serve(store: Arc<RecordingStore>, iam: Option<Arc<dyn IdentityProvider>>) -> String {
-        let app = apply_request_auth_layers(
+        crate::daemon::handlers::test_support::serve(
             admin_rate_limit_router(AdminRateLimitState {
                 store: Some(store as Arc<dyn RateLimitOverrideStore>),
             }),
-            TenantMiddlewareState {
-                team_repo: None,
-                membership_repo: None,
-                event_bus: Arc::new(EventBus::new(16)),
-            },
             iam,
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback listener");
-        let addr = listener.local_addr().expect("listener address");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve admin router");
-        });
-        format!("http://{addr}")
+            None,
+        )
+        .await
     }
 
-    fn identity_provider(identities: &[(&str, UserIdentity)]) -> Arc<dyn IdentityProvider> {
-        Arc::new(TokenTableIdentityProvider {
-            identities: identities
-                .iter()
-                .map(|(token, id)| (token.to_string(), id.clone()))
-                .collect(),
-        })
-    }
-
-    async fn send(
-        base: &str,
-        method: &reqwest::Method,
-        path: &str,
-        body: &Option<serde_json::Value>,
-        bearer: Option<&str>,
-    ) -> u16 {
-        let mut req = reqwest::Client::new().request(method.clone(), format!("{base}{path}"));
-        if let Some(token) = bearer {
-            req = req.bearer_auth(token);
-        }
-        if let Some(json) = body {
-            req = req.json(json);
-        }
-        req.send()
-            .await
-            .expect("loopback request")
-            .status()
-            .as_u16()
+    /// The admin routes need no JWT scope; only the identity decides.
+    fn provider(callers: &[(&str, UserIdentity)]) -> Arc<dyn IdentityProvider> {
+        let rows: Vec<(&str, UserIdentity, &str)> =
+            callers.iter().map(|(t, id)| (*t, id.clone(), "")).collect();
+        identity_provider(&rows)
     }
 
     #[tokio::test]
     async fn admin_rate_limit_routes_refuse_non_operators_before_the_store() {
         let callers = [
-            ("consumer-token", free_consumer()),
-            ("tenant-user-token", tenant_user()),
+            ("consumer-token", consumer("consumer-sub")),
+            ("tenant-user-token", tenant_user("tenant-user-sub", "acme")),
             ("service-account-token", service_account()),
         ];
         let mut failures = Vec::new();
         for (token, identity) in &callers {
             for (label, method, path, body) in admin_routes() {
                 let store = Arc::new(RecordingStore::default());
-                let base = serve(store.clone(), Some(identity_provider(&callers))).await;
-                let status = send(&base, &method, &path, &body, Some(token)).await;
+                let base = serve(store.clone(), Some(provider(&callers))).await;
+                let (status, _) = send(&base, &method, &path, &body, Some(token)).await;
                 if status != 403 || store.calls() != 0 {
                     failures.push(format!(
                         "{label} as {:?} answered {status} after {} store call(s); expected 403 and none",
@@ -827,8 +703,8 @@ mod tests {
         for (label, method, path, body) in admin_routes() {
             // Full stack, no bearer token: the IAM layer refuses.
             let store = Arc::new(RecordingStore::default());
-            let base = serve(store.clone(), Some(identity_provider(&[]))).await;
-            let status = send(&base, &method, &path, &body, None).await;
+            let base = serve(store.clone(), Some(provider(&[]))).await;
+            let (status, _) = send(&base, &method, &path, &body, None).await;
             if status != 401 || store.calls() != 0 {
                 failures.push(format!(
                     "{label} without a bearer token answered {status} after {} store call(s); expected 401 and none",
@@ -839,7 +715,7 @@ mod tests {
             // must refuse, because no identity reaches it.
             let store = Arc::new(RecordingStore::default());
             let base = serve(store.clone(), None).await;
-            let status = send(&base, &method, &path, &body, None).await;
+            let (status, _) = send(&base, &method, &path, &body, None).await;
             if status != 401 || store.calls() != 0 {
                 failures.push(format!(
                     "{label} with no IAM layer and no identity answered {status} after {} store call(s); expected 401 and none",
@@ -871,8 +747,8 @@ mod tests {
             );
             for (label, method, path, body) in admin_routes() {
                 let store = Arc::new(RecordingStore::default());
-                let base = serve(store.clone(), Some(identity_provider(&callers))).await;
-                let status = send(&base, &method, &path, &body, Some(token)).await;
+                let base = serve(store.clone(), Some(provider(&callers))).await;
+                let (status, _) = send(&base, &method, &path, &body, Some(token)).await;
                 let (want_status, want_calls) = if read_only && is_write(&method) {
                     (403, 0)
                 } else {

@@ -28,6 +28,8 @@ pub(crate) mod seal;
 pub(crate) mod stimulus;
 pub(crate) mod swarms;
 pub(crate) mod tenant_provisioning;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod volumes;
 pub(crate) mod workflow_executions;
 pub(crate) mod workflows;
@@ -135,6 +137,27 @@ pub(crate) fn is_operator(identity: Option<&UserIdentity>) -> bool {
         identity.map(|i| &i.identity_kind),
         Some(IdentityKind::Operator { .. })
     )
+}
+
+/// Refuse a write by an `aegis:readonly` operator.
+///
+/// ADR-073 §3e: `aegis:readonly` reads every surface and changes nothing.
+/// Handlers that let operators act across tenants on a write call this
+/// before acting, so the unscoped operator path is open only to
+/// `aegis:admin` and `aegis:operator`. The refusal is the body `admin.rs`
+/// and `credentials.rs` answer the same caller with.
+pub(crate) fn refuse_read_only_operator(
+    identity: Option<&UserIdentity>,
+) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    match identity.map(|i| &i.identity_kind) {
+        Some(IdentityKind::Operator {
+            aegis_role: aegis_orchestrator_core::domain::iam::AegisRole::Readonly,
+        }) => Err((
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "Operator or Admin role required"})),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Read the `TenantId` resolved by the `tenant_context_middleware` (ADR-056 /

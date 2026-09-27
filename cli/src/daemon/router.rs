@@ -24,10 +24,7 @@ use crate::daemon::handlers::agents::{
 use crate::daemon::handlers::api_keys::{
     create_api_key_handler, list_api_keys_handler, revoke_api_key_handler, validate_api_key_handler,
 };
-use crate::daemon::handlers::approvals::{
-    approve_request_handler, get_pending_approval_handler, list_pending_approvals_handler,
-    reject_request_handler,
-};
+use crate::daemon::handlers::approvals::{approvals_router, ApprovalsState};
 use crate::daemon::handlers::billing::{
     change_tier_handler, create_checkout_handler, create_portal_handler, get_subscription_handler,
     list_invoices_handler, list_prices_handler, preview_tier_change_handler, update_seats_handler,
@@ -193,19 +190,6 @@ pub(crate) fn create_router(
             post(cancel_workflow_execution_handler),
         )
         .route("/v1/temporal-events", post(temporal_events_handler))
-        .route("/v1/human-approvals", get(list_pending_approvals_handler))
-        .route(
-            "/v1/human-approvals/{id}",
-            get(get_pending_approval_handler),
-        )
-        .route(
-            "/v1/human-approvals/{id}/approve",
-            post(approve_request_handler),
-        )
-        .route(
-            "/v1/human-approvals/{id}/reject",
-            post(reject_request_handler),
-        )
         .route("/v1/seal/attest", post(attest_seal_handler))
         .route("/v1/seal/invoke", post(invoke_seal_handler))
         .route("/v1/seal/tools", get(list_seal_tools_handler))
@@ -408,6 +392,13 @@ pub(crate) fn create_router(
             .rate_limit_override_repo
             .clone()
             .map(|repo| repo as Arc<dyn RateLimitOverrideStore>),
+    }));
+
+    // Human-approval requests (ADR-097 §approvals, ADR-073 §3e), mounted over
+    // their own narrow state so their gate is driven through the real
+    // middleware stack by the handler tests.
+    let router = router.merge(approvals_router(ApprovalsState {
+        human_input_service: app_state.human_input_service.clone(),
     }));
 
     // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed
