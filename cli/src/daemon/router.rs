@@ -13,9 +13,8 @@ use aegis_orchestrator_core::presentation::webhook_guard::MAX_WEBHOOK_BODY_BYTES
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
 
 use crate::daemon::handlers::admin::{
-    delete_rate_limit_override_handler, get_rate_limit_usage_handler,
-    get_user_rate_limit_usage_handler, list_rate_limit_overrides_handler,
-    upsert_rate_limit_override_handler,
+    admin_rate_limit_router, get_user_rate_limit_usage_handler, AdminRateLimitState,
+    RateLimitOverrideStore,
 };
 use crate::daemon::handlers::agents::{
     delete_agent_handler, deploy_agent_handler, execute_agent_handler, get_agent_handler,
@@ -231,19 +230,6 @@ pub(crate) fn create_router(
         .route("/v1/cortex/patterns", get(list_cortex_patterns_handler))
         .route("/v1/cortex/skills", get(get_cortex_skills_handler))
         .route("/v1/cortex/metrics", get(get_cortex_metrics_handler))
-        // Admin rate-limit override management (ADR-072)
-        .route(
-            "/v1/admin/rate-limits/overrides",
-            get(list_rate_limit_overrides_handler).post(upsert_rate_limit_override_handler),
-        )
-        .route(
-            "/v1/admin/rate-limits/overrides/{id}",
-            delete(delete_rate_limit_override_handler),
-        )
-        .route(
-            "/v1/admin/rate-limits/usage",
-            get(get_rate_limit_usage_handler),
-        )
         .route(
             "/v1/user/rate-limits/usage",
             get(get_user_rate_limit_usage_handler),
@@ -413,6 +399,17 @@ pub(crate) fn create_router(
         )
         .with_state(app_state.clone());
 
+    // Admin rate-limit override management (ADR-072, ADR-073 §9). Mounted as
+    // its own sub-router over the narrow `RateLimitOverrideStore` port so the
+    // operator-only gate in `handlers::admin` is exercised through the real
+    // middleware stack by its regression tests.
+    let router = router.merge(admin_rate_limit_router(AdminRateLimitState {
+        store: app_state
+            .rate_limit_override_repo
+            .clone()
+            .map(|repo| repo as Arc<dyn RateLimitOverrideStore>),
+    }));
+
     // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed
     // (i.e. a Postgres pool is available). Pure-worker deployments without a
     // pool skip this mount and never serve the operator surface.
@@ -431,6 +428,24 @@ pub(crate) fn create_router(
             membership_repo: app_state.membership_repo.clone(),
             event_bus: app_state.event_bus.clone(),
         };
+    apply_request_auth_layers(router, tenant_state, iam_service)
+}
+
+/// Wrap `router` in the request authentication stack every daemon route
+/// sits behind: `tenant_context_middleware` inside, `iam_auth_middleware`
+/// outside (axum applies the last `.layer()` outermost, so the IAM layer
+/// runs first and inserts the `UserIdentity` the tenant layer reads).
+///
+/// When `iam_service` is `None` — a node whose config has no `spec.iam`
+/// block, which `server.rs` refuses for production-labelled nodes — no
+/// authentication layer is mounted and handlers see no `UserIdentity`.
+/// Handlers gating on identity must therefore treat a missing identity as
+/// a refusal.
+pub(crate) fn apply_request_auth_layers(
+    router: Router,
+    tenant_state: aegis_orchestrator_core::presentation::tenant_middleware::TenantMiddlewareState,
+    iam_service: Option<Arc<dyn IdentityProvider>>,
+) -> Router {
     let router = router.layer(middleware::from_fn_with_state(
         tenant_state,
         aegis_orchestrator_core::presentation::tenant_middleware::tenant_context_middleware,
