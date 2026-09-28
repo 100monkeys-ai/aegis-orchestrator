@@ -1049,6 +1049,54 @@ impl KeycloakAdminClient {
 mod tests {
     use super::*;
 
+    /// The admin token endpoint refuses the grant with an RFC 6749 error body
+    /// that also carries an unrelated field holding a marker. The error the
+    /// client returns keeps `error` and `error_description` and drops the
+    /// rest of the body.
+    #[tokio::test]
+    async fn token_error_keeps_only_the_oauth_error_fields() {
+        async fn refuse() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "Invalid user credentials",
+                    "echo": "Mk7-keycloak-error-body-marker",
+                })),
+            )
+        }
+        let app = axum::Router::new().route(
+            "/realms/master/protocol/openid-connect/token",
+            axum::routing::post(refuse),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let kc = KeycloakAdminClient::new(KeycloakAdminConfig {
+            host: format!("http://{addr}"),
+            admin_username: "admin".to_string(),
+            admin_password: crate::domain::secrets::SensitiveString::new("admin-password"),
+        });
+
+        let err = kc
+            .create_realm("r")
+            .await
+            .expect_err("the refused grant is an error");
+        let printed = format!("{err} {err:?}");
+        assert!(
+            !printed.contains("Mk7-keycloak-error-body-marker"),
+            "the token error carried more of the body than its OAuth fields: {printed}"
+        );
+        for kept in ["401", "invalid_grant", "Invalid user credentials"] {
+            assert!(
+                printed.contains(kept),
+                "the token error lost {kept:?}: {printed}"
+            );
+        }
+    }
+
     /// Audit 002 §4.37.10 regression — `KeycloakAdminConfig`'s `Debug`
     /// output must NOT contain the admin password. Before the fix,
     /// `admin_password: String` combined with `#[derive(Debug)]` meant
