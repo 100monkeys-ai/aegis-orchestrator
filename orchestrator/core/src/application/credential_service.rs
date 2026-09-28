@@ -1097,3 +1097,84 @@ impl CredentialManagementService for StandardCredentialManagementService {
         }
     }
 }
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn oauth_provider_config_debug_does_not_print_a_credential_in_its_urls() {
+        let cfg = OAuthProviderConfig {
+            authorization_url: "https://user:Mk7-authorization-url-marker@idp.example/authorize"
+                .into(),
+            token_url: "https://user:Mk7-oauth-token-url-marker@idp.example/token".into(),
+            client_id: "client".to_string(),
+            client_secret: Some(SensitiveString::new("Mk7-oauth-client-secret-marker")),
+            redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
+        };
+        let printed = format!("{cfg:?}");
+        for marker in [
+            "Mk7-authorization-url-marker",
+            "Mk7-oauth-token-url-marker",
+            "Mk7-oauth-client-secret-marker",
+        ] {
+            assert!(
+                !printed.contains(marker),
+                "OAuthProviderConfig's Debug printed a credential: {printed}"
+            );
+        }
+        assert!(
+            printed.contains("idp.example"),
+            "Debug lost the host: {printed}"
+        );
+    }
+
+    #[test]
+    fn oauth_token_response_debug_does_not_print_the_tokens() {
+        let response: OAuthTokenResponse = serde_json::from_str(
+            r#"{"access_token":"Mk7-oauth-access-token-marker","token_type":"bearer","expires_in":3600,"refresh_token":"Mk7-oauth-refresh-token-marker","scope":"repo"}"#,
+        )
+        .unwrap();
+        let printed = format!("{response:?}");
+        for marker in [
+            "Mk7-oauth-access-token-marker",
+            "Mk7-oauth-refresh-token-marker",
+        ] {
+            assert!(
+                !printed.contains(marker),
+                "OAuthTokenResponse's Debug printed a token: {printed}"
+            );
+        }
+        assert!(printed.contains("repo"), "Debug lost the scope: {printed}");
+    }
+
+    #[test]
+    fn oauth_initiation_debug_does_not_print_a_credential_in_the_url() {
+        let initiation = OAuthInitiation {
+            authorization_url: "https://user:Mk7-initiation-url-marker@idp.example/authorize?x=1"
+                .into(),
+            state: "state-1".to_string(),
+        };
+        let printed = format!("{initiation:?}");
+        assert!(
+            !printed.contains("Mk7-initiation-url-marker"),
+            "OAuthInitiation's Debug printed a credential: {printed}"
+        );
+    }
+
+    #[test]
+    fn insecure_token_url_error_does_not_print_the_url_credential() {
+        let err =
+            ensure_secure_token_url("http://user:Mk7-insecure-token-url-marker@evil.example/token")
+                .expect_err("an http token URL off localhost is refused");
+        let printed = format!("{err} {err:?}");
+        assert!(
+            !printed.contains("Mk7-insecure-token-url-marker"),
+            "the insecure token URL error printed the URL's credential: {printed}"
+        );
+        assert!(
+            printed.contains("evil.example"),
+            "the error lost the host it refused: {printed}"
+        );
+    }
+}

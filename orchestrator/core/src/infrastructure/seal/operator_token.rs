@@ -325,4 +325,27 @@ mod tests {
             .expect("some");
         assert_eq!(format!("{:?}", all.client_secret), "[REDACTED]");
     }
+
+    #[test]
+    fn operator_credentials_debug_does_not_print_a_credential_in_the_token_url() {
+        let credentials = OperatorCredentials {
+            token_url: "https://user:Mk7-operator-token-url-marker@idp.example/token".into(),
+            client_id: "aegis-orchestrator".to_string(),
+            client_secret: SensitiveString::new("Mk7-operator-client-secret-marker"),
+        };
+        let printed = format!("{credentials:?}");
+        for marker in [
+            "Mk7-operator-token-url-marker",
+            "Mk7-operator-client-secret-marker",
+        ] {
+            assert!(
+                !printed.contains(marker),
+                "OperatorCredentials' Debug printed a credential: {printed}"
+            );
+        }
+        assert!(
+            printed.contains("idp.example"),
+            "Debug lost the token endpoint's host: {printed}"
+        );
+    }
 }
