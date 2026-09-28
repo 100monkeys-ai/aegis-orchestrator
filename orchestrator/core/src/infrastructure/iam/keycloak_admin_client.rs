@@ -161,6 +161,56 @@ struct TokenResponse {
     expires_in: i64,
 }
 
+/// The realm a new tenant or team realm is created as.
+///
+/// Keycloak's defaults leave brute-force protection and email verification
+/// off. A realm the orchestrator creates has the protections of the
+/// `zaru-consumer` realm, as the deployment's Keycloak bootstrap sets them:
+/// verified email, one account per email address, sign-in with the email
+/// address as the username, password reset, and the consumer realm's token
+/// and session lifetimes. Where the consumer realm sets nothing, or where an
+/// Enterprise realm needs its own value, the value here is the safe one:
+///
+/// - self-registration is off: people reach a tenant or team realm by
+///   invitation or through the team's identity provider;
+/// - brute-force detection is on, with Keycloak's own lockout settings
+///   (a temporary lockout after 30 failures, growing by a minute to at most
+///   fifteen, counted over twelve hours; never permanent);
+/// - passwords need 12 characters and may not be the username or email;
+/// - HTTPS is required for every address outside the private networks
+///   (`external`, as in the consumer realm, which leaves the setting at
+///   Keycloak's default).
+///
+/// Email delivery (SMTP) is not set: it holds a credential the orchestrator
+/// does not have, and it is configured with the realm's other deployment
+/// settings.
+fn protected_realm_representation(realm_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "realm": realm_name,
+        "enabled": true,
+        "verifyEmail": true,
+        "duplicateEmailsAllowed": false,
+        "loginWithEmailAllowed": true,
+        "registrationEmailAsUsername": true,
+        "resetPasswordAllowed": true,
+        "registrationAllowed": false,
+        "editUsernameAllowed": false,
+        "sslRequired": "external",
+        "bruteForceProtected": true,
+        "permanentLockout": false,
+        "failureFactor": 30,
+        "waitIncrementSeconds": 60,
+        "maxFailureWaitSeconds": 900,
+        "maxDeltaTimeSeconds": 43200,
+        "minimumQuickLoginWaitSeconds": 60,
+        "quickLoginCheckMilliSeconds": 1000,
+        "passwordPolicy": "length(12) and maxLength(128) and notUsername and notEmail",
+        "accessTokenLifespan": 1800,
+        "ssoSessionIdleTimeout": 259200,
+        "ssoSessionMaxLifespan": 1209600
+    })
+}
+
 /// The user representation a `PUT /users/{id}` sends: the user as it was
 /// read, with `attributes` in place of its attributes.
 ///
@@ -480,9 +530,12 @@ impl KeycloakAdminClient {
         Ok(token_resp.access_token)
     }
 
-    /// Create a new Keycloak realm for an enterprise tenant (ADR-056).
+    /// Create a new Keycloak realm for an enterprise tenant (ADR-056) or an
+    /// Enterprise team, with its protections on (see
+    /// `protected_realm_representation`).
     ///
-    /// Idempotent: a 409 Conflict response (realm already exists) is treated as success.
+    /// Idempotent: a 409 Conflict response (realm already exists) is treated
+    /// as success, and the existing realm is not changed.
     pub async fn create_realm(&self, realm_name: &str) -> Result<(), KeycloakAdminError> {
         let token = self.get_admin_token().await?;
         let url = format!("{}/admin/realms", self.config.host);
@@ -491,10 +544,7 @@ impl KeycloakAdminClient {
             .http
             .post(&url)
             .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "realm": realm_name,
-                "enabled": true
-            }))
+            .json(&protected_realm_representation(realm_name))
             .send()
             .await?;
 
