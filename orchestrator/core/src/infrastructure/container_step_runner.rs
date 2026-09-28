@@ -322,10 +322,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             }
             Some(s) => Err(ContainerStepError::ImagePullFailed {
                 image: config.image.clone(),
-                error: format!(
-                    "unrecognised registry_credentials format '{s}'; \
-                             expected 'env:VAR_NAME' or 'secret:engine/path'"
-                ),
+                error: unrecognised_registry_credentials_message(s),
             }),
         };
 
@@ -1100,11 +1097,52 @@ fn parse_memory_string(s: &str) -> Option<i64> {
     }
 }
 
+/// The error text for a step's `registry_credentials` value that is neither
+/// `env:VAR_NAME` nor `secret:engine/path`.
+fn unrecognised_registry_credentials_message(value: &str) -> String {
+    format!(
+        "unrecognised registry_credentials format '{value}'; \
+         expected 'env:VAR_NAME' or 'secret:engine/path'"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_memory_string, ContainerStepRunnerConfig};
+    use super::{
+        parse_memory_string, unrecognised_registry_credentials_message, ContainerStepRunnerConfig,
+    };
     use crate::domain::runtime::ContainerStepConfig;
     use std::collections::HashMap;
+
+    /// A step's `registry_credentials` holds a reference (`env:VAR_NAME` or
+    /// `secret:engine/path`). A value in any other form may be the literal
+    /// credential a workflow author put there by mistake, and the error that
+    /// rejects it is published as the step's failure reason and returned to
+    /// the caller, so it must not repeat the value.
+    #[test]
+    fn unrecognised_registry_credentials_error_does_not_echo_the_value() {
+        let marker = "Mk7-registry-password-marker";
+        let mut leaked = Vec::new();
+        for value in [
+            format!("robot:{marker}"),
+            format!("robot:{marker}@ghcr.io"),
+            marker.to_string(),
+        ] {
+            let message = unrecognised_registry_credentials_message(&value);
+            if message.contains(marker) {
+                leaked.push(message.clone());
+            }
+            assert!(
+                message.contains("env:VAR_NAME") && message.contains("secret:engine/path"),
+                "the error must still say which forms are accepted: {message}"
+            );
+        }
+        assert!(
+            leaked.is_empty(),
+            "the registry_credentials value reached the error text:\n{}",
+            leaked.join("\n")
+        );
+    }
 
     /// Regression: ContainerStepRunnerConfig must propagate network_mode so
     /// container steps use the same Docker network as agent containers.
