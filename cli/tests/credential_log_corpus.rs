@@ -161,11 +161,6 @@ const SECRET_FIELD_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "0",
         "the URL parser's error message, which does not repeat the URL",
     ),
-    (
-        "KeycloakAdminError::TokenError",
-        "0",
-        "an error message: the HTTP status and the identity provider's RFC 6749 error body, which does not repeat the request's credentials",
-    ),
 ];
 
 /// Crate source roots walked, relative to the workspace root.
