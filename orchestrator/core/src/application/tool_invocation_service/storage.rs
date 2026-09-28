@@ -833,3 +833,57 @@ fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
+    use crate::domain::shared_kernel::{TenantId, VolumeId};
+
+    /// `aegis.git.clone`, `aegis.git.list` and `aegis.git.status` answer an
+    /// agent with this view of a binding, and the agent's model provider
+    /// reads it. It holds the repository's address and nothing of a
+    /// credential written into the stored URL: no user info and no secret
+    /// query value.
+    #[test]
+    fn git_tool_answer_holds_the_repository_address_and_no_credential() {
+        for (stored, address) in [
+            (
+                "https://Mk7-git-tool-user:Mk7-git-tool-token@git.example.invalid/o/r.git",
+                "git.example.invalid/o/r.git",
+            ),
+            (
+                "https://Mk7-git-tool-token@git.example.invalid/o/r.git?access_token=Mk7-git-tool-query",
+                "git.example.invalid/o/r.git",
+            ),
+            (
+                "Mk7-git-tool-user@git.example.invalid:o/r.git",
+                "git.example.invalid:o/r.git",
+            ),
+        ] {
+            let binding = GitRepoBinding::new(
+                TenantId::consumer(),
+                None,
+                stored.to_string(),
+                GitRef::default(),
+                None,
+                VolumeId::new(),
+                "tool-view".to_string(),
+                CloneStrategy::Libgit2,
+                false,
+                None,
+                None,
+                None,
+            );
+            let answer = serde_json::to_string(&redacted_binding(&binding)).unwrap();
+            assert!(
+                !answer.contains("Mk7-git-tool"),
+                "the git tool answer carries a credential from the stored URL: {answer}"
+            );
+            assert!(
+                answer.contains(address),
+                "the git tool answer lost the repository's address {address}: {answer}"
+            );
+        }
+    }
+}

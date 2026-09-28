@@ -3442,6 +3442,38 @@ mod gateway_timeout_regression {
         );
     }
 
+    /// A SEAL gateway call that fails answers the agent with an error, and
+    /// the agent's model provider reads it. The error names the gateway by
+    /// its address and never carries a credential written into the
+    /// configured URL, whether the URL cannot be used or the gateway cannot
+    /// be reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seal_gateway_errors_carry_no_credential_from_the_gateway_url() {
+        for url in [
+            // Nothing listens on port 1: the connect fails.
+            "http://Mk7-gw-user:Mk7-gw-token@127.0.0.1:1",
+            // A space in the host: the URL cannot be used.
+            "http://Mk7-gw-user:Mk7-gw-token@bad host:1",
+        ] {
+            let service = make_service(Some(url.to_string()));
+            let err = service
+                .invoke_seal_gateway_internal_grpc(
+                    crate::domain::execution::ExecutionId::new(),
+                    "gateway.tool",
+                    serde_json::json!({}),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("the gateway call fails");
+            let shown = err.to_string();
+            assert!(
+                !shown.contains("Mk7-gw"),
+                "the gateway error the agent reads carries the URL's credential: {shown}"
+            );
+        }
+    }
+
     /// Regression: an erroring gateway returns Ok(empty) — best-effort,
     /// errors must NOT propagate from the enumeration path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
