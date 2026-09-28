@@ -127,6 +127,10 @@ struct Harness {
 }
 
 async fn setup_harness(token_url: String) -> Harness {
+    setup_harness_with("https://github.com/login/oauth/authorize", token_url).await
+}
+
+async fn setup_harness_with(authorization_url: &str, token_url: String) -> Harness {
     let repo = Arc::new(InMemoryCredentialRepo::default());
     let event_bus = Arc::new(EventBus::new(64));
     let secret_store = Arc::new(TestSecretStore::new());
@@ -139,7 +143,7 @@ async fn setup_harness(token_url: String) -> Harness {
     registry.insert(
         CredentialProvider::GitHub,
         OAuthProviderConfig {
-            authorization_url: "https://github.com/login/oauth/authorize".into(),
+            authorization_url: authorization_url.into(),
             token_url: token_url.into(),
             client_id: "test-client-id".to_string(),
             client_secret: Some(SensitiveString::new("test-client-secret")),
@@ -602,4 +606,69 @@ async fn initiate_oauth_accepts_allowlisted_redirect_uri() {
         )
         .await
         .expect("allowlisted redirect_uri must succeed");
+}
+
+/// The authorization-code exchange is posted to the token URL exactly as
+/// configured: a marker in its query survives. A site that formats the URL
+/// instead of reading it posts to the redacted form and misses the mock.
+#[tokio::test]
+async fn oauth_exchange_posts_to_the_token_url_as_configured() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/token")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "api_key".into(),
+            "Mk7-oauth-token-url-marker".into(),
+        ))
+        .match_body(mockito::Matcher::UrlEncoded(
+            "client_secret".into(),
+            "test-client-secret".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"access_token":"at","token_type":"Bearer","expires_in":3600}"#)
+        .create_async()
+        .await;
+    let harness = setup_harness(format!(
+        "{}/token?api_key=Mk7-oauth-token-url-marker",
+        server.url()
+    ))
+    .await;
+
+    harness
+        .service
+        .complete_oauth_connection(&harness.state, "provider-auth-code-123")
+        .await
+        .expect("the exchange reaches the configured token URL");
+
+    mock.assert_async().await;
+}
+
+/// The redirect the client is sent to is built from the authorization URL
+/// exactly as configured: a marker in its query survives, ahead of the
+/// parameters the flow appends.
+#[tokio::test]
+async fn initiate_oauth_builds_the_redirect_from_the_authorization_url_as_configured() {
+    let harness = setup_harness_with(
+        "https://github.com/login/oauth/authorize?tenant_key=Mk7-authorization-url-marker",
+        "https://github.com/login/oauth/access_token".to_string(),
+    )
+    .await;
+    let init = harness
+        .service
+        .initiate_oauth_connection(
+            "user-sub-abc",
+            &TenantId::consumer(),
+            CredentialProvider::GitHub,
+            "https://app.example/oauth/callback".to_string(),
+        )
+        .await
+        .expect("initiate should succeed");
+    let url = init.authorization_url.expose();
+    assert!(
+        url.starts_with(
+            "https://github.com/login/oauth/authorize?tenant_key=Mk7-authorization-url-marker&"
+        ),
+        "the redirect was not built from the configured authorization URL: {url}"
+    );
 }

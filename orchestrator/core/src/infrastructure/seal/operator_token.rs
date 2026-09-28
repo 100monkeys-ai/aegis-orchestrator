@@ -351,4 +351,65 @@ mod tests {
             "Debug lost the token endpoint's host: {printed}"
         );
     }
+
+    type SeenGrant =
+        Arc<std::sync::Mutex<Option<(String, Option<String>, HashMap<String, String>)>>>;
+
+    async fn record_grant(
+        State(seen): State<SeenGrant>,
+        uri: axum::http::Uri,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        *seen.lock().unwrap() = Some((
+            uri.path().to_string(),
+            uri.query().map(str::to_string),
+            form,
+        ));
+        Json(serde_json::json!({
+            "access_token": "granted",
+            "expires_in": 300,
+            "token_type": "Bearer",
+        }))
+    }
+
+    /// The grant goes to the token URL exactly as configured (a marker in its
+    /// query survives) and carries the client secret exactly as held. A site
+    /// that formats either value instead of reading it sends something else.
+    #[tokio::test]
+    async fn the_grant_goes_to_the_token_url_as_given_with_the_secret_as_held() {
+        let seen: SeenGrant = Arc::new(std::sync::Mutex::new(None));
+        let app = Router::new()
+            .route(
+                "/realms/r/protocol/openid-connect/token",
+                post(record_grant),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let url = format!(
+            "http://{addr}/realms/r/protocol/openid-connect/token?api_key=Mk7-operator-token-url-marker"
+        );
+        let source =
+            OperatorTokenSource::new(credentials(url, "Mk7-operator-client-secret-marker"));
+
+        source.authorization().await.expect("the grant is served");
+
+        let (path, query, form) = seen.lock().unwrap().clone().expect("the grant arrived");
+        assert_eq!(path, "/realms/r/protocol/openid-connect/token");
+        assert_eq!(
+            query.as_deref(),
+            Some("api_key=Mk7-operator-token-url-marker"),
+            "the grant went to a different URL than the one configured"
+        );
+        assert_eq!(
+            form.get("client_secret").map(String::as_str),
+            Some("Mk7-operator-client-secret-marker"),
+            "the grant carried a different client secret than the one held"
+        );
+    }
 }
