@@ -37,6 +37,7 @@ pub mod handlers;
 #[cfg(unix)]
 pub mod install;
 pub(crate) mod log_sanitize;
+pub mod migrations;
 pub mod operator_read_models;
 pub(crate) mod ports;
 pub mod relay_server;

@@ -109,6 +109,21 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      # PgBouncer in front of it, in transaction pooling mode as the
+      # deployment runs it, with one server connection, for the tests of two
+      # processes migrating at once.
+      pgbouncer:
+        image: edoburu/pgbouncer@sha256:4c1ca296ef525f108f5d3552cc337c0c09587cf8dae7f0067fd93349e47dc1cd
+        env:
+          DB_HOST: postgres
+          DB_USER: postgres
+          DB_PASSWORD: unused
+          AUTH_TYPE: trust
+          POOL_MODE: transaction
+          DEFAULT_POOL_SIZE: "1"
+          LISTEN_PORT: "6432"
+        ports:
+          - 6432:6432
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -159,6 +174,7 @@ jobs:
           AEGIS_TEST_KEYCLOAK: "1"
           AEGIS_TEST_KEYCLOAK_URL: http://127.0.0.1:18080
           AEGIS_TEST_POSTGRES_URL: postgres://postgres@localhost:5432/postgres
+          AEGIS_TEST_PGBOUNCER_URL: postgres://postgres@localhost:6432/postgres
           # The runner has a container engine. With this set, a test that
           # needs one fails when it cannot reach it, instead of skipping.
           AEGIS_TEST_DOCKER: "1"

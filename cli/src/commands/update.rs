@@ -214,7 +214,7 @@ pub(crate) async fn run_database_migrations(
     // the canonical location for migrations is `cli/migrations/` (NOT
     // `orchestrator/core/migrations/`). All ADR-117 edge migrations
     // (029_edge_mode.sql, ...) live here.
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+    use crate::daemon::migrations::{apply_migrations, MIGRATOR};
 
     if dry_run {
         println!(
@@ -252,8 +252,7 @@ pub(crate) async fn run_database_migrations(
         );
     } else {
         println!("  Applying {pending} pending migration(s)...");
-        MIGRATOR
-            .run(&pool)
+        apply_migrations(&pool)
             .await
             .context("Failed to apply migrations")?;
         println!("  {} {} migration(s) applied", "✓".green(), pending);

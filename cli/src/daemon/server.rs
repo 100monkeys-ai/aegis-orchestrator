@@ -252,9 +252,7 @@ pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Opti
                 info!("Connected to PostgreSQL");
 
                 // Check migration status
-                static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
-                let total_known = MIGRATOR.iter().count();
+                let total_known = crate::daemon::migrations::MIGRATOR.iter().count();
                 if total_known == 0 {
                     return Err(anyhow::anyhow!(
                         "CRITICAL: No migrations found in binary! Check build process."
@@ -279,7 +277,7 @@ pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Opti
 
                 if applied_count < total_known {
                     info!("Applying pending migrations...");
-                    match MIGRATOR.run(&db_pool).await {
+                    match crate::daemon::migrations::apply_migrations(&db_pool).await {
                         Ok(_) => info!("Database migrations applied successfully"),
                         Err(e) => {
                             return Err(anyhow::anyhow!("Failed to apply migrations: {e}"));
