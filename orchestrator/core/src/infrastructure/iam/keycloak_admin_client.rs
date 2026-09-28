@@ -1161,6 +1161,349 @@ mod tests {
         assert!(dumped.contains("admin"));
     }
 
+    // ── invite_team_user against a Keycloak double ─────────────────────────
+
+    /// A loopback stand-in for the Keycloak admin API that keeps its users.
+    /// Like Keycloak, `PUT /users/{id}` replaces the user's representation:
+    /// what the body leaves out is gone. Every call is recorded as
+    /// (method, path, body).
+    #[derive(Default)]
+    struct KeycloakDouble {
+        /// realm -> user id -> user representation
+        users: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<String, serde_json::Value>,
+        >,
+        /// realm -> group name -> group id
+        groups: std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+        /// (realm, user id, group id)
+        group_members: Vec<(String, String, String)>,
+        calls: Vec<(String, String, String)>,
+        /// How many user searches still answer "nobody", as a search made
+        /// just before another request created the user would.
+        stale_searches: u32,
+    }
+
+    type SharedDouble = std::sync::Arc<std::sync::Mutex<KeycloakDouble>>;
+
+    async fn keycloak_double(
+        axum::extract::State(double): axum::extract::State<SharedDouble>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let path = uri.path().to_string();
+        let query = uri.query().unwrap_or("").to_string();
+        let body_text = String::from_utf8_lossy(&body).to_string();
+        let mut d = double.lock().unwrap();
+        d.calls
+            .push((method.to_string(), path.clone(), body_text.clone()));
+
+        if path == "/realms/master/protocol/openid-connect/token" {
+            return axum::Json(
+                serde_json::json!({"access_token": "admin-token", "expires_in": 300}),
+            )
+            .into_response();
+        }
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        // admin / realms / {realm} / ...
+        if parts.len() < 4 || parts[0] != "admin" || parts[1] != "realms" {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+        let realm = parts[2].to_string();
+        let rest = &parts[3..];
+        let param = |name: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .map(str::to_owned)
+        };
+        match (method.as_str(), rest) {
+            ("GET", ["users"]) => {
+                if d.stale_searches > 0 {
+                    d.stale_searches -= 1;
+                    return axum::Json(Vec::<serde_json::Value>::new()).into_response();
+                }
+                let email = param("email").unwrap_or_default();
+                let found: Vec<serde_json::Value> = d
+                    .users
+                    .get(&realm)
+                    .map(|m| {
+                        m.values()
+                            .filter(|u| u["email"].as_str() == Some(email.as_str()))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                axum::Json(found).into_response()
+            }
+            ("POST", ["users"]) => {
+                let mut rep: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+                let email = rep["email"].as_str().unwrap_or_default().to_string();
+                let realm_users = d.users.entry(realm.clone()).or_default();
+                if realm_users
+                    .values()
+                    .any(|u| u["email"].as_str() == Some(email.as_str()))
+                {
+                    return (
+                        axum::http::StatusCode::CONFLICT,
+                        axum::Json(
+                            serde_json::json!({"errorMessage": "User exists with same email"}),
+                        ),
+                    )
+                        .into_response();
+                }
+                let id = format!("user-{}", realm_users.len() + 1);
+                rep["id"] = serde_json::json!(id);
+                rep["createdTimestamp"] = serde_json::json!(0);
+                realm_users.insert(id.clone(), rep);
+                (
+                    axum::http::StatusCode::CREATED,
+                    [(axum::http::header::LOCATION, format!("{path}/{id}"))],
+                    "",
+                )
+                    .into_response()
+            }
+            ("GET", ["users", id]) => match d.users.get(&realm).and_then(|m| m.get(*id)) {
+                Some(u) => axum::Json(u.clone()).into_response(),
+                None => axum::http::StatusCode::NOT_FOUND.into_response(),
+            },
+            ("PUT", ["users", id]) => {
+                let Some(stored) = d.users.get_mut(&realm).and_then(|m| m.get_mut(*id)) else {
+                    return axum::http::StatusCode::NOT_FOUND.into_response();
+                };
+                // Full replace: keep only the id and what the body carries.
+                let mut rep: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+                rep["id"] = stored["id"].clone();
+                rep["createdTimestamp"] = stored["createdTimestamp"].clone();
+                *stored = rep;
+                axum::http::StatusCode::NO_CONTENT.into_response()
+            }
+            ("GET", ["groups"]) => {
+                let name = param("search").unwrap_or_default();
+                let found: Vec<serde_json::Value> = d
+                    .groups
+                    .get(&realm)
+                    .and_then(|g| g.get(&name))
+                    .map(|gid| vec![serde_json::json!({"id": gid, "name": name})])
+                    .unwrap_or_default();
+                axum::Json(found).into_response()
+            }
+            ("POST", ["groups"]) => {
+                let rep: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+                let name = rep["name"].as_str().unwrap_or_default().to_string();
+                let groups = d.groups.entry(realm.clone()).or_default();
+                let gid = format!("group-{}", groups.len() + 1);
+                groups.insert(name, gid.clone());
+                (
+                    axum::http::StatusCode::CREATED,
+                    [(axum::http::header::LOCATION, format!("{path}/{gid}"))],
+                    "",
+                )
+                    .into_response()
+            }
+            ("PUT", ["users", id, "groups", gid]) => {
+                let member = (realm.clone(), id.to_string(), gid.to_string());
+                if !d.group_members.contains(&member) {
+                    d.group_members.push(member);
+                }
+                axum::http::StatusCode::NO_CONTENT.into_response()
+            }
+            _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn serve_keycloak_double(double: SharedDouble) -> KeycloakAdminClient {
+        let app = axum::Router::new()
+            .fallback(keycloak_double)
+            .with_state(double);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        KeycloakAdminClient::new(KeycloakAdminConfig {
+            host: format!("http://{addr}"),
+            admin_username: "admin".to_string(),
+            admin_password: crate::domain::secrets::SensitiveString::new("admin-password"),
+        })
+    }
+
+    /// The Keycloak realm a team of this tier invites into.
+    fn invite_realm(tier: &TenantTier) -> &'static str {
+        match tier {
+            TenantTier::Enterprise => "team-acme",
+            _ => "zaru-consumer",
+        }
+    }
+
+    /// A user who already exists, with the attributes the platform keeps on
+    /// every consumer: the tenant, the tier and the team memberships.
+    fn existing_user() -> serde_json::Value {
+        serde_json::json!({
+            "id": "user-9",
+            "username": "invitee@example.com",
+            "email": "invitee@example.com",
+            "emailVerified": true,
+            "firstName": "Ada",
+            "lastName": "Lovelace",
+            "enabled": true,
+            "createdTimestamp": 0,
+            "attributes": {
+                "tenant_id": ["u-0123456789abcdef0123456789abcdef"],
+                "zaru_tier": ["business"],
+                "team_memberships": ["t-11111111-2222-3333-4444-555555555555"]
+            }
+        })
+    }
+
+    /// Inviting a person who already has a Keycloak user leaves every
+    /// attribute that user had exactly as it was, whatever the team's tier.
+    #[tokio::test]
+    async fn inviting_an_existing_user_keeps_the_users_attributes() {
+        for tier in [TenantTier::Business, TenantTier::Enterprise] {
+            let realm = invite_realm(&tier);
+            let double = SharedDouble::default();
+            let before = existing_user();
+            double
+                .lock()
+                .unwrap()
+                .users
+                .entry(realm.to_string())
+                .or_default()
+                .insert("user-9".to_string(), before.clone());
+            let kc = serve_keycloak_double(double.clone()).await;
+
+            let user_id = kc
+                .invite_team_user(tier.clone(), "acme", "invitee@example.com", "member")
+                .await
+                .expect("the invitation reaches Keycloak");
+            assert_eq!(user_id, "user-9", "the existing user was not reused");
+
+            let d = double.lock().unwrap();
+            let after = &d.users[realm]["user-9"];
+            for key in ["tenant_id", "zaru_tier", "team_memberships"] {
+                assert_eq!(
+                    after["attributes"][key], before["attributes"][key],
+                    "inviting an existing {tier:?} user changed its {key} attribute: before {}, after {}",
+                    before["attributes"], after["attributes"]
+                );
+            }
+            for field in ["email", "firstName", "lastName"] {
+                assert_eq!(
+                    after[field], before[field],
+                    "inviting an existing {tier:?} user changed its {field}"
+                );
+            }
+        }
+    }
+
+    /// An invitation writes no user attribute: nothing reads one. An
+    /// existing user is not rewritten at all, and a new user is created
+    /// without attributes.
+    #[tokio::test]
+    async fn an_invitation_writes_no_user_attribute() {
+        for tier in [TenantTier::Business, TenantTier::Enterprise] {
+            let realm = invite_realm(&tier);
+            for existing in [true, false] {
+                let double = SharedDouble::default();
+                if existing {
+                    double
+                        .lock()
+                        .unwrap()
+                        .users
+                        .entry(realm.to_string())
+                        .or_default()
+                        .insert("user-9".to_string(), existing_user());
+                }
+                let kc = serve_keycloak_double(double.clone()).await;
+                let user_id = kc
+                    .invite_team_user(tier.clone(), "acme", "invitee@example.com", "member")
+                    .await
+                    .expect("the invitation reaches Keycloak");
+
+                let d = double.lock().unwrap();
+                let user_path = format!("/admin/realms/{realm}/users/{user_id}");
+                let rewrites: Vec<_> = d
+                    .calls
+                    .iter()
+                    .filter(|(m, p, _)| m == "PUT" && *p == user_path)
+                    .collect();
+                assert!(
+                    rewrites.is_empty(),
+                    "inviting a {tier:?} user rewrote the user: {rewrites:?}"
+                );
+                if !existing {
+                    let created = &d.users[realm][&user_id];
+                    assert!(
+                        created.get("attributes").is_none(),
+                        "inviting a new {tier:?} user wrote attributes: {created}"
+                    );
+                    assert_eq!(created["email"], "invitee@example.com");
+                }
+                if matches!(tier, TenantTier::Business) {
+                    assert!(
+                        d.group_members
+                            .iter()
+                            .any(|(r, u, _)| r == realm && *u == user_id),
+                        "the {tier:?} invitee was not put in the team's group: {:?}",
+                        d.calls
+                    );
+                }
+            }
+        }
+    }
+
+    /// Two invitations for a person with no Keycloak user can both search,
+    /// find nobody, and both create one. Keycloak refuses the second create
+    /// with 409. The second invitation then uses the user the first one
+    /// created, leaves its attributes alone, and still puts it in its team.
+    #[tokio::test]
+    async fn an_invitation_that_loses_the_create_race_uses_the_user_that_won() {
+        let double = SharedDouble::default();
+        {
+            let mut d = double.lock().unwrap();
+            // The first invitation created this user after the second
+            // invitation's search found nobody.
+            d.users
+                .entry("zaru-consumer".to_string())
+                .or_default()
+                .insert("user-9".to_string(), existing_user());
+            d.stale_searches = 1;
+        }
+        let kc = serve_keycloak_double(double.clone()).await;
+
+        let user_id = kc
+            .invite_team_user(
+                TenantTier::Business,
+                "acme",
+                "invitee@example.com",
+                "member",
+            )
+            .await
+            .expect("an invitation whose create is refused with 409 still invites the user");
+
+        let d = double.lock().unwrap();
+        assert_eq!(
+            user_id, "user-9",
+            "the invitation did not use the existing user"
+        );
+        assert_eq!(d.users["zaru-consumer"].len(), 1);
+        assert_eq!(
+            d.users["zaru-consumer"]["user-9"]["attributes"],
+            existing_user()["attributes"],
+            "the invitation changed the existing user's attributes"
+        );
+        assert!(
+            d.group_members
+                .iter()
+                .any(|(r, u, _)| r == "zaru-consumer" && u == "user-9"),
+            "the invitee was not put in the team's group: {:?}",
+            d.calls
+        );
+    }
+
     // ── build_set_attribute_body ───────────────────────────────────────────
 
     /// The PUT body must include `id`, `email`, `firstName`, `lastName`,
