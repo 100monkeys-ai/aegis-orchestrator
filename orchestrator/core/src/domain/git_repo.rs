@@ -754,4 +754,23 @@ mod tests {
     fn validate_url_rejects_ip_host() {
         assert!(validate_repo_url("https://192.168.1.1/foo").is_err());
     }
+
+    /// A URL that is refused is not repeated in the error, which the caller
+    /// and an agent read: it may hold a credential, as user info or as a
+    /// token pasted where the URL belongs.
+    #[test]
+    fn a_refused_url_is_not_repeated_in_the_error() {
+        for url in [
+            "http://someone:Mk6-password-marker@git.example.invalid/o/r.git",
+            "ftp://Mk6-token-marker@git.example.invalid/o/r.git",
+            "Mk6-bare-token-marker",
+            "ghp_Mk6-pasted-token-marker",
+        ] {
+            let error = validate_repo_url(url).expect_err("the URL is refused");
+            assert!(
+                !error.contains("Mk6"),
+                "the refusal repeats the URL it refused: {error}"
+            );
+        }
+    }
 }
