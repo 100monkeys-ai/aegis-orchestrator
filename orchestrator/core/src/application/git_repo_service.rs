@@ -41,7 +41,10 @@ use tracing::{error, info, instrument, warn};
 
 use chrono::Utc;
 
-use crate::application::git_clone_executor::{CloneError, GitCloneExecutor, ResolvedCredential};
+use crate::application::git_clone_executor::{
+    clone_credential, credential_secrets, redact_git_output, strip_remote_user_info, CloneError,
+    GitCloneExecutor, ResolvedCredential,
+};
 use crate::application::git_ssh_key::attach_ssh_credentials;
 use crate::application::user_volume_service::{UserVolumeError, UserVolumeService};
 use crate::application::volume_manager::CreateUserVolumeCommand;
@@ -1196,6 +1199,35 @@ fn blocking_commit(
     Ok(commit_oid.to_string())
 }
 
+/// Push the working tree at `target_dir` to `remote_name` for the binding
+/// whose repository URL is `repo_url`, authenticating with `credential`.
+///
+/// The credential is the one the binding names or, failing that, the user
+/// info of its URL, as for a clone. User info is taken off the remote's URL
+/// in `.git/config`, and the remote still points where it did. An error's
+/// text holds no part of the credential.
+pub(crate) fn push_to_remote(
+    target_dir: &std::path::Path,
+    repo_url: &SensitiveUrl,
+    remote_name: &str,
+    ref_name: Option<String>,
+    credential: Option<ResolvedCredential>,
+) -> Result<String, GitRepoError> {
+    let (_, credential) = clone_credential(repo_url.expose(), credential);
+    let secrets = credential_secrets(credential.as_ref());
+    let pushed = (|| {
+        let repo = git2::Repository::open(target_dir)
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+        strip_remote_user_info(&repo, remote_name)
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+        blocking_push(target_dir, remote_name, ref_name, credential)
+    })();
+    pushed.map_err(|e| match e {
+        GitRepoError::GitFailed(m) => GitRepoError::GitFailed(redact_git_output(&m, &secrets)),
+        other => other,
+    })
+}
+
 /// Blocking libgit2 push against `target_dir`.
 ///
 /// Resolves `ref_name` to the shorthand of HEAD when `None`; a reference name
@@ -1206,18 +1238,6 @@ fn blocking_commit(
 /// drop).
 /// Returns the resolved `ref_name` so the service can emit
 /// [`GitRepoEvent::PushCompleted`] with the actual ref that was pushed.
-/// Push the working tree at `target_dir` to `remote_name` for the binding
-/// whose repository URL is `repo_url`, authenticating with `credential`.
-pub(crate) fn push_to_remote(
-    target_dir: &std::path::Path,
-    _repo_url: &SensitiveUrl,
-    remote_name: &str,
-    ref_name: Option<String>,
-    credential: Option<ResolvedCredential>,
-) -> Result<String, GitRepoError> {
-    blocking_push(target_dir, remote_name, ref_name, credential)
-}
-
 fn blocking_push(
     target_dir: &std::path::Path,
     remote_name: &str,

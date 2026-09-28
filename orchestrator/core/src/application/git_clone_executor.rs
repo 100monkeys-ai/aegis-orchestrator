@@ -26,6 +26,14 @@
 //!   Spawns an `alpine/git` container through the ADR-050
 //!   [`ContainerStepRunner`] and mounts the target volume via the
 //!   orchestrator's FUSE gateway.
+//! - Where a credential goes: in process, only into libgit2's credentials
+//!   callback. In the container, only onto the step's standard input; the
+//!   step keeps it in a directory on its memory-backed `/tmp`, gives it to
+//!   git through a credential helper (or to ssh with `-i`), and removes the
+//!   directory when it ends. User info in a binding's URL is taken off the
+//!   URL git is given and used as the credential, so no command line,
+//!   `.git/config` or message of git's holds it. Text from git is redacted
+//!   (`redact_git_output`) before it is stored or shown.
 //! - Sparse checkout — applied post-clone by writing
 //!   `.git/info/sparse-checkout` and re-running `checkout_head`.
 
@@ -44,7 +52,7 @@ use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
 use crate::domain::runtime::{
     ContainerStepConfig, ContainerStepError, ContainerStepRunner, ContainerVolumeMount,
 };
-use crate::domain::secrets::SensitiveString;
+use crate::domain::secrets::{SensitiveBytes, SensitiveString};
 use crate::domain::shared_kernel::ImagePullPolicy;
 use crate::domain::volume::{Volume, VolumeBackend, VolumeId};
 use crate::domain::workflow::StateName;
@@ -60,9 +68,10 @@ use crate::infrastructure::secrets_manager::SecretsManager;
 ///
 /// The engine spawns an `alpine/git` container through the ADR-050
 /// [`ContainerStepRunner`] with the bound volume mounted at `/workspace`
-/// (FUSE transport — ADR-107). Credentials are delivered via environment
-/// variables (`GIT_ASKPASS` for HTTPS+PAT, `GIT_SSH_COMMAND` for SSH keys)
-/// so they never appear in the command line.
+/// (FUSE transport — ADR-107). The credential is handed to the step on its
+/// standard input and never appears in its command, environment or labels,
+/// which anyone who can inspect the container or list the host's processes
+/// can read.
 pub struct EphemeralCliEngine {
     runner: Arc<dyn ContainerStepRunner>,
     volume_registry: Arc<NfsVolumeRegistry>,
@@ -84,7 +93,7 @@ impl Default for EphemeralCliPaths {
     fn default() -> Self {
         Self {
             workspace: "/workspace".to_string(),
-            scratch: "/tmp".to_string(),
+            scratch: "/tmp/aegis-git".to_string(),
         }
     }
 }
@@ -179,135 +188,26 @@ impl EphemeralCliEngine {
         shallow: bool,
         execution_id: ExecutionId,
     ) -> Result<String, CloneError> {
-        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut script_prelude = String::new();
-        let ws = self.paths.workspace.as_str();
-        let tmp = self.paths.scratch.as_str();
-
-        // -- ref selection flags --
-        let (ref_flag, checkout_cmd) = match &binding.git_ref {
-            GitRef::Branch(name) => (format!("--branch {}", shell_escape(name)), String::new()),
-            GitRef::Tag(name) => (format!("--branch {}", shell_escape(name)), String::new()),
-            GitRef::Commit(sha) => (
-                String::new(),
-                format!("&& git -C {ws}/repo checkout {}", shell_escape(sha)),
-            ),
-        };
-
-        let depth_flag = if shallow { "--depth=1" } else { "" };
-        let filter_flag = "--filter=blob:limit=10M";
-
-        // -- credential wiring --
-        let auth_repo_url = match credential {
-            Some(ResolvedCredential::HttpsPat { username, token }) => {
-                // Security audit 002 §4.24 — the PAT MUST NOT travel
-                // through container environment variables. Env vars are
-                // visible via `docker inspect`, `/proc/<pid>/environ`,
-                // and any logging middleware that snapshots the spawn
-                // configuration. Instead, materialise the credential to
-                // a mode-0600 file inside the container (heredoc into
-                // the script prelude — the PAT only exists inside the
-                // container's mount namespace) and have a tiny
-                // `GIT_ASKPASS` script `cat` it on demand. The username
-                // is non-secret and follows the same file-based path
-                // for symmetry. Trailing files are deleted at the end
-                // of the script so the secret material does not survive
-                // the container's lifetime even if the volume is
-                // inspected post-mortem.
-                let prelude = build_https_askpass_prelude(tmp, &username, token.expose());
-                script_prelude.push_str(&prelude);
-                env.insert("GIT_ASKPASS".to_string(), format!("{tmp}/askpass.sh"));
-                env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
-                remote_url(binding)
-            }
-            Some(ResolvedCredential::SshKey {
-                private_key_pem,
-                passphrase: _, // container-ephemeral passphrases not supported
-            }) => {
-                // Audit 002 §4.31: do NOT embed key material in the `sh -c`
-                // argv (heredoc-in-script). The argv is observable via
-                // `ps`, `docker inspect`, OTLP spans, and any tracing
-                // middleware that captures the spawned command. Pass the
-                // key via the environment variable `AEGIS_SSH_KEY` and
-                // materialise it inside the container with `printf '%s'`
-                // — this keeps the bytes out of argv. We chmod 0600,
-                // unset the env var so it does not leak to child
-                // processes (`git`, `ssh`), and `shred + rm` the file in
-                // a trap so the bytes are scrubbed on success and on
-                // failure paths alike. `set +o history` is a defensive
-                // no-op for non-interactive `sh` but documents intent.
-                env.insert(
-                    "AEGIS_SSH_KEY".to_string(),
-                    private_key_pem.expose().to_string(),
-                );
-                script_prelude.push_str(&format!(
-                    "set +o history 2>/dev/null || true\n\
-                     umask 0077\n\
-                     printf '%s' \"$AEGIS_SSH_KEY\" >{tmp}/ssh_key\n\
-                     case \"$(tail -c1 {tmp}/ssh_key | od -An -c | tr -d ' ')\" in\n\
-                       '\\n') ;;\n\
-                       *) printf '\\n' >>{tmp}/ssh_key ;;\n\
-                     esac\n\
-                     chmod 0600 {tmp}/ssh_key\n\
-                     unset AEGIS_SSH_KEY\n\
-                     trap 'shred -u {tmp}/ssh_key 2>/dev/null || rm -f {tmp}/ssh_key' EXIT INT TERM\n",
-                ));
-                env.insert(
-                    "GIT_SSH_COMMAND".to_string(),
-                    format!("ssh -i {tmp}/ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"),
-                );
-                remote_url(binding)
-            }
-            None => remote_url(binding),
-        };
-
-        // -- sparse checkout --
-        let sparse_cmd = if let Some(paths) = &binding.sparse_paths {
-            let escaped: Vec<String> = paths.iter().map(|p| shell_escape(p)).collect();
-            format!(
-                " && git -C {ws}/repo sparse-checkout set --cone {}",
-                escaped.join(" ")
-            )
-        } else {
-            String::new()
-        };
-
-        // Full shell command:
-        //   <prelude>            -- materialise credential files (mode 0600)
-        //   trap '<scrub>' EXIT  -- guarantee scrub on success or failure
-        //   git clone [--depth=1 --filter=blob:limit=10M] [--branch X] URL /workspace/repo
-        //   [ && git -C /workspace/repo checkout SHA ]
-        //   [ && git -C /workspace/repo sparse-checkout set --cone A B ]
-        //   && git -C /workspace/repo rev-parse HEAD
-        //
-        // The `trap` ensures that `/tmp/git_password`, `/tmp/git_username`,
-        // `/tmp/ssh_key`, and `/tmp/askpass.sh` are removed even if the
-        // clone fails. This is the file-side complement of the
-        // env-var-removal fix for security audit 002 §4.24.
-        let command = format!(
-            "{prelude}\
-             trap 'rm -f {tmp}/git_password {tmp}/git_username {tmp}/askpass.sh {tmp}/ssh_key' EXIT && \
-             set -eu && \
-             git clone {depth} {filter} {ref_} {url} {ws}/repo \
-             {checkout}{sparse} && \
-             git -C {ws}/repo rev-parse HEAD",
-            prelude = script_prelude,
-            depth = depth_flag,
-            filter = filter_flag,
-            ref_ = ref_flag,
-            url = shell_escape(&auth_repo_url),
-            checkout = checkout_cmd,
-            sparse = sparse_cmd,
-        );
+        let (clone_url, credential) = clone_credential(binding.repo_url.expose(), credential);
+        let secrets = credential_secrets(credential.as_ref());
+        let step = clone_step(
+            &self.paths,
+            binding,
+            &clone_url,
+            credential.as_ref(),
+            shallow,
+        )?;
 
         let cfg = ContainerStepConfig {
             name: format!("git-clone-{}", binding.id),
             image: self.image.clone(),
             image_pull_policy: ImagePullPolicy::IfNotPresent,
-            entrypoint: None,
-            command: vec!["sh".to_string(), "-c".to_string(), command],
-            stdin: None,
-            env,
+            // The image's own entrypoint may be `git` (it is in `alpine/git`),
+            // which would run `git sh -c …`.
+            entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+            command: vec![step.script],
+            stdin: step.stdin,
+            env: std::collections::HashMap::new(),
             workdir: Some(self.paths.workspace.clone()),
             volumes: vec![ContainerVolumeMount {
                 name: volume_id.0.to_string(),
@@ -318,40 +218,48 @@ impl EphemeralCliEngine {
             registry_credentials: None,
             execution_id,
             state_name: StateName::new("GIT_CLONE").expect("static state name is valid"),
-            read_only_root_filesystem: false,
+            // A read-only root file system comes with a memory-backed `/tmp`,
+            // where the step keeps the credential while git runs.
+            read_only_root_filesystem: true,
             run_as_user: None,
             network_mode: None,
             workflow_execution_id: None,
         };
 
-        let result = self.runner.run_step(cfg).await.map_err(|e| match e {
-            ContainerStepError::ImagePullFailed { image, error } => CloneError::Git(format!(
-                "ephemeral-cli image pull failed for '{image}': {error}"
-            )),
-            ContainerStepError::TimeoutExpired { timeout_secs } => CloneError::Git(format!(
-                "ephemeral-cli clone timed out after {timeout_secs}s"
-            )),
-            ContainerStepError::VolumeMountFailed { volume, error } => CloneError::Io(format!(
-                "ephemeral-cli volume mount failed for '{volume}': {error}"
-            )),
-            ContainerStepError::ResourceExhausted { detail } => {
-                CloneError::Git(format!("ephemeral-cli resource exhausted: {detail}"))
+        let result = self.runner.run_step(cfg).await.map_err(|e| {
+            match e {
+                ContainerStepError::ImagePullFailed { image, error } => CloneError::Git(format!(
+                    "ephemeral-cli image pull failed for '{image}': {error}"
+                )),
+                ContainerStepError::TimeoutExpired { timeout_secs } => CloneError::Git(format!(
+                    "ephemeral-cli clone timed out after {timeout_secs}s"
+                )),
+                ContainerStepError::VolumeMountFailed { volume, error } => CloneError::Io(format!(
+                    "ephemeral-cli volume mount failed for '{volume}': {error}"
+                )),
+                ContainerStepError::ResourceExhausted { detail } => {
+                    CloneError::Git(format!("ephemeral-cli resource exhausted: {detail}"))
+                }
+                ContainerStepError::DockerError(m) => CloneError::Git(format!("docker: {m}")),
             }
-            ContainerStepError::DockerError(m) => CloneError::Git(format!("docker: {m}")),
+            .redacted(&secrets)
         })?;
 
+        // What git printed is redacted before it is cut, so no cut can leave
+        // part of a credential behind.
+        let stdout = redact_git_output(&result.stdout, &secrets);
+        let stderr = redact_git_output(&result.stderr, &secrets);
         if result.exit_code != 0 {
             return Err(CloneError::Git(format!(
                 "ephemeral-cli git exited {}: stdout={:?} stderr={:?}",
                 result.exit_code,
-                truncate(&result.stdout, 256),
-                truncate(&result.stderr, 256)
+                truncate(&stdout, 256),
+                truncate(&stderr, 256)
             )));
         }
 
         // The last line of stdout is the HEAD SHA (from `git rev-parse HEAD`).
-        let sha = result
-            .stdout
+        let sha = stdout
             .lines()
             .last()
             .map(|s| s.trim().to_string())
@@ -359,18 +267,238 @@ impl EphemeralCliEngine {
         if sha.len() != 40 {
             return Err(CloneError::Git(format!(
                 "ephemeral-cli could not parse HEAD sha from stdout tail: {:?}",
-                truncate(&result.stdout, 256)
+                truncate(&stdout, 256)
             )));
         }
         Ok(sha)
     }
 }
 
-/// The URL git connects to, as stored on the binding. The one place the
-/// executor reads it: the clone command (every credential arm) and libgit2's
-/// clone and fetch all take it from here.
-fn remote_url(binding: &GitRepoBinding) -> String {
-    binding.repo_url.expose().to_string()
+/// The clone step's script and what it is handed on standard input.
+struct CloneStep {
+    script: String,
+    stdin: Option<SensitiveBytes>,
+}
+
+/// Build the clone step. The credential is never in the script: it is the
+/// step's standard input, which the script writes to a file in a directory
+/// only its user can read. git reads it from there through a credential
+/// helper, or ssh through `-i`. The directory is removed when the script
+/// ends, whether the clone succeeded or not.
+fn clone_step(
+    paths: &EphemeralCliPaths,
+    binding: &GitRepoBinding,
+    clone_url: &str,
+    credential: Option<&ResolvedCredential>,
+    shallow: bool,
+) -> Result<CloneStep, CloneError> {
+    let dest = shell_escape(&format!("{}/repo", paths.workspace));
+    let mut s = String::new();
+    s.push_str("set -eu\numask 077\n");
+    s.push_str(&format!("scratch={}\n", shell_escape(&paths.scratch)));
+    s.push_str(
+        "rm -rf \"$scratch\"\n\
+         mkdir -m 700 \"$scratch\"\n\
+         trap 'rm -rf \"$scratch\"' EXIT\n\
+         trap 'exit 129' HUP\n\
+         trap 'exit 130' INT\n\
+         trap 'exit 143' TERM\n\
+         GIT_TERMINAL_PROMPT=0\n\
+         export GIT_TERMINAL_PROMPT\n",
+    );
+
+    let mut git_options = String::new();
+    let mut stdin = None;
+    match credential {
+        Some(ResolvedCredential::HttpsPat { username, token }) => {
+            if username.contains(['\n', '\r']) || token.expose().contains(['\n', '\r']) {
+                return Err(CloneError::Git(
+                    "the credential holds a line break, which git cannot be given".to_string(),
+                ));
+            }
+            stdin = Some(SensitiveBytes::from(
+                format!("{username}\n{}", token.expose()).into_bytes(),
+            ));
+            s.push_str(
+                "AEGIS_GIT_CREDENTIAL_FILE=\"$scratch/credential\"\n\
+                 export AEGIS_GIT_CREDENTIAL_FILE\n\
+                 cat >\"$AEGIS_GIT_CREDENTIAL_FILE\"\n",
+            );
+            // git runs a helper that starts with `!` through the shell. This
+            // one answers `get` from the file; the empty value first drops
+            // any helper the image configures, so git stores nothing.
+            let helper = "credential.helper=!f() { test \"$1\" = get || exit 0; \
+                          printf 'username=%s\\npassword=%s\\n' \
+                          \"$(head -n 1 \"$AEGIS_GIT_CREDENTIAL_FILE\")\" \
+                          \"$(tail -n +2 \"$AEGIS_GIT_CREDENTIAL_FILE\")\"; }; f";
+            git_options = format!(" -c credential.helper= -c {}", shell_escape(helper));
+        }
+        Some(ResolvedCredential::SshKey {
+            private_key_pem,
+            passphrase: _, // container-ephemeral passphrases not supported
+        }) => {
+            stdin = Some(SensitiveBytes::from(
+                private_key_pem.expose().as_bytes().to_vec(),
+            ));
+            s.push_str(
+                "cat >\"$scratch/key\"\n\
+                 if [ -n \"$(tail -c 1 \"$scratch/key\")\" ]; then printf '\\n' >>\"$scratch/key\"; fi\n\
+                 GIT_SSH_COMMAND=\"ssh -i '$scratch/key' -o IdentitiesOnly=yes \
+                 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\"\n\
+                 export GIT_SSH_COMMAND\n",
+            );
+        }
+        None => {}
+    }
+
+    let ref_flag = match &binding.git_ref {
+        GitRef::Branch(name) | GitRef::Tag(name) => format!(" --branch {}", shell_escape(name)),
+        GitRef::Commit(_) => String::new(),
+    };
+    let depth_flag = if shallow { " --depth=1" } else { "" };
+    s.push_str(&format!(
+        "git{git_options} clone{depth_flag} --filter=blob:limit=10M{ref_flag} -- {} {dest}\n",
+        shell_escape(clone_url)
+    ));
+    if let GitRef::Commit(sha) = &binding.git_ref {
+        s.push_str(&format!("git -C {dest} checkout {}\n", shell_escape(sha)));
+    }
+    if let Some(sparse) = &binding.sparse_paths {
+        let escaped: Vec<String> = sparse.iter().map(|p| shell_escape(p)).collect();
+        s.push_str(&format!(
+            "git -C {dest} sparse-checkout set --cone {}\n",
+            escaped.join(" ")
+        ));
+    }
+    s.push_str(&format!("git -C {dest} rev-parse HEAD\n"));
+    Ok(CloneStep { script: s, stdin })
+}
+
+/// The URL git is given and the credential it authenticates with.
+///
+/// User info in the binding's URL (`https://user:token@host/…`) is taken off
+/// the URL, so that no command line, `.git/config` or message of git's holds
+/// it, and becomes the credential when the binding names none. A credential
+/// the binding names wins, and the URL's user info is then not used.
+pub(crate) fn clone_credential(
+    repo_url: &str,
+    credential: Option<ResolvedCredential>,
+) -> (String, Option<ResolvedCredential>) {
+    let (url, from_url) = split_repo_url(repo_url);
+    (url, credential.or(from_url))
+}
+
+/// Split the user info off an `http(s)` URL. Any other URL is returned as it
+/// is.
+pub(crate) fn split_repo_url(raw: &str) -> (String, Option<ResolvedCredential>) {
+    if !(raw.starts_with("https://") || raw.starts_with("http://")) {
+        return (raw.to_string(), None);
+    }
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return (raw.to_string(), None);
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return (raw.to_string(), None);
+    }
+    let username = percent_decode(url.username());
+    let token = url.password().map(percent_decode).unwrap_or_default();
+    // Clearing both cannot fail on an http(s) URL, which has a host.
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    (
+        url.to_string(),
+        Some(ResolvedCredential::HttpsPat {
+            username,
+            token: SensitiveString::new(token),
+        }),
+    )
+}
+
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// The values a clone's output must never show: the token or password, the
+/// user name (which may itself be a token), and a key and each line of it.
+pub(crate) fn credential_secrets(credential: Option<&ResolvedCredential>) -> Vec<SensitiveString> {
+    let mut out = Vec::new();
+    match credential {
+        Some(ResolvedCredential::HttpsPat { username, token }) => {
+            out.push(token.clone());
+            out.push(SensitiveString::new(username.clone()));
+        }
+        Some(ResolvedCredential::SshKey {
+            private_key_pem,
+            passphrase,
+        }) => {
+            out.push(private_key_pem.clone());
+            for line in private_key_pem.expose().lines() {
+                if line.len() >= 8 && !line.starts_with("-----") {
+                    out.push(SensitiveString::new(line));
+                }
+            }
+            if let Some(p) = passphrase {
+                out.push(p.clone());
+            }
+        }
+        None => {}
+    }
+    out.retain(|s| !s.expose().is_empty());
+    // Longest first, so a value is not left partly replaced by a shorter one
+    // it contains.
+    out.sort_by_key(|s| std::cmp::Reverse(s.expose().len()));
+    out
+}
+
+/// Text from git (an error, its output) made fit to store or show: every
+/// value in `secrets` is replaced, and so is the user info of any URL in it.
+pub(crate) fn redact_git_output(text: &str, secrets: &[SensitiveString]) -> String {
+    let mut out = text.to_string();
+    for s in secrets {
+        out = out.replace(s.expose(), "[REDACTED]");
+    }
+    redact_user_info_in_text(&out)
+}
+
+/// Replace the user info of every `scheme://user[:password]@host` in `text`.
+fn redact_user_info_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c.is_whitespace() || "/?#'\"<>`".contains(c))
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("[REDACTED]");
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn shell_escape(s: &str) -> String {
@@ -379,60 +507,15 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Build the script prelude that materialises an HTTPS PAT credential to
-/// mode-0600 files inside the container and installs a `GIT_ASKPASS`
-/// helper that reads them.
-///
-/// Security audit 002 §4.24: this replaces the previous design that
-/// passed the PAT via the container's `GIT_PASSWORD` environment
-/// variable. Env-var values are visible via `docker inspect` and
-/// `/proc/<pid>/environ`; file-based delivery limits exposure to a
-/// process holding a file descriptor on a 0600 file inside the
-/// container's mount namespace.
-///
-/// The `<<'EOF'` heredoc form is critical: the single-quoted delimiter
-/// disables shell interpolation, so any metacharacters in the PAT or
-/// username (e.g. `$`, `` ` ``, `\`) are written verbatim and NOT
-/// expanded by the surrounding `sh -c`.
-///
-/// The prelude is paired with a `trap '<scrub>' EXIT` in the surrounding
-/// command so the files are removed even if the clone fails.
-///
-/// Factored out for unit testability — see
-/// `https_askpass_prelude_does_not_leak_secret_to_env`.
-fn build_https_askpass_prelude(tmp: &str, username: &str, password: &str) -> String {
-    // The askpass.sh script `cat`s the appropriate file based on what
-    // git is asking for (Username vs Password prompt). Files are mode
-    // 0600 so only root inside the container can read them.
-    let mut s = String::new();
-    s.push_str(&format!("cat >{tmp}/git_username <<'AEGIS_USERNAME_EOF'\n"));
-    s.push_str(username);
-    s.push('\n');
-    s.push_str("AEGIS_USERNAME_EOF\n");
-    s.push_str(&format!("chmod 0600 {tmp}/git_username\n"));
-    s.push_str(&format!("cat >{tmp}/git_password <<'AEGIS_PASSWORD_EOF'\n"));
-    s.push_str(password);
-    s.push('\n');
-    s.push_str("AEGIS_PASSWORD_EOF\n");
-    s.push_str(&format!("chmod 0600 {tmp}/git_password\n"));
-    s.push_str(&format!(
-        "cat >{tmp}/askpass.sh <<'AEGIS_ASKPASS_EOF'\n\
-         #!/bin/sh\n\
-         case \"$1\" in\n\
-         Username*) cat {tmp}/git_username ;;\n\
-         Password*) cat {tmp}/git_password ;;\n\
-         esac\n\
-         AEGIS_ASKPASS_EOF\n\
-         chmod 0700 {tmp}/askpass.sh\n",
-    ));
-    s
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let mut cut = max;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &s[..cut])
     }
 }
 
@@ -455,6 +538,18 @@ pub enum CloneError {
     /// later ADR-081 phase.
     #[error("not yet implemented: {0}")]
     NotYetImplemented(&'static str),
+}
+
+impl CloneError {
+    /// The same error with every value in `secrets`, and the user info of any
+    /// URL, taken out of its text.
+    pub(crate) fn redacted(self, secrets: &[SensitiveString]) -> Self {
+        match self {
+            Self::Git(m) => Self::Git(redact_git_output(&m, secrets)),
+            Self::Io(m) => Self::Io(redact_git_output(&m, secrets)),
+            other => other,
+        }
+    }
 }
 
 impl From<git2::Error> for CloneError {
@@ -488,9 +583,9 @@ pub enum ResolvedCredential {
         token: SensitiveString,
     },
     /// SSH private key material. The executor materialises the key to a
-    /// mode-`0600` temp file (libgit2 path) or heredocs it into the
-    /// container (EphemeralCli path). Always zeroed + removed via
-    /// `scopeguard` before the function returns.
+    /// mode-`0600` temp file (libgit2 path, zeroed and removed when the
+    /// operation ends) or hands it to the clone step on standard input
+    /// (EphemeralCli path, where the step removes its copy when it ends).
     SshKey {
         private_key_pem: SensitiveString,
         passphrase: Option<SensitiveString>,
@@ -584,7 +679,8 @@ impl GitCloneExecutor {
         credential: Option<ResolvedCredential>,
         shallow: bool,
     ) -> Result<String, CloneError> {
-        let repo_url = remote_url(binding);
+        let (repo_url, credential) = clone_credential(binding.repo_url.expose(), credential);
+        let secrets = credential_secrets(credential.as_ref());
         let target_dir: PathBuf = target_dir.to_path_buf();
         let sparse_paths = binding.sparse_paths.clone();
 
@@ -598,7 +694,8 @@ impl GitCloneExecutor {
             blocking_clone(&repo_url, &target_dir, credential, shallow, sparse_paths)
         })
         .await
-        .map_err(|e| CloneError::Io(format!("clone task panicked: {e}")))??;
+        .map_err(|e| CloneError::Io(format!("clone task panicked: {e}")))?
+        .map_err(|e| e.redacted(&secrets))?;
 
         debug!(commit_sha = %sha, "clone completed");
         Ok(sha)
@@ -642,13 +739,15 @@ impl GitCloneExecutor {
     ) -> Result<String, CloneError> {
         let target_dir: PathBuf = target_dir.to_path_buf();
         let git_ref = binding.git_ref.clone();
-        let repo_url = remote_url(binding);
+        let (repo_url, credential) = clone_credential(binding.repo_url.expose(), credential);
+        let secrets = credential_secrets(credential.as_ref());
 
         let sha = tokio::task::spawn_blocking(move || -> Result<String, CloneError> {
             blocking_fetch_and_checkout(&repo_url, &target_dir, &git_ref, credential)
         })
         .await
-        .map_err(|e| CloneError::Io(format!("fetch task panicked: {e}")))??;
+        .map_err(|e| CloneError::Io(format!("fetch task panicked: {e}")))?
+        .map_err(|e| e.redacted(&secrets))?;
 
         Ok(sha)
     }
@@ -889,6 +988,43 @@ fn blocking_clone(
     Ok(commit_sha)
 }
 
+/// Point the tree's `origin` at `url`, the repository's URL without user
+/// info. A tree cloned with the user info in the URL (before it was taken off)
+/// loses it from `.git/config` here.
+fn point_origin_at(repo: &Repository, url: &str) -> Result<(), git2::Error> {
+    match repo.find_remote("origin") {
+        // `url()` fails only on a URL that is not UTF-8; that one is rewritten.
+        Ok(r) => {
+            if r.url().ok() != Some(url) {
+                drop(r);
+                repo.remote_set_url("origin", url)?;
+            }
+        }
+        Err(_) => {
+            repo.remote("origin", url)?;
+        }
+    }
+    Ok(())
+}
+
+/// Take any user info off the URL of the tree's remote `name`, leaving the
+/// remote where it points. A tree cloned before user info was taken off
+/// the URL loses it from `.git/config` here.
+pub(crate) fn strip_remote_user_info(repo: &Repository, name: &str) -> Result<(), git2::Error> {
+    let url = match repo.find_remote(name) {
+        Ok(r) => match r.url() {
+            Ok(u) => u.to_string(),
+            Err(_) => return Ok(()),
+        },
+        Err(_) => return Ok(()),
+    };
+    let (clean, user_info) = split_repo_url(&url);
+    if user_info.is_some() {
+        repo.remote_set_url(name, &clean)?;
+    }
+    Ok(())
+}
+
 /// Run libgit2 fetch + checkout on the calling (blocking) thread.
 fn blocking_fetch_and_checkout(
     repo_url: &str,
@@ -898,31 +1034,7 @@ fn blocking_fetch_and_checkout(
 ) -> Result<String, CloneError> {
     let repo = Repository::open(target_dir)?;
 
-    // Ensure remote `origin` points at the binding's repo_url. Rewrite
-    // if the caller changed it (e.g. credential rotation that altered
-    // the userinfo segment).
-    {
-        let origin = repo.find_remote("origin");
-        match origin {
-            Ok(r) => {
-                // git2 0.21 changed `Remote::url()` from `Option<&str>` to
-                // `Result<&str, git2::Error>`. The condition is unchanged:
-                // `url_bytes()` is identical in both versions and returns `&[]`
-                // for an unset url, so 0.20's `None` and 0.21's `Err` denote the
-                // same single case — the bytes are not UTF-8 — and `.ok()` maps
-                // it back. Every remote state produces the same branch as before:
-                // matching url -> no rewrite; differing, unset, or non-UTF-8 ->
-                // rewrite.
-                if r.url().ok() != Some(repo_url) {
-                    drop(r);
-                    repo.remote_set_url("origin", repo_url)?;
-                }
-            }
-            Err(_) => {
-                repo.remote("origin", repo_url)?;
-            }
-        }
-    }
+    point_origin_at(&repo, repo_url)?;
 
     let mut callbacks = RemoteCallbacks::new();
     let _ssh_guard = configure_credentials(&mut callbacks, credential)?;
@@ -989,56 +1101,6 @@ fn blocking_fetch_and_checkout(
 mod tests {
     use super::*;
 
-    /// Regression for security audit 002 §4.24 — the HTTPS PAT MUST
-    /// NOT appear anywhere in the spawn environment of the ephemeral
-    /// container. The previous design set `env["GIT_PASSWORD"] = pat`
-    /// which was visible via `docker inspect` and `/proc/<pid>/environ`.
-    #[test]
-    fn https_askpass_prelude_does_not_leak_secret_to_env() {
-        const SECRET: &str = "ghp_SECRETPATBYTES_xyz123";
-        let prelude = build_https_askpass_prelude("/tmp", "x-access-token", SECRET);
-
-        // Simulate the env that would be passed to the container — same
-        // population logic as `run_clone_container`. The fix is correct
-        // iff the ONLY env vars set are non-secret routing flags.
-        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        env.insert("GIT_ASKPASS".to_string(), "/tmp/askpass.sh".to_string());
-        env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
-
-        for (k, v) in env.iter() {
-            assert!(
-                !v.contains(SECRET),
-                "env var {k}={v:?} contains the secret — §4.24 regressed"
-            );
-            assert_ne!(k, "GIT_PASSWORD", "GIT_PASSWORD env var must not be set");
-            assert_ne!(k, "GIT_USERNAME", "GIT_USERNAME env var must not be set");
-        }
-
-        // The secret IS expected inside the heredoc-rendered prelude
-        // (that is the file-based delivery path). Sanity-check that
-        // the file path machinery is in fact used.
-        assert!(
-            prelude.contains(SECRET),
-            "secret must appear in heredoc payload"
-        );
-        assert!(prelude.contains("/tmp/git_password"));
-        assert!(prelude.contains("chmod 0600 /tmp/git_password"));
-    }
-
-    /// The heredoc delimiter MUST be single-quoted so that shell
-    /// metacharacters in the credential are not expanded by the
-    /// outer `sh -c`. This pins that property.
-    #[test]
-    fn https_askpass_prelude_uses_quoted_heredoc_delimiter() {
-        let prelude =
-            build_https_askpass_prelude("/tmp", "u", "secret-with-$dollar-and-`backtick`");
-        assert!(prelude.contains("<<'AEGIS_PASSWORD_EOF'"));
-        assert!(prelude.contains("<<'AEGIS_USERNAME_EOF'"));
-        // Secret is written verbatim — the test value contains $ and `
-        // which would be expanded if the delimiter were unquoted.
-        assert!(prelude.contains("secret-with-$dollar-and-`backtick`"));
-    }
-
     #[test]
     fn github_pat_default_username() {
         let cred = ResolvedCredential::github_pat(SensitiveString::new("abc123"));
@@ -1056,79 +1118,96 @@ mod tests {
         assert_eq!(shell_escape("abc"), "'abc'");
     }
 
-    /// Regression for audit 002 §4.31: the SSH private key MUST NOT appear
-    /// anywhere in the spawned container's argv (the `sh -c` script).
-    /// Argv is observable via `ps`, `docker inspect`, OTLP spans, and any
-    /// tracing middleware that captures the command line. The key may
-    /// only travel through the container env (`AEGIS_SSH_KEY`), which the
-    /// in-script trampoline materialises to `/tmp/ssh_key` (mode 0600),
-    /// then `unset`s and `shred`s on exit.
-    #[tokio::test]
-    async fn ssh_key_never_appears_in_container_argv() {
-        use crate::domain::runtime::{
-            ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
-        };
-        use crate::domain::tenant::TenantId;
-        use crate::domain::volume::{
-            FilerEndpoint, StorageClass, Volume, VolumeBackend, VolumeOwnership,
-        };
-        use std::sync::Mutex;
-
-        struct CapturingRunner {
-            captured: Arc<Mutex<Option<ContainerStepConfig>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl ContainerStepRunner for CapturingRunner {
-            async fn run_step(
-                &self,
-                config: ContainerStepConfig,
-            ) -> Result<ContainerStepResult, ContainerStepError> {
-                *self.captured.lock().unwrap() = Some(config);
-                // Return a 40-char SHA so the executor's parse step
-                // doesn't fail before we get to assert on the captured
-                // config.
-                Ok(ContainerStepResult {
-                    exit_code: 0,
-                    stdout: format!("{}\n", "a".repeat(40)),
-                    stderr: String::new(),
-                    duration_ms: 1,
-                })
+    /// User info in the repository URL is taken off the URL git is given and
+    /// becomes the credential, percent-decoded, in both HTTPS forms. A URL
+    /// with none, and an SSH URL, are returned as they are.
+    #[test]
+    fn repository_url_user_info_is_taken_off_and_becomes_the_credential() {
+        let (url, cred) = split_repo_url("https://x-access-token:Mk7%40tok@github.com/o/r.git");
+        assert_eq!(url, "https://github.com/o/r.git");
+        match cred {
+            Some(ResolvedCredential::HttpsPat { username, token }) => {
+                assert_eq!(username, "x-access-token");
+                assert_eq!(token.expose(), "Mk7@tok");
             }
+            _ => panic!("the URL's user info did not become the credential"),
         }
+        let (url, cred) = split_repo_url("https://Mk7tokenasuser@github.com/o/r.git");
+        assert_eq!(url, "https://github.com/o/r.git");
+        match cred {
+            Some(ResolvedCredential::HttpsPat { username, token }) => {
+                assert_eq!(username, "Mk7tokenasuser");
+                assert_eq!(token.expose(), "");
+            }
+            _ => panic!("a token carried as the user name did not become the credential"),
+        }
+        for plain in ["https://github.com/o/r.git", "git@github.com:o/r.git"] {
+            let (url, cred) = split_repo_url(plain);
+            assert_eq!(url, plain);
+            assert!(cred.is_none());
+        }
+    }
 
-        // Sentinel key with bytes unlikely to appear elsewhere in the script.
-        const SENTINEL_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
-                                    AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK\n\
-                                    -----END OPENSSH PRIVATE KEY-----";
+    /// A credential the binding names wins over user info in its URL, which
+    /// is still taken off the URL.
+    #[test]
+    fn a_named_credential_wins_over_url_user_info() {
+        let (url, cred) = clone_credential(
+            "https://u:from-url@github.com/o/r.git",
+            ResolvedCredential::github_pat(SensitiveString::new("named")).into(),
+        );
+        assert_eq!(url, "https://github.com/o/r.git");
+        match cred {
+            Some(ResolvedCredential::HttpsPat { token, .. }) => {
+                assert_eq!(token.expose(), "named")
+            }
+            _ => panic!("the named credential was not used"),
+        }
+    }
 
-        let captured = Arc::new(Mutex::new(None));
-        let runner = Arc::new(CapturingRunner {
-            captured: captured.clone(),
-        });
-        let registry = Arc::new(NfsVolumeRegistry::new());
-        let engine = EphemeralCliEngine::new(runner, registry);
+    /// Text from git loses every credential value and the user info of any
+    /// URL in it, a key line by line as well as whole.
+    #[test]
+    fn redact_git_output_removes_credentials_and_url_user_info() {
+        let secrets = credential_secrets(Some(&ResolvedCredential::HttpsPat {
+            username: "Mk7-user-marker".to_string(),
+            token: SensitiveString::new("Mk7-token-marker"),
+        }));
+        let out = redact_git_output(
+            "fatal: could not read from 'https://a:b@host/r.git': Mk7-token-marker for Mk7-user-marker\n\
+             see ssh://git:pw@host:22/x and http://host/plain",
+            &secrets,
+        );
+        assert!(!out.contains("Mk7-"), "a credential value survived: {out}");
+        assert!(
+            !out.contains("a:b@") && !out.contains("git:pw@"),
+            "user info survived: {out}"
+        );
+        assert!(out.contains("https://[REDACTED]@host/r.git"));
+        assert!(out.contains("http://host/plain"));
 
-        let volume = Volume::new(
-            "audit-002-4-31".to_string(),
-            TenantId::system(),
-            StorageClass::ephemeral_hours(1),
-            VolumeBackend::SeaweedFS {
-                filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
-                remote_path: "/aegis/seaweedfs/test".to_string(),
-            },
-            1024 * 1024,
-            VolumeOwnership::persistent("audit-test"),
-        )
-        .unwrap();
+        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nMk7keyline1abcdef\nMk7keyline2abcdef\n-----END OPENSSH PRIVATE KEY-----\n";
+        let secrets = credential_secrets(Some(&ResolvedCredential::SshKey {
+            private_key_pem: SensitiveString::new(key),
+            passphrase: None,
+        }));
+        let out = redact_git_output("load failed: Mk7keyline2abcdef", &secrets);
+        assert!(!out.contains("Mk7keyline"), "a key line survived: {out}");
+    }
+
+    /// The clone command names the repository URL without its user info, in
+    /// each credential arm, and never holds the credential.
+    #[test]
+    fn clone_command_names_the_repository_url_without_user_info() {
+        use crate::domain::tenant::TenantId;
         let binding = GitRepoBinding::new(
             TenantId::system(),
             None,
-            "git@github.com:owner/repo.git".to_string(),
+            "https://x-access-token:Mk7-url-marker@github.com/owner/repo.git".to_string(),
             GitRef::Branch("main".to_string()),
             None,
-            volume.id,
-            "audit-002-4-31".to_string(),
+            VolumeId::new(),
+            "clone-url".to_string(),
             CloneStrategy::EphemeralCli {
                 reason: "test".to_string(),
             },
@@ -1137,201 +1216,41 @@ mod tests {
             None,
             None,
         );
-
-        let credential = ResolvedCredential::SshKey {
-            private_key_pem: SensitiveString::new(SENTINEL_KEY),
-            passphrase: None,
-        };
-
-        engine
-            .clone_into_volume(&binding, &volume, Some(credential), true)
-            .await
-            .expect("captured runner returns Ok");
-
-        let cfg = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("runner must have been called once");
-
-        // 1. The argv must contain only `["sh", "-c", "<script>"]`. The script
-        //    itself must NOT contain the sentinel key bytes.
-        let script = cfg.command.last().expect("script arg present");
-        assert!(
-            !script.contains("AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK"),
-            "SSH key bytes must NEVER appear in the spawned container argv; \
-             this is the audit 002 §4.31 regression. argv command was:\n{script}"
-        );
-        assert!(
-            !script.contains("BEGIN OPENSSH PRIVATE KEY"),
-            "PEM header must not appear in argv either"
-        );
-        for arg in &cfg.command {
-            assert!(
-                !arg.contains("AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK"),
-                "key bytes must not appear in any argv element"
-            );
-        }
-
-        // 2. The key MUST be passed via env var (acceptable per audit; the
-        //    in-script trampoline unsets + shreds it).
-        let env_key = cfg
-            .env
-            .get("AEGIS_SSH_KEY")
-            .expect("AEGIS_SSH_KEY env must carry the key");
-        assert!(
-            env_key.contains("AEGIS-AUDIT-002-SECTION-4-31-SENTINEL-DO-NOT-LEAK"),
-            "AEGIS_SSH_KEY env must carry the actual key bytes"
-        );
-
-        // 3. GIT_SSH_COMMAND must point at /tmp/ssh_key with IdentitiesOnly=yes.
-        let ssh_cmd = cfg
-            .env
-            .get("GIT_SSH_COMMAND")
-            .expect("GIT_SSH_COMMAND must be set for SSH credential path");
-        assert!(ssh_cmd.contains("-i /tmp/ssh_key"));
-        assert!(ssh_cmd.contains("IdentitiesOnly=yes"));
-
-        // 4. The trampoline must unset the env var and shred the file on exit.
-        assert!(
-            script.contains("unset AEGIS_SSH_KEY"),
-            "script must unset AEGIS_SSH_KEY before invoking git"
-        );
-        assert!(
-            script.contains("shred -u /tmp/ssh_key") || script.contains("rm -f /tmp/ssh_key"),
-            "script must scrub /tmp/ssh_key on EXIT/INT/TERM"
-        );
-        assert!(
-            script.contains("chmod 0600 /tmp/ssh_key"),
-            "script must chmod 0600 the materialised key"
-        );
-    }
-
-    /// libgit2 is handed the binding's URL exactly as stored, user info
-    /// included: a redacted rendering would lose the credential it carries.
-    #[test]
-    fn libgit2_is_handed_the_repository_url_as_stored() {
-        use crate::domain::tenant::TenantId;
-        const URL: &str = "https://x-access-token:Mk7-libgit2-url-marker@github.com/owner/repo.git";
-        let binding = GitRepoBinding::new(
-            TenantId::system(),
-            None,
-            URL.to_string(),
-            GitRef::Branch("main".to_string()),
-            None,
-            crate::domain::volume::VolumeId::new(),
-            "libgit2-url".to_string(),
-            CloneStrategy::Libgit2,
-            false,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(
-            remote_url(&binding),
-            URL,
-            "libgit2 would connect to a different URL than the binding's"
-        );
-    }
-
-    /// The clone step's command carries the binding's repository URL exactly
-    /// as stored, in each credential arm (PAT, SSH key, none). The URL holds a
-    /// marker as user info, which a redacted rendering would drop, so the test
-    /// fails if the step formats the URL instead of reading it. Nothing is
-    /// run: a capturing runner records the step it is given.
-    #[tokio::test]
-    async fn clone_command_carries_the_repository_url_in_each_credential_arm() {
-        use crate::domain::runtime::{
-            ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
-        };
-        use crate::domain::tenant::TenantId;
-        use crate::domain::volume::{
-            FilerEndpoint, StorageClass, Volume, VolumeBackend, VolumeOwnership,
-        };
-        use std::sync::Mutex;
-
-        struct CapturingRunner {
-            captured: Arc<Mutex<Option<ContainerStepConfig>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl ContainerStepRunner for CapturingRunner {
-            async fn run_step(
-                &self,
-                config: ContainerStepConfig,
-            ) -> Result<ContainerStepResult, ContainerStepError> {
-                *self.captured.lock().unwrap() = Some(config);
-                Ok(ContainerStepResult {
-                    exit_code: 0,
-                    stdout: format!("{}\n", "a".repeat(40)),
-                    stderr: String::new(),
-                    duration_ms: 1,
-                })
-            }
-        }
-
-        const URL: &str = "https://x-access-token:Mk7-clone-url-marker@github.com/owner/repo.git";
-        let arms: [(&str, fn() -> Option<ResolvedCredential>); 3] = [
-            ("https pat", || {
+        let arms: [(&str, Option<ResolvedCredential>); 3] = [
+            (
+                "https token",
                 Some(ResolvedCredential::github_pat(SensitiveString::new(
-                    "pat-value",
-                )))
-            }),
-            ("ssh key", || {
+                    "Mk7-pat-marker",
+                ))),
+            ),
+            (
+                "ssh key",
                 Some(ResolvedCredential::SshKey {
-                    private_key_pem: SensitiveString::new("key-value"),
+                    private_key_pem: SensitiveString::new("Mk7-key-marker"),
                     passphrase: None,
-                })
-            }),
-            ("no credential", || None),
+                }),
+            ),
+            ("no credential", None),
         ];
         for (arm, credential) in arms {
-            let captured = Arc::new(Mutex::new(None));
-            let runner = Arc::new(CapturingRunner {
-                captured: captured.clone(),
-            });
-            let engine = EphemeralCliEngine::new(runner, Arc::new(NfsVolumeRegistry::new()));
-            let volume = Volume::new(
-                "clone-url".to_string(),
-                TenantId::system(),
-                StorageClass::ephemeral_hours(1),
-                VolumeBackend::SeaweedFS {
-                    filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
-                    remote_path: "/aegis/seaweedfs/test".to_string(),
-                },
-                1024 * 1024,
-                VolumeOwnership::persistent("clone-url-test"),
+            let (url, credential) = clone_credential(binding.repo_url.expose(), credential);
+            let step = clone_step(
+                &EphemeralCliPaths::default(),
+                &binding,
+                &url,
+                credential.as_ref(),
+                true,
             )
             .unwrap();
-            let binding = GitRepoBinding::new(
-                TenantId::system(),
-                None,
-                URL.to_string(),
-                GitRef::Branch("main".to_string()),
-                None,
-                volume.id,
-                "clone-url".to_string(),
-                CloneStrategy::EphemeralCli {
-                    reason: "test".to_string(),
-                },
-                false,
-                None,
-                None,
-                None,
-            );
-            engine
-                .clone_into_volume(&binding, &volume, credential(), true)
-                .await
-                .expect("captured runner returns Ok");
-            let cfg = captured
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("runner must have been called once");
-            let script = cfg.command.last().expect("script arg present");
             assert!(
-                script.contains(&format!(" {} /workspace/repo", shell_escape(URL))),
-                "{arm}: the clone command does not carry the repository URL as stored:\n{script}"
+                step.script
+                    .contains(" -- 'https://github.com/owner/repo.git' '/workspace/repo'"),
+                "{arm}: the clone command does not name the URL without user info:\n{}",
+                step.script
+            );
+            assert!(
+                !step.script.contains("Mk7-"),
+                "{arm}: the clone command holds the credential"
             );
         }
     }
@@ -1848,8 +1767,8 @@ mod credential_tests {
             "ssh key: ssh's arguments hold the key"
         );
         let handed = std::fs::read_to_string(out.join("key")).unwrap_or_default();
-        assert_eq!(
-            handed, key,
+        assert!(
+            handed == key,
             "ssh key: ssh was not handed the key in its file"
         );
         std::fs::remove_file(out.join("key")).unwrap();
@@ -2169,6 +2088,41 @@ mod credential_tests {
                 );
             }
         }
+    }
+
+    /// A tree whose remote URL still holds user info (a clone made before
+    /// it was taken off) loses it on push, and the remote keeps pointing
+    /// where it did.
+    #[test]
+    fn push_takes_user_info_off_the_remote_url_and_leaves_it_pointing_where_it_did() {
+        let dirs = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dirs.path()).unwrap();
+        repo.remote(
+            "origin",
+            "https://u:Mk7-old-tree-marker@git.example.invalid/o/r.git",
+        )
+        .unwrap();
+        repo.remote("mirror", "https://mirror.example.invalid/o/r.git")
+            .unwrap();
+        strip_remote_user_info(&repo, "origin").unwrap();
+        strip_remote_user_info(&repo, "mirror").unwrap();
+        strip_remote_user_info(&repo, "absent").unwrap();
+        let origin = repo.find_remote("origin").unwrap();
+        assert_eq!(
+            origin.url().unwrap(),
+            "https://git.example.invalid/o/r.git",
+            "the remote's URL still holds user info, or points elsewhere"
+        );
+        let mirror = repo.find_remote("mirror").unwrap();
+        assert_eq!(
+            mirror.url().unwrap(),
+            "https://mirror.example.invalid/o/r.git"
+        );
+        let config = std::fs::read_to_string(dirs.path().join(".git/config")).unwrap();
+        assert!(
+            !config.contains("Mk7-"),
+            ".git/config still holds the user info"
+        );
     }
 
     struct NoEvents;

@@ -34,8 +34,8 @@ use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum};
 use bollard::query_parameters::{
-    CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
-    WaitContainerOptions,
+    AttachContainerOptions, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
+    StartContainerOptions, WaitContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -156,6 +156,27 @@ impl ContainerStepRunnerImpl {
             ContainerStepError::DockerError(msg) => ContainerRunFailureReason::ResourceExhausted {
                 detail: msg.clone(),
             },
+        }
+    }
+
+    /// Remove a container the step could not go on with.
+    async fn remove_after_failure(&self, container_id: &str) {
+        if let Err(e) = self
+            .docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            warn!(
+                container_id = %container_id,
+                error = %e,
+                "Failed to remove container after a failed step"
+            );
         }
     }
 
@@ -690,9 +711,16 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             uuid::Uuid::new_v4()
         );
 
+        // A step handed a secret gets it on standard input (see
+        // `ContainerStepConfig::stdin`), opened here and closed once written.
+        let takes_stdin = config.stdin.is_some();
         let container_config = ContainerCreateBody {
             image: Some(config.image.clone()),
+            entrypoint: config.entrypoint.clone(),
             cmd: Some(cmd),
+            open_stdin: takes_stdin.then_some(true),
+            stdin_once: takes_stdin.then_some(true),
+            attach_stdin: takes_stdin.then_some(true),
             env: Some(env_strings),
             working_dir: config.workdir.clone(),
             user: config.run_as_user.clone(),
@@ -734,6 +762,31 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
 
         let container_id = container.id.clone();
 
+        // ─── 6b. Attach to standard input before the process starts ──────────
+        let mut stdin_writer = None;
+        if takes_stdin {
+            match self
+                .docker
+                .attach_container(
+                    &container_id,
+                    Some(AttachContainerOptions {
+                        stdin: true,
+                        stream: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(attached) => stdin_writer = Some(attached.input),
+                Err(e) => {
+                    self.remove_after_failure(&container_id).await;
+                    let error = ContainerStepError::DockerError(format!("attach_container: {e}"));
+                    self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                    return Err(error);
+                }
+            }
+        }
+
         // ─── 7. Start container ───────────────────────────────────────────────
         if let Err(e) = self
             .docker
@@ -767,6 +820,24 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             step_name = %config.name,
             "Container step started"
         );
+
+        // ─── 8. Hand the process its standard input, then close it ───────────
+        if let (Some(mut writer), Some(bytes)) = (stdin_writer, config.stdin.as_ref()) {
+            use tokio::io::AsyncWriteExt;
+            let written = async {
+                writer.write_all(bytes.expose()).await?;
+                writer.flush().await?;
+                writer.shutdown().await
+            }
+            .await;
+            drop(writer);
+            if let Err(e) = written {
+                self.remove_after_failure(&container_id).await;
+                let error = ContainerStepError::DockerError(format!("write stdin: {e}"));
+                self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                return Err(error);
+            }
+        }
 
         // ─── 9. Stream logs + wait with optional timeout ──────────────────────
         let timeout_duration = config.resources.as_ref().and_then(|r| r.timeout);
@@ -1437,8 +1508,8 @@ mod tests {
 
         let result = runner.run_step(config).await.expect("the step runs");
         let shown = watcher.await.unwrap();
-        assert_eq!(
-            result.stdout, secret,
+        assert!(
+            result.stdout == secret,
             "the step's standard input did not reach its process"
         );
         assert!(
