@@ -9,7 +9,7 @@
 //!
 //! | Type | Role |
 //! |------|------|
-//! | [`SensitiveString`] | Credential wrapper that redacts itself in `Debug`/`Display` |
+//! | [`SensitiveString`] | Credential wrapper: `Debug` prints `[REDACTED]`; there is no `Display` |
 //! | [`SensitiveUrl`] | Connection URL that prints without its user info or secret query parameters |
 //! | [`SecretPath`] | Namespace-aware structured path value object |
 //! | [`AccessContext`] | Audit metadata for every secret access operation |
@@ -32,9 +32,12 @@ use thiserror::Error;
 /// A `String` wrapper that prevents accidental credential exposure in logs and
 /// error messages.
 ///
-/// Both `Debug` and `Display` emit `[REDACTED]` regardless of the inner value.
-/// Call [`SensitiveString::expose`] only at intentional, audited injection
-/// points (e.g. env-var injection into an MCP server process).
+/// `Debug` emits `[REDACTED]` regardless of the inner value. There is no
+/// `Display`: a secret has no display form, so `format!("{}", secret)`,
+/// `secret.to_string()` and `%secret` in a log macro do not compile, and a
+/// site that needs the value must call [`SensitiveString::expose`], at an
+/// intentional, audited point of use (e.g. env-var injection into an MCP
+/// server process).
 ///
 /// ## Design Rationale
 ///
@@ -109,11 +112,19 @@ impl std::fmt::Debug for SensitiveString {
     }
 }
 
-impl std::fmt::Display for SensitiveString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[REDACTED]")
+// A secret has no display form. This fails to compile if `Display` is ever
+// implemented for `SensitiveString`: with it, the trait below has two
+// candidate impls and the path is ambiguous (the technique behind
+// `static_assertions::assert_not_impl_any!`).
+const _: fn() = || {
+    trait AmbiguousIfDisplay<A> {
+        fn some_item() {}
     }
-}
+    impl<T: ?Sized> AmbiguousIfDisplay<()> for T {}
+    struct Invalid;
+    impl<T: ?Sized + std::fmt::Display> AmbiguousIfDisplay<Invalid> for T {}
+    let _ = <SensitiveString as AmbiguousIfDisplay<_>>::some_item;
+};
 
 // ---------------------------------------------------------------------------
 // SensitiveUrl — connection URL wrapper that prints itself redacted
@@ -577,7 +588,6 @@ mod tests {
     fn sensitive_string_redacts_in_debug() {
         let s = SensitiveString::new("super-secret-api-key");
         assert_eq!(format!("{s:?}"), "[REDACTED]");
-        assert_eq!(format!("{s}"), "[REDACTED]");
     }
 
     #[test]
