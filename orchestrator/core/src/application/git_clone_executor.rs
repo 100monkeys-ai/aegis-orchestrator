@@ -67,6 +67,26 @@ pub struct EphemeralCliEngine {
     runner: Arc<dyn ContainerStepRunner>,
     volume_registry: Arc<NfsVolumeRegistry>,
     image: String,
+    paths: EphemeralCliPaths,
+}
+
+/// Where the clone step works inside its container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EphemeralCliPaths {
+    /// Where the bound volume is mounted. The clone lands in `repo` under it.
+    pub workspace: String,
+    /// A directory the step makes for the credential and removes when it
+    /// ends.
+    pub scratch: String,
+}
+
+impl Default for EphemeralCliPaths {
+    fn default() -> Self {
+        Self {
+            workspace: "/workspace".to_string(),
+            scratch: "/tmp".to_string(),
+        }
+    }
 }
 
 impl EphemeralCliEngine {
@@ -83,7 +103,16 @@ impl EphemeralCliEngine {
             runner,
             volume_registry,
             image: Self::DEFAULT_IMAGE.to_string(),
+            paths: EphemeralCliPaths::default(),
         }
+    }
+
+    /// Run the step with other paths. Tests use it to run the step's script
+    /// in directories of their own.
+    #[cfg(test)]
+    pub(crate) fn with_paths(mut self, paths: EphemeralCliPaths) -> Self {
+        self.paths = paths;
+        self
     }
 
     pub fn with_image(mut self, image: impl Into<String>) -> Self {
@@ -120,7 +149,7 @@ impl EphemeralCliEngine {
 
         // Register with NFS gateway so FUSE mount is authorised for the
         // ephemeral container's scope.
-        let mount_point = PathBuf::from("/workspace");
+        let mount_point = PathBuf::from(&self.paths.workspace);
         let ephemeral_exec = ExecutionId::new();
         self.volume_registry.register(VolumeRegistration {
             volume_id: volume.id,
@@ -152,6 +181,8 @@ impl EphemeralCliEngine {
     ) -> Result<String, CloneError> {
         let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut script_prelude = String::new();
+        let ws = self.paths.workspace.as_str();
+        let tmp = self.paths.scratch.as_str();
 
         // -- ref selection flags --
         let (ref_flag, checkout_cmd) = match &binding.git_ref {
@@ -159,7 +190,7 @@ impl EphemeralCliEngine {
             GitRef::Tag(name) => (format!("--branch {}", shell_escape(name)), String::new()),
             GitRef::Commit(sha) => (
                 String::new(),
-                format!("&& git -C /workspace/repo checkout {}", shell_escape(sha)),
+                format!("&& git -C {ws}/repo checkout {}", shell_escape(sha)),
             ),
         };
 
@@ -183,9 +214,9 @@ impl EphemeralCliEngine {
                 // of the script so the secret material does not survive
                 // the container's lifetime even if the volume is
                 // inspected post-mortem.
-                let prelude = build_https_askpass_prelude(&username, token.expose());
+                let prelude = build_https_askpass_prelude(tmp, &username, token.expose());
                 script_prelude.push_str(&prelude);
-                env.insert("GIT_ASKPASS".to_string(), "/tmp/askpass.sh".to_string());
+                env.insert("GIT_ASKPASS".to_string(), format!("{tmp}/askpass.sh"));
                 env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
                 remote_url(binding)
             }
@@ -209,21 +240,21 @@ impl EphemeralCliEngine {
                     "AEGIS_SSH_KEY".to_string(),
                     private_key_pem.expose().to_string(),
                 );
-                script_prelude.push_str(
+                script_prelude.push_str(&format!(
                     "set +o history 2>/dev/null || true\n\
                      umask 0077\n\
-                     printf '%s' \"$AEGIS_SSH_KEY\" >/tmp/ssh_key\n\
-                     case \"$(tail -c1 /tmp/ssh_key | od -An -c | tr -d ' ')\" in\n\
+                     printf '%s' \"$AEGIS_SSH_KEY\" >{tmp}/ssh_key\n\
+                     case \"$(tail -c1 {tmp}/ssh_key | od -An -c | tr -d ' ')\" in\n\
                        '\\n') ;;\n\
-                       *) printf '\\n' >>/tmp/ssh_key ;;\n\
+                       *) printf '\\n' >>{tmp}/ssh_key ;;\n\
                      esac\n\
-                     chmod 0600 /tmp/ssh_key\n\
+                     chmod 0600 {tmp}/ssh_key\n\
                      unset AEGIS_SSH_KEY\n\
-                     trap 'shred -u /tmp/ssh_key 2>/dev/null || rm -f /tmp/ssh_key' EXIT INT TERM\n",
-                );
+                     trap 'shred -u {tmp}/ssh_key 2>/dev/null || rm -f {tmp}/ssh_key' EXIT INT TERM\n",
+                ));
                 env.insert(
                     "GIT_SSH_COMMAND".to_string(),
-                    "ssh -i /tmp/ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string(),
+                    format!("ssh -i {tmp}/ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"),
                 );
                 remote_url(binding)
             }
@@ -234,7 +265,7 @@ impl EphemeralCliEngine {
         let sparse_cmd = if let Some(paths) = &binding.sparse_paths {
             let escaped: Vec<String> = paths.iter().map(|p| shell_escape(p)).collect();
             format!(
-                " && git -C /workspace/repo sparse-checkout set --cone {}",
+                " && git -C {ws}/repo sparse-checkout set --cone {}",
                 escaped.join(" ")
             )
         } else {
@@ -255,11 +286,11 @@ impl EphemeralCliEngine {
         // env-var-removal fix for security audit 002 §4.24.
         let command = format!(
             "{prelude}\
-             trap 'rm -f /tmp/git_password /tmp/git_username /tmp/askpass.sh /tmp/ssh_key' EXIT && \
+             trap 'rm -f {tmp}/git_password {tmp}/git_username {tmp}/askpass.sh {tmp}/ssh_key' EXIT && \
              set -eu && \
-             git clone {depth} {filter} {ref_} {url} /workspace/repo \
+             git clone {depth} {filter} {ref_} {url} {ws}/repo \
              {checkout}{sparse} && \
-             git -C /workspace/repo rev-parse HEAD",
+             git -C {ws}/repo rev-parse HEAD",
             prelude = script_prelude,
             depth = depth_flag,
             filter = filter_flag,
@@ -273,12 +304,14 @@ impl EphemeralCliEngine {
             name: format!("git-clone-{}", binding.id),
             image: self.image.clone(),
             image_pull_policy: ImagePullPolicy::IfNotPresent,
+            entrypoint: None,
             command: vec!["sh".to_string(), "-c".to_string(), command],
+            stdin: None,
             env,
-            workdir: Some("/workspace".to_string()),
+            workdir: Some(self.paths.workspace.clone()),
             volumes: vec![ContainerVolumeMount {
                 name: volume_id.0.to_string(),
-                mount_path: "/workspace".to_string(),
+                mount_path: self.paths.workspace.clone(),
                 read_only: false,
             }],
             resources: None,
@@ -367,31 +400,31 @@ fn shell_escape(s: &str) -> String {
 ///
 /// Factored out for unit testability — see
 /// `https_askpass_prelude_does_not_leak_secret_to_env`.
-fn build_https_askpass_prelude(username: &str, password: &str) -> String {
+fn build_https_askpass_prelude(tmp: &str, username: &str, password: &str) -> String {
     // The askpass.sh script `cat`s the appropriate file based on what
     // git is asking for (Username vs Password prompt). Files are mode
     // 0600 so only root inside the container can read them.
     let mut s = String::new();
-    s.push_str("cat >/tmp/git_username <<'AEGIS_USERNAME_EOF'\n");
+    s.push_str(&format!("cat >{tmp}/git_username <<'AEGIS_USERNAME_EOF'\n"));
     s.push_str(username);
     s.push('\n');
     s.push_str("AEGIS_USERNAME_EOF\n");
-    s.push_str("chmod 0600 /tmp/git_username\n");
-    s.push_str("cat >/tmp/git_password <<'AEGIS_PASSWORD_EOF'\n");
+    s.push_str(&format!("chmod 0600 {tmp}/git_username\n"));
+    s.push_str(&format!("cat >{tmp}/git_password <<'AEGIS_PASSWORD_EOF'\n"));
     s.push_str(password);
     s.push('\n');
     s.push_str("AEGIS_PASSWORD_EOF\n");
-    s.push_str("chmod 0600 /tmp/git_password\n");
-    s.push_str(
-        "cat >/tmp/askpass.sh <<'AEGIS_ASKPASS_EOF'\n\
+    s.push_str(&format!("chmod 0600 {tmp}/git_password\n"));
+    s.push_str(&format!(
+        "cat >{tmp}/askpass.sh <<'AEGIS_ASKPASS_EOF'\n\
          #!/bin/sh\n\
          case \"$1\" in\n\
-         Username*) cat /tmp/git_username ;;\n\
-         Password*) cat /tmp/git_password ;;\n\
+         Username*) cat {tmp}/git_username ;;\n\
+         Password*) cat {tmp}/git_password ;;\n\
          esac\n\
          AEGIS_ASKPASS_EOF\n\
-         chmod 0700 /tmp/askpass.sh\n",
-    );
+         chmod 0700 {tmp}/askpass.sh\n",
+    ));
     s
 }
 
@@ -963,7 +996,7 @@ mod tests {
     #[test]
     fn https_askpass_prelude_does_not_leak_secret_to_env() {
         const SECRET: &str = "ghp_SECRETPATBYTES_xyz123";
-        let prelude = build_https_askpass_prelude("x-access-token", SECRET);
+        let prelude = build_https_askpass_prelude("/tmp", "x-access-token", SECRET);
 
         // Simulate the env that would be passed to the container — same
         // population logic as `run_clone_container`. The fix is correct
@@ -997,7 +1030,8 @@ mod tests {
     /// outer `sh -c`. This pins that property.
     #[test]
     fn https_askpass_prelude_uses_quoted_heredoc_delimiter() {
-        let prelude = build_https_askpass_prelude("u", "secret-with-$dollar-and-`backtick`");
+        let prelude =
+            build_https_askpass_prelude("/tmp", "u", "secret-with-$dollar-and-`backtick`");
         assert!(prelude.contains("<<'AEGIS_PASSWORD_EOF'"));
         assert!(prelude.contains("<<'AEGIS_USERNAME_EOF'"));
         // Secret is written verbatim — the test value contains $ and `
@@ -1431,5 +1465,739 @@ mod tests {
             !root.join("top.txt").exists(),
             "excluded top-level file removed"
         );
+    }
+}
+
+// ============================================================================
+// Tests: where a clone's credential goes
+// ============================================================================
+
+/// Every test here makes a marker credential of its own and then looks for it,
+/// or any run of 8 of its characters, everywhere it must not be: the step's
+/// configuration (command, entrypoint, environment, name; one `Debug` print
+/// covers them all), the host's process table while the step runs, the error
+/// a failed clone returns, and every file of the cloned tree, `.git` included.
+/// The servers are real git servers on the loopback interface that demand the
+/// password (`git_test_server`).
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use crate::application::git_test_server::{
+        container_engine, container_runner, files_holding, holds_any_part_of, marker,
+        GitTestServer, HostShellRunner, ProcessWatch,
+    };
+    use crate::domain::runtime::{ContainerStepResult, ContainerStepRunner};
+    use crate::domain::tenant::TenantId;
+    use crate::domain::volume::{FilerEndpoint, StorageClass, VolumeOwnership};
+    use std::sync::Mutex;
+
+    const USER: &str = "aegis-test-user";
+
+    fn seaweed_volume() -> Volume {
+        Volume::new(
+            "clone-credential".to_string(),
+            TenantId::system(),
+            StorageClass::ephemeral_hours(1),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
+                remote_path: "/aegis/seaweedfs/test".to_string(),
+            },
+            1024 * 1024,
+            VolumeOwnership::persistent("clone-credential"),
+        )
+        .unwrap()
+    }
+
+    fn binding(url: &str, volume: &Volume, strategy: CloneStrategy) -> GitRepoBinding {
+        GitRepoBinding::new(
+            TenantId::system(),
+            None,
+            url.to_string(),
+            GitRef::Branch("main".to_string()),
+            None,
+            volume.id,
+            "clone-credential".to_string(),
+            strategy,
+            false,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn ephemeral() -> CloneStrategy {
+        CloneStrategy::EphemeralCli {
+            reason: "test".to_string(),
+        }
+    }
+
+    fn pat(token: &str) -> Option<ResolvedCredential> {
+        Some(ResolvedCredential::HttpsPat {
+            username: USER.to_string(),
+            token: SensitiveString::new(token),
+        })
+    }
+
+    /// `http://user:password@host/...` from a URL that has none.
+    fn with_user_info(url: &str, password: &str) -> String {
+        url.replacen("http://", &format!("http://{USER}:{password}@"), 1)
+    }
+
+    fn stdin_of(cfg: &ContainerStepConfig) -> String {
+        cfg.stdin
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b.expose()).to_string())
+            .unwrap_or_default()
+    }
+
+    struct CapturingRunner {
+        captured: Mutex<Option<ContainerStepConfig>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerStepRunner for CapturingRunner {
+        async fn run_step(
+            &self,
+            config: ContainerStepConfig,
+        ) -> Result<ContainerStepResult, ContainerStepError> {
+            *self.captured.lock().unwrap() = Some(config);
+            Ok(ContainerStepResult {
+                exit_code: 0,
+                stdout: format!("{}\n", "a".repeat(40)),
+                stderr: String::new(),
+                duration_ms: 1,
+            })
+        }
+    }
+
+    /// The clone step's configuration holds no part of the credential in any
+    /// credential arm, and its standard input carries it.
+    #[tokio::test]
+    async fn clone_step_configuration_holds_no_credential() {
+        let secret = marker("Kq");
+        let key = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{secret}\n-----END OPENSSH PRIVATE KEY-----\n"
+        );
+        let arms: Vec<(&str, String, Option<ResolvedCredential>)> = vec![
+            (
+                "https token",
+                "https://example.invalid/owner/repo.git".to_string(),
+                pat(&secret),
+            ),
+            (
+                "ssh key",
+                "git@example.invalid:owner/repo.git".to_string(),
+                Some(ResolvedCredential::SshKey {
+                    private_key_pem: SensitiveString::new(key.clone()),
+                    passphrase: None,
+                }),
+            ),
+            (
+                "token in the URL's user info",
+                format!("https://{USER}:{secret}@example.invalid/owner/repo.git"),
+                None,
+            ),
+        ];
+        for (arm, url, credential) in arms {
+            let runner = Arc::new(CapturingRunner {
+                captured: Mutex::new(None),
+            });
+            let engine =
+                EphemeralCliEngine::new(runner.clone(), Arc::new(NfsVolumeRegistry::new()));
+            let volume = seaweed_volume();
+            engine
+                .clone_into_volume(
+                    &binding(&url, &volume, ephemeral()),
+                    &volume,
+                    credential,
+                    true,
+                )
+                .await
+                .expect("captured runner returns Ok");
+            let cfg = runner.captured.lock().unwrap().clone().expect("one step");
+            assert!(
+                !holds_any_part_of(&format!("{cfg:?}"), &secret),
+                "{arm}: the clone step's configuration holds the credential"
+            );
+            assert!(
+                stdin_of(&cfg).contains(&secret),
+                "{arm}: the clone step's standard input does not carry the credential"
+            );
+        }
+    }
+
+    /// Run the clone step's own script with the host's shell against a git
+    /// server that demands the password, in each HTTPS arm. The clone
+    /// authenticates; afterwards no argument list or environment seen in the
+    /// process table, no step configuration and no file of the cloned tree
+    /// holds any part of the credential, and the credential's directory is
+    /// gone.
+    #[tokio::test]
+    async fn clone_step_run_by_a_shell_authenticates_and_leaves_no_credential() {
+        for arm in ["https token", "token in the URL's user info"] {
+            let secret = marker("Kq");
+            let server = GitTestServer::start(USER, &secret);
+            let (url, credential) = match arm {
+                "https token" => (server.url(), pat(&secret)),
+                _ => (with_user_info(&server.url(), &secret), None),
+            };
+            let dirs = tempfile::tempdir().unwrap();
+            let workspace = dirs.path().join("ws");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let scratch = dirs.path().join("scratch").join("aegis-git");
+            std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+            let runner = Arc::new(HostShellRunner::new());
+            let engine =
+                EphemeralCliEngine::new(runner.clone(), Arc::new(NfsVolumeRegistry::new()))
+                    .with_paths(EphemeralCliPaths {
+                        workspace: workspace.display().to_string(),
+                        scratch: scratch.display().to_string(),
+                    });
+            let volume = seaweed_volume();
+
+            let watch = ProcessWatch::start(&secret);
+            let result = engine
+                .clone_into_volume(
+                    &binding(&url, &volume, ephemeral()),
+                    &volume,
+                    credential,
+                    true,
+                )
+                .await;
+            let (seen_in, rounds) = watch.stop();
+
+            assert!(
+                !holds_any_part_of(&runner.seen_debug(), &secret),
+                "{arm}: the clone step's configuration holds the credential"
+            );
+            assert!(
+                seen_in.is_empty(),
+                "{arm}: the credential was in the process table at {seen_in:?} ({rounds} reads)"
+            );
+            let sha = result.unwrap_or_else(|e| panic!("{arm}: the clone failed: {e}"));
+            assert_eq!(sha, server.head(), "{arm}: cloned the wrong commit");
+            assert!(
+                server.authorized_requests() > 0,
+                "{arm}: no request authenticated"
+            );
+            let holding = files_holding(&workspace, &secret);
+            assert!(
+                holding.is_empty(),
+                "{arm}: files of the cloned tree hold the credential: {holding:?}"
+            );
+            let config = std::fs::read_to_string(workspace.join("repo/.git/config")).unwrap();
+            assert!(
+                config.contains(&format!("url = {}", server.url())),
+                "{arm}: the remote URL in .git/config is not the repository's URL"
+            );
+            assert!(
+                !scratch.exists(),
+                "{arm}: the credential's directory is still there after the clone"
+            );
+        }
+    }
+
+    /// A clone with a wrong credential fails, and nothing it leaves or returns
+    /// holds any part of the credential it was given.
+    #[tokio::test]
+    async fn failed_clone_step_shows_no_part_of_the_credential() {
+        for arm in ["https token", "token in the URL's user info"] {
+            let wrong = marker("Kq");
+            let server = GitTestServer::start(USER, &marker("Rw"));
+            let (url, credential) = match arm {
+                "https token" => (server.url(), pat(&wrong)),
+                _ => (with_user_info(&server.url(), &wrong), None),
+            };
+            let dirs = tempfile::tempdir().unwrap();
+            let workspace = dirs.path().join("ws");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let scratch = dirs.path().join("scratch").join("aegis-git");
+            std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+            let runner = Arc::new(HostShellRunner::new());
+            let engine =
+                EphemeralCliEngine::new(runner.clone(), Arc::new(NfsVolumeRegistry::new()))
+                    .with_paths(EphemeralCliPaths {
+                        workspace: workspace.display().to_string(),
+                        scratch: scratch.display().to_string(),
+                    });
+            let volume = seaweed_volume();
+
+            let watch = ProcessWatch::start(&wrong);
+            let result = engine
+                .clone_into_volume(
+                    &binding(&url, &volume, ephemeral()),
+                    &volume,
+                    credential,
+                    true,
+                )
+                .await;
+            let (seen_in, rounds) = watch.stop();
+
+            assert!(
+                !holds_any_part_of(&runner.seen_debug(), &wrong),
+                "{arm}: the clone step's configuration holds the credential"
+            );
+            assert!(
+                seen_in.is_empty(),
+                "{arm}: the credential was in the process table at {seen_in:?} ({rounds} reads)"
+            );
+            let error = match result {
+                Ok(_) => panic!("{arm}: a clone with a wrong credential succeeded"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                !holds_any_part_of(&error, &wrong),
+                "{arm}: the failed clone's error holds the credential"
+            );
+            assert!(
+                server.refused_requests() > 0,
+                "{arm}: the server refused nothing"
+            );
+            let holding = files_holding(dirs.path(), &wrong);
+            assert!(
+                holding.is_empty(),
+                "{arm}: files left by the failed clone hold the credential: {holding:?}"
+            );
+            assert!(
+                !scratch.exists(),
+                "{arm}: the credential's directory is still there after the failed clone"
+            );
+        }
+    }
+
+    /// The SSH arm: the key reaches ssh as a file named on its command line,
+    /// never as the key itself, and the file is gone when the step ends.
+    /// `ssh` here is a stand-in that records its arguments, copies the file
+    /// it is given with `-i`, and fails.
+    #[tokio::test]
+    async fn ssh_clone_step_hands_the_key_to_ssh_in_a_file_that_is_removed() {
+        let secret = marker("Kq");
+        let key = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{secret}\n-----END OPENSSH PRIVATE KEY-----\n"
+        );
+        let dirs = tempfile::tempdir().unwrap();
+        let bin = dirs.path().join("bin");
+        let out = dirs.path().join("ssh-out");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let fake_ssh = bin.join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" >\"$FAKE_SSH_OUT/args\"\n\
+             while [ $# -gt 0 ]; do\n\
+               if [ \"$1\" = -i ]; then cp \"$2\" \"$FAKE_SSH_OUT/key\"; fi\n\
+               shift\n\
+             done\n\
+             exit 255\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let workspace = dirs.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let scratch = dirs.path().join("scratch").join("aegis-git");
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        let runner = Arc::new(
+            HostShellRunner::new()
+                .with_env("PATH", &bin.display().to_string())
+                .with_env("FAKE_SSH_OUT", &out.display().to_string()),
+        );
+        let engine = EphemeralCliEngine::new(runner.clone(), Arc::new(NfsVolumeRegistry::new()))
+            .with_paths(EphemeralCliPaths {
+                workspace: workspace.display().to_string(),
+                scratch: scratch.display().to_string(),
+            });
+        let volume = seaweed_volume();
+
+        let watch = ProcessWatch::start(&secret);
+        let result = engine
+            .clone_into_volume(
+                &binding("git@example.invalid:owner/repo.git", &volume, ephemeral()),
+                &volume,
+                Some(ResolvedCredential::SshKey {
+                    private_key_pem: SensitiveString::new(key.clone()),
+                    passphrase: None,
+                }),
+                true,
+            )
+            .await;
+        let (seen_in, rounds) = watch.stop();
+
+        assert!(
+            !holds_any_part_of(&runner.seen_debug(), &secret),
+            "ssh key: the clone step's configuration holds the key"
+        );
+        assert!(
+            seen_in.is_empty(),
+            "ssh key: the key was in the process table at {seen_in:?} ({rounds} reads)"
+        );
+        let error = match result {
+            Ok(_) => panic!("ssh key: the stand-in ssh fails, so the clone must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !holds_any_part_of(&error, &secret),
+            "ssh key: the failed clone's error holds the key"
+        );
+        let args = std::fs::read_to_string(out.join("args")).expect("ssh was run");
+        assert!(
+            !holds_any_part_of(&args, &secret),
+            "ssh key: ssh's arguments hold the key"
+        );
+        let handed = std::fs::read_to_string(out.join("key")).unwrap_or_default();
+        assert_eq!(
+            handed, key,
+            "ssh key: ssh was not handed the key in its file"
+        );
+        std::fs::remove_file(out.join("key")).unwrap();
+        assert!(
+            !scratch.exists(),
+            "ssh key: the key's directory is still there after the step"
+        );
+        let holding = files_holding(&workspace, &secret);
+        assert!(
+            holding.is_empty(),
+            "ssh key: files hold the key: {holding:?}"
+        );
+    }
+
+    /// The in-process clone and a later fetch, in each HTTPS arm, against a
+    /// server that demands the password: both authenticate, and no file of the
+    /// cloned tree holds any part of the credential after either.
+    #[tokio::test]
+    async fn libgit2_clone_and_fetch_authenticate_and_leave_no_credential_in_the_tree() {
+        for arm in ["https token", "token in the URL's user info"] {
+            let secret = marker("Kq");
+            let server = GitTestServer::start(USER, &secret);
+            let (url, credential): (String, fn(&str) -> Option<ResolvedCredential>) = match arm {
+                "https token" => (server.url(), pat),
+                _ => (with_user_info(&server.url(), &secret), |_| None),
+            };
+            let dirs = tempfile::tempdir().unwrap();
+            let target = dirs.path().join("repo");
+            let volume = seaweed_volume();
+            let b = binding(&url, &volume, CloneStrategy::Libgit2);
+            let executor = test_executor(dirs.path());
+
+            let sha = executor
+                .clone_libgit2(&b, &target, credential(&secret), true)
+                .await
+                .unwrap_or_else(|e| panic!("{arm}: the clone failed: {e}"));
+            assert_eq!(sha, server.head(), "{arm}: cloned the wrong commit");
+            let holding = files_holding(&target, &secret);
+            assert!(
+                holding.is_empty(),
+                "{arm}: files of the cloned tree hold the credential: {holding:?}"
+            );
+
+            let before = server.authorized_requests();
+            let next = server.add_commit("second.txt", "second\n");
+            let fetched = executor
+                .fetch_and_checkout(&b, &target, credential(&secret))
+                .await
+                .unwrap_or_else(|e| panic!("{arm}: the fetch failed: {e}"));
+            assert_eq!(
+                fetched, next,
+                "{arm}: the fetch did not reach the new commit"
+            );
+            assert!(
+                server.authorized_requests() > before,
+                "{arm}: the fetch made no authenticated request"
+            );
+            let holding = files_holding(&target, &secret);
+            assert!(
+                holding.is_empty(),
+                "{arm}: files of the tree hold the credential after the fetch: {holding:?}"
+            );
+        }
+    }
+
+    /// A failed in-process clone with a wrong credential returns an error
+    /// that holds no part of it, and leaves no file that does.
+    #[tokio::test]
+    async fn libgit2_failed_clone_shows_no_part_of_the_credential() {
+        for arm in ["https token", "token in the URL's user info"] {
+            let wrong = marker("Kq");
+            let server = GitTestServer::start(USER, &marker("Rw"));
+            let (url, credential) = match arm {
+                "https token" => (server.url(), pat(&wrong)),
+                _ => (with_user_info(&server.url(), &wrong), None),
+            };
+            let dirs = tempfile::tempdir().unwrap();
+            let target = dirs.path().join("repo");
+            let volume = seaweed_volume();
+            let result = test_executor(dirs.path())
+                .clone_libgit2(
+                    &binding(&url, &volume, CloneStrategy::Libgit2),
+                    &target,
+                    credential,
+                    true,
+                )
+                .await;
+            let error = match result {
+                Ok(_) => panic!("{arm}: a clone with a wrong credential succeeded"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                !holds_any_part_of(&error, &wrong),
+                "{arm}: the failed clone's error holds the credential"
+            );
+            let holding = files_holding(dirs.path(), &wrong);
+            assert!(
+                holding.is_empty(),
+                "{arm}: files left by the failed clone hold the credential: {holding:?}"
+            );
+        }
+    }
+
+    /// A push after an in-process clone authenticates in each HTTPS arm, and
+    /// leaves no file of the tree holding any part of the credential.
+    #[tokio::test]
+    async fn push_authenticates_and_leaves_no_credential_in_the_tree() {
+        use crate::application::git_repo_service::push_to_remote;
+        for arm in ["https token", "token in the URL's user info"] {
+            let secret = marker("Kq");
+            let server = GitTestServer::start(USER, &secret);
+            let (url, credential): (String, fn(&str) -> Option<ResolvedCredential>) = match arm {
+                "https token" => (server.url(), pat),
+                _ => (with_user_info(&server.url(), &secret), |_| None),
+            };
+            let dirs = tempfile::tempdir().unwrap();
+            let target = dirs.path().join("repo");
+            let volume = seaweed_volume();
+            let b = binding(&url, &volume, CloneStrategy::Libgit2);
+            test_executor(dirs.path())
+                .clone_libgit2(&b, &target, credential(&secret), false)
+                .await
+                .unwrap_or_else(|e| panic!("{arm}: the clone failed: {e}"));
+
+            let repo = Repository::open(&target).unwrap();
+            std::fs::write(target.join("pushed.txt"), "pushed\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("pushed.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("test", "test@example.invalid").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let commit = repo
+                .commit(Some("HEAD"), &sig, &sig, "pushed", &tree, &[&parent])
+                .unwrap();
+
+            let target_for_push = target.clone();
+            let repo_url = b.repo_url.clone();
+            let cred = credential(&secret);
+            tokio::task::spawn_blocking(move || {
+                push_to_remote(
+                    &target_for_push,
+                    &repo_url,
+                    "origin",
+                    Some("main".into()),
+                    cred,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{arm}: the push failed: {e}"));
+            assert_eq!(
+                server.head(),
+                commit.to_string(),
+                "{arm}: the push did not land"
+            );
+            let holding = files_holding(&target, &secret);
+            assert!(
+                holding.is_empty(),
+                "{arm}: files of the tree hold the credential after the push: {holding:?}"
+            );
+        }
+    }
+
+    /// Runs the clone step on the real container runner with three test-only
+    /// changes: no volume (the clone lands in the container's `/tmp`), the
+    /// host's network (to reach the loopback server), and, after the step's
+    /// own script, a report on standard error of the cloned tree (as a tar)
+    /// and of whether the credential's directory is still there. The report is
+    /// taken off the result before the engine sees it.
+    struct ReportingContainerRunner {
+        inner: Arc<crate::infrastructure::container_step_runner::ContainerStepRunnerImpl>,
+        workspace: String,
+        scratch: String,
+        tree: Mutex<Vec<u8>>,
+        scratch_left: Mutex<Option<bool>>,
+        seen: Mutex<Vec<ContainerStepConfig>>,
+    }
+
+    const REPORT: &str = "AEGIS-TEST-REPORT";
+
+    #[async_trait::async_trait]
+    impl ContainerStepRunner for ReportingContainerRunner {
+        async fn run_step(
+            &self,
+            mut config: ContainerStepConfig,
+        ) -> Result<ContainerStepResult, ContainerStepError> {
+            self.seen.lock().unwrap().push(config.clone());
+            config.volumes.clear();
+            config.network_mode = Some("host".to_string());
+            let script = config.command.pop().expect("a script");
+            config.command.push(format!(
+                "( {script}\n)\nrc=$?\n{{ echo {REPORT}; tar -C {ws} -cf - repo 2>/dev/null | base64; \
+                 echo {REPORT}; if [ -e {scratch} ]; then echo left; else echo gone; fi; }} >&2\nexit $rc",
+                ws = self.workspace,
+                scratch = self.scratch,
+            ));
+            let mut result = self.inner.run_step(config).await?;
+            if let Some((before, report)) = result.stderr.split_once(REPORT) {
+                let (tar_b64, rest) = report.split_once(REPORT).unwrap_or((report, ""));
+                use base64::Engine;
+                let compact: String = tar_b64.chars().filter(|c| !c.is_whitespace()).collect();
+                *self.tree.lock().unwrap() = base64::engine::general_purpose::STANDARD
+                    .decode(compact)
+                    .unwrap_or_default();
+                *self.scratch_left.lock().unwrap() = Some(rest.trim() == "left");
+                result.stderr = before.to_string();
+            }
+            Ok(result)
+        }
+    }
+
+    /// The clone step in a real container, in each HTTPS arm and with a wrong
+    /// credential: the clone authenticates (or fails, for the wrong one), and
+    /// no part of the credential is in the container's configuration as the
+    /// engine shows it, in any event published for the step, in the cloned
+    /// tree, or in the error; the credential's directory is gone when the step
+    /// ends. Needs a container engine (see `container_engine`).
+    #[tokio::test]
+    async fn clone_step_in_a_container_authenticates_and_leaves_no_credential() {
+        let test = "clone_step_in_a_container_authenticates_and_leaves_no_credential";
+        let Some(docker) = container_engine(test).await else {
+            return;
+        };
+        for arm in ["https token", "token in the URL's user info", "wrong token"] {
+            let secret = marker("Kq");
+            let server = GitTestServer::start(
+                USER,
+                &if arm == "wrong token" {
+                    marker("Rw")
+                } else {
+                    secret.clone()
+                },
+            );
+            let (url, credential) = match arm {
+                "token in the URL's user info" => (with_user_info(&server.url(), &secret), None),
+                _ => (server.url(), pat(&secret)),
+            };
+            let bus = Arc::new(crate::infrastructure::event_bus::EventBus::new(256));
+            let mut events = bus.subscribe();
+            let paths = EphemeralCliPaths {
+                workspace: "/tmp/aegis-ws".to_string(),
+                scratch: "/tmp/aegis-git".to_string(),
+            };
+            let runner = Arc::new(ReportingContainerRunner {
+                inner: container_runner(docker.clone(), bus.clone()),
+                workspace: paths.workspace.clone(),
+                scratch: paths.scratch.clone(),
+                tree: Mutex::new(Vec::new()),
+                scratch_left: Mutex::new(None),
+                seen: Mutex::new(Vec::new()),
+            });
+            let engine =
+                EphemeralCliEngine::new(runner.clone(), Arc::new(NfsVolumeRegistry::new()))
+                    .with_paths(paths);
+            let volume = seaweed_volume();
+            let result = engine
+                .clone_into_volume(
+                    &binding(&url, &volume, ephemeral()),
+                    &volume,
+                    credential,
+                    true,
+                )
+                .await;
+
+            let seen = format!("{:?}", runner.seen.lock().unwrap());
+            assert!(
+                !holds_any_part_of(&seen, &secret),
+                "{arm}: the clone step's configuration holds the credential"
+            );
+            let mut published = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                published.push(serde_json::to_string(&event).unwrap_or_default());
+            }
+            assert!(
+                !published.is_empty(),
+                "{arm}: the runner published no event"
+            );
+            assert!(
+                !published.iter().any(|e| holds_any_part_of(e, &secret)),
+                "{arm}: an event published for the step holds the credential"
+            );
+            let tree = String::from_utf8_lossy(&runner.tree.lock().unwrap()).to_string();
+            assert!(
+                !holds_any_part_of(&tree, &secret),
+                "{arm}: the cloned tree holds the credential"
+            );
+            assert_eq!(
+                *runner.scratch_left.lock().unwrap(),
+                Some(false),
+                "{arm}: the credential's directory is still there after the step, \
+                 or the step did not report"
+            );
+            if arm == "wrong token" {
+                let error = match result {
+                    Ok(_) => panic!("{arm}: a clone with a wrong credential succeeded"),
+                    Err(e) => e.to_string(),
+                };
+                assert!(
+                    !holds_any_part_of(&error, &secret),
+                    "{arm}: the failed clone's error holds the credential"
+                );
+                assert!(
+                    server.refused_requests() > 0,
+                    "{arm}: the server refused nothing"
+                );
+            } else {
+                let sha = result.unwrap_or_else(|e| panic!("{arm}: the clone failed: {e}"));
+                assert_eq!(sha, server.head(), "{arm}: cloned the wrong commit");
+                assert!(
+                    server.authorized_requests() > 0,
+                    "{arm}: no request authenticated"
+                );
+                assert!(
+                    tree.contains(&format!("url = {}", server.url())),
+                    "{arm}: the cloned tree's .git/config does not name the repository's URL"
+                );
+            }
+        }
+    }
+
+    struct NoEvents;
+
+    #[async_trait::async_trait]
+    impl crate::domain::fsal::EventPublisher for NoEvents {
+        async fn publish_storage_event(&self, _event: crate::domain::events::StorageEvent) {}
+    }
+
+    /// The executor with an FSAL over a temporary directory. The libgit2 path
+    /// writes to the directory it is given and never reads the FSAL.
+    fn test_executor(dir: &Path) -> GitCloneExecutor {
+        use crate::infrastructure::event_bus::EventBus;
+        use crate::infrastructure::repositories::InMemoryVolumeRepository;
+        use crate::infrastructure::secrets_manager::TestSecretStore;
+        use crate::infrastructure::storage::LocalHostStorageProvider;
+        let bus = Arc::new(EventBus::new(16));
+        let secrets = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            bus,
+        ));
+        let root = dir.join("fsal");
+        std::fs::create_dir_all(&root).unwrap();
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(&root).unwrap()),
+            Arc::new(InMemoryVolumeRepository::new()),
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            Arc::new(NoEvents),
+        ));
+        GitCloneExecutor::new(secrets, fsal, None)
     }
 }

@@ -139,6 +139,9 @@ jobs:
         working-directory: aegis-orchestrator
         env:
           AEGIS_TEST_POSTGRES_URL: postgres://postgres@localhost:5432/postgres
+          # The runner has a container engine. With this set, a test that
+          # needs one fails when it cannot reach it, instead of skipping.
+          AEGIS_TEST_DOCKER: "1"
         run: cargo test --workspace --locked
 
   doc:

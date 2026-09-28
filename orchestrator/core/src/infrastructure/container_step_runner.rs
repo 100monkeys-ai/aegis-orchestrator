@@ -1181,7 +1181,9 @@ mod tests {
             name: "execute-user-code".to_string(),
             image: "python:3.12-slim".to_string(),
             image_pull_policy: ImagePullPolicy::IfNotPresent,
+            entrypoint: None,
             command: vec!["python3".to_string(), "/workspace/solution.py".to_string()],
+            stdin: None,
             env: std::collections::HashMap::new(),
             workdir: Some("/workspace".to_string()),
             volumes: vec![],
@@ -1343,5 +1345,117 @@ mod tests {
         assert_eq!(grpc_mounted_volumes.len(), 2);
         assert_eq!(grpc_mounted_volumes[0], (exec_id.clone(), vol_id_1));
         assert_eq!(grpc_mounted_volumes[1], (exec_id, vol_id_2));
+    }
+
+    /// A step's standard input reaches its process, and nothing the engine
+    /// shows about the container while it runs (its inspect record and its
+    /// process list) holds any part of it, nor does any event the runner
+    /// publishes. Needs a container engine (see `container_engine`).
+    #[tokio::test]
+    async fn stdin_reaches_the_step_and_nothing_the_engine_shows_holds_it() {
+        use crate::application::git_test_server::{
+            container_engine, container_runner, holds_any_part_of, marker,
+        };
+        use crate::domain::execution::ExecutionId;
+        use crate::domain::runtime::ContainerStepRunner;
+        use crate::domain::secrets::SensitiveBytes;
+        use crate::domain::shared_kernel::ImagePullPolicy;
+        use crate::domain::workflow::StateName;
+        use crate::infrastructure::event_bus::EventBus;
+        use bollard::query_parameters::{
+            InspectContainerOptions, ListContainersOptions, TopOptions,
+        };
+        use std::sync::Arc;
+
+        let test = "stdin_reaches_the_step_and_nothing_the_engine_shows_holds_it";
+        let Some(docker) = container_engine(test).await else {
+            return;
+        };
+        let secret = marker("Kq");
+        let bus = Arc::new(EventBus::new(256));
+        let mut events = bus.subscribe();
+        let runner = container_runner(docker.clone(), bus.clone());
+        let execution_id = ExecutionId::new();
+        let config = ContainerStepConfig {
+            name: "stdin".to_string(),
+            image: "alpine/git:latest".to_string(),
+            image_pull_policy: ImagePullPolicy::IfNotPresent,
+            entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+            command: vec!["cat >/tmp/in; sleep 4; cat /tmp/in".to_string()],
+            stdin: Some(SensitiveBytes::from(secret.clone().into_bytes())),
+            env: HashMap::new(),
+            workdir: None,
+            volumes: vec![],
+            resources: None,
+            registry_credentials: None,
+            execution_id,
+            state_name: StateName::new("STDIN").unwrap(),
+            read_only_root_filesystem: true,
+            run_as_user: None,
+            network_mode: None,
+            workflow_execution_id: None,
+        };
+
+        // While the step sleeps, read what the engine shows about it.
+        let watcher = {
+            let docker = docker.clone();
+            let name = format!("aegis-step-{execution_id}");
+            tokio::spawn(async move {
+                let mut shown: Vec<String> = Vec::new();
+                for _ in 0..80 {
+                    let mut filters = HashMap::new();
+                    filters.insert("name".to_string(), vec![name.clone()]);
+                    let listed = docker
+                        .list_containers(Some(ListContainersOptions {
+                            all: true,
+                            filters: Some(filters),
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap_or_default();
+                    for c in listed {
+                        let Some(id) = c.id else { continue };
+                        shown.push(serde_json::to_string(&c.command).unwrap_or_default());
+                        if let Ok(inspect) = docker
+                            .inspect_container(&id, None::<InspectContainerOptions>)
+                            .await
+                        {
+                            shown.push(serde_json::to_string(&inspect).unwrap_or_default());
+                        }
+                        if let Ok(top) = docker.top_processes(&id, None::<TopOptions>).await {
+                            shown.push(serde_json::to_string(&top).unwrap_or_default());
+                        }
+                    }
+                    if shown.len() >= 6 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                shown
+            })
+        };
+
+        let result = runner.run_step(config).await.expect("the step runs");
+        let shown = watcher.await.unwrap();
+        assert_eq!(
+            result.stdout, secret,
+            "the step's standard input did not reach its process"
+        );
+        assert!(
+            !shown.is_empty(),
+            "the engine showed nothing about the running step"
+        );
+        assert!(
+            !shown.iter().any(|s| holds_any_part_of(s, &secret)),
+            "what the engine shows about the running step holds its standard input"
+        );
+        let mut published = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            published.push(serde_json::to_string(&event).unwrap_or_default());
+        }
+        assert!(
+            !published.iter().any(|e| holds_any_part_of(e, &secret)),
+            "an event published for the step holds its standard input"
+        );
     }
 }

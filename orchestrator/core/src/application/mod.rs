@@ -67,6 +67,8 @@ pub mod file_operations_service;
 pub mod git_clone_executor;
 pub mod git_repo_service;
 pub mod git_ssh_key;
+#[cfg(test)]
+pub(crate) mod git_test_server;
 pub mod inner_loop_service;
 pub mod nfs_gateway;
 pub mod register_workflow;

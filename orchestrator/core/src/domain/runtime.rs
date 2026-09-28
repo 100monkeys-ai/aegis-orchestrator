@@ -477,9 +477,19 @@ pub struct ContainerStepConfig {
     /// Image pull policy
     pub image_pull_policy: ImagePullPolicy,
 
+    /// Replaces the image's entrypoint when set. `None` keeps the image's own.
+    pub entrypoint: Option<Vec<String>>,
+
     /// Argv to execute inside the container (`sh -c` wrapping applied externally
     /// when the caller sets `shell: true` before constructing this config)
     pub command: Vec<String>,
+
+    /// Bytes written to the process's standard input once it starts, after
+    /// which standard input is closed. This is how a step is handed a secret:
+    /// the command, the environment and the labels are shown to anyone who can
+    /// inspect the container or list the host's processes, and standard input
+    /// is not. `None` leaves standard input closed.
+    pub stdin: Option<crate::domain::secrets::SensitiveBytes>,
 
     /// Environment variables
     pub env: HashMap<String, String>,

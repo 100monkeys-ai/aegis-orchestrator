@@ -743,9 +743,16 @@ impl GitRepoService {
 
         let remote_name = remote.unwrap_or("origin").to_string();
         let explicit_ref = ref_name.map(str::to_string);
+        let repo_url = binding.repo_url.clone();
 
         let resolved_ref = tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
-            blocking_push(&target_dir, &remote_name, explicit_ref, credential)
+            push_to_remote(
+                &target_dir,
+                &repo_url,
+                &remote_name,
+                explicit_ref,
+                credential,
+            )
         })
         .await
         .map_err(|e| GitRepoError::GitFailed(format!("push task panicked: {e}")))??;
@@ -1199,6 +1206,18 @@ fn blocking_commit(
 /// drop).
 /// Returns the resolved `ref_name` so the service can emit
 /// [`GitRepoEvent::PushCompleted`] with the actual ref that was pushed.
+/// Push the working tree at `target_dir` to `remote_name` for the binding
+/// whose repository URL is `repo_url`, authenticating with `credential`.
+pub(crate) fn push_to_remote(
+    target_dir: &std::path::Path,
+    _repo_url: &SensitiveUrl,
+    remote_name: &str,
+    ref_name: Option<String>,
+    credential: Option<ResolvedCredential>,
+) -> Result<String, GitRepoError> {
+    blocking_push(target_dir, remote_name, ref_name, credential)
+}
+
 fn blocking_push(
     target_dir: &std::path::Path,
     remote_name: &str,
