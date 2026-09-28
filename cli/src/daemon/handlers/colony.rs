@@ -196,6 +196,7 @@ fn map_service_error(err: TeamServiceError) -> axum::response::Response {
         TeamServiceError::SeatCapReached { .. } => (StatusCode::CONFLICT, "seat_cap_reached"),
         TeamServiceError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
         TeamServiceError::InvalidInvitation => (StatusCode::BAD_REQUEST, "invalid_invitation"),
+        TeamServiceError::EmailNotVerified => (StatusCode::FORBIDDEN, "email_not_verified"),
         TeamServiceError::InvitationExpired => (StatusCode::GONE, "invitation_expired"),
         TeamServiceError::InvitationNotPending => (StatusCode::CONFLICT, "invitation_not_pending"),
         TeamServiceError::OwnerRoleImmutable => (StatusCode::BAD_REQUEST, "owner_role_immutable"),
@@ -885,6 +886,7 @@ pub(crate) async fn accept_invitation(
         .accept_invitation(AcceptInvitationCommand {
             token: token.into(),
             authenticated_email: email,
+            authenticated_email_verified: identity.email_verified,
             authenticated_user_id: identity.sub.clone(),
         })
         .await
@@ -1483,6 +1485,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&issued_view()).unwrap(),
             r#"{"id":"inv-1","team_id":"team-1","invitee_email":"invitee@example.com","token":"Mk7-invitation-view-token-marker","expires_at":"2026-09-28T00:00:00+00:00"}"#
+        );
+    }
+
+    /// A refusal for an unverified email is a 403 whose message tells the
+    /// person to verify their address.
+    #[tokio::test]
+    async fn an_unverified_email_is_refused_with_a_message_to_verify_it() {
+        let resp = map_service_error(TeamServiceError::EmailNotVerified);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "email_not_verified");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not verified") && message.contains("verify it"),
+            "the refusal does not tell the person to verify their address: {body}"
         );
     }
 

@@ -72,6 +72,10 @@ pub enum TeamServiceError {
     /// authenticated email does not match the invitation's invitee.
     #[error("invalid invitation token")]
     InvalidInvitation,
+    /// The caller's email address is not verified, so it cannot show that
+    /// the invitation was sent to them.
+    #[error("your email address is not verified; verify it, then accept the invitation again")]
+    EmailNotVerified,
     /// The invitation has expired.
     #[error("invitation has expired")]
     InvitationExpired,
@@ -128,6 +132,9 @@ pub struct AcceptInvitationCommand {
     /// Email address of the authenticated caller — must match the
     /// invitation's invitee (case-insensitive).
     pub authenticated_email: String,
+    /// Whether the identity provider says the caller proved that
+    /// `authenticated_email` is theirs (the token's `email_verified`).
+    pub authenticated_email_verified: bool,
     /// Keycloak `sub` of the authenticated caller.
     pub authenticated_user_id: String,
 }
@@ -825,6 +832,7 @@ mod tests {
         let accept = super::AcceptInvitationCommand {
             token: "Mk7-accept-invitation-token-marker".into(),
             authenticated_email: "invitee@example.com".to_string(),
+            authenticated_email_verified: true,
             authenticated_user_id: "user-2".to_string(),
         };
         let issued = super::InvitationIssued {
@@ -1422,6 +1430,7 @@ mod tests {
         svc.accept_invitation(AcceptInvitationCommand {
             token: issued.raw_token.clone(),
             authenticated_email: "newbie@example.com".to_string(),
+            authenticated_email_verified: true,
             authenticated_user_id: "user-2".to_string(),
         })
         .await
@@ -1443,6 +1452,57 @@ mod tests {
             "invitee's claim must include the new tenant; got {:?}",
             stamps_for_user2[0]
         );
+    }
+
+    /// An invitation is not accepted by a caller whose email address is not
+    /// verified, even when the address and the token match: without
+    /// verification the address does not show the invitation was sent to
+    /// them. The invitation stays pending, and the same person accepts it
+    /// once the address is verified.
+    #[tokio::test]
+    async fn an_invitation_is_not_accepted_when_the_email_is_not_verified() {
+        let sync = Arc::new(RecordingMembershipsSync::default());
+        let svc = build_service_with_memberships_sync(sync.clone());
+        let team = svc
+            .provision_team(cmd(TenantTier::Business))
+            .await
+            .expect("provision must succeed");
+        let issued = svc
+            .invite_member(InviteMemberCommand {
+                team_id: team.id,
+                invitee_email: "newbie@example.com".to_string(),
+                invited_by_user_id: "user-1".to_string(),
+            })
+            .await
+            .expect("invite must succeed");
+        sync.calls.lock().unwrap().clear();
+
+        let refused = svc
+            .accept_invitation(AcceptInvitationCommand {
+                token: issued.raw_token.clone(),
+                authenticated_email: "newbie@example.com".to_string(),
+                authenticated_email_verified: false,
+                authenticated_user_id: "user-2".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(refused, Err(TeamServiceError::EmailNotVerified)),
+            "a caller whose email is not verified accepted the invitation: {:?}",
+            refused.map(|m| (m.team_id, m.user_id))
+        );
+        assert!(
+            sync.calls.lock().unwrap().is_empty(),
+            "a refused acceptance changed the caller's team memberships"
+        );
+
+        svc.accept_invitation(AcceptInvitationCommand {
+            token: issued.raw_token,
+            authenticated_email: "newbie@example.com".to_string(),
+            authenticated_email_verified: true,
+            authenticated_user_id: "user-2".to_string(),
+        })
+        .await
+        .expect("the invitation is still pending and accepted once the email is verified");
     }
 
     /// Regression: revoke_membership must re-stamp the affected user's
@@ -1471,6 +1531,7 @@ mod tests {
         svc.accept_invitation(AcceptInvitationCommand {
             token: issued.raw_token,
             authenticated_email: "victim@example.com".to_string(),
+            authenticated_email_verified: true,
             authenticated_user_id: "user-2".to_string(),
         })
         .await
@@ -1603,6 +1664,7 @@ mod tests {
             .accept_invitation(AcceptInvitationCommand {
                 token: kept.as_str().into(),
                 authenticated_email: "newbie@example.com".to_string(),
+                authenticated_email_verified: true,
                 authenticated_user_id: "user-2".to_string(),
             })
             .await;
@@ -1614,6 +1676,7 @@ mod tests {
         svc.accept_invitation(AcceptInvitationCommand {
             token: issued.raw_token.clone(),
             authenticated_email: "newbie@example.com".to_string(),
+            authenticated_email_verified: true,
             authenticated_user_id: "user-2".to_string(),
         })
         .await

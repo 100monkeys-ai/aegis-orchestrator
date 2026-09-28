@@ -2491,6 +2491,7 @@ impl StandardExecutionService {
                 sub: "tenant-scope".to_string(),
                 realm_slug: "aegis-system".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: crate::domain::iam::IdentityKind::TenantUser {
                     tenant_slug: tenant_id.as_str().to_string(),

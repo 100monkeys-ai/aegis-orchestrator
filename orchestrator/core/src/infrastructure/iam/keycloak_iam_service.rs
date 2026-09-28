@@ -625,6 +625,7 @@ impl IdentityProvider for StandardIamService {
             sub: claims.sub.clone(),
             realm_slug: realm.realm_slug.clone(),
             email: claims.email.clone(),
+            email_verified: false,
             name: claims
                 .extra
                 .get("name")
@@ -903,6 +904,7 @@ mod tests {
                 sub: "test-sub".to_string(),
                 realm_slug: "zaru-consumer".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::ConsumerUser {
                     zaru_tier: ZaruTier::Pro,
@@ -934,6 +936,7 @@ mod tests {
                 sub: "test-sub".to_string(),
                 realm_slug: "aegis-system".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::Operator {
                     aegis_role: AegisRole::Admin,
@@ -977,6 +980,7 @@ mod tests {
                 sub: "operator-sub".to_string(),
                 realm_slug: "aegis-system".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::Operator {
                     aegis_role: AegisRole::Admin,
@@ -1015,6 +1019,7 @@ mod tests {
                 sub: "sa-sub".to_string(),
                 realm_slug: "aegis-system".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::ServiceAccount {
                     client_id: "aegis-sdk-python".to_string(),
@@ -1047,6 +1052,7 @@ mod tests {
                 sub: "consumer-sub".to_string(),
                 realm_slug: "zaru-consumer".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::ConsumerUser {
                     zaru_tier: ZaruTier::Free,
@@ -1087,6 +1093,7 @@ mod tests {
                 sub: "tenant-user-sub".to_string(),
                 realm_slug: "tenant-acme".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::TenantUser {
                     tenant_slug: "acme".to_string(),
@@ -1119,6 +1126,7 @@ mod tests {
                 sub: "sa-sub".to_string(),
                 realm_slug: "aegis-system".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::ServiceAccount {
                     client_id: "aegis-sdk-python".to_string(),
@@ -1471,6 +1479,52 @@ mod tests {
             Some(exp),
             "raw_claims must include exp"
         );
+    }
+
+    /// The identity says the email is verified only when the token's
+    /// `email_verified` claim is the JSON value `true`. Absent, `false`, or
+    /// any other value (a string, a number) is not verified.
+    #[tokio::test]
+    async fn identity_email_is_verified_only_when_the_token_says_true() {
+        let service = test_service_with_consumer_realm();
+        populate_jwks_cache(&service).await;
+
+        let cases: [(Option<serde_json::Value>, bool); 5] = [
+            (Some(serde_json::json!(true)), true),
+            (Some(serde_json::json!(false)), false),
+            (None, false),
+            (Some(serde_json::json!("true")), false),
+            (Some(serde_json::json!(1)), false),
+        ];
+        for (claim, expected) in cases {
+            let now = now_secs();
+            let mut claims = serde_json::json!({
+                "sub": "abc-def-123",
+                "iss": TEST_ISSUER,
+                "aud": TEST_AUDIENCE,
+                "iat": now,
+                "exp": now + 3600,
+                "email": "person@example.com",
+                "zaru_tier": "free",
+                "tenant_id": "u-abcdef123",
+            });
+            if let Some(value) = &claim {
+                claims["email_verified"] = value.clone();
+            }
+            let validated = service
+                .validate_token(&sign_test_jwt(claims))
+                .await
+                .expect("token should validate");
+            assert_eq!(
+                validated.identity.email_verified, expected,
+                "a token with email_verified {claim:?} gave an identity with email_verified {}",
+                validated.identity.email_verified
+            );
+            assert_eq!(
+                validated.identity.email.as_deref(),
+                Some("person@example.com")
+            );
+        }
     }
 
     #[tokio::test]

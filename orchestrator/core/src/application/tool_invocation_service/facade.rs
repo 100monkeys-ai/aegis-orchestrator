@@ -326,6 +326,7 @@ impl ToolInvocationService {
                 sub: uid.clone(),
                 realm_slug: "zaru-consumer".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: crate::domain::iam::IdentityKind::ConsumerUser {
                     zaru_tier: crate::domain::iam::ZaruTier::from_security_context_name(
@@ -413,6 +414,7 @@ impl ToolInvocationService {
                 sub: sub.clone(),
                 realm_slug: "zaru-consumer".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: crate::domain::iam::IdentityKind::ConsumerUser {
                     zaru_tier: crate::domain::iam::ZaruTier::Free,

@@ -228,6 +228,7 @@ mod tests {
             sub: "user-1".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
@@ -246,6 +247,7 @@ mod tests {
             sub: "op-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: crate::domain::iam::AegisRole::Admin,
@@ -263,6 +265,7 @@ mod tests {
             sub: "tu-1".into(),
             realm_slug: "tenant-acme".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "acme".into(),
@@ -283,6 +286,7 @@ mod tests {
             sub: "tu-bad".into(),
             realm_slug: "tenant-Bad Slug!".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "Bad Slug!".into(),

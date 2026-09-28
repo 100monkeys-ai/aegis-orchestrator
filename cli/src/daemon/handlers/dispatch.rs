@@ -78,7 +78,7 @@ pub(crate) async fn dispatch_gateway_handler(
             let identity = exec.initiating_user_sub.as_ref().map(|sub| UserIdentity {
                 sub: sub.clone(),
                 realm_slug: "zaru-consumer".to_string(),
-                email: None,
+                email: None, email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::ConsumerUser {
                     zaru_tier: ZaruTier::Free,

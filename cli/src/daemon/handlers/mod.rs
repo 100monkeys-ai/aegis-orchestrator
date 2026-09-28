@@ -192,6 +192,7 @@ mod tests {
             sub: "op-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator { aegis_role: role },
         }
@@ -202,6 +203,7 @@ mod tests {
             sub: "svc-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "aegis-temporal-worker".into(),
@@ -214,6 +216,7 @@ mod tests {
             sub: "user-1".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
@@ -227,6 +230,7 @@ mod tests {
             sub: "tu-1".into(),
             realm_slug: format!("tenant-{slug}"),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: slug.into(),

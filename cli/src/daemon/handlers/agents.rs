@@ -785,6 +785,7 @@ mod tests {
             sub: "op-sub".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Operator,

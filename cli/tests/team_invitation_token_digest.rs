@@ -201,6 +201,7 @@ async fn accept(
     svc.accept_invitation(AcceptInvitationCommand {
         token: SensitiveString::new(token),
         authenticated_email: email.to_string(),
+        authenticated_email_verified: true,
         authenticated_user_id: user.to_string(),
     })
     .await

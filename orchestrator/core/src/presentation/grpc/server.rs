@@ -3439,6 +3439,7 @@ mod tests {
                 sub: "user-a-sub".to_string(),
                 realm_slug: "zaru-consumer".to_string(),
                 email: None,
+                email_verified: false,
                 name: None,
                 identity_kind: IdentityKind::ConsumerUser {
                     zaru_tier: ZaruTier::Free,

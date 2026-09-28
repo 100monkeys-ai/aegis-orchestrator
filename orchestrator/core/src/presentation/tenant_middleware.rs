@@ -395,6 +395,7 @@ mod tests {
             sub: "user-1".to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
@@ -410,6 +411,7 @@ mod tests {
             sub: "admin-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Admin,
@@ -424,6 +426,7 @@ mod tests {
             sub: "tu-1".to_string(),
             realm_slug: "tenant-acme".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "tenant-acme".to_string(),
@@ -439,6 +442,7 @@ mod tests {
             sub: "sa-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "sdk-python".to_string(),
@@ -459,6 +463,7 @@ mod tests {
             sub: "tu-bad".to_string(),
             realm_slug: "tenant-Bad Slug!".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "Bad Slug!".to_string(),
@@ -693,6 +698,7 @@ mod tests {
             sub: sub.to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
@@ -706,6 +712,7 @@ mod tests {
             sub: "op-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Admin,
@@ -718,6 +725,7 @@ mod tests {
             sub: "svc-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "aegis-temporal-worker".into(),
@@ -796,6 +804,7 @@ mod tests {
             sub: "tu-bad".to_string(),
             realm_slug: "tenant-Bad Slug!".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "Bad Slug!".to_string(),

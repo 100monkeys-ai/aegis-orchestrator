@@ -211,6 +211,7 @@ mod tests {
             sub: "u-1".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
@@ -229,6 +230,7 @@ mod tests {
             sub: "u-2".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,
@@ -247,6 +249,7 @@ mod tests {
             sub: "u-3".into(),
             realm_slug: "tenant-acme".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "acme".into(),
@@ -264,6 +267,7 @@ mod tests {
             sub: "u-4".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: crate::domain::iam::AegisRole::Admin,
@@ -281,6 +285,7 @@ mod tests {
             sub: "sa-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "aegis-sdk".into(),

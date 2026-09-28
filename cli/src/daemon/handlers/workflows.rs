@@ -582,6 +582,7 @@ mod tests {
             sub: format!("user-{slug}"),
             realm_slug: format!("tenant-{slug}"),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: slug.into(),
@@ -594,6 +595,7 @@ mod tests {
             sub: sub.into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,

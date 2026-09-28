@@ -1096,6 +1096,7 @@ mod tests {
             sub: "svc-no-router".to_string(),
             realm_slug: "tenant-no-router".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "tenant-no-router".to_string(),
@@ -1156,6 +1157,7 @@ mod tests {
             sub: "user-low-conf".to_string(),
             realm_slug: "tenant-42".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "tenant-42".to_string(),
@@ -1229,6 +1231,7 @@ mod tests {
             sub: "user-valid-router".to_string(),
             realm_slug: "tenant-99".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "tenant-99".to_string(),
@@ -1336,6 +1339,7 @@ mod tests {
             sub: "user-sub-abc123".to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: Some("user@example.com".to_string()),
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,

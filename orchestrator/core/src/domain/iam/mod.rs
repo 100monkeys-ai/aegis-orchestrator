@@ -105,6 +105,12 @@ pub struct UserIdentity {
     pub realm_slug: String,
     /// User email if present in claims
     pub email: Option<String>,
+    /// True only when the identity provider said the user proved that
+    /// `email` is theirs: the token's `email_verified` claim was `true`.
+    /// Absent, false, or any other value is false. Nothing that an email
+    /// address grants may be given when this is false.
+    #[serde(default)]
+    pub email_verified: bool,
     /// User's display name if present in claims (e.g. "given_name family_name")
     pub name: Option<String>,
     /// Classification of this identity
@@ -547,6 +553,7 @@ mod tests {
             sub: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: Some("user@example.com".to_string()),
+            email_verified: false,
             name: Some("Test User".to_string()),
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,

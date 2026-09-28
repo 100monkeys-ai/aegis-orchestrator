@@ -385,6 +385,7 @@ async fn identity_from_api_key(state: &AppState, raw_token: &str) -> Option<User
         sub: row.user_id,
         realm_slug,
         email: None,
+        email_verified: false,
         name: None,
         identity_kind,
     })
@@ -694,6 +695,7 @@ mod attest_tenant_resolution_tests {
             sub: sub.to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
@@ -707,6 +709,7 @@ mod attest_tenant_resolution_tests {
             sub: "op-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Admin,
@@ -719,6 +722,7 @@ mod attest_tenant_resolution_tests {
             sub: "svc-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "aegis-sdk".to_string(),

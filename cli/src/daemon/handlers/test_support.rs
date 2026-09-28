@@ -75,6 +75,7 @@ pub(crate) fn operator(role: AegisRole) -> UserIdentity {
         sub: format!("op-{}", role.as_claim_str()),
         realm_slug: "aegis-system".into(),
         email: None,
+        email_verified: false,
         name: None,
         identity_kind: IdentityKind::Operator { aegis_role: role },
     }
@@ -86,6 +87,7 @@ pub(crate) fn consumer(sub: &str) -> UserIdentity {
         sub: sub.into(),
         realm_slug: "zaru-consumer".into(),
         email: None,
+        email_verified: false,
         name: None,
         identity_kind: IdentityKind::ConsumerUser {
             zaru_tier: ZaruTier::Free,
@@ -99,6 +101,7 @@ pub(crate) fn tenant_user(sub: &str, tenant_slug: &str) -> UserIdentity {
         sub: sub.into(),
         realm_slug: format!("tenant-{tenant_slug}"),
         email: None,
+        email_verified: false,
         name: None,
         identity_kind: IdentityKind::TenantUser {
             tenant_slug: tenant_slug.into(),
@@ -111,6 +114,7 @@ pub(crate) fn service_account() -> UserIdentity {
         sub: "svc-sub".into(),
         realm_slug: "aegis-system".into(),
         email: None,
+        email_verified: false,
         name: None,
         identity_kind: IdentityKind::ServiceAccount {
             client_id: "aegis-temporal-worker".into(),

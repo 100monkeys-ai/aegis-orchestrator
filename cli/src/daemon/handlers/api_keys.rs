@@ -329,6 +329,7 @@ mod tests {
             sub: sub.to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: tier,
@@ -342,6 +343,7 @@ mod tests {
             sub: "op-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::Operator { aegis_role: role },
         }
@@ -421,6 +423,7 @@ mod tests {
             sub: "svc-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "aegis-sdk".to_string(),
@@ -432,6 +435,7 @@ mod tests {
             sub: "tu-1".to_string(),
             realm_slug: "tenant-acme".to_string(),
             email: None,
+            email_verified: false,
             name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "acme".to_string(),
