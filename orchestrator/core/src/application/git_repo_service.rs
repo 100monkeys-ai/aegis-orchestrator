@@ -1329,6 +1329,26 @@ fn blocking_diff(target_dir: &std::path::Path, staged: bool) -> Result<String, G
 mod tests {
     use super::*;
 
+    #[test]
+    fn create_git_repo_command_debug_does_not_print_the_url_credential() {
+        let cmd = CreateGitRepoCommand::new(
+            TenantId::consumer(),
+            "user-1",
+            ZaruTier::Pro,
+            "https://user:Mk7-create-command-pat-marker@github.com/o/r.git",
+            "label",
+        );
+        let printed = format!("{cmd:?}");
+        assert!(
+            !printed.contains("Mk7-create-command-pat-marker"),
+            "CreateGitRepoCommand's Debug printed the repository URL's credential: {printed}"
+        );
+        assert!(
+            printed.contains("github.com"),
+            "Debug lost the repository host: {printed}"
+        );
+    }
+
     fn gh_signature(secret: &[u8], body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
         mac.update(body);

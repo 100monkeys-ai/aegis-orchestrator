@@ -613,6 +613,62 @@ fn is_ip_address(host: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A `BindingCreated` event as it is serialised. Captured from the
+    /// derived serde form while `repo_url` was a `String`.
+    const BINDING_CREATED_FIXTURE: &str = r#"{"BindingCreated":{"id":"00000000-0000-0000-0000-000000000001","repo_url":"https://user:Mk7-git-pat-marker@github.com/o/r.git","git_ref":{"Branch":"main"},"volume_id":"00000000-0000-0000-0000-000000000002","created_at":"2026-09-28T00:00:00Z"}}"#;
+
+    #[test]
+    fn git_repo_event_debug_does_not_print_the_url_credential() {
+        let event: GitRepoEvent = serde_json::from_str(BINDING_CREATED_FIXTURE).unwrap();
+        let printed = format!("{event:?}");
+        assert!(
+            !printed.contains("Mk7-git-pat-marker"),
+            "GitRepoEvent's Debug printed the repository URL's credential: {printed}"
+        );
+        assert!(
+            printed.contains("github.com"),
+            "Debug lost the repository host: {printed}"
+        );
+    }
+
+    #[test]
+    fn git_repo_event_wire_form_is_unchanged() {
+        let event: GitRepoEvent = serde_json::from_str(BINDING_CREATED_FIXTURE).unwrap();
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            BINDING_CREATED_FIXTURE
+        );
+    }
+
+    #[test]
+    fn git_repo_binding_debug_does_not_print_the_url_credential_or_webhook_secret() {
+        let binding = GitRepoBinding::new(
+            TenantId::consumer(),
+            None,
+            "https://user:Mk7-git-pat-marker@github.com/o/r.git".to_string(),
+            GitRef::default(),
+            None,
+            VolumeId::new(),
+            "label".to_string(),
+            CloneStrategy::Libgit2,
+            true,
+            Some("Mk7-webhook-secret-marker".to_string()),
+            Some("vault:v1:ciphertext".to_string()),
+            Some("lookup-hash".to_string()),
+        );
+        let printed = format!("{binding:?}");
+        for marker in ["Mk7-git-pat-marker", "Mk7-webhook-secret-marker"] {
+            assert!(
+                !printed.contains(marker),
+                "GitRepoBinding's Debug printed a credential: {printed}"
+            );
+        }
+        assert!(
+            printed.contains("github.com"),
+            "Debug lost the repository host: {printed}"
+        );
+    }
+
     fn sample_binding() -> GitRepoBinding {
         GitRepoBinding::new(
             TenantId::consumer(),

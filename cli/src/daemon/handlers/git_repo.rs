@@ -550,3 +550,25 @@ pub(crate) async fn diff_git_repo(
         Json(serde_json::json!({ "diff": diff_text })),
     ))
 }
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn create_git_repo_request_debug_does_not_print_the_url_credential() {
+        let request: CreateGitRepoRequest = serde_json::from_str(
+            r#"{"repo_url":"https://user:Mk7-create-request-pat-marker@github.com/o/r.git","label":"l"}"#,
+        )
+        .unwrap();
+        let printed = format!("{request:?}");
+        assert!(
+            !printed.contains("Mk7-create-request-pat-marker"),
+            "CreateGitRepoRequest's Debug printed the repository URL's credential: {printed}"
+        );
+        assert!(
+            printed.contains("github.com"),
+            "Debug lost the repository host: {printed}"
+        );
+    }
+}
