@@ -128,7 +128,9 @@ fn git_repo_error_response(e: GitRepoError) -> (StatusCode, Json<serde_json::Val
             (StatusCode::NOT_FOUND, e.to_string())
         }
         GitRepoError::TierLimitExceeded { .. } => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
-        GitRepoError::UrlValidationFailed(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        GitRepoError::UrlValidationFailed(_) | GitRepoError::SshHostKeys(_) => {
+            (StatusCode::BAD_REQUEST, e.to_string())
+        }
         GitRepoError::NotYetImplemented(_) => (StatusCode::NOT_IMPLEMENTED, e.to_string()),
         GitRepoError::CloneFailed(_) | GitRepoError::GitFailed(_) => {
             (StatusCode::BAD_GATEWAY, e.to_string())

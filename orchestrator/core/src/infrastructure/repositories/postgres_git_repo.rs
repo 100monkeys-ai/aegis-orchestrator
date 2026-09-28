@@ -178,6 +178,11 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> Result<GitRepoBinding, Reposi
     let webhook_lookup_hash: Option<String> = row
         .try_get("webhook_lookup_hash")
         .map_err(|e| RepositoryError::Serialization(format!("webhook_lookup_hash: {e}")))?;
+    let ssh_host_keys_json: serde_json::Value = row
+        .try_get("ssh_host_keys")
+        .map_err(|e| RepositoryError::Serialization(format!("ssh_host_keys: {e}")))?;
+    let ssh_host_keys = serde_json::from_value(ssh_host_keys_json)
+        .map_err(|e| RepositoryError::Serialization(format!("ssh_host_keys deser: {e}")))?;
     let created_at: DateTime<Utc> = row
         .try_get("created_at")
         .map_err(|e| RepositoryError::Serialization(format!("created_at: {e}")))?;
@@ -216,7 +221,7 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> Result<GitRepoBinding, Reposi
         webhook_secret: None,
         webhook_secret_ciphertext,
         webhook_lookup_hash,
-        ssh_host_keys: Vec::new(),
+        ssh_host_keys,
         created_at,
         updated_at,
         domain_events: Vec::new(),
@@ -233,6 +238,8 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
         let (git_ref_type, git_ref_value) = git_ref_to_db(&binding.git_ref);
         let (status_text, status_error) = status_to_db(&binding.status);
         let clone_strategy_text = clone_strategy_to_db(&binding.clone_strategy);
+        let ssh_host_keys_json = serde_json::to_value(&binding.ssh_host_keys)
+            .map_err(|e| RepositoryError::Serialization(format!("ssh_host_keys ser: {e}")))?;
         let sparse_paths_json = binding
             .sparse_paths
             .as_ref()
@@ -248,9 +255,9 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
                 label, status, status_error, clone_strategy,
                 last_cloned_at, last_commit_sha, auto_refresh,
                 webhook_secret_ciphertext, webhook_lookup_hash,
-                created_at, updated_at
+                created_at, updated_at, ssh_host_keys
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id                  = EXCLUDED.tenant_id,
                 credential_binding_id      = EXCLUDED.credential_binding_id,
@@ -268,7 +275,8 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
                 auto_refresh               = EXCLUDED.auto_refresh,
                 webhook_secret_ciphertext  = EXCLUDED.webhook_secret_ciphertext,
                 webhook_lookup_hash        = EXCLUDED.webhook_lookup_hash,
-                updated_at                 = EXCLUDED.updated_at
+                updated_at                 = EXCLUDED.updated_at,
+                ssh_host_keys              = EXCLUDED.ssh_host_keys
             "#,
         )
         .bind(binding.id.0)
@@ -292,6 +300,7 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
         .bind(binding.webhook_lookup_hash.as_deref())
         .bind(binding.created_at)
         .bind(binding.updated_at)
+        .bind(ssh_host_keys_json)
         .execute(&self.pool)
         .await
         .map_err(|e| {

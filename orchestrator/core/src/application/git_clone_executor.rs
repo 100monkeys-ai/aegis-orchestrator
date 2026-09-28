@@ -44,10 +44,11 @@ use git2::{Cred, FetchOptions, Oid, RemoteCallbacks, Repository};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
-use crate::application::git_ssh_key::{attach_ssh_credentials, SshKeyTempFile};
+use crate::application::git_ssh_key::{attach_ssh_credentials, check_ssh_host_key, SshKeyTempFile};
 use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
 use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::{AegisFSAL, FsalAccessPolicy};
+use crate::domain::git_host_keys::{host_keys_for, known_hosts_file, SshHostKey};
 use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
 use crate::domain::runtime::{
     ContainerStepConfig, ContainerStepError, ContainerStepRunner, ContainerVolumeMount,
@@ -190,12 +191,17 @@ impl EphemeralCliEngine {
     ) -> Result<String, CloneError> {
         let (clone_url, credential) = clone_credential(binding.repo_url.expose(), credential);
         let secrets = credential_secrets(credential.as_ref());
+        // Refused here, before a container starts, when an SSH host has no
+        // known key.
+        let host_keys =
+            host_keys_for(&clone_url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
         let step = clone_step(
             &self.paths,
             binding,
             &clone_url,
             credential.as_ref(),
             shallow,
+            host_keys.as_deref(),
         )?;
 
         let cfg = ContainerStepConfig {
@@ -285,12 +291,18 @@ struct CloneStep {
 /// only its user can read. git reads it from there through a credential
 /// helper, or ssh through `-i`. The directory is removed when the script
 /// ends, whether the clone succeeded or not.
+///
+/// For a remote reached over SSH, `host_keys` are the keys its host must
+/// present: ssh gets them as its only known-hosts file, checks them strictly
+/// before it authenticates, and reads no configuration of the image's or
+/// the user's that could change that.
 fn clone_step(
     paths: &EphemeralCliPaths,
     binding: &GitRepoBinding,
     clone_url: &str,
     credential: Option<&ResolvedCredential>,
     shallow: bool,
+    host_keys: Option<&[SshHostKey]>,
 ) -> Result<CloneStep, CloneError> {
     let dest = shell_escape(&format!("{}/repo", paths.workspace));
     let mut s = String::new();
@@ -309,6 +321,7 @@ fn clone_step(
 
     let mut git_options = String::new();
     let mut stdin = None;
+    let mut ssh_identity = String::new();
     match credential {
         Some(ResolvedCredential::HttpsPat { username, token }) => {
             if username.contains(['\n', '\r']) || token.expose().contains(['\n', '\r']) {
@@ -342,13 +355,26 @@ fn clone_step(
             ));
             s.push_str(
                 "cat >\"$scratch/key\"\n\
-                 if [ -n \"$(tail -c 1 \"$scratch/key\")\" ]; then printf '\\n' >>\"$scratch/key\"; fi\n\
-                 GIT_SSH_COMMAND=\"ssh -i '$scratch/key' -o IdentitiesOnly=yes \
-                 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\"\n\
-                 export GIT_SSH_COMMAND\n",
+                 if [ -n \"$(tail -c 1 \"$scratch/key\")\" ]; then printf '\\n' >>\"$scratch/key\"; fi\n",
             );
+            ssh_identity = " -i '$scratch/key' -o IdentitiesOnly=yes".to_string();
         }
         None => {}
+    }
+    if let Some(keys) = host_keys {
+        let known_hosts = known_hosts_file(clone_url, keys).ok_or_else(|| {
+            CloneError::Git("host keys were given for a remote not reached over SSH".to_string())
+        })?;
+        s.push_str(&format!(
+            "printf '%s' {} >\"$scratch/known_hosts\"\n",
+            shell_escape(&known_hosts)
+        ));
+        s.push_str(&format!(
+            "GIT_SSH_COMMAND=\"ssh -F /dev/null{ssh_identity} -o BatchMode=yes \
+             -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$scratch/known_hosts' \
+             -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no\"\n\
+             export GIT_SSH_COMMAND\n"
+        ));
     }
 
     let ref_flag = match &binding.git_ref {
@@ -681,6 +707,8 @@ impl GitCloneExecutor {
     ) -> Result<String, CloneError> {
         let (repo_url, credential) = clone_credential(binding.repo_url.expose(), credential);
         let secrets = credential_secrets(credential.as_ref());
+        let host_keys =
+            host_keys_for(&repo_url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
         let target_dir: PathBuf = target_dir.to_path_buf();
         let sparse_paths = binding.sparse_paths.clone();
 
@@ -691,7 +719,14 @@ impl GitCloneExecutor {
         );
 
         let sha = tokio::task::spawn_blocking(move || -> Result<String, CloneError> {
-            blocking_clone(&repo_url, &target_dir, credential, shallow, sparse_paths)
+            blocking_clone(
+                &repo_url,
+                &target_dir,
+                credential,
+                shallow,
+                sparse_paths,
+                host_keys,
+            )
         })
         .await
         .map_err(|e| CloneError::Io(format!("clone task panicked: {e}")))?
@@ -741,9 +776,11 @@ impl GitCloneExecutor {
         let git_ref = binding.git_ref.clone();
         let (repo_url, credential) = clone_credential(binding.repo_url.expose(), credential);
         let secrets = credential_secrets(credential.as_ref());
+        let host_keys =
+            host_keys_for(&repo_url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
 
         let sha = tokio::task::spawn_blocking(move || -> Result<String, CloneError> {
-            blocking_fetch_and_checkout(&repo_url, &target_dir, &git_ref, credential)
+            blocking_fetch_and_checkout(&repo_url, &target_dir, &git_ref, credential, host_keys)
         })
         .await
         .map_err(|e| CloneError::Io(format!("fetch task panicked: {e}")))?
@@ -943,6 +980,7 @@ fn blocking_clone(
     credential: Option<ResolvedCredential>,
     shallow: bool,
     sparse_paths: Option<Vec<String>>,
+    host_keys: Option<Vec<SshHostKey>>,
 ) -> Result<String, CloneError> {
     // Ensure parent exists.
     if let Some(parent) = target_dir.parent() {
@@ -950,6 +988,9 @@ fn blocking_clone(
     }
 
     let mut callbacks = RemoteCallbacks::new();
+    if let Some(keys) = host_keys {
+        check_ssh_host_key(&mut callbacks, keys);
+    }
     let _ssh_guard = configure_credentials(&mut callbacks, credential)?;
 
     let mut fetch_opts = FetchOptions::new();
@@ -1031,12 +1072,16 @@ fn blocking_fetch_and_checkout(
     target_dir: &Path,
     git_ref: &GitRef,
     credential: Option<ResolvedCredential>,
+    host_keys: Option<Vec<SshHostKey>>,
 ) -> Result<String, CloneError> {
     let repo = Repository::open(target_dir)?;
 
     point_origin_at(&repo, repo_url)?;
 
     let mut callbacks = RemoteCallbacks::new();
+    if let Some(keys) = host_keys {
+        check_ssh_host_key(&mut callbacks, keys);
+    }
     let _ssh_guard = configure_credentials(&mut callbacks, credential)?;
     let mut fetch_opts = FetchOptions::new();
     fetch_opts.remote_callbacks(callbacks);
@@ -1240,6 +1285,7 @@ mod tests {
                 &url,
                 credential.as_ref(),
                 true,
+                None,
             )
             .unwrap();
             assert!(
@@ -1428,7 +1474,17 @@ mod credential_tests {
         .unwrap()
     }
 
+    /// A host key for the SSH remotes of these tests that no server
+    /// presents. The private half was discarded when it was made.
+    const EXAMPLE_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILLVgzw/nXIVlhnSJ6bOJHA+tbKKmPAvtpuRyFvqJnQ6";
+
+    /// A binding of `url`; an SSH remote is given [`EXAMPLE_HOST_KEY`].
     fn binding(url: &str, volume: &Volume, strategy: CloneStrategy) -> GitRepoBinding {
+        let keys = match crate::domain::git_host_keys::ssh_remote(url) {
+            Some(_) => vec![SshHostKey::parse(EXAMPLE_HOST_KEY).unwrap()],
+            None => vec![],
+        };
         GitRepoBinding::new(
             TenantId::system(),
             None,
@@ -1443,6 +1499,7 @@ mod credential_tests {
             None,
             None,
         )
+        .with_ssh_host_keys(keys)
     }
 
     fn ephemeral() -> CloneStrategy {

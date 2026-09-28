@@ -45,13 +45,14 @@ use crate::application::git_clone_executor::{
     clone_credential, credential_secrets, redact_git_output, strip_remote_user_info, CloneError,
     GitCloneExecutor, ResolvedCredential,
 };
-use crate::application::git_ssh_key::attach_ssh_credentials;
+use crate::application::git_ssh_key::{attach_ssh_credentials, check_ssh_host_key};
 use crate::application::user_volume_service::{UserVolumeError, UserVolumeService};
 use crate::application::volume_manager::CreateUserVolumeCommand;
 use crate::domain::credential::{
     CredentialBindingId, CredentialBindingRepository, CredentialStatus, CredentialType,
     UserCredentialBinding,
 };
+use crate::domain::git_host_keys::{host_keys_for, ssh_remote, SshHostKey};
 use crate::domain::git_repo::{
     validate_repo_url, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
     GitRepoBindingRepository, GitRepoEvent, GitRepoStatus,
@@ -170,6 +171,12 @@ pub enum GitRepoError {
 
     #[error("url validation failed: {0}")]
     UrlValidationFailed(String),
+
+    /// The SSH host keys given for a binding are missing, not keys, or given
+    /// for a remote that is not reached over SSH. The message says what to
+    /// send. Maps to HTTP `400 Bad Request`.
+    #[error("{0}")]
+    SshHostKeys(String),
 
     #[error("volume provisioning failed: {0}")]
     VolumeProvisioningFailed(String),
@@ -314,6 +321,7 @@ impl GitRepoService {
     ) -> Result<GitRepoBinding, GitRepoError> {
         // Read to validate its form.
         validate_repo_url(cmd.repo_url.expose()).map_err(GitRepoError::UrlValidationFailed)?;
+        let ssh_host_keys = binding_host_keys(cmd.repo_url.expose(), &cmd.ssh_host_keys)?;
 
         let limits = GitRepoTierLimits::for_tier(cmd.zaru_tier.clone());
         if let Some(max) = limits.max_bindings {
@@ -390,7 +398,8 @@ impl GitRepoService {
             webhook_secret,
             webhook_secret_ciphertext,
             webhook_lookup_hash,
-        );
+        )
+        .with_ssh_host_keys(ssh_host_keys);
 
         self.repo.save(&binding).await?;
         self.drain_and_publish(&mut binding);
@@ -1206,6 +1215,30 @@ fn blocking_commit(
     Ok(commit_oid.to_string())
 }
 
+/// The SSH host keys a new binding holds, from the lines its creator gave.
+///
+/// An SSH remote on a host other than the well-known ones must be given its
+/// key, since every clone checks it; keys given for a remote that is not
+/// reached over SSH are refused rather than ignored.
+fn binding_host_keys(repo_url: &str, lines: &[String]) -> Result<Vec<SshHostKey>, GitRepoError> {
+    let keys = lines
+        .iter()
+        .map(|line| SshHostKey::parse(line))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(GitRepoError::SshHostKeys)?;
+    if ssh_remote(repo_url).is_none() {
+        if keys.is_empty() {
+            return Ok(keys);
+        }
+        return Err(GitRepoError::SshHostKeys(
+            "`ssh_host_keys` is for a repository reached over SSH (git@host:path); this one is not"
+                .to_string(),
+        ));
+    }
+    host_keys_for(repo_url, &keys).map_err(GitRepoError::SshHostKeys)?;
+    Ok(keys)
+}
+
 /// Push the working tree at `target_dir` to `remote_name` for the binding
 /// whose repository URL is `repo_url`, authenticating with `credential`.
 ///
@@ -1219,7 +1252,7 @@ pub(crate) fn push_to_remote(
     remote_name: &str,
     ref_name: Option<String>,
     credential: Option<ResolvedCredential>,
-    _ssh_host_keys: &[crate::domain::git_host_keys::SshHostKey],
+    ssh_host_keys: &[crate::domain::git_host_keys::SshHostKey],
 ) -> Result<String, GitRepoError> {
     let (_, credential) = clone_credential(repo_url.expose(), credential);
     let secrets = credential_secrets(credential.as_ref());
@@ -1228,7 +1261,20 @@ pub(crate) fn push_to_remote(
             .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
         strip_remote_user_info(&repo, remote_name)
             .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
-        blocking_push(target_dir, remote_name, ref_name, credential)
+        // The push goes where the tree's remote points. The binding's keys
+        // are for the binding's host; a remote on another host is checked
+        // against that host's published keys, or refused.
+        let remote_url = repo
+            .find_remote(remote_name)
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+            .url()
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+            .to_string();
+        let same_host = ssh_remote(&remote_url).map(|(host, _)| host)
+            == ssh_remote(repo_url.expose()).map(|(host, _)| host);
+        let keys = host_keys_for(&remote_url, if same_host { ssh_host_keys } else { &[] })
+            .map_err(GitRepoError::GitFailed)?;
+        blocking_push(target_dir, remote_name, ref_name, credential, keys)
     })();
     pushed.map_err(|e| match e {
         GitRepoError::GitFailed(m) => GitRepoError::GitFailed(redact_git_output(&m, &secrets)),
@@ -1251,6 +1297,7 @@ fn blocking_push(
     remote_name: &str,
     ref_name: Option<String>,
     credential: Option<ResolvedCredential>,
+    ssh_host_keys: Option<Vec<crate::domain::git_host_keys::SshHostKey>>,
 ) -> Result<String, GitRepoError> {
     use git2::{PushOptions, RemoteCallbacks, Repository};
 
@@ -1285,6 +1332,9 @@ fn blocking_push(
         .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
 
     let mut callbacks = RemoteCallbacks::new();
+    if let Some(keys) = ssh_host_keys {
+        check_ssh_host_key(&mut callbacks, keys);
+    }
     // SSH guard must outlive the `remote.push()` call — libgit2 reads
     // the key tempfile from inside `push`. Dropping the guard before
     // then zeros the file and would break auth. Bind it into this
@@ -1573,6 +1623,7 @@ mod tests {
             "origin",
             Some("main".to_string()),
             Some(credential),
+            None,
         );
 
         // The fix: any failure mode is acceptable EXCEPT the old

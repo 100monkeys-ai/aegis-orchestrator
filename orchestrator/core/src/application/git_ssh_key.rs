@@ -44,6 +44,8 @@ use std::path::PathBuf;
 
 use git2::{Cred, RemoteCallbacks};
 
+use crate::domain::git_host_keys::SshHostKey;
+
 /// Dropper guard owning an on-disk SSH key tempfile. On drop it zero-
 /// fills the file and removes it — regardless of whether the libgit2
 /// operation succeeded or panicked.
@@ -128,6 +130,30 @@ pub(crate) fn attach_ssh_credentials<'cb>(
     });
 
     Ok(guard)
+}
+
+/// Make libgit2 accept an SSH host only when it presents one of `keys`.
+///
+/// libgit2 calls this after the key exchange and before authentication, so
+/// a host presenting any other key is refused before a credential is
+/// offered. An HTTPS certificate is left to libgit2's own checks: this is
+/// set only for a remote reached over SSH.
+pub(crate) fn check_ssh_host_key(callbacks: &mut RemoteCallbacks<'_>, keys: Vec<SshHostKey>) {
+    callbacks.certificate_check(move |cert, host| {
+        let presented = cert.as_hostkey().and_then(|k| k.hostkey());
+        match presented {
+            Some(presented) if keys.iter().any(|k| k.blob() == presented) => {
+                Ok(git2::CertificateCheckStatus::CertificateOk)
+            }
+            Some(_) => Err(git2::Error::from_str(&format!(
+                "the SSH host {host} presented a key that is not a known key for this \
+                 repository; nothing was sent to it"
+            ))),
+            None => Err(git2::Error::from_str(&format!(
+                "the host {host} presented no SSH host key; nothing was sent to it"
+            ))),
+        }
+    });
 }
 
 // ============================================================================

@@ -214,10 +214,10 @@ pub fn host_keys_for(
     }
     well_known_host_keys(&host).map(Some).ok_or_else(|| {
         format!(
-            "the SSH host {host} has no known host key, so its key cannot be checked and nothing \
-             was sent to it. Give the repository the host's public key in `ssh_host_keys` (a line \
-             such as `ssh-ed25519 AAAA…`, as the host publishes it); a binding made without one \
-             must be deleted and created again with it"
+            "the SSH host {host} has no known host key. Its key is checked before anything is \
+             sent to it, so the repository needs the host's public key in `ssh_host_keys`: a line \
+             such as `ssh-ed25519 AAAA…`, as the host publishes it. A repository added without \
+             one must be removed and added again with it"
         )
     })
 }

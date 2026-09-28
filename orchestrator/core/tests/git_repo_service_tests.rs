@@ -482,13 +482,16 @@ async fn create_binding_needs_the_host_key_of_an_ssh_host() {
     const KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf";
     let fx = build_fixture();
+    // Each binding gets a volume named after its label, so each needs its own.
+    let made = std::cell::Cell::new(0);
     let command = |url: &str, keys: &[&str]| {
+        made.set(made.get() + 1);
         let mut cmd = CreateGitRepoCommand::new(
             TenantId::consumer(),
             "user-ssh",
             ZaruTier::Enterprise,
             url,
-            "ssh",
+            format!("ssh-{}", made.get()),
         );
         cmd.ssh_host_keys = keys.iter().map(|k| k.to_string()).collect();
         cmd
