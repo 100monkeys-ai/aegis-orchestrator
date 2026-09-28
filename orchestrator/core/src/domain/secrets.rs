@@ -114,7 +114,7 @@ impl std::fmt::Debug for SensitiveString {
 }
 
 // A secret has no display form. This fails to compile if `Display` is ever
-// implemented for `SensitiveString`: with it, the trait below has two
+// implemented for `SensitiveString` or `SensitiveBytes`: with it, the trait below has two
 // candidate impls and the path is ambiguous (the technique behind
 // `static_assertions::assert_not_impl_any!`).
 const _: fn() = || {
@@ -125,6 +125,7 @@ const _: fn() = || {
     struct Invalid;
     impl<T: ?Sized + std::fmt::Display> AmbiguousIfDisplay<Invalid> for T {}
     let _ = <SensitiveString as AmbiguousIfDisplay<_>>::some_item;
+    let _ = <SensitiveBytes as AmbiguousIfDisplay<_>>::some_item;
 };
 
 // ---------------------------------------------------------------------------

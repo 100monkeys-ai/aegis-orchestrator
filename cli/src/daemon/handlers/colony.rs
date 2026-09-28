@@ -36,6 +36,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::application::team_service::InvitationIssued;
 use aegis_orchestrator_core::application::team_service::{
     AcceptInvitationCommand, InviteMemberCommand, ProvisionTeamCommand, TeamService,
     TeamServiceError,
@@ -45,7 +46,9 @@ use aegis_orchestrator_core::domain::team::{
     InvitationStatus, MembershipRole, MembershipStatus, Team, TeamId, TeamInvitationId, TeamSlug,
 };
 use aegis_orchestrator_core::domain::tenancy::{TenantKind, TenantTier};
-use aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::SamlIdpConfig;
+use aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::{
+    KeycloakAdminClient, KeycloakAdminError, SamlIdpConfig,
+};
 
 use crate::daemon::handlers::resolved_tenant;
 use crate::daemon::state::AppState;
@@ -731,16 +734,7 @@ pub(crate) async fn create_invitation(
         .as_deref()
         .unwrap_or(MembershipRole::Member.as_str());
     if let Some(kc) = state.keycloak_admin.clone() {
-        if let Err(e) = kc
-            .invite_team_user(
-                team.tier,
-                team.slug.as_str(),
-                &issued.invitee_email,
-                role,
-                // Sent to Keycloak as the invitee's attribute.
-                issued.raw_token.expose(),
-            )
-            .await
+        if let Err(e) = materialize_invitee(&kc, team.tier, team.slug.as_str(), &issued, role).await
         {
             tracing::warn!(
                 error = %e,
@@ -854,6 +848,26 @@ pub(crate) async fn cancel_invitation(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => map_service_error(e),
     }
+}
+
+/// Create or update the invitee in Keycloak. The invitation token is read
+/// here, and only here, to send it as the invitee's `team_invite_token`
+/// attribute.
+pub(crate) async fn materialize_invitee(
+    kc: &KeycloakAdminClient,
+    tier: TenantTier,
+    team_slug: &str,
+    issued: &InvitationIssued,
+    role: &str,
+) -> Result<String, KeycloakAdminError> {
+    kc.invite_team_user(
+        tier,
+        team_slug,
+        &issued.invitee_email,
+        role,
+        issued.raw_token.expose(),
+    )
+    .await
 }
 
 /// `POST /v1/colony/invitations/:token/accept` — invitee accepts. Does NOT
@@ -1346,6 +1360,80 @@ mod tests {
             token: "Mk7-invitation-view-token-marker".into(),
             expires_at: "2026-09-28T00:00:00+00:00".to_string(),
         }
+    }
+
+    /// A loopback stand-in for the Keycloak admin API: grants an admin token,
+    /// finds no existing user, and records the create-user call.
+    async fn fake_keycloak(
+        axum::extract::State(seen): axum::extract::State<
+            std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        >,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        let path = uri.path().to_string();
+        seen.lock().unwrap().push((
+            method.to_string(),
+            path.clone(),
+            String::from_utf8_lossy(&body).to_string(),
+        ));
+        if path.ends_with("/protocol/openid-connect/token") {
+            Json(serde_json::json!({"access_token": "admin-token", "expires_in": 300}))
+                .into_response()
+        } else if method == axum::http::Method::GET {
+            Json(serde_json::json!([])).into_response()
+        } else {
+            (
+                StatusCode::CREATED,
+                [(axum::http::header::LOCATION, format!("{path}/user-1"))],
+                "",
+            )
+                .into_response()
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_token_reaches_keycloak_as_issued() {
+        use aegis_orchestrator_core::domain::secrets::SensitiveString;
+        use aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminConfig;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .fallback(fake_keycloak)
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let kc = KeycloakAdminClient::new(KeycloakAdminConfig {
+            host: format!("http://{addr}"),
+            admin_username: "admin".to_string(),
+            admin_password: SensitiveString::new("admin-password"),
+        });
+        let issued = InvitationIssued {
+            invitation_id: aegis_orchestrator_core::domain::team::TeamInvitationId::new(),
+            team_id: aegis_orchestrator_core::domain::team::TeamId::new(),
+            invitee_email: "invitee@example.com".to_string(),
+            raw_token: SensitiveString::new("Mk7-colony-invitation-token-marker"),
+            expires_at: chrono::Utc::now(),
+        };
+
+        materialize_invitee(&kc, TenantTier::Enterprise, "acme", &issued, "member")
+            .await
+            .expect("the fake Keycloak accepts the invitee");
+
+        let seen = seen.lock().unwrap().clone();
+        let create = seen
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/admin/realms/team-acme/users")
+            .unwrap_or_else(|| panic!("no create-user call reached Keycloak: {seen:?}"));
+        let body: serde_json::Value = serde_json::from_str(&create.2).unwrap();
+        assert_eq!(
+            body["attributes"]["team_invite_token"],
+            serde_json::json!(["Mk7-colony-invitation-token-marker"]),
+            "Keycloak received a different invitation token: {body}"
+        );
     }
 
     #[test]
