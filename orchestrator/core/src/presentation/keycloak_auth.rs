@@ -114,6 +114,9 @@ pub async fn iam_auth_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
+    // Logged in place of the path, which can carry a secret (the invitation
+    // accept route carries the invitation token).
+    let route = crate::presentation::matched_route(&request);
 
     // Skip auth for exempt paths
     if is_exempt(&path) {
@@ -128,7 +131,7 @@ pub async fn iam_auth_middleware(
     {
         Some(h) => h.to_string(),
         None => {
-            warn!(path, "HTTP request missing Authorization header");
+            warn!(route = %route, "HTTP request missing Authorization header");
             return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response();
         }
     };
@@ -138,7 +141,7 @@ pub async fn iam_auth_middleware(
         Some(t) => t,
         None => {
             warn!(
-                path,
+                route = %route,
                 "Invalid Authorization header format (expected Bearer)"
             );
             return (
@@ -165,7 +168,7 @@ pub async fn iam_auth_middleware(
             next.run(request).await
         }
         Err(e) => {
-            warn!(path, error = %e, "HTTP JWT validation failed");
+            warn!(route = %route, error = %e, "HTTP JWT validation failed");
             // Return a static message — do not echo JWT error detail to the caller
             // to prevent leaking token contents or internal error paths.
             (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()

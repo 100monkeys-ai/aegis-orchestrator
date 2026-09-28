@@ -22,3 +22,14 @@ pub mod webhook_guard;
 
 #[cfg(test)]
 pub(crate) mod test_log_capture;
+
+/// The route template a request matched (`/v1/colony/invitations/{token}/accept`),
+/// for logs: never the request's path, which can carry a secret in a path
+/// segment, nor its query string. `[unmatched]` when no route matched.
+pub(crate) fn matched_route(request: &axum::extract::Request) -> String {
+    request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "[unmatched]".to_string())
+}

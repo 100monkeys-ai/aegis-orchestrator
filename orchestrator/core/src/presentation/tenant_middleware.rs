@@ -192,7 +192,7 @@ pub async fn tenant_context_middleware(
             tracing::warn!(
                 sub = %id.sub,
                 error = %e,
-                path = %path,
+                route = %crate::presentation::matched_route(&request),
                 "rejecting request: tenant slug in token is invalid (ADR-097)"
             );
             return (
