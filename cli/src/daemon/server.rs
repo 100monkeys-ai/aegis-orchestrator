@@ -188,81 +188,13 @@ fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
 // cluster_role_to_string, node_status_to_string, cluster_node_view, fallback_cluster_node,
 // cluster_status_view, load_cluster_nodes moved to cluster_helpers.rs
 
-pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
-    // Write PID file
-    let pid = std::process::id();
-    write_pid_file(pid)?;
-
-    // Ensure PID file cleanup on exit
-    let _guard = PidFileGuard;
-
-    info!("AEGIS daemon starting (PID: {})", pid);
-    // Load configuration
-    info!("Loading configuration...");
-    let mut config = NodeConfigManifest::load_or_default(config_path.clone())
-        .context("Failed to load configuration")?;
-
-    // Prefer the discovered config path so Docker deployments that set
-    // AEGIS_CONFIG_PATH resolve generated artifacts under the mounted stack root.
-    let generated_artifacts_root = resolve_generated_artifacts_root(config_path.clone());
-
-    config
-        .validate()
-        .context("Configuration validation failed")?;
-
-    // Initialize metrics if enabled (ADR-058 Step 2)
-    if config
-        .spec
-        .observability
-        .as_ref()
-        .and_then(|o| o.metrics.as_ref())
-        .map(|m| m.enabled)
-        .unwrap_or(false)
-    {
-        let metrics_cfg = config
-            .spec
-            .observability
-            .as_ref()
-            .unwrap()
-            .metrics
-            .as_ref()
-            .unwrap();
-        let region = config.spec.node.region.as_deref();
-        let version = env!("CARGO_PKG_VERSION");
-
-        aegis_orchestrator_core::infrastructure::telemetry::init_metrics(
-            &metrics_cfg.bind_address,
-            metrics_cfg.port,
-            &config.spec.node.id,
-            &config.metadata.name,
-            region,
-            version,
-        )
-        .context("Failed to initialize metrics")?;
-        info!(
-            bind_address = %metrics_cfg.bind_address,
-            port = metrics_cfg.port,
-            "Metrics exporter initialized"
-        );
-    }
-
-    if let Some(seal_gateway) = &config.spec.seal_gateway {
-        let resolved_url =
-            resolve_env_value(&seal_gateway.url).unwrap_or_else(|_| seal_gateway.url.clone());
-        tracing::info!(
-            "Configured SEAL tooling gateway URL from node config: {}",
-            resolved_url
-        );
-    }
-
-    if config.spec.llm_providers.is_empty() {
-        warn!(
-            "No LLM providers configured. Agents will fail to generate text. Please check your config file or ensure one is discovered."
-        );
-    }
-
-    info!("Configuration loaded. Initializing services...");
-
+/// Connect to the PostgreSQL database named by `spec.database`, applying any
+/// pending migrations.
+///
+/// Returns `Ok(None)` when no database is configured, or when the connection
+/// fails on a node that is not labelled production (the daemon then falls back
+/// to in-memory repositories). A production node refuses both.
+pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Option<PgPool>> {
     // Initialize repositories — resolve database URL from config (spec.database)
     let database_url: Option<String> =
         config
@@ -358,6 +290,86 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         info!("No database configured (spec.database omitted), using InMemory repositories");
         None
     };
+
+    Ok(db_pool)
+}
+
+pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
+    // Write PID file
+    let pid = std::process::id();
+    write_pid_file(pid)?;
+
+    // Ensure PID file cleanup on exit
+    let _guard = PidFileGuard;
+
+    info!("AEGIS daemon starting (PID: {})", pid);
+    // Load configuration
+    info!("Loading configuration...");
+    let mut config = NodeConfigManifest::load_or_default(config_path.clone())
+        .context("Failed to load configuration")?;
+
+    // Prefer the discovered config path so Docker deployments that set
+    // AEGIS_CONFIG_PATH resolve generated artifacts under the mounted stack root.
+    let generated_artifacts_root = resolve_generated_artifacts_root(config_path.clone());
+
+    config
+        .validate()
+        .context("Configuration validation failed")?;
+
+    // Initialize metrics if enabled (ADR-058 Step 2)
+    if config
+        .spec
+        .observability
+        .as_ref()
+        .and_then(|o| o.metrics.as_ref())
+        .map(|m| m.enabled)
+        .unwrap_or(false)
+    {
+        let metrics_cfg = config
+            .spec
+            .observability
+            .as_ref()
+            .unwrap()
+            .metrics
+            .as_ref()
+            .unwrap();
+        let region = config.spec.node.region.as_deref();
+        let version = env!("CARGO_PKG_VERSION");
+
+        aegis_orchestrator_core::infrastructure::telemetry::init_metrics(
+            &metrics_cfg.bind_address,
+            metrics_cfg.port,
+            &config.spec.node.id,
+            &config.metadata.name,
+            region,
+            version,
+        )
+        .context("Failed to initialize metrics")?;
+        info!(
+            bind_address = %metrics_cfg.bind_address,
+            port = metrics_cfg.port,
+            "Metrics exporter initialized"
+        );
+    }
+
+    if let Some(seal_gateway) = &config.spec.seal_gateway {
+        let resolved_url =
+            resolve_env_value(&seal_gateway.url).unwrap_or_else(|_| seal_gateway.url.clone());
+        tracing::info!(
+            "Configured SEAL tooling gateway URL from node config: {}",
+            resolved_url
+        );
+    }
+
+    if config.spec.llm_providers.is_empty() {
+        warn!(
+            "No LLM providers configured. Agents will fail to generate text. Please check your config file or ensure one is discovered."
+        );
+    }
+
+    info!("Configuration loaded. Initializing services...");
+
+    let db_pool: Option<PgPool> = connect_postgres(&config).await?;
 
     let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): RepositoryTuple =
         if let Some(db_pool) = db_pool.as_ref() {

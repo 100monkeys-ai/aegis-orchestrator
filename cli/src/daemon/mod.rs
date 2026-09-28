@@ -29,6 +29,8 @@ pub mod client;
 pub(crate) mod cluster_helpers;
 pub(crate) mod container_helpers;
 #[cfg(test)]
+mod credential_log_tests;
+#[cfg(test)]
 mod edge_fleet_cancel_tests;
 pub mod edge_lifecycle;
 pub mod handlers;

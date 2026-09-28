@@ -10,6 +10,7 @@
 //! | Type | Role |
 //! |------|------|
 //! | [`SensitiveString`] | Credential wrapper that redacts itself in `Debug`/`Display` |
+//! | [`SensitiveUrl`] | Connection URL that prints without its user info or secret query parameters |
 //! | [`SecretPath`] | Namespace-aware structured path value object |
 //! | [`AccessContext`] | Audit metadata for every secret access operation |
 //! | [`DomainDynamicSecret`] | Short-lived credential entity with TTL lifecycle methods |
@@ -69,6 +70,118 @@ impl std::fmt::Debug for SensitiveString {
 impl std::fmt::Display for SensitiveString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[REDACTED]")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SensitiveUrl — connection URL wrapper that prints itself redacted
+// ---------------------------------------------------------------------------
+
+/// Query parameter names whose values are redacted when a URL is rendered for
+/// output. A parameter is redacted when its lower-cased name *contains* any of
+/// these, so `sslpassword` and `X-Api-Key` are covered.
+const SENSITIVE_QUERY_PARAMS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "auth",
+    "authorization",
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "client_id",
+    "credential",
+    "credentials",
+    "session",
+    "session_id",
+    "private_key",
+    "signing_key",
+    "signature",
+    "sig",
+];
+
+/// Renders a URL for output with its credentials removed.
+///
+/// Returns the URL with sensitive parameter values replaced by `[REDACTED]`.
+/// If the URL cannot be parsed, returns `[unparseable-url]`.
+pub fn redact_url(raw: &str) -> String {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return "[unparseable-url]".to_string();
+    };
+
+    if parsed.query().is_none() {
+        return parsed.to_string();
+    }
+
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| {
+            let key_lower = k.to_lowercase();
+            if SENSITIVE_QUERY_PARAMS.iter().any(|s| key_lower.contains(s)) {
+                (k.into_owned(), "[REDACTED]".to_string())
+            } else {
+                (k.into_owned(), v.into_owned())
+            }
+        })
+        .collect();
+
+    // Build query string manually to avoid percent-encoding of brackets
+    let base = &parsed[..url::Position::AfterPath];
+    if pairs.is_empty() {
+        base.to_string()
+    } else {
+        let qs: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        format!("{base}?{}", qs.join("&"))
+    }
+}
+
+/// A connection URL (database DSN, service endpoint) that may carry a
+/// credential in its user info or query string.
+///
+/// `Display` and `Debug` both print the URL through [`redact_url`], so a
+/// `tracing::info!(url = %url, ..)` or a `{url:?}` on a struct holding one is
+/// safe by construction. [`SensitiveUrl::expose`] returns the raw value and is
+/// called only where the URL is handed to the client that connects with it.
+///
+/// Serialises and deserialises as the bare string, so a configuration field
+/// can hold one without changing its file format.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveUrl(String);
+
+impl SensitiveUrl {
+    /// Construct a new `SensitiveUrl`.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Access the raw URL at an intentional, audited connection point.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The URL as it may appear in any output: user info removed and secret
+    /// query parameters replaced.
+    pub fn redacted(&self) -> String {
+        redact_url(&self.0)
+    }
+}
+
+impl std::fmt::Debug for SensitiveUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SensitiveUrl")
+            .field(&self.redacted())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for SensitiveUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.redacted())
     }
 }
 
@@ -394,6 +507,143 @@ mod tests {
         let c = SensitiveString::new("token-xyz");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    // ── SensitiveUrl ─────────────────────────────────────────────────────────
+
+    /// Marker password: any appearance of it, raw or percent-encoded, in a
+    /// rendered URL is a leaked credential.
+    const MARKER: &str = "Mk7-redaction-marker";
+
+    /// Assert that neither `Display` nor `Debug` of `raw` carries the marker
+    /// (raw or percent-encoded) or the extra `forbidden` fragments, and that
+    /// both carry every `kept` fragment. Collects every failure before
+    /// panicking so one run reports all of them.
+    fn assert_rendered(raw: &str, forbidden: &[&str], kept: &[&str]) -> Vec<String> {
+        let url = SensitiveUrl::new(raw);
+        let mut failures = Vec::new();
+        for (how, text) in [("Display", format!("{url}")), ("Debug", format!("{url:?}"))] {
+            for bad in std::iter::once(&MARKER).chain(forbidden.iter()) {
+                if text.contains(bad) {
+                    failures.push(format!("{how} of {raw:?} carries {bad:?}: {text}"));
+                }
+            }
+            for good in kept {
+                if !text.contains(good) {
+                    failures.push(format!("{how} of {raw:?} lost {good:?}: {text}"));
+                }
+            }
+        }
+        failures
+    }
+
+    #[test]
+    fn sensitive_url_display_and_debug_never_carry_the_credential() {
+        let cases: Vec<(String, Vec<&str>, Vec<&str>)> = vec![
+            // Plain password in user info.
+            (
+                format!("postgres://aegis:{MARKER}@db.internal:5432/aegis"),
+                vec![],
+                vec!["postgres://", "db.internal:5432", "/aegis"],
+            ),
+            // Percent-encoded password containing `@` and `:`.
+            (
+                format!("postgres://aegis:p%40ss%3A{MARKER}@db.internal:5432/aegis"),
+                vec!["p%40ss", "p@ss"],
+                vec!["db.internal:5432", "/aegis"],
+            ),
+            // Raw `@` and `:` inside the password: the last `@` ends user info.
+            (
+                format!("postgres://aegis:p@ss:{MARKER}@db.internal:5432/aegis"),
+                vec!["p@ss", "p%40ss"],
+                vec!["db.internal:5432", "/aegis"],
+            ),
+            // IPv6 host.
+            (
+                format!("postgres://aegis:{MARKER}@[::1]:5432/aegis"),
+                vec![],
+                vec!["[::1]:5432", "/aegis"],
+            ),
+            // A token carried as the user name, with no password.
+            (
+                format!("https://{MARKER}@git.example.com/org/repo.git"),
+                vec![],
+                vec!["git.example.com", "/org/repo.git"],
+            ),
+            // A secret in the query string; the harmless parameter survives.
+            (
+                format!("postgres://db.internal:5432/aegis?sslmode=require&password={MARKER}"),
+                vec![],
+                vec!["db.internal:5432", "sslmode=require"],
+            ),
+            // No scheme: `user:password@host:port`.
+            (
+                format!("aegis:{MARKER}@db.internal:5432"),
+                vec![],
+                vec!["db.internal:5432"],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (raw, forbidden, kept) in &cases {
+            failures.extend(assert_rendered(raw, forbidden, kept));
+        }
+        assert!(
+            failures.is_empty(),
+            "SensitiveUrl rendered a credential or lost the address:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn sensitive_url_keeps_a_url_that_carries_no_credential() {
+        let mut failures = Vec::new();
+        for (raw, expected) in [
+            (
+                "postgres://db.internal:5432/aegis",
+                "postgres://db.internal:5432/aegis",
+            ),
+            ("http://[::1]:50056", "http://[::1]:50056/"),
+            (
+                "https://example.com/page?q=hello",
+                "https://example.com/page?q=hello",
+            ),
+            ("127.0.0.1:7233", "127.0.0.1:7233"),
+            ("temporal:7233", "temporal:7233"),
+        ] {
+            let url = SensitiveUrl::new(raw);
+            let display = format!("{url}");
+            if display != expected {
+                failures.push(format!(
+                    "Display of {raw:?} is {display:?}, expected {expected:?}"
+                ));
+            }
+            let debug = format!("{url:?}");
+            let expected_debug = format!("SensitiveUrl({expected:?})");
+            if debug != expected_debug {
+                failures.push(format!(
+                    "Debug of {raw:?} is {debug}, expected {expected_debug}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn sensitive_url_refuses_to_render_what_it_cannot_parse() {
+        let url = SensitiveUrl::new(format!("not a url {MARKER}"));
+        assert_eq!(format!("{url}"), "[unparseable-url]");
+        assert!(!format!("{url:?}").contains(MARKER));
+    }
+
+    #[test]
+    fn sensitive_url_expose_and_serde_keep_the_raw_value() {
+        let raw = format!("postgres://aegis:{MARKER}@db.internal:5432/aegis");
+        let url = SensitiveUrl::new(raw.clone());
+        assert_eq!(url.expose(), raw);
+        let json = serde_json::to_string(&url).unwrap();
+        assert_eq!(json, serde_json::to_string(&raw).unwrap());
+        let back: SensitiveUrl = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, url);
     }
 
     // ── SecretPath ───────────────────────────────────────────────────────────

@@ -5,66 +5,16 @@
 //! All potentially sensitive data (prompts, user inputs, URLs with query params,
 //! request/response bodies) MUST be sanitized before logging at levels above DEBUG.
 
-use url::Url;
+use crate::domain::secrets::redact_url;
 
-/// Sensitive query parameter names that should be redacted from URLs.
-const SENSITIVE_PARAMS: &[&str] = &[
-    "api_key",
-    "apikey",
-    "key",
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "auth",
-    "authorization",
-    "access_token",
-    "refresh_token",
-    "client_secret",
-    "client_id",
-    "credential",
-    "credentials",
-    "session",
-    "session_id",
-    "private_key",
-    "signing_key",
-    "signature",
-    "sig",
-];
-
-/// Redacts sensitive query parameters from a URL string.
+/// Redacts credentials from a URL string before it is logged.
 ///
-/// Returns the URL with sensitive parameter values replaced by `[REDACTED]`.
-/// If the URL cannot be parsed, returns `[unparseable-url]`.
+/// Delegates to [`redact_url`], the one redaction rule shared with
+/// [`crate::domain::secrets::SensitiveUrl`]: user info is removed and
+/// sensitive query parameter values are replaced by `[REDACTED]`. If the URL
+/// cannot be parsed, returns `[unparseable-url]`.
 pub fn sanitize_url(raw: &str) -> String {
-    let Ok(parsed) = Url::parse(raw) else {
-        return "[unparseable-url]".to_string();
-    };
-
-    if parsed.query().is_none() {
-        return parsed.to_string();
-    }
-
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(k, v)| {
-            let key_lower = k.to_lowercase();
-            if SENSITIVE_PARAMS.iter().any(|s| key_lower.contains(s)) {
-                (k.into_owned(), "[REDACTED]".to_string())
-            } else {
-                (k.into_owned(), v.into_owned())
-            }
-        })
-        .collect();
-
-    // Build query string manually to avoid percent-encoding of brackets
-    let base = &parsed[..url::Position::AfterPath];
-    if pairs.is_empty() {
-        base.to_string()
-    } else {
-        let qs: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        format!("{base}?{}", qs.join("&"))
-    }
+    redact_url(raw)
 }
 
 /// Truncates a string for safe logging, appending an ellipsis if truncated.
@@ -154,6 +104,29 @@ mod tests {
         assert!(
             !result.contains("secret123"),
             "api_key secret leaked into sanitized output: {result}"
+        );
+    }
+
+    /// A URL whose user info carries a password must not reach a log line
+    /// with the password in it, whether or not it also has a query string.
+    #[test]
+    fn sanitize_url_removes_user_info() {
+        let marker = "Mk7-redaction-marker";
+        let mut leaked = Vec::new();
+        for url in [
+            format!("https://agent:{marker}@example.com/data"),
+            format!("https://agent:{marker}@example.com/data?format=json"),
+            format!("https://{marker}@example.com/data"),
+        ] {
+            let result = sanitize_url(&url);
+            if result.contains(marker) {
+                leaked.push(format!("{url} -> {result}"));
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "user-info credential leaked into sanitized output:\n{}",
+            leaked.join("\n")
         );
     }
 
