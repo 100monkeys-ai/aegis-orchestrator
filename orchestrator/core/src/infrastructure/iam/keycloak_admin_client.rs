@@ -412,63 +412,6 @@ impl KeycloakAdminClient {
         Ok(users)
     }
 
-    /// Create a user in a realm and send required actions (verify email + set password).
-    /// Returns the newly created user fetched by the Location header.
-    pub async fn invite_user(
-        &self,
-        realm: &str,
-        email: &str,
-        role: &str,
-    ) -> Result<KeycloakUser, KeycloakAdminError> {
-        let token = self.get_admin_token().await?;
-        let url = format!("{}/admin/realms/{}/users", self.config.host, realm);
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "email": email,
-                "username": email,
-                "enabled": true,
-                "requiredActions": ["UPDATE_PASSWORD", "VERIFY_EMAIL"],
-                "attributes": {
-                    "aegis_role": [role]
-                }
-            }))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KeycloakAdminError::RealmError { status, body });
-        }
-
-        // Keycloak returns the new user URL in Location header
-        let location = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| KeycloakAdminError::RealmError {
-                status: 0,
-                body: "No Location header in create-user response".into(),
-            })?;
-
-        // Fetch the created user
-        let token2 = self.get_admin_token().await?;
-        let user_resp = self.http.get(location).bearer_auth(&token2).send().await?;
-
-        if !user_resp.status().is_success() {
-            let status = user_resp.status().as_u16();
-            let body = user_resp.text().await.unwrap_or_default();
-            return Err(KeycloakAdminError::RealmError { status, body });
-        }
-
-        let user: KeycloakUser = user_resp.json().await?;
-        Ok(user)
-    }
-
     /// Delete a user from a realm.
     pub async fn remove_user(&self, realm: &str, user_id: &str) -> Result<(), KeycloakAdminError> {
         let token = self.get_admin_token().await?;
@@ -955,11 +898,13 @@ impl KeycloakAdminClient {
     ///   attaches them to the group named `team_slug` (the group is created
     ///   on demand).
     ///
-    /// The invitation token is not sent: Keycloak has no use for it, and a
-    /// user attribute would keep a usable token where the realm's
-    /// administrators and service accounts can read it. Accepting an
-    /// invitation goes to the orchestrator, which checks the token against
-    /// the digest it stores.
+    /// An invitation writes no user attribute. An existing user is left as
+    /// it is: Keycloak's `PUT /users/{id}` replaces the whole user, so a
+    /// write here would drop the attributes other parts of the platform
+    /// keep on it (`tenant_id`, `zaru_tier`, `team_memberships`). Nothing
+    /// reads an attribute about the invitation, and the invitation token
+    /// is never sent: accepting an invitation goes to the orchestrator,
+    /// which checks the token against the digest it stores.
     ///
     /// Returns the Keycloak user id.
     pub async fn invite_team_user(
@@ -967,7 +912,6 @@ impl KeycloakAdminClient {
         team_tier: TenantTier,
         team_slug: &str,
         email: &str,
-        role: &str,
     ) -> Result<String, KeycloakAdminError> {
         // POLICY (ADR-097 footgun #9): Non-Enterprise team tiers (Pro,
         // Business) reuse the shared `zaru-consumer` realm and rely on
@@ -1006,65 +950,8 @@ impl KeycloakAdminClient {
         // Reuse an existing user if one already exists with this email;
         // otherwise create a fresh invited user.
         let user_id = match self.find_user_by_email(&realm, email).await? {
-            Some(u) => {
-                // Set the aegis_role and team_slug attributes.
-                let token = self.get_admin_token().await?;
-                let url = format!("{}/admin/realms/{}/users/{}", self.config.host, realm, u.id);
-                let resp = self
-                    .http
-                    .put(&url)
-                    .bearer_auth(&token)
-                    .json(&serde_json::json!({
-                        "attributes": {
-                            "aegis_role": [role],
-                            "team_slug": [team_slug]
-                        }
-                    }))
-                    .send()
-                    .await?;
-                if !resp.status().is_success() {
-                    let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(KeycloakAdminError::AttributeError { status, body });
-                }
-                u.id
-            }
-            None => {
-                let token = self.get_admin_token().await?;
-                let url = format!("{}/admin/realms/{}/users", self.config.host, realm);
-                let resp = self
-                    .http
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .json(&serde_json::json!({
-                        "email": email,
-                        "username": email,
-                        "enabled": true,
-                        "requiredActions": ["VERIFY_EMAIL"],
-                        "attributes": {
-                            "aegis_role": [role],
-                            "team_slug": [team_slug]
-                        }
-                    }))
-                    .send()
-                    .await?;
-
-                if !resp.status().is_success() {
-                    let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(KeycloakAdminError::RealmError { status, body });
-                }
-
-                let location = resp
-                    .headers()
-                    .get("location")
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| KeycloakAdminError::RealmError {
-                        status: 0,
-                        body: "No Location header in create-user response".into(),
-                    })?;
-                location.rsplit('/').next().unwrap_or("").to_string()
-            }
+            Some(u) => u.id,
+            None => self.create_invited_user(&realm, email).await?,
         };
 
         if use_group {
@@ -1077,6 +964,60 @@ impl KeycloakAdminClient {
         }
 
         Ok(user_id)
+    }
+
+    /// Create the user an invitation is for, with its email as username,
+    /// the verify-email action and no attributes. Returns the user id.
+    ///
+    /// Another invitation for the same email can create the user between
+    /// this invitation's search and its create; Keycloak then refuses the
+    /// create with 409, and the user that was created is looked up and
+    /// used.
+    async fn create_invited_user(
+        &self,
+        realm: &str,
+        email: &str,
+    ) -> Result<String, KeycloakAdminError> {
+        let token = self.get_admin_token().await?;
+        let url = format!("{}/admin/realms/{}/users", self.config.host, realm);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "email": email,
+                "username": email,
+                "enabled": true,
+                "requiredActions": ["VERIFY_EMAIL"],
+            }))
+            .send()
+            .await?;
+
+        if resp.status().as_u16() == 409 {
+            return match self.find_user_by_email(realm, email).await? {
+                Some(u) => Ok(u.id),
+                None => Err(KeycloakAdminError::RealmError {
+                    status: 409,
+                    body: "the user create was refused as a conflict and no user has this email"
+                        .into(),
+                }),
+            };
+        }
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(KeycloakAdminError::RealmError { status, body });
+        }
+
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| KeycloakAdminError::RealmError {
+                status: 0,
+                body: "No Location header in create-user response".into(),
+            })?;
+        Ok(location.rsplit('/').next().unwrap_or("").to_string())
     }
 }
 
@@ -1376,7 +1317,7 @@ mod tests {
             let kc = serve_keycloak_double(double.clone()).await;
 
             let user_id = kc
-                .invite_team_user(tier.clone(), "acme", "invitee@example.com", "member")
+                .invite_team_user(tier.clone(), "acme", "invitee@example.com")
                 .await
                 .expect("the invitation reaches Keycloak");
             assert_eq!(user_id, "user-9", "the existing user was not reused");
@@ -1419,7 +1360,7 @@ mod tests {
                 }
                 let kc = serve_keycloak_double(double.clone()).await;
                 let user_id = kc
-                    .invite_team_user(tier.clone(), "acme", "invitee@example.com", "member")
+                    .invite_team_user(tier.clone(), "acme", "invitee@example.com")
                     .await
                     .expect("the invitation reaches Keycloak");
 
@@ -1475,12 +1416,7 @@ mod tests {
         let kc = serve_keycloak_double(double.clone()).await;
 
         let user_id = kc
-            .invite_team_user(
-                TenantTier::Business,
-                "acme",
-                "invitee@example.com",
-                "member",
-            )
+            .invite_team_user(TenantTier::Business, "acme", "invitee@example.com")
             .await
             .expect("an invitation whose create is refused with 409 still invites the user");
 

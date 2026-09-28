@@ -64,7 +64,6 @@ pub(crate) struct CreateTeamRequest {
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct InviteRequest {
     pub invitee_email: String,
-    pub role: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -729,13 +728,8 @@ pub(crate) async fn create_invitation(
 
     // Materialize the Keycloak user + group membership now so that when the
     // invitee logs in they are already routed to the correct realm/group.
-    let role = payload
-        .role
-        .as_deref()
-        .unwrap_or(MembershipRole::Member.as_str());
     if let Some(kc) = state.keycloak_admin.clone() {
-        if let Err(e) = materialize_invitee(&kc, team.tier, team.slug.as_str(), &issued, role).await
-        {
+        if let Err(e) = materialize_invitee(&kc, team.tier, team.slug.as_str(), &issued).await {
             tracing::warn!(
                 error = %e,
                 team_id = %team.id,
@@ -850,16 +844,16 @@ pub(crate) async fn cancel_invitation(
     }
 }
 
-/// Create or update the invitee in Keycloak. The invitation token is not
-/// sent; Keycloak has no use for it.
+/// Make sure the invitee has a Keycloak user, and for a Business team put
+/// it in the team's group. No user attribute is written and the invitation
+/// token is not sent; Keycloak has no use for either.
 pub(crate) async fn materialize_invitee(
     kc: &KeycloakAdminClient,
     tier: TenantTier,
     team_slug: &str,
     issued: &InvitationIssued,
-    role: &str,
 ) -> Result<String, KeycloakAdminError> {
-    kc.invite_team_user(tier, team_slug, &issued.invitee_email, role)
+    kc.invite_team_user(tier, team_slug, &issued.invitee_email)
         .await
 }
 
@@ -1425,7 +1419,7 @@ mod tests {
             expires_at: chrono::Utc::now(),
         };
 
-        materialize_invitee(&kc, TenantTier::Enterprise, "acme", &issued, "member")
+        materialize_invitee(&kc, TenantTier::Enterprise, "acme", &issued)
             .await
             .expect("the fake Keycloak accepts the invitee");
 
@@ -1433,13 +1427,13 @@ mod tests {
         seen
     }
 
-    /// Keycloak is sent what it needs for the invitee (the email, the team
-    /// and the role) and never the invitation token, whether the invitee's
-    /// user is created or an existing one is updated.
+    /// Keycloak is sent what it needs for the invitee (its email) and never
+    /// the invitation token or any attribute, whether the invitee's user is
+    /// created or already exists. An existing user is not rewritten.
     #[tokio::test]
     async fn invitee_keycloak_record_carries_no_invitation_token() {
         const MARKER: &str = "Mk7-colony-invitation-token-marker";
-        for (existing_user, write) in [(false, "POST"), (true, "PUT")] {
+        for existing_user in [false, true] {
             let seen = materialize_against_fake_keycloak(existing_user, MARKER).await;
             for (method, uri, body) in &seen {
                 assert!(
@@ -1447,20 +1441,28 @@ mod tests {
                     "the invitation token reached Keycloak in {method} {uri}: {body}"
                 );
             }
-            let (_, _, body) = seen
+            let writes: Vec<_> = seen
                 .iter()
-                .find(|(m, u, _)| m == write && u.starts_with("/admin/realms/team-acme/users"))
-                .unwrap_or_else(|| panic!("no {write} of the invitee reached Keycloak: {seen:?}"));
-            let body: serde_json::Value = serde_json::from_str(body).unwrap();
-            assert_eq!(body["attributes"]["team_slug"], serde_json::json!(["acme"]));
-            assert_eq!(
-                body["attributes"]["aegis_role"],
-                serde_json::json!(["member"])
-            );
-            assert!(
-                body["attributes"].get("team_invite_token").is_none(),
-                "Keycloak was sent a team_invite_token attribute: {body}"
-            );
+                .filter(|(m, u, _)| {
+                    (m == "POST" || m == "PUT") && u.starts_with("/admin/realms/team-acme/users")
+                })
+                .collect();
+            if existing_user {
+                assert!(
+                    writes.is_empty(),
+                    "an existing invitee's user was rewritten: {writes:?}"
+                );
+            } else {
+                let (_, _, body) = writes
+                    .first()
+                    .unwrap_or_else(|| panic!("no POST of the invitee reached Keycloak: {seen:?}"));
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(body["email"], "invitee@example.com");
+                assert!(
+                    body.get("attributes").is_none(),
+                    "Keycloak was sent attributes for the invitee: {body}"
+                );
+            }
         }
     }
 
