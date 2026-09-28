@@ -21,13 +21,18 @@ elif m == "invite":
         };
         {
             let token = self.get_admin_token().await?;
-            let _ = self
+            let resp = self
                 .http
                 .put(format!("{}/admin/realms/{}/users/{}", self.config.host, realm, user_id))
                 .bearer_auth(&token)
                 .json(&serde_json::json!({"attributes": {"aegis_role": ["member"], "team_slug": [team_slug]}}))
                 .send()
                 .await?;
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(KeycloakAdminError::AttributeError { status, body });
+            }
         }
 """)
 elif m == "saml":
