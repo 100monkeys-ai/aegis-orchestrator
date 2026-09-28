@@ -1321,6 +1321,10 @@ pub(crate) mod tests {
             String,
             std::collections::BTreeMap<String, serde_json::Value>,
         >,
+        /// realm name -> realm representation, as created
+        realms: std::collections::BTreeMap<String, serde_json::Value>,
+        /// (realm, role name)
+        realm_roles: Vec<(String, String)>,
     }
 
     pub(crate) type SharedDouble = std::sync::Arc<std::sync::Mutex<KeycloakDouble>>;
@@ -1374,6 +1378,16 @@ pub(crate) mod tests {
             .into_response();
         }
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if method == axum::http::Method::POST && parts == ["admin", "realms"] {
+            // Like Keycloak: a realm that exists already is refused with 409.
+            let rep: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+            let name = rep["realm"].as_str().unwrap_or_default().to_string();
+            if d.realms.contains_key(&name) {
+                return axum::http::StatusCode::CONFLICT.into_response();
+            }
+            d.realms.insert(name, rep);
+            return axum::http::StatusCode::CREATED.into_response();
+        }
         // admin / realms / {realm} / ...
         if parts.len() < 4 || parts[0] != "admin" || parts[1] != "realms" {
             return axum::http::StatusCode::NOT_FOUND.into_response();
@@ -1477,6 +1491,18 @@ pub(crate) mod tests {
                     d.group_members.push(member);
                 }
                 axum::http::StatusCode::NO_CONTENT.into_response()
+            }
+            ("POST", ["roles"]) => {
+                let rep: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+                let role = (
+                    realm.clone(),
+                    rep["name"].as_str().unwrap_or_default().to_string(),
+                );
+                if d.realm_roles.contains(&role) {
+                    return axum::http::StatusCode::CONFLICT.into_response();
+                }
+                d.realm_roles.push(role);
+                axum::http::StatusCode::CREATED.into_response()
             }
             ("GET", ["identity-provider", "instances"]) => {
                 let all: Vec<serde_json::Value> = d
@@ -1968,6 +1994,99 @@ pub(crate) mod tests {
             user["enabled"],
             serde_json::json!(false),
             "an attribute write enabled a disabled user: {user}"
+        );
+    }
+
+    // ── realms the orchestrator creates ────────────────────────────────────
+
+    /// What a realm the orchestrator creates must hold: the protections of
+    /// the `zaru-consumer` realm, and a safe value where the consumer realm
+    /// sets none or where an Enterprise realm needs its own.
+    fn expected_realm_protections() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("enabled", serde_json::json!(true)),
+            ("verifyEmail", serde_json::json!(true)),
+            ("duplicateEmailsAllowed", serde_json::json!(false)),
+            ("loginWithEmailAllowed", serde_json::json!(true)),
+            ("registrationEmailAsUsername", serde_json::json!(true)),
+            ("resetPasswordAllowed", serde_json::json!(true)),
+            ("registrationAllowed", serde_json::json!(false)),
+            ("editUsernameAllowed", serde_json::json!(false)),
+            ("sslRequired", serde_json::json!("external")),
+            ("bruteForceProtected", serde_json::json!(true)),
+            ("permanentLockout", serde_json::json!(false)),
+            ("failureFactor", serde_json::json!(30)),
+            ("waitIncrementSeconds", serde_json::json!(60)),
+            ("maxFailureWaitSeconds", serde_json::json!(900)),
+            ("maxDeltaTimeSeconds", serde_json::json!(43200)),
+            ("minimumQuickLoginWaitSeconds", serde_json::json!(60)),
+            ("quickLoginCheckMilliSeconds", serde_json::json!(1000)),
+            (
+                "passwordPolicy",
+                serde_json::json!("length(12) and maxLength(128) and notUsername and notEmail"),
+            ),
+            ("accessTokenLifespan", serde_json::json!(1800)),
+            ("ssoSessionIdleTimeout", serde_json::json!(259200)),
+            ("ssoSessionMaxLifespan", serde_json::json!(1209600)),
+        ]
+    }
+
+    /// Every realm the orchestrator creates, an Enterprise tenant's or an
+    /// Enterprise team's, is created with its protections on, not with
+    /// Keycloak's defaults (brute-force protection and email verification
+    /// off).
+    #[tokio::test]
+    async fn created_realms_have_the_consumer_realms_protections() {
+        let double = SharedDouble::default();
+        let kc = serve_keycloak_double(double.clone()).await;
+        kc.create_team_realm("acme")
+            .await
+            .expect("the team realm is created");
+        kc.create_realm("tenant-acme")
+            .await
+            .expect("the tenant realm is created");
+
+        let realms = double.lock().unwrap().realms.clone();
+        for name in ["team-acme", "tenant-acme"] {
+            let rep = realms
+                .get(name)
+                .unwrap_or_else(|| panic!("the realm {name} was not created"));
+            let wrong: Vec<String> = expected_realm_protections()
+                .into_iter()
+                .filter(|(key, value)| rep.get(*key) != Some(value))
+                .map(|(key, value)| format!("{key} (wanted {value}, sent {})", rep[key]))
+                .collect();
+            assert!(
+                wrong.is_empty(),
+                "the realm {name} was created without these protections: {wrong:?}"
+            );
+        }
+    }
+
+    /// A realm that exists already is left as it is: creating it again
+    /// sends nothing that changes it.
+    #[tokio::test]
+    async fn creating_a_realm_that_exists_changes_nothing() {
+        let double = SharedDouble::default();
+        double.lock().unwrap().realms.insert(
+            "team-acme".to_string(),
+            serde_json::json!({"realm": "team-acme"}),
+        );
+        let kc = serve_keycloak_double(double.clone()).await;
+        kc.create_team_realm("acme")
+            .await
+            .expect("an existing realm is not an error");
+        let d = double.lock().unwrap();
+        assert_eq!(
+            d.realms["team-acme"],
+            serde_json::json!({"realm": "team-acme"})
+        );
+        assert!(
+            !d.calls
+                .iter()
+                .any(|(method, path, _)| method == "PUT" && path == "/admin/realms/team-acme"),
+            "an existing realm was rewritten: {:?}",
+            d.calls
         );
     }
 
