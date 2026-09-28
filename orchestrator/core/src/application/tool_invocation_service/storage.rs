@@ -790,12 +790,19 @@ fn parse_script_id(s: &str) -> Result<crate::domain::script::ScriptId, SealSessi
     Ok(crate::domain::script::ScriptId(uuid))
 }
 
+/// The view of a binding that the git tools return to an agent. The agent's
+/// model provider reads it, so the URL goes through [`RedactedUrl`]: the
+/// repository's address with no user info and no secret query value. Clone,
+/// fetch and push take the credential from the stored binding, so an agent
+/// never needs it.
+///
+/// [`RedactedUrl`]: crate::domain::secrets::RedactedUrl
 fn redacted_binding(b: &crate::domain::git_repo::GitRepoBinding) -> Value {
     json!({
         "id": b.id.0,
         "tenant_id": b.tenant_id,
         "credential_binding_id": b.credential_binding_id.map(|c| c.0),
-        "repo_url": b.repo_url,
+        "repo_url": crate::domain::secrets::RedactedUrl::from(&b.repo_url),
         "git_ref": b.git_ref,
         "sparse_paths": b.sparse_paths,
         "volume_id": b.volume_id.0,

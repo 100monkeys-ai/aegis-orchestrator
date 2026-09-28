@@ -313,7 +313,8 @@ impl ToolInvocationService {
         let endpoint = tonic::transport::Endpoint::from_shared(gateway_url.to_string())
             .map_err(|e| {
                 SealSessionError::InternalError(format!(
-                    "seal tooling gateway invalid URL '{gateway_url}': {e}"
+                    "seal tooling gateway invalid URL '{}': {e}",
+                    SensitiveUrl::new(gateway_url)
                 ))
             })?
             .connect_timeout(GATEWAY_CONNECT_TIMEOUT);
@@ -323,13 +324,15 @@ impl ToolInvocationService {
                 Ok(Ok(channel)) => GatewayInvocationServiceClient::new(channel),
                 Ok(Err(e)) => {
                     return Err(SealSessionError::InternalError(format!(
-                        "seal tooling gateway connect failed ({gateway_url}): {e}"
+                        "seal tooling gateway connect failed ({}): {e}",
+                        SensitiveUrl::new(gateway_url)
                     )));
                 }
                 Err(_) => {
                     return Err(SealSessionError::InternalError(format!(
-                        "seal tooling gateway connect timeout after {}s ({gateway_url})",
-                        GATEWAY_CONNECT_TIMEOUT.as_secs()
+                        "seal tooling gateway connect timeout after {}s ({})",
+                        GATEWAY_CONNECT_TIMEOUT.as_secs(),
+                        SensitiveUrl::new(gateway_url)
                     )));
                 }
             };
