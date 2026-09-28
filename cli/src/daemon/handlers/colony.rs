@@ -850,9 +850,8 @@ pub(crate) async fn cancel_invitation(
     }
 }
 
-/// Create or update the invitee in Keycloak. The invitation token is read
-/// here, and only here, to send it as the invitee's `team_invite_token`
-/// attribute.
+/// Create or update the invitee in Keycloak. The invitation token is not
+/// sent; Keycloak has no use for it.
 pub(crate) async fn materialize_invitee(
     kc: &KeycloakAdminClient,
     tier: TenantTier,
@@ -860,14 +859,8 @@ pub(crate) async fn materialize_invitee(
     issued: &InvitationIssued,
     role: &str,
 ) -> Result<String, KeycloakAdminError> {
-    kc.invite_team_user(
-        tier,
-        team_slug,
-        &issued.invitee_email,
-        role,
-        issued.raw_token.expose(),
-    )
-    .await
+    kc.invite_team_user(tier, team_slug, &issued.invitee_email, role)
+        .await
 }
 
 /// `POST /v1/colony/invitations/:token/accept` — invitee accepts. Does NOT

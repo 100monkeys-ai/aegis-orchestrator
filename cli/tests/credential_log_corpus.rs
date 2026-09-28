@@ -161,6 +161,11 @@ const SECRET_FIELD_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "0",
         "the URL parser's error message, which does not repeat the URL",
     ),
+    (
+        "InvitationTokenDigest",
+        "0",
+        "the SHA-256 digest of an invitation token, which is what is stored; presented in the token's place it accepts nothing",
+    ),
 ];
 
 /// Crate source roots walked, relative to the workspace root.

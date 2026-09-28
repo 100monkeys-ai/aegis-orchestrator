@@ -665,7 +665,7 @@ mod tests {
         }
         async fn find_by_token_hash(
             &self,
-            _t: &crate::domain::secrets::SensitiveString,
+            _t: &crate::domain::team::InvitationTokenDigest,
         ) -> Result<Option<TeamInvitation>, RepositoryError> {
             Ok(None)
         }

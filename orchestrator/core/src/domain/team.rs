@@ -31,6 +31,7 @@ use crate::domain::repository::RepositoryError;
 use crate::domain::secrets::SensitiveString;
 use crate::domain::tenancy::TenantTier;
 use crate::domain::tenant::TenantId;
+use sha2::{Digest, Sha256};
 
 // ============================================================================
 // Value Object — Identity
@@ -524,6 +525,57 @@ impl Membership {
 }
 
 // ============================================================================
+// Value object — InvitationTokenDigest
+// ============================================================================
+
+/// What `team_invitations.token_hash` holds: the SHA-256 digest of an
+/// invitation token, written `sha256:` followed by 64 lowercase hex digits.
+///
+/// The token itself is never stored. Accepting an invitation takes the
+/// token, and the invitation is found by the digest of the token presented,
+/// so the stored value cannot be used in the token's place. The token has
+/// 256 bits that cannot be guessed without the invitation key, so a plain
+/// SHA-256 is enough and needs no key of its own; it is also what migration
+/// 033 computes in SQL for the rows stored before it.
+///
+/// The only way to make one is [`of`](Self::of), from a token, or
+/// [`from_stored`](Self::from_stored), which refuses anything that is not a
+/// digest in this form. So a token cannot be stored in its place by mistake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitationTokenDigest(String);
+
+impl InvitationTokenDigest {
+    /// The prefix every stored digest starts with. A token is hex digits
+    /// only, so it never does.
+    pub const PREFIX: &'static str = "sha256:";
+
+    /// The digest of `token`.
+    pub fn of(token: &SensitiveString) -> Self {
+        // Read to digest the token; the digest is what is stored and looked up.
+        let digest = Sha256::digest(token.expose().as_bytes());
+        Self(format!("{}{}", Self::PREFIX, hex::encode(digest)))
+    }
+
+    /// A digest as read back from storage. Refuses a value that is not
+    /// `sha256:` followed by 64 lowercase hex digits.
+    pub fn from_stored(stored: String) -> Result<Self, String> {
+        let well_formed = stored.strip_prefix(Self::PREFIX).is_some_and(|hex| {
+            hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        if well_formed {
+            Ok(Self(stored))
+        } else {
+            Err("stored invitation token digest is not in the form sha256:<64 hex>".to_string())
+        }
+    }
+
+    /// The digest as stored.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// ============================================================================
 // Aggregate — TeamInvitation
 // ============================================================================
 
@@ -536,10 +588,8 @@ pub struct TeamInvitation {
     pub id: TeamInvitationId,
     pub team_id: TeamId,
     pub invitee_email: String,
-    /// The invitation token: an HMAC-SHA256 over `(team_id, invitee_email)`,
-    /// hex-encoded. This value is itself the bearer token the invitee
-    /// presents, so it prints redacted.
-    pub token_hash: SensitiveString,
+    /// The digest of the invitation token. The token itself is not kept.
+    pub token_hash: InvitationTokenDigest,
     pub status: InvitationStatus,
     pub expires_at: DateTime<Utc>,
     pub invited_by: String,
@@ -557,7 +607,7 @@ impl TeamInvitation {
     pub fn send(
         team_id: TeamId,
         invitee_email: String,
-        token_hash: impl Into<SensitiveString>,
+        token_hash: InvitationTokenDigest,
         invited_by: String,
         expires_at: DateTime<Utc>,
     ) -> Self {
@@ -567,7 +617,7 @@ impl TeamInvitation {
             id,
             team_id,
             invitee_email: invitee_email.clone(),
-            token_hash: token_hash.into(),
+            token_hash,
             status: InvitationStatus::Pending,
             expires_at,
             invited_by: invited_by.clone(),
@@ -738,9 +788,10 @@ pub trait TeamInvitationRepository: Send + Sync {
         &self,
         id: &TeamInvitationId,
     ) -> Result<Option<TeamInvitation>, RepositoryError>;
+    /// Find the invitation whose stored digest is `token_hash`.
     async fn find_by_token_hash(
         &self,
-        token_hash: &SensitiveString,
+        token_hash: &InvitationTokenDigest,
     ) -> Result<Option<TeamInvitation>, RepositoryError>;
     async fn find_pending_by_team(
         &self,
@@ -759,12 +810,16 @@ pub trait TeamInvitationRepository: Send + Sync {
 mod tests {
     use super::*;
 
+    fn digest_of(token: &str) -> InvitationTokenDigest {
+        InvitationTokenDigest::of(&SensitiveString::new(token))
+    }
+
     #[test]
     fn team_invitation_debug_does_not_print_the_token() {
         let invitation = TeamInvitation::send(
             TeamId::new(),
             "invitee@example.com".to_string(),
-            "Mk7-team-invitation-token-marker".to_string(),
+            digest_of("Mk7-team-invitation-token-marker"),
             "user-1".to_string(),
             Utc::now(),
         );
@@ -777,6 +832,46 @@ mod tests {
             printed.contains("invitee@example.com"),
             "Debug lost the invitee: {printed}"
         );
+    }
+
+    /// The digest is `sha256:` and the lowercase hex SHA-256 of the token's
+    /// text: the form migration 033 writes with
+    /// `'sha256:' || encode(sha256(convert_to(token, 'UTF8')), 'hex')`.
+    /// The expected value is SHA-256 of "abc" (FIPS 180-2, appendix B.1).
+    #[test]
+    fn invitation_token_digest_is_sha256_hex_of_the_token() {
+        let digest = digest_of("abc");
+        assert_eq!(
+            digest.as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(digest, digest_of("abd"));
+    }
+
+    #[test]
+    fn invitation_token_digest_from_stored_takes_only_a_digest() {
+        let digest = digest_of("token-a");
+        assert_eq!(
+            InvitationTokenDigest::from_stored(digest.as_str().to_string()),
+            Ok(digest)
+        );
+        // A token as the column held it before migration 033: 64 hex digits.
+        let token = "a".repeat(64);
+        assert!(InvitationTokenDigest::from_stored(token.clone()).is_err());
+        for refused in [
+            String::new(),
+            "sha256:".to_string(),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("sha256:{}g", "a".repeat(63)),
+            format!("sha512:{token}"),
+        ] {
+            assert!(
+                InvitationTokenDigest::from_stored(refused.clone()).is_err(),
+                "from_stored accepted {refused:?}"
+            );
+        }
     }
 
     #[test]
@@ -829,7 +924,7 @@ mod tests {
         let mut inv = TeamInvitation::send(
             team_id,
             "alice@example.com".into(),
-            "hash-a",
+            digest_of("token-a"),
             "owner-1".into(),
             Utc::now() + chrono::Duration::days(7),
         );
@@ -847,7 +942,7 @@ mod tests {
         let mut inv = TeamInvitation::send(
             team_id,
             "alice@example.com".into(),
-            "hash-a",
+            digest_of("token-a"),
             "owner-1".into(),
             Utc::now() - chrono::Duration::days(1),
         );
@@ -860,7 +955,7 @@ mod tests {
         let mut inv = TeamInvitation::send(
             team_id,
             "alice@example.com".into(),
-            "hash-a",
+            digest_of("token-a"),
             "owner-1".into(),
             Utc::now() + chrono::Duration::days(7),
         );

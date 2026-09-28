@@ -16,11 +16,10 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::domain::repository::RepositoryError;
-use crate::domain::secrets::SensitiveString;
 use crate::domain::team::{
-    InvitationStatus, Membership, MembershipRepository, MembershipRole, MembershipStatus, Team,
-    TeamId, TeamInvitation, TeamInvitationId, TeamInvitationRepository, TeamRepository, TeamSlug,
-    TeamStatus,
+    InvitationStatus, InvitationTokenDigest, Membership, MembershipRepository, MembershipRole,
+    MembershipStatus, Team, TeamId, TeamInvitation, TeamInvitationId, TeamInvitationRepository,
+    TeamRepository, TeamSlug, TeamStatus,
 };
 use crate::domain::tenancy::TenantTier;
 use crate::domain::tenant::TenantId;
@@ -109,7 +108,8 @@ fn row_to_invitation(row: &sqlx::postgres::PgRow) -> Result<TeamInvitation, Repo
         id: TeamInvitationId(id),
         team_id: TeamId(team_id),
         invitee_email: row.get("invitee_email"),
-        token_hash: SensitiveString::new(row.get::<String, _>("token_hash")),
+        token_hash: InvitationTokenDigest::from_stored(row.get::<String, _>("token_hash"))
+            .map_err(RepositoryError::Serialization)?,
         status: InvitationStatus::from_str(&status_str).map_err(RepositoryError::Serialization)?,
         expires_at: row.get("expires_at"),
         invited_by: row.get("invited_by"),
@@ -391,8 +391,8 @@ impl TeamInvitationRepository for PgTeamInvitationRepository {
         .bind(invitation.id.0)
         .bind(invitation.team_id.0)
         .bind(&invitation.invitee_email)
-        // Stored as it always was: the column holds the token's text.
-        .bind(invitation.token_hash.expose())
+        // The digest of the token; the token itself is never stored.
+        .bind(invitation.token_hash.as_str())
         .bind(invitation.status.as_str())
         .bind(invitation.expires_at)
         .bind(&invitation.invited_by)
@@ -419,10 +419,10 @@ impl TeamInvitationRepository for PgTeamInvitationRepository {
 
     async fn find_by_token_hash(
         &self,
-        token_hash: &SensitiveString,
+        token_hash: &InvitationTokenDigest,
     ) -> Result<Option<TeamInvitation>, RepositoryError> {
         let row = sqlx::query("SELECT * FROM team_invitations WHERE token_hash = $1")
-            .bind(token_hash.expose())
+            .bind(token_hash.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| RepositoryError::Database(e.to_string()))?;

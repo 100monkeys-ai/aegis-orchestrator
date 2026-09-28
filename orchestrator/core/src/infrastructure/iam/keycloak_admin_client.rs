@@ -955,8 +955,12 @@ impl KeycloakAdminClient {
     ///   attaches them to the group named `team_slug` (the group is created
     ///   on demand).
     ///
-    /// `invite_token` is stored as a user attribute so downstream flows can
-    /// correlate the Keycloak user with the orchestrator `TeamInvitation`.
+    /// The invitation token is not sent: Keycloak has no use for it, and a
+    /// user attribute would keep a usable token where the realm's
+    /// administrators and service accounts can read it. Accepting an
+    /// invitation goes to the orchestrator, which checks the token against
+    /// the digest it stores.
+    ///
     /// Returns the Keycloak user id.
     pub async fn invite_team_user(
         &self,
@@ -964,7 +968,6 @@ impl KeycloakAdminClient {
         team_slug: &str,
         email: &str,
         role: &str,
-        invite_token: &str,
     ) -> Result<String, KeycloakAdminError> {
         // POLICY (ADR-097 footgun #9): Non-Enterprise team tiers (Pro,
         // Business) reuse the shared `zaru-consumer` realm and rely on
@@ -1004,7 +1007,7 @@ impl KeycloakAdminClient {
         // otherwise create a fresh invited user.
         let user_id = match self.find_user_by_email(&realm, email).await? {
             Some(u) => {
-                // Update the aegis_role and invite_token attributes in place.
+                // Set the aegis_role and team_slug attributes.
                 let token = self.get_admin_token().await?;
                 let url = format!("{}/admin/realms/{}/users/{}", self.config.host, realm, u.id);
                 let resp = self
@@ -1014,7 +1017,6 @@ impl KeycloakAdminClient {
                     .json(&serde_json::json!({
                         "attributes": {
                             "aegis_role": [role],
-                            "team_invite_token": [invite_token],
                             "team_slug": [team_slug]
                         }
                     }))
@@ -1041,7 +1043,6 @@ impl KeycloakAdminClient {
                         "requiredActions": ["VERIFY_EMAIL"],
                         "attributes": {
                             "aegis_role": [role],
-                            "team_invite_token": [invite_token],
                             "team_slug": [team_slug]
                         }
                     }))

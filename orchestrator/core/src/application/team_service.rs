@@ -30,8 +30,9 @@ use crate::application::effective_tier_service::EffectiveTierService;
 use crate::domain::repository::{RepositoryError, TenantRepository};
 use crate::domain::secrets::{SensitiveBytes, SensitiveString};
 use crate::domain::team::{
-    InvitationStatus, Membership, MembershipRepository, MembershipRole, Team, TeamEvent, TeamId,
-    TeamInvitation, TeamInvitationId, TeamInvitationRepository, TeamRepository,
+    InvitationStatus, InvitationTokenDigest, Membership, MembershipRepository, MembershipRole,
+    Team, TeamEvent, TeamId, TeamInvitation, TeamInvitationId, TeamInvitationRepository,
+    TeamRepository,
 };
 use crate::domain::tenancy::{Tenant, TenantTier};
 use crate::infrastructure::event_bus::EventBus;
@@ -372,15 +373,9 @@ impl StandardTeamService {
     }
 
     /// Compute `HMAC-SHA256(key, team_id || ':' || invitee_email)`, returning
-    /// the hex-encoded digest. This is both the raw token and the stored
-    /// hash — because the "secret" is the HMAC key, an attacker who only sees
-    /// the `token_hash` column cannot forge a valid token without the key.
-    ///
-    /// NOTE: Re-computing the hash for verification requires the caller's
-    /// email and team_id; the raw token delivered in the email is therefore
-    /// the hex digest itself. This matches ADR-111 §Invitation Flow's
-    /// `token = HMAC-SHA256(secret, team_id || invitee_email)` statement and
-    /// the `token_hash` stored column.
+    /// it hex-encoded. This is the invitation token: the value in the
+    /// invitee's link, which accepts the invitation. It is never stored; the
+    /// `token_hash` column holds its [`InvitationTokenDigest`].
     fn token_for(&self, team_id: TeamId, invitee_email: &str) -> Result<String, TeamServiceError> {
         // Read to key the HMAC that derives the invitation token.
         let key = self
@@ -535,7 +530,7 @@ impl TeamService for StandardTeamService {
         // Normalize email for token binding and storage.
         let email_lower = cmd.invitee_email.trim().to_ascii_lowercase();
         let token = SensitiveString::new(self.token_for(cmd.team_id, &email_lower)?);
-        let token_hash = token.clone();
+        let token_hash = InvitationTokenDigest::of(&token);
         let expires_at = Utc::now() + Duration::days(7);
 
         let mut invitation = TeamInvitation::send(
@@ -563,9 +558,11 @@ impl TeamService for StandardTeamService {
         &self,
         cmd: AcceptInvitationCommand,
     ) -> Result<Membership, TeamServiceError> {
+        // The row is found by the digest of the presented token; the stored
+        // digest itself, presented as a token, finds nothing.
         let invitation = self
             .invitation_repo
-            .find_by_token_hash(&cmd.token)
+            .find_by_token_hash(&InvitationTokenDigest::of(&cmd.token))
             .await?
             .ok_or(TeamServiceError::InvalidInvitation)?;
 
@@ -1025,7 +1022,7 @@ mod tests {
         }
         async fn find_by_token_hash(
             &self,
-            _: &SensitiveString,
+            _: &InvitationTokenDigest,
         ) -> Result<Option<TeamInvitation>, RepositoryError> {
             Ok(None)
         }
@@ -1319,7 +1316,7 @@ mod tests {
         }
         async fn find_by_token_hash(
             &self,
-            token_hash: &SensitiveString,
+            token_hash: &InvitationTokenDigest,
         ) -> Result<Option<TeamInvitation>, RepositoryError> {
             Ok(self
                 .items
@@ -1561,5 +1558,65 @@ mod tests {
             .await
             .expect("business personal must allow enterprise colony");
         assert_eq!(team.tier, TenantTier::Enterprise);
+    }
+
+    fn build_service_with_invitations(
+        invitations: Arc<StatefulInvitationRepo>,
+    ) -> StandardTeamService {
+        StandardTeamService::new(
+            Arc::new(MemTeamRepo::default()),
+            Arc::new(MemMembershipRepo::default()),
+            invitations,
+            Arc::new(MemTenantRepo::default()),
+            Arc::new(NoopBilling),
+            Arc::new(EventBus::with_default_capacity()),
+            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec().into()),
+            None,
+            None,
+        )
+    }
+
+    /// The invitation keeps the digest of the token it issued, never the
+    /// token, and the kept value presented as a token accepts nothing.
+    #[tokio::test]
+    async fn invitation_keeps_a_digest_that_cannot_accept_it() {
+        let invitations = Arc::new(StatefulInvitationRepo::default());
+        let svc = build_service_with_invitations(invitations.clone());
+        let team = svc
+            .provision_team(cmd(TenantTier::Business))
+            .await
+            .expect("provision must succeed");
+        let issued = svc
+            .invite_member(InviteMemberCommand {
+                team_id: team.id,
+                invitee_email: "newbie@example.com".to_string(),
+                invited_by_user_id: "user-1".to_string(),
+            })
+            .await
+            .expect("invite must succeed");
+
+        let kept = invitations.items.lock().unwrap()[0].token_hash.clone();
+        assert_eq!(kept, InvitationTokenDigest::of(&issued.raw_token));
+        assert_ne!(kept.as_str(), issued.raw_token.expose());
+
+        let with_kept_value = svc
+            .accept_invitation(AcceptInvitationCommand {
+                token: kept.as_str().into(),
+                authenticated_email: "newbie@example.com".to_string(),
+                authenticated_user_id: "user-2".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(with_kept_value, Err(TeamServiceError::InvalidInvitation)),
+            "the kept digest was taken as the token: {with_kept_value:?}"
+        );
+
+        svc.accept_invitation(AcceptInvitationCommand {
+            token: issued.raw_token.clone(),
+            authenticated_email: "newbie@example.com".to_string(),
+            authenticated_user_id: "user-2".to_string(),
+        })
+        .await
+        .expect("the token in the link accepts the invitation");
     }
 }
