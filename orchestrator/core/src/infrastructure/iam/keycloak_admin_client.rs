@@ -1246,11 +1246,12 @@ mod tests {
         }
         let realm = parts[2].to_string();
         let rest = &parts[3..];
+        // Decoded as a web server decodes a query string: `+` is a space
+        // and `%XX` is a byte.
         let param = |name: &str| {
-            query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
-                .map(str::to_owned)
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
         };
         match (method.as_str(), rest) {
             ("GET", ["users"]) => {
@@ -1647,6 +1648,45 @@ mod tests {
             assert!(
                 message.contains("signing certificate"),
                 "the refusal does not say what to fix: {message}"
+            );
+        }
+    }
+
+    /// An invitation to an address with a plus sign finds the user who
+    /// already has it: the address reaches Keycloak's search as the
+    /// address, not with the plus read as a space.
+    #[tokio::test]
+    async fn an_existing_user_whose_address_has_a_plus_sign_is_found() {
+        for email in ["ada+team@example.com", "ada&b=c@example.com"] {
+            let double = SharedDouble::default();
+            let mut user = existing_user();
+            user["email"] = serde_json::json!(email);
+            user["username"] = serde_json::json!(email);
+            double
+                .lock()
+                .unwrap()
+                .users
+                .entry("zaru-consumer".to_string())
+                .or_default()
+                .insert("user-9".to_string(), user);
+            let kc = serve_keycloak_double(double.clone()).await;
+
+            let found = kc
+                .find_user_by_email("zaru-consumer", email)
+                .await
+                .expect("the search reaches Keycloak");
+            assert_eq!(
+                found.map(|u| u.id),
+                Some("user-9".to_string()),
+                "the user with the address {email:?} was not found"
+            );
+            let user_id = kc
+                .invite_team_user(TenantTier::Business, "acme", email)
+                .await
+                .unwrap_or_else(|e| panic!("inviting {email:?} failed: {e}"));
+            assert_eq!(
+                user_id, "user-9",
+                "inviting {email:?} did not use the existing user"
             );
         }
     }
