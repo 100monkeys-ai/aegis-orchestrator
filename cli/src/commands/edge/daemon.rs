@@ -26,6 +26,7 @@ use tokio::signal;
 use tracing::{info, warn};
 
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+use aegis_orchestrator_core::domain::secrets::SensitiveUrl;
 use aegis_orchestrator_core::domain::security_context::{
     Capability, SecurityContext, SecurityContextMetadata,
 };
@@ -195,7 +196,7 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
 
     info!(
         node_id = %node_id_str,
-        controller = %controller_endpoint,
+        controller = %SensitiveUrl::new(controller_endpoint.as_str()),
         once = args.once,
         "edge daemon: starting ConnectEdge lifecycle"
     );

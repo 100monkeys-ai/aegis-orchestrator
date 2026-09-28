@@ -248,9 +248,8 @@ async fn perform_fetch(
     timeout: Duration,
     follow_redirects: bool,
 ) -> Result<(u16, bool, String), String> {
-    let sanitized_url = sanitize_url(url);
-    info!("Web fetch requested: {}", sanitized_url);
-    debug!("Fetching: {}", sanitized_url);
+    info!("Web fetch requested: {}", sanitize_url(url));
+    debug!("Fetching: {}", sanitize_url(url));
 
     let client = reqwest::Client::builder()
         .user_agent("AEGIS Orchestrator WebFetch/1.0")

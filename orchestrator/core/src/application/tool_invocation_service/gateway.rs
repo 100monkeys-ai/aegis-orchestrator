@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::secrets::SensitiveUrl;
 use std::time::Duration;
 
 /// Connect timeout for SEAL Tooling Gateway gRPC connections.
@@ -170,7 +171,7 @@ impl ToolInvocationService {
             Ok(ep) => ep.connect_timeout(GATEWAY_CONNECT_TIMEOUT),
             Err(e) => {
                 tracing::warn!(
-                    gateway_url,
+                    gateway_url = %SensitiveUrl::new(gateway_url),
                     error = %e,
                     "invalid SEAL gateway URL; skipping gateway tool enumeration"
                 );
@@ -184,7 +185,7 @@ impl ToolInvocationService {
             Ok(Ok(channel)) => GatewayInvocationServiceClient::new(channel),
             Ok(Err(e)) => {
                 tracing::warn!(
-                    gateway_url,
+                    gateway_url = %SensitiveUrl::new(gateway_url),
                     error = %e,
                     "SEAL gateway connect failed during tool enumeration; proceeding with built-in tools only"
                 );
@@ -192,7 +193,7 @@ impl ToolInvocationService {
             }
             Err(_) => {
                 tracing::warn!(
-                    gateway_url,
+                    gateway_url = %SensitiveUrl::new(gateway_url),
                     timeout_secs = GATEWAY_CONNECT_TIMEOUT.as_secs(),
                     "SEAL gateway connect timed out during tool enumeration; proceeding with built-in tools only"
                 );
@@ -218,7 +219,7 @@ impl ToolInvocationService {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
                 tracing::warn!(
-                    gateway_url,
+                    gateway_url = %SensitiveUrl::new(gateway_url),
                     error = %e,
                     "SEAL gateway list_tools failed during tool enumeration; proceeding with built-in tools only"
                 );
@@ -226,7 +227,7 @@ impl ToolInvocationService {
             }
             Err(_) => {
                 tracing::warn!(
-                    gateway_url,
+                    gateway_url = %SensitiveUrl::new(gateway_url),
                     timeout_secs = GATEWAY_LIST_TOOLS_TIMEOUT.as_secs(),
                     "SEAL gateway list_tools timed out during tool enumeration; proceeding with built-in tools only"
                 );

@@ -56,7 +56,7 @@ use crate::domain::git_repo::{
 use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
 use crate::domain::iam::ZaruTier;
 use crate::domain::repository::RepositoryError;
-use crate::domain::secrets::AccessContext;
+use crate::domain::secrets::{AccessContext, SensitiveUrl};
 use crate::domain::shared_kernel::TenantId;
 use crate::domain::volume::{Volume, VolumeBackend};
 use crate::infrastructure::event_bus::EventBus;
@@ -298,7 +298,7 @@ impl GitRepoService {
     ///
     /// The caller is responsible for scheduling the background clone
     /// task (e.g. via `tokio::spawn(service.clone_repo(id))`).
-    #[instrument(skip(self, cmd), fields(owner = %cmd.owner, repo_url = %cmd.repo_url))]
+    #[instrument(skip(self, cmd), fields(owner = %cmd.owner, repo_url = %SensitiveUrl::new(cmd.repo_url.as_str())))]
     pub async fn create_binding(
         &self,
         cmd: CreateGitRepoCommand,

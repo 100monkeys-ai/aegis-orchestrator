@@ -281,7 +281,7 @@ pub(crate) async fn webhook_handler(
             use aegis_orchestrator_core::domain::node_config::resolve_env_value;
             c.stripe_webhook_secret
                 .as_ref()
-                .and_then(|s| resolve_env_value(s).ok())
+                .and_then(|s| resolve_env_value(s.expose()).ok())
         });
 
         let webhook_secret = match webhook_secret {

@@ -282,7 +282,8 @@ async fn join_cluster(
             .cluster
             .as_ref()
             .and_then(|c| c.controller.as_ref())
-            .and_then(|c| c.token.as_deref())
+            .and_then(|c| c.token.as_ref())
+            .map(|t| t.expose())
             .map(|t| {
                 aegis_orchestrator_core::domain::node_config::resolve_env_value(t)
                     .unwrap_or_else(|_| t.to_string())

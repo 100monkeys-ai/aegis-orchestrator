@@ -94,6 +94,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
+use aegis_orchestrator_core::domain::secrets::SensitiveUrl;
 use aegis_orchestrator_core::{
     application::{
         agent::AgentLifecycleService,
@@ -196,13 +197,13 @@ fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
 /// to in-memory repositories). A production node refuses both.
 pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Option<PgPool>> {
     // Initialize repositories — resolve database URL from config (spec.database)
-    let database_url: Option<String> =
+    let database_url: Option<SensitiveUrl> =
         config
             .spec
             .database
             .as_ref()
-            .and_then(|db| match resolve_env_value(&db.url) {
-                Ok(url) => Some(url),
+            .and_then(|db| match resolve_env_value(db.url.expose()) {
+                Ok(url) => Some(SensitiveUrl::new(url)),
                 Err(e) => {
                     tracing::warn!(
                         "Failed to resolve database URL: {}. Falling back to InMemory.",
@@ -220,10 +221,10 @@ pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Opti
 
     // Store pool separately for later volume repo initialization
     let db_pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
-        info!(url = %url, "Initializing repositories with PostgreSQL");
+        info!(url = %url.redacted(), "Initializing repositories with PostgreSQL");
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(db_max_connections)
-            .connect(url)
+            .connect(url.expose())
             .await
         {
             Ok(db_pool) => {
@@ -356,8 +357,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         let resolved_url =
             resolve_env_value(&seal_gateway.url).unwrap_or_else(|_| seal_gateway.url.clone());
         tracing::info!(
-            "Configured SEAL tooling gateway URL from node config: {}",
-            resolved_url
+            url = %SensitiveUrl::new(resolved_url),
+            "Configured SEAL tooling gateway URL from node config"
         );
     }
 
@@ -632,7 +633,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 })
             {
                 Ok(channel) => {
-                    tracing::info!(endpoint = %endpoint, "Connected to FUSE daemon gRPC service");
+                    tracing::info!(
+                        endpoint = %SensitiveUrl::new(endpoint.as_str()),
+                        "Connected to FUSE daemon gRPC service"
+                    );
                     Some(
                         aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient::new(
                             channel,
@@ -641,7 +645,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 }
                 Err(e) => {
                     tracing::warn!(
-                        endpoint = %endpoint,
+                        endpoint = %SensitiveUrl::new(endpoint.as_str()),
                         error = %e,
                         "Failed to construct FUSE daemon gRPC channel; FUSE transport disabled"
                     );
@@ -712,7 +716,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 // Resolve env variables in config map
                 let mut resolved_options = std::collections::HashMap::new();
                 for (k, v) in opendal_config.options {
-                    resolved_options.insert(k, resolve_env_value(&v).unwrap_or(v));
+                    let raw = v.expose_owned();
+                    let value = resolve_env_value(&raw).unwrap_or(raw);
+                    resolved_options.insert(k, value);
                 }
                 aegis_orchestrator_core::infrastructure::storage::create_storage_provider(
                     aegis_orchestrator_core::infrastructure::storage::StorageBackend::OpenDal {
@@ -1259,7 +1265,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .iter()
         .find(|d| d.name == "web.search")
         .and_then(|d| d.api_key.as_ref())
-        .and_then(|k| resolve_env_value(k).ok());
+        .and_then(|k| resolve_env_value(k.expose()).ok());
 
     let tool_router = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
@@ -1285,7 +1291,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .cortex
         .as_ref()
         .and_then(|c| c.api_key.as_ref())
-        .and_then(|k| resolve_env_value(k).ok());
+        .and_then(|k| resolve_env_value(k.expose()).ok());
     let cortex_client: Option<
         std::sync::Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>,
     > = match cortex_grpc_url {
@@ -1297,12 +1303,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .await
             {
                 Ok(client) => {
-                    tracing::info!(url = %url, "Connected to Cortex gRPC service");
+                    tracing::info!(
+                        url = %SensitiveUrl::new(url.as_str()),
+                        "Connected to Cortex gRPC service"
+                    );
                     Some(std::sync::Arc::new(client))
                 }
                 Err(e) => {
                     tracing::warn!(
-                        url = %url,
+                        url = %SensitiveUrl::new(url.as_str()),
                         error = %e,
                         "Failed to connect to Cortex gRPC service; running in memoryless mode"
                     );
@@ -1848,7 +1857,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     return None;
                 }
             };
-            let password = match resolve_env_value(&admin_cfg.admin_password) {
+            let password = match resolve_env_value(admin_cfg.admin_password.expose()) {
                 Ok(p) => p,
                 Err(e) => {
                     warn!("Keycloak admin password not resolvable: {e} — admin client disabled");
@@ -2036,7 +2045,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .spec
                 .zaru
                 .as_ref()
-                .and_then(|cfg| resolve_env_value(&cfg.internal_secret).ok());
+                .and_then(|cfg| resolve_env_value(cfg.internal_secret.expose()).ok());
             let port: Arc<
                 dyn aegis_orchestrator_core::application::effective_tier_service::TierSyncPort,
             > = Arc::new(
@@ -2134,7 +2143,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .invitation_hmac_key
                 .as_ref()
                 .and_then(|k| {
-                    aegis_orchestrator_core::domain::node_config::resolve_env_value(k).ok()
+                    aegis_orchestrator_core::domain::node_config::resolve_env_value(k.expose()).ok()
                 })
                 .map(|s| s.into_bytes());
             // `team_memberships` JWT-claim sync port. Stamps the multivalued
@@ -2239,7 +2248,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     Some(endpoint) => {
                         tracing::info!(
                             role = ?cluster_role,
-                            relay = %endpoint,
+                            relay = %SensitiveUrl::new(endpoint.as_str()),
                             "edge enrollment-token issuer: gRPC to relay-coordinator (ADR-117)"
                         );
                         Arc::new(
@@ -2360,7 +2369,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .spec
             .zaru
             .as_ref()
-            .and_then(|cfg| resolve_env_value(&cfg.internal_secret).ok()),
+            .and_then(|cfg| resolve_env_value(cfg.internal_secret.expose()).ok()),
         edge_api: edge_api_state,
     };
 
@@ -2954,7 +2963,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                     // env: indirection is supported.
                                     let enrolment_token = controller
                                         .token
-                                        .as_deref()
+                                        .as_ref()
+                                        .map(|t| t.expose())
                                         .map(|t| {
                                             aegis_orchestrator_core::domain::node_config::resolve_env_value(t)
                                                 .unwrap_or_else(|_| t.to_string())

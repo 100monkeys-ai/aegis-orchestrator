@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::domain::cluster::MergedConfig;
+use crate::domain::secrets::{SensitiveString, SensitiveUrl};
 
 /// Top-level Kubernetes-style node configuration manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +102,7 @@ pub struct RegistryCredentials {
     pub username: String,
     /// Password or personal access token.
     /// Supports `env:VAR_NAME` syntax for environment variable substitution.
-    pub password: String,
+    pub password: SensitiveString,
 }
 
 /// Node configuration specification (content under spec:)
@@ -297,7 +298,7 @@ pub struct LLMProviderConfig {
 
     /// API key (supports "env:VAR_NAME" for environment variables)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub api_key: Option<SensitiveString>,
 
     /// Whether this provider is active
     #[serde(default = "default_true")]
@@ -848,8 +849,10 @@ pub struct OpenDalConfig {
     pub provider: String,
 
     /// Configuration options for the provider. Values can use "env:VAR_NAME"
+    /// Provider options. Held as [`SensitiveString`] because they include
+    /// the provider's credentials (e.g. an S3 `secret_access_key`).
     #[serde(default)]
-    pub options: std::collections::HashMap<String, String>,
+    pub options: std::collections::HashMap<String, SensitiveString>,
 }
 
 impl Default for OpenDalConfig {
@@ -903,7 +906,7 @@ pub struct BuiltinDispatcherConfig {
     /// Optional API key for builtins that call external services.
     /// Supports "env:VAR_NAME" and "secret:path/to/secret" resolution.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub api_key: Option<SensitiveString>,
 }
 
 /// MCP Server configuration
@@ -1004,7 +1007,7 @@ pub struct DatabaseConfig {
     /// Supports `env:VAR_NAME` for environment variable resolution
     /// and `secret:namespace/mount/path` for secret-backend references (Phase 2).
     /// Example: `"env:AEGIS_DATABASE_URL"` or `"postgresql://user:pass@host:5432/db"`
-    pub url: String,
+    pub url: SensitiveUrl,
 
     /// Maximum connection pool size.
     #[serde(default = "default_db_max_connections")]
@@ -1038,7 +1041,7 @@ pub struct TemporalConfig {
     /// Supports `env:VAR_NAME` and `secret:` credential resolution patterns.
     /// If omitted, the `/v1/temporal-events` endpoint is unauthenticated (warns at startup).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_secret: Option<String>,
+    pub worker_secret: Option<SensitiveString>,
 
     /// Temporal namespace.
     #[serde(default = "default_temporal_namespace")]
@@ -1088,7 +1091,7 @@ pub struct CortexConfig {
     /// Omit for self-hosted deployments.
     /// Example: `"env:CORTEX_API_KEY"`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub api_key: Option<SensitiveString>,
 }
 
 /// Top-level secrets configuration wrapper (ADR-034).
@@ -1293,7 +1296,7 @@ pub struct ClusterControllerConfig {
     /// gRPC endpoint of the cluster controller (required for workers)
     pub endpoint: String,
     /// Secret token for initial node-to-controller authentication (Step 0)
-    pub token: Option<String>,
+    pub token: Option<SensitiveString>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1502,7 +1505,7 @@ pub struct KeycloakAdminConfig {
     /// Admin username for the `master` realm. Supports `env:VAR` syntax.
     pub admin_username: String,
     /// Admin password for the `master` realm. Supports `env:VAR` syntax.
-    pub admin_password: String,
+    pub admin_password: SensitiveString,
 }
 
 impl Default for IamClaimsConfig {
@@ -1559,7 +1562,7 @@ pub struct ZaruConfig {
     /// Base URL for the zaru-client service. Supports `env:VAR_NAME` syntax.
     pub public_url: String,
     /// Shared secret for zaru-client internal endpoints. Supports `env:VAR_NAME` syntax.
-    pub internal_secret: String,
+    pub internal_secret: SensitiveString,
 }
 
 /// Stripe billing configuration (SaaS mode only).
@@ -1570,17 +1573,17 @@ pub struct ZaruConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BillingConfig {
     /// Stripe API secret key. Supports `env:VAR_NAME` syntax.
-    pub stripe_secret_key: String,
+    pub stripe_secret_key: SensitiveString,
 
     /// Stripe webhook signing secret. Supports `env:VAR_NAME` syntax.
     #[serde(default)]
-    pub stripe_webhook_secret: Option<String>,
+    pub stripe_webhook_secret: Option<SensitiveString>,
 
     /// HMAC-SHA256 key used to sign team invitation tokens (ADR-111
     /// §Invitation Flow). Supports `env:VAR_NAME` syntax. If absent, team
     /// invitations are disabled and the invitation endpoint returns 501.
     #[serde(default)]
-    pub invitation_hmac_key: Option<String>,
+    pub invitation_hmac_key: Option<SensitiveString>,
 }
 
 // Default value functions
@@ -2575,7 +2578,7 @@ mod tests {
         let mut manifest = NodeConfigManifest::default();
         manifest.spec.node.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
         manifest.spec.database = Some(DatabaseConfig {
-            url: "postgresql://localhost/aegis".to_string(),
+            url: SensitiveUrl::new("postgresql://localhost/aegis"),
             max_connections: 5,
             connect_timeout_seconds: 10,
         });

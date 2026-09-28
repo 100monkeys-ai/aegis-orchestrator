@@ -13,6 +13,7 @@ use crate::domain::llm::{
 use crate::domain::node_config::{
     resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, NodeConfigManifest,
 };
+use crate::domain::secrets::SensitiveString;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,7 +63,7 @@ pub struct ProviderRegistry {
     fallback_provider: Option<(String, Arc<dyn LLMProvider>)>,
     /// alias → raw `api_key` value from the provider config (before env resolution).
     /// Used to determine [`ApiKeySource`] for BYOK exemption (ADR-072).
-    raw_api_keys: HashMap<String, Option<String>>,
+    raw_api_keys: HashMap<String, Option<SensitiveString>>,
     /// alias → per-model `max_output_tokens` override from config.
     /// When set, overrides `GenerationOptions::max_tokens` for calls on that alias.
     alias_max_output_tokens: HashMap<String, u32>,
@@ -190,7 +191,7 @@ impl ProviderRegistry {
 
         // ── Phase 2: build one per-model adapter per winning alias ─────────────────────
         let mut alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)> = HashMap::new();
-        let mut raw_api_keys: HashMap<String, Option<String>> = HashMap::new();
+        let mut raw_api_keys: HashMap<String, Option<SensitiveString>> = HashMap::new();
         let mut alias_max_output_tokens: HashMap<String, u32> = HashMap::new();
         let mut alias_temperatures: HashMap<String, f32> = HashMap::new();
 
@@ -300,9 +301,9 @@ impl ProviderRegistry {
 
     /// Resolve API key from config (supports "env:VAR_NAME" syntax)
     /// Delegates to the centralized `resolve_env_value()` utility.
-    fn resolve_api_key(key: &Option<String>) -> anyhow::Result<String> {
+    fn resolve_api_key(key: &Option<SensitiveString>) -> anyhow::Result<String> {
         match key {
-            Some(k) => resolve_env_value(k),
+            Some(k) => resolve_env_value(k.expose()),
             None => Ok(String::new()), // For local providers without auth
         }
     }
@@ -532,7 +533,7 @@ impl ProviderRegistry {
     /// because they consume their own provider quota.
     pub fn key_source_for_alias(&self, alias: &str) -> ApiKeySource {
         match self.raw_api_keys.get(alias) {
-            Some(Some(key)) if !key.starts_with("env:") => ApiKeySource::User,
+            Some(Some(key)) if !key.expose().starts_with("env:") => ApiKeySource::User,
             _ => ApiKeySource::Platform,
         }
     }

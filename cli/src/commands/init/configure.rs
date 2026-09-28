@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aegis_orchestrator_core::domain::secrets::SensitiveString;
+use aegis_orchestrator_core::domain::secrets::{SensitiveString, SensitiveUrl};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use dialoguer::{Confirm, Input, Password};
@@ -59,7 +59,8 @@ pub struct AdvancedConfig {
     pub docker_network: String,
     pub orchestrator_url: String,
     pub nfs_host: String,
-    pub database_url: String,
+    /// May carry the database password; prints redacted.
+    pub database_url: SensitiveUrl,
     pub keep_container: bool,
     pub enable_lmstudio: bool,
     pub lmstudio_endpoint: String,
@@ -339,7 +340,7 @@ impl ConfigWizard {
             docker_network: "aegis-network".to_string(),
             orchestrator_url: "http://aegis-runtime:8088".to_string(),
             nfs_host: "127.0.0.1".to_string(),
-            database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+            database_url: SensitiveUrl::new("postgresql://aegis:aegis@postgres:5432/aegis"),
 
             keep_container: false,
             enable_lmstudio: false,
@@ -455,10 +456,12 @@ impl ConfigWizard {
                 .with_prompt("AEGIS_NFS_HOST")
                 .default(defaults.nfs_host.clone())
                 .interact_text()?,
-            database_url: Input::new()
-                .with_prompt("AEGIS_DATABASE_URL")
-                .default(defaults.database_url.clone())
-                .interact_text()?,
+            database_url: SensitiveUrl::new(
+                Input::<String>::new()
+                    .with_prompt("AEGIS_DATABASE_URL")
+                    .default(defaults.database_url.expose().to_string())
+                    .interact_text()?,
+            ),
             keep_container: Confirm::new()
                 .with_prompt("Set AEGIS_KEEP_CONTAINER=true for debugging?")
                 .default(defaults.keep_container)
@@ -1384,7 +1387,7 @@ AEGIS_SEAL_PRIVATE_KEY='{seal_private_key}'
             docker_network = config.advanced.docker_network,
             orchestrator_url = config.advanced.orchestrator_url,
             nfs_host = config.advanced.nfs_host,
-            database_url = config.advanced.database_url,
+            database_url = config.advanced.database_url.expose(),
             keep_container = if config.advanced.keep_container {
                 "true"
             } else {
@@ -1520,7 +1523,7 @@ mod tests {
                 docker_network: "aegis-network".to_string(),
                 orchestrator_url: "http://aegis-runtime:8088".to_string(),
                 nfs_host: "127.0.0.1".to_string(),
-                database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+                database_url: SensitiveUrl::new("postgresql://aegis:aegis@postgres:5432/aegis"),
 
                 keep_container: false,
                 enable_lmstudio: false,
@@ -1595,7 +1598,7 @@ mod tests {
                 docker_network: "aegis-network".to_string(),
                 orchestrator_url: "http://aegis-runtime:8088".to_string(),
                 nfs_host: "127.0.0.1".to_string(),
-                database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+                database_url: SensitiveUrl::new("postgresql://aegis:aegis@postgres:5432/aegis"),
 
                 keep_container: false,
                 enable_lmstudio: false,
@@ -1676,7 +1679,9 @@ mod tests {
                 docker_network: "aegis-network".to_string(),
                 orchestrator_url: "http://aegis-runtime:8088".to_string(),
                 nfs_host: "127.0.0.1".to_string(),
-                database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+                database_url: SensitiveUrl::new(format!(
+                    "postgresql://aegis:{SENTINEL}@postgres:5432/aegis"
+                )),
                 keep_container: false,
                 enable_lmstudio: false,
                 lmstudio_endpoint: "x".to_string(),
@@ -1728,6 +1733,7 @@ mod tests {
         assert!(!format!("{:?}", config.advanced.anthropic_api_key).contains(SENTINEL));
         assert!(!format!("{:?}", config.advanced.gemini_api_key).contains(SENTINEL));
         assert!(!format!("{:?}", config.advanced.cluster_token).contains(SENTINEL));
+        assert!(!format!("{:?}", config.advanced.database_url).contains(SENTINEL));
     }
 
     #[test]

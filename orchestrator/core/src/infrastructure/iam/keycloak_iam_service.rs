@@ -19,6 +19,7 @@ use crate::domain::iam::{
     ValidatedIdentityToken, ZaruTier,
 };
 use crate::domain::node_config::{IamClaimsConfig, IamConfig, IamRealmConfig};
+use crate::domain::secrets::SensitiveUrl;
 use crate::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -194,7 +195,11 @@ impl StandardIamService {
 
     /// Fetch JWKS from a realm's endpoint and update the cache.
     async fn refresh_jwks(&self, realm: &IdentityRealm) -> Result<(), IamError> {
-        debug!(realm = %realm.realm_slug, jwks_uri = %realm.jwks_uri, "Fetching JWKS");
+        debug!(
+            realm = %realm.realm_slug,
+            jwks_uri = %SensitiveUrl::new(realm.jwks_uri.as_str()),
+            "Fetching JWKS"
+        );
 
         let response = self
             .http_client

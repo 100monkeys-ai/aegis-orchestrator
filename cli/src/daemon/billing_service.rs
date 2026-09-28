@@ -41,7 +41,7 @@ impl StripeBillingService {
     }
 
     fn stripe_client(&self) -> Result<stripe::Client, BillingServiceError> {
-        let key = resolve_env_value(&self.config.stripe_secret_key)
+        let key = resolve_env_value(self.config.stripe_secret_key.expose())
             .map_err(|_| BillingServiceError::NotConfigured)?;
         if key.is_empty() {
             return Err(BillingServiceError::NotConfigured);

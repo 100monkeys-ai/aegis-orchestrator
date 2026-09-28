@@ -26,7 +26,7 @@ use crate::domain::credential::{
     OAuthPendingState, UserCredentialBinding,
 };
 use crate::domain::events::CredentialEvent;
-use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString};
+use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, SensitiveUrl};
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
@@ -590,7 +590,7 @@ impl StandardCredentialManagementService {
 
         tracing::info!(
             provider = %provider,
-            token_url = %cfg.token_url,
+            token_url = %SensitiveUrl::new(cfg.token_url.as_str()),
             "Posting OAuth authorization-code exchange to provider token endpoint"
         );
 

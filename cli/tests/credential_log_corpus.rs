@@ -11,7 +11,9 @@
 //! This test walks every non-test source file of the workspace and reads every
 //! argument of every `tracing` event and span macro, every `#[instrument]`
 //! attribute, and — in daemon code — every `println!`, `eprintln!`, `print!`,
-//! `eprint!`, `panic!`, `anyhow!` and `bail!`. An argument is a connection
+//! `eprint!`, `panic!`, `anyhow!` and `bail!`, and every `format!` that builds
+//! an error's context (`.context(format!(…))`, `.with_context(|| format!(…))`).
+//! An argument is a connection
 //! string when its field name, or any lower-case identifier in its
 //! expression, or any inline `{capture}` in its format string, is named like
 //! one: `url`, `uri`, `dsn`, `endpoint`, `connection`, `conn_str`,
@@ -423,6 +425,17 @@ fn raw_connection_string(arg: &str) -> Option<String> {
         .map(|ident| format!("value `{ident}`"))
 }
 
+/// Is the `format!` starting at `at` the argument of `.context(` or of a
+/// `.with_context(|| …)` closure, so that its text becomes an error message?
+fn builds_error_context(src: &str, at: usize) -> bool {
+    let before = src[..at].trim_end();
+    let before = before
+        .strip_suffix("||")
+        .map(str::trim_end)
+        .unwrap_or(before);
+    before.ends_with("context(")
+}
+
 /// Line number (1-based) of byte offset `at`.
 fn line_of(src: &str, at: usize) -> usize {
     src[..at].bytes().filter(|b| *b == b'\n').count() + 1
@@ -463,8 +476,9 @@ fn scan_source(relative: &str, src: &str, scan: &mut Scan) {
                 .unwrap_or(src.len() - i);
             let name = &src[i..end];
             let rest = &src[end..];
-            let checked =
-                TRACING_MACROS.contains(&name) || (daemon && PROCESS_OUTPUT_MACROS.contains(&name));
+            let checked = TRACING_MACROS.contains(&name)
+                || (daemon && PROCESS_OUTPUT_MACROS.contains(&name))
+                || (daemon && name == "format" && builds_error_context(src, i));
             if checked && rest.starts_with('!') {
                 let after_bang = rest[1..].trim_start();
                 if after_bang.starts_with('(') {
@@ -616,6 +630,7 @@ fn checker_catches_every_form_of_a_raw_connection_string() {
             info!("Configured gateway: {}", resolved_url);
             error!("connect to {dsn} failed");
             info_span!("s", target_endpoint = ?cfg.endpoint);
+            let r = fetch().with_context(|| format!("Failed to fetch {url}"));
         }
         #[instrument(skip(self), fields(repo = %binding.repo_url))]
         async fn g(&self, binding: &B) {}
@@ -629,7 +644,7 @@ fn checker_catches_every_form_of_a_raw_connection_string() {
     scan_source("orchestrator/core/src/example.rs", raw, &mut scan);
     assert_eq!(
         scan.violations.len(),
-        8,
+        9,
         "every raw form must be reported once:\n{}",
         scan.violations.join("\n")
     );
@@ -640,6 +655,8 @@ fn checker_catches_every_form_of_a_raw_connection_string() {
             tracing::warn!(url = %SensitiveUrl::new(raw.clone()), "x");
             info!("Fetch: {}", sanitize_url(&url));
             info!(host = %host, port = port, "no connection string here");
+            let s = format!("{url}/models");
+            let r = fetch().with_context(|| format!("Failed: {}", sanitize_url(&url)));
         }
         #[instrument(skip(self, connection_string))]
         async fn h(&self, connection_string: &str) {}

@@ -464,7 +464,7 @@ pub(crate) async fn workflow_execution_temporal_linkage(
     let Some(database) = config.spec.database.as_ref() else {
         return Ok(None);
     };
-    let database_url = resolve_env_value(&database.url)
+    let database_url = resolve_env_value(database.url.expose())
         .with_context(|| "Failed to resolve database URL for workflow execution linkage")?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -1071,7 +1071,7 @@ pub(crate) async fn remove_workflow_execution_handler(
     }
 
     let db_cleanup = if let Some(database) = &state.config.spec.database {
-        let database_url = match resolve_env_value(&database.url) {
+        let database_url = match resolve_env_value(database.url.expose()) {
             Ok(url) => url,
             Err(error) => {
                 return Ok((

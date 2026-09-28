@@ -68,7 +68,7 @@ use crate::daemon::state::AppState;
 
 /// Build a Stripe client from the resolved `BillingConfig`.
 fn stripe_client_from_config(billing: &BillingConfig) -> Option<stripe::Client> {
-    let key = resolve_env_value(&billing.stripe_secret_key).ok()?;
+    let key = resolve_env_value(billing.stripe_secret_key.expose()).ok()?;
     if key.is_empty() {
         return None;
     }

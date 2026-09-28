@@ -30,6 +30,7 @@
 
 use crate::domain::credential::CredentialBindingId;
 use crate::domain::repository::RepositoryError;
+use crate::domain::secrets::{SensitiveString, SensitiveUrl};
 use crate::domain::shared_kernel::{TenantId, VolumeId};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -219,7 +220,12 @@ pub enum GitRepoEvent {
 ///   `VolumeOwnership::Persistent`.
 /// - `repo_url` MUST pass [`validate_repo_url`] (HTTPS or SSH, no IP hosts).
 /// - Only the owning tenant can modify or delete.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand: `repo_url` may carry a token as user info
+/// (`https://user:token@host/repo.git`) and `webhook_secret` is the cleartext
+/// secret, and a binding is recorded by `Debug` wherever it is a parameter of
+/// an `#[instrument]`ed function.
+#[derive(Clone)]
 pub struct GitRepoBinding {
     pub id: GitRepoBindingId,
     pub tenant_id: TenantId,
@@ -259,6 +265,36 @@ pub struct GitRepoBinding {
     /// Event buffer. Drained by [`take_events`](Self::take_events) at the
     /// aggregate boundary and published to the event bus.
     pub domain_events: Vec<GitRepoEvent>,
+}
+
+impl std::fmt::Debug for GitRepoBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitRepoBinding")
+            .field("id", &self.id)
+            .field("tenant_id", &self.tenant_id)
+            .field("credential_binding_id", &self.credential_binding_id)
+            .field("repo_url", &SensitiveUrl::new(self.repo_url.as_str()))
+            .field("git_ref", &self.git_ref)
+            .field("sparse_paths", &self.sparse_paths)
+            .field("volume_id", &self.volume_id)
+            .field("label", &self.label)
+            .field("status", &self.status)
+            .field("clone_strategy", &self.clone_strategy)
+            .field("last_cloned_at", &self.last_cloned_at)
+            .field("last_commit_sha", &self.last_commit_sha)
+            .field("auto_refresh", &self.auto_refresh)
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(SensitiveString::new),
+            )
+            .field("webhook_secret_ciphertext", &self.webhook_secret_ciphertext)
+            .field("webhook_lookup_hash", &self.webhook_lookup_hash)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            // `BindingCreated` carries the raw `repo_url`; count, do not print.
+            .field("domain_events", &self.domain_events.len())
+            .finish()
+    }
 }
 
 impl GitRepoBinding {

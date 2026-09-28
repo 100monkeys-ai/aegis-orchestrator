@@ -224,10 +224,11 @@ impl DockerImageManager for StandardDockerImageManager {
             let credentials = self.credential_resolver.resolve(image).await;
             credentials.map(|cred| {
                 // Resolve env:VAR_NAME substitution on the password if present.
-                let password = if let Some(var) = cred.password.strip_prefix("env:") {
-                    std::env::var(var).unwrap_or(cred.password.clone())
+                let raw = cred.password.expose();
+                let password = if let Some(var) = raw.strip_prefix("env:") {
+                    std::env::var(var).unwrap_or_else(|_| raw.to_string())
                 } else {
-                    cred.password.clone()
+                    raw.to_string()
                 };
                 DockerCredentials {
                     username: Some(cred.username.clone()),

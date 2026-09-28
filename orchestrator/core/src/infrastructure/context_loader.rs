@@ -35,6 +35,7 @@
 //! ```
 
 use crate::domain::agent::ContextItem;
+use crate::infrastructure::log_sanitizer::sanitize_url;
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
@@ -194,10 +195,14 @@ impl ContextLoader {
             .header("User-Agent", "AEGIS/1.0")
             .send()
             .await
-            .with_context(|| format!("Failed to fetch URL: {url}"))?;
+            .with_context(|| format!("Failed to fetch URL: {}", sanitize_url(url)))?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("HTTP {} fetching URL: {}", response.status(), url));
+            return Err(anyhow!(
+                "HTTP {} fetching URL: {}",
+                response.status(),
+                sanitize_url(url)
+            ));
         }
 
         // Reject early if Content-Length advertises a payload over the cap.
@@ -210,7 +215,7 @@ impl ContextLoader {
                     "URL content size ({} bytes) exceeds limit ({} bytes): {}",
                     content_length,
                     self.max_file_size,
-                    url
+                    sanitize_url(url)
                 ));
             }
         }
@@ -219,7 +224,7 @@ impl ContextLoader {
         // to allocate beyond the cap regardless of Content-Length honesty.
         let bytes = read_capped(response, self.max_file_size, url).await?;
         let text = String::from_utf8(bytes)
-            .with_context(|| format!("URL content is not valid UTF-8: {url}"))?;
+            .with_context(|| format!("URL content is not valid UTF-8: {}", sanitize_url(url)))?;
 
         Ok(text)
     }
@@ -277,10 +282,12 @@ async fn read_capped(response: reqwest::Response, max_bytes: usize, url: &str) -
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("Failed to read URL response chunk: {url}"))?;
+        let chunk = chunk
+            .with_context(|| format!("Failed to read URL response chunk: {}", sanitize_url(url)))?;
         if buf.len().saturating_add(chunk.len()) > max_bytes {
             return Err(anyhow!(
-                "URL content exceeds limit ({max_bytes} bytes): {url}"
+                "URL content exceeds limit ({max_bytes} bytes): {}",
+                sanitize_url(url)
             ));
         }
         buf.extend_from_slice(&chunk);

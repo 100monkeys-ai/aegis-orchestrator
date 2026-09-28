@@ -44,7 +44,7 @@ use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
 use crate::domain::runtime::{
     ContainerStepConfig, ContainerStepError, ContainerStepRunner, ContainerVolumeMount,
 };
-use crate::domain::secrets::SensitiveString;
+use crate::domain::secrets::{SensitiveString, SensitiveUrl};
 use crate::domain::shared_kernel::ImagePullPolicy;
 use crate::domain::volume::{Volume, VolumeBackend, VolumeId};
 use crate::domain::workflow::StateName;
@@ -536,7 +536,7 @@ impl GitCloneExecutor {
     ///   passed into libgit2's credentials callback for the duration of
     ///   the clone and dropped immediately afterward.
     /// - `shallow == true` sets `depth = 1` on the fetch.
-    #[instrument(skip(self, credential), fields(binding_id = %binding.id, repo_url = %binding.repo_url))]
+    #[instrument(skip(self, credential), fields(binding_id = %binding.id, repo_url = %SensitiveUrl::new(binding.repo_url.as_str())))]
     pub async fn clone_libgit2(
         &self,
         binding: &GitRepoBinding,

@@ -116,7 +116,7 @@ impl aegis_orchestrator_core::application::ports::WorkflowExecutionControlPort
 
         // Also clean up the database row if available
         if let Some(database) = &self.config.spec.database {
-            if let Ok(database_url) = resolve_env_value(&database.url) {
+            if let Ok(database_url) = resolve_env_value(database.url.expose()) {
                 if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(1)
                     .connect(&database_url)

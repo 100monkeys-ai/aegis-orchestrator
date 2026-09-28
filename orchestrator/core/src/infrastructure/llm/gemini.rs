@@ -8,6 +8,7 @@ use crate::domain::llm::{
     ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
     LLMError, LLMProvider, ToolSchema,
 };
+use crate::domain::secrets::SensitiveUrl;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -335,7 +336,7 @@ impl LLMProvider for GeminiAdapter {
         tracing::debug!(
             provider = "gemini",
             model = %self.model,
-            endpoint_url = %url,
+            endpoint_url = %SensitiveUrl::new(url.as_str()),
             "LLM HTTP request"
         );
         let http_started_at = std::time::Instant::now();

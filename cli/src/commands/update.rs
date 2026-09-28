@@ -207,7 +207,7 @@ pub(crate) async fn run_database_migrations(
         .as_ref()
         .context("spec.database not configured in aegis-config.yaml")?;
     let database_url =
-        resolve_env_value(&db_config.url).context("Failed to resolve spec.database.url")?;
+        resolve_env_value(db_config.url.expose()).context("Failed to resolve spec.database.url")?;
 
     // ADR-117 SEV-2 #2.1: the orchestrator binary lives in the `cli` crate;
     // `sqlx::migrate!` resolves its argument relative to the crate root, so

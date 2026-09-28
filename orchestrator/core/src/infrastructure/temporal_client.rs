@@ -59,6 +59,7 @@
 //! - **Task Queue**: Worker registration and task routing identifier
 
 use crate::application::ports::WorkflowEnginePort;
+use crate::domain::secrets::SensitiveUrl;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
@@ -190,7 +191,7 @@ impl TemporalClient {
             .await
             .context(format!(
                 "Failed to start workflow execution via gRPC (Temporal: {})",
-                self.temporal_endpoint
+                SensitiveUrl::new(self.temporal_endpoint.as_str())
             ))?;
 
         Ok(response.into_inner().run_id)

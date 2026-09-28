@@ -104,39 +104,77 @@ const SENSITIVE_QUERY_PARAMS: &[&str] = &[
     "sig",
 ];
 
+/// What [`redact_url`] prints for a value it cannot read as a URL. The value
+/// itself is never printed, because a string that is not a URL may be a
+/// credential put in the wrong field.
+const UNPARSEABLE_URL: &str = "[unparseable-url]";
+
 /// Renders a URL for output with its credentials removed.
 ///
-/// Returns the URL with sensitive parameter values replaced by `[REDACTED]`.
-/// If the URL cannot be parsed, returns `[unparseable-url]`.
+/// Scheme, host, port and path are kept. User info, whether a password, a
+/// token carried as the user name, or both, is replaced by `[REDACTED]`. The
+/// value of every query parameter named in `SENSITIVE_QUERY_PARAMS` is
+/// replaced by `[REDACTED]`; other parameters are kept. The fragment is
+/// dropped.
+///
+/// A value with no `://` is read as `[user:password@]host:port` (the form of
+/// a Temporal address or a bare DSN authority) and printed without the user
+/// info. Anything that is neither is printed as `[unparseable-url]`.
 pub fn redact_url(raw: &str) -> String {
-    let Ok(parsed) = url::Url::parse(raw) else {
-        return "[unparseable-url]".to_string();
-    };
-
-    if parsed.query().is_none() {
-        return parsed.to_string();
+    let raw = raw.trim();
+    if raw.contains("://") {
+        match url::Url::parse(raw) {
+            Ok(parsed) => render_redacted(&parsed, true),
+            Err(_) => UNPARSEABLE_URL.to_string(),
+        }
+    } else {
+        // Read `[user:password@]host:port` through a scheme that has an
+        // authority, then print it without that scheme.
+        match url::Url::parse(&format!("tcp://{raw}")) {
+            Ok(parsed) if parsed.host_str().is_some() && parsed.port().is_some() => {
+                render_redacted(&parsed, false)
+            }
+            _ => UNPARSEABLE_URL.to_string(),
+        }
     }
+}
 
-    let pairs: Vec<(String, String)> = parsed
+fn render_redacted(parsed: &url::Url, with_scheme: bool) -> String {
+    let mut out = String::new();
+    if with_scheme {
+        out.push_str(parsed.scheme());
+        out.push_str("://");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        out.push_str("[REDACTED]@");
+    }
+    if let Some(host) = parsed.host_str() {
+        out.push_str(host);
+    }
+    if let Some(port) = parsed.port() {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
+    let path = parsed.path();
+    if with_scheme || path != "/" {
+        out.push_str(path);
+    }
+    let pairs: Vec<String> = parsed
         .query_pairs()
         .map(|(k, v)| {
             let key_lower = k.to_lowercase();
             if SENSITIVE_QUERY_PARAMS.iter().any(|s| key_lower.contains(s)) {
-                (k.into_owned(), "[REDACTED]".to_string())
+                format!("{k}=[REDACTED]")
             } else {
-                (k.into_owned(), v.into_owned())
+                format!("{k}={v}")
             }
         })
         .collect();
-
-    // Build query string manually to avoid percent-encoding of brackets
-    let base = &parsed[..url::Position::AfterPath];
-    if pairs.is_empty() {
-        base.to_string()
-    } else {
-        let qs: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        format!("{base}?{}", qs.join("&"))
+    if !pairs.is_empty() {
+        out.push('?');
+        out.push_str(&pairs.join("&"));
     }
+    out
 }
 
 /// A connection URL (database DSN, service endpoint) that may carry a

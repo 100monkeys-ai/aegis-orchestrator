@@ -22,6 +22,8 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use aegis_orchestrator_core::domain::secrets::SensitiveUrl;
+
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_service_server::{
     FuseMountService, FuseMountServiceServer,
 };
@@ -334,7 +336,7 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             listen_addr,
         } => {
             info!(
-                orchestrator_url = %orchestrator_url,
+                orchestrator_url = %SensitiveUrl::new(orchestrator_url.as_str()),
                 mount_prefix = %mount_prefix,
                 listen_addr = %listen_addr,
                 "Starting AEGIS FUSE daemon (ADR-107)"
