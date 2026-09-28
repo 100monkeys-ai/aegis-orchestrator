@@ -31,21 +31,52 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// locks are kept per database, so one key serves every database.
 const MIGRATION_LOCK_KEY: i64 = 0x6165_6769_736d_6967; // "aegismig"
 
+/// Why migrations were not applied.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    /// Another process held the migration lock for longer than this one
+    /// waits.
+    #[error(
+        "another process has been applying the database migrations for more than {seconds} \
+         seconds; this process stopped waiting and applied none"
+    )]
+    Busy { seconds: u64 },
+    #[error(transparent)]
+    Migrate(#[from] MigrateError),
+}
+
+/// How long a process waits for another that is applying migrations.
+pub const MIGRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A statement PostgreSQL refuses inside a transaction block, when `sql`
+/// holds one: its name. Comments are not read.
+pub fn refused_in_a_transaction(_sql: &str) -> Option<&'static str> {
+    None
+}
+
 /// Apply every migration the database does not have yet, one process at a
-/// time. A process that waited for another finds the migrations applied and
-/// returns `Ok`.
-pub async fn apply_migrations(pool: &PgPool) -> Result<(), MigrateError> {
-    let mut tx = pool.begin().await?;
+/// time, waiting at most `MIGRATION_WAIT` for another.
+pub async fn apply_migrations(pool: &PgPool) -> Result<(), MigrationError> {
+    apply_migrations_waiting_at_most(pool, MIGRATION_WAIT).await
+}
+
+/// As [`apply_migrations`], waiting at most `_wait` for another process.
+pub async fn apply_migrations_waiting_at_most(
+    pool: &PgPool,
+    _wait: std::time::Duration,
+) -> Result<(), MigrationError> {
+    let mut tx = pool.begin().await.map_err(MigrateError::from)?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(MIGRATION_LOCK_KEY)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(MigrateError::from)?;
     // The lock above holds for the whole transaction; sqlx's own lock would
     // be a second, session-level one.
     let mut migrator = Migrator::new(Shipped).await?;
     migrator.set_locking(false);
     migrator.run_direct(&mut *tx).await?;
-    tx.commit().await?;
+    tx.commit().await.map_err(MigrateError::from)?;
     Ok(())
 }
 
