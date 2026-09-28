@@ -5161,3 +5161,279 @@ async fn aegis_task_remove_rejects_cross_tenant_execution_id() {
         "expected NotFound surfaced as 'Failed to remove execution', got {err}"
     );
 }
+
+/// `aegis.system.config` answers an agent, and so the agent's model provider.
+/// It must never hand over a secret written literally in the node's
+/// configuration file.
+mod system_config_tool {
+    use super::*;
+
+    /// A node configuration with a literal marker secret in every field that
+    /// can hold a secret: each secret-typed value, each map of credentials,
+    /// headers or environment, and the user info of each URL. Each marker
+    /// names its field, so a failure says which field leaked.
+    const CONFIG_WITH_LITERAL_SECRETS: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+metadata:
+  name: marker-node
+spec:
+  node:
+    id: marker-node
+    type: orchestrator
+  registry_credentials:
+    - registry: ghcr.io
+      username: someone
+      password: "Mk5-registry-password"
+  llm_providers:
+    - name: primary
+      type: openai-compatible
+      endpoint: "https://u:Mk5-llm-endpoint@llm.example.invalid/v1"
+      api_key: "Mk5-llm-api-key"
+      models:
+        - alias: default
+          model: some-model
+          capabilities: [chat]
+          context_window: 8192
+  runtime:
+    orchestrator_url: "http://u:Mk5-runtime-orchestrator-url@aegis-runtime:8088"
+    fuse_daemon_endpoint: "http://u:Mk5-runtime-fuse-endpoint@fuse:50070"
+  network:
+    orchestrator_endpoint: "wss://u:Mk5-network-orchestrator-endpoint@edge.example.invalid/ws"
+  observability:
+    logging:
+      otlp_endpoint: "https://u:Mk5-logging-otlp-endpoint@otlp.example.invalid"
+      otlp_headers:
+        authorization: "Mk5-logging-otlp-header"
+    tracing:
+      enabled: true
+      otlp_endpoint: "https://u:Mk5-tracing-otlp-endpoint@otlp.example.invalid"
+  storage:
+    backend: seaweedfs
+    seaweedfs:
+      filer_url: "http://u:Mk5-seaweedfs-filer-url@filer:8888"
+      s3_endpoint: "http://u:Mk5-seaweedfs-s3-endpoint@s3:8333"
+    opendal:
+      provider: s3
+      options:
+        secret_access_key: "Mk5-opendal-option"
+  mcp_servers:
+    - name: tools
+      executable: /usr/local/bin/tools
+      credentials:
+        API_TOKEN: "Mk5-mcp-credential"
+      environment:
+        SERVICE_PASSWORD: "Mk5-mcp-environment"
+  builtin_dispatchers:
+    - name: web.search
+      description: search
+      api_key: "Mk5-dispatcher-api-key"
+  database:
+    url: "postgresql://aegis:Mk5-database-url@db:5432/aegis"
+  temporal:
+    address: "u:Mk5-temporal-address@temporal:7233"
+    worker_http_endpoint: "http://u:Mk5-temporal-worker-endpoint@worker:3000"
+    worker_secret: "Mk5-temporal-worker-secret"
+  cortex:
+    grpc_url: "http://u:Mk5-cortex-grpc-url@cortex:50052"
+    api_key: "Mk5-cortex-api-key"
+  secrets:
+    backend:
+      address: "https://u:Mk5-secrets-address@openbao:8200"
+      approle:
+        role_id: some-role
+  cluster:
+    enabled: true
+    role: worker
+    controller:
+      endpoint: "http://u:Mk5-cluster-controller-endpoint@controller:50056"
+      token: "Mk5-cluster-controller-token"
+    peers:
+      - "http://u:Mk5-cluster-peer@peer:50056"
+    relay_coordinator_endpoint: "http://u:Mk5-cluster-relay-endpoint@relay:50056"
+    ingress:
+      public_endpoint: "https://u:Mk5-cluster-ingress-endpoint@relay.example.invalid"
+  iam:
+    realms:
+      - slug: zaru-consumer
+        issuer_url: "https://u:Mk5-iam-issuer-url@auth.example.invalid/realms/zaru-consumer"
+        jwks_uri: "https://u:Mk5-iam-jwks-uri@auth.example.invalid/realms/zaru-consumer/certs"
+        audience: account
+        kind: consumer
+    keycloak_admin:
+      host: "https://u:Mk5-keycloak-host@auth.example.invalid"
+      admin_username: admin
+      admin_password: "Mk5-keycloak-admin-password"
+  seal_gateway:
+    url: "http://u:Mk5-seal-gateway-url@gateway:50055"
+  zaru:
+    public_url: "https://u:Mk5-zaru-public-url@zaru.example.invalid"
+    internal_secret: "Mk5-zaru-internal-secret"
+  billing:
+    stripe_secret_key: "Mk5-billing-stripe-secret-key"
+    stripe_webhook_secret: "Mk5-billing-stripe-webhook-secret"
+    invitation_hmac_key: "Mk5-billing-invitation-hmac-key"
+"#;
+
+    fn service_reading(path: std::path::PathBuf) -> ToolInvocationService {
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let (fsal, volume_registry, _storage_root) = test_fsal_deps();
+        ToolInvocationService::new(
+            Arc::new(InMemorySealSessionRepository::new()),
+            Arc::new(
+                crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+            ),
+            Arc::new(SealMiddleware::new()),
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        )
+        .with_node_config_path(Some(path))
+    }
+
+    async fn answer_for(config_text: &str) -> Value {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("aegis-config.yaml");
+        std::fs::write(&path, config_text).expect("configuration written");
+        match service_reading(path)
+            .invoke_aegis_system_config_tool()
+            .await
+            .expect("the tool answers")
+        {
+            ToolInvocationResult::Direct(value) => value,
+            _ => panic!("the tool answers directly"),
+        }
+    }
+
+    /// The markers in the fixture, each named by the field it sits in.
+    fn markers() -> Vec<String> {
+        CONFIG_WITH_LITERAL_SECRETS
+            .split('"')
+            .flat_map(|part| part.split(['@', ':']))
+            .filter(|part| part.starts_with("Mk5-"))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn every_marker_is_read_into_the_configuration() {
+        // Guards the fixture: a marker under a key the configuration does not
+        // have would be dropped when the file is parsed, and the test below
+        // would pass without testing that field.
+        let parsed = crate::domain::node_config::NodeConfigManifest::from_yaml_str(
+            CONFIG_WITH_LITERAL_SECRETS,
+        )
+        .expect("the fixture is a node configuration");
+        let ordinary = serde_json::to_string(&parsed).expect("serialises");
+        let markers = markers();
+        assert_eq!(
+            markers.len(),
+            37,
+            "the fixture has {} markers",
+            markers.len()
+        );
+        let dropped: Vec<&String> = markers
+            .iter()
+            .filter(|m| !ordinary.contains(m.as_str()))
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "markers not read into the configuration: {dropped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_config_answer_holds_no_literal_secret_from_the_file() {
+        let answer = answer_for(CONFIG_WITH_LITERAL_SECRETS).await;
+        let text = answer.to_string();
+        let leaked: Vec<String> = markers()
+            .into_iter()
+            .filter(|m| text.contains(m.as_str()))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the configuration the agent reads holds literal secrets from: {leaked:?}"
+        );
+        assert!(
+            answer.get("content_yaml").is_none(),
+            "the answer carries the file's text"
+        );
+        let spec = &answer["config"]["spec"];
+        assert_eq!(spec["billing"]["stripe_secret_key"], "[REDACTED]");
+        assert_eq!(
+            spec["database"]["url"],
+            "postgresql://[REDACTED]@db:5432/aegis"
+        );
+        assert_eq!(spec["node"]["id"], "marker-node", "settings are shown");
+    }
+
+    #[tokio::test]
+    async fn system_config_answer_shows_references_as_written() {
+        let config = r#"
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+metadata:
+  name: reference-node
+spec:
+  node:
+    id: reference-node
+    type: orchestrator
+  database:
+    url: "env:AEGIS_DATABASE_URL"
+  mcp_servers:
+    - name: tools
+      executable: /usr/local/bin/tools
+      credentials:
+        API_TOKEN: "secret:aegis-system/kv/tools#token"
+  billing:
+    stripe_secret_key: "env:STRIPE_SECRET_KEY"
+"#;
+        let answer = answer_for(config).await;
+        let spec = &answer["config"]["spec"];
+        assert_eq!(spec["database"]["url"], "env:AEGIS_DATABASE_URL");
+        assert_eq!(
+            spec["billing"]["stripe_secret_key"],
+            "env:STRIPE_SECRET_KEY"
+        );
+        assert_eq!(
+            spec["mcp_servers"][0]["credentials"]["API_TOKEN"],
+            "secret:aegis-system/kv/tools#token"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_config_error_does_not_repeat_the_file() {
+        // A secret written into a field of the wrong type makes the parser's
+        // own message quote it.
+        let config = r#"
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+metadata:
+  name: broken-node
+spec:
+  node:
+    id: broken-node
+    type: orchestrator
+  network:
+    port: "Mk5-in-the-wrong-field"
+"#;
+        let answer = answer_for(config).await;
+        let text = answer.to_string();
+        assert!(
+            !text.contains("Mk5"),
+            "the answer to a configuration that does not parse repeats its text: {text}"
+        );
+        assert!(
+            answer.get("error").is_some(),
+            "the answer says it failed: {text}"
+        );
+    }
+}

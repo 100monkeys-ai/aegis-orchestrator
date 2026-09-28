@@ -409,6 +409,17 @@ impl std::fmt::Display for RedactedUrl {
 }
 
 // ---------------------------------------------------------------------------
+// The redacted view — a value as it may be shown to someone who must not see
+// a secret
+// ---------------------------------------------------------------------------
+
+/// Serialise `value` to JSON in the form that may be shown to a reader who
+/// must not see a secret, such as an agent and its model provider.
+pub fn to_redacted_json<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(value)
+}
+
+// ---------------------------------------------------------------------------
 // SecretPath — namespace-aware path value object (ADR-034 §SecretPath)
 // ---------------------------------------------------------------------------
 
@@ -748,6 +759,84 @@ mod tests {
         }
     }
     use super::*;
+
+    // ── The redacted view ────────────────────────────────────────────────────
+
+    /// A value of a secret type is shown as its reference when it is one and
+    /// never as a literal, wherever it sits: a field, an option, a list or a
+    /// map. The decision is made by the type, so a field of a secret type
+    /// added later is covered without being named anywhere.
+    #[test]
+    fn redacted_view_shows_references_and_no_literal_of_any_secret_type() {
+        #[derive(Serialize)]
+        struct Inner {
+            token: SensitiveString,
+            key: SensitiveBytes,
+        }
+        #[derive(Serialize)]
+        struct Holder {
+            plain: SensitiveString,
+            optional: Option<SensitiveString>,
+            listed: Vec<SensitiveString>,
+            mapped: std::collections::BTreeMap<String, SensitiveString>,
+            nested: Inner,
+            url: SensitiveUrl,
+            url_reference: SensitiveUrl,
+            env_reference: SensitiveString,
+            store_reference: SensitiveString,
+            not_a_reference: SensitiveString,
+            name: String,
+        }
+        let holder = Holder {
+            plain: SensitiveString::new("Mk9-plain"),
+            optional: Some(SensitiveString::new("Mk9-optional")),
+            listed: vec![SensitiveString::new("Mk9-listed")],
+            mapped: [("k".to_string(), SensitiveString::new("Mk9-mapped"))]
+                .into_iter()
+                .collect(),
+            nested: Inner {
+                token: SensitiveString::new("Mk9-nested"),
+                key: SensitiveBytes::new(b"Mk9-bytes".to_vec()),
+            },
+            url: SensitiveUrl::new("https://u:Mk9-url@db.example.invalid/x?token=Mk9-query"),
+            url_reference: SensitiveUrl::new("env:DATABASE_URL"),
+            env_reference: SensitiveString::new("env:STRIPE_SECRET_KEY"),
+            store_reference: SensitiveString::new("secret:aegis-system/kv/stripe#key"),
+            not_a_reference: SensitiveString::new("env:Mk9 has spaces"),
+            name: "kept".to_string(),
+        };
+
+        let shown = to_redacted_json(&holder).expect("serialises");
+        let text = shown.to_string();
+        assert!(
+            !text.contains("Mk9"),
+            "the redacted view holds a literal secret: {text}"
+        );
+        assert_eq!(shown["plain"], "[REDACTED]");
+        assert_eq!(shown["mapped"]["k"], "[REDACTED]");
+        assert_eq!(shown["nested"]["key"], "[REDACTED]");
+        assert_eq!(
+            shown["url"],
+            "https://[REDACTED]@db.example.invalid/x?token=[REDACTED]"
+        );
+        assert_eq!(shown["url_reference"], "env:DATABASE_URL");
+        assert_eq!(shown["env_reference"], "env:STRIPE_SECRET_KEY");
+        assert_eq!(
+            shown["store_reference"],
+            "secret:aegis-system/kv/stripe#key"
+        );
+        assert_eq!(shown["name"], "kept");
+
+        // The ordinary form is unchanged: a configuration file written back
+        // still holds its values.
+        let ordinary = serde_json::to_value(&holder)
+            .expect("serialises")
+            .to_string();
+        assert!(
+            ordinary.contains("Mk9-plain") && ordinary.contains("Mk9-url"),
+            "the ordinary form lost a value"
+        );
+    }
 
     // ── SensitiveString ──────────────────────────────────────────────────────
 
