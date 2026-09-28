@@ -95,6 +95,14 @@ use tracing::{debug, error, info, warn};
 use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::domain::secrets::SensitiveUrl;
+use aegis_orchestrator_core::presentation::grpc::health::{
+    postgres_readiness, service_name, GrpcHealth, ReadinessCheck,
+};
+
+/// How long a gRPC server's readiness waits for its database's `SELECT 1`.
+const DATABASE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How often a gRPC server started here re-evaluates its readiness.
+const READINESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 use aegis_orchestrator_core::{
     application::{
         agent::AgentLifecycleService,
@@ -2448,6 +2456,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         _ => None,
     };
 
+    // The main gRPC server is ready while its database answers, when it has
+    // one; without one it serves from in-memory repositories.
+    let grpc_readiness: Vec<ReadinessCheck> = db_pool
+        .as_ref()
+        .map(|pool| vec![postgres_readiness(pool.clone(), DATABASE_READINESS_TIMEOUT)])
+        .unwrap_or_default();
+
     tokio::spawn(async move {
         tracing::info!(address = %grpc_addr, "Starting gRPC server");
         if let Err(e) = aegis_orchestrator_core::presentation::grpc::server::start_grpc_server(
@@ -2473,6 +2488,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 output_handler_service: Some(output_handler_service),
                 fsal: Some(nfs_gateway.fsal().clone()),
                 fuse_mount_client: fuse_mount_client.clone(),
+                readiness: grpc_readiness,
             },
         )
         .await
@@ -2778,16 +2794,31 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             let storage_handler =
                 RemoteStorageServiceHandler::new(remote_fsal, cluster_repo, controller_node_id);
 
+            // The cluster server is ready while its database answers: every
+            // NodeClusterService RPC reads or writes the cluster tables.
+            let cluster_readiness =
+                vec![postgres_readiness(pool.clone(), DATABASE_READINESS_TIMEOUT)];
+
             tokio::spawn(async move {
                 tracing::info!(address = %cluster_addr, "Starting cluster gRPC server on port {cluster_grpc_port}");
+                let cluster_server = NodeClusterServiceServer::new(handler);
+                let storage_server = RemoteStorageServiceServer::new(storage_handler);
+                let (health, health_server) = GrpcHealth::new(&[
+                    service_name(&cluster_server),
+                    service_name(&storage_server),
+                ])
+                .await;
+                let monitor = health.spawn_monitor(cluster_readiness, READINESS_INTERVAL);
                 if let Err(e) = tonic::transport::Server::builder()
-                    .add_service(NodeClusterServiceServer::new(handler))
-                    .add_service(RemoteStorageServiceServer::new(storage_handler))
+                    .add_service(health_server)
+                    .add_service(cluster_server)
+                    .add_service(storage_server)
                     .serve(cluster_addr)
                     .await
                 {
                     tracing::error!(error = %e, "Cluster gRPC server failed");
                 }
+                monitor.abort();
             });
 
             // ADR-062: Spawn health sweeper for stale heartbeat detection

@@ -23,6 +23,9 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use aegis_orchestrator_core::domain::secrets::SensitiveUrl;
+use aegis_orchestrator_core::presentation::grpc::health::{
+    service_name, GrpcHealth, ServingStatus,
+};
 
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_service_server::{
     FuseMountService, FuseMountServiceServer,
@@ -468,8 +471,14 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             // active mount before exiting so the kernel never holds dangling
             // FUSE mounts after a daemon restart.
             let shutdown_handles = handles.clone();
+            // Its one dependency, the orchestrator's FsalService, was
+            // connected above before the server starts: SERVING once listening.
+            let fuse_server = FuseMountServiceServer::new(service);
+            let (health, health_server) = GrpcHealth::new(&[service_name(&fuse_server)]).await;
+            health.set(ServingStatus::Serving).await;
             let server_result = Server::builder()
-                .add_service(FuseMountServiceServer::new(service))
+                .add_service(health_server)
+                .add_service(fuse_server)
                 .serve_with_shutdown(addr, shutdown_signal())
                 .await;
 

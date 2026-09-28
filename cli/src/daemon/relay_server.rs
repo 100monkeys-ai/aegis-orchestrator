@@ -31,7 +31,9 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_s
 use aegis_orchestrator_core::infrastructure::cluster::NodeClusterServiceHandler;
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager;
-use aegis_orchestrator_core::presentation::grpc::health::{postgres_readiness, ReadinessCheck};
+use aegis_orchestrator_core::presentation::grpc::health::{
+    postgres_readiness, service_name, GrpcHealth, ReadinessCheck,
+};
 use std::future::Future;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -414,15 +416,19 @@ pub(crate) async fn serve_relay_cluster(
     readiness_interval: Duration,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
-    // The readiness checks are accepted here and reported by the next commit.
-    let _ = (readiness, readiness_interval);
-    tonic::transport::Server::builder()
-        .add_service(NodeClusterServiceServer::new(handler))
+    let cluster_server = NodeClusterServiceServer::new(handler);
+    let (health, health_server) = GrpcHealth::new(&[service_name(&cluster_server)]).await;
+    let monitor = health.spawn_monitor(readiness, readiness_interval);
+    let result = tonic::transport::Server::builder()
+        .add_service(health_server)
+        .add_service(cluster_server)
         .serve_with_incoming_shutdown(
             TcpIncoming::from(listener).with_nodelay(Some(true)),
             shutdown,
         )
-        .await
+        .await;
+    monitor.abort();
+    result
 }
 
 #[cfg(test)]

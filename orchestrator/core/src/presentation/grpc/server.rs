@@ -35,6 +35,7 @@ const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 1000;
 const EXECUTION_TERMINAL_POLL_INTERVAL_MS: u64 = 250;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
 use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
+use crate::presentation::grpc::health::{service_name, GrpcHealth, ReadinessCheck};
 use crate::presentation::keycloak_auth::ScopeGuard;
 use crate::presentation::metrics_middleware::GrpcMetricsLayer;
 
@@ -1826,7 +1827,13 @@ pub struct GrpcServerConfig {
             tonic::transport::Channel,
         >,
     >,
+    /// What this server needs in order to serve, reported over
+    /// `grpc.health.v1.Health`. Empty: `SERVING` once listening.
+    pub readiness: Vec<ReadinessCheck>,
 }
+
+/// How often the main gRPC server re-evaluates its readiness.
+const GRPC_READINESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut service = AegisRuntimeService::new(config.execution_service, config.validation_service);
@@ -1872,18 +1879,31 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
     }
 
     let server = service.into_server();
+    let fsal_server = config
+        .fsal
+        .map(|fsal| FsalServiceServer::new(FsalGrpcService::new(fsal)));
+
+    let mut hosted = vec![service_name(&server)];
+    if let Some(fsal_server) = &fsal_server {
+        hosted.push(service_name(fsal_server));
+    }
+    let (health, health_server) = GrpcHealth::new(&hosted).await;
+    let monitor = health.spawn_monitor(config.readiness, GRPC_READINESS_INTERVAL);
 
     tracing::info!("Starting AEGIS gRPC server on {}", config.addr);
 
     let mut builder = tonic::transport::Server::builder()
         .layer(GrpcMetricsLayer)
+        .add_service(health_server)
         .add_service(server);
 
-    if let Some(fsal) = config.fsal {
-        builder = builder.add_service(FsalServiceServer::new(FsalGrpcService::new(fsal)));
+    if let Some(fsal_server) = fsal_server {
+        builder = builder.add_service(fsal_server);
     }
 
-    builder.serve(config.addr).await?;
+    let result = builder.serve(config.addr).await;
+    monitor.abort();
+    result?;
 
     Ok(())
 }
@@ -2870,6 +2890,7 @@ mod tests {
             output_handler_service: None,
             fsal: None,
             fuse_mount_client: None,
+            readiness: vec![],
         };
 
         assert!(
@@ -3180,6 +3201,7 @@ mod tests {
             output_handler_service: None,
             fsal: None,
             fuse_mount_client: None,
+            readiness: vec![],
         };
         assert!(
             config.fsal.is_none(),
