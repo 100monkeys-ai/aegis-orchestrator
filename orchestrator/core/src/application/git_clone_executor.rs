@@ -187,7 +187,7 @@ impl EphemeralCliEngine {
                 script_prelude.push_str(&prelude);
                 env.insert("GIT_ASKPASS".to_string(), "/tmp/askpass.sh".to_string());
                 env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
-                binding.repo_url.expose().to_string()
+                remote_url(binding)
             }
             Some(ResolvedCredential::SshKey {
                 private_key_pem,
@@ -225,9 +225,9 @@ impl EphemeralCliEngine {
                     "GIT_SSH_COMMAND".to_string(),
                     "ssh -i /tmp/ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string(),
                 );
-                binding.repo_url.expose().to_string()
+                remote_url(binding)
             }
-            None => binding.repo_url.expose().to_string(),
+            None => remote_url(binding),
         };
 
         // -- sparse checkout --
@@ -331,6 +331,13 @@ impl EphemeralCliEngine {
         }
         Ok(sha)
     }
+}
+
+/// The URL git connects to, as stored on the binding. The one place the
+/// executor reads it: the clone command (every credential arm) and libgit2's
+/// clone and fetch all take it from here.
+fn remote_url(binding: &GitRepoBinding) -> String {
+    binding.repo_url.expose().to_string()
 }
 
 fn shell_escape(s: &str) -> String {
@@ -544,8 +551,7 @@ impl GitCloneExecutor {
         credential: Option<ResolvedCredential>,
         shallow: bool,
     ) -> Result<String, CloneError> {
-        // Read to connect: libgit2 clones from it.
-        let repo_url = binding.repo_url.expose().to_string();
+        let repo_url = remote_url(binding);
         let target_dir: PathBuf = target_dir.to_path_buf();
         let sparse_paths = binding.sparse_paths.clone();
 
@@ -603,8 +609,7 @@ impl GitCloneExecutor {
     ) -> Result<String, CloneError> {
         let target_dir: PathBuf = target_dir.to_path_buf();
         let git_ref = binding.git_ref.clone();
-        // Read to connect: libgit2 fetches from it.
-        let repo_url = binding.repo_url.expose().to_string();
+        let repo_url = remote_url(binding);
 
         let sha = tokio::task::spawn_blocking(move || -> Result<String, CloneError> {
             blocking_fetch_and_checkout(&repo_url, &target_dir, &git_ref, credential)
@@ -1166,6 +1171,135 @@ mod tests {
             script.contains("chmod 0600 /tmp/ssh_key"),
             "script must chmod 0600 the materialised key"
         );
+    }
+
+    /// libgit2 is handed the binding's URL exactly as stored, user info
+    /// included: a redacted rendering would lose the credential it carries.
+    #[test]
+    fn libgit2_is_handed_the_repository_url_as_stored() {
+        use crate::domain::tenant::TenantId;
+        const URL: &str = "https://x-access-token:Mk7-libgit2-url-marker@github.com/owner/repo.git";
+        let binding = GitRepoBinding::new(
+            TenantId::system(),
+            None,
+            URL.to_string(),
+            GitRef::Branch("main".to_string()),
+            None,
+            crate::domain::volume::VolumeId::new(),
+            "libgit2-url".to_string(),
+            CloneStrategy::Libgit2,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            remote_url(&binding),
+            URL,
+            "libgit2 would connect to a different URL than the binding's"
+        );
+    }
+
+    /// The clone step's command carries the binding's repository URL exactly
+    /// as stored, in each credential arm (PAT, SSH key, none). The URL holds a
+    /// marker as user info, which a redacted rendering would drop, so the test
+    /// fails if the step formats the URL instead of reading it. Nothing is
+    /// run: a capturing runner records the step it is given.
+    #[tokio::test]
+    async fn clone_command_carries_the_repository_url_in_each_credential_arm() {
+        use crate::domain::runtime::{
+            ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
+        };
+        use crate::domain::tenant::TenantId;
+        use crate::domain::volume::{
+            FilerEndpoint, StorageClass, Volume, VolumeBackend, VolumeOwnership,
+        };
+        use std::sync::Mutex;
+
+        struct CapturingRunner {
+            captured: Arc<Mutex<Option<ContainerStepConfig>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ContainerStepRunner for CapturingRunner {
+            async fn run_step(
+                &self,
+                config: ContainerStepConfig,
+            ) -> Result<ContainerStepResult, ContainerStepError> {
+                *self.captured.lock().unwrap() = Some(config);
+                Ok(ContainerStepResult {
+                    exit_code: 0,
+                    stdout: format!("{}\n", "a".repeat(40)),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                })
+            }
+        }
+
+        const URL: &str = "https://x-access-token:Mk7-clone-url-marker@github.com/owner/repo.git";
+        let arms: [(&str, fn() -> Option<ResolvedCredential>); 3] = [
+            ("https pat", || {
+                Some(ResolvedCredential::github_pat(SensitiveString::new(
+                    "pat-value",
+                )))
+            }),
+            ("ssh key", || {
+                Some(ResolvedCredential::SshKey {
+                    private_key_pem: SensitiveString::new("key-value"),
+                    passphrase: None,
+                })
+            }),
+            ("no credential", || None),
+        ];
+        for (arm, credential) in arms {
+            let captured = Arc::new(Mutex::new(None));
+            let runner = Arc::new(CapturingRunner {
+                captured: captured.clone(),
+            });
+            let engine = EphemeralCliEngine::new(runner, Arc::new(NfsVolumeRegistry::new()));
+            let volume = Volume::new(
+                "clone-url".to_string(),
+                TenantId::system(),
+                StorageClass::ephemeral_hours(1),
+                VolumeBackend::SeaweedFS {
+                    filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
+                    remote_path: "/aegis/seaweedfs/test".to_string(),
+                },
+                1024 * 1024,
+                VolumeOwnership::persistent("clone-url-test"),
+            )
+            .unwrap();
+            let binding = GitRepoBinding::new(
+                TenantId::system(),
+                None,
+                URL.to_string(),
+                GitRef::Branch("main".to_string()),
+                None,
+                volume.id,
+                "clone-url".to_string(),
+                CloneStrategy::EphemeralCli {
+                    reason: "test".to_string(),
+                },
+                false,
+                None,
+                None,
+                None,
+            );
+            engine
+                .clone_into_volume(&binding, &volume, credential(), true)
+                .await
+                .expect("captured runner returns Ok");
+            let cfg = captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("runner must have been called once");
+            let script = cfg.command.last().expect("script arg present");
+            assert!(
+                script.contains(&format!(" {} /workspace/repo", shell_escape(URL))),
+                "{arm}: the clone command does not carry the repository URL as stored:\n{script}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
