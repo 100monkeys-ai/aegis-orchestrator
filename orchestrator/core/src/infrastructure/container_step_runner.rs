@@ -1099,9 +1099,18 @@ fn parse_memory_string(s: &str) -> Option<i64> {
 
 /// The error text for a step's `registry_credentials` value that is neither
 /// `env:VAR_NAME` nor `secret:engine/path`.
+///
+/// The value itself is never repeated: in any other form it may be the
+/// literal credential, and this text becomes the step's published failure
+/// reason. It says only whether the value has the shape of one.
 fn unrecognised_registry_credentials_message(value: &str) -> String {
+    let shape = if value.contains(':') {
+        "it looks like a literal 'username:password', which is not accepted"
+    } else {
+        "the value is withheld"
+    };
     format!(
-        "unrecognised registry_credentials format '{value}'; \
+        "unrecognised registry_credentials format ({shape}); \
          expected 'env:VAR_NAME' or 'secret:engine/path'"
     )
 }
