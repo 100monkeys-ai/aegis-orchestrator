@@ -128,7 +128,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let source = Arc::new(OperatorTokenSource::new(OperatorCredentials {
-            token_url: format!("{base}/token"),
+            token_url: format!("{base}/token").into(),
             client_id: "aegis-orchestrator".to_string(),
             client_secret: SensitiveString::new("test-secret"),
         }));

@@ -59,9 +59,11 @@ use url::Url;
 pub struct OAuthProviderConfig {
     /// Provider's authorization endpoint URL (where the user-agent is sent
     /// to begin the flow). MUST be HTTPS and MUST NOT be a placeholder.
-    pub authorization_url: String,
+    /// A URL can carry a credential, so it prints redacted.
+    pub authorization_url: SensitiveUrl,
     /// Provider's token endpoint URL. MUST be HTTPS (localhost exempted for dev).
-    pub token_url: String,
+    /// Prints redacted.
+    pub token_url: SensitiveUrl,
     /// OAuth 2.0 `client_id` registered with the provider.
     pub client_id: String,
     /// OAuth 2.0 `client_secret` for confidential clients. `None` for public clients.
@@ -114,7 +116,9 @@ pub fn validate_oauth_provider_registry(
     for (provider, cfg) in registry.iter() {
         let provider_str = provider.to_string();
 
-        if cfg.authorization_url.is_empty() {
+        // Read to validate its form; any URL an error carries is redacted.
+        let authorization_url = cfg.authorization_url.expose();
+        if authorization_url.is_empty() {
             return Err(OAuthRegistryError::EmptyAuthorizationUrl {
                 provider: provider_str,
             });
@@ -123,13 +127,13 @@ pub fn validate_oauth_provider_registry(
         // "placeholder" anywhere — this catches the legacy
         // `oauth.placeholder` host and any developer copy-paste of the
         // default value.
-        if cfg.authorization_url.contains("placeholder") {
+        if authorization_url.contains("placeholder") {
             return Err(OAuthRegistryError::PlaceholderAuthorizationUrl {
                 provider: provider_str,
-                url: cfg.authorization_url.clone(),
+                url: cfg.authorization_url.redacted(),
             });
         }
-        let parsed = Url::parse(&cfg.authorization_url).map_err(|e| {
+        let parsed = Url::parse(authorization_url).map_err(|e| {
             OAuthRegistryError::UnparseableAuthorizationUrl {
                 provider: provider_str.clone(),
                 detail: e.to_string(),
@@ -138,7 +142,7 @@ pub fn validate_oauth_provider_registry(
         if parsed.scheme() != "https" {
             return Err(OAuthRegistryError::InsecureAuthorizationUrl {
                 provider: provider_str,
-                url: cfg.authorization_url.clone(),
+                url: cfg.authorization_url.redacted(),
             });
         }
 
@@ -173,8 +177,13 @@ pub enum CredentialError {
         description: Option<String>,
     },
     /// The provider's `token_url` is not HTTPS (and not `http://localhost`).
+    /// The URL prints redacted.
     #[error("OAuth token_url must use HTTPS (or http://localhost for dev): {0}")]
-    InsecureTokenUrl(String),
+    InsecureTokenUrl(SensitiveUrl),
+    /// The provider's `token_url` cannot be parsed. Carries the parser's
+    /// message, which does not repeat the URL.
+    #[error("OAuth token_url is unparseable: {0}")]
+    UnparseableTokenUrl(String),
     /// No `OAuthProviderConfig` was registered for the provider.
     #[error("No OAuth provider configuration registered for: {0}")]
     ProviderNotConfigured(String),
@@ -193,8 +202,8 @@ pub enum CredentialError {
 /// Enforce HTTPS on the token URL per RFC 6749 §3.1.2.1, with a development
 /// exemption for `http://localhost` / `http://127.0.0.1`.
 fn ensure_secure_token_url(token_url: &str) -> Result<(), CredentialError> {
-    let parsed = Url::parse(token_url)
-        .map_err(|e| CredentialError::InsecureTokenUrl(format!("unparseable: {e}")))?;
+    let parsed =
+        Url::parse(token_url).map_err(|e| CredentialError::UnparseableTokenUrl(e.to_string()))?;
     match parsed.scheme() {
         "https" => Ok(()),
         "http" => {
@@ -202,10 +211,14 @@ fn ensure_secure_token_url(token_url: &str) -> Result<(), CredentialError> {
             if host == "localhost" || host == "127.0.0.1" || host == "::1" {
                 Ok(())
             } else {
-                Err(CredentialError::InsecureTokenUrl(token_url.to_string()))
+                Err(CredentialError::InsecureTokenUrl(SensitiveUrl::new(
+                    token_url,
+                )))
             }
         }
-        _ => Err(CredentialError::InsecureTokenUrl(token_url.to_string())),
+        _ => Err(CredentialError::InsecureTokenUrl(SensitiveUrl::new(
+            token_url,
+        ))),
     }
 }
 
@@ -213,19 +226,15 @@ fn ensure_secure_token_url(token_url: &str) -> Result<(), CredentialError> {
 // Wire-format types for the token endpoint (RFC 6749 §5.1 / §5.2)
 // ============================================================================
 
-/// RFC 6749 §5.1 successful token response.
-///
-/// NEVER derive `Debug` on a value populated from a live response: `Debug` is
-/// derived here because the struct is only used transiently inside the
-/// exchange function and never logged. Values are moved directly into
-/// `SensitiveString` before being stored or returned.
+/// RFC 6749 §5.1 successful token response. The tokens are held in
+/// `SensitiveString`, so the derived `Debug` prints them redacted.
 #[derive(Debug, serde::Deserialize)]
 struct OAuthTokenResponse {
-    access_token: String,
+    access_token: SensitiveString,
     #[allow(dead_code)]
     token_type: String,
     expires_in: Option<u64>,
-    refresh_token: Option<String>,
+    refresh_token: Option<SensitiveString>,
     scope: Option<String>,
 }
 
@@ -263,7 +272,8 @@ pub struct StoreApiKeyCommand {
 #[derive(Debug)]
 pub struct OAuthInitiation {
     /// The provider's authorization URL the client must redirect to.
-    pub authorization_url: String,
+    /// Prints redacted; serialises as the bare string.
+    pub authorization_url: SensitiveUrl,
     /// The opaque CSRF/state token — the client MUST pass this back at callback.
     pub state: String,
 }
@@ -571,7 +581,8 @@ impl StandardCredentialManagementService {
             .get(provider)
             .ok_or_else(|| CredentialError::ProviderNotConfigured(provider.to_string()))?;
 
-        ensure_secure_token_url(&cfg.token_url)?;
+        // Read to check its scheme before any request is sent.
+        ensure_secure_token_url(cfg.token_url.expose())?;
 
         // Build application/x-www-form-urlencoded body per RFC 6749 §4.1.3.
         // `client_secret` is included only for confidential clients.
@@ -590,13 +601,14 @@ impl StandardCredentialManagementService {
 
         tracing::info!(
             provider = %provider,
-            token_url = %SensitiveUrl::new(cfg.token_url.as_str()),
+            token_url = %cfg.token_url.redacted(),
             "Posting OAuth authorization-code exchange to provider token endpoint"
         );
 
         let resp = self
             .http
-            .post(&cfg.token_url)
+            // Read to send the exchange to the token endpoint.
+            .post(cfg.token_url.expose())
             .header("Accept", "application/json")
             .form(&form)
             .send()
@@ -804,7 +816,8 @@ impl CredentialManagementService for StandardCredentialManagementService {
         // base and appending properly-encoded query parameters via
         // `Url::query_pairs_mut` — never via `format!` (security audit 002
         // §4.11: caller-supplied `redirect_uri` must be percent-encoded).
-        let mut auth_url = Url::parse(&cfg.authorization_url).map_err(|e| {
+        // Read to build the redirect the client follows.
+        let mut auth_url = Url::parse(cfg.authorization_url.expose()).map_err(|e| {
             anyhow!(
                 "configured authorization_url for {} is unparseable: {}",
                 provider,
@@ -821,7 +834,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
             .append_pair("redirect_uri", &redirect_uri);
 
         Ok(OAuthInitiation {
-            authorization_url: auth_url.to_string(),
+            authorization_url: SensitiveUrl::new(auth_url.to_string()),
             state,
         })
     }
@@ -883,15 +896,9 @@ impl CredentialManagementService for StandardCredentialManagementService {
         // Persist the tokens returned by the provider. Compute an absolute
         // `expires_at` so the refresh path doesn't need clock math on read.
         let mut secret_data = HashMap::new();
-        secret_data.insert(
-            "access_token".to_string(),
-            SensitiveString::new(token_response.access_token),
-        );
+        secret_data.insert("access_token".to_string(), token_response.access_token);
         if let Some(refresh_token) = token_response.refresh_token {
-            secret_data.insert(
-                "refresh_token".to_string(),
-                SensitiveString::new(refresh_token),
-            );
+            secret_data.insert("refresh_token".to_string(), refresh_token);
         }
         if let Some(expires_in) = token_response.expires_in {
             let expires_at = Utc::now() + chrono::Duration::seconds(expires_in as i64);

@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::domain::secrets::SensitiveString;
+use crate::domain::secrets::{SensitiveString, SensitiveUrl};
 
 /// Environment variable naming the identity provider's token endpoint.
 pub const TOKEN_URL_ENV: &str = "AEGIS_SEAL_OPERATOR_TOKEN_URL";
@@ -57,7 +57,9 @@ pub enum OperatorTokenError {
 /// Client-credentials configuration for the gateway's operator API.
 #[derive(Debug, Clone)]
 pub struct OperatorCredentials {
-    pub token_url: String,
+    /// The identity provider's token endpoint. A URL can carry a credential,
+    /// so it prints redacted.
+    pub token_url: SensitiveUrl,
     pub client_id: String,
     pub client_secret: SensitiveString,
 }
@@ -80,7 +82,7 @@ impl OperatorCredentials {
         match (token_url, client_id, client_secret) {
             (None, None, None) => Ok(None),
             (Some(token_url), Some(client_id), Some(client_secret)) => Ok(Some(Self {
-                token_url,
+                token_url: SensitiveUrl::new(token_url),
                 client_id,
                 client_secret: SensitiveString::new(client_secret),
             })),
@@ -104,7 +106,7 @@ struct CachedToken {
 
 #[derive(Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    access_token: SensitiveString,
     expires_in: i64,
     #[serde(default)]
     token_type: Option<String>,
@@ -155,7 +157,8 @@ impl OperatorTokenSource {
         let requested_at = Utc::now();
         let response = self
             .http
-            .post(&self.credentials.token_url)
+            // Read to send the grant to the token endpoint.
+            .post(self.credentials.token_url.expose())
             .form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", self.credentials.client_id.as_str()),
@@ -195,7 +198,7 @@ impl OperatorTokenSource {
         let lifetime = chrono::Duration::seconds(body.expires_in);
         let margin = std::cmp::max(MIN_REFRESH_MARGIN, lifetime / 10);
         Ok(CachedToken {
-            access_token: SensitiveString::new(body.access_token),
+            access_token: body.access_token,
             refresh_after: requested_at + lifetime - margin,
         })
     }
@@ -263,7 +266,7 @@ mod tests {
 
     fn credentials(token_url: String, secret: &str) -> OperatorCredentials {
         OperatorCredentials {
-            token_url,
+            token_url: token_url.into(),
             client_id: "aegis-orchestrator".to_string(),
             client_secret: SensitiveString::new(secret),
         }

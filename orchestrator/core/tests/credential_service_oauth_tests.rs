@@ -139,8 +139,8 @@ async fn setup_harness(token_url: String) -> Harness {
     registry.insert(
         CredentialProvider::GitHub,
         OAuthProviderConfig {
-            authorization_url: "https://github.com/login/oauth/authorize".to_string(),
-            token_url,
+            authorization_url: "https://github.com/login/oauth/authorize".into(),
+            token_url: token_url.into(),
             client_id: "test-client-id".to_string(),
             client_secret: Some(SensitiveString::new("test-client-secret")),
             redirect_uri_allowlist: vec!["https://app.example/oauth/callback".to_string()],
@@ -426,7 +426,7 @@ async fn oauth_exchange_rejects_insecure_non_localhost_token_url() {
 
     match downcast_credential_error(&err) {
         CredentialError::InsecureTokenUrl(url) => {
-            assert!(url.contains("evil.example.com"));
+            assert!(url.redacted().contains("evil.example.com"));
         }
         other => panic!("expected InsecureTokenUrl, got: {other:?}"),
     }
@@ -454,8 +454,8 @@ fn registry_validation_rejects_placeholder_authorization_url() {
     registry.insert(
         CredentialProvider::GitHub,
         OAuthProviderConfig {
-            authorization_url: "https://oauth.placeholder/github/authorize".to_string(),
-            token_url: "https://github.com/token".to_string(),
+            authorization_url: "https://oauth.placeholder/github/authorize".into(),
+            token_url: "https://github.com/token".into(),
             client_id: "id".to_string(),
             client_secret: None,
             redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
@@ -477,8 +477,8 @@ fn registry_validation_rejects_insecure_authorization_url() {
     registry.insert(
         CredentialProvider::GitHub,
         OAuthProviderConfig {
-            authorization_url: "http://github.com/login/oauth/authorize".to_string(),
-            token_url: "https://github.com/token".to_string(),
+            authorization_url: "http://github.com/login/oauth/authorize".into(),
+            token_url: "https://github.com/token".into(),
             client_id: "id".to_string(),
             client_secret: None,
             redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
@@ -496,8 +496,8 @@ fn registry_validation_rejects_empty_redirect_allowlist() {
     registry.insert(
         CredentialProvider::GitHub,
         OAuthProviderConfig {
-            authorization_url: "https://github.com/login/oauth/authorize".to_string(),
-            token_url: "https://github.com/token".to_string(),
+            authorization_url: "https://github.com/login/oauth/authorize".into(),
+            token_url: "https://github.com/token".into(),
             client_id: "id".to_string(),
             client_secret: None,
             redirect_uri_allowlist: vec![],
@@ -515,8 +515,8 @@ fn registry_validation_accepts_real_https_authorization_url() {
     registry.insert(
         CredentialProvider::GitHub,
         OAuthProviderConfig {
-            authorization_url: "https://github.com/login/oauth/authorize".to_string(),
-            token_url: "https://github.com/login/oauth/access_token".to_string(),
+            authorization_url: "https://github.com/login/oauth/authorize".into(),
+            token_url: "https://github.com/login/oauth/access_token".into(),
             client_id: "id".to_string(),
             client_secret: Some(SensitiveString::new("secret")),
             redirect_uri_allowlist: vec!["https://app.example/oauth/callback".to_string()],
@@ -545,12 +545,13 @@ async fn initiate_oauth_uses_configured_authorization_url_not_placeholder() {
         .expect("initiate should succeed");
     assert!(
         init.authorization_url
+            .expose()
             .starts_with("https://github.com/login/oauth/authorize?"),
         "authorization_url must derive from configured base, got: {}",
         init.authorization_url
     );
     assert!(
-        !init.authorization_url.contains("placeholder"),
+        !init.authorization_url.expose().contains("placeholder"),
         "authorization_url MUST NOT contain placeholder substring, got: {}",
         init.authorization_url
     );
@@ -558,6 +559,7 @@ async fn initiate_oauth_uses_configured_authorization_url_not_placeholder() {
     // callback are encoded by `url::Url::query_pairs_mut`).
     assert!(
         init.authorization_url
+            .expose()
             .contains("redirect_uri=https%3A%2F%2Fapp.example%2Foauth%2Fcallback"),
         "redirect_uri must be URL-encoded, got: {}",
         init.authorization_url
