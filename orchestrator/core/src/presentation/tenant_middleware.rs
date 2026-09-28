@@ -786,6 +786,66 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
+    /// A request refused for a malformed tenant slug is logged with the
+    /// matched route template, never the path (the invitation accept route
+    /// carries the invitation token) or its query string.
+    #[test]
+    fn a_refused_tenant_is_logged_with_the_route_template_not_the_path() {
+        use crate::presentation::test_log_capture::capture_logs;
+        let identity = UserIdentity {
+            sub: "tu-bad".to_string(),
+            realm_slug: "tenant-Bad Slug!".to_string(),
+            email: None,
+            name: None,
+            identity_kind: IdentityKind::TenantUser {
+                tenant_slug: "Bad Slug!".to_string(),
+            },
+        };
+        let state = TenantMiddlewareState {
+            team_repo: None,
+            membership_repo: None,
+            event_bus: Arc::new(EventBus::new(8)),
+        };
+        let app = Router::new()
+            .route(
+                "/v1/colony/invitations/{token}/accept",
+                axum::routing::post(|| async { "accepted" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                tenant_context_middleware,
+            ))
+            .layer(axum::middleware::from_fn(
+                move |mut req: Request, next: Next| {
+                    let identity = identity.clone();
+                    async move {
+                        req.extensions_mut().insert(identity);
+                        next.run(req).await
+                    }
+                },
+            ));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/colony/invitations/Mk7-tenant-path-token-marker/accept?q=Mk7-tenant-query-marker")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, logs) =
+            capture_logs(async move { app.oneshot(request).await.unwrap().status() });
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        for marker in ["Mk7-tenant-path-token-marker", "Mk7-tenant-query-marker"] {
+            assert!(
+                !logs.contains(marker),
+                "the request path reached the log:\n{logs}"
+            );
+        }
+        assert!(
+            logs.contains("/v1/colony/invitations/{token}/accept"),
+            "the log does not name the route:\n{logs}"
+        );
+    }
+
     #[tokio::test]
     async fn consumer_without_header_falls_back_to_jwt_tenant() {
         let team_repo = Arc::new(InMemoryTeamRepo::default());

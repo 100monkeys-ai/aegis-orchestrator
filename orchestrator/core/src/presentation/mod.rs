@@ -19,3 +19,6 @@ pub mod keycloak_auth;
 pub mod metrics_middleware;
 pub mod tenant_middleware;
 pub mod webhook_guard;
+
+#[cfg(test)]
+pub(crate) mod test_log_capture;

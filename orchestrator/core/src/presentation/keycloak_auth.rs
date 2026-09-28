@@ -234,3 +234,78 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
     }
 }
+
+#[cfg(test)]
+mod request_path_logging_tests {
+    use super::*;
+    use crate::domain::iam::{
+        AegisRole, IamError, IdentityRealm, ValidatedIdentityToken, ZaruTier,
+    };
+    use crate::presentation::test_log_capture::capture_logs;
+    use tower::util::ServiceExt;
+
+    /// Refuses every token, so each request takes a refusal branch.
+    struct RefusingProvider;
+
+    #[async_trait::async_trait]
+    impl IdentityProvider for RefusingProvider {
+        async fn validate_token(&self, _: &str) -> Result<ValidatedIdentityToken, IamError> {
+            Err(IamError::MissingClaim {
+                claim: "sub".to_string(),
+            })
+        }
+        fn resolve_tier(&self, _: &ValidatedIdentityToken) -> Result<ZaruTier, IamError> {
+            Ok(ZaruTier::Free)
+        }
+        fn resolve_role(&self, _: &ValidatedIdentityToken) -> Result<AegisRole, IamError> {
+            Err(IamError::MissingClaim {
+                claim: "aegis_role".to_string(),
+            })
+        }
+        fn known_realms(&self) -> Vec<IdentityRealm> {
+            vec![]
+        }
+    }
+
+    /// A refused request to a route whose path carries a secret (the
+    /// invitation accept route carries the invitation token) is logged with
+    /// the matched route template, never the path or its query string. All
+    /// three refusal branches: no Authorization header, a header that is not
+    /// Bearer, and a token the provider refuses.
+    #[test]
+    fn a_refused_request_logs_the_route_template_not_the_path() {
+        for authorization in [None, Some("Basic abc"), Some("Bearer abc")] {
+            let app = axum::Router::new()
+                .route(
+                    "/v1/colony/invitations/{token}/accept",
+                    axum::routing::post(|| async { "accepted" }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::new(RefusingProvider) as Arc<dyn IdentityProvider>,
+                    iam_auth_middleware,
+                ));
+            let mut request = axum::http::Request::builder().method("POST").uri(
+                "/v1/colony/invitations/Mk7-path-invitation-token-marker/accept?q=Mk7-path-query-marker",
+            );
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            let request = request.body(axum::body::Body::empty()).unwrap();
+
+            let (status, logs) =
+                capture_logs(async move { app.oneshot(request).await.unwrap().status() });
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{authorization:?}");
+            for marker in ["Mk7-path-invitation-token-marker", "Mk7-path-query-marker"] {
+                assert!(
+                    !logs.contains(marker),
+                    "{authorization:?}: the request path reached the log:\n{logs}"
+                );
+            }
+            assert!(
+                logs.contains("/v1/colony/invitations/{token}/accept"),
+                "{authorization:?}: the log does not name the route:\n{logs}"
+            );
+        }
+    }
+}
