@@ -96,9 +96,9 @@ impl TenantProvisioningService {
         let slug = tenant_id.as_str().to_string();
         let keycloak_realm = "zaru-consumer".to_string();
 
-        // Fetch the full Keycloak user first — `set_user_attribute` needs the
-        // complete representation on PUT, and we must fail fast with a
-        // retryable error if the user record hasn't materialised yet.
+        // Fetch the Keycloak user first: we must fail fast with a retryable
+        // error if the user record hasn't materialised yet. The write below
+        // reads the user again under the per-user write lock.
         let kc_user = match self
             .keycloak_admin
             .get_user("zaru-consumer", user_sub)

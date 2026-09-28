@@ -4129,6 +4129,7 @@ mod tests {
             first_name: Some("Alice".to_string()),
             last_name: Some("Smith".to_string()),
             created_timestamp: 1_700_000_000,
+            enabled: Some(true),
             attributes: Some(existing_attrs),
         };
 

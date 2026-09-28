@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Effective Tier Service (ADR-111 Phase 3)
 //!
-//! Centralizes every write to the Keycloak `zaru_tier` user attribute.
+//! Centralizes every write to the Keycloak `zaru_tier` user attribute, and
+//! writes the user's `team_memberships` with it.
 //!
 //! A user's **effective personal tier** is the `max()` of:
 //!
@@ -22,6 +23,15 @@
 //! (`tenant-{slug}`) operate under a different identity model and are handled
 //! by the legacy `sync_tier_to_keycloak` code path in `billing.rs`.
 //!
+//! ## One write, from the database
+//!
+//! The database holds the truth of both attributes: the subscriptions and
+//! memberships that decide the tier, and the memberships that make up
+//! `team_memberships`. A recompute writes both in one write, so a write of
+//! either that was lost, overwritten by another write to the user made at
+//! the same moment, is repaired by the user's next recompute, whatever
+//! triggered it.
+//!
 //! ## Testability
 //!
 //! The service does not call Keycloak directly. It depends on the
@@ -39,7 +49,7 @@ use crate::domain::team::{MembershipRepository, TeamId, TeamRepository, TeamStat
 use crate::domain::tenancy::TenantTier;
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient;
+use crate::infrastructure::iam::keycloak_admin_client::{KeycloakAdminClient, UserWrite};
 use crate::infrastructure::repositories::BillingRepository;
 
 // ============================================================================
@@ -60,17 +70,32 @@ pub enum EffectiveTierError {
 // TierSyncPort — abstraction over "write tier + invalidate sessions"
 // ============================================================================
 
-/// Port that writes a user's `zaru_tier` claim and invalidates their active
-/// sessions so the new tier takes effect on the next request.
+/// The claims of a consumer user whose truth is the orchestrator's
+/// database, written together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserClaims {
+    /// The effective personal tier (`zaru_tier`).
+    pub zaru_tier: TenantTier,
+    /// The tenant slugs of the user's active team memberships
+    /// (`team_memberships`).
+    pub team_memberships: Vec<String>,
+}
+
+/// Port that writes a user's claims and invalidates their active sessions
+/// when the tier changed, so the new tier takes effect on the next request.
 ///
 /// Production implementation is [`KeycloakTierSyncPort`]; tests provide an
 /// in-memory recorder.
 #[async_trait]
 pub trait TierSyncPort: Send + Sync {
-    /// Write the given tier to the user's identity store (Keycloak) and
-    /// invalidate live sessions. Idempotent — if the user already has this
-    /// tier, the port MAY short-circuit without contacting Keycloak.
-    async fn set_tier(&self, user_id: &str, tier: TenantTier) -> Result<(), EffectiveTierError>;
+    /// Write `claims` to the user's identity store (Keycloak) in one write
+    /// and, when the tier changed, invalidate live sessions. Idempotent: a
+    /// user that already holds the claims is not written.
+    async fn set_claims(
+        &self,
+        user_id: &str,
+        claims: &UserClaims,
+    ) -> Result<(), EffectiveTierError>;
 }
 
 /// Keycloak-backed implementation of [`TierSyncPort`] for the shared
@@ -126,16 +151,27 @@ impl KeycloakTierSyncPort {
 
 #[async_trait]
 impl TierSyncPort for KeycloakTierSyncPort {
-    async fn set_tier(&self, user_id: &str, tier: TenantTier) -> Result<(), EffectiveTierError> {
+    async fn set_claims(
+        &self,
+        user_id: &str,
+        claims: &UserClaims,
+    ) -> Result<(), EffectiveTierError> {
         let realm = "zaru-consumer";
-        let user = match self
+        let desired = claims.zaru_tier.as_keycloak_str();
+        let written = self
             .keycloak_admin
-            .get_user(realm, user_id)
+            .write_user_attributes(
+                realm,
+                user_id,
+                &[
+                    ("zaru_tier", vec![desired.to_string()]),
+                    ("team_memberships", claims.team_memberships.clone()),
+                ],
+            )
             .await
-            .map_err(|e| EffectiveTierError::TierSync(format!("get_user: {e}")))?
-        {
-            Some(u) => u,
-            None => {
+            .map_err(|e| EffectiveTierError::TierSync(format!("write_user_attributes: {e}")))?;
+        match written {
+            UserWrite::Missing => {
                 // Self-heal: the Keycloak user is gone (deleted account, realm
                 // reset, etc). Treat as a successful no-op and surface a
                 // structured drift event for observability rather than
@@ -155,30 +191,21 @@ impl TierSyncPort for KeycloakTierSyncPort {
                         });
                     }
                 }
-                return Ok(());
             }
-        };
-
-        let current = user
-            .attributes
-            .as_ref()
-            .and_then(|attrs| attrs.get("zaru_tier"))
-            .and_then(|v| v.first())
-            .map(|s| s.as_str())
-            .unwrap_or("free")
-            .to_string();
-
-        let desired = tier.as_keycloak_str();
-        if current == desired {
-            return Ok(());
+            UserWrite::Unchanged => {}
+            UserWrite::Written { before } => {
+                let previous = before
+                    .attributes
+                    .as_ref()
+                    .and_then(|attrs| attrs.get("zaru_tier"))
+                    .and_then(|v| v.first())
+                    .map(String::as_str)
+                    .unwrap_or("free");
+                if previous != desired {
+                    self.invalidate_sessions(user_id).await;
+                }
+            }
         }
-
-        self.keycloak_admin
-            .set_user_attribute(realm, &user.id, "zaru_tier", desired)
-            .await
-            .map_err(|e| EffectiveTierError::TierSync(format!("set_user_attribute: {e}")))?;
-
-        self.invalidate_sessions(&user.id).await;
         Ok(())
     }
 }
@@ -233,7 +260,22 @@ impl StandardEffectiveTierService {
 impl EffectiveTierService for StandardEffectiveTierService {
     async fn recompute_for_user(&self, user_id: &str) -> Result<TenantTier, EffectiveTierError> {
         let effective = self.compute_effective_tier(user_id).await?;
-        self.tier_sync.set_tier(user_id, effective).await?;
+        let team_memberships = self
+            .membership_repo
+            .find_active_team_tenants_for_user(user_id)
+            .await
+            .map_err(|e| {
+                EffectiveTierError::Repository(format!("find_active_team_tenants_for_user: {e}"))
+            })?;
+        self.tier_sync
+            .set_claims(
+                user_id,
+                &UserClaims {
+                    zaru_tier: effective,
+                    team_memberships,
+                },
+            )
+            .await?;
         Ok(effective)
     }
 
@@ -571,12 +613,15 @@ mod tests {
 
     #[async_trait]
     impl TierSyncPort for RecordingTierSync {
-        async fn set_tier(
+        async fn set_claims(
             &self,
             user_id: &str,
-            tier: TenantTier,
+            claims: &UserClaims,
         ) -> Result<(), EffectiveTierError> {
-            self.calls.lock().unwrap().push((user_id.to_string(), tier));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((user_id.to_string(), claims.zaru_tier));
             Ok(())
         }
     }
@@ -761,7 +806,7 @@ mod tests {
     }
 
     /// Regression for Phase 1.4: when the Keycloak user is gone, the
-    /// `KeycloakTierSyncPort::set_tier` path must return `Ok(())` and
+    /// `KeycloakTierSyncPort::set_claims` path must return `Ok(())` and
     /// publish a `KeycloakUserMissing` drift event rather than bubble a
     /// `UserNotFound` error that forces every caller to classify
     /// "expected after deletion" vs "real bug".

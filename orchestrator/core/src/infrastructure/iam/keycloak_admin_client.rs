@@ -24,7 +24,23 @@ pub struct KeycloakUser {
     pub last_name: Option<String>,
     #[serde(rename = "createdTimestamp")]
     pub created_timestamp: i64,
+    /// Whether the user may sign in, as Keycloak holds it. A write of an
+    /// attribute sends it back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     pub attributes: Option<std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// What [`KeycloakAdminClient::write_user_attributes`] did.
+#[derive(Debug)]
+pub enum UserWrite {
+    /// The realm has no such user; nothing was written.
+    Missing,
+    /// The user already held every value; nothing was written.
+    Unchanged,
+    /// The user was written. `before` is the user as it was read, inside
+    /// the lock, just before the write.
+    Written { before: KeycloakUser },
 }
 
 /// SAML IdP configuration for a Keycloak realm.
@@ -53,11 +69,28 @@ pub struct KeycloakAdminConfig {
     pub admin_password: crate::domain::secrets::SensitiveString,
 }
 
+/// How long a write to a Keycloak user waits for another write to the same
+/// user to finish before it gives up.
+const USER_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// (realm, user id) -> the lock writes to that user take.
+type UserWriteLocks =
+    std::collections::HashMap<(String, String), std::sync::Weak<tokio::sync::Mutex<()>>>;
+
 /// HTTP client for Keycloak Admin REST API operations.
+///
+/// Writes to one user are made one at a time: see
+/// [`KeycloakAdminClient::write_user_attributes`]. The lock is held in this
+/// process, which is enough while one orchestrator process writes a realm's
+/// users.
 pub struct KeycloakAdminClient {
     http: Client,
     config: KeycloakAdminConfig,
     cached_token: RwLock<Option<CachedToken>>,
+    /// (realm, user id) -> the lock writes to that user take. Entries whose
+    /// lock nobody holds or waits for are dropped as new ones are added.
+    user_writes: std::sync::Mutex<UserWriteLocks>,
+    user_write_wait: std::time::Duration,
 }
 
 struct CachedToken {
@@ -83,6 +116,17 @@ pub enum KeycloakAdminError {
     AttributeError { status: u16, body: String },
     #[error("realm operation failed: {status} {body}")]
     RealmError { status: u16, body: String },
+    /// Another write to the same user did not finish in time. Nothing was
+    /// written.
+    #[error(
+        "another change to Keycloak user {user_id} in realm {realm} did not finish within \
+         {seconds} seconds, so this change was not made; try again"
+    )]
+    UserWriteBusy {
+        realm: String,
+        user_id: String,
+        seconds: u64,
+    },
     /// A SAML identity provider configuration was refused before anything
     /// was sent to Keycloak. The message says what to fix.
     #[error("{0}")]
@@ -117,10 +161,30 @@ struct TokenResponse {
     expires_in: i64,
 }
 
-/// Build the full user representation body for a Keycloak PUT /users/{id} call,
-/// merging `attribute = [value]` into the user's existing attributes.
+/// The user representation a `PUT /users/{id}` sends: the user as it was
+/// read, with `attributes` in place of its attributes.
 ///
-/// `createdTimestamp` is intentionally excluded — Keycloak rejects it on PUT.
+/// `createdTimestamp` is left out: Keycloak rejects it on PUT. `enabled` is
+/// sent as it was read, so a write of an attribute never enables a user an
+/// administrator disabled.
+fn build_user_body(
+    user: &KeycloakUser,
+    attributes: std::collections::HashMap<String, Vec<String>>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "id": user.id,
+        "email": user.email,
+        "firstName": user.first_name,
+        "lastName": user.last_name,
+        "attributes": attributes
+    });
+    if let Some(enabled) = user.enabled {
+        body["enabled"] = serde_json::json!(enabled);
+    }
+    body
+}
+
+#[cfg(test)]
 fn build_set_attribute_body(
     user: &KeycloakUser,
     attribute: &str,
@@ -129,28 +193,15 @@ fn build_set_attribute_body(
     build_set_multivalue_body(user, attribute, &[value.to_string()])
 }
 
-/// Multi-valued variant of [`build_set_attribute_body`]. Keycloak stores user
-/// attributes as `Map<String, List<String>>`, so a multi-valued attribute is
-/// expressed by passing the full list. An empty `values` slice clears the
-/// attribute (Keycloak preserves the key with an empty list, which the
-/// upstream MCP middleware treats as "no memberships").
+#[cfg(test)]
 fn build_set_multivalue_body(
     user: &KeycloakUser,
     attribute: &str,
     values: &[String],
 ) -> serde_json::Value {
-    let mut attrs: std::collections::HashMap<String, Vec<String>> =
-        user.attributes.clone().unwrap_or_default();
+    let mut attrs = user.attributes.clone().unwrap_or_default();
     attrs.insert(attribute.to_string(), values.to_vec());
-
-    serde_json::json!({
-        "id": user.id,
-        "email": user.email,
-        "firstName": user.first_name,
-        "lastName": user.last_name,
-        "enabled": true,
-        "attributes": attrs
-    })
+    build_user_body(user, attrs)
 }
 
 /// Refuse a SAML signing certificate that is missing or is not an X.509
@@ -241,7 +292,104 @@ impl KeycloakAdminClient {
             http,
             config,
             cached_token: RwLock::new(None),
+            user_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            user_write_wait: USER_WRITE_WAIT,
         }
+    }
+
+    /// Wait at most `wait` for another write to the same user (10 seconds
+    /// unless set).
+    pub fn with_user_write_wait(mut self, wait: std::time::Duration) -> Self {
+        self.user_write_wait = wait;
+        self
+    }
+
+    /// Take the lock for writes to `user_id` in `realm`, waiting at most the
+    /// client's user write wait.
+    async fn lock_user(
+        &self,
+        realm: &str,
+        user_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, KeycloakAdminError> {
+        let lock = {
+            let mut locks = self
+                .user_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, held| held.strong_count() > 0);
+            let key = (realm.to_string(), user_id.to_string());
+            match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(key, std::sync::Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        tokio::time::timeout(self.user_write_wait, lock.lock_owned())
+            .await
+            .map_err(|_| KeycloakAdminError::UserWriteBusy {
+                realm: realm.to_string(),
+                user_id: user_id.to_string(),
+                seconds: self.user_write_wait.as_secs(),
+            })
+    }
+
+    /// Set `attributes` on a user, each to the full list of values given,
+    /// leaving everything else on the user as it is.
+    ///
+    /// Keycloak's `PUT /admin/realms/{realm}/users/{id}` replaces the user's
+    /// representation and has no version check, so a write is a read, a
+    /// merge and a write of the whole user. Two of them at once would each
+    /// read the user before the other wrote, and the second would drop what
+    /// the first wrote. So every write to a user goes through here, and
+    /// holds a lock keyed on the realm and the user's id from the read to
+    /// the end of the write: writes to one user are made one at a time. A
+    /// write that cannot take the lock within the client's wait fails with
+    /// [`KeycloakAdminError::UserWriteBusy`] and writes nothing.
+    ///
+    /// Nothing is written when the user already holds every value.
+    pub async fn write_user_attributes(
+        &self,
+        realm: &str,
+        user_id: &str,
+        attributes: &[(&str, Vec<String>)],
+    ) -> Result<UserWrite, KeycloakAdminError> {
+        let _one_at_a_time = self.lock_user(realm, user_id).await?;
+        let Some(user) = self.get_user(realm, user_id).await? else {
+            return Ok(UserWrite::Missing);
+        };
+        let mut merged = user.attributes.clone().unwrap_or_default();
+        let mut changed = false;
+        for (name, values) in attributes {
+            if merged.get(*name) != Some(values) {
+                merged.insert((*name).to_string(), values.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(UserWrite::Unchanged);
+        }
+
+        let token = self.get_admin_token().await?;
+        let url = format!(
+            "{}/admin/realms/{}/users/{}",
+            self.config.host, realm, user.id
+        );
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&build_user_body(&user, merged))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(KeycloakAdminError::AttributeError { status, body });
+        }
+        Ok(UserWrite::Written { before: user })
     }
 
     /// Obtain an admin access token, using cache if valid.
@@ -379,13 +527,9 @@ impl KeycloakAdminClient {
         Err(KeycloakAdminError::RealmError { status: code, body })
     }
 
-    /// Set a user attribute on a Keycloak user in the given realm.
-    ///
-    /// Keycloak's PUT `/admin/realms/{realm}/users/{id}` is a **full replace**:
-    /// sending only `{"attributes": {...}}` causes Keycloak to null out `email`
-    /// and reject with 400 `error-user-attribute-required`.  We therefore build
-    /// a complete user representation, merging the new attribute over the
-    /// existing ones.
+    /// Set a single-valued attribute on a user in the given realm, through
+    /// [`write_user_attributes`](Self::write_user_attributes). A user the
+    /// realm does not have is left alone.
     pub async fn set_user_attribute(
         &self,
         realm: &str,
@@ -393,84 +537,31 @@ impl KeycloakAdminClient {
         attribute: &str,
         value: &str,
     ) -> Result<(), KeycloakAdminError> {
-        let Some(user) = self.get_user(realm, user_id).await? else {
-            return Ok(());
-        };
-        let user = &user;
-        let token = self.get_admin_token().await?;
-        let url = format!(
-            "{}/admin/realms/{}/users/{}",
-            self.config.host, realm, user.id
-        );
-
-        let body = build_set_attribute_body(user, attribute, value);
-
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KeycloakAdminError::AttributeError { status, body });
-        }
-
-        Ok(())
+        self.write_user_attributes(realm, user_id, &[(attribute, vec![value.to_string()])])
+            .await
+            .map(|_| ())
     }
 
-    /// Set the multi-valued `team_memberships` user attribute.
+    /// Set the multi-valued `team_memberships` user attribute, through
+    /// [`write_user_attributes`](Self::write_user_attributes).
     ///
     /// The upstream MCP middleware reads this list of `t-{uuid}` tenant slugs
     /// off the JWT to decide whether the caller may transact against a team
-    /// tenant; missing values cause a fail-closed 403. Mirrors
-    /// [`set_user_attribute`](Self::set_user_attribute) but writes a
-    /// multi-valued list instead of a single value, which Keycloak's user
-    /// attributes natively support.
+    /// tenant; missing values cause a fail-closed 403.
     ///
     /// Passing an empty `tenants` slice clears the attribute (the user is no
-    /// longer a member of any team).
+    /// longer a member of any team). A user the realm does not have is left
+    /// alone: the caller (TeamService / backfill) decides whether that is
+    /// drift, as the tier sync does.
     pub async fn set_user_team_memberships(
         &self,
         realm: &str,
         user_id: &str,
         tenants: &[String],
     ) -> Result<(), KeycloakAdminError> {
-        let user = match self.get_user(realm, user_id).await? {
-            Some(u) => u,
-            None => {
-                // User not found in this realm — nothing to stamp. Caller
-                // (TeamService / backfill) decides whether this is a drift
-                // condition; we return Ok to keep behaviour consistent with
-                // the tier-sync soft-heal path.
-                return Ok(());
-            }
-        };
-
-        let token = self.get_admin_token().await?;
-        let url = format!(
-            "{}/admin/realms/{}/users/{}",
-            self.config.host, realm, user.id
-        );
-        let body = build_set_multivalue_body(&user, "team_memberships", tenants);
-
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KeycloakAdminError::AttributeError { status, body });
-        }
-        Ok(())
+        self.write_user_attributes(realm, user_id, &[("team_memberships", tenants.to_vec())])
+            .await
+            .map(|_| ())
     }
 
     /// List all users in a realm (up to 1000).
@@ -1800,6 +1891,57 @@ pub(crate) mod tests {
         );
     }
 
+    /// A write that waits longer than the client allows for another write
+    /// to the same user fails with a sentence that says so, and writes
+    /// nothing. A write to another user does not wait.
+    #[tokio::test]
+    async fn a_write_that_waits_too_long_for_another_fails_plainly() {
+        let double = SharedDouble::default();
+        {
+            let mut d = double.lock().unwrap();
+            d.get_user_delay = Some(std::time::Duration::from_millis(600));
+            let users = d.users.entry("zaru-consumer".to_string()).or_default();
+            users.insert("user-9".to_string(), existing_user());
+            let mut other = existing_user();
+            other["id"] = serde_json::json!("user-8");
+            users.insert("user-8".to_string(), other);
+        }
+        let kc = std::sync::Arc::new(
+            serve_keycloak_double(double.clone())
+                .await
+                .with_user_write_wait(std::time::Duration::from_millis(100)),
+        );
+        let first = {
+            let kc = kc.clone();
+            tokio::spawn(async move {
+                kc.set_user_attribute("zaru-consumer", "user-9", "zaru_tier", "pro")
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = kc
+            .set_user_attribute("zaru-consumer", "user-9", "zaru_tier", "enterprise")
+            .await;
+        let message = match second {
+            Err(e @ KeycloakAdminError::UserWriteBusy { .. }) => e.to_string(),
+            other => panic!("a write that waited too long did not fail plainly: {other:?}"),
+        };
+        assert!(
+            message.contains("user-9") && message.contains("try again"),
+            "the refusal does not say what happened: {message}"
+        );
+        kc.set_user_attribute("zaru-consumer", "user-8", "zaru_tier", "business")
+            .await
+            .expect("a write to another user does not wait");
+        first.await.unwrap().expect("the first write succeeds");
+        let d = double.lock().unwrap();
+        assert_eq!(
+            d.users["zaru-consumer"]["user-9"]["attributes"]["zaru_tier"],
+            serde_json::json!(["pro"]),
+            "the refused write changed the user"
+        );
+    }
+
     /// A write of an attribute changes that attribute and nothing else: a
     /// user an administrator disabled stays disabled.
     #[tokio::test]
@@ -1832,8 +1974,8 @@ pub(crate) mod tests {
     // ── build_set_attribute_body ───────────────────────────────────────────
 
     /// The PUT body must include `id`, `email`, `firstName`, `lastName`,
-    /// `enabled: true`, and the merged attributes map.  `createdTimestamp`
-    /// must be absent (Keycloak rejects it on PUT).
+    /// `enabled` as it was read, and the merged attributes map.
+    /// `createdTimestamp` must be absent (Keycloak rejects it on PUT).
     #[test]
     fn set_user_attribute_includes_existing_fields() {
         let mut existing_attrs = std::collections::HashMap::new();
@@ -1845,6 +1987,7 @@ pub(crate) mod tests {
             first_name: Some("Alice".to_string()),
             last_name: Some("Smith".to_string()),
             created_timestamp: 1_700_000_000,
+            enabled: Some(true),
             attributes: Some(existing_attrs),
         };
 
@@ -1880,13 +2023,17 @@ pub(crate) mod tests {
             first_name: None,
             last_name: None,
             created_timestamp: 0,
+            enabled: None,
             attributes: None,
         };
 
         let body = build_set_attribute_body(&user, "zaru_tier", "business");
 
         assert_eq!(body["id"], "user-456");
-        assert_eq!(body["enabled"], true);
+        assert!(
+            body.get("enabled").is_none(),
+            "a user read with no `enabled` is written with none"
+        );
         assert_eq!(body["attributes"]["zaru_tier"][0], "business");
     }
 
@@ -1900,6 +2047,7 @@ pub(crate) mod tests {
             first_name: None,
             last_name: None,
             created_timestamp: 0,
+            enabled: None,
             attributes: None,
         };
 
@@ -1935,6 +2083,7 @@ pub(crate) mod tests {
             first_name: None,
             last_name: None,
             created_timestamp: 0,
+            enabled: None,
             attributes: Some(existing),
         };
 
@@ -1957,6 +2106,7 @@ pub(crate) mod tests {
             first_name: None,
             last_name: None,
             created_timestamp: 0,
+            enabled: None,
             attributes: Some(attrs),
         };
 
