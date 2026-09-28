@@ -35,7 +35,8 @@ pub async fn refresh_token(profile: &AegisProfile) -> Result<AegisProfile> {
         .form(&[
             ("client_id", CLIENT_ID),
             ("grant_type", "refresh_token"),
-            ("refresh_token", profile.refresh_key.as_str()),
+            // Read to send the refresh grant to the auth server.
+            ("refresh_token", profile.refresh_key.expose()),
         ])
         .send()
         .await
@@ -77,8 +78,8 @@ pub async fn refresh_token(profile: &AegisProfile) -> Result<AegisProfile> {
         name: profile.name.clone(),
         env: profile.env.clone(),
         client_id: profile.client_id.clone(),
-        access_key,
-        refresh_key,
+        access_key: access_key.into(),
+        refresh_key: refresh_key.into(),
         expires_at,
         roles,
         scopes,

@@ -12,8 +12,10 @@ pub struct AegisProfile {
     /// Environment hostname, e.g. "dev.100monkeys.ai"
     pub env: String,
     pub client_id: String,
-    pub access_key: String,
-    pub refresh_key: String,
+    /// The session's access token. Prints redacted; stored as the bare string.
+    pub access_key: aegis_orchestrator_core::domain::secrets::SensitiveString,
+    /// The session's refresh token. Prints redacted; stored as the bare string.
+    pub refresh_key: aegis_orchestrator_core::domain::secrets::SensitiveString,
     pub expires_at: DateTime<Utc>,
     pub roles: Vec<String>,
     pub scopes: Vec<String>,

@@ -55,7 +55,8 @@ pub enum StorageBackend {
 
 #[derive(Debug, Clone)]
 pub struct PostgresConfig {
-    pub connection_string: String,
+    /// A connection URL, which may carry the password; prints redacted.
+    pub connection_string: crate::domain::secrets::SensitiveUrl,
 }
 
 /// A snapshot of a specific agent version from the append-only version history.

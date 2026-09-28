@@ -50,7 +50,8 @@ use crate::infrastructure::aegis_cortex_proto::{
 #[derive(Debug, Clone)]
 pub struct CortexGrpcClient {
     client: CortexServiceClient<Channel>,
-    api_key: Option<String>,
+    /// Bearer key for the Cortex service. Prints redacted.
+    api_key: Option<crate::domain::secrets::SensitiveString>,
 }
 
 impl CortexGrpcClient {
@@ -66,7 +67,10 @@ impl CortexGrpcClient {
         api_key: Option<String>,
     ) -> Result<Self, tonic::transport::Error> {
         let client = CortexServiceClient::connect(url).await?;
-        Ok(Self { client, api_key })
+        Ok(Self {
+            client,
+            api_key: api_key.map(crate::domain::secrets::SensitiveString::new),
+        })
     }
 
     /// Wrap a request body in a `tonic::Request`, injecting the `Authorization`
@@ -74,7 +78,10 @@ impl CortexGrpcClient {
     fn authed_request<T>(&self, body: T) -> tonic::Request<T> {
         let mut req = tonic::Request::new(body);
         if let Some(ref key) = self.api_key {
-            if let Ok(val) = tonic::metadata::MetadataValue::try_from(format!("Bearer {key}")) {
+            // Read to send as the bearer header.
+            if let Ok(val) =
+                tonic::metadata::MetadataValue::try_from(format!("Bearer {}", key.expose()))
+            {
                 req.metadata_mut().insert("authorization", val);
             }
         }

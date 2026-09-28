@@ -126,7 +126,8 @@ async fn revoke_session(profile: &auth::AegisProfile) -> Result<()> {
         .post(&url)
         .form(&[
             ("client_id", "aegis-cli"),
-            ("refresh_token", profile.refresh_key.as_str()),
+            // Read to send with the logout, which revokes it.
+            ("refresh_token", profile.refresh_key.expose()),
         ])
         .send()
         .await?;

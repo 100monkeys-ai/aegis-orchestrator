@@ -29,7 +29,8 @@ enum WorkflowListResponse {
 pub struct DaemonClient {
     client: Client,
     base_url: String,
-    auth_key: Option<String>,
+    /// Bearer key for the daemon. Prints redacted.
+    auth_key: Option<aegis_orchestrator_core::domain::secrets::SensitiveString>,
 }
 
 impl DaemonClient {
@@ -53,7 +54,7 @@ impl DaemonClient {
     }
 
     pub fn with_auth(mut self, key: String) -> Self {
-        self.auth_key = Some(key);
+        self.auth_key = Some(key.into());
         self
     }
 
@@ -64,7 +65,11 @@ impl DaemonClient {
     ) -> reqwest::RequestBuilder {
         let builder = self.client.request(method, url);
         if let Some(ref key) = self.auth_key {
-            builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+            // Read to send as the bearer header.
+            builder.header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", key.expose()),
+            )
         } else {
             builder
         }

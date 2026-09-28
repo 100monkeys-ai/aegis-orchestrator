@@ -80,7 +80,9 @@ impl EdgeApiClient {
         let mut headers = HeaderMap::new();
         if let Ok(store) = load_store() {
             if let Some(profile) = store.profiles.get(&store.active_profile) {
-                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", profile.access_key))
+                // Read to send as the bearer header.
+                if let Ok(value) =
+                    HeaderValue::from_str(&format!("Bearer {}", profile.access_key.expose()))
                 {
                     headers.insert(AUTHORIZATION, value);
                 }

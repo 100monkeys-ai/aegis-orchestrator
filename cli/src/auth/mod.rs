@@ -31,15 +31,17 @@ pub async fn require_key() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Not authenticated. Run 'aegis auth login'."))?
         .clone();
 
+    // Read here: the key is handed to the caller, which presents it as a
+    // bearer token (or, for `aegis auth token`, prints it on request).
     if chrono::Utc::now() < profile.expires_at {
-        return Ok(profile.access_key.clone());
+        return Ok(profile.access_key.expose().to_string());
     }
 
     // Silent refresh
     let refreshed = refresh::refresh_token(&profile).await?;
     store.profiles.insert(profile_name, refreshed.clone());
     save_store(&store)?;
-    Ok(refreshed.access_key)
+    Ok(refreshed.access_key.expose_owned())
 }
 
 pub use device_flow::run_device_flow;
