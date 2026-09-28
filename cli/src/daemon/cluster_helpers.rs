@@ -98,7 +98,7 @@ pub(crate) fn fallback_cluster_node(config: &NodeConfigManifest) -> NodePeer {
             cluster
                 .controller
                 .as_ref()
-                .map(|controller| controller.endpoint.clone())
+                .map(|controller| controller.endpoint.expose().to_string())
         })
         .unwrap_or_else(|| {
             config

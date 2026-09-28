@@ -373,7 +373,7 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Sd
                 OtlpProtocol::Grpc => {
                     let mut exporter_builder = LogExporter::builder()
                         .with_tonic()
-                        .with_endpoint(endpoint)
+                        .with_endpoint(endpoint.expose())
                         .with_timeout(Duration::from_millis(cfg.batch.export_timeout_ms));
 
                     let mut metadata = tonic::metadata::MetadataMap::new();
@@ -381,7 +381,7 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Sd
                         use std::str::FromStr;
                         if let (Ok(key), Ok(val)) = (
                             tonic::metadata::MetadataKey::from_str(k),
-                            tonic::metadata::MetadataValue::from_str(v),
+                            tonic::metadata::MetadataValue::from_str(v.expose()),
                         ) {
                             metadata.insert(key, val);
                         }
@@ -410,12 +410,12 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Sd
                 OtlpProtocol::Http => {
                     let mut exporter_builder = LogExporter::builder()
                         .with_http()
-                        .with_endpoint(endpoint)
+                        .with_endpoint(endpoint.expose())
                         .with_timeout(Duration::from_millis(cfg.batch.export_timeout_ms));
 
                     let mut headers = std::collections::HashMap::new();
                     for (k, v) in &cfg.otlp_headers {
-                        headers.insert(k.clone(), v.clone());
+                        headers.insert(k.clone(), v.expose().to_string());
                     }
                     if !headers.is_empty() {
                         exporter_builder = exporter_builder.with_headers(headers);

@@ -375,8 +375,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
 
     if let Some(seal_gateway) = &config.spec.seal_gateway {
-        let resolved_url =
-            resolve_env_value(&seal_gateway.url).unwrap_or_else(|_| seal_gateway.url.clone());
+        let resolved_url = resolve_env_value(seal_gateway.url.expose())
+            .unwrap_or_else(|_| seal_gateway.url.expose().to_string());
         tracing::info!(
             url = %SensitiveUrl::new(resolved_url),
             "Configured SEAL tooling gateway URL from node config"
@@ -488,9 +488,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .iter()
                 .map(|realm| IamRealmConfig {
                     slug: resolve_env_value(&realm.slug).unwrap_or_else(|_| realm.slug.clone()),
-                    issuer_url: resolve_env_value(&realm.issuer_url)
+                    issuer_url: resolve_env_value(realm.issuer_url.expose())
+                        .map(SensitiveUrl::new)
                         .unwrap_or_else(|_| realm.issuer_url.clone()),
-                    jwks_uri: resolve_env_value(&realm.jwks_uri)
+                    jwks_uri: resolve_env_value(realm.jwks_uri.expose())
+                        .map(SensitiveUrl::new)
                         .unwrap_or_else(|_| realm.jwks_uri.clone()),
                     audience: resolve_env_value(&realm.audience)
                         .unwrap_or_else(|_| realm.audience.clone()),
@@ -531,10 +533,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
     if let Some(iam) = &config.spec.iam {
         for realm in &iam.realms {
-            if realm.issuer_url.trim().is_empty() {
+            if realm.issuer_url.expose().trim().is_empty() {
                 anyhow::bail!("IAM realm '{}' has empty issuer_url", realm.slug);
             }
-            if realm.jwks_uri.trim().is_empty() {
+            if realm.jwks_uri.expose().trim().is_empty() {
                 anyhow::bail!("IAM realm '{}' has empty jwks_uri", realm.slug);
             }
         }
@@ -568,7 +570,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Resolve the orchestrator URL, supporting `env:VAR_NAME` syntax and a shared default.
     fn resolve_orchestrator_url(config: &NodeConfigManifest) -> String {
-        resolve_env_value(&config.spec.runtime.orchestrator_url).unwrap_or_else(|e| {
+        resolve_env_value(config.spec.runtime.orchestrator_url.expose()).unwrap_or_else(|e| {
             tracing::warn!("Failed to resolve orchestrator URL: {}. Using default.", e);
             DEFAULT_ORCHESTRATOR_URL.to_string()
         })
@@ -640,7 +642,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .runtime
         .fuse_daemon_endpoint
         .as_ref()
-        .and_then(|ep| resolve_env_value(ep).ok());
+        .and_then(|ep| resolve_env_value(ep.expose()).ok());
     let fuse_mount_client: Option<
         aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
             tonic::transport::Channel,
@@ -694,7 +696,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         storage_config
             .seaweedfs
             .as_ref()
-            .map(|s| s.filer_url.clone())
+            .map(|s| s.filer_url.expose().to_string())
             .unwrap_or_else(|| "http://localhost:8888".to_string())
     } else {
         "http://localhost:8888".to_string() // Fallback even for local mode
@@ -1131,9 +1133,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Initialize Temporal Client — read from config (spec.temporal)
     let temporal_required = config.spec.temporal.is_some();
     let temporal_config = config.spec.temporal.clone().unwrap_or_default();
-    let temporal_address =
-        resolve_env_value(&temporal_config.address).unwrap_or_else(|_| "temporal:7233".to_string());
-    let worker_http_endpoint = resolve_env_value(&temporal_config.worker_http_endpoint)
+    let temporal_address = resolve_env_value(temporal_config.address.expose())
+        .unwrap_or_else(|_| "temporal:7233".to_string());
+    let worker_http_endpoint = resolve_env_value(temporal_config.worker_http_endpoint.expose())
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let temporal_namespace = temporal_config.namespace.clone();
     let temporal_task_queue = temporal_config.task_queue.clone();
@@ -1306,7 +1308,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .cortex
         .as_ref()
         .and_then(|c| c.grpc_url.as_ref())
-        .and_then(|url| resolve_env_value(url).ok());
+        .and_then(|url| resolve_env_value(url.expose()).ok());
     let cortex_api_key: Option<String> = config
         .spec
         .cortex
@@ -1724,7 +1726,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ),
             event_bus.clone(),
             config.spec.seal_gateway.as_ref().map(|gateway| {
-                resolve_env_value(&gateway.url).unwrap_or_else(|_| gateway.url.clone())
+                resolve_env_value(gateway.url.expose())
+                    .unwrap_or_else(|_| gateway.url.expose().to_string())
             }),
         )
         .with_workflow_authoring(
@@ -1884,7 +1887,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .as_ref()
         .and_then(|iam| iam.keycloak_admin.as_ref())
         .and_then(|admin_cfg| {
-            let host = match resolve_env_value(&admin_cfg.host) {
+            let host = match resolve_env_value(admin_cfg.host.expose()) {
                 Ok(h) => h,
                 Err(e) => {
                     warn!("Keycloak admin host not resolvable: {e} — admin client disabled");
@@ -2081,7 +2084,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .spec
                 .zaru
                 .as_ref()
-                .and_then(|cfg| resolve_env_value(&cfg.public_url).ok());
+                .and_then(|cfg| resolve_env_value(cfg.public_url.expose()).ok());
             let zaru_secret = config
                 .spec
                 .zaru
@@ -2267,7 +2270,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     .spec
                     .cluster
                     .as_ref()
-                    .and_then(|c| c.relay_coordinator_endpoint.clone());
+                    .and_then(|c| c.relay_coordinator_endpoint.as_ref())
+                    .map(|endpoint| endpoint.expose().to_string());
 
                 let cluster_endpoint = config
                     .spec
@@ -2279,7 +2283,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     .spec
                     .zaru
                     .as_ref()
-                    .and_then(|z| resolve_env_value(&z.public_url).ok())
+                    .and_then(|z| resolve_env_value(z.public_url.expose()).ok())
                     .unwrap_or_else(|| "aegis-controller".to_string());
 
                 // The dispatch is keyed strictly on the presence of
@@ -2407,7 +2411,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .spec
             .zaru
             .as_ref()
-            .and_then(|cfg| resolve_env_value(&cfg.public_url).ok()),
+            .and_then(|cfg| resolve_env_value(cfg.public_url.expose()).ok()),
         zaru_internal_secret: config
             .spec
             .zaru
@@ -2608,7 +2612,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     .spec
                     .zaru
                     .as_ref()
-                    .and_then(|z| resolve_env_value(&z.public_url).ok())
+                    .and_then(|z| resolve_env_value(z.public_url.expose()).ok())
                     .unwrap_or_else(|| "aegis-controller".to_string());
                 Arc::new(EnrollEdgeService::new(
                     edge_repo.clone(),
@@ -2710,14 +2714,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     .spec
                     .zaru
                     .as_ref()
-                    .and_then(|z| resolve_env_value(&z.public_url).ok())
+                    .and_then(|z| resolve_env_value(z.public_url.expose()).ok())
                     .unwrap_or_else(|| "aegis-controller".to_string());
                 let cluster_public_endpoint = config
                     .spec
                     .cluster
                     .as_ref()
                     .and_then(|c| c.ingress.as_ref())
-                    .and_then(|i| resolve_env_value(&i.public_endpoint).ok())
+                    .and_then(|i| resolve_env_value(i.public_endpoint.expose()).ok())
                     .unwrap_or_else(|| cluster_addr_str.clone());
                 let local_signer = Arc::new(IssueEnrollmentToken::new(
                     secrets_manager.secret_store(),
@@ -3019,7 +3023,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
                                     let client =
                                         aegis_orchestrator_core::infrastructure::cluster::NodeClusterClient::new(
-                                            controller.endpoint.clone(),
+                                            controller.endpoint.expose().to_string(),
                                             signing_key.clone(),
                                             worker_node_id,
                                         );

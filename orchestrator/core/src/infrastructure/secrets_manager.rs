@@ -94,7 +94,7 @@ impl OpenBaoSecretStore {
     /// Build an unauthenticated `VaultClient` from the given config.
     fn build_client(config: &SecretBackendConfig) -> Result<VaultClient, SecretsError> {
         let mut builder = VaultClientSettingsBuilder::default();
-        builder.address(&config.address);
+        builder.address(config.address.expose());
 
         if let Some(namespace) = &config.namespace {
             builder.set_namespace(namespace.clone());

@@ -443,7 +443,7 @@ impl StandardExecutionService {
             .storage
             .as_ref()
             .and_then(|s| s.seaweedfs.as_ref())
-            .map(|sf| sf.filer_url.clone())
+            .map(|sf| sf.filer_url.expose().to_string())
             .unwrap_or_else(|| "http://localhost:8888".to_string());
         for (alias_volume_id, source_volume, mount_point) in borrowed {
             gateway.register_borrowed_volume(alias_volume_id, child_execution_id, source_volume);
@@ -2838,19 +2838,20 @@ impl StandardExecutionService {
 
         // Inject Orchestrator URL
         // Resolve from config (supports env:VAR_NAME), fallback to host.docker.internal
-        let orchestrator_url = resolve_env_value(&self.config.spec.runtime.orchestrator_url)
-            .ok()
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| {
-                let port = self
-                    .config
-                    .spec
-                    .network
-                    .as_ref()
-                    .map(|n| n.port)
-                    .unwrap_or(8088);
-                format!("http://host.docker.internal:{port}")
-            });
+        let orchestrator_url =
+            resolve_env_value(self.config.spec.runtime.orchestrator_url.expose())
+                .ok()
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| {
+                    let port = self
+                        .config
+                        .spec
+                        .network
+                        .as_ref()
+                        .map(|n| n.port)
+                        .unwrap_or(8088);
+                    format!("http://host.docker.internal:{port}")
+                });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
 
         // Inject LLM timeout for bootstrap.py (default 300 seconds)
@@ -3640,19 +3641,20 @@ impl ExecutionService for StandardExecutionService {
             "AEGIS_EXECUTION_ID".to_string(),
             child_execution_id.0.to_string(),
         );
-        let orchestrator_url = resolve_env_value(&self.config.spec.runtime.orchestrator_url)
-            .ok()
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| {
-                let port = self
-                    .config
-                    .spec
-                    .network
-                    .as_ref()
-                    .map(|n| n.port)
-                    .unwrap_or(8088);
-                format!("http://host.docker.internal:{port}")
-            });
+        let orchestrator_url =
+            resolve_env_value(self.config.spec.runtime.orchestrator_url.expose())
+                .ok()
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| {
+                    let port = self
+                        .config
+                        .spec
+                        .network
+                        .as_ref()
+                        .map(|n| n.port)
+                        .unwrap_or(8088);
+                    format!("http://host.docker.internal:{port}")
+                });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
         let llm_timeout_seconds = agent
             .manifest

@@ -16,7 +16,8 @@ pub(crate) async fn connect_temporal_workflow_client(
         .temporal
         .as_ref()
         .context("Temporal configuration is not available")?;
-    let address = resolve_env_value(&temporal.address).unwrap_or_else(|_| temporal.address.clone());
+    let address = resolve_env_value(temporal.address.expose())
+        .unwrap_or_else(|_| temporal.address.expose().to_string());
     let endpoint = if address.contains("://") {
         address
     } else {

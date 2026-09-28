@@ -350,7 +350,7 @@ async fn list_peers(config: &NodeConfigManifest, output_format: OutputFormat) ->
     let endpoint = cluster_config
         .controller
         .as_ref()
-        .map(|c| c.endpoint.clone())
+        .map(|c| c.endpoint.expose().to_string())
         .context("Controller endpoint not configured in spec.cluster.controller.endpoint")?;
 
     if !output_format.is_structured() {

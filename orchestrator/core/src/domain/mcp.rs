@@ -235,12 +235,12 @@ impl ToolServer {
             .credentials
             .iter()
             .map(|(env_key, v)| {
-                let cred_ref = if let Some(env_val) = v.strip_prefix("env:") {
+                let cred_ref = if let Some(env_val) = v.expose().strip_prefix("env:") {
                     CredentialRef::from_env(env_val)
-                } else if let Some(secret_val) = v.strip_prefix("secret:") {
+                } else if let Some(secret_val) = v.expose().strip_prefix("secret:") {
                     CredentialRef::from_secret_store(secret_val)
                 } else {
-                    CredentialRef::from_env(v)
+                    CredentialRef::from_env(v.expose())
                 };
                 (env_key.clone(), cred_ref)
             })

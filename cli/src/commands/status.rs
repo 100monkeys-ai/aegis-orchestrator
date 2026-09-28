@@ -165,7 +165,7 @@ async fn run_cluster_status(
     let endpoint = cluster_config
         .controller
         .as_ref()
-        .map(|controller| controller.endpoint.clone())
+        .map(|controller| controller.endpoint.expose().to_string())
         .context("Controller endpoint not configured in spec.cluster.controller.endpoint")?;
 
     if !output_format.is_structured() {

@@ -263,7 +263,7 @@ pub(crate) fn build_relay_cluster(
         .spec
         .zaru
         .as_ref()
-        .and_then(|z| resolve_env_value(&z.public_url).ok())
+        .and_then(|z| resolve_env_value(z.public_url.expose()).ok())
         .unwrap_or_else(|| "aegis-relay-coordinator".to_string());
     let registry_repo: Arc<dyn aegis_orchestrator_core::domain::cluster::NodeRegistryRepository> =
         Arc::new(PgNodeRegistryRepository::new(pool.clone()));
@@ -355,7 +355,7 @@ pub(crate) fn build_relay_cluster(
         .cluster
         .as_ref()
         .and_then(|c| c.ingress.as_ref())
-        .and_then(|i| resolve_env_value(&i.public_endpoint).ok())
+        .and_then(|i| resolve_env_value(i.public_endpoint.expose()).ok())
         .unwrap_or_else(|| cluster_addr_str.to_string());
     let local_signer = Arc::new(IssueEnrollmentToken::new(
         secrets_manager.secret_store(),

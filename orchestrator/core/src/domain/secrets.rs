@@ -47,10 +47,22 @@ use thiserror::Error;
 /// `.expose()` is an intentional act that reviewers can grep for.
 ///
 /// Serialises and deserialises as the bare string, so a wire or storage field
-/// can hold one without changing its format. Equality is constant-time.
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// can hold one without changing its format. In the redacted view
+/// ([`to_redacted_json`]) it serialises as its reference when it is one and
+/// as `[REDACTED]` otherwise. Equality is constant-time.
+#[derive(Clone, Default, Deserialize)]
 #[serde(transparent)]
 pub struct SensitiveString(String);
+
+impl Serialize for SensitiveString {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if in_redacted_view() {
+            serializer.serialize_str(secret_reference(&self.0).unwrap_or(REDACTED))
+        } else {
+            serializer.serialize_str(&self.0)
+        }
+    }
+}
 
 impl SensitiveString {
     /// Construct a new `SensitiveString`.
@@ -137,10 +149,21 @@ const _: fn() = || {
 /// The byte counterpart of [`SensitiveString`], with the same properties:
 /// `Debug` prints `[REDACTED]`, [`SensitiveBytes::expose`] is the one way to
 /// read the bytes, serde is transparent (the form of a `Vec<u8>`), and
-/// equality is constant-time.
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// equality is constant-time. In the redacted view ([`to_redacted_json`]) it
+/// serialises as `[REDACTED]`.
+#[derive(Clone, Default, Deserialize)]
 #[serde(transparent)]
 pub struct SensitiveBytes(Vec<u8>);
+
+impl Serialize for SensitiveBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if in_redacted_view() {
+            serializer.serialize_str(REDACTED)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
 
 impl SensitiveBytes {
     /// Construct a new `SensitiveBytes`.
@@ -287,10 +310,25 @@ fn render_redacted(parsed: &url::Url, with_scheme: bool) -> String {
 /// called only where the URL is handed to the client that connects with it.
 ///
 /// Serialises and deserialises as the bare string, so a configuration field
-/// can hold one without changing its file format.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// can hold one without changing its file format. In the redacted view
+/// ([`to_redacted_json`]) it serialises as its reference when it is one and
+/// through [`redact_url`] otherwise.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct SensitiveUrl(String);
+
+impl Serialize for SensitiveUrl {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if in_redacted_view() {
+            match secret_reference(&self.0) {
+                Some(reference) => serializer.serialize_str(reference),
+                None => serializer.serialize_str(&self.redacted()),
+            }
+        } else {
+            serializer.serialize_str(&self.0)
+        }
+    }
+}
 
 impl SensitiveUrl {
     /// Construct a new `SensitiveUrl`.
@@ -413,10 +451,74 @@ impl std::fmt::Display for RedactedUrl {
 // a secret
 // ---------------------------------------------------------------------------
 
+/// What a literal secret is shown as in the redacted view.
+const REDACTED: &str = "[REDACTED]";
+
+thread_local! {
+    /// Set while [`to_redacted_json`] serialises on this thread. Serialising
+    /// is synchronous, so nothing else runs on the thread meanwhile.
+    static REDACTED_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn in_redacted_view() -> bool {
+    REDACTED_VIEW.with(std::cell::Cell::get)
+}
+
 /// Serialise `value` to JSON in the form that may be shown to a reader who
 /// must not see a secret, such as an agent and its model provider.
+///
+/// Every value of a secret type ([`SensitiveString`], [`SensitiveUrl`],
+/// [`SensitiveBytes`]) is shown as its reference when it is one (see
+/// [`secret_reference`]) and never as a literal: a string or bytes as
+/// `[REDACTED]`, a URL through [`redact_url`]. The decision is made by the
+/// type, wherever the value sits, so a field of a secret type added later is
+/// covered without being named here. Everything else serialises as usual.
 pub fn to_redacted_json<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<serde_json::Value> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REDACTED_VIEW.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(REDACTED_VIEW.with(|flag| flag.replace(true)));
     serde_json::to_value(value)
+}
+
+/// The value as a reference to where a secret is kept, when it is one.
+///
+/// Two forms are references, the two the orchestrator resolves:
+/// `env:NAME`, where `NAME` is an environment variable name (letters,
+/// digits and `_`, not starting with a digit), and `secret:path`, where the
+/// path has at least two segments of letters, digits, `_`, `-` and `.`,
+/// separated by `/`, optionally followed by `#field`. Anything else is a
+/// literal, and a literal may be a secret.
+pub fn secret_reference(raw: &str) -> Option<&str> {
+    fn is_env_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    fn is_store_path(path: &str) -> bool {
+        let (path, field) = match path.split_once('#') {
+            Some((path, field)) => (path, Some(field)),
+            None => (path, None),
+        };
+        let segment_ok = |seg: &str| {
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        };
+        path.split('/').count() >= 2
+            && path.split('/').all(segment_ok)
+            && field.is_none_or(segment_ok)
+    }
+    let is_reference = match raw.split_once(':') {
+        Some(("env", name)) => is_env_name(name),
+        Some(("secret", path)) => is_store_path(path),
+        _ => false,
+    };
+    is_reference.then_some(raw)
 }
 
 // ---------------------------------------------------------------------------

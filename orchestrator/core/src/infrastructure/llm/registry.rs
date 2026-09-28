@@ -271,7 +271,7 @@ impl ProviderRegistry {
     ) -> anyhow::Result<Arc<dyn LLMProvider>> {
         let api_key = Self::resolve_api_key(&config.api_key)?;
 
-        let endpoint = if config.endpoint.is_empty() {
+        let endpoint = if config.endpoint.expose().is_empty() {
             match config.provider_type.as_str() {
                 "openai" | "openai-compatible" => "https://api.openai.com/v1",
                 "anthropic" => "https://api.anthropic.com/v1",
@@ -281,7 +281,7 @@ impl ProviderRegistry {
             }
             .to_string()
         } else {
-            config.endpoint.clone()
+            config.endpoint.expose().to_string()
         };
 
         let provider: Arc<dyn LLMProvider> = match config.provider_type.as_str() {
@@ -1012,7 +1012,7 @@ mod tests {
                 llm_providers: vec![LLMProviderConfig {
                     name: "test-ollama".to_string(),
                     provider_type: "ollama".to_string(),
-                    endpoint: "http://localhost:11434".to_string(),
+                    endpoint: "http://localhost:11434".into(),
                     api_key: None,
                     enabled: true,
                     models: vec![ModelConfig {

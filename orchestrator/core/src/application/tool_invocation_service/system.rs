@@ -105,6 +105,11 @@ impl ToolInvocationService {
         ))
     }
 
+    /// `aegis.system.config`: the node's configuration, as parsed from its
+    /// file, in the redacted view. The answer reaches the agent and its
+    /// model provider, so it never holds the file's text: every field of a
+    /// secret type shows its reference, or `[REDACTED]` for a literal (see
+    /// [`crate::domain::secrets::to_redacted_json`]).
     pub(super) async fn invoke_aegis_system_config_tool(
         &self,
     ) -> Result<ToolInvocationResult, SealSessionError> {
@@ -118,15 +123,41 @@ impl ToolInvocationService {
             }
         };
 
-        match std::fs::read_to_string(path) {
-            Ok(content) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.system.config",
+                    "error": format!("Failed to read node configuration: {}", e.kind())
+                })));
+            }
+        };
+        // The parser's own message can quote the value it could not read,
+        // which may be a secret in the wrong field: only its place is given.
+        let config: crate::domain::node_config::NodeConfigManifest = match serde_yaml::from_str(
+            &text,
+        ) {
+            Ok(config) => config,
+            Err(e) => {
+                let place = e
+                    .location()
+                    .map(|l| format!(" at line {}, column {}", l.line(), l.column()))
+                    .unwrap_or_default();
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.system.config",
+                    "error": format!("The node configuration file is not a valid node configuration{place}")
+                })));
+            }
+        };
+        match crate::domain::secrets::to_redacted_json(&config) {
+            Ok(shown) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.system.config",
                 "config_path": path.to_string_lossy(),
-                "content_yaml": content
+                "config": shown
             }))),
-            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+            Err(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.system.config",
-                "error": format!("Failed to read node configuration: {e}")
+                "error": "The node configuration could not be shown"
             }))),
         }
     }

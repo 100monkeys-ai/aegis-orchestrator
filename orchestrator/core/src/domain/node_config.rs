@@ -68,7 +68,7 @@ pub struct BootstrapConfig {
     /// Database connection settings (required to reach the config layers table).
     pub database: Option<DatabaseConfig>,
     /// Controller endpoint for worker/hybrid nodes to reach the controller.
-    pub controller_endpoint: Option<String>,
+    pub controller_endpoint: Option<SensitiveUrl>,
     /// Path to the persistent Ed25519 keypair for node authentication.
     pub node_keypair_path: PathBuf,
 }
@@ -294,7 +294,7 @@ pub struct LLMProviderConfig {
     pub provider_type: String, // "ollama", "openai", "anthropic", "gemini", "openai-compatible"
 
     /// API endpoint URL
-    pub endpoint: String,
+    pub endpoint: SensitiveUrl,
 
     /// API key (supports "env:VAR_NAME" for environment variables)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -420,7 +420,7 @@ pub struct RuntimeConfig {
     /// Default: "http://localhost:8088" (local development)
     /// Docker deployments should override to "http://aegis-runtime:8088"
     #[serde(default = "default_orchestrator_url")]
-    pub orchestrator_url: String,
+    pub orchestrator_url: SensitiveUrl,
 
     /// NFS server hostname/IP for volume mounts (ADR-036)
     /// Used by the Docker daemon on the host operating system to mount NFS volumes.
@@ -463,7 +463,7 @@ pub struct RuntimeConfig {
     /// Supports env:VAR_NAME syntax for environment variable substitution.
     /// Default: None (FUSE transport disabled; falls back to in-process daemon)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fuse_daemon_endpoint: Option<String>,
+    pub fuse_daemon_endpoint: Option<SensitiveUrl>,
 }
 
 fn default_runtime_registry_path() -> String {
@@ -496,7 +496,7 @@ impl Default for RuntimeConfig {
 pub struct NetworkConfig {
     /// Orchestrator endpoint (WebSocket URL for edge nodes)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub orchestrator_endpoint: Option<String>,
+    pub orchestrator_endpoint: Option<SensitiveUrl>,
 
     /// Heartbeat interval in seconds
     #[serde(default = "default_heartbeat")]
@@ -578,7 +578,7 @@ pub struct LoggingConfig {
     /// OTLP collector endpoint.
     /// E.g. "http://localhost:4317" or "<https://otlp.datadoghq.com>"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub otlp_endpoint: Option<String>,
+    pub otlp_endpoint: Option<SensitiveUrl>,
 
     /// OTLP protocol. Defaults to `grpc`.
     #[serde(default)]
@@ -586,7 +586,7 @@ pub struct LoggingConfig {
 
     /// Static headers to inject into OTLP requests (e.g. for API keys).
     #[serde(default)]
-    pub otlp_headers: std::collections::BTreeMap<String, String>,
+    pub otlp_headers: std::collections::BTreeMap<String, SensitiveString>,
 
     /// Minimum log level to export to OTLP. Defaults to "info".
     /// Local file/stdout logging retains its own level control.
@@ -727,7 +727,7 @@ pub struct TracingConfig {
 
     /// OpenTelemetry collector endpoint
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub otlp_endpoint: Option<String>,
+    pub otlp_endpoint: Option<SensitiveUrl>,
 }
 
 /// Storage configuration for distributed agent file systems
@@ -773,7 +773,7 @@ impl Default for StorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeaweedFSConfig {
     /// Filer endpoint URL (e.g., "http://seaweedfs-filer:8888")
-    pub filer_url: String,
+    pub filer_url: SensitiveUrl,
 
     /// Host mount location for volumes
     /// Default: platform-specific aegis storage directory
@@ -802,7 +802,7 @@ pub struct SeaweedFSConfig {
 
     /// Optional S3 gateway endpoint
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub s3_endpoint: Option<String>,
+    pub s3_endpoint: Option<SensitiveUrl>,
 
     /// S3 region for gateway
     /// Default: "us-east-1"
@@ -813,7 +813,7 @@ pub struct SeaweedFSConfig {
 impl Default for SeaweedFSConfig {
     fn default() -> Self {
         Self {
-            filer_url: "http://localhost:8888".to_string(),
+            filer_url: SensitiveUrl::new("http://localhost:8888"),
             mount_point: default_seaweedfs_mount_point(),
             default_ttl_hours: default_ttl_hours(),
             default_size_limit_mb: default_size_limit_mb(),
@@ -933,7 +933,7 @@ pub struct McpServerConfig {
 
     /// API keys/tokens for external services
     #[serde(default)]
-    pub credentials: HashMap<String, String>,
+    pub credentials: HashMap<String, SensitiveString>,
 
     /// Health monitoring configuration
     #[serde(default)]
@@ -945,7 +945,7 @@ pub struct McpServerConfig {
 
     /// Additional environment variables
     #[serde(default)]
-    pub environment: HashMap<String, String>,
+    pub environment: HashMap<String, SensitiveString>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1029,13 +1029,13 @@ pub struct TemporalConfig {
     /// Temporal server address (host:port).
     /// Example: `"temporal:7233"` (Docker), `"localhost:7233"` (local dev)
     #[serde(default = "default_temporal_address")]
-    pub address: String,
+    pub address: SensitiveUrl,
 
     /// HTTP endpoint of the Temporal worker service.
     /// Used for workflow activity callbacks.
     /// Example: `"http://temporal-worker:3000"`
     #[serde(default = "default_temporal_worker_http_endpoint")]
-    pub worker_http_endpoint: String,
+    pub worker_http_endpoint: SensitiveUrl,
 
     /// Shared HMAC secret for authenticating Temporal event callbacks.
     /// Supports `env:VAR_NAME` and `secret:` credential resolution patterns.
@@ -1084,7 +1084,7 @@ pub struct CortexConfig {
     /// Example: `"http://cortex:50052"`, `"env:CORTEX_GRPC_URL"`
     /// If `None`, the orchestrator runs in memoryless mode.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub grpc_url: Option<String>,
+    pub grpc_url: Option<SensitiveUrl>,
 
     /// API key for the 100monkeys Cortex service (Zaru SaaS).
     /// When set, every outbound Cortex RPC includes `Authorization: Bearer <key>`.
@@ -1110,7 +1110,7 @@ pub struct SecretsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretBackendConfig {
     /// Backend API address (e.g. "<https://secrets.internal:8200>")
-    pub address: String,
+    pub address: SensitiveUrl,
 
     /// Authentication method (must be "approle" for orchestrators)
     #[serde(default = "default_secret_backend_auth_method")]
@@ -1222,7 +1222,7 @@ pub struct ClusterConfig {
     pub cluster_grpc_port: u16,
     /// Phase 1: static peer list (empty on workers; listing known controllers for fallback)
     #[serde(default)]
-    pub peers: Vec<String>,
+    pub peers: Vec<SensitiveUrl>,
     /// Path to persistent Ed25519 keypair. Generated by `aegis node init`.
     #[serde(default = "default_keypair_path")]
     pub node_keypair_path: PathBuf,
@@ -1255,7 +1255,7 @@ pub struct ClusterConfig {
     /// `transit/sign/edge-enrollment-token`). Format: full base URL,
     /// e.g. `http://aegis-relay-coordinator:50056`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relay_coordinator_endpoint: Option<String>,
+    pub relay_coordinator_endpoint: Option<SensitiveUrl>,
 }
 
 impl ClusterConfig {
@@ -1294,7 +1294,7 @@ impl ClusterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterControllerConfig {
     /// gRPC endpoint of the cluster controller (required for workers)
-    pub endpoint: String,
+    pub endpoint: SensitiveUrl,
     /// Secret token for initial node-to-controller authentication (Step 0)
     pub token: Option<SensitiveString>,
 }
@@ -1374,7 +1374,7 @@ pub struct EdgeCapabilitiesConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayIngressConfig {
     /// Public endpoint advertised in enrollment tokens via the `cep` claim.
-    pub public_endpoint: String,
+    pub public_endpoint: SensitiveUrl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1471,9 +1471,9 @@ pub struct IamRealmConfig {
     /// Realm identifier: "aegis-system", "zaru-consumer", or "tenant-{slug}"
     pub slug: String,
     /// Full issuer URL: `https://auth.example.com/realms/{slug}`
-    pub issuer_url: String,
+    pub issuer_url: SensitiveUrl,
     /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
-    pub jwks_uri: String,
+    pub jwks_uri: SensitiveUrl,
     /// Expected "aud" claim value for tokens from this realm
     pub audience: String,
     /// Realm classification: "system", "consumer", or "tenant"
@@ -1501,7 +1501,7 @@ pub struct IamClaimsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeycloakAdminConfig {
     /// Keycloak base URL (e.g. `https://auth.aegis.local`). Supports `env:VAR` syntax.
-    pub host: String,
+    pub host: SensitiveUrl,
     /// Admin username for the `master` realm. Supports `env:VAR` syntax.
     pub admin_username: String,
     /// Admin password for the `master` realm. Supports `env:VAR` syntax.
@@ -1553,14 +1553,14 @@ pub struct GrpcAuthConfig {
 pub struct SealGatewayConfig {
     /// gRPC endpoint URL of the gateway invocation service.
     /// Example: "http://aegis-seal-gateway:50055"
-    pub url: String,
+    pub url: SensitiveUrl,
 }
 
 /// Configuration for the Zaru consumer product service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZaruConfig {
     /// Base URL for the zaru-client service. Supports `env:VAR_NAME` syntax.
-    pub public_url: String,
+    pub public_url: SensitiveUrl,
     /// Shared secret for zaru-client internal endpoints. Supports `env:VAR_NAME` syntax.
     pub internal_secret: SensitiveString,
 }
@@ -1611,8 +1611,8 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_orchestrator_url() -> String {
-    "http://localhost:8088".to_string()
+fn default_orchestrator_url() -> SensitiveUrl {
+    SensitiveUrl::new("http://localhost:8088")
 }
 
 fn default_log_format() -> String {
@@ -1748,11 +1748,11 @@ fn default_db_max_connections() -> u32 {
 fn default_db_connect_timeout_seconds() -> u64 {
     5
 }
-fn default_temporal_address() -> String {
-    "temporal:7233".to_string()
+fn default_temporal_address() -> SensitiveUrl {
+    SensitiveUrl::new("temporal:7233")
 }
-fn default_temporal_worker_http_endpoint() -> String {
-    "http://localhost:3000".to_string()
+fn default_temporal_worker_http_endpoint() -> SensitiveUrl {
+    SensitiveUrl::new("http://localhost:3000")
 }
 fn default_temporal_namespace() -> String {
     "default".to_string()
@@ -2090,7 +2090,7 @@ impl NodeConfigManifest {
                     tracing: None,
                 });
                 let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
-                logging.otlp_endpoint = Some(endpoint);
+                logging.otlp_endpoint = Some(SensitiveUrl::new(endpoint));
             }
         }
 
@@ -2123,7 +2123,7 @@ impl NodeConfigManifest {
                     if let Some((k, v)) = pair.split_once('=') {
                         logging
                             .otlp_headers
-                            .insert(k.trim().to_string(), v.trim().to_string());
+                            .insert(k.trim().to_string(), SensitiveString::new(v.trim()));
                     }
                 }
             }
@@ -2202,7 +2202,7 @@ impl NodeConfigManifest {
                 anyhow::bail!("LLM provider name cannot be empty");
             }
 
-            if provider.endpoint.is_empty() {
+            if provider.endpoint.expose().is_empty() {
                 anyhow::bail!(
                     "LLM provider endpoint cannot be empty for: {}",
                     provider.name
@@ -2444,7 +2444,7 @@ mod tests {
                 llm_providers: vec![LLMProviderConfig {
                     name: "ollama".to_string(),
                     provider_type: "ollama".to_string(),
-                    endpoint: "http://localhost:11434".to_string(),
+                    endpoint: "http://localhost:11434".into(),
                     api_key: None,
                     enabled: true,
                     models: vec![ModelConfig {
@@ -2565,7 +2565,7 @@ mod tests {
         manifest.spec.llm_providers.push(LLMProviderConfig {
             name: "invalid".to_string(),
             provider_type: "openai".to_string(),
-            endpoint: "https://api.openai.com".to_string(),
+            endpoint: "https://api.openai.com".into(),
             api_key: None,
             enabled: true,
             models: vec![],
@@ -2586,7 +2586,7 @@ mod tests {
             enabled: true,
             role: NodeRole::Worker,
             controller: Some(ClusterControllerConfig {
-                endpoint: "https://controller:9090".to_string(),
+                endpoint: "https://controller:9090".into(),
                 token: None,
             }),
             cluster_grpc_port: 9090,
@@ -2607,7 +2607,10 @@ mod tests {
         assert_eq!(bootstrap.role, NodeRole::Worker);
         assert!(bootstrap.database.is_some());
         assert_eq!(
-            bootstrap.controller_endpoint.as_deref(),
+            bootstrap
+                .controller_endpoint
+                .as_ref()
+                .map(SensitiveUrl::expose),
             Some("https://controller:9090")
         );
         assert_eq!(
@@ -2630,7 +2633,7 @@ mod tests {
         let mut manifest = NodeConfigManifest::default();
         manifest.spec.node.id = "test-node-id".to_string();
         manifest.spec.runtime.bootstrap_script = "original.py".to_string();
-        manifest.spec.runtime.orchestrator_url = "http://original:8088".to_string();
+        manifest.spec.runtime.orchestrator_url = "http://original:8088".into();
 
         let merged = MergedConfig {
             payload: serde_json::json!({
@@ -2645,7 +2648,7 @@ mod tests {
         assert_eq!(manifest.spec.runtime.bootstrap_script, "overridden.py");
         // Fields not in overlay are preserved
         assert_eq!(
-            manifest.spec.runtime.orchestrator_url,
+            manifest.spec.runtime.orchestrator_url.expose(),
             "http://original:8088"
         );
     }
@@ -2906,7 +2909,7 @@ path: "/metrics"
         manifest.spec.llm_providers = vec![LLMProviderConfig {
             name: "ollama".to_string(),
             provider_type: "ollama".to_string(),
-            endpoint: "http://localhost:11434".to_string(),
+            endpoint: "http://localhost:11434".into(),
             api_key: None,
             enabled: true,
             models: vec![ModelConfig {

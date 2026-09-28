@@ -794,8 +794,8 @@ fn realm_from_config(config: &IamRealmConfig) -> Result<IdentityRealm, IamError>
 
     Ok(IdentityRealm {
         realm_slug: config.slug.clone(),
-        issuer_url: config.issuer_url.clone(),
-        jwks_uri: config.jwks_uri.clone(),
+        issuer_url: config.issuer_url.expose().to_string(),
+        jwks_uri: config.jwks_uri.expose().to_string(),
         audience: config.audience.clone(),
         realm_kind,
     })
@@ -809,9 +809,9 @@ mod tests {
     fn realm_from_config_system() {
         let config = IamRealmConfig {
             slug: "aegis-system".to_string(),
-            issuer_url: "https://auth.example.com/realms/aegis-system".to_string(),
+            issuer_url: "https://auth.example.com/realms/aegis-system".into(),
             jwks_uri: "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
-                .to_string(),
+                .into(),
             audience: "aegis-orchestrator".to_string(),
             kind: "system".to_string(),
         };
@@ -824,9 +824,9 @@ mod tests {
     fn realm_from_config_consumer() {
         let config = IamRealmConfig {
             slug: "zaru-consumer".to_string(),
-            issuer_url: "https://auth.example.com/realms/zaru-consumer".to_string(),
+            issuer_url: "https://auth.example.com/realms/zaru-consumer".into(),
             jwks_uri: "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
-                .to_string(),
+                .into(),
             audience: "aegis-orchestrator".to_string(),
             kind: "consumer".to_string(),
         };
@@ -838,9 +838,9 @@ mod tests {
     fn realm_from_config_tenant() {
         let config = IamRealmConfig {
             slug: "tenant-acme".to_string(),
-            issuer_url: "https://auth.example.com/realms/tenant-acme".to_string(),
+            issuer_url: "https://auth.example.com/realms/tenant-acme".into(),
             jwks_uri: "https://auth.example.com/realms/tenant-acme/protocol/openid-connect/certs"
-                .to_string(),
+                .into(),
             audience: "aegis-orchestrator".to_string(),
             kind: "tenant".to_string(),
         };
@@ -859,19 +859,19 @@ mod tests {
             realms: vec![
                 IamRealmConfig {
                     slug: "aegis-system".to_string(),
-                    issuer_url: "https://auth.example.com/realms/aegis-system".to_string(),
+                    issuer_url: "https://auth.example.com/realms/aegis-system".into(),
                     jwks_uri:
                         "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
-                            .to_string(),
+                            .into(),
                     audience: "aegis-orchestrator".to_string(),
                     kind: "system".to_string(),
                 },
                 IamRealmConfig {
                     slug: "zaru-consumer".to_string(),
-                    issuer_url: "https://auth.example.com/realms/zaru-consumer".to_string(),
+                    issuer_url: "https://auth.example.com/realms/zaru-consumer".into(),
                     jwks_uri:
                         "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
-                            .to_string(),
+                            .into(),
                     audience: "aegis-orchestrator".to_string(),
                     kind: "consumer".to_string(),
                 },
@@ -1252,9 +1252,8 @@ mod tests {
     fn realm_from_config_errors_on_malformed_tenant_slug() {
         let config = IamRealmConfig {
             slug: "foo".to_string(),
-            issuer_url: "https://auth.example.com/realms/foo".to_string(),
-            jwks_uri: "https://auth.example.com/realms/foo/protocol/openid-connect/certs"
-                .to_string(),
+            issuer_url: "https://auth.example.com/realms/foo".into(),
+            jwks_uri: "https://auth.example.com/realms/foo/protocol/openid-connect/certs".into(),
             audience: "aegis-orchestrator".to_string(),
             kind: "tenant".to_string(),
         };
@@ -1276,9 +1275,9 @@ mod tests {
     fn realm_from_config_errors_on_unknown_kind() {
         let config = IamRealmConfig {
             slug: "tenant-acme".to_string(),
-            issuer_url: "https://auth.example.com/realms/tenant-acme".to_string(),
+            issuer_url: "https://auth.example.com/realms/tenant-acme".into(),
             jwks_uri: "https://auth.example.com/realms/tenant-acme/protocol/openid-connect/certs"
-                .to_string(),
+                .into(),
             audience: "aegis-orchestrator".to_string(),
             kind: "bogus".to_string(),
         };
@@ -1303,10 +1302,10 @@ mod tests {
         let config = IamConfig {
             realms: vec![IamRealmConfig {
                 slug: "tenant-acme".to_string(),
-                issuer_url: "https://auth.example.com/realms/tenant-acme".to_string(),
+                issuer_url: "https://auth.example.com/realms/tenant-acme".into(),
                 jwks_uri:
                     "https://auth.example.com/realms/tenant-acme/protocol/openid-connect/certs"
-                        .to_string(),
+                        .into(),
                 audience: "aegis-orchestrator".to_string(),
                 kind: "definitely-not-a-realm-kind".to_string(),
             }],
@@ -1346,10 +1345,10 @@ mod tests {
         let config = IamConfig {
             realms: vec![IamRealmConfig {
                 slug: "zaru-consumer".to_string(),
-                issuer_url: TEST_ISSUER.to_string(),
+                issuer_url: TEST_ISSUER.into(),
                 jwks_uri:
                     "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
-                        .to_string(),
+                        .into(),
                 audience: TEST_AUDIENCE.to_string(),
                 kind: "consumer".to_string(),
             }],
@@ -1544,9 +1543,9 @@ mod tests {
         let config = IamConfig {
             realms: vec![IamRealmConfig {
                 slug: "zaru-consumer".to_string(),
-                issuer_url: TEST_ISSUER.to_string(),
+                issuer_url: TEST_ISSUER.into(),
                 // RFC 5737 TEST-NET-1: guaranteed-non-routable
-                jwks_uri: "http://192.0.2.1:1/jwks".to_string(),
+                jwks_uri: "http://192.0.2.1:1/jwks".into(),
                 audience: TEST_AUDIENCE.to_string(),
                 kind: "consumer".to_string(),
             }],
@@ -1710,10 +1709,10 @@ mod tests {
     fn second_consumer_realm_config() -> IamRealmConfig {
         IamRealmConfig {
             slug: "zaru-consumer-2".to_string(),
-            issuer_url: "https://auth.example.com/realms/zaru-consumer-2".to_string(),
+            issuer_url: "https://auth.example.com/realms/zaru-consumer-2".into(),
             jwks_uri:
                 "https://auth.example.com/realms/zaru-consumer-2/protocol/openid-connect/certs"
-                    .to_string(),
+                    .into(),
             audience: TEST_AUDIENCE.to_string(),
             kind: "consumer".to_string(),
         }
@@ -1724,10 +1723,10 @@ mod tests {
             realms: vec![
                 IamRealmConfig {
                     slug: "zaru-consumer".to_string(),
-                    issuer_url: TEST_ISSUER.to_string(),
+                    issuer_url: TEST_ISSUER.into(),
                     jwks_uri:
                         "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
-                            .to_string(),
+                            .into(),
                     audience: TEST_AUDIENCE.to_string(),
                     kind: "consumer".to_string(),
                 },
@@ -1868,9 +1867,9 @@ mod tests {
         let config = IamConfig {
             realms: vec![IamRealmConfig {
                 slug: "zaru-consumer".to_string(),
-                issuer_url: TEST_ISSUER.to_string(),
+                issuer_url: TEST_ISSUER.into(),
                 // RFC 5737 TEST-NET-1: guaranteed-non-routable
-                jwks_uri: "http://192.0.2.1:1/jwks".to_string(),
+                jwks_uri: "http://192.0.2.1:1/jwks".into(),
                 audience: TEST_AUDIENCE.to_string(),
                 kind: "consumer".to_string(),
             }],
@@ -1932,8 +1931,8 @@ mod tests {
         let config = IamConfig {
             realms: vec![IamRealmConfig {
                 slug: "zaru-consumer".to_string(),
-                issuer_url: TEST_ISSUER.to_string(),
-                jwks_uri: "http://192.0.2.1:1/jwks".to_string(),
+                issuer_url: TEST_ISSUER.into(),
+                jwks_uri: "http://192.0.2.1:1/jwks".into(),
                 audience: TEST_AUDIENCE.to_string(),
                 kind: "consumer".to_string(),
             }],

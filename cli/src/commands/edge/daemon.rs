@@ -93,7 +93,7 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
         .cluster
         .as_ref()
         .and_then(|c| c.controller.as_ref())
-        .map(|c| c.endpoint.clone())
+        .map(|c| c.endpoint.expose().to_string())
         .filter(|ep| !ep.is_empty() && !ep.contains("{{"))
         .map(Ok)
         .unwrap_or_else(|| grpc::load_controller_endpoint(&state_dir))
