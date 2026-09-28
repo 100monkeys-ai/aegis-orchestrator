@@ -3,9 +3,18 @@
 //! # gRPC health checking (`grpc.health.v1.Health`)
 //!
 //! Every gRPC server the orchestrator starts serves the standard health
-//! service, so that `grpc_health_probe` and any other standard client can ask
-//! whether the server is able to serve. A server reports `SERVING` only while
-//! every dependency its role needs answers, and `NOT_SERVING` otherwise.
+//! service, and answers two different questions under two kinds of name:
+//!
+//! - The **overall** name, the empty string (what `grpc_health_probe` asks
+//!   without `-service`): is this process up and able to answer? `SERVING`
+//!   once the server listens, and it stays `SERVING` through a dependency's
+//!   outage. It is what a liveness probe asks.
+//! - Each **service** name (e.g. `aegis.cluster.v1.NodeClusterService`): can
+//!   this service do its work now? `SERVING` only while every dependency the
+//!   service needs answers, `NOT_SERVING` otherwise, re-evaluated
+//!   periodically. It is what a readiness probe asks, with `-service`.
+//!
+//! An unknown service name answers `NOT_FOUND`, as the protocol specifies.
 //!
 //! A dependency is expressed as a [`ReadinessCheck`]: an async predicate that
 //! answers `true` when the dependency is reachable.
@@ -33,8 +42,9 @@ pub fn service_name<S: tonic::server::NamedService>(_server: &S) -> &'static str
 }
 
 /// The health of one gRPC server: its overall status (the empty service
-/// name, which `grpc_health_probe` asks for when given no `-service`) and the
-/// status of each service it hosts. All of them move together.
+/// name, which `grpc_health_probe` asks for when given no `-service`), which
+/// is `SERVING` for as long as the server answers, and the status of each
+/// service it hosts, which follows the server's readiness checks.
 #[derive(Clone)]
 pub struct GrpcHealth {
     reporter: HealthReporter,
@@ -42,11 +52,15 @@ pub struct GrpcHealth {
 }
 
 impl GrpcHealth {
-    /// The health service for a server hosting `services`. The overall
-    /// server and every named service start `NOT_SERVING`: nothing is
-    /// reported as serving before something has checked that it can.
+    /// The health service for a server hosting `services`. The overall name
+    /// is `SERVING`: whenever the health service can answer, the process is
+    /// up. Every named service starts `NOT_SERVING`: no service is reported
+    /// as serving before something has checked that it can.
     pub async fn new(services: &[&str]) -> (Self, HealthServer<impl Health>) {
         let (reporter, server) = ::tonic_health::server::health_reporter();
+        reporter
+            .set_service_status("", ServingStatus::Serving)
+            .await;
         let health = Self {
             reporter,
             services: services.iter().map(|s| s.to_string()).collect(),
@@ -55,17 +69,18 @@ impl GrpcHealth {
         (health, server)
     }
 
-    /// Report `status` for the overall server and every named service.
+    /// Report `status` for every named service. The overall name is not
+    /// touched: a service's readiness never takes the process down.
     pub async fn set(&self, status: ServingStatus) {
-        self.reporter.set_service_status("", status).await;
         for service in self.services.iter() {
             self.reporter.set_service_status(service, status).await;
         }
     }
 
-    /// Evaluate `checks` now and then every `interval`, reporting `SERVING`
-    /// while all of them pass and `NOT_SERVING` otherwise. With no checks
-    /// the server reports `SERVING` from the first evaluation.
+    /// Evaluate `checks` now and then every `interval`, reporting every
+    /// named service `SERVING` while all of them pass and `NOT_SERVING`
+    /// otherwise. With no checks the services report `SERVING` from the
+    /// first evaluation.
     pub fn spawn_monitor(self, checks: Vec<ReadinessCheck>, interval: Duration) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
