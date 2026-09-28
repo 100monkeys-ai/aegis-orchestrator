@@ -23,6 +23,32 @@ const GATEWAY_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(5);
 const GATEWAY_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl ToolInvocationService {
+    /// Put the operator token in `request`'s `authorization` metadata, as
+    /// `Bearer <token>`. Without configured credentials the request goes
+    /// unauthenticated and the gateway refuses it unless its operator
+    /// authentication is off.
+    async fn authorize_gateway_request<T>(
+        &self,
+        request: &mut tonic::Request<T>,
+    ) -> Result<(), SealSessionError> {
+        let Some(source) = &self.seal_gateway_operator_token else {
+            return Ok(());
+        };
+        let authorization = source.authorization().await.map_err(|e| {
+            SealSessionError::InternalError(format!("SEAL gateway operator token: {e}"))
+        })?;
+        let value = authorization
+            .expose()
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .map_err(|_| {
+                SealSessionError::InternalError(
+                    "SEAL gateway operator token is not a valid metadata value".to_string(),
+                )
+            })?;
+        request.metadata_mut().insert("authorization", value);
+        Ok(())
+    }
+
     pub async fn get_available_tools(
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
@@ -202,11 +228,12 @@ impl ToolInvocationService {
         };
 
         let mut request = tonic::Request::new(ListToolsRequest {});
-        if let Ok(token) = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN") {
-            if let Ok(val) = token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
-            {
-                request.metadata_mut().insert("authorization", val);
-            }
+        if let Err(e) = self.authorize_gateway_request(&mut request).await {
+            tracing::warn!(
+                error = %e,
+                "no SEAL gateway operator token for tool enumeration; proceeding with built-in tools only"
+            );
+            return Ok(Vec::new());
         }
         // Bound the RPC await: a hung `list_tools` MUST NOT cause the
         // orchestrator to hang on the tool-invocation path.
@@ -353,13 +380,7 @@ impl ToolInvocationService {
                 fsal_mounts,
                 tenant_id: tenant_id.unwrap_or("").to_string(),
             });
-            if let Ok(token) = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN") {
-                if let Ok(val) =
-                    token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
-                {
-                    request.metadata_mut().insert("authorization", val);
-                }
-            }
+            self.authorize_gateway_request(&mut request).await?;
             let response = match tokio::time::timeout(
                 GATEWAY_INVOKE_TIMEOUT,
                 client.invoke_cli(request),
@@ -394,12 +415,7 @@ impl ToolInvocationService {
             zaru_user_token: zaru_user_token.unwrap_or("").to_string(),
             tenant_id: tenant_id.unwrap_or("").to_string(),
         });
-        if let Ok(token) = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN") {
-            if let Ok(val) = token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
-            {
-                request.metadata_mut().insert("authorization", val);
-            }
-        }
+        self.authorize_gateway_request(&mut request).await?;
         let response =
             match tokio::time::timeout(GATEWAY_INVOKE_TIMEOUT, client.invoke_workflow(request))
                 .await

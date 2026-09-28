@@ -110,6 +110,10 @@ pub struct ToolInvocationService {
     node_config_path: Option<PathBuf>,
     /// Optional ADR-053 SEAL gateway URL from node config.
     seal_gateway_url: Option<String>,
+    /// Operator credentials for the SEAL gateway's gRPC services (ADR-088
+    /// §6.6). `None` only when none are configured.
+    seal_gateway_operator_token:
+        Option<Arc<crate::infrastructure::seal::operator_token::OperatorTokenSource>>,
     /// Schema registry for builtin schema.get / schema.validate tools.
     schema_registry: Arc<SchemaRegistry>,
     /// Optional port for workflow execution control (cancel, signal, remove).

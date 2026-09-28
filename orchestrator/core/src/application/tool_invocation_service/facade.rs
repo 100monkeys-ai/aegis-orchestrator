@@ -89,6 +89,7 @@ impl ToolInvocationService {
             generated_manifests_root: None,
             node_config_path: None,
             seal_gateway_url,
+            seal_gateway_operator_token: None,
             schema_registry: Arc::new(SchemaRegistry::build()),
             workflow_execution_control: None,
             agent_activity: None,
@@ -104,6 +105,16 @@ impl ToolInvocationService {
             edge_fleet_dispatcher: None,
             edge_fleet_cancel: None,
         }
+    }
+
+    /// Authenticate calls to the SEAL gateway's gRPC services with this
+    /// operator token source.
+    pub fn with_seal_gateway_operator_token(
+        mut self,
+        source: Arc<crate::infrastructure::seal::operator_token::OperatorTokenSource>,
+    ) -> Self {
+        self.seal_gateway_operator_token = Some(source);
+        self
     }
 
     /// ADR-117: enable the four-step edge dispatch pre-routing hook.

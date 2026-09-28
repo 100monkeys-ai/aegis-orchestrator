@@ -1409,17 +1409,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         })?,
     );
 
+    // Operator credentials for the SEAL gateway's operator API (ADR-088 §6.6):
+    // a client-credentials token, obtained and refreshed by the orchestrator.
+    // All three variables or none; a partial set refuses to start.
+    let seal_gateway_operator_token = aegis_orchestrator_core::infrastructure::seal::operator_token::OperatorCredentials::from_env()?
+        .map(|credentials| {
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::seal::operator_token::OperatorTokenSource::new(
+                    credentials,
+                ),
+            )
+        });
+    if seal_gateway_operator_token.is_none() {
+        warn!(
+            "AEGIS_SEAL_OPERATOR_TOKEN_URL, AEGIS_SEAL_OPERATOR_CLIENT_ID and AEGIS_SEAL_OPERATOR_CLIENT_SECRET are not set: calls to the SEAL gateway's operator API carry no token and a gateway with operator authentication refuses them"
+        );
+    }
+
     // SEAL gateway client for session pre-creation (ADR-088 §A8).
     let seal_gateway_client: Arc<
         dyn aegis_orchestrator_core::application::ports::SealGatewayClient,
     > = {
         let gateway_url = std::env::var("AEGIS_SEAL_GATEWAY_URL")
             .unwrap_or_else(|_| "http://localhost:8089".to_string());
-        let operator_token = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN").ok();
         Arc::new(
             aegis_orchestrator_core::infrastructure::seal::gateway_client::HttpSealGatewayClient::new(
                 gateway_url,
-                operator_token,
+                seal_gateway_operator_token.clone(),
             ),
         )
     };
@@ -1717,6 +1733,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_tool_catalog(tool_catalog.clone())
         .with_runtime_registry(runtime_registry.clone())
         .with_file_operations_service(file_operations_service.clone());
+    if let Some(source) = &seal_gateway_operator_token {
+        tool_invocation_service_builder =
+            tool_invocation_service_builder.with_seal_gateway_operator_token(source.clone());
+    }
 
     // Wire discovery service into ToolInvocationService if available (ADR-075)
     if let Some(ref disc_svc) = discovery_service {

@@ -40,6 +40,7 @@ pub mod envelope;
 pub mod gateway_client;
 pub mod middleware;
 pub mod nonce_store;
+pub mod operator_token;
 pub mod policy_engine;
 pub mod session_repository;
 pub mod signature;
