@@ -1206,7 +1206,7 @@ pub enum IamEvent {
         realm_slug: String,
         /// "system" | "consumer" | "tenant"
         realm_kind: String,
-        issuer_url: String,
+        issuer_url: crate::domain::secrets::RedactedUrl,
         registered_at: DateTime<Utc>,
     },
     /// A tenant realm was provisioned (Phase 2 — OIDC Admin API + secret namespace).

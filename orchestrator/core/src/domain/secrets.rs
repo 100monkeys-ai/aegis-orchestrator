@@ -337,6 +337,78 @@ impl std::fmt::Display for SensitiveUrl {
 }
 
 // ---------------------------------------------------------------------------
+// RedactedUrl — a URL as a published record carries it
+// ---------------------------------------------------------------------------
+
+/// A URL as an event, or any other record that is published, carries it.
+///
+/// User info is dropped when the value is made, and so are the values of
+/// secret query parameters (the rule of [`redact_url`]); nothing else of the
+/// URL can be held, so nothing else can be serialised. A value read back
+/// through serde is made the same way. An SSH address written
+/// `user@host:path` keeps `host:path`.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RedactedUrl(String);
+
+impl RedactedUrl {
+    /// Make one from a raw URL, dropping any user info.
+    pub fn new(raw: &str) -> Self {
+        Self(without_user_info(raw))
+    }
+
+    /// The URL as held: with no user info.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn without_user_info(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.contains("://") {
+        match url::Url::parse(raw) {
+            Ok(mut parsed) => {
+                // Clearing either cannot fail on a URL that has a host, and
+                // one that has none has no user info.
+                let _ = parsed.set_password(None);
+                let _ = parsed.set_username("");
+                redact_url(parsed.as_str())
+            }
+            Err(_) => UNPARSEABLE_URL.to_string(),
+        }
+    } else if let Some((_, rest)) = raw.rsplit_once('@') {
+        rest.to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+impl<'de> Deserialize<'de> for RedactedUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::new(&raw))
+    }
+}
+
+impl From<&SensitiveUrl> for RedactedUrl {
+    fn from(value: &SensitiveUrl) -> Self {
+        Self::new(value.expose())
+    }
+}
+
+impl std::fmt::Debug for RedactedUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RedactedUrl").field(&self.0).finish()
+    }
+}
+
+impl std::fmt::Display for RedactedUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SecretPath — namespace-aware path value object (ADR-034 §SecretPath)
 // ---------------------------------------------------------------------------
 
@@ -628,6 +700,53 @@ impl DomainDynamicSecret {
 
 #[cfg(test)]
 mod tests {
+
+    /// `RedactedUrl` holds no user info however it is made (from a raw URL,
+    /// from a `SensitiveUrl`, read back through serde), in every URL form,
+    /// and keeps the address.
+    #[test]
+    fn redacted_url_never_holds_user_info() {
+        let cases = [
+            (
+                "https://u:Mk7pw@git.example.invalid/o/r.git",
+                "https://git.example.invalid/o/r.git",
+            ),
+            (
+                "https://Mk7tok@git.example.invalid/o/r.git",
+                "https://git.example.invalid/o/r.git",
+            ),
+            (
+                "http://u:Mk7pw@127.0.0.1:8080/r.git",
+                "http://127.0.0.1:8080/r.git",
+            ),
+            ("git@github.com:o/r.git", "github.com:o/r.git"),
+            (
+                "https://git.example.invalid/o/r.git",
+                "https://git.example.invalid/o/r.git",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let made = RedactedUrl::new(raw);
+            let from_sensitive = RedactedUrl::from(&SensitiveUrl::new(raw));
+            let read_back: RedactedUrl =
+                serde_json::from_str(&serde_json::to_string(raw).unwrap()).unwrap();
+            for (how, value) in [
+                ("new", &made),
+                ("from", &from_sensitive),
+                ("serde", &read_back),
+            ] {
+                assert_eq!(value.as_str(), expected, "{how}: {raw}");
+                let shown = format!(
+                    "{value} {value:?} {}",
+                    serde_json::to_string(value).unwrap()
+                );
+                assert!(
+                    !shown.contains("Mk7"),
+                    "{how}: user info survived for {raw}"
+                );
+            }
+        }
+    }
     use super::*;
 
     // ── SensitiveString ──────────────────────────────────────────────────────

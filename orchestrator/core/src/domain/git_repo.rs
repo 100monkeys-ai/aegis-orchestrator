@@ -30,7 +30,7 @@
 
 use crate::domain::credential::CredentialBindingId;
 use crate::domain::repository::RepositoryError;
-use crate::domain::secrets::{SensitiveString, SensitiveUrl};
+use crate::domain::secrets::{RedactedUrl, SensitiveString, SensitiveUrl};
 use crate::domain::shared_kernel::{TenantId, VolumeId};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -138,8 +138,8 @@ pub enum CloneStrategy {
 pub enum GitRepoEvent {
     BindingCreated {
         id: GitRepoBindingId,
-        /// May carry a token as user info; prints redacted.
-        repo_url: SensitiveUrl,
+        /// The binding's URL without its user info.
+        repo_url: RedactedUrl,
         git_ref: GitRef,
         volume_id: VolumeId,
         created_at: DateTime<Utc>,
@@ -319,7 +319,7 @@ impl GitRepoBinding {
         };
         binding.domain_events.push(GitRepoEvent::BindingCreated {
             id,
-            repo_url,
+            repo_url: RedactedUrl::from(&repo_url),
             git_ref,
             volume_id,
             created_at: now,
@@ -603,12 +603,14 @@ mod tests {
         );
     }
 
+    /// The event's wire form is the fixture's with only the URL's user info
+    /// gone, also for an event read back from the old form.
     #[test]
-    fn git_repo_event_wire_form_is_unchanged() {
+    fn git_repo_event_wire_form_drops_only_the_user_info() {
         let event: GitRepoEvent = serde_json::from_str(BINDING_CREATED_FIXTURE).unwrap();
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
-            BINDING_CREATED_FIXTURE
+            BINDING_CREATED_FIXTURE.replace("user:Mk7-git-pat-marker@", "")
         );
     }
 

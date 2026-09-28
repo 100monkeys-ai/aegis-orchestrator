@@ -3,7 +3,8 @@
 
 use crate::domain::agent::AgentId;
 use crate::domain::events::{
-    CorrelatedActivityEvent, ExecutionEvent, StorageEvent, ValidationEvent, WorkflowEvent,
+    AgentLifecycleEvent, CorrelatedActivityEvent, ExecutionEvent, StorageEvent, ValidationEvent,
+    WorkflowEvent,
 };
 use crate::domain::execution::{Execution, ExecutionId, ExecutionStatus, IterationStatus};
 use crate::domain::repository::{ExecutionRepository, WorkflowExecutionRepository};
@@ -99,6 +100,12 @@ impl CorrelatedActivityStreamService {
         }
     }
 
+    /// Follow an agent's activity for `tenant_id`: its history, then every
+    /// live event that belongs on the stream (see `event_belongs_to_agent`).
+    ///
+    /// `verbose` adds nothing to the live part: the events it once added were
+    /// those that carry neither an agent nor an execution, which cannot be
+    /// tied to the caller's tenant and are never forwarded.
     pub async fn stream_agent_activity(
         &self,
         agent_id: AgentId,
@@ -107,39 +114,37 @@ impl CorrelatedActivityStreamService {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CorrelatedActivityEvent>> + Send>>> {
         let history = self.agent_history(agent_id, tenant_id, verbose).await?;
         let repository = Arc::clone(&self.execution_repository);
-        let cache = Arc::new(RwLock::new(HashMap::<ExecutionId, AgentId>::new()));
+        let cache = Arc::new(RwLock::new(HashMap::<ExecutionId, bool>::new()));
+        let tenant = tenant_id.clone();
         let receiver = self.event_bus.subscribe();
 
         let live = futures::stream::unfold(
-            (receiver, repository, cache, verbose),
-            move |(mut receiver, repository, cache, verbose)| async move {
+            (receiver, repository, cache, tenant),
+            move |(mut receiver, repository, cache, tenant)| async move {
                 loop {
                     match receiver.recv().await {
                         Ok(event) => {
-                            match resolve_agent_for_event(&event, &repository, &cache).await {
-                                Ok(Some(resolved_agent_id)) if resolved_agent_id == agent_id => {
-                                    let normalized =
-                                        normalize_domain_event(&event, Some(resolved_agent_id));
+                            match event_belongs_to_agent(
+                                &event,
+                                agent_id,
+                                &tenant,
+                                &repository,
+                                &cache,
+                            )
+                            .await
+                            {
+                                Ok(true) => {
+                                    let normalized = normalize_domain_event(&event, Some(agent_id));
                                     return Some((
                                         Ok(normalized),
-                                        (receiver, repository, cache, verbose),
+                                        (receiver, repository, cache, tenant),
                                     ));
                                 }
-                                Ok(None) if verbose => {
-                                    // In verbose mode, emit unresolvable events (system-level
-                                    // events with no agent_id) with agent_id: None so they are
-                                    // visible to the caller.
-                                    let normalized = normalize_domain_event(&event, None);
-                                    return Some((
-                                        Ok(normalized),
-                                        (receiver, repository, cache, verbose),
-                                    ));
-                                }
-                                Ok(_) => continue,
+                                Ok(false) => continue,
                                 Err(error) => {
                                     return Some((
                                         Err(error),
-                                        (receiver, repository, cache, verbose),
+                                        (receiver, repository, cache, tenant),
                                     ));
                                 }
                             }
@@ -148,7 +153,7 @@ impl CorrelatedActivityStreamService {
                         Err(error) => {
                             return Some((
                                 Err(anyhow!("Event bus error: {error}")),
-                                (receiver, repository, cache, verbose),
+                                (receiver, repository, cache, tenant),
                             ));
                         }
                     }
@@ -222,32 +227,96 @@ impl CorrelatedActivityStreamService {
     }
 }
 
-async fn resolve_agent_for_event(
+/// Does `event` belong on `agent_id`'s stream for `tenant_id`?
+///
+/// Only when it can be tied to both: it names an execution of `tenant_id`
+/// run by `agent_id` (and, if it names an agent too, that agent), or it is a
+/// lifecycle event of `agent_id` whose every tenant is `tenant_id`. An event
+/// that names an execution not found for the tenant, or that names neither
+/// an execution nor an agent, does not. The outcome for an execution is
+/// cached once the execution is found under any tenant; one not stored yet
+/// is looked up again next time.
+async fn event_belongs_to_agent(
     event: &DomainEvent,
+    agent_id: AgentId,
+    tenant_id: &TenantId,
     repository: &Arc<dyn ExecutionRepository>,
-    cache: &Arc<RwLock<HashMap<ExecutionId, AgentId>>>,
-) -> Result<Option<AgentId>> {
-    if let Some(agent_id) = event.agent_id() {
-        return Ok(Some(agent_id));
-    }
-
+    cache: &Arc<RwLock<HashMap<ExecutionId, bool>>>,
+) -> Result<bool> {
     let Some(execution_id) = event.execution_id() else {
-        return Ok(None);
+        return Ok(match event {
+            DomainEvent::AgentLifecycle(lifecycle) => {
+                lifecycle_belongs_to_agent(lifecycle, agent_id, tenant_id)
+            }
+            _ => false,
+        });
     };
-
-    if let Some(agent_id) = cache.read().await.get(&execution_id).copied() {
-        return Ok(Some(agent_id));
+    if event.agent_id().is_some_and(|named| named != agent_id) {
+        return Ok(false);
     }
 
-    let execution = repository
-        .find_by_id_unscoped(execution_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!("Execution {execution_id} not found while correlating agent activity")
-        })?;
-    let agent_id = execution.agent_id;
-    cache.write().await.insert(execution_id, agent_id);
-    Ok(Some(agent_id))
+    let cached = cache.read().await.get(&execution_id).copied();
+    let belongs = match cached {
+        Some(belongs) => belongs,
+        None => match repository
+            .find_by_id_for_tenant(tenant_id, execution_id)
+            .await?
+        {
+            Some(execution) => {
+                let belongs = execution.agent_id == agent_id;
+                cache.write().await.insert(execution_id, belongs);
+                belongs
+            }
+            None => {
+                if repository
+                    .find_by_id_unscoped(execution_id)
+                    .await?
+                    .is_some()
+                {
+                    // Another tenant's execution.
+                    cache.write().await.insert(execution_id, false);
+                }
+                false
+            }
+        },
+    };
+    Ok(belongs)
+}
+
+/// A lifecycle event belongs on an agent's stream when it is that agent's
+/// and every tenant it names is the caller's. One that names no tenant
+/// cannot be tied to the caller.
+fn lifecycle_belongs_to_agent(
+    event: &AgentLifecycleEvent,
+    agent_id: AgentId,
+    tenant_id: &TenantId,
+) -> bool {
+    match event {
+        AgentLifecycleEvent::AgentDeployed {
+            agent_id: a,
+            tenant_id: t,
+            ..
+        }
+        | AgentLifecycleEvent::AgentUpdated {
+            agent_id: a,
+            tenant_id: t,
+            ..
+        }
+        | AgentLifecycleEvent::AgentRemoved {
+            agent_id: a,
+            tenant_id: t,
+            ..
+        } => *a == agent_id && t == tenant_id,
+        AgentLifecycleEvent::AgentScopeChanged {
+            agent_id: a,
+            previous_tenant_id,
+            new_tenant_id,
+            ..
+        } => *a == agent_id && previous_tenant_id == tenant_id && new_tenant_id == tenant_id,
+        AgentLifecycleEvent::AgentPaused { .. }
+        | AgentLifecycleEvent::AgentResumed { .. }
+        | AgentLifecycleEvent::AgentFailed { .. } => false,
+    }
 }
 
 fn execution_to_history(execution: &Execution) -> Vec<CorrelatedActivityEvent> {
