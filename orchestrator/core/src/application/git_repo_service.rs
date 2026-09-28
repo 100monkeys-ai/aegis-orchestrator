@@ -112,6 +112,10 @@ pub struct CreateGitRepoCommand {
     /// `true` (default) clones with `depth = 1`. Full-history clones
     /// require explicit opt-in.
     pub shallow: bool,
+    /// The SSH host keys of the remote, as public key lines
+    /// (`ssh-ed25519 AAAA…`). Required for an SSH remote on a host that is
+    /// not well known; not allowed for an HTTPS remote.
+    pub ssh_host_keys: Vec<String>,
 }
 
 impl CreateGitRepoCommand {
@@ -134,6 +138,7 @@ impl CreateGitRepoCommand {
             label: label.into(),
             auto_refresh: false,
             shallow: true,
+            ssh_host_keys: Vec::new(),
         }
     }
 }
@@ -747,6 +752,7 @@ impl GitRepoService {
         let remote_name = remote.unwrap_or("origin").to_string();
         let explicit_ref = ref_name.map(str::to_string);
         let repo_url = binding.repo_url.clone();
+        let ssh_host_keys = binding.ssh_host_keys.clone();
 
         let resolved_ref = tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
             push_to_remote(
@@ -755,6 +761,7 @@ impl GitRepoService {
                 &remote_name,
                 explicit_ref,
                 credential,
+                &ssh_host_keys,
             )
         })
         .await
@@ -1212,6 +1219,7 @@ pub(crate) fn push_to_remote(
     remote_name: &str,
     ref_name: Option<String>,
     credential: Option<ResolvedCredential>,
+    _ssh_host_keys: &[crate::domain::git_host_keys::SshHostKey],
 ) -> Result<String, GitRepoError> {
     let (_, credential) = clone_credential(repo_url.expose(), credential);
     let secrets = credential_secrets(credential.as_ref());

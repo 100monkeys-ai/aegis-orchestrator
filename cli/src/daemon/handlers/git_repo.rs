@@ -64,6 +64,11 @@ pub(crate) struct CreateGitRepoRequest {
     pub(crate) auto_refresh: bool,
     #[serde(default = "default_shallow")]
     pub(crate) shallow: bool,
+    /// The SSH host keys of the remote, as public key lines
+    /// (`ssh-ed25519 AAAA…`). Required for an SSH remote on a host other
+    /// than GitHub, GitLab or Bitbucket.
+    #[serde(default)]
+    pub(crate) ssh_host_keys: Vec<String>,
 }
 
 fn default_shallow() -> bool {
@@ -260,6 +265,7 @@ pub(crate) async fn create_git_repo(
         label: body.label,
         auto_refresh: body.auto_refresh,
         shallow: body.shallow,
+        ssh_host_keys: body.ssh_host_keys,
     };
 
     let binding = svc

@@ -29,6 +29,7 @@
 //! See [`crate::domain::git_repo_tier_limits`] for per-[`crate::domain::iam::ZaruTier`] gating.
 
 use crate::domain::credential::CredentialBindingId;
+use crate::domain::git_host_keys::SshHostKey;
 use crate::domain::repository::RepositoryError;
 use crate::domain::secrets::{RedactedUrl, SensitiveString, SensitiveUrl};
 use crate::domain::shared_kernel::{TenantId, VolumeId};
@@ -261,6 +262,11 @@ pub struct GitRepoBinding {
     /// without the HMAC key, so DB-only access cannot recover the
     /// cleartext. Stored under `git_repo_bindings.webhook_lookup_hash`.
     pub webhook_lookup_hash: Option<String>,
+    /// The SSH host keys given for this repository's remote when the binding
+    /// was created. Empty for an HTTPS remote and for an SSH remote on a
+    /// well-known host, whose published keys are used
+    /// ([`crate::domain::git_host_keys::host_keys_for`]).
+    pub ssh_host_keys: Vec<SshHostKey>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Event buffer. Drained by [`take_events`](Self::take_events) at the
@@ -313,6 +319,7 @@ impl GitRepoBinding {
             webhook_secret: webhook_secret.map(SensitiveString::new),
             webhook_secret_ciphertext,
             webhook_lookup_hash,
+            ssh_host_keys: Vec::new(),
             created_at: now,
             updated_at: now,
             domain_events: Vec::new(),
@@ -325,6 +332,13 @@ impl GitRepoBinding {
             created_at: now,
         });
         binding
+    }
+
+    /// The SSH host keys of the repository's remote, given when the binding
+    /// is created.
+    pub fn with_ssh_host_keys(mut self, keys: Vec<SshHostKey>) -> Self {
+        self.ssh_host_keys = keys;
+        self
     }
 
     /// Transition `Pending → Cloning`. Emits [`GitRepoEvent::CloneStarted`].

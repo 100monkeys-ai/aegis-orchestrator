@@ -1403,8 +1403,9 @@ mod credential_tests {
     use super::*;
     use crate::application::git_test_server::{
         container_engine, container_runner, files_holding, holds_any_part_of, marker,
-        GitTestServer, HostShellRunner, ProcessWatch,
+        GitTestServer, HostShellRunner, ProcessWatch, SshTestServer,
     };
+    use crate::domain::git_host_keys::SshHostKey;
     use crate::domain::runtime::{ContainerStepResult, ContainerStepRunner};
     use crate::domain::tenant::TenantId;
     use crate::domain::volume::{FilerEndpoint, StorageClass, VolumeOwnership};
@@ -1915,6 +1916,7 @@ mod credential_tests {
                     "origin",
                     Some("main".into()),
                     cred,
+                    &[],
                 )
             })
             .await
@@ -1930,6 +1932,207 @@ mod credential_tests {
                 holding.is_empty(),
                 "{arm}: files of the tree hold the credential after the push: {holding:?}"
             );
+        }
+    }
+
+    // ── SSH host keys ────────────────────────────────────────────────────
+
+    /// A binding to the test SSH server whose host keys are `keys`.
+    fn ssh_binding(
+        server: &SshTestServer,
+        keys: &[String],
+        volume: &Volume,
+        strategy: CloneStrategy,
+    ) -> GitRepoBinding {
+        binding(&server.url(), volume, strategy).with_ssh_host_keys(
+            keys.iter()
+                .map(|k| SshHostKey::parse(k).expect("a test host key parses"))
+                .collect(),
+        )
+    }
+
+    fn deploy_key(server: &SshTestServer) -> Option<ResolvedCredential> {
+        Some(ResolvedCredential::SshKey {
+            private_key_pem: SensitiveString::new(server.client_key()),
+            passphrase: None,
+        })
+    }
+
+    fn shell_engine(dirs: &Path) -> (EphemeralCliEngine, std::path::PathBuf) {
+        let workspace = dirs.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let scratch = dirs.join("scratch").join("aegis-git");
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        let engine = EphemeralCliEngine::new(
+            Arc::new(HostShellRunner::new()),
+            Arc::new(NfsVolumeRegistry::new()),
+        )
+        .with_paths(EphemeralCliPaths {
+            workspace: workspace.display().to_string(),
+            scratch: scratch.display().to_string(),
+        });
+        (engine, workspace)
+    }
+
+    /// The clone step checks the host's key against the binding's before it
+    /// offers the deploy key: a host presenting any other key is refused
+    /// before it is asked to authenticate anything, and the host with the
+    /// binding's key is cloned from.
+    #[tokio::test]
+    async fn clone_step_checks_the_host_key_before_offering_the_deploy_key() {
+        let test = "clone_step_checks_the_host_key_before_offering_the_deploy_key";
+        let Some(server) = SshTestServer::start(test) else {
+            return;
+        };
+        let volume = seaweed_volume();
+
+        let dirs = tempfile::tempdir().unwrap();
+        let (engine, _) = shell_engine(dirs.path());
+        let refused = engine
+            .clone_into_volume(
+                &ssh_binding(&server, &[server.other_host_key()], &volume, ephemeral()),
+                &volume,
+                deploy_key(&server),
+                true,
+            )
+            .await;
+        let asked = server.authentication_requests();
+        assert!(
+            asked == 0,
+            "the clone step offered a credential to a host whose key is not the binding's: \
+             {asked} authentication request(s)"
+        );
+        assert!(
+            refused.is_err(),
+            "the clone step cloned from a host whose key is not the binding's"
+        );
+
+        let dirs = tempfile::tempdir().unwrap();
+        let (engine, _) = shell_engine(dirs.path());
+        let sha = engine
+            .clone_into_volume(
+                &ssh_binding(&server, &[server.host_key()], &volume, ephemeral()),
+                &volume,
+                deploy_key(&server),
+                true,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the clone step from the host with the binding's key failed: {e}\n{}",
+                    server.log()
+                )
+            });
+        assert_eq!(sha, server.head(), "cloned the wrong commit");
+        assert!(
+            server.authentication_requests() > 0,
+            "the server logs no authentication request, so the check above proves nothing"
+        );
+    }
+
+    /// The in-process clone, fetch and push check the host's key against the
+    /// binding's before they offer the deploy key.
+    #[tokio::test]
+    async fn libgit2_checks_the_host_key_before_offering_the_deploy_key() {
+        use crate::application::git_repo_service::push_to_remote;
+        let test = "libgit2_checks_the_host_key_before_offering_the_deploy_key";
+        let Some(server) = SshTestServer::start(test) else {
+            return;
+        };
+        let volume = seaweed_volume();
+        let dirs = tempfile::tempdir().unwrap();
+        let executor = test_executor(dirs.path());
+        let wrong = ssh_binding(
+            &server,
+            &[server.other_host_key()],
+            &volume,
+            CloneStrategy::Libgit2,
+        );
+        let right = ssh_binding(
+            &server,
+            &[server.host_key()],
+            &volume,
+            CloneStrategy::Libgit2,
+        );
+
+        let refused = executor
+            .clone_libgit2(
+                &wrong,
+                &dirs.path().join("wrong"),
+                deploy_key(&server),
+                true,
+            )
+            .await;
+        let asked = server.authentication_requests();
+        assert!(
+            asked == 0,
+            "the in-process clone offered a credential to a host whose key is not the binding's: \
+             {asked} authentication request(s)"
+        );
+        assert!(
+            refused.is_err(),
+            "the in-process clone cloned from a host whose key is not the binding's"
+        );
+
+        let target = dirs.path().join("right");
+        let sha = executor
+            .clone_libgit2(&right, &target, deploy_key(&server), false)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the in-process clone from the host with the binding's key failed: {e}\n{}",
+                    server.log()
+                )
+            });
+        assert_eq!(sha, server.head(), "cloned the wrong commit");
+        let asked = server.authentication_requests();
+        assert!(
+            asked > 0,
+            "the server logs no authentication request, so the check above proves nothing"
+        );
+
+        let refused = executor
+            .fetch_and_checkout(&wrong, &target, deploy_key(&server))
+            .await;
+        assert!(
+            refused.is_err() && server.authentication_requests() == asked,
+            "the fetch offered a credential to a host whose key is not the binding's"
+        );
+        executor
+            .fetch_and_checkout(&right, &target, deploy_key(&server))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("the fetch from the host with the binding's key failed: {e}")
+            });
+
+        let asked = server.authentication_requests();
+        for (binding, lands) in [(&wrong, false), (&right, true)] {
+            let target = target.clone();
+            let keys = binding.ssh_host_keys.clone();
+            let repo_url = binding.repo_url.clone();
+            let credential = deploy_key(&server);
+            let pushed = tokio::task::spawn_blocking(move || {
+                push_to_remote(
+                    &target,
+                    &repo_url,
+                    "origin",
+                    Some("main".into()),
+                    credential,
+                    &keys,
+                )
+            })
+            .await
+            .unwrap();
+            if lands {
+                pushed.unwrap_or_else(|e| {
+                    panic!("the push to the host with the binding's key failed: {e}")
+                });
+            } else {
+                assert!(
+                    pushed.is_err() && server.authentication_requests() == asked,
+                    "the push offered a credential to a host whose key is not the binding's"
+                );
+            }
         }
     }
 

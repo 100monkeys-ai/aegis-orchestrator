@@ -473,6 +473,80 @@ async fn create_binding_rejects_invalid_url() {
     );
 }
 
+/// An SSH repository's host key is checked on every clone, so a binding to
+/// an SSH host must have one: GitHub, GitLab and Bitbucket have their
+/// published keys; any other host must be given its key, and a binding
+/// without one is refused with a sentence that says what to add.
+#[tokio::test]
+async fn create_binding_needs_the_host_key_of_an_ssh_host() {
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf";
+    let fx = build_fixture();
+    let command = |url: &str, keys: &[&str]| {
+        let mut cmd = CreateGitRepoCommand::new(
+            TenantId::consumer(),
+            "user-ssh",
+            ZaruTier::Enterprise,
+            url,
+            "ssh",
+        );
+        cmd.ssh_host_keys = keys.iter().map(|k| k.to_string()).collect();
+        cmd
+    };
+
+    let refused = fx
+        .service
+        .create_binding(command("git@git.example.invalid:o/r.git", &[]))
+        .await;
+    let message = match refused {
+        Ok(_) => panic!("an SSH binding to a host with no known key was created"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        message.contains("git.example.invalid") && message.contains("ssh_host_keys"),
+        "the refusal does not say what to add: {message}"
+    );
+
+    for (url, keys, why) in [
+        (
+            "git@git.example.invalid:o/r.git",
+            &["ssh-ed25519 not-a-key"][..],
+            "a host key that is not one",
+        ),
+        (
+            "https://git.example.invalid/o/r.git",
+            &[KEY][..],
+            "a host key for an HTTPS repository",
+        ),
+    ] {
+        assert!(
+            fx.service.create_binding(command(url, keys)).await.is_err(),
+            "a binding with {why} was created"
+        );
+    }
+
+    let given = fx
+        .service
+        .create_binding(command("git@git.example.invalid:o/r.git", &[KEY]))
+        .await
+        .expect("an SSH binding with its host key is created");
+    assert_eq!(
+        given
+            .ssh_host_keys
+            .iter()
+            .map(|k| k.to_line())
+            .collect::<Vec<_>>(),
+        vec![KEY.to_string()],
+        "the binding holds the key it was given"
+    );
+    let known = fx
+        .service
+        .create_binding(command("git@github.com:o/r.git", &[]))
+        .await
+        .expect("an SSH binding to GitHub needs no key");
+    assert!(known.ssh_host_keys.is_empty());
+}
+
 #[tokio::test]
 async fn list_bindings_filters_by_owner() {
     let fx = build_fixture();
@@ -660,6 +734,7 @@ async fn handle_webhook_rejects_bad_signature() {
             label: "alice-one".to_string(),
             auto_refresh: true,
             shallow: true,
+            ssh_host_keys: Vec::new(),
         })
         .await
         .unwrap();
@@ -701,6 +776,7 @@ async fn handle_webhook_accepts_valid_github_signature() {
             label: "alice-one".to_string(),
             auto_refresh: true,
             shallow: true,
+            ssh_host_keys: Vec::new(),
         })
         .await
         .unwrap();
@@ -760,6 +836,7 @@ async fn webhook_secret_is_persisted_as_ciphertext_plus_lookup_hash_only() {
             label: "audit13".to_string(),
             auto_refresh: true,
             shallow: true,
+            ssh_host_keys: Vec::new(),
         })
         .await
         .unwrap();

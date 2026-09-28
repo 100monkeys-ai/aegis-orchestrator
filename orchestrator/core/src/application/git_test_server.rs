@@ -548,6 +548,188 @@ impl Drop for ProcessWatch {
     }
 }
 
+/// A git server over SSH for tests: `sshd` on the loopback interface, run as
+/// the current user, serving one bare repository with one commit on `main`.
+/// It accepts one client key, made for it, and logs every authentication
+/// request a client makes, so a test can tell whether a client offered a
+/// credential. Dropping it stops `sshd` and removes its files.
+pub(crate) struct SshTestServer {
+    root: tempfile::TempDir,
+    port: u16,
+    user: String,
+    child: std::process::Child,
+}
+
+impl SshTestServer {
+    /// Start a server, or `None` when there is no `sshd` and none is
+    /// required. Where `AEGIS_TEST_SSHD` is set (CI sets it) a missing or
+    /// failing `sshd` fails the test instead, so these tests cannot pass
+    /// there without running.
+    pub(crate) fn start(test: &str) -> Option<Self> {
+        const SSHD: &str = "/usr/sbin/sshd";
+        let required = std::env::var_os("AEGIS_TEST_SSHD").is_some();
+        if !Path::new(SSHD).exists() {
+            if required {
+                panic!("{test}: AEGIS_TEST_SSHD is set and there is no {SSHD}");
+            }
+            eprintln!(
+                "SKIPPED {test}: there is no {SSHD}. This test ran nothing. \
+                 Set AEGIS_TEST_SSHD=1 where openssh-server is installed; CI does."
+            );
+            return None;
+        }
+        let root = tempfile::tempdir().expect("temp dir for the ssh server");
+        let dir = root.path();
+        let bare = dir.join("repo.git");
+        let work = dir.join("work");
+        run_git(
+            dir,
+            &["init", "--bare", "--initial-branch=main", "repo.git"],
+        );
+        run_git(dir, &["init", "--initial-branch=main", "work"]);
+        std::fs::write(work.join("README.md"), "first\n").unwrap();
+        run_git(&work, &["add", "README.md"]);
+        run_git(&work, &["commit", "-m", "first"]);
+        run_git(&work, &["push", bare.to_str().unwrap(), "main"]);
+
+        for name in ["host_key", "other_host_key", "client_key"] {
+            let status = Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-C", name, "-f"])
+                .arg(dir.join(name))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("ssh-keygen runs");
+            assert!(status.success(), "ssh-keygen made no {name}");
+        }
+        std::fs::copy(dir.join("client_key.pub"), dir.join("authorized_keys")).unwrap();
+
+        let user = String::from_utf8(
+            Command::new("id")
+                .arg("-un")
+                .output()
+                .expect("id runs")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free loopback port")
+            .port();
+        let config = format!(
+            "Port {port}\n\
+             ListenAddress 127.0.0.1\n\
+             HostKey {host_key}\n\
+             PidFile none\n\
+             AuthorizedKeysFile {authorized}\n\
+             StrictModes no\n\
+             UsePAM no\n\
+             PasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\n\
+             PubkeyAuthentication yes\n\
+             AllowUsers {user}\n\
+             LogLevel DEBUG1\n",
+            host_key = dir.join("host_key").display(),
+            authorized = dir.join("authorized_keys").display(),
+        );
+        std::fs::write(dir.join("sshd_config"), config).unwrap();
+        let log = std::fs::File::create(dir.join("sshd.log")).unwrap();
+        let child = Command::new(SSHD)
+            .arg("-D")
+            .arg("-f")
+            .arg(dir.join("sshd_config"))
+            .arg("-E")
+            .arg(dir.join("sshd.log"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap_or_else(|e| panic!("{test}: sshd did not start: {e}"));
+        let server = Self {
+            root,
+            port,
+            user,
+            child,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "{test}: sshd did not listen within 10s: {}",
+                    std::fs::read_to_string(server.root.path().join("sshd.log"))
+                        .unwrap_or_default()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Some(server)
+    }
+
+    /// The repository's URL: `ssh://user@127.0.0.1:port/…/repo.git`.
+    pub(crate) fn url(&self) -> String {
+        format!(
+            "ssh://{}@127.0.0.1:{}{}",
+            self.user,
+            self.port,
+            self.root.path().join("repo.git").display()
+        )
+    }
+
+    fn public_key(&self, name: &str) -> String {
+        let text = std::fs::read_to_string(self.root.path().join(format!("{name}.pub"))).unwrap();
+        let mut words = text.split_whitespace();
+        format!("{} {}", words.next().unwrap(), words.next().unwrap())
+    }
+
+    /// The key the server presents, as a public key line.
+    pub(crate) fn host_key(&self) -> String {
+        self.public_key("host_key")
+    }
+
+    /// A key the server does not present, as a public key line.
+    pub(crate) fn other_host_key(&self) -> String {
+        self.public_key("other_host_key")
+    }
+
+    /// The private key the server accepts, in OpenSSH form.
+    pub(crate) fn client_key(&self) -> String {
+        std::fs::read_to_string(self.root.path().join("client_key")).unwrap()
+    }
+
+    /// How many authentication requests clients have made: each one is a
+    /// client offering, or about to offer, a credential.
+    pub(crate) fn authentication_requests(&self) -> usize {
+        std::fs::read_to_string(self.root.path().join("sshd.log"))
+            .unwrap_or_default()
+            .matches("userauth-request")
+            .count()
+    }
+
+    /// The server's log, for a failure message.
+    pub(crate) fn log(&self) -> String {
+        std::fs::read_to_string(self.root.path().join("sshd.log")).unwrap_or_default()
+    }
+
+    /// The id of `main` in the served repository.
+    pub(crate) fn head(&self) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(self.root.path().join("repo.git"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+}
+
+impl Drop for SshTestServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A container engine for a test that needs one, or `None` when there is
 /// none and none is required. Where `AEGIS_TEST_DOCKER` is set (CI sets it)
 /// a missing engine fails the test instead, so these tests cannot pass there

@@ -542,6 +542,7 @@ async fn webhook_rejects_bad_signature() {
             label: "a1".to_string(),
             auto_refresh: true,
             shallow: true,
+            ssh_host_keys: Vec::new(),
         })
         .await
         .unwrap();
@@ -574,6 +575,7 @@ async fn webhook_accepts_valid_signature() {
             label: "a1".to_string(),
             auto_refresh: true,
             shallow: true,
+            ssh_host_keys: Vec::new(),
         })
         .await
         .unwrap();

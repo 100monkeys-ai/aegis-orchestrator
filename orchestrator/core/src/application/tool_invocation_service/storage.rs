@@ -378,6 +378,15 @@ impl ToolInvocationService {
             .get("shallow")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        let ssh_host_keys: Vec<String> = args
+            .get("ssh_host_keys")
+            .and_then(|v| v.as_array())
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(|k| k.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let cmd = crate::application::git_repo_service::CreateGitRepoCommand {
             tenant_id,
@@ -390,6 +399,7 @@ impl ToolInvocationService {
             label: label.to_string(),
             auto_refresh,
             shallow,
+            ssh_host_keys,
         };
 
         let binding = svc.create_binding(cmd).await.map_err(internal_err)?;

@@ -216,6 +216,7 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> Result<GitRepoBinding, Reposi
         webhook_secret: None,
         webhook_secret_ciphertext,
         webhook_lookup_hash,
+        ssh_host_keys: Vec::new(),
         created_at,
         updated_at,
         domain_events: Vec::new(),

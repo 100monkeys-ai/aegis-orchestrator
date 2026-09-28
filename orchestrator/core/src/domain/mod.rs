@@ -61,6 +61,7 @@ pub mod env_guard;
 pub mod events;
 pub mod execution;
 pub mod fsal;
+pub mod git_host_keys;
 pub mod git_repo;
 pub mod git_repo_tier_limits;
 pub mod iam;
