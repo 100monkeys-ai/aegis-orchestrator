@@ -83,6 +83,10 @@ pub enum KeycloakAdminError {
     AttributeError { status: u16, body: String },
     #[error("realm operation failed: {status} {body}")]
     RealmError { status: u16, body: String },
+    /// A SAML identity provider configuration was refused before anything
+    /// was sent to Keycloak. The message says what to fix.
+    #[error("{0}")]
+    InvalidIdpConfig(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 }
@@ -1123,6 +1127,11 @@ mod tests {
         /// How many user searches still answer "nobody", as a search made
         /// just before another request created the user would.
         stale_searches: u32,
+        /// realm -> identity provider alias -> representation
+        idps: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<String, serde_json::Value>,
+        >,
     }
 
     type SharedDouble = std::sync::Arc<std::sync::Mutex<KeycloakDouble>>;
@@ -1249,6 +1258,28 @@ mod tests {
                 if !d.group_members.contains(&member) {
                     d.group_members.push(member);
                 }
+                axum::http::StatusCode::NO_CONTENT.into_response()
+            }
+            ("GET", ["identity-provider", "instances"]) => {
+                let all: Vec<serde_json::Value> = d
+                    .idps
+                    .get(&realm)
+                    .map(|m| m.values().cloned().collect())
+                    .unwrap_or_default();
+                axum::Json(all).into_response()
+            }
+            ("POST", ["identity-provider", "instances"]) => {
+                let rep: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+                let alias = rep["alias"].as_str().unwrap_or_default().to_string();
+                d.idps.entry(realm.clone()).or_default().insert(alias, rep);
+                axum::http::StatusCode::CREATED.into_response()
+            }
+            ("PUT", ["identity-provider", "instances", alias]) => {
+                // Like Keycloak: the representation is replaced whole.
+                let Some(stored) = d.idps.get_mut(&realm).and_then(|m| m.get_mut(*alias)) else {
+                    return axum::http::StatusCode::NOT_FOUND.into_response();
+                };
+                *stored = serde_json::from_str(&body_text).unwrap();
                 axum::http::StatusCode::NO_CONTENT.into_response()
             }
             _ => axum::http::StatusCode::NOT_FOUND.into_response(),
@@ -1438,6 +1469,103 @@ mod tests {
             "the invitee was not put in the team's group: {:?}",
             d.calls
         );
+    }
+
+    // ── SAML identity provider ─────────────────────────────────────────────
+
+    /// A self-signed certificate made for these tests; it signs nothing.
+    const TEST_IDP_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDJzCCAg+gAwIBAgIUANWjdiTFGbUnyYlLX4fymSLj8fowDQYJKoZIhvcNAQEL\nBQAwIzEhMB8GA1UEAwwYc2FtbC1pZHAuZXhhbXBsZS5pbnZhbGlkMB4XDTI2MDky\nODE3NDM0OVoXDTM2MDkyNTE3NDM0OVowIzEhMB8GA1UEAwwYc2FtbC1pZHAuZXhh\nbXBsZS5pbnZhbGlkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxAPv\nOG12dD2iDGxl0e0VZk1c41pJUFS0pdl9l2LmrK6qiM+fIPO0JfT/rlRFLNgEKKoN\n/0QTnS9bTJLCn+XSQmWWdjvjSi+uDwcl7I/MiMAGqJf1aXgEB3P1YMehdjf3OmLL\nwvXvAjk2raB4NIazQo9LdjhkDf1riiAnmJG37fjh5g2ZZ4NeMA2jKNWilCVIKQIL\nn901al87VFzfP7R+eNP8GGy5/DC2/xHo8NSFT28n0xW3D0M4tNKR3ychl5gKQ3FE\n2BWJekb8Qql9JlJrdQopE13F/Rx9CqGjt+Y5Mec/W45OnokvEKKs+vISWG1iozus\nhWlYuoGUog8h/o9GuQIDAQABo1MwUTAdBgNVHQ4EFgQUFH/7aTCr3O5HcDHu4Hwc\nDcugVlgwHwYDVR0jBBgwFoAUFH/7aTCr3O5HcDHu4HwcDcugVlgwDwYDVR0TAQH/\nBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAC0MUQ9kAjCxyLFZSbZ7O0RHcdUgV\nbMzVT34EXFk3gRPF1qZHXzmKU1y/2QUCLwP3G0UWidfhLeGHZHq+Tqg0Ixu1Zywz\nJqo/MbGL1+JvLu0KZkht6+Bn4Zwj7gWQIWAldp4NPrKNBxzy18HiImzu3G/ri+lz\naezC27mUZEM8koc5p7A16HaOoRANLs4AL8sf5oCK/MWFYMR6WO9LEbNB70jB+wwW\nKhwNZtF5OdATAEesuwCYeaNt4GWig6bGaKqOfnibzFCh5AX8Z7IyPshZaeMgjq7F\n5RLtBusi4q8KxZldB33DR7F8vX6qxyk6X8mNfUWvkpdD4CvCJLqbUEsa6Q==\n-----END CERTIFICATE-----";
+
+    fn saml_config(certificate: &str) -> SamlIdpConfig {
+        SamlIdpConfig {
+            entity_id: "https://idp.example.invalid/metadata".to_string(),
+            sso_url: "https://idp.example.invalid/sso".to_string(),
+            certificate: certificate.to_string(),
+        }
+    }
+
+    /// Every setting in a stored SAML provider that would weaken a check,
+    /// as (setting, value found). Empty when the provider validates
+    /// signatures and trusts no email it is sent.
+    fn weakened_checks(idp: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        let mut found = Vec::new();
+        let config = &idp["config"];
+        if config["validateSignature"] != serde_json::json!("true") {
+            found.push((
+                "validateSignature".to_string(),
+                config["validateSignature"].clone(),
+            ));
+        }
+        if idp["trustEmail"] == serde_json::json!(true) {
+            found.push(("trustEmail".to_string(), idp["trustEmail"].clone()));
+        }
+        found
+    }
+
+    /// A team's SAML provider is written so that Keycloak checks the
+    /// signature of every response against the provider's certificate,
+    /// whether the provider is created or an existing one is replaced, and
+    /// with the certificate as PEM or as bare base64.
+    #[tokio::test]
+    async fn saml_provider_is_written_to_validate_signatures() {
+        let bare: String = TEST_IDP_CERTIFICATE_PEM
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        for certificate in [TEST_IDP_CERTIFICATE_PEM.to_string(), bare] {
+            let double = SharedDouble::default();
+            let kc = serve_keycloak_double(double.clone()).await;
+            for write in ["create", "replace"] {
+                kc.set_idp_config("team-acme", &saml_config(&certificate))
+                    .await
+                    .unwrap_or_else(|e| panic!("the SAML provider {write} was refused: {e}"));
+                let d = double.lock().unwrap();
+                let idp = &d.idps["team-acme"]["saml"];
+                assert!(
+                    weakened_checks(idp).is_empty(),
+                    "the SAML provider ({write}) was written with a check turned off: {:?}",
+                    weakened_checks(idp)
+                );
+                assert_eq!(
+                    idp["config"]["signingCertificate"],
+                    serde_json::json!(certificate)
+                );
+            }
+        }
+    }
+
+    /// A SAML provider with no signing certificate, or with something that
+    /// is not a certificate, is refused with a plain error, and nothing is
+    /// sent to Keycloak.
+    #[tokio::test]
+    async fn saml_provider_without_a_signing_certificate_is_refused() {
+        for certificate in ["", "   ", "not a certificate", "aGVsbG8gd29ybGQ="] {
+            let double = SharedDouble::default();
+            let kc = serve_keycloak_double(double.clone()).await;
+            let result = kc
+                .set_idp_config("team-acme", &saml_config(certificate))
+                .await;
+            let d = double.lock().unwrap();
+            assert!(
+                matches!(result, Err(KeycloakAdminError::InvalidIdpConfig(_))),
+                "a SAML provider with the certificate {certificate:?} was accepted: {result:?}; Keycloak holds {:?}",
+                d.idps.get("team-acme")
+            );
+            assert!(
+                d.idps.is_empty()
+                    && !d
+                        .calls
+                        .iter()
+                        .any(|(_, p, _)| p.contains("identity-provider")),
+                "a refused SAML provider reached Keycloak: {:?}",
+                d.calls
+            );
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("signing certificate"),
+                "the refusal does not say what to fix: {message}"
+            );
+        }
     }
 
     // ── build_set_attribute_body ───────────────────────────────────────────
