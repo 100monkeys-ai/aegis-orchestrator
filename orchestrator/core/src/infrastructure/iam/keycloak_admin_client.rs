@@ -1261,6 +1261,11 @@ impl KeycloakAdminClient {
     }
 }
 
+/// The same client against a real Keycloak (CI starts one).
+#[cfg(test)]
+#[path = "keycloak_live_tests.rs"]
+mod live_tests;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1768,9 +1773,9 @@ pub(crate) mod tests {
     // ── SAML identity provider ─────────────────────────────────────────────
 
     /// A self-signed certificate made for these tests; it signs nothing.
-    const TEST_IDP_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDJzCCAg+gAwIBAgIUANWjdiTFGbUnyYlLX4fymSLj8fowDQYJKoZIhvcNAQEL\nBQAwIzEhMB8GA1UEAwwYc2FtbC1pZHAuZXhhbXBsZS5pbnZhbGlkMB4XDTI2MDky\nODE3NDM0OVoXDTM2MDkyNTE3NDM0OVowIzEhMB8GA1UEAwwYc2FtbC1pZHAuZXhh\nbXBsZS5pbnZhbGlkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxAPv\nOG12dD2iDGxl0e0VZk1c41pJUFS0pdl9l2LmrK6qiM+fIPO0JfT/rlRFLNgEKKoN\n/0QTnS9bTJLCn+XSQmWWdjvjSi+uDwcl7I/MiMAGqJf1aXgEB3P1YMehdjf3OmLL\nwvXvAjk2raB4NIazQo9LdjhkDf1riiAnmJG37fjh5g2ZZ4NeMA2jKNWilCVIKQIL\nn901al87VFzfP7R+eNP8GGy5/DC2/xHo8NSFT28n0xW3D0M4tNKR3ychl5gKQ3FE\n2BWJekb8Qql9JlJrdQopE13F/Rx9CqGjt+Y5Mec/W45OnokvEKKs+vISWG1iozus\nhWlYuoGUog8h/o9GuQIDAQABo1MwUTAdBgNVHQ4EFgQUFH/7aTCr3O5HcDHu4Hwc\nDcugVlgwHwYDVR0jBBgwFoAUFH/7aTCr3O5HcDHu4HwcDcugVlgwDwYDVR0TAQH/\nBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAC0MUQ9kAjCxyLFZSbZ7O0RHcdUgV\nbMzVT34EXFk3gRPF1qZHXzmKU1y/2QUCLwP3G0UWidfhLeGHZHq+Tqg0Ixu1Zywz\nJqo/MbGL1+JvLu0KZkht6+Bn4Zwj7gWQIWAldp4NPrKNBxzy18HiImzu3G/ri+lz\naezC27mUZEM8koc5p7A16HaOoRANLs4AL8sf5oCK/MWFYMR6WO9LEbNB70jB+wwW\nKhwNZtF5OdATAEesuwCYeaNt4GWig6bGaKqOfnibzFCh5AX8Z7IyPshZaeMgjq7F\n5RLtBusi4q8KxZldB33DR7F8vX6qxyk6X8mNfUWvkpdD4CvCJLqbUEsa6Q==\n-----END CERTIFICATE-----";
+    pub(crate) const TEST_IDP_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDJzCCAg+gAwIBAgIUANWjdiTFGbUnyYlLX4fymSLj8fowDQYJKoZIhvcNAQEL\nBQAwIzEhMB8GA1UEAwwYc2FtbC1pZHAuZXhhbXBsZS5pbnZhbGlkMB4XDTI2MDky\nODE3NDM0OVoXDTM2MDkyNTE3NDM0OVowIzEhMB8GA1UEAwwYc2FtbC1pZHAuZXhh\nbXBsZS5pbnZhbGlkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxAPv\nOG12dD2iDGxl0e0VZk1c41pJUFS0pdl9l2LmrK6qiM+fIPO0JfT/rlRFLNgEKKoN\n/0QTnS9bTJLCn+XSQmWWdjvjSi+uDwcl7I/MiMAGqJf1aXgEB3P1YMehdjf3OmLL\nwvXvAjk2raB4NIazQo9LdjhkDf1riiAnmJG37fjh5g2ZZ4NeMA2jKNWilCVIKQIL\nn901al87VFzfP7R+eNP8GGy5/DC2/xHo8NSFT28n0xW3D0M4tNKR3ychl5gKQ3FE\n2BWJekb8Qql9JlJrdQopE13F/Rx9CqGjt+Y5Mec/W45OnokvEKKs+vISWG1iozus\nhWlYuoGUog8h/o9GuQIDAQABo1MwUTAdBgNVHQ4EFgQUFH/7aTCr3O5HcDHu4Hwc\nDcugVlgwHwYDVR0jBBgwFoAUFH/7aTCr3O5HcDHu4HwcDcugVlgwDwYDVR0TAQH/\nBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAC0MUQ9kAjCxyLFZSbZ7O0RHcdUgV\nbMzVT34EXFk3gRPF1qZHXzmKU1y/2QUCLwP3G0UWidfhLeGHZHq+Tqg0Ixu1Zywz\nJqo/MbGL1+JvLu0KZkht6+Bn4Zwj7gWQIWAldp4NPrKNBxzy18HiImzu3G/ri+lz\naezC27mUZEM8koc5p7A16HaOoRANLs4AL8sf5oCK/MWFYMR6WO9LEbNB70jB+wwW\nKhwNZtF5OdATAEesuwCYeaNt4GWig6bGaKqOfnibzFCh5AX8Z7IyPshZaeMgjq7F\n5RLtBusi4q8KxZldB33DR7F8vX6qxyk6X8mNfUWvkpdD4CvCJLqbUEsa6Q==\n-----END CERTIFICATE-----";
 
-    fn saml_config(certificate: &str) -> SamlIdpConfig {
+    pub(crate) fn saml_config(certificate: &str) -> SamlIdpConfig {
         SamlIdpConfig {
             entity_id: "https://idp.example.invalid/metadata".to_string(),
             sso_url: "https://idp.example.invalid/sso".to_string(),
@@ -1781,7 +1786,7 @@ pub(crate) mod tests {
     /// Every setting in a stored SAML provider that would weaken a check,
     /// as (setting, value found). Empty when the provider validates
     /// signatures and trusts no email it is sent.
-    fn weakened_checks(idp: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    pub(crate) fn weakened_checks(idp: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
         let mut found = Vec::new();
         let config = &idp["config"];
         if config["validateSignature"] != serde_json::json!("true") {

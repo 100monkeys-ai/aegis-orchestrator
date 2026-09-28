@@ -135,9 +135,29 @@ jobs:
           prefix-key: "v2-ubuntu22"
           workspaces: aegis-orchestrator -> target
 
+      # The Keycloak the deployment runs (quay.io/keycloak/keycloak:24.0,
+      # pinned by digest), in development mode on the loopback interface,
+      # for the Keycloak admin client's tests against the real thing.
+      - name: Start Keycloak
+        run: |
+          docker run -d --name aegis-test-keycloak -p 127.0.0.1:18080:8080 \
+            -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin \
+            quay.io/keycloak/keycloak@sha256:f8ade94c1d0ad2f2fa7734a455fee5392764f402c43ca35e9af6bf63a2541dc9 \
+            start-dev
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:18080/realms/master >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          docker logs --tail 50 aegis-test-keycloak
+          exit 1
+
       - name: Run tests
         working-directory: aegis-orchestrator
         env:
+          # With this set, the tests that need Keycloak fail when they cannot
+          # reach it, instead of skipping.
+          AEGIS_TEST_KEYCLOAK: "1"
+          AEGIS_TEST_KEYCLOAK_URL: http://127.0.0.1:18080
           AEGIS_TEST_POSTGRES_URL: postgres://postgres@localhost:5432/postgres
           # The runner has a container engine. With this set, a test that
           # needs one fails when it cannot reach it, instead of skipping.
