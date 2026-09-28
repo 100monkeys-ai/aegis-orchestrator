@@ -117,3 +117,27 @@ pub trait AttestationService: Send + Sync {
     /// - JWT signing fails
     async fn attest(&self, request: AttestationRequest) -> Result<AttestationResponse>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attestation_response_debug_does_not_print_the_security_token() {
+        let response = AttestationResponse {
+            status: "success".to_string(),
+            security_token: "Mk7-attestation-token-marker".into(),
+            expires_at: "2026-09-28T00:00:00Z".to_string(),
+            session_id: Some("session-1".to_string()),
+        };
+        let printed = format!("{response:?}");
+        assert!(
+            !printed.contains("Mk7-attestation-token-marker"),
+            "AttestationResponse's Debug printed its security token: {printed}"
+        );
+        assert!(
+            printed.contains("session-1"),
+            "Debug lost the session id: {printed}"
+        );
+    }
+}

@@ -109,7 +109,7 @@ mod tests {
             agent_id: "agent-1".to_string(),
             security_context: "aegis-system-default".to_string(),
             public_key_b64: "AAAA".to_string(),
-            security_token: "seal-token".to_string(),
+            security_token: "seal-token".into(),
             session_status: "Active".to_string(),
             expires_at: "2026-09-28T00:00:00Z".to_string(),
             allowed_tool_patterns: vec!["*".to_string()],
@@ -153,6 +153,30 @@ mod tests {
             *recorder.grants.lock().unwrap(),
             1,
             "the token is reused while fresh"
+        );
+    }
+    /// The JSON the gateway receives for a session pre-creation. Captured
+    /// from the derived serde form while `security_token` was a `String`.
+    const SESSION_REQUEST_FIXTURE: &str = r#"{"execution_id":"exec-1","agent_id":"agent-1","security_context":"aegis-system-default","public_key_b64":"AAAA","security_token":"seal-token","session_status":"Active","expires_at":"2026-09-28T00:00:00Z","allowed_tool_patterns":["*"]}"#;
+
+    #[test]
+    fn session_request_wire_form_is_unchanged() {
+        assert_eq!(
+            serde_json::to_string(&session_request()).unwrap(),
+            SESSION_REQUEST_FIXTURE
+        );
+    }
+
+    #[test]
+    fn session_request_debug_does_not_print_the_security_token() {
+        let printed = format!("{:?}", session_request());
+        assert!(
+            !printed.contains("seal-token"),
+            "SealSessionCreateRequest's Debug printed its security token: {printed}"
+        );
+        assert!(
+            printed.contains("exec-1"),
+            "Debug lost the execution id: {printed}"
         );
     }
 }

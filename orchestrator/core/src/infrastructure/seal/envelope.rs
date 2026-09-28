@@ -304,7 +304,7 @@ mod tests {
 
         let envelope = SealEnvelope {
             protocol: "seal/v1".to_string(),
-            security_token: "test-jwt.token.here".to_string(),
+            security_token: "test-jwt.token.here".into(),
             signature: signature_b64,
             payload: payload_json.clone(),
             timestamp,
@@ -345,7 +345,7 @@ mod tests {
 
         let envelope = SealEnvelope {
             protocol: "seal/v1".to_string(),
-            security_token: "test.jwt".to_string(),
+            security_token: "test.jwt".into(),
             signature: signature_b64,
             payload: payload_json,
             timestamp,
@@ -370,5 +370,28 @@ mod tests {
 
         let normalized = normalize_public_key_bytes(&encoded).unwrap();
         assert_eq!(normalized, verifying_key.as_bytes());
+    }
+    /// The envelope as an agent sends it. Captured from the derived serde
+    /// form while `security_token` was a `String`.
+    const ENVELOPE_FIXTURE: &str = r#"{"protocol":"seal/v1","security_token":"Mk7-seal-envelope-token-marker","signature":"c2lnbmF0dXJl","payload":{"method":"tools/call","params":{"name":"fs.read"}},"timestamp":"2026-09-28T00:00:00.000Z"}"#;
+
+    #[test]
+    fn seal_envelope_debug_does_not_print_the_security_token() {
+        let envelope: SealEnvelope = serde_json::from_str(ENVELOPE_FIXTURE).unwrap();
+        let printed = format!("{envelope:?}");
+        assert!(
+            !printed.contains("Mk7-seal-envelope-token-marker"),
+            "SealEnvelope's Debug printed its security token: {printed}"
+        );
+        assert!(
+            printed.contains("seal/v1"),
+            "Debug lost the protocol: {printed}"
+        );
+    }
+
+    #[test]
+    fn seal_envelope_wire_form_is_unchanged() {
+        let envelope: SealEnvelope = serde_json::from_str(ENVELOPE_FIXTURE).unwrap();
+        assert_eq!(serde_json::to_string(&envelope).unwrap(), ENVELOPE_FIXTURE);
     }
 }

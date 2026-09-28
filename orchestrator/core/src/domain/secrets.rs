@@ -41,7 +41,11 @@ use thiserror::Error;
 /// Named `expose()` rather than implementing `Deref<Target = str>` to make
 /// credential access sites visually obvious during code review. Any call to
 /// `.expose()` is an intentional act that reviewers can grep for.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Serialises and deserialises as the bare string, so a wire or storage field
+/// can hold one without changing its format. Equality is constant-time.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SensitiveString(String);
 
 impl SensitiveString {
@@ -58,6 +62,44 @@ impl SensitiveString {
     /// Consume `self` and return the inner `String` at an intentional injection point.
     pub fn expose_owned(self) -> String {
         self.0
+    }
+
+    /// Whether the secret equals `candidate`, compared in constant time so the
+    /// time taken does not tell a caller how much of a guess was right.
+    pub fn matches(&self, candidate: &str) -> bool {
+        constant_time_eq(self.0.as_bytes(), candidate.as_bytes())
+    }
+
+    /// Whether the secret is the empty string.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Constant-time equality of two byte strings. The lengths are compared
+/// first; a length is not treated as secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
+
+impl PartialEq for SensitiveString {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+impl Eq for SensitiveString {}
+
+impl From<String> for SensitiveString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SensitiveString {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 
@@ -206,6 +248,18 @@ impl SensitiveUrl {
     /// query parameters replaced.
     pub fn redacted(&self) -> String {
         redact_url(&self.0)
+    }
+}
+
+impl From<String> for SensitiveUrl {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SensitiveUrl {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 
@@ -545,6 +599,35 @@ mod tests {
         let c = SensitiveString::new("token-xyz");
         assert_eq!(a, b);
         assert_ne!(a, c);
+        assert_ne!(a, SensitiveString::new("token-ab"));
+        assert_ne!(a, SensitiveString::new("token-abcd"));
+    }
+
+    #[test]
+    fn sensitive_string_matches_only_the_exact_value() {
+        let s = SensitiveString::new("token-abc");
+        assert!(s.matches("token-abc"));
+        for wrong in ["token-abd", "token-ab", "token-abcd", "", "TOKEN-ABC"] {
+            assert!(!s.matches(wrong), "matched {wrong:?}");
+        }
+        assert!(SensitiveString::new("").matches(""));
+    }
+
+    /// The serialised form is the bare string, byte for byte, in both
+    /// directions. The fixture was the output of the derived newtype
+    /// serialisation before `#[serde(transparent)]` was written down.
+    #[test]
+    fn sensitive_string_serialises_as_the_bare_string() {
+        const FIXTURE: &str = r#"{"k":"Mk7-sensitive-string-marker"}"#;
+        #[derive(Serialize, Deserialize)]
+        struct Holder {
+            k: SensitiveString,
+        }
+        let held: Holder = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(held.k.expose(), "Mk7-sensitive-string-marker");
+        assert_eq!(serde_json::to_string(&held).unwrap(), FIXTURE);
+        let from: SensitiveString = String::from("a").into();
+        assert_eq!(from, "a".into());
     }
 
     // ── SensitiveUrl ─────────────────────────────────────────────────────────

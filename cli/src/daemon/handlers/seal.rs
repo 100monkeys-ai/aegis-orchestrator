@@ -912,3 +912,28 @@ mod attest_tenant_resolution_tests {
         assert!(!may_delegate(&consumer_identity("user-1")));
     }
 }
+
+#[cfg(test)]
+mod envelope_wire_tests {
+    use super::*;
+
+    /// An envelope as an agent posts it to `/v1/seal/invoke`. Captured while
+    /// `security_token` was a `String`.
+    const HTTP_ENVELOPE_FIXTURE: &str = r#"{"protocol":"seal/v1","security_token":"Mk7-http-envelope-token-marker","signature":"c2lnbmF0dXJl","payload":{"method":"tools/call"},"timestamp":"2026-09-28T00:00:00.000Z"}"#;
+
+    #[test]
+    fn http_seal_envelope_reads_the_same_wire_form() {
+        let request: HttpSealEnvelope = serde_json::from_str(HTTP_ENVELOPE_FIXTURE).unwrap();
+        let envelope = aegis_orchestrator_core::infrastructure::seal::envelope::SealEnvelope {
+            protocol: request.protocol.unwrap(),
+            security_token: request.security_token,
+            signature: request.signature,
+            payload: request.payload,
+            timestamp: request.timestamp.unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&envelope).unwrap(),
+            HTTP_ENVELOPE_FIXTURE
+        );
+    }
+}

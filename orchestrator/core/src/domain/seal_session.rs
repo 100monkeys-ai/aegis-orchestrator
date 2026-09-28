@@ -420,3 +420,40 @@ impl SealSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::security_context::SecurityContextMetadata;
+
+    #[test]
+    fn seal_session_debug_does_not_print_the_security_token() {
+        let session = SealSession::new(
+            AgentId::new(),
+            ExecutionId::new(),
+            vec![1, 2, 3],
+            "Mk7-seal-session-token-marker".to_string(),
+            SecurityContext {
+                name: "ctx".to_string(),
+                description: "ctx".to_string(),
+                capabilities: vec![],
+                deny_list: vec![],
+                metadata: SecurityContextMetadata {
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    version: 1,
+                },
+            },
+            TenantId::consumer(),
+        );
+        let printed = format!("{session:?}");
+        assert!(
+            !printed.contains("Mk7-seal-session-token-marker"),
+            "SealSession's Debug printed its security token: {printed}"
+        );
+        assert!(
+            printed.contains("SealSession"),
+            "Debug lost the type: {printed}"
+        );
+    }
+}
