@@ -672,6 +672,42 @@ mod tests {
         assert!(matches!(events[0], GitRepoEvent::BindingCreated { .. }));
     }
 
+    /// An event published for a binding whose URL holds user info shows none
+    /// of it once serialised, the form every subscriber and stream reads.
+    #[test]
+    fn binding_created_event_serialises_the_url_without_user_info() {
+        let mut binding = GitRepoBinding::new(
+            TenantId::system(),
+            None,
+            "https://Mk7-event-user:Mk7-event-token@git.example.invalid/o/r.git".to_string(),
+            GitRef::Branch("main".to_string()),
+            None,
+            VolumeId::new(),
+            "event-url".to_string(),
+            CloneStrategy::Libgit2,
+            false,
+            None,
+            None,
+            None,
+        );
+        let events = binding.take_events();
+        let json = serde_json::to_string(&events).unwrap();
+        let bus_json = serde_json::to_string(
+            &crate::infrastructure::event_bus::DomainEvent::GitRepo(events[0].clone()),
+        )
+        .unwrap();
+        for (form, text) in [("event", &json), ("bus event", &bus_json)] {
+            assert!(
+                !text.contains("Mk7-event"),
+                "the serialised {form} holds the URL's user info"
+            );
+            assert!(
+                text.contains("git.example.invalid/o/r.git"),
+                "the serialised {form} lost the repository's address"
+            );
+        }
+    }
+
     #[test]
     fn start_clone_transitions_and_emits_event() {
         let mut binding = sample_binding();

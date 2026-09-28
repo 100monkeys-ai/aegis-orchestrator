@@ -36,6 +36,12 @@
 //! redacted, and the struct keeps its derived `Debug`. A field that is named
 //! like a secret and is not one is listed in `SECRET_FIELD_EXEMPTIONS` with
 //! its reason.
+//!
+//! A third rule covers events. Every domain event is serialised whole wherever
+//! it is published: to subscribers, to activity streams, to other processes.
+//! No type named `…Event` may hold a field named like a URL (the names above)
+//! of any type but `RedactedUrl`, which drops user info when it is made and
+//! serialises only what is left.
 
 use std::path::{Path, PathBuf};
 
@@ -1258,5 +1264,190 @@ fn no_output_site_renders_a_raw_connection_string() {
          it with `%url` via `.redacted()`, or pass it through `sanitize_url`:\n{}",
         scan.violations.len(),
         scan.violations.join("\n")
+    );
+}
+
+// ── Rule 3: no event holds a URL that can carry user info ───────────────────
+
+/// Is `ty` the one type an event may hold a URL in?
+fn is_event_url_type(ty: &str) -> bool {
+    let compact: String = ty.split_whitespace().collect();
+    let inner = compact
+        .strip_prefix("Option<")
+        .and_then(|t| t.strip_suffix('>'))
+        .unwrap_or(&compact);
+    inner == "RedactedUrl" || inner.ends_with("::RedactedUrl")
+}
+
+/// Check the named fields of one event type or variant.
+fn check_event_fields(relative: &str, line: usize, owner: &str, body: &str, out: &mut Vec<String>) {
+    for part in split_top_level(&blank_attributes(body)) {
+        let Some((name, ty)) = split_field(&part) else {
+            continue;
+        };
+        if is_connection_name(&name) && !is_event_url_type(&ty) {
+            out.push(format!(
+                "{relative}:{line}: {owner}.{name}: {ty} is serialised with any user info it holds"
+            ));
+        }
+    }
+}
+
+/// Find every struct and enum named `…Event` in one file's (comment- and
+/// test-stripped) source and check its fields. Returns how many it read.
+fn scan_event_types(relative: &str, src: &str, out: &mut Vec<String>) -> usize {
+    let b = src.as_bytes();
+    let mut found = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(next) = skip_literal(b, i) {
+            i = next;
+            continue;
+        }
+        let at_word = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        let rest = &src[i..];
+        let after_kw = if !at_word {
+            None
+        } else if let Some(r) = rest.strip_prefix("enum ") {
+            Some(r)
+        } else {
+            rest.strip_prefix("struct ")
+        };
+        let Some(after_kw) = after_kw else {
+            i += 1;
+            continue;
+        };
+        let name_len = after_kw
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after_kw.len());
+        let name = &after_kw[..name_len];
+        let name_at = src.len() - after_kw.len();
+        if !name.ends_with("Event") {
+            i = name_at + name_len.max(1);
+            continue;
+        }
+        let Some(body_open) = src[name_at..]
+            .find(['{', '(', ';'])
+            .map(|p| name_at + p)
+            .filter(|p| b[*p] == b'{')
+        else {
+            i = name_at + name_len;
+            continue;
+        };
+        let Some(body_close) = matching_close(b, body_open) else {
+            i = name_at + name_len;
+            continue;
+        };
+        found += 1;
+        let line = line_of(src, i);
+        let body = &src[body_open + 1..body_close];
+        if rest.starts_with("struct ") {
+            check_event_fields(relative, line, name, body, out);
+        } else {
+            for variant in split_top_level(&blank_attributes(body)) {
+                let v = variant.trim();
+                let vlen = v
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(v.len());
+                let owner = format!("{name}::{}", &v[..vlen]);
+                let vrest = v[vlen..].trim_start();
+                if vrest.starts_with('{') {
+                    if let Some(c) = matching_close(vrest.as_bytes(), 0) {
+                        check_event_fields(relative, line, &owner, &vrest[1..c], out);
+                    }
+                }
+            }
+        }
+        i = body_close + 1;
+    }
+    found
+}
+
+fn walk_events(root: &Path, dir: &Path, out: &mut Vec<String>, types: &mut usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("tests") {
+                continue;
+            }
+            walk_events(root, &path, out, types);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name.ends_with("_tests.rs") || file_name == "tests.rs" {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let src = blank_test_modules(&blank_comments(&src));
+            *types += scan_event_types(&relative, &src, out);
+        }
+    }
+}
+
+/// The checker itself: a URL-named field of an event type in any type but
+/// `RedactedUrl` is caught, in an enum variant and in a struct; the allowed
+/// type, a field not named like a URL, and a type not named `…Event` are not.
+#[test]
+fn event_checker_catches_a_url_that_can_carry_user_info() {
+    let raw = r#"
+        #[derive(Debug, Clone, Serialize)]
+        pub enum GitEvent {
+            Created { id: Uuid, repo_url: SensitiveUrl, at: DateTime<Utc> },
+            Moved { endpoint: Option<String> },
+            Other(u32),
+        }
+        pub struct IssuerEvent { pub issuer_url: String }
+    "#;
+    let mut out = Vec::new();
+    let types = scan_event_types("orchestrator/core/src/example.rs", raw, &mut out);
+    assert_eq!(types, 2, "both event types must be read");
+    assert_eq!(
+        out.len(),
+        3,
+        "every URL field must be reported once:\n{}",
+        out.join("\n")
+    );
+
+    let safe = r#"
+        pub enum GitEvent {
+            Created { repo_url: RedactedUrl, name: String },
+            Moved { endpoint: Option<crate::domain::secrets::RedactedUrl> },
+        }
+        pub struct Binding { pub repo_url: SensitiveUrl }
+        pub enum Eventual { A { url: String } }
+    "#;
+    let mut out = Vec::new();
+    scan_event_types("orchestrator/core/src/example.rs", safe, &mut out);
+    assert!(out.is_empty(), "false positives:\n{}", out.join("\n"));
+}
+
+#[test]
+fn no_event_holds_a_url_that_can_carry_user_info() {
+    let root = workspace_root();
+    let mut out = Vec::new();
+    let mut types = 0;
+    for crate_root in ROOTS {
+        walk_events(&root, &root.join(crate_root), &mut out, &mut types);
+    }
+    // A walk that found nothing would pass vacuously.
+    assert!(
+        types >= 20,
+        "precondition: the walk read {types} event types; the workspace has more"
+    );
+    assert!(
+        out.is_empty(),
+        "{} event field(s) can serialise a URL with its user info, which may be a \
+         credential, to every subscriber of the event. Hold the URL as `RedactedUrl` \
+         (aegis_orchestrator_core::domain::secrets):\n{}",
+        out.len(),
+        out.join("\n")
     );
 }

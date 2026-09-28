@@ -871,6 +871,175 @@ mod tests {
         assert!(saw_live_storage, "expected live storage event in stream");
     }
 
+    fn execution_for(agent_id: AgentId) -> Execution {
+        Execution::new(
+            agent_id,
+            ExecutionInput {
+                intent: Some("scoping".to_string()),
+                input: Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        )
+    }
+
+    /// Tenant A follows its own agent's verbose stream while tenant B works
+    /// on the same bus: B creates a git binding whose URL holds a marker
+    /// credential, B runs A's agent (as with a shared agent), B's billing
+    /// state drifts, and a step runs under an execution nobody stored. A
+    /// receives none of it, and still receives its own agent's event.
+    #[tokio::test]
+    async fn agent_stream_carries_nothing_of_another_tenant() {
+        use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
+        use crate::domain::tenant::TenantId;
+
+        let marker = "Kq-cross-tenant-marker-credential";
+        let tenant_a = TenantId::from_string("tenant-a").unwrap();
+        let tenant_b = TenantId::from_string("tenant-b").unwrap();
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repository = Arc::new(InMemoryExecutionRepository::new());
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        let a_exec = execution_for(agent_a);
+        let b_runs_a = execution_for(agent_a);
+        let b_exec = execution_for(agent_b);
+        repository
+            .save_for_tenant(&tenant_a, &a_exec)
+            .await
+            .unwrap();
+        repository
+            .save_for_tenant(&tenant_b, &b_runs_a)
+            .await
+            .unwrap();
+        repository
+            .save_for_tenant(&tenant_b, &b_exec)
+            .await
+            .unwrap();
+
+        let service = CorrelatedActivityStreamService::new(
+            event_bus.clone(),
+            repository,
+            Some(Arc::new(EmptyWorkflowExecutionRepository)),
+        );
+        let mut stream = service
+            .stream_agent_activity(agent_a, &tenant_a, true)
+            .await
+            .unwrap();
+
+        let mut received: Vec<String> = Vec::new();
+        let mut errors = 0usize;
+        // History first: A's own execution.
+        while let Ok(Some(item)) = timeout(Duration::from_millis(300), stream.next()).await {
+            match item {
+                Ok(activity) => received.push(serde_json::to_string(&activity).unwrap()),
+                Err(_) => errors += 1,
+            }
+        }
+        let history = received.len();
+
+        // Tenant B's activity.
+        let mut binding = GitRepoBinding::new(
+            tenant_b.clone(),
+            None,
+            format!("https://x-access-token:{marker}@git.example.invalid/b/repo.git"),
+            GitRef::Branch("main".to_string()),
+            None,
+            crate::domain::volume::VolumeId::new(),
+            "b-repo".to_string(),
+            CloneStrategy::Libgit2,
+            false,
+            None,
+            None,
+            None,
+        );
+        for event in binding.take_events() {
+            event_bus.publish_git_repo_event(event);
+        }
+        event_bus.publish_execution_event(ExecutionEvent::ConsoleOutput {
+            execution_id: b_runs_a.id,
+            agent_id: agent_a,
+            iteration_number: 1,
+            stream: "stdout".to_string(),
+            content: format!("tenant-b output {marker}"),
+            timestamp: Utc::now(),
+        });
+        event_bus.publish_storage_event(StorageEvent::FileOpened {
+            execution_id: Some(b_exec.id),
+            workflow_execution_id: None,
+            volume_id: crate::domain::volume::VolumeId::new(),
+            path: format!("/workspace/{marker}"),
+            open_mode: "read".to_string(),
+            opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
+        });
+        event_bus.publish_drift_event(crate::domain::events::DriftEvent::OrphanSubscription {
+            tenant_id: tenant_b.clone(),
+            stripe_customer_id: "cus_tenant_b".to_string(),
+            detected_at: Utc::now(),
+        });
+        event_bus.publish_container_run_event(
+            crate::domain::events::ContainerRunEvent::ContainerRunStarted {
+                execution_id: ExecutionId::new(),
+                state_name: "GIT_CLONE".to_string(),
+                step_name: "git-clone".to_string(),
+                image: "alpine/git:latest".to_string(),
+                command: vec![],
+                started_at: Utc::now(),
+            },
+        );
+        // Then tenant A's own agent.
+        event_bus.publish_storage_event(StorageEvent::FileOpened {
+            execution_id: Some(a_exec.id),
+            workflow_execution_id: None,
+            volume_id: crate::domain::volume::VolumeId::new(),
+            path: "/workspace/a.txt".to_string(),
+            open_mode: "read".to_string(),
+            opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
+        });
+
+        let mut own = false;
+        while let Ok(Some(item)) = timeout(Duration::from_secs(2), stream.next()).await {
+            match item {
+                Ok(activity) => {
+                    let is_own = activity.event_type == "file_opened"
+                        && activity.execution_id == Some(a_exec.id);
+                    received.push(serde_json::to_string(&activity).unwrap());
+                    if is_own {
+                        own = true;
+                        break;
+                    }
+                }
+                Err(_) => errors += 1,
+            }
+        }
+
+        let live = received.len() - history - usize::from(own);
+        assert!(
+            live == 0 && errors == 0,
+            "tenant A's stream on its own agent received {live} event(s) and {errors} error(s) \
+             it cannot tie to tenant A"
+        );
+        assert!(
+            !received.iter().any(|r| r.contains(marker)
+                || r.contains("tenant-b")
+                || r.contains("cus_tenant_b")),
+            "tenant A's stream holds tenant B's data"
+        );
+        assert!(
+            own,
+            "tenant A's stream did not receive its own agent's event"
+        );
+    }
+
     #[tokio::test]
     async fn stream_agent_activity_correlates_execution_only_events() {
         let event_bus = Arc::new(EventBus::with_default_capacity());
