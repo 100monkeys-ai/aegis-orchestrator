@@ -3475,7 +3475,7 @@ async fn sync_tier_to_keycloak(
         match kc.get_user(realm, &user_sub).await {
             Ok(Some(user)) => {
                 if let Err(e) = kc
-                    .set_user_attribute(realm, &user, "zaru_tier", tier_value)
+                    .set_user_attribute(realm, &user.id, "zaru_tier", tier_value)
                     .await
                 {
                     warn!(
@@ -3511,7 +3511,7 @@ async fn sync_tier_to_keycloak(
             Ok(users) => {
                 for user in users {
                     if let Err(e) = kc
-                        .set_user_attribute(&realm, &user, "zaru_tier", tier_value)
+                        .set_user_attribute(&realm, &user.id, "zaru_tier", tier_value)
                         .await
                     {
                         warn!(

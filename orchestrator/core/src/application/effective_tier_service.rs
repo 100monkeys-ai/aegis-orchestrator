@@ -174,7 +174,7 @@ impl TierSyncPort for KeycloakTierSyncPort {
         }
 
         self.keycloak_admin
-            .set_user_attribute(realm, &user, "zaru_tier", desired)
+            .set_user_attribute(realm, &user.id, "zaru_tier", desired)
             .await
             .map_err(|e| EffectiveTierError::TierSync(format!("set_user_attribute: {e}")))?;
 
@@ -607,6 +607,60 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────────────────────
+
+    /// The orchestrator keeps the truth of `zaru_tier` and `team_memberships`
+    /// in its own database. A recompute writes both from the database in one
+    /// write, so a write of either that was lost (overwritten by another
+    /// write to the user made at the same moment) is repaired by the user's
+    /// next recompute, whatever triggered it.
+    #[tokio::test]
+    async fn a_recompute_repairs_a_lost_team_memberships_write() {
+        use crate::infrastructure::iam::keycloak_admin_client::tests::{
+            existing_user, serve_keycloak_double, SharedDouble,
+        };
+        let team_repo = Arc::new(FakeTeamRepo::default());
+        let membership_repo = Arc::new(FakeMembershipRepo::default());
+        let billing_repo = Arc::new(FakeBillingRepo::default());
+        let team = mk_team(TenantTier::Business, TeamStatus::Active);
+        team_repo.save(&team).await.unwrap();
+        membership_repo.insert(mk_active_membership(team.id, USER_ID));
+        let member_of = vec![TeamSlug::new(team.id).as_str().to_string()];
+
+        // Keycloak has the tier the database gives, but the membership write
+        // was lost.
+        let double = SharedDouble::default();
+        let mut user = existing_user();
+        user["id"] = serde_json::json!(USER_ID);
+        user["attributes"]["zaru_tier"] = serde_json::json!(["business"]);
+        user["attributes"]
+            .as_object_mut()
+            .unwrap()
+            .remove("team_memberships");
+        double
+            .lock()
+            .unwrap()
+            .users
+            .entry("zaru-consumer".to_string())
+            .or_default()
+            .insert(USER_ID.to_string(), user);
+        let kc = Arc::new(serve_keycloak_double(double.clone()).await);
+        let svc = StandardEffectiveTierService::new(
+            team_repo,
+            membership_repo,
+            billing_repo,
+            Arc::new(KeycloakTierSyncPort::new(kc, None, None)),
+        );
+
+        let tier = svc.recompute_for_user(USER_ID).await.unwrap();
+        assert_eq!(tier, TenantTier::Business);
+        let attributes =
+            double.lock().unwrap().users["zaru-consumer"][USER_ID]["attributes"].clone();
+        assert!(
+            attributes["team_memberships"] == serde_json::json!(member_of)
+                && attributes["zaru_tier"] == serde_json::json!(["business"]),
+            "the recompute did not repair the lost team_memberships write: the user holds {attributes}"
+        );
+    }
 
     #[tokio::test]
     async fn effective_tier_personal_only_is_personal() {

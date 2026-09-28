@@ -155,7 +155,7 @@ impl TenantProvisioningService {
             .map(|s| s.as_str());
         if tenant_id_attr != Some(slug.as_str()) {
             self.keycloak_admin
-                .set_user_attribute("zaru-consumer", &kc_user, "tenant_id", &slug)
+                .set_user_attribute("zaru-consumer", &kc_user.id, "tenant_id", &slug)
                 .await?;
         }
 

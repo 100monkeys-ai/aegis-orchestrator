@@ -389,10 +389,14 @@ impl KeycloakAdminClient {
     pub async fn set_user_attribute(
         &self,
         realm: &str,
-        user: &KeycloakUser,
+        user_id: &str,
         attribute: &str,
         value: &str,
     ) -> Result<(), KeycloakAdminError> {
+        let Some(user) = self.get_user(realm, user_id).await? else {
+            return Ok(());
+        };
+        let user = &user;
         let token = self.get_admin_token().await?;
         let url = format!(
             "{}/admin/realms/{}/users/{}",
@@ -1117,7 +1121,7 @@ impl KeycloakAdminClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The admin token endpoint refuses the grant with an RFC 6749 error body
@@ -1204,9 +1208,12 @@ mod tests {
     /// what the body leaves out is gone. Every call is recorded as
     /// (method, path, body).
     #[derive(Default)]
-    struct KeycloakDouble {
+    pub(crate) struct KeycloakDouble {
+        /// How long `GET /users/{id}` takes to answer, after it has read the
+        /// user: two writers that read at once both read the user as it was.
+        pub(crate) get_user_delay: Option<std::time::Duration>,
         /// realm -> user id -> user representation
-        users: std::collections::HashMap<
+        pub(crate) users: std::collections::HashMap<
             String,
             std::collections::BTreeMap<String, serde_json::Value>,
         >,
@@ -1225,9 +1232,37 @@ mod tests {
         >,
     }
 
-    type SharedDouble = std::sync::Arc<std::sync::Mutex<KeycloakDouble>>;
+    pub(crate) type SharedDouble = std::sync::Arc<std::sync::Mutex<KeycloakDouble>>;
 
     async fn keycloak_double(
+        state: axum::extract::State<SharedDouble>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        let delay = {
+            let d = state.0.lock().unwrap();
+            let parts: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
+            let user_read = method == axum::http::Method::GET
+                && parts.len() == 5
+                && parts[0] == "admin"
+                && parts[3] == "users";
+            if user_read {
+                d.get_user_delay
+            } else {
+                None
+            }
+        };
+        // The answer is what the stand-in holds when the request arrives;
+        // a delayed answer arrives later.
+        let answer = keycloak_double_now(state, method, uri, body);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        answer
+    }
+
+    fn keycloak_double_now(
         axum::extract::State(double): axum::extract::State<SharedDouble>,
         method: axum::http::Method,
         uri: axum::http::Uri,
@@ -1378,7 +1413,7 @@ mod tests {
         }
     }
 
-    async fn serve_keycloak_double(double: SharedDouble) -> KeycloakAdminClient {
+    pub(crate) async fn serve_keycloak_double(double: SharedDouble) -> KeycloakAdminClient {
         let app = axum::Router::new()
             .fallback(keycloak_double)
             .with_state(double);
@@ -1404,7 +1439,7 @@ mod tests {
 
     /// A user who already exists, with the attributes the platform keeps on
     /// every consumer: the tenant, the tier and the team memberships.
-    fn existing_user() -> serde_json::Value {
+    pub(crate) fn existing_user() -> serde_json::Value {
         serde_json::json!({
             "id": "user-9",
             "username": "invitee@example.com",
@@ -1697,6 +1732,101 @@ mod tests {
                 "inviting {email:?} did not use the existing user"
             );
         }
+    }
+
+    // ── writes to one user ─────────────────────────────────────────────────
+
+    /// Two writes to one user at once, each of a different attribute, both
+    /// land. Keycloak's `PUT /users/{id}` replaces the user whole and has no
+    /// version check, so without writes being made one at a time the second
+    /// PUT carries the user as it was before the first and drops what the
+    /// first wrote.
+    #[tokio::test]
+    async fn two_writes_to_one_user_at_once_keep_both() {
+        let double = SharedDouble::default();
+        {
+            let mut d = double.lock().unwrap();
+            d.get_user_delay = Some(std::time::Duration::from_millis(300));
+            d.users
+                .entry("zaru-consumer".to_string())
+                .or_default()
+                .insert("user-9".to_string(), existing_user());
+        }
+        let kc = std::sync::Arc::new(serve_keycloak_double(double.clone()).await);
+        let tier = {
+            let kc = kc.clone();
+            tokio::spawn(async move {
+                kc.set_user_attribute("zaru-consumer", "user-9", "zaru_tier", "enterprise")
+                    .await
+            })
+        };
+        let memberships = {
+            let kc = kc.clone();
+            tokio::spawn(async move {
+                kc.set_user_team_memberships(
+                    "zaru-consumer",
+                    "user-9",
+                    &["t-99999999-8888-7777-6666-555555555555".to_string()],
+                )
+                .await
+            })
+        };
+        tier.await.unwrap().expect("the tier write succeeds");
+        memberships
+            .await
+            .unwrap()
+            .expect("the memberships write succeeds");
+
+        let user = double.lock().unwrap().users["zaru-consumer"]["user-9"].clone();
+        let attributes = &user["attributes"];
+        let lost: Vec<&str> = [
+            ("zaru_tier", serde_json::json!(["enterprise"])),
+            (
+                "team_memberships",
+                serde_json::json!(["t-99999999-8888-7777-6666-555555555555"]),
+            ),
+            (
+                "tenant_id",
+                serde_json::json!(["u-0123456789abcdef0123456789abcdef"]),
+            ),
+        ]
+        .iter()
+        .filter(|(name, value)| attributes.get(*name) != Some(value))
+        .map(|(name, _)| *name)
+        .collect();
+        assert!(
+            lost.is_empty(),
+            "two writes to one user at once lost {lost:?}: the user holds {attributes}"
+        );
+    }
+
+    /// A write of an attribute changes that attribute and nothing else: a
+    /// user an administrator disabled stays disabled.
+    #[tokio::test]
+    async fn an_attribute_write_leaves_a_disabled_user_disabled() {
+        let double = SharedDouble::default();
+        let mut user = existing_user();
+        user["enabled"] = serde_json::json!(false);
+        double
+            .lock()
+            .unwrap()
+            .users
+            .entry("zaru-consumer".to_string())
+            .or_default()
+            .insert("user-9".to_string(), user);
+        let kc = serve_keycloak_double(double.clone()).await;
+        kc.set_user_attribute("zaru-consumer", "user-9", "zaru_tier", "pro")
+            .await
+            .expect("the write succeeds");
+        kc.set_user_team_memberships("zaru-consumer", "user-9", &[])
+            .await
+            .expect("the write succeeds");
+        let user = double.lock().unwrap().users["zaru-consumer"]["user-9"].clone();
+        assert_eq!(
+            user["enabled"],
+            serde_json::json!(false),
+            "an attribute write enabled a disabled user: {user}"
+        );
     }
 
     // ── build_set_attribute_body ───────────────────────────────────────────
