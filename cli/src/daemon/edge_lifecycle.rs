@@ -17,6 +17,7 @@
 //!
 //! Reconnect uses the configured `stream_reconnect_backoff_secs` schedule.
 
+use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
@@ -102,7 +103,7 @@ pub(crate) fn canonical_envelope_payload(
 /// signing bytes for the given message kind.
 pub(crate) fn signed_envelope(
     signing_key: &SigningKey,
-    node_security_token: &str,
+    node_security_token: &SensitiveString,
     node_id: &str,
     stream_id: &str,
     kind: CanonicalKind,
@@ -112,7 +113,8 @@ pub(crate) fn signed_envelope(
     let payload = canonical_envelope_payload(kind, node_id, stream_id, ts, inner);
     let signature = signing_key.sign(&payload).to_bytes().to_vec();
     SealNodeEnvelope {
-        node_security_token: node_security_token.to_string(),
+        // Sent to the controller, which authenticates the node by it.
+        node_security_token: node_security_token.expose().to_string(),
         signature,
         payload,
     }
@@ -146,7 +148,8 @@ pub struct EdgeLifecycleConfig {
 #[derive(Debug, Clone)]
 struct EdgeCredentials {
     signing_key: Arc<SigningKey>,
-    node_security_token: String,
+    /// The node's bearer token. Prints redacted.
+    node_security_token: SensitiveString,
     node_id_str: String,
 }
 
@@ -174,7 +177,7 @@ fn load_credentials_from_disk(state_dir: &Path) -> Result<EdgeCredentials> {
         .context("derive node_id from reloaded NodeSecurityToken")?;
     Ok(EdgeCredentials {
         signing_key,
-        node_security_token,
+        node_security_token: node_security_token.into(),
         node_id_str,
     })
 }
@@ -792,7 +795,7 @@ impl Drop for ChildGuard {
 /// Inline variant of CommandProgress emission used inside the cmd.run streamers.
 async fn send_progress_inline(
     tx: &mpsc::Sender<EdgeEvent>,
-    parts: &(Arc<SigningKey>, String, String, String, String),
+    parts: &(Arc<SigningKey>, SensitiveString, String, String, String),
     sequence: u32,
     chunk: Vec<u8>,
     is_stderr: bool,
@@ -893,7 +896,7 @@ mod tests {
 
         let envelope = signed_envelope(
             &signing_key,
-            "tok.tok.tok",
+            &"tok.tok.tok".into(),
             "node-uuid",
             "stream-uuid",
             CanonicalKind::Hello,
@@ -923,7 +926,7 @@ mod tests {
         let verifying_key: VerifyingKey = signing_key.verifying_key();
         let envelope = signed_envelope(
             &signing_key,
-            "tok.tok.tok",
+            &"tok.tok.tok".into(),
             "node-uuid",
             "stream-uuid",
             CanonicalKind::Heartbeat,
@@ -939,7 +942,7 @@ mod tests {
         let verifying_key: VerifyingKey = signing_key.verifying_key();
         let env_a = signed_envelope(
             &signing_key,
-            "tok.tok.tok",
+            &"tok.tok.tok".into(),
             "node",
             "stream",
             CanonicalKind::CommandResult,
@@ -947,7 +950,7 @@ mod tests {
         );
         let env_b = signed_envelope(
             &signing_key,
-            "tok.tok.tok",
+            &"tok.tok.tok".into(),
             "node",
             "stream",
             CanonicalKind::CommandResult,
@@ -1219,7 +1222,7 @@ mod tests {
             "node_id must come from THIS dir's node.token, not a hardcoded default"
         );
         assert_eq!(
-            creds.node_security_token.trim(),
+            creds.node_security_token.expose().trim(),
             token,
             "token must be loaded verbatim from the supplied dir"
         );

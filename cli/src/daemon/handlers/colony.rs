@@ -124,7 +124,8 @@ pub(crate) struct InvitationIssuedView {
     pub id: String,
     pub team_id: String,
     pub invitee_email: String,
-    pub token: String,
+    /// The invitation token. Prints redacted; serialises as the bare string.
+    pub token: aegis_orchestrator_core::domain::secrets::SensitiveString,
     pub expires_at: String,
 }
 
@@ -736,7 +737,8 @@ pub(crate) async fn create_invitation(
                 team.slug.as_str(),
                 &issued.invitee_email,
                 role,
-                &issued.raw_token,
+                // Sent to Keycloak as the invitee's attribute.
+                issued.raw_token.expose(),
             )
             .await
         {
@@ -880,7 +882,7 @@ pub(crate) async fn accept_invitation(
     };
     let membership = match svc
         .accept_invitation(AcceptInvitationCommand {
-            token,
+            token: token.into(),
             authenticated_email: email,
             authenticated_user_id: identity.sub.clone(),
         })

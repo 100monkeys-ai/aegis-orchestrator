@@ -162,11 +162,13 @@ struct IssueTokenRequest {
 
 #[derive(Serialize)]
 struct IssueTokenResponse {
-    token: String,
+    // The token and the two strings that carry it. Serialised as the bare
+    // strings: this body is how the operator receives the token.
+    token: crate::domain::secrets::SensitiveString,
     expires_at: String,
     controller_endpoint: String,
-    qr_payload: String,
-    command_hint: String,
+    qr_payload: crate::domain::secrets::SensitiveString,
+    command_hint: crate::domain::secrets::SensitiveString,
 }
 
 async fn post_enrollment_token(

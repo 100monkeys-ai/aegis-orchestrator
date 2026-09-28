@@ -28,6 +28,7 @@ use sha2::Sha256;
 use crate::application::billing_service::{BillingService, BillingServiceError};
 use crate::application::effective_tier_service::EffectiveTierService;
 use crate::domain::repository::{RepositoryError, TenantRepository};
+use crate::domain::secrets::{SensitiveBytes, SensitiveString};
 use crate::domain::team::{
     InvitationStatus, Membership, MembershipRepository, MembershipRole, Team, TeamEvent, TeamId,
     TeamInvitation, TeamInvitationId, TeamInvitationRepository, TeamRepository,
@@ -121,8 +122,8 @@ pub struct InviteMemberCommand {
 /// Command to accept an invitation.
 #[derive(Debug, Clone)]
 pub struct AcceptInvitationCommand {
-    /// Raw invitation token from the email link.
-    pub token: String,
+    /// Raw invitation token from the email link. Prints redacted.
+    pub token: SensitiveString,
     /// Email address of the authenticated caller — must match the
     /// invitation's invitee (case-insensitive).
     pub authenticated_email: String,
@@ -138,7 +139,8 @@ pub struct InvitationIssued {
     pub invitation_id: TeamInvitationId,
     pub team_id: TeamId,
     pub invitee_email: String,
-    pub raw_token: String,
+    /// The invitation token. Prints redacted.
+    pub raw_token: SensitiveString,
     pub expires_at: chrono::DateTime<Utc>,
 }
 
@@ -295,7 +297,7 @@ pub struct StandardTeamService {
     /// Raw HMAC key bytes used to derive invitation token hashes. `None` when
     /// `BillingConfig.invitation_hmac_key` is absent — invitation operations
     /// then return [`TeamServiceError::InvitationsNotConfigured`].
-    invitation_hmac_key: Option<Vec<u8>>,
+    invitation_hmac_key: Option<SensitiveBytes>,
     /// Effective tier synchronizer (ADR-111 Phase 3). When set, membership
     /// transitions (accept / revoke) trigger a recompute + Keycloak sync for
     /// the affected user. Optional so the service works in environments
@@ -318,7 +320,7 @@ impl StandardTeamService {
         tenant_repo: Arc<dyn TenantRepository>,
         billing_service: Arc<dyn BillingService>,
         event_bus: Arc<EventBus>,
-        invitation_hmac_key: Option<Vec<u8>>,
+        invitation_hmac_key: Option<SensitiveBytes>,
         effective_tier_service: Option<Arc<dyn EffectiveTierService>>,
         team_memberships_sync: Option<Arc<dyn TeamMembershipsSyncPort>>,
     ) -> Self {
@@ -380,9 +382,11 @@ impl StandardTeamService {
     /// `token = HMAC-SHA256(secret, team_id || invitee_email)` statement and
     /// the `token_hash` stored column.
     fn token_for(&self, team_id: TeamId, invitee_email: &str) -> Result<String, TeamServiceError> {
+        // Read to key the HMAC that derives the invitation token.
         let key = self
             .invitation_hmac_key
-            .as_deref()
+            .as_ref()
+            .map(SensitiveBytes::expose)
             .ok_or(TeamServiceError::InvitationsNotConfigured)?;
         let mut mac = HmacSha256::new_from_slice(key)
             .map_err(|e| TeamServiceError::Domain(format!("hmac init failed: {e}")))?;
@@ -530,7 +534,7 @@ impl TeamService for StandardTeamService {
 
         // Normalize email for token binding and storage.
         let email_lower = cmd.invitee_email.trim().to_ascii_lowercase();
-        let token = self.token_for(cmd.team_id, &email_lower)?;
+        let token = SensitiveString::new(self.token_for(cmd.team_id, &email_lower)?);
         let token_hash = token.clone();
         let expires_at = Utc::now() + Duration::days(7);
 
@@ -589,7 +593,9 @@ impl TeamService for StandardTeamService {
             invitation.team_id,
             &invitation.invitee_email.to_ascii_lowercase(),
         )?;
-        if !constant_time_eq(expected.as_bytes(), cmd.token.as_bytes()) {
+        // Constant-time: read to compare with the token this invitation
+        // should carry.
+        if !constant_time_eq(expected.as_bytes(), cmd.token.expose().as_bytes()) {
             return Err(TeamServiceError::InvalidInvitation);
         }
 
@@ -1019,7 +1025,7 @@ mod tests {
         }
         async fn find_by_token_hash(
             &self,
-            _: &str,
+            _: &SensitiveString,
         ) -> Result<Option<TeamInvitation>, RepositoryError> {
             Ok(None)
         }
@@ -1119,7 +1125,7 @@ mod tests {
             Arc::new(MemTenantRepo::default()),
             Arc::new(NoopBilling),
             Arc::new(EventBus::with_default_capacity()),
-            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
+            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec().into()),
             None,
             None,
         )
@@ -1223,7 +1229,7 @@ mod tests {
             Arc::new(MemTenantRepo::default()),
             Arc::new(NoopBilling),
             Arc::new(EventBus::with_default_capacity()),
-            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
+            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec().into()),
             Some(Arc::new(StubPersonalTier(personal))),
             None,
         )
@@ -1313,14 +1319,14 @@ mod tests {
         }
         async fn find_by_token_hash(
             &self,
-            token_hash: &str,
+            token_hash: &SensitiveString,
         ) -> Result<Option<TeamInvitation>, RepositoryError> {
             Ok(self
                 .items
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|i| i.token_hash == token_hash)
+                .find(|i| i.token_hash == *token_hash)
                 .cloned())
         }
         async fn find_pending_by_team(
@@ -1362,7 +1368,7 @@ mod tests {
             Arc::new(MemTenantRepo::default()),
             Arc::new(NoopBilling),
             Arc::new(EventBus::with_default_capacity()),
-            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec()),
+            Some(b"test-key-32-bytes-long-xxxxxxxxxx".to_vec().into()),
             None,
             Some(sync),
         )

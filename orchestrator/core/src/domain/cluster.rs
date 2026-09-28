@@ -210,12 +210,15 @@ impl std::fmt::Display for ClusterSummaryStatus {
 ///
 /// RS256 JWT issued by controller's OpenBao Transit key.
 /// Carries `node_id`, `role`, `capabilities_hash`, `iat`, `exp`.
+///
+/// A bearer credential: prints redacted, serialises as the bare string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeSecurityToken(pub String);
+pub struct NodeSecurityToken(pub crate::domain::secrets::SensitiveString);
 
 impl NodeSecurityToken {
     pub fn claims(&self) -> Result<NodeTokenClaims, String> {
-        let parts: Vec<&str> = self.0.split('.').collect();
+        // Read to decode the claims; the signature is checked elsewhere.
+        let parts: Vec<&str> = self.0.expose().split('.').collect();
         if parts.len() != 3 {
             return Err("Invalid JWT format".to_string());
         }

@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::repository::RepositoryError;
+use crate::domain::secrets::SensitiveString;
 use crate::domain::tenancy::TenantTier;
 use crate::domain::tenant::TenantId;
 
@@ -535,10 +536,10 @@ pub struct TeamInvitation {
     pub id: TeamInvitationId,
     pub team_id: TeamId,
     pub invitee_email: String,
-    /// HMAC-SHA256 digest of the raw invitation token, bound to
-    /// `(team_id, invitee_email)`. Only the digest is stored; the raw token is
-    /// delivered once in the outbound email.
-    pub token_hash: String,
+    /// The invitation token: an HMAC-SHA256 over `(team_id, invitee_email)`,
+    /// hex-encoded. This value is itself the bearer token the invitee
+    /// presents, so it prints redacted.
+    pub token_hash: SensitiveString,
     pub status: InvitationStatus,
     pub expires_at: DateTime<Utc>,
     pub invited_by: String,
@@ -556,7 +557,7 @@ impl TeamInvitation {
     pub fn send(
         team_id: TeamId,
         invitee_email: String,
-        token_hash: String,
+        token_hash: impl Into<SensitiveString>,
         invited_by: String,
         expires_at: DateTime<Utc>,
     ) -> Self {
@@ -566,7 +567,7 @@ impl TeamInvitation {
             id,
             team_id,
             invitee_email: invitee_email.clone(),
-            token_hash,
+            token_hash: token_hash.into(),
             status: InvitationStatus::Pending,
             expires_at,
             invited_by: invited_by.clone(),
@@ -739,7 +740,7 @@ pub trait TeamInvitationRepository: Send + Sync {
     ) -> Result<Option<TeamInvitation>, RepositoryError>;
     async fn find_by_token_hash(
         &self,
-        token_hash: &str,
+        token_hash: &SensitiveString,
     ) -> Result<Option<TeamInvitation>, RepositoryError>;
     async fn find_pending_by_team(
         &self,
@@ -828,7 +829,7 @@ mod tests {
         let mut inv = TeamInvitation::send(
             team_id,
             "alice@example.com".into(),
-            "hash-a".into(),
+            "hash-a",
             "owner-1".into(),
             Utc::now() + chrono::Duration::days(7),
         );
@@ -846,7 +847,7 @@ mod tests {
         let mut inv = TeamInvitation::send(
             team_id,
             "alice@example.com".into(),
-            "hash-a".into(),
+            "hash-a",
             "owner-1".into(),
             Utc::now() - chrono::Duration::days(1),
         );
@@ -859,7 +860,7 @@ mod tests {
         let mut inv = TeamInvitation::send(
             team_id,
             "alice@example.com".into(),
-            "hash-a".into(),
+            "hash-a",
             "owner-1".into(),
             Utc::now() + chrono::Duration::days(7),
         );

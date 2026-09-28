@@ -51,8 +51,8 @@ pub struct HandshakeOutcome {
     /// enrollment JWT).
     pub controller_endpoint: String,
     /// Raw NodeSecurityToken JWT (RS256). Caller persists this to
-    /// `<state_dir>/node.token`.
-    pub node_security_token: String,
+    /// `<state_dir>/node.token`. Prints redacted.
+    pub node_security_token: aegis_orchestrator_core::domain::secrets::SensitiveString,
     /// RFC-3339 timestamp at which the issued token expires. `None` when the
     /// server omitted the field (older controllers).
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -205,7 +205,7 @@ pub async fn run_attest_and_challenge(
         node_id: issued_sub,
         tenant_id,
         controller_endpoint: claims.cep,
-        node_security_token: challenge_resp.node_security_token,
+        node_security_token: challenge_resp.node_security_token.into(),
         expires_at,
     })
 }
@@ -437,7 +437,7 @@ mod tests {
             node_id: "00000000-0000-0000-0000-000000000001".to_string(),
             tenant_id: tenant_id.to_string(),
             controller_endpoint: controller_endpoint.to_string(),
-            node_security_token: "header.payload.sig".to_string(),
+            node_security_token: "header.payload.sig".into(),
             expires_at: None,
         }
     }

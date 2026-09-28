@@ -6,7 +6,7 @@ use crate::domain::cluster::{
     NodeChallengeRepository, NodeClusterRepository, NodeId, NodePeer, NodePeerStatus, NodeRole,
     NodeTokenClaims,
 };
-use crate::domain::secrets::SecretStore;
+use crate::domain::secrets::{SecretStore, SensitiveString};
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use chrono::Utc;
@@ -18,7 +18,8 @@ use std::sync::Arc;
 /// bootstrap_proof { string enrollment_token = 4; }`.
 #[derive(Debug, Clone)]
 pub enum BootstrapProof {
-    EnrollmentToken(String),
+    /// The enrolment JWT, a bearer credential. Prints redacted.
+    EnrollmentToken(SensitiveString),
 }
 
 pub struct ChallengeNodeRequest {
@@ -128,7 +129,13 @@ impl ChallengeNodeUseCase {
             let edge_caps = crate::domain::edge::EdgeCapabilities::default();
 
             match svc
-                .enroll(jwt, req.node_id, challenge.public_key.clone(), edge_caps)
+                // Verified and redeemed by the enrolment service.
+                .enroll(
+                    jwt.expose(),
+                    req.node_id,
+                    challenge.public_key.clone(),
+                    edge_caps,
+                )
                 .await
             {
                 Ok(claims) => (Some(claims.tid), Some(claims.cep)),
@@ -717,7 +724,7 @@ mod tests {
                 challenge_id,
                 node_id,
                 challenge_signature: signature.to_bytes().to_vec(),
-                bootstrap_proof: Some(BootstrapProof::EnrollmentToken(jwt)),
+                bootstrap_proof: Some(BootstrapProof::EnrollmentToken(jwt.into())),
             })
             .await
             .expect("Edge ChallengeNode must succeed when EnrollEdgeService is wired");
@@ -816,7 +823,7 @@ mod tests {
                 challenge_id,
                 node_id,
                 challenge_signature: signature.to_bytes().to_vec(),
-                bootstrap_proof: Some(BootstrapProof::EnrollmentToken(jwt)),
+                bootstrap_proof: Some(BootstrapProof::EnrollmentToken(jwt.into())),
             })
             .await;
         let err = match result {

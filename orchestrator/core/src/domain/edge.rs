@@ -202,8 +202,10 @@ pub struct EdgeDaemon {
 /// Short-lived enrollment JWT. The string is opaque outside the security
 /// infrastructure; claims are exposed via [`EnrollmentTokenClaims`] after
 /// verification at the application layer.
+///
+/// A bearer credential: prints redacted, serialises as the bare string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnrollmentToken(pub String);
+pub struct EnrollmentToken(pub crate::domain::secrets::SensitiveString);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentTokenClaims {

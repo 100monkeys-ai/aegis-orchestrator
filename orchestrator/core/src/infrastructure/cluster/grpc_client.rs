@@ -273,7 +273,7 @@ impl NodeClusterClient {
     pub async fn token_expires_at(&self) -> Option<DateTime<Utc>> {
         let guard = self.token.read().await;
         let raw = guard.as_ref()?;
-        let nst = NodeSecurityToken(raw.clone());
+        let nst = NodeSecurityToken(raw.as_str().into());
         let claims = nst.claims().ok()?;
         DateTime::from_timestamp(claims.exp, 0)
     }

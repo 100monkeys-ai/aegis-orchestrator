@@ -16,7 +16,7 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
-use crate::domain::secrets::SecretStore;
+use crate::domain::secrets::{SecretStore, SensitiveString};
 use crate::domain::shared_kernel::TenantId;
 use crate::infrastructure::aegis_cluster_proto::{
     node_cluster_service_client::NodeClusterServiceClient, IssueEnrollmentTokenRequest,
@@ -60,15 +60,17 @@ pub trait EnrollmentTokenIssuer: Send + Sync {
 /// Output of [`EnrollmentTokenIssuer::issue`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssuedEnrollmentToken {
-    pub token: String,
+    /// The enrolment JWT, a bearer credential. Prints redacted.
+    pub token: SensitiveString,
     pub expires_at: chrono::DateTime<Utc>,
     /// Endpoint the daemon should connect to (host:port). Echoed in the JWT
     /// `cep` claim so the CLI doesn't need a separate `--endpoint` flag.
     pub controller_endpoint: String,
-    /// Pre-rendered QR payload (`aegis edge enroll <token>`).
-    pub qr_payload: String,
-    /// Copy-pasteable shell command for the operator.
-    pub command_hint: String,
+    /// Pre-rendered QR payload (`aegis edge enroll <token>`). Carries the
+    /// token, so it prints redacted too.
+    pub qr_payload: SensitiveString,
+    /// Copy-pasteable shell command for the operator. Carries the token.
+    pub command_hint: SensitiveString,
 }
 
 #[derive(Serialize)]
@@ -168,9 +170,9 @@ impl IssueEnrollmentToken {
         let s_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
         let token = format!("{signing_input}.{s_b64}");
 
-        let cmd = format!("aegis edge enroll {token}");
+        let cmd = SensitiveString::new(format!("aegis edge enroll {token}"));
         Ok(IssuedEnrollmentToken {
-            token,
+            token: SensitiveString::new(token),
             expires_at,
             controller_endpoint: self.controller_endpoint.clone(),
             qr_payload: cmd.clone(),
@@ -273,11 +275,11 @@ impl EnrollmentTokenIssuer for RelayGrpcEnrollmentTokenIssuer {
             .map_err(|e| anyhow::anyhow!("relay expires_at parse: {e}"))?
             .with_timezone(&Utc);
         Ok(IssuedEnrollmentToken {
-            token: resp.token,
+            token: resp.token.into(),
             expires_at,
             controller_endpoint: resp.controller_endpoint,
-            qr_payload: resp.qr_payload,
-            command_hint: resp.command_hint,
+            qr_payload: resp.qr_payload.into(),
+            command_hint: resp.command_hint.into(),
         })
     }
 }
@@ -588,7 +590,7 @@ mod tests {
             .await
             .expect("rpc must succeed");
 
-        assert_eq!(issued.token, "stub-token");
+        assert_eq!(issued.token.expose(), "stub-token");
         assert_eq!(issued.controller_endpoint, "relay.myzaru.com:443");
 
         let (auth, tenant_meta, inner) = captured

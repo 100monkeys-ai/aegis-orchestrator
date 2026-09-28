@@ -24,8 +24,9 @@ use crate::output::OutputFormat;
 
 #[derive(Debug, Args)]
 pub struct EnrollArgs {
-    /// Enrollment token issued by `POST /v1/edge/enrollment-tokens`.
-    pub token: String,
+    /// Enrollment token issued by `POST /v1/edge/enrollment-tokens`. Prints
+    /// redacted.
+    pub token: aegis_orchestrator_core::domain::secrets::SensitiveString,
     /// Override the local edge state directory (default: `~/.aegis/edge`).
     #[arg(long)]
     pub state_dir: Option<std::path::PathBuf>,
@@ -70,9 +71,12 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
 
     // Step 1 (local FS): generate keypair, persist enrollment.jwt, write
     // aegis-config.yaml. Returns Ok before any network I/O.
-    let plan = BootstrapPlan::detect(args.state_dir.clone(), &args.token, &policy)?;
+    // Read here and only here: the token is decoded for its claims, stored
+    // under the state directory and presented in the handshake.
+    let enrollment_jwt = args.token.expose();
+    let plan = BootstrapPlan::detect(args.state_dir.clone(), enrollment_jwt, &policy)?;
     let resolved_state_dir = plan.state_dir.clone();
-    run_bootstrap(plan, &policy, bootstrap_output, &args.token).await?;
+    run_bootstrap(plan, &policy, bootstrap_output, enrollment_jwt).await?;
 
     // --dry-run terminates before the wire flow per BootstrapPolicy contract.
     if policy.dry_run {
@@ -87,7 +91,7 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
     // jti. Treat enrollment as already complete.
     let node_token_path = resolved_state_dir.join("node.token");
     if policy.keep_existing && node_token_path.exists() {
-        let outcome = build_outcome_from_existing(&resolved_state_dir, &args.token)?;
+        let outcome = build_outcome_from_existing(&resolved_state_dir, enrollment_jwt)?;
         // BUG 1 fix: even on the keep-existing short-circuit, ensure the
         // config carries the tenant_id derived from the on-disk identity.
         // This heals legacy configs left over from before the
@@ -114,7 +118,7 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
     // The bootstrap step already validated the JWT is well-formed; we
     // re-decode here rather than threading the value through to keep the
     // bootstrap and handshake stages independent.
-    let claims = super::handshake::decode_enrollment_claims(&args.token)?;
+    let claims = super::handshake::decode_enrollment_claims(enrollment_jwt)?;
 
     // The daemon's node_id is a UUID minted client-side at bootstrap and
     // persisted in `aegis-config.yaml` (`spec.node.id`). It is decoupled
@@ -126,13 +130,17 @@ pub async fn run(args: EnrollArgs, output: OutputFormat) -> anyhow::Result<()> {
         .context("read minted node_id from aegis-config.yaml after bootstrap")?;
 
     let outcome =
-        run_attest_and_challenge(&claims.cep, &node_id, &signing_key, &args.token).await?;
+        run_attest_and_challenge(&claims.cep, &node_id, &signing_key, enrollment_jwt).await?;
 
     // Persist node.token AFTER the handshake succeeds. Atomic-write +
     // mode-0600 mirrors how `bootstrap.rs` and `keys.rs` treat secrets — a
     // partial write would corrupt the daemon's identity.
-    grpc::atomic_write_secret(&node_token_path, outcome.node_security_token.as_bytes())
-        .context("persist NodeSecurityToken to node.token")?;
+    // Written to the state directory, where the daemon reads it.
+    grpc::atomic_write_secret(
+        &node_token_path,
+        outcome.node_security_token.expose().as_bytes(),
+    )
+    .context("persist NodeSecurityToken to node.token")?;
 
     // BUG 1 fix: write the tenant_id and (re-affirm) the controller endpoint
     // into aegis-config.yaml. Without this the daemon starts with
@@ -301,7 +309,7 @@ fn build_outcome_from_existing(state_dir: &Path, enrollment_jwt: &str) -> Result
         node_id,
         tenant_id: claims.tid,
         controller_endpoint: claims.cep,
-        node_security_token: token,
+        node_security_token: token.into(),
         // We deliberately do not parse the existing token's `exp` here — the
         // caller path emits this only as informational metadata, and the
         // daemon's `token refresh` command is the authoritative expiry source.

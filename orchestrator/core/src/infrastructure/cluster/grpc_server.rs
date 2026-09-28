@@ -141,7 +141,7 @@ impl NodeClusterServiceHandler {
             proto_envelope.ok_or_else(|| Status::unauthenticated("Missing security envelope"))?;
 
         // 1. Parse token and extract claims
-        let token = NodeSecurityToken(proto_envelope.node_security_token.clone());
+        let token = NodeSecurityToken(proto_envelope.node_security_token.clone().into());
         let claims = token
             .claims()
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
@@ -262,7 +262,7 @@ impl NodeClusterService for NodeClusterServiceHandler {
         // ADR-117: translate the prost-generated `bootstrap_proof` oneof.
         use crate::infrastructure::aegis_cluster_proto::challenge_node_request::BootstrapProof as ProtoBootstrapProof;
         let bootstrap_proof = req.bootstrap_proof.map(|bp| match bp {
-            ProtoBootstrapProof::EnrollmentToken(t) => BootstrapProof::EnrollmentToken(t),
+            ProtoBootstrapProof::EnrollmentToken(t) => BootstrapProof::EnrollmentToken(t.into()),
         });
         let app_req = AppChallengeNodeRequest {
             challenge_id: uuid::Uuid::parse_str(&req.challenge_id)
@@ -720,12 +720,14 @@ impl NodeClusterService for NodeClusterServiceHandler {
             .await
             .map_err(|e| Status::internal(format!("issue enrollment token: {e}")))?;
 
+        // Sent to the operator who asked for the token; the generated type
+        // holds Strings.
         Ok(Response::new(IssueEnrollmentTokenResponse {
-            token: issued.token,
+            token: issued.token.expose_owned(),
             expires_at: issued.expires_at.to_rfc3339(),
             controller_endpoint: issued.controller_endpoint,
-            qr_payload: issued.qr_payload,
-            command_hint: issued.command_hint,
+            qr_payload: issued.qr_payload.expose_owned(),
+            command_hint: issued.command_hint.expose_owned(),
         }))
     }
 }

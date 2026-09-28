@@ -297,7 +297,7 @@ fn make_node_security_token(sub: &str, tid: &str) -> String {
 
 fn enroll_args(token: String, state_dir: &Path) -> EnrollArgs {
     EnrollArgs {
-        token,
+        token: token.into(),
         state_dir: Some(state_dir.to_path_buf()),
         non_interactive: true,
         force: false,

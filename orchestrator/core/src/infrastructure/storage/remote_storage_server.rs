@@ -99,7 +99,7 @@ impl RemoteStorageServiceHandler {
             envelope.ok_or_else(|| Status::unauthenticated("Missing security envelope"))?;
 
         // 1. Parse token and extract claims
-        let token = NodeSecurityToken(envelope.node_security_token.clone());
+        let token = NodeSecurityToken(envelope.node_security_token.clone().into());
         let claims = token
             .claims()
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {e}")))?;

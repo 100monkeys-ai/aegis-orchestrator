@@ -2173,7 +2173,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .and_then(|k| {
                     aegis_orchestrator_core::domain::node_config::resolve_env_value(k.expose()).ok()
                 })
-                .map(|s| s.into_bytes());
+                .map(|s| {
+                    aegis_orchestrator_core::domain::secrets::SensitiveBytes::new(s.into_bytes())
+                });
             // `team_memberships` JWT-claim sync port. Stamps the multivalued
             // Keycloak attribute every time a membership mutation lands;
             // disabled (None) when keycloak_admin is unavailable, in which

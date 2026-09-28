@@ -34,7 +34,8 @@ impl SealNodeVerifier {
     /// Verify the envelope's token and signature, returning the authenticated `NodeId`.
     pub async fn verify_envelope(&self, envelope: &SealNodeEnvelope) -> Result<NodeId> {
         // 1. Parse and validate token claims (expiry check included)
-        let claims = Self::verify_token_claims(&envelope.node_security_token.0)?;
+        // Read to verify the token signature and decode its claims.
+        let claims = Self::verify_token_claims(envelope.node_security_token.0.expose())?;
         let node_id = claims.node_id;
 
         // 2. Look up the peer's registered public key

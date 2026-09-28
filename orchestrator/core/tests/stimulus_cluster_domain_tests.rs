@@ -659,7 +659,7 @@ fn capability_hash_differs_for_different_values() {
 #[test]
 fn node_security_token_claims_valid_jwt() {
     let claims = make_token_claims(300);
-    let token = NodeSecurityToken(make_jwt(&claims));
+    let token = NodeSecurityToken(make_jwt(&claims).into());
     let decoded = token.claims().unwrap();
     assert_eq!(decoded.node_id, claims.node_id);
     assert_eq!(decoded.role, claims.role);
@@ -669,38 +669,38 @@ fn node_security_token_claims_valid_jwt() {
 
 #[test]
 fn node_security_token_claims_invalid_jwt_format() {
-    let token = NodeSecurityToken("not.a.valid.jwt.at.all".to_string());
+    let token = NodeSecurityToken("not.a.valid.jwt.at.all".into());
     // More than 3 parts
     assert!(token.claims().is_err());
 
-    let token2 = NodeSecurityToken("onlyonepart".to_string());
+    let token2 = NodeSecurityToken("onlyonepart".into());
     assert!(token2.claims().is_err());
 }
 
 #[test]
 fn node_security_token_is_expired_future() {
     let claims = make_token_claims(300); // 5 minutes from now
-    let token = NodeSecurityToken(make_jwt(&claims));
+    let token = NodeSecurityToken(make_jwt(&claims).into());
     assert!(!token.is_expired());
 }
 
 #[test]
 fn node_security_token_is_expired_past() {
     let claims = make_token_claims(-60); // 1 minute ago
-    let token = NodeSecurityToken(make_jwt(&claims));
+    let token = NodeSecurityToken(make_jwt(&claims).into());
     assert!(token.is_expired());
 }
 
 #[test]
 fn node_security_token_is_expired_invalid_token() {
-    let token = NodeSecurityToken("garbage".to_string());
+    let token = NodeSecurityToken("garbage".into());
     assert!(token.is_expired()); // Invalid tokens are treated as expired
 }
 
 #[test]
 fn node_security_token_seconds_until_expiry() {
     let claims = make_token_claims(120);
-    let token = NodeSecurityToken(make_jwt(&claims));
+    let token = NodeSecurityToken(make_jwt(&claims).into());
     let remaining = token.seconds_until_expiry();
     // Should be close to 120 (within a few seconds of test execution)
     assert!(remaining > 115 && remaining <= 120);
@@ -709,13 +709,13 @@ fn node_security_token_seconds_until_expiry() {
 #[test]
 fn node_security_token_seconds_until_expiry_already_expired() {
     let claims = make_token_claims(-30);
-    let token = NodeSecurityToken(make_jwt(&claims));
+    let token = NodeSecurityToken(make_jwt(&claims).into());
     assert_eq!(token.seconds_until_expiry(), 0);
 }
 
 #[test]
 fn node_security_token_seconds_until_expiry_invalid() {
-    let token = NodeSecurityToken("bad".to_string());
+    let token = NodeSecurityToken("bad".into());
     assert_eq!(token.seconds_until_expiry(), 0);
 }
 
@@ -979,7 +979,7 @@ fn serde_roundtrip_config_scope() {
 #[test]
 fn serde_roundtrip_node_security_token() {
     let claims = make_token_claims(300);
-    let token = NodeSecurityToken(make_jwt(&claims));
+    let token = NodeSecurityToken(make_jwt(&claims).into());
     let json = serde_json::to_string(&token).expect("serialize");
     let deser: NodeSecurityToken = serde_json::from_str(&json).expect("deserialize");
     let deser_claims = deser.claims().unwrap();
