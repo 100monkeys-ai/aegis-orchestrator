@@ -67,14 +67,44 @@ struct CachedToken {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeycloakAdminError {
-    #[error("failed to obtain admin token: {0}")]
-    TokenError(String),
+    /// The admin token endpoint refused the grant. Carries only the RFC 6749
+    /// §5.2 `error` and `error_description` of the response body; anything
+    /// else in the body is dropped.
+    #[error(
+        "failed to obtain admin token: HTTP {status}{}",
+        oauth_error_detail(.error.as_deref(), .error_description.as_deref())
+    )]
+    TokenError {
+        status: u16,
+        error: Option<String>,
+        error_description: Option<String>,
+    },
     #[error("failed to set user attribute: {status} {body}")]
     AttributeError { status: u16, body: String },
     #[error("realm operation failed: {status} {body}")]
     RealmError { status: u16, body: String },
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+}
+
+/// The fields of an RFC 6749 §5.2 error response. Any other field in the
+/// body is ignored.
+#[derive(Deserialize, Default)]
+struct OAuthErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// `": <error> — <error_description>"`, or as much of it as is present.
+fn oauth_error_detail(error: Option<&str>, description: Option<&str>) -> String {
+    match (error, description) {
+        (Some(e), Some(d)) => format!(": {e} — {d}"),
+        (Some(e), None) => format!(": {e}"),
+        (None, Some(d)) => format!(": {d}"),
+        (None, None) => String::new(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -201,10 +231,14 @@ impl KeycloakAdminClient {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KeycloakAdminError::TokenError(format!(
-                "HTTP {status}: {body}"
-            )));
+            // Keep the two fields RFC 6749 §5.2 defines for a refused grant;
+            // drop the rest of the body.
+            let body: OAuthErrorBody = resp.json().await.unwrap_or_default();
+            return Err(KeycloakAdminError::TokenError {
+                status,
+                error: body.error,
+                error_description: body.error_description,
+            });
         }
 
         let token_resp: TokenResponse = resp.json().await?;
