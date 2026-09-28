@@ -110,6 +110,15 @@ async fn logout() -> Result<()> {
 }
 
 async fn revoke_session(profile: &auth::AegisProfile) -> Result<()> {
+    let url = format!(
+        "https://auth.{}/realms/aegis-system/protocol/openid-connect/logout",
+        profile.env
+    );
+    revoke_session_at(&url, profile).await
+}
+
+/// Revoke the session at the OpenID Connect logout endpoint `url`.
+async fn revoke_session_at(url: &str, profile: &auth::AegisProfile) -> Result<()> {
     // Audit 002 §4.37.9 — bound the logout wait on a frozen IdP. Logout is
     // best-effort, so use a tight budget to avoid hanging the user's
     // terminal on a flaky auth host.
@@ -118,12 +127,8 @@ async fn revoke_session(profile: &auth::AegisProfile) -> Result<()> {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| anyhow::anyhow!("reqwest client build: {e}"))?;
-    let url = format!(
-        "https://auth.{}/realms/aegis-system/protocol/openid-connect/logout",
-        profile.env
-    );
     client
-        .post(&url)
+        .post(url)
         .form(&[
             ("client_id", "aegis-cli"),
             // Read to send with the logout, which revokes it.
@@ -206,4 +211,64 @@ async fn print_token() -> Result<()> {
     let key = auth::require_key().await?;
     println!("{key}");
     Ok(())
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Option<(String, HashMap<String, String>)>>>;
+
+    async fn logout_endpoint(
+        axum::extract::State(seen): axum::extract::State<Seen>,
+        uri: axum::http::Uri,
+        axum::Form(form): axum::Form<HashMap<String, String>>,
+    ) -> axum::http::StatusCode {
+        *seen.lock().unwrap() = Some((uri.path().to_string(), form));
+        axum::http::StatusCode::NO_CONTENT
+    }
+
+    /// Logout reaches the auth server's logout endpoint carrying the refresh
+    /// token exactly as held, so the server can revoke it.
+    #[tokio::test]
+    async fn logout_sends_the_refresh_token_as_held() {
+        let seen: Seen = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/realms/aegis-system/protocol/openid-connect/logout",
+                axum::routing::post(logout_endpoint),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let profile = auth::AegisProfile {
+            name: "default".to_string(),
+            env: "dev.example.com".to_string(),
+            client_id: "aegis-cli".to_string(),
+            access_key: "access".into(),
+            refresh_key: "Mk7-logout-refresh-marker".into(),
+            expires_at: chrono::Utc::now(),
+            roles: vec![],
+            scopes: vec![],
+        };
+
+        revoke_session_at(
+            &format!("http://{addr}/realms/aegis-system/protocol/openid-connect/logout"),
+            &profile,
+        )
+        .await
+        .expect("the logout is accepted");
+
+        let (path, form) = seen.lock().unwrap().clone().expect("the logout arrived");
+        assert_eq!(path, "/realms/aegis-system/protocol/openid-connect/logout");
+        assert_eq!(
+            form.get("refresh_token").map(String::as_str),
+            Some("Mk7-logout-refresh-marker"),
+            "logout carried a different refresh token than the one held"
+        );
+    }
 }

@@ -1563,6 +1563,51 @@ impl DaemonClient {
 
 #[cfg(test)]
 mod debug_tests {
+    type SeenAuth = std::sync::Arc<std::sync::Mutex<Option<(String, Option<String>)>>>;
+
+    async fn record_auth(
+        axum::extract::State(seen): axum::extract::State<SeenAuth>,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+    ) -> axum::Json<serde_json::Value> {
+        *seen.lock().unwrap() = Some((
+            uri.path().to_string(),
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        ));
+        axum::Json(serde_json::json!([]))
+    }
+
+    /// A request from the daemon client carries the auth key, exactly as
+    /// given, as its bearer token.
+    #[tokio::test]
+    async fn daemon_client_sends_the_auth_key_as_given() {
+        let seen: SeenAuth = Default::default();
+        let app = axum::Router::new()
+            .route("/v1/agents", axum::routing::get(record_auth))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = super::DaemonClient::new("127.0.0.1", addr.port())
+            .unwrap()
+            .with_auth("Mk7-daemon-client-bearer-marker".to_string());
+
+        client.list_agents().await.expect("served");
+
+        let (path, auth) = seen.lock().unwrap().clone().expect("the request arrived");
+        assert_eq!(path, "/v1/agents");
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer Mk7-daemon-client-bearer-marker"),
+            "the daemon client presented a different bearer token than the key given"
+        );
+    }
+
     #[test]
     fn daemon_client_debug_does_not_print_the_auth_key() {
         let client = super::DaemonClient::new("localhost", 8088)

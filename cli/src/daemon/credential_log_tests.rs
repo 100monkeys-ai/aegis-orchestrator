@@ -84,3 +84,24 @@ async fn postgres_start_up_log_does_not_carry_the_database_password() {
         "the database URL's password reached the daemon log:\n{output}"
     );
 }
+
+/// The driver is handed the database URL exactly as configured: the host,
+/// port, user and database, and the password byte for byte. No database is
+/// needed; the options are what `connect_with` receives.
+#[test]
+fn postgres_driver_is_handed_the_url_as_configured() {
+    let url = aegis_orchestrator_core::domain::secrets::SensitiveUrl::new(
+        "postgres://aegis:Mk7-pg-driver-password-marker@db.internal:5433/aegis_db",
+    );
+    let options = super::server::pg_connect_options(&url).expect("the URL parses");
+    assert_eq!(options.get_host(), "db.internal");
+    assert_eq!(options.get_port(), 5433);
+    assert_eq!(options.get_username(), "aegis");
+    assert_eq!(options.get_database(), Some("aegis_db"));
+    // The options expose no password getter; their Debug shows the field.
+    let printed = format!("{options:?}");
+    assert!(
+        printed.contains("password: Some(\"Mk7-pg-driver-password-marker\")"),
+        "the driver would connect with a different password than the one configured: {printed}"
+    );
+}

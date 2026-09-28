@@ -340,3 +340,214 @@ mod cortex_redaction_tests {
         assert_eq!(out, "\"<unparseable>\"");
     }
 }
+
+#[cfg(test)]
+mod cortex_bearer_tests {
+    use super::*;
+    use crate::infrastructure::aegis_cortex_proto::{
+        ApplyCortisolRequest, ApplyCortisolResponse, ApplyDopamineRequest, ApplyDopamineResponse,
+        CreateEdgeRequest, CreateEdgeResponse, CreateNodeRequest, CreateNodeResponse,
+        DiscoverAgentsRequest, DiscoverAgentsResponse, DiscoverWorkflowsRequest,
+        DiscoverWorkflowsResponse, GetMetricsRequest, GetMetricsResponse, GetPatternRequest,
+        GetPatternResponse, GetSkillRequest, GetSkillResponse, HealthCheckRequest,
+        HealthCheckResponse, IndexAgentRequest, IndexAgentResponse, IndexWorkflowRequest,
+        IndexWorkflowResponse, ListSkillsRequest, ListSkillsResponse, QueryGraphRequest,
+        QueryGraphResponse, QueryPatternsRequest, QueryPatternsResponse,
+        RemoveDiscoveryAgentRequest, RemoveDiscoveryAgentResponse, RemoveDiscoveryWorkflowRequest,
+        RemoveDiscoveryWorkflowResponse, StorePatternRequest, StorePatternResponse,
+        StoreTrajectoryPatternRequest, StoreTrajectoryPatternResponse, TraverseGraphRequest,
+        TraverseGraphResponse, TriggerConsolidationRequest, TriggerConsolidationResponse,
+        TriggerPruningRequest, TriggerPruningResponse, UpdatePatternSuccessRequest,
+        UpdatePatternSuccessResponse,
+    };
+
+    /// A stand-in Cortex service on a loopback port: records the
+    /// `authorization` metadata of a QueryPatterns call.
+    struct RecordingCortex {
+        seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::infrastructure::aegis_cortex_proto::cortex_service_server::CortexService
+        for RecordingCortex
+    {
+        async fn query_patterns(
+            &self,
+            request: tonic::Request<QueryPatternsRequest>,
+        ) -> Result<tonic::Response<QueryPatternsResponse>, tonic::Status> {
+            *self.seen.lock().unwrap() = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            Ok(tonic::Response::new(QueryPatternsResponse::default()))
+        }
+        async fn store_pattern(
+            &self,
+            _: tonic::Request<StorePatternRequest>,
+        ) -> Result<tonic::Response<StorePatternResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn store_trajectory_pattern(
+            &self,
+            _: tonic::Request<StoreTrajectoryPatternRequest>,
+        ) -> Result<tonic::Response<StoreTrajectoryPatternResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn get_pattern(
+            &self,
+            _: tonic::Request<GetPatternRequest>,
+        ) -> Result<tonic::Response<GetPatternResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn apply_dopamine(
+            &self,
+            _: tonic::Request<ApplyDopamineRequest>,
+        ) -> Result<tonic::Response<ApplyDopamineResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn apply_cortisol(
+            &self,
+            _: tonic::Request<ApplyCortisolRequest>,
+        ) -> Result<tonic::Response<ApplyCortisolResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn update_pattern_success(
+            &self,
+            _: tonic::Request<UpdatePatternSuccessRequest>,
+        ) -> Result<tonic::Response<UpdatePatternSuccessResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn create_node(
+            &self,
+            _: tonic::Request<CreateNodeRequest>,
+        ) -> Result<tonic::Response<CreateNodeResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn create_edge(
+            &self,
+            _: tonic::Request<CreateEdgeRequest>,
+        ) -> Result<tonic::Response<CreateEdgeResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn traverse_graph(
+            &self,
+            _: tonic::Request<TraverseGraphRequest>,
+        ) -> Result<tonic::Response<TraverseGraphResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn query_graph(
+            &self,
+            _: tonic::Request<QueryGraphRequest>,
+        ) -> Result<tonic::Response<QueryGraphResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn list_skills(
+            &self,
+            _: tonic::Request<ListSkillsRequest>,
+        ) -> Result<tonic::Response<ListSkillsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn get_skill(
+            &self,
+            _: tonic::Request<GetSkillRequest>,
+        ) -> Result<tonic::Response<GetSkillResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn index_agent(
+            &self,
+            _: tonic::Request<IndexAgentRequest>,
+        ) -> Result<tonic::Response<IndexAgentResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn index_workflow(
+            &self,
+            _: tonic::Request<IndexWorkflowRequest>,
+        ) -> Result<tonic::Response<IndexWorkflowResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn remove_agent(
+            &self,
+            _: tonic::Request<RemoveDiscoveryAgentRequest>,
+        ) -> Result<tonic::Response<RemoveDiscoveryAgentResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn remove_workflow(
+            &self,
+            _: tonic::Request<RemoveDiscoveryWorkflowRequest>,
+        ) -> Result<tonic::Response<RemoveDiscoveryWorkflowResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn discover_agents(
+            &self,
+            _: tonic::Request<DiscoverAgentsRequest>,
+        ) -> Result<tonic::Response<DiscoverAgentsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn discover_workflows(
+            &self,
+            _: tonic::Request<DiscoverWorkflowsRequest>,
+        ) -> Result<tonic::Response<DiscoverWorkflowsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn trigger_consolidation(
+            &self,
+            _: tonic::Request<TriggerConsolidationRequest>,
+        ) -> Result<tonic::Response<TriggerConsolidationResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn trigger_pruning(
+            &self,
+            _: tonic::Request<TriggerPruningRequest>,
+        ) -> Result<tonic::Response<TriggerPruningResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn get_metrics(
+            &self,
+            _: tonic::Request<GetMetricsRequest>,
+        ) -> Result<tonic::Response<GetMetricsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+        async fn health_check(
+            &self,
+            _: tonic::Request<HealthCheckRequest>,
+        ) -> Result<tonic::Response<HealthCheckResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    /// A call from the Cortex client carries the API key, exactly as
+    /// configured, as its bearer token.
+    #[tokio::test]
+    async fn cortex_client_sends_the_api_key_as_configured() {
+        use crate::infrastructure::aegis_cortex_proto::cortex_service_server::CortexServiceServer;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = RecordingCortex { seen: seen.clone() };
+        tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let _ = tonic::transport::Server::builder()
+                .add_service(CortexServiceServer::new(service))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        let client = CortexGrpcClient::new(
+            format!("http://{addr}"),
+            Some("Mk7-cortex-bearer-marker".to_string()),
+        )
+        .await
+        .expect("connect to the stand-in service");
+
+        client
+            .query_patterns(QueryPatternsRequest::default())
+            .await
+            .expect("served");
+
+        assert_eq!(
+            seen.lock().unwrap().clone().as_deref(),
+            Some("Bearer Mk7-cortex-bearer-marker"),
+            "the Cortex client presented a different bearer token than the key configured"
+        );
+    }
+}

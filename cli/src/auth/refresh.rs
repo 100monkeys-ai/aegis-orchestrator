@@ -23,6 +23,14 @@ pub async fn refresh_token(profile: &AegisProfile) -> Result<AegisProfile> {
         "https://auth.{}/realms/aegis-system/protocol/openid-connect",
         profile.env
     );
+    refresh_token_at(&auth_base, profile).await
+}
+
+/// Refresh against the OpenID Connect endpoints under `auth_base`.
+pub(crate) async fn refresh_token_at(
+    auth_base: &str,
+    profile: &AegisProfile,
+) -> Result<AegisProfile> {
     // Audit 002 §4.37.9 — bound the refresh wait on a frozen IdP.
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -84,4 +92,68 @@ pub async fn refresh_token(profile: &AegisProfile) -> Result<AegisProfile> {
         roles,
         scopes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Option<(String, HashMap<String, String>)>>>;
+
+    async fn token_endpoint(
+        axum::extract::State(seen): axum::extract::State<Seen>,
+        uri: axum::http::Uri,
+        axum::Form(form): axum::Form<HashMap<String, String>>,
+    ) -> axum::Json<serde_json::Value> {
+        *seen.lock().unwrap() = Some((uri.path().to_string(), form));
+        axum::Json(serde_json::json!({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 900,
+        }))
+    }
+
+    /// The refresh grant reaches the auth server's token endpoint carrying the
+    /// refresh token exactly as held.
+    #[tokio::test]
+    async fn refresh_sends_the_refresh_token_as_held() {
+        let seen: Seen = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/realms/aegis-system/protocol/openid-connect/token",
+                axum::routing::post(token_endpoint),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let profile = AegisProfile {
+            name: "default".to_string(),
+            env: "dev.example.com".to_string(),
+            client_id: "aegis-cli".to_string(),
+            access_key: "old-access".into(),
+            refresh_key: "Mk7-refresh-grant-marker".into(),
+            expires_at: Utc::now(),
+            roles: vec![],
+            scopes: vec![],
+        };
+
+        refresh_token_at(
+            &format!("http://{addr}/realms/aegis-system/protocol/openid-connect"),
+            &profile,
+        )
+        .await
+        .expect("the refresh is granted");
+
+        let (path, form) = seen.lock().unwrap().clone().expect("the grant arrived");
+        assert_eq!(path, "/realms/aegis-system/protocol/openid-connect/token");
+        assert_eq!(
+            form.get("refresh_token").map(String::as_str),
+            Some("Mk7-refresh-grant-marker"),
+            "the refresh grant carried a different refresh token than the one held"
+        );
+    }
 }

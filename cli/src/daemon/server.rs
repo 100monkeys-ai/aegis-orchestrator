@@ -203,6 +203,14 @@ fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
 /// Returns `Ok(None)` when no database is configured, or when the connection
 /// fails on a node that is not labelled production (the daemon then falls back
 /// to in-memory repositories). A production node refuses both.
+/// The options the PostgreSQL driver connects with, parsed from the database
+/// URL as configured. The one place the URL is read for the driver.
+pub(crate) fn pg_connect_options(
+    url: &SensitiveUrl,
+) -> std::result::Result<sqlx::postgres::PgConnectOptions, sqlx::Error> {
+    url.expose().parse()
+}
+
 pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Option<PgPool>> {
     // Initialize repositories — resolve database URL from config (spec.database)
     let database_url: Option<SensitiveUrl> =
@@ -230,11 +238,16 @@ pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Opti
     // Store pool separately for later volume repo initialization
     let db_pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
         info!(url = %url.redacted(), "Initializing repositories with PostgreSQL");
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(db_max_connections)
-            .connect(url.expose())
-            .await
-        {
+        let connected = match pg_connect_options(url) {
+            Ok(options) => {
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(db_max_connections)
+                    .connect_with(options)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match connected {
             Ok(db_pool) => {
                 info!("Connected to PostgreSQL");
 

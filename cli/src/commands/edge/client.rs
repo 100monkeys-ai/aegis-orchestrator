@@ -60,15 +60,17 @@ impl EdgeApiClient {
     }
 
     pub fn from_env() -> Result<Self> {
+        let store = load_store().ok();
+        let profile = store
+            .as_ref()
+            .and_then(|s| s.profiles.get(&s.active_profile));
         let base_url = std::env::var("AEGIS_API_URL")
             .or_else(|_| std::env::var("AEGIS_CONTROLLER_ENDPOINT"))
             .or_else(|_| {
-                load_store()
-                    .ok()
-                    .and_then(|s| s.profiles.get(&s.active_profile).cloned())
+                profile
                     .map(|p| {
                         if p.env.starts_with("http") {
-                            p.env
+                            p.env.clone()
                         } else {
                             format!("https://{}", p.env)
                         }
@@ -77,22 +79,29 @@ impl EdgeApiClient {
             })
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
 
-        let mut headers = HeaderMap::new();
-        if let Ok(store) = load_store() {
-            if let Some(profile) = store.profiles.get(&store.active_profile) {
-                // Read to send as the bearer header.
-                if let Ok(value) =
-                    HeaderValue::from_str(&format!("Bearer {}", profile.access_key.expose()))
-                {
-                    headers.insert(AUTHORIZATION, value);
-                }
-            }
-        }
-
         let tenant = std::env::var("AEGIS_EFFECTIVE_TENANT").map_err(|_| {
             anyhow!("AEGIS_EFFECTIVE_TENANT env var is required for /v1/edge/* calls")
         })?;
-        insert_tenant_header(&mut headers, &tenant)?;
+        Self::from_parts(base_url, profile, &tenant)
+    }
+
+    /// A client for `base_url` presenting `profile`'s access key, when there
+    /// is one, as the bearer token, for `tenant`.
+    pub(crate) fn from_parts(
+        base_url: String,
+        profile: Option<&crate::auth::AegisProfile>,
+        tenant: &str,
+    ) -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        if let Some(profile) = profile {
+            // Read to send as the bearer header.
+            if let Ok(value) =
+                HeaderValue::from_str(&format!("Bearer {}", profile.access_key.expose()))
+            {
+                headers.insert(AUTHORIZATION, value);
+            }
+        }
+        insert_tenant_header(&mut headers, tenant)?;
 
         Ok(Self {
             base_url,
@@ -193,6 +202,61 @@ impl EdgeApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type SeenAuth = std::sync::Arc<std::sync::Mutex<Option<(String, Option<String>)>>>;
+
+    async fn record_auth(
+        axum::extract::State(seen): axum::extract::State<SeenAuth>,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+    ) -> axum::Json<serde_json::Value> {
+        *seen.lock().unwrap() = Some((
+            uri.path().to_string(),
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        ));
+        axum::Json(serde_json::json!({}))
+    }
+
+    /// A request from the edge CLI client carries the profile's access key,
+    /// exactly as held, as its bearer token.
+    #[tokio::test]
+    async fn edge_client_sends_the_access_key_as_held() {
+        let seen: SeenAuth = Default::default();
+        let app = axum::Router::new()
+            .route("/v1/edge/hosts", axum::routing::get(record_auth))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let profile = crate::auth::AegisProfile {
+            name: "default".to_string(),
+            env: "dev.example.com".to_string(),
+            client_id: "aegis-cli".to_string(),
+            access_key: "Mk7-edge-client-access-key-marker".into(),
+            refresh_key: "refresh".into(),
+            expires_at: chrono::Utc::now(),
+            roles: vec![],
+            scopes: vec![],
+        };
+        let client =
+            EdgeApiClient::from_parts(format!("http://{addr}"), Some(&profile), "tenant-1")
+                .unwrap();
+
+        let _: serde_json::Value = client.get("/v1/edge/hosts").await.expect("served");
+
+        let (path, auth) = seen.lock().unwrap().clone().expect("the request arrived");
+        assert_eq!(path, "/v1/edge/hosts");
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer Mk7-edge-client-access-key-marker"),
+            "the edge client presented a different bearer token than the access key held"
+        );
+    }
 
     /// Regression: the CLI used to send `X-Effective-Tenant`, which the
     /// orchestrator's `tenant_context_middleware` does not read — every
