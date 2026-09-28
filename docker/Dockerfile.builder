@@ -11,10 +11,15 @@ RUN apt-get update && apt-get install -y \
     libfuse3-dev protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+RUN curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /build
+
+# The compiler is the one rust-toolchain.toml pins, the same one CI tests with
+# and builds the published image with. rustup installs it from the file.
+COPY aegis-orchestrator/rust-toolchain.toml ./aegis-orchestrator/
+RUN cd aegis-orchestrator && rustup toolchain install && rustc --version
 
 # Copy manifests first for dependency caching
 COPY aegis-orchestrator/Cargo.toml aegis-orchestrator/Cargo.lock ./aegis-orchestrator/

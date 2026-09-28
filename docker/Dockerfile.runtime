@@ -2,7 +2,12 @@
 # This builds the Rust gRPC server that provides ExecutionService, ValidationService, etc.
 
 # Stage 1: Build the Rust binary
-FROM rust:1.95 AS builder
+# The compiler is the one rust-toolchain.toml pins, the same one CI tests with
+# and builds the published image with. The toolchain file is copied in and
+# installed below, so it governs; this base image is only a cache of that
+# version, pinned by its multi-arch index digest, and is moved together with
+# the toolchain file.
+FROM rust:1.98.1@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -13,6 +18,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Install the pinned toolchain before any cargo command runs.
+COPY aegis-orchestrator/rust-toolchain.toml ./rust-toolchain.toml
+RUN rustup toolchain install && rustc --version
 
 # Copy workspace Cargo files for dependency caching
 COPY aegis-orchestrator/Cargo.toml ./Cargo.toml
