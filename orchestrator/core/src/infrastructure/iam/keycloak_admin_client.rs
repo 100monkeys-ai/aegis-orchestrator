@@ -153,6 +153,79 @@ fn build_set_multivalue_body(
     })
 }
 
+/// Refuse a SAML signing certificate that is missing or is not an X.509
+/// certificate. Takes what Keycloak's `signingCertificate` takes: one or
+/// more certificates separated by commas, each as PEM or as bare base64.
+/// Only the shape is checked (base64 of a DER certificate: a sequence of the
+/// signed part, the algorithm and the signature); Keycloak checks each
+/// response's signature with it.
+fn check_signing_certificate(text: &str) -> Result<(), KeycloakAdminError> {
+    use base64::Engine;
+    if text.trim().is_empty() {
+        return Err(KeycloakAdminError::InvalidIdpConfig(
+            "the identity provider's signing certificate is missing; add the certificate the provider signs its SAML responses with"
+                .to_string(),
+        ));
+    }
+    for one in text.split(',') {
+        let body: String = one
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("-----"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let is_certificate = base64::engine::general_purpose::STANDARD
+            .decode(body.as_bytes())
+            .ok()
+            .is_some_and(|der| der_is_certificate(&der));
+        if !is_certificate {
+            return Err(KeycloakAdminError::InvalidIdpConfig(
+                "the identity provider's signing certificate is not a certificate; paste the X.509 certificate the provider signs its SAML responses with, as PEM or base64"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One DER element at the start of `der`: (tag, contents, rest).
+fn der_element(der: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = der.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (first as usize, rest)
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        let len = rest[..n]
+            .iter()
+            .fold(0usize, |acc, b| (acc << 8) | *b as usize);
+        (len, &rest[n..])
+    };
+    if rest.len() < len {
+        return None;
+    }
+    Some((tag, &rest[..len], &rest[len..]))
+}
+
+/// An X.509 certificate in DER: a SEQUENCE, filling the whole input, of a
+/// SEQUENCE (the signed part), a SEQUENCE (the algorithm) and a BIT STRING
+/// (the signature).
+fn der_is_certificate(der: &[u8]) -> bool {
+    let Some((0x30, cert, [])) = der_element(der) else {
+        return false;
+    };
+    let Some((0x30, _, rest)) = der_element(cert) else {
+        return false;
+    };
+    let Some((0x30, _, rest)) = der_element(rest) else {
+        return false;
+    };
+    matches!(der_element(rest), Some((0x03, _, [])))
+}
+
 impl KeycloakAdminClient {
     pub fn new(config: KeycloakAdminConfig) -> Self {
         // Audit 002 §4.37.9 — bound the wait on a frozen Keycloak host. A
@@ -539,22 +612,32 @@ impl KeycloakAdminClient {
     }
 
     /// Create or update the SAML IdP configuration for a realm.
+    ///
+    /// Keycloak checks the signature of every SAML response against the
+    /// provider's signing certificate, always: without that check anyone
+    /// who can reach the realm's broker endpoint could sign in as any user.
+    /// So the configuration must carry a signing certificate, and one that
+    /// has none, or holds something that is not a certificate, is refused
+    /// before anything is sent. The email a provider sends is not trusted
+    /// as verified. There is no setting that turns either check off.
     pub async fn set_idp_config(
         &self,
         realm: &str,
         config: &SamlIdpConfig,
     ) -> Result<(), KeycloakAdminError> {
+        check_signing_certificate(&config.certificate)?;
         let token = self.get_admin_token().await?;
 
         let payload = serde_json::json!({
             "alias": "saml",
             "providerId": "saml",
             "enabled": true,
+            "trustEmail": false,
             "config": {
                 "entityId": config.entity_id,
                 "singleSignOnServiceUrl": config.sso_url,
                 "signingCertificate": config.certificate,
-                "validateSignature": "false",
+                "validateSignature": "true",
                 "nameIDPolicyFormat": "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
             }
         });

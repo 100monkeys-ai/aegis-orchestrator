@@ -1188,6 +1188,11 @@ pub(crate) async fn set_saml_config(
             Json(serde_json::json!({"status": "configured"})),
         )
             .into_response(),
+        Err(KeycloakAdminError::InvalidIdpConfig(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_saml_config", "message": message})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
