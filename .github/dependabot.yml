@@ -56,6 +56,12 @@ updates:
       - docker
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # The rust builder image carries the compiler, and the compiler is the one
+      # rust-toolchain.toml pins. Moving it is a toolchain change with a clippy
+      # surface behind it, made by hand in one commit with the toolchain file,
+      # never as a Dockerfile-only bump.
+      - dependency-name: rust
 
   # ─── GitHub Actions ──────────────────────────────────────────────────────────
   # Covers all workflows under .github/workflows/:
