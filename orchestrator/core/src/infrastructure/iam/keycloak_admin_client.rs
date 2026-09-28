@@ -779,12 +779,15 @@ impl KeycloakAdminClient {
         group_name: &str,
     ) -> Result<Option<String>, KeycloakAdminError> {
         let token = self.get_admin_token().await?;
-        let url = format!(
-            "{}/admin/realms/{}/groups?search={}&exact=true",
-            self.config.host, realm, group_name
-        );
+        let url = format!("{}/admin/realms/{}/groups", self.config.host, realm);
 
-        let resp = self.http.get(&url).bearer_auth(&token).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("search", group_name), ("exact", "true")])
+            .bearer_auth(&token)
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -905,12 +908,17 @@ impl KeycloakAdminClient {
         email: &str,
     ) -> Result<Option<KeycloakUser>, KeycloakAdminError> {
         let token = self.get_admin_token().await?;
-        let url = format!(
-            "{}/admin/realms/{}/users?email={}&exact=true",
-            self.config.host, realm, email
-        );
+        let url = format!("{}/admin/realms/{}/users", self.config.host, realm);
 
-        let resp = self.http.get(&url).bearer_auth(&token).send().await?;
+        // Encoded as a query parameter: a `+` or `&` in the address is part
+        // of the address, not query syntax.
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("email", email), ("exact", "true")])
+            .bearer_auth(&token)
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
