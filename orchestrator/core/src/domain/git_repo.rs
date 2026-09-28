@@ -576,9 +576,21 @@ pub fn validate_repo_url(url: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!(
-        "repo URL must use https:// or git@ scheme; got: {url}"
-    ))
+    // The URL is not repeated: it may hold a credential. A scheme is named
+    // only when it is one a repository URL is known to use.
+    const KNOWN_SCHEMES: &[&str] = &[
+        "http", "ftp", "ftps", "file", "ssh", "git", "git+ssh", "ssh+git", "svn", "rsync",
+    ];
+    let scheme = url
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .filter(|scheme| KNOWN_SCHEMES.contains(&scheme.as_str()));
+    Err(match scheme {
+        Some(scheme) => {
+            format!("repo URL must use https:// or git@host:path; this one uses {scheme}://")
+        }
+        None => "repo URL must use https:// or git@host:path".to_string(),
+    })
 }
 
 /// Return `true` if `host` parses as a bare IPv4 or IPv6 address.
