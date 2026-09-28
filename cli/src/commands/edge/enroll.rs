@@ -359,6 +359,23 @@ mod tests {
 
     use super::*;
     use std::cell::RefCell;
+
+    #[derive(clap::Parser, Debug)]
+    struct EnrollCli {
+        #[command(flatten)]
+        args: EnrollArgs,
+    }
+
+    #[test]
+    fn enroll_args_debug_does_not_print_the_enrollment_token() {
+        use clap::Parser;
+        let cli = EnrollCli::try_parse_from(["aegis", "Mk7-enroll-args-token-marker"]).unwrap();
+        let printed = format!("{cli:?}");
+        assert!(
+            !printed.contains("Mk7-enroll-args-token-marker"),
+            "EnrollArgs' Debug printed the enrollment token: {printed}"
+        );
+    }
     use std::path::PathBuf;
     use std::rc::Rc;
 

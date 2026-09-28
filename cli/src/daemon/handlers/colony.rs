@@ -1336,6 +1336,36 @@ mod tests {
     use super::*;
     use aegis_orchestrator_core::domain::tenant::TenantId;
 
+    fn issued_view() -> InvitationIssuedView {
+        InvitationIssuedView {
+            id: "inv-1".to_string(),
+            team_id: "team-1".to_string(),
+            invitee_email: "invitee@example.com".to_string(),
+            token: "Mk7-invitation-view-token-marker".into(),
+            expires_at: "2026-09-28T00:00:00+00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn invitation_issued_view_debug_does_not_print_the_token() {
+        let printed = format!("{:?}", issued_view());
+        assert!(
+            !printed.contains("Mk7-invitation-view-token-marker"),
+            "InvitationIssuedView's Debug printed the token: {printed}"
+        );
+        assert!(printed.contains("inv-1"), "Debug lost the id: {printed}");
+    }
+
+    /// The response body of `POST /v1/colony/teams/:id/invitations`.
+    /// Captured from the derived serde form while `token` was a `String`.
+    #[test]
+    fn invitation_issued_view_wire_form_is_unchanged() {
+        assert_eq!(
+            serde_json::to_string(&issued_view()).unwrap(),
+            r#"{"id":"inv-1","team_id":"team-1","invitee_email":"invitee@example.com","token":"Mk7-invitation-view-token-marker","expires_at":"2026-09-28T00:00:00+00:00"}"#
+        );
+    }
+
     #[test]
     fn parse_tier_accepts_known_tiers() {
         assert!(matches!(parse_tier("pro"), Ok(TenantTier::Pro)));

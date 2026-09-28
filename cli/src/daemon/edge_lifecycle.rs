@@ -829,6 +829,24 @@ mod tests {
     use aegis_orchestrator_core::domain::security_context::{Capability, SecurityContextMetadata};
     use ed25519_dalek::{Verifier, VerifyingKey};
 
+    #[test]
+    fn edge_credentials_debug_does_not_print_the_node_token() {
+        let creds = EdgeCredentials {
+            signing_key: Arc::new(SigningKey::from_bytes(&[9u8; 32])),
+            node_security_token: "Mk7-edge-credentials-token-marker".into(),
+            node_id_str: "node-1".to_string(),
+        };
+        let printed = format!("{creds:?}");
+        assert!(
+            !printed.contains("Mk7-edge-credentials-token-marker"),
+            "EdgeCredentials' Debug printed the node token: {printed}"
+        );
+        assert!(
+            printed.contains("node-1"),
+            "Debug lost the node id: {printed}"
+        );
+    }
+
     /// Builds a minimal `SecurityContext` for policy-evaluation tests:
     /// allows `cmd.run` against `/bin/echo` only, with no other capabilities
     /// or deny-list entries. Caller supplies the context name.

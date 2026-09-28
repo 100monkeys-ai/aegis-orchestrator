@@ -286,6 +286,32 @@ impl EnrollmentTokenIssuer for RelayGrpcEnrollmentTokenIssuer {
 mod tests {
     use super::*;
     use crate::domain::secrets::{SecretStore, SecretsError, SensitiveString};
+
+    /// The JSON of an issued enrolment token. Captured from the derived serde
+    /// form while `token` was a `String`.
+    const ISSUED_FIXTURE: &str = r#"{"token":"Mk7-enrolment-token-marker","expires_at":"2026-09-28T00:00:00Z","controller_endpoint":"relay.example.com:443","qr_payload":"aegis edge enroll Mk7-enrolment-token-marker","command_hint":"aegis edge enroll Mk7-enrolment-token-marker"}"#;
+
+    #[test]
+    fn issued_enrollment_token_debug_does_not_print_the_token() {
+        let issued: IssuedEnrollmentToken = serde_json::from_str(ISSUED_FIXTURE).unwrap();
+        let printed = format!("{issued:?}");
+        // The token is in `token`, and again inside `qr_payload` and
+        // `command_hint`.
+        assert!(
+            !printed.contains("Mk7-enrolment-token-marker"),
+            "IssuedEnrollmentToken's Debug printed the token: {printed}"
+        );
+        assert!(
+            printed.contains("relay.example.com:443"),
+            "Debug lost the controller endpoint: {printed}"
+        );
+    }
+
+    #[test]
+    fn issued_enrollment_token_wire_form_is_unchanged() {
+        let issued: IssuedEnrollmentToken = serde_json::from_str(ISSUED_FIXTURE).unwrap();
+        assert_eq!(serde_json::to_string(&issued).unwrap(), ISSUED_FIXTURE);
+    }
     use async_trait::async_trait;
     use std::collections::HashMap;
 

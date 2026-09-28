@@ -878,6 +878,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn node_security_token_debug_does_not_print_the_token_and_serde_is_unchanged() {
+        const FIXTURE: &str =
+            r#""Mk7-node-token-header.Mk7-node-token-payload.Mk7-node-token-sig""#;
+        let token: NodeSecurityToken = serde_json::from_str(FIXTURE).unwrap();
+        let printed = format!("{token:?}");
+        assert!(
+            !printed.contains("Mk7-node-token"),
+            "NodeSecurityToken's Debug printed the token: {printed}"
+        );
+        assert_eq!(serde_json::to_string(&token).unwrap(), FIXTURE);
+    }
+
+    #[test]
     fn test_effective_config_validator_rejects_missing_fields() {
         let merged = MergedConfig {
             payload: serde_json::json!({

@@ -252,6 +252,16 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
+    #[test]
+    fn bootstrap_proof_debug_does_not_print_the_enrollment_token() {
+        let proof = super::BootstrapProof::EnrollmentToken("Mk7-bootstrap-proof-marker".into());
+        let printed = format!("{proof:?}");
+        assert!(
+            !printed.contains("Mk7-bootstrap-proof-marker"),
+            "BootstrapProof's Debug printed the enrollment token: {printed}"
+        );
+    }
+
     /// Captures the `key_path` argument passed to `transit_sign` so the
     /// test can assert the use case forwards its configured signing key
     /// rather than re-hardcoding a literal.

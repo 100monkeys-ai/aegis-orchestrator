@@ -1074,6 +1074,24 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // The operator receives the token in this body: its wire form is
+        // pinned (expires_at is the clock, so it is checked for presence).
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert!(v["expires_at"].is_string(), "expires_at missing: {v}");
+        v.as_object_mut().unwrap().remove("expires_at");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "token": "stub-token",
+                "controller_endpoint": "relay.myzaru.com:443",
+                "qr_payload": "aegis edge enroll stub-token",
+                "command_hint": "aegis edge enroll stub-token",
+            })
+        );
+
         let captured = issuer.captured.lock().unwrap().clone();
         let (tenant, sub, bearer) = captured.expect("issuer must have been invoked");
         assert_eq!(tenant, "t-consumer");

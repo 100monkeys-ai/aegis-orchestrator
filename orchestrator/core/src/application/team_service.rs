@@ -817,6 +817,33 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invitation_commands_debug_does_not_print_the_token() {
+        let accept = super::AcceptInvitationCommand {
+            token: "Mk7-accept-invitation-token-marker".into(),
+            authenticated_email: "invitee@example.com".to_string(),
+            authenticated_user_id: "user-2".to_string(),
+        };
+        let issued = super::InvitationIssued {
+            invitation_id: crate::domain::team::TeamInvitationId::new(),
+            team_id: crate::domain::team::TeamId::new(),
+            invitee_email: "invitee@example.com".to_string(),
+            raw_token: "Mk7-invitation-issued-token-marker".into(),
+            expires_at: chrono::Utc::now(),
+        };
+        let printed = format!("{accept:?} {issued:?}");
+        for marker in [
+            "Mk7-accept-invitation-token-marker",
+            "Mk7-invitation-issued-token-marker",
+        ] {
+            assert!(
+                !printed.contains(marker),
+                "an invitation command's Debug printed its token: {printed}"
+            );
+        }
+        assert!(printed.contains("invitee@example.com"));
+    }
+
     use super::*;
     use crate::domain::team::{MembershipStatus, TeamInvitationRepository, TeamSlug, TeamStatus};
     use crate::domain::tenancy::{Tenant, TenantStatus};

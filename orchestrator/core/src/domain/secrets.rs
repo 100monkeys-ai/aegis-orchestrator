@@ -11,6 +11,7 @@
 //! |------|------|
 //! | [`SensitiveString`] | Credential wrapper: `Debug` prints `[REDACTED]`; there is no `Display` |
 //! | [`SensitiveUrl`] | Connection URL that prints without its user info or secret query parameters |
+//! | [`SensitiveBytes`] | Key material held as bytes, redacted in `Debug` |
 //! | [`SecretPath`] | Namespace-aware structured path value object |
 //! | [`AccessContext`] | Audit metadata for every secret access operation |
 //! | [`DomainDynamicSecret`] | Short-lived credential entity with TTL lifecycle methods |
@@ -125,6 +126,52 @@ const _: fn() = || {
     impl<T: ?Sized + std::fmt::Display> AmbiguousIfDisplay<Invalid> for T {}
     let _ = <SensitiveString as AmbiguousIfDisplay<_>>::some_item;
 };
+
+// ---------------------------------------------------------------------------
+// SensitiveBytes — key material held as bytes
+// ---------------------------------------------------------------------------
+
+/// Key material held as bytes (an HMAC key, a seed) that must not reach logs.
+///
+/// The byte counterpart of [`SensitiveString`], with the same properties:
+/// `Debug` prints `[REDACTED]`, [`SensitiveBytes::expose`] is the one way to
+/// read the bytes, serde is transparent (the form of a `Vec<u8>`), and
+/// equality is constant-time.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveBytes(Vec<u8>);
+
+impl SensitiveBytes {
+    /// Construct a new `SensitiveBytes`.
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+
+    /// Access the bytes at an intentional, audited point of use.
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl PartialEq for SensitiveBytes {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SensitiveBytes {}
+
+impl From<Vec<u8>> for SensitiveBytes {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for SensitiveBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SensitiveUrl — connection URL wrapper that prints itself redacted
@@ -638,6 +685,31 @@ mod tests {
         assert_eq!(serde_json::to_string(&held).unwrap(), FIXTURE);
         let from: SensitiveString = String::from("a").into();
         assert_eq!(from, "a".into());
+    }
+
+    // ── SensitiveBytes ───────────────────────────────────────────────────────
+
+    #[test]
+    fn sensitive_bytes_redacts_in_debug_and_keeps_its_bytes() {
+        let key = SensitiveBytes::new(b"Mk7-sensitive-bytes-marker".to_vec());
+        assert_eq!(format!("{key:?}"), "[REDACTED]");
+        assert_eq!(key.expose(), b"Mk7-sensitive-bytes-marker");
+        assert_eq!(
+            key,
+            SensitiveBytes::from(b"Mk7-sensitive-bytes-marker".to_vec())
+        );
+        assert_ne!(
+            key,
+            SensitiveBytes::new(b"Mk7-sensitive-bytes-marke".to_vec())
+        );
+    }
+
+    #[test]
+    fn sensitive_bytes_serialises_as_a_byte_vector() {
+        let key = SensitiveBytes::new(vec![1u8, 2, 255]);
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(json, serde_json::to_string(&vec![1u8, 2, 255]).unwrap());
+        assert_eq!(serde_json::from_str::<SensitiveBytes>(&json).unwrap(), key);
     }
 
     // ── SensitiveUrl ─────────────────────────────────────────────────────────

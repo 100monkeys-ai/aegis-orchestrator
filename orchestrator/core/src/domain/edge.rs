@@ -332,6 +332,18 @@ pub trait EdgeGroupRepository: Send + Sync {
 mod tests {
     use super::*;
 
+    #[test]
+    fn enrollment_token_debug_does_not_print_the_token_and_serde_is_unchanged() {
+        const FIXTURE: &str = r#""Mk7-edge-enrollment-token-marker""#;
+        let token: EnrollmentToken = serde_json::from_str(FIXTURE).unwrap();
+        let printed = format!("{token:?}");
+        assert!(
+            !printed.contains("Mk7-edge-enrollment-token-marker"),
+            "EnrollmentToken's Debug printed the token: {printed}"
+        );
+        assert_eq!(serde_json::to_string(&token).unwrap(), FIXTURE);
+    }
+
     fn caps_with(
         os: &str,
         arch: &str,

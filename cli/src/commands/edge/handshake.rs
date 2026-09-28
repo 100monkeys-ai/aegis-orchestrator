@@ -347,6 +347,26 @@ fn ensure_child_mapping<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn handshake_outcome_debug_does_not_print_the_node_token() {
+        let outcome = HandshakeOutcome {
+            node_id: "node-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
+            controller_endpoint: "relay.example.com:443".to_string(),
+            node_security_token: "Mk7-handshake-token-marker".into(),
+            expires_at: None,
+        };
+        let printed = format!("{outcome:?}");
+        assert!(
+            !printed.contains("Mk7-handshake-token-marker"),
+            "HandshakeOutcome's Debug printed the node token: {printed}"
+        );
+        assert!(
+            printed.contains("node-1"),
+            "Debug lost the node id: {printed}"
+        );
+    }
+
     fn make_jwt(payload_json: &str) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
         let payload =

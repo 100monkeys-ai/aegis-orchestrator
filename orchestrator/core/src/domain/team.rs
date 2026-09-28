@@ -759,6 +759,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn team_invitation_debug_does_not_print_the_token() {
+        let invitation = TeamInvitation::send(
+            TeamId::new(),
+            "invitee@example.com".to_string(),
+            "Mk7-team-invitation-token-marker".to_string(),
+            "user-1".to_string(),
+            Utc::now(),
+        );
+        let printed = format!("{invitation:?}");
+        assert!(
+            !printed.contains("Mk7-team-invitation-token-marker"),
+            "TeamInvitation's Debug printed its token: {printed}"
+        );
+        assert!(
+            printed.contains("invitee@example.com"),
+            "Debug lost the invitee: {printed}"
+        );
+    }
+
+    #[test]
     fn slug_roundtrip() {
         let id = TeamId::new();
         let slug = TeamSlug::new(id);
