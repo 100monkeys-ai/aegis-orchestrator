@@ -94,6 +94,21 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-22.04
+    # A throwaway PostgreSQL for the tests that need a real database. The
+    # major version is production's. Each such test makes its own database
+    # on it and drops it at the end.
+    services:
+      postgres:
+        image: postgres:15-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -122,6 +137,8 @@ jobs:
 
       - name: Run tests
         working-directory: aegis-orchestrator
+        env:
+          AEGIS_TEST_POSTGRES_URL: postgres://postgres@localhost:5432/postgres
         run: cargo test --workspace --locked
 
   doc:

@@ -1363,11 +1363,13 @@ mod tests {
     }
 
     /// A loopback stand-in for the Keycloak admin API: grants an admin token,
-    /// finds no existing user, and records the create-user call.
+    /// answers the user search with one existing user or none, and records
+    /// every call.
     async fn fake_keycloak(
-        axum::extract::State(seen): axum::extract::State<
+        axum::extract::State((seen, existing_user)): axum::extract::State<(
             std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
-        >,
+            bool,
+        )>,
         method: axum::http::Method,
         uri: axum::http::Uri,
         body: axum::body::Bytes,
@@ -1375,12 +1377,19 @@ mod tests {
         let path = uri.path().to_string();
         seen.lock().unwrap().push((
             method.to_string(),
-            path.clone(),
+            format!("{uri}"),
             String::from_utf8_lossy(&body).to_string(),
         ));
         if path.ends_with("/protocol/openid-connect/token") {
             Json(serde_json::json!({"access_token": "admin-token", "expires_in": 300}))
                 .into_response()
+        } else if method == axum::http::Method::GET && path.ends_with("/users") && existing_user {
+            Json(serde_json::json!([{
+                "id": "user-9",
+                "email": "invitee@example.com",
+                "createdTimestamp": 0
+            }]))
+            .into_response()
         } else if method == axum::http::Method::GET {
             Json(serde_json::json!([])).into_response()
         } else {
@@ -1393,14 +1402,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn invitation_token_reaches_keycloak_as_issued() {
+    /// Materialise an invitee against the fake Keycloak and return every call
+    /// it received as (method, URI, body).
+    async fn materialize_against_fake_keycloak(
+        existing_user: bool,
+        token_marker: &str,
+    ) -> Vec<(String, String, String)> {
         use aegis_orchestrator_core::domain::secrets::SensitiveString;
         use aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminConfig;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = axum::Router::new()
             .fallback(fake_keycloak)
-            .with_state(seen.clone());
+            .with_state((seen.clone(), existing_user));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1415,7 +1428,7 @@ mod tests {
             invitation_id: aegis_orchestrator_core::domain::team::TeamInvitationId::new(),
             team_id: aegis_orchestrator_core::domain::team::TeamId::new(),
             invitee_email: "invitee@example.com".to_string(),
-            raw_token: SensitiveString::new("Mk7-colony-invitation-token-marker"),
+            raw_token: SensitiveString::new(token_marker),
             expires_at: chrono::Utc::now(),
         };
 
@@ -1424,16 +1437,38 @@ mod tests {
             .expect("the fake Keycloak accepts the invitee");
 
         let seen = seen.lock().unwrap().clone();
-        let create = seen
-            .iter()
-            .find(|(m, p, _)| m == "POST" && p == "/admin/realms/team-acme/users")
-            .unwrap_or_else(|| panic!("no create-user call reached Keycloak: {seen:?}"));
-        let body: serde_json::Value = serde_json::from_str(&create.2).unwrap();
-        assert_eq!(
-            body["attributes"]["team_invite_token"],
-            serde_json::json!(["Mk7-colony-invitation-token-marker"]),
-            "Keycloak received a different invitation token: {body}"
-        );
+        seen
+    }
+
+    /// Keycloak is sent what it needs for the invitee (the email, the team
+    /// and the role) and never the invitation token, whether the invitee's
+    /// user is created or an existing one is updated.
+    #[tokio::test]
+    async fn invitee_keycloak_record_carries_no_invitation_token() {
+        const MARKER: &str = "Mk7-colony-invitation-token-marker";
+        for (existing_user, write) in [(false, "POST"), (true, "PUT")] {
+            let seen = materialize_against_fake_keycloak(existing_user, MARKER).await;
+            for (method, uri, body) in &seen {
+                assert!(
+                    !uri.contains(MARKER) && !body.contains(MARKER),
+                    "the invitation token reached Keycloak in {method} {uri}: {body}"
+                );
+            }
+            let (_, _, body) = seen
+                .iter()
+                .find(|(m, u, _)| m == write && u.starts_with("/admin/realms/team-acme/users"))
+                .unwrap_or_else(|| panic!("no {write} of the invitee reached Keycloak: {seen:?}"));
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body["attributes"]["team_slug"], serde_json::json!(["acme"]));
+            assert_eq!(
+                body["attributes"]["aegis_role"],
+                serde_json::json!(["member"])
+            );
+            assert!(
+                body["attributes"].get("team_invite_token").is_none(),
+                "Keycloak was sent a team_invite_token attribute: {body}"
+            );
+        }
     }
 
     #[test]
