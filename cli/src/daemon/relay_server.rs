@@ -535,26 +535,42 @@ mod tests {
         }
     }
 
-    /// The pod probes `grpc_health_probe -addr=localhost:50056`. With the
-    /// relay's database unreachable, its server must answer the probe, and
-    /// answer NOT_SERVING, for the overall server and for NodeClusterService.
+    /// The pod probes `grpc_health_probe -addr=localhost:50056`, the overall
+    /// name, for liveness. With the relay's database unreachable the process
+    /// is still up: the overall name must answer SERVING, the relay's
+    /// NodeClusterService must answer NOT_SERVING (what a readiness probe
+    /// asks with `-service`), and an unknown service name NOT_FOUND.
     #[tokio::test]
-    async fn relay_server_answers_grpc_health_not_serving_while_its_database_is_unreachable() {
+    async fn relay_server_health_separates_the_process_from_its_database() {
         let pool = unreachable_pool();
         let (mut client, _shutdown) = start_relay(&pool, relay_readiness(&pool)).await;
         let mut failures = Vec::new();
-        for service in [OVERALL, NODE_CLUSTER_SERVICE] {
-            if let Err(e) = wait_for_status(&mut client, service, ServingStatus::NotServing).await {
+        for (service, expected) in [
+            (NODE_CLUSTER_SERVICE, ServingStatus::NotServing),
+            (OVERALL, ServingStatus::Serving),
+        ] {
+            if let Err(e) = wait_for_status(&mut client, service, expected).await {
                 failures.push(e);
             }
+        }
+        match client
+            .check(HealthCheckRequest {
+                service: "aegis.no.such.Service".to_string(),
+            })
+            .await
+        {
+            Err(status) if status.code() == tonic::Code::NotFound => {}
+            other => failures.push(format!(
+                "an unknown service name answered {other:?}, expected NOT_FOUND"
+            )),
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// With every dependency up, the relay's server answers SERVING; when a
-    /// dependency goes down it answers NOT_SERVING; when it returns, SERVING.
+    /// NodeClusterService follows its dependency — SERVING, NOT_SERVING,
+    /// SERVING — while the overall name stays SERVING throughout.
     #[tokio::test]
-    async fn relay_server_reports_serving_and_not_serving_as_its_dependency_changes() {
+    async fn relay_service_health_follows_its_dependency_while_the_process_stays_serving() {
         let pool = unreachable_pool();
         let up = Arc::new(AtomicBool::new(true));
         let check_up = up.clone();
@@ -570,8 +586,11 @@ mod tests {
             ("dependency back", true, ServingStatus::Serving),
         ] {
             up.store(dependency_up, Ordering::SeqCst);
-            for service in [OVERALL, NODE_CLUSTER_SERVICE] {
-                if let Err(e) = wait_for_status(&mut client, service, expected).await {
+            for (service, want) in [
+                (NODE_CLUSTER_SERVICE, expected),
+                (OVERALL, ServingStatus::Serving),
+            ] {
+                if let Err(e) = wait_for_status(&mut client, service, want).await {
                     failures.push(format!("{phase}: {e}"));
                 }
             }

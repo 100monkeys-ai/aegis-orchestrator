@@ -1836,6 +1836,25 @@ pub struct GrpcServerConfig {
 const GRPC_READINESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(config.addr).await?;
+    serve_grpc_server(
+        config,
+        listener,
+        GRPC_READINESS_INTERVAL,
+        std::future::pending(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Serve the main gRPC server on `listener` until `shutdown`, re-evaluating
+/// its readiness every `readiness_interval`.
+pub async fn serve_grpc_server(
+    config: GrpcServerConfig,
+    listener: tokio::net::TcpListener,
+    readiness_interval: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), tonic::transport::Error> {
     let mut service = AegisRuntimeService::new(config.execution_service, config.validation_service);
 
     if let Some(auth) = config.grpc_auth {
@@ -1888,7 +1907,7 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
         hosted.push(service_name(fsal_server));
     }
     let (health, health_server) = GrpcHealth::new(&hosted).await;
-    let monitor = health.spawn_monitor(config.readiness, GRPC_READINESS_INTERVAL);
+    let monitor = health.spawn_monitor(config.readiness, readiness_interval);
 
     tracing::info!("Starting AEGIS gRPC server on {}", config.addr);
 
@@ -1901,11 +1920,14 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
         builder = builder.add_service(fsal_server);
     }
 
-    let result = builder.serve(config.addr).await;
+    let result = builder
+        .serve_with_incoming_shutdown(
+            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true)),
+            shutdown,
+        )
+        .await;
     monitor.abort();
-    result?;
-
-    Ok(())
+    result
 }
 
 // =============================================================================
@@ -2854,6 +2876,115 @@ mod tests {
             .expect_err("invoke_tool should be unimplemented via gRPC pending proto update");
 
         assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    /// The main gRPC server answers grpc.health.v1 for the process (the
+    /// overall name) and for AegisRuntime: the overall name is SERVING while
+    /// the server is up, whatever its dependencies; AegisRuntime follows its
+    /// readiness; an unknown service name is NOT_FOUND.
+    #[tokio::test]
+    async fn main_grpc_server_health_separates_the_process_from_its_dependencies() {
+        use crate::infrastructure::aegis_runtime_proto::aegis_runtime_server::SERVICE_NAME as AEGIS_RUNTIME;
+        use crate::presentation::grpc::health::readiness_check;
+        use crate::presentation::grpc::health::tonic_health::pb::{
+            health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let execution_id = ExecutionId::new();
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id,
+            stream_events: vec![],
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let up = Arc::new(AtomicBool::new(false));
+        let check_up = up.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("local_addr");
+        let config = GrpcServerConfig {
+            addr,
+            execution_service,
+            validation_service,
+            grpc_auth: None,
+            attestation_service: None,
+            tool_invocation_service: None,
+            cortex_client: None,
+            run_container_step_use_case: None,
+            agent_service: None,
+            stimulus_service: None,
+            discovery_service: None,
+            volume_service: None,
+            output_handler_service: None,
+            fsal: None,
+            fuse_mount_client: None,
+            readiness: vec![readiness_check(move || {
+                let up = check_up.load(Ordering::SeqCst);
+                async move { up }
+            })],
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = serve_grpc_server(config, listener, Duration::from_millis(25), async {
+                let _ = rx.await;
+            })
+            .await;
+        });
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .expect("valid URI")
+            .connect()
+            .await
+            .expect("connect to the main gRPC server");
+        let mut client = HealthClient::new(channel);
+
+        let mut failures = Vec::new();
+        for (phase, dependency_up, expected_service) in [
+            ("dependency down", false, ServingStatus::NotServing),
+            ("dependency up", true, ServingStatus::Serving),
+            ("dependency down again", false, ServingStatus::NotServing),
+        ] {
+            up.store(dependency_up, Ordering::SeqCst);
+            for (service, expected) in [
+                (AEGIS_RUNTIME, expected_service),
+                ("", ServingStatus::Serving),
+            ] {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let status = client
+                        .check(HealthCheckRequest {
+                            service: service.to_string(),
+                        })
+                        .await
+                        .map(|r| r.into_inner().status);
+                    match status {
+                        Ok(s) if s == expected as i32 => break,
+                        _ if tokio::time::Instant::now() >= deadline => {
+                            failures.push(format!(
+                                "{phase}: service {service:?} answered {status:?}, expected {expected:?}"
+                            ));
+                            break;
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(25)).await,
+                    }
+                }
+            }
+        }
+        match client
+            .check(HealthCheckRequest {
+                service: "aegis.no.such.Service".to_string(),
+            })
+            .await
+        {
+            Err(status) if status.code() == tonic::Code::NotFound => {}
+            other => failures.push(format!(
+                "an unknown service name answered {other:?}, expected NOT_FOUND"
+            )),
+        }
+        let _ = tx.send(());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Regression: GrpcServerConfig must include output_handler_service so the
