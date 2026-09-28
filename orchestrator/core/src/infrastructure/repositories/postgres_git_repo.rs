@@ -200,7 +200,7 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> Result<GitRepoBinding, Reposi
         id: GitRepoBindingId(id),
         tenant_id,
         credential_binding_id: credential_binding_id.map(CredentialBindingId),
-        repo_url,
+        repo_url: crate::domain::secrets::SensitiveUrl::new(repo_url),
         git_ref: db_to_git_ref(&git_ref_type, &git_ref_value)?,
         sparse_paths,
         volume_id: VolumeId(volume_id),
@@ -273,7 +273,8 @@ impl GitRepoBindingRepository for PostgresGitRepoBindingRepository {
         .bind(binding.id.0)
         .bind(binding.tenant_id.as_str())
         .bind(binding.credential_binding_id.map(|id| id.0))
-        .bind(&binding.repo_url)
+        // Stored as it always was: the column holds the URL's text.
+        .bind(binding.repo_url.expose())
         .bind(git_ref_type)
         .bind(git_ref_value)
         .bind(sparse_paths_json)

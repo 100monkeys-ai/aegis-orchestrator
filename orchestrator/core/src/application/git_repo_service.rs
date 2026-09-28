@@ -100,7 +100,8 @@ pub struct CreateGitRepoCommand {
     pub owner: String,
     pub zaru_tier: ZaruTier,
     pub credential_binding_id: Option<CredentialBindingId>,
-    pub repo_url: String,
+    /// May carry a token as user info; prints redacted.
+    pub repo_url: SensitiveUrl,
     pub git_ref: GitRef,
     pub sparse_paths: Option<Vec<String>>,
     pub label: String,
@@ -124,7 +125,7 @@ impl CreateGitRepoCommand {
             owner: owner.into(),
             zaru_tier,
             credential_binding_id: None,
-            repo_url: repo_url.into(),
+            repo_url: SensitiveUrl::new(repo_url),
             git_ref: GitRef::default(),
             sparse_paths: None,
             label: label.into(),
@@ -298,12 +299,13 @@ impl GitRepoService {
     ///
     /// The caller is responsible for scheduling the background clone
     /// task (e.g. via `tokio::spawn(service.clone_repo(id))`).
-    #[instrument(skip(self, cmd), fields(owner = %cmd.owner, repo_url = %SensitiveUrl::new(cmd.repo_url.as_str())))]
+    #[instrument(skip(self, cmd), fields(owner = %cmd.owner, repo_url = %cmd.repo_url.redacted()))]
     pub async fn create_binding(
         &self,
         cmd: CreateGitRepoCommand,
     ) -> Result<GitRepoBinding, GitRepoError> {
-        validate_repo_url(&cmd.repo_url).map_err(GitRepoError::UrlValidationFailed)?;
+        // Read to validate its form.
+        validate_repo_url(cmd.repo_url.expose()).map_err(GitRepoError::UrlValidationFailed)?;
 
         let limits = GitRepoTierLimits::for_tier(cmd.zaru_tier.clone());
         if let Some(max) = limits.max_bindings {

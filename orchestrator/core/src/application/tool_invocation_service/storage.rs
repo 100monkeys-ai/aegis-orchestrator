@@ -384,7 +384,7 @@ impl ToolInvocationService {
             owner,
             zaru_tier: tier,
             credential_binding_id,
-            repo_url: repo_url.to_string(),
+            repo_url: repo_url.into(),
             git_ref,
             sparse_paths,
             label: label.to_string(),

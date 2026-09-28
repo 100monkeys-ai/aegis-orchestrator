@@ -138,7 +138,8 @@ pub enum CloneStrategy {
 pub enum GitRepoEvent {
     BindingCreated {
         id: GitRepoBindingId,
-        repo_url: String,
+        /// May carry a token as user info; prints redacted.
+        repo_url: SensitiveUrl,
         git_ref: GitRef,
         volume_id: VolumeId,
         created_at: DateTime<Utc>,
@@ -221,16 +222,16 @@ pub enum GitRepoEvent {
 /// - `repo_url` MUST pass [`validate_repo_url`] (HTTPS or SSH, no IP hosts).
 /// - Only the owning tenant can modify or delete.
 ///
-/// `Debug` is written by hand: `repo_url` may carry a token as user info
+/// `repo_url` may carry a token as user info
 /// (`https://user:token@host/repo.git`) and `webhook_secret` is the cleartext
-/// secret, and a binding is recorded by `Debug` wherever it is a parameter of
-/// an `#[instrument]`ed function.
-#[derive(Clone)]
+/// secret; both are held in types that print redacted, so the derived
+/// `Debug` is safe wherever a binding is recorded (`#[instrument]`).
+#[derive(Debug, Clone)]
 pub struct GitRepoBinding {
     pub id: GitRepoBindingId,
     pub tenant_id: TenantId,
     pub credential_binding_id: Option<CredentialBindingId>,
-    pub repo_url: String,
+    pub repo_url: SensitiveUrl,
     pub git_ref: GitRef,
     pub sparse_paths: Option<Vec<String>>,
     pub volume_id: VolumeId,
@@ -248,7 +249,7 @@ pub struct GitRepoBinding {
     /// Persistence ignores this field; the repository hydrates it as
     /// `None` on every read and the application service decrypts on
     /// demand when verifying webhook deliveries.
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SensitiveString>,
     /// Audit 002 §4.37.13 — Transit ciphertext of the cleartext webhook
     /// secret. Persisted at rest under
     /// `git_repo_bindings.webhook_secret_ciphertext`. Decrypted via
@@ -267,36 +268,6 @@ pub struct GitRepoBinding {
     pub domain_events: Vec<GitRepoEvent>,
 }
 
-impl std::fmt::Debug for GitRepoBinding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GitRepoBinding")
-            .field("id", &self.id)
-            .field("tenant_id", &self.tenant_id)
-            .field("credential_binding_id", &self.credential_binding_id)
-            .field("repo_url", &SensitiveUrl::new(self.repo_url.as_str()))
-            .field("git_ref", &self.git_ref)
-            .field("sparse_paths", &self.sparse_paths)
-            .field("volume_id", &self.volume_id)
-            .field("label", &self.label)
-            .field("status", &self.status)
-            .field("clone_strategy", &self.clone_strategy)
-            .field("last_cloned_at", &self.last_cloned_at)
-            .field("last_commit_sha", &self.last_commit_sha)
-            .field("auto_refresh", &self.auto_refresh)
-            .field(
-                "webhook_secret",
-                &self.webhook_secret.as_ref().map(SensitiveString::new),
-            )
-            .field("webhook_secret_ciphertext", &self.webhook_secret_ciphertext)
-            .field("webhook_lookup_hash", &self.webhook_lookup_hash)
-            .field("created_at", &self.created_at)
-            .field("updated_at", &self.updated_at)
-            // `BindingCreated` carries the raw `repo_url`; count, do not print.
-            .field("domain_events", &self.domain_events.len())
-            .finish()
-    }
-}
-
 impl GitRepoBinding {
     /// Construct a new binding in [`GitRepoStatus::Pending`] state and buffer
     /// a [`GitRepoEvent::BindingCreated`] event.
@@ -307,7 +278,7 @@ impl GitRepoBinding {
     pub fn new(
         tenant_id: TenantId,
         credential_binding_id: Option<CredentialBindingId>,
-        repo_url: String,
+        repo_url: impl Into<SensitiveUrl>,
         git_ref: GitRef,
         sparse_paths: Option<Vec<String>>,
         volume_id: VolumeId,
@@ -322,6 +293,7 @@ impl GitRepoBinding {
         webhook_secret_ciphertext: Option<String>,
         webhook_lookup_hash: Option<String>,
     ) -> Self {
+        let repo_url = repo_url.into();
         let id = GitRepoBindingId::new();
         let now = Utc::now();
         let mut binding = Self {
@@ -338,7 +310,7 @@ impl GitRepoBinding {
             last_cloned_at: None,
             last_commit_sha: None,
             auto_refresh,
-            webhook_secret,
+            webhook_secret: webhook_secret.map(SensitiveString::new),
             webhook_secret_ciphertext,
             webhook_lookup_hash,
             created_at: now,

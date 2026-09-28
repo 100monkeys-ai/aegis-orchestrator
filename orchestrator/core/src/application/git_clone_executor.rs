@@ -44,7 +44,7 @@ use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
 use crate::domain::runtime::{
     ContainerStepConfig, ContainerStepError, ContainerStepRunner, ContainerVolumeMount,
 };
-use crate::domain::secrets::{SensitiveString, SensitiveUrl};
+use crate::domain::secrets::SensitiveString;
 use crate::domain::shared_kernel::ImagePullPolicy;
 use crate::domain::volume::{Volume, VolumeBackend, VolumeId};
 use crate::domain::workflow::StateName;
@@ -187,7 +187,7 @@ impl EphemeralCliEngine {
                 script_prelude.push_str(&prelude);
                 env.insert("GIT_ASKPASS".to_string(), "/tmp/askpass.sh".to_string());
                 env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
-                binding.repo_url.clone()
+                binding.repo_url.expose().to_string()
             }
             Some(ResolvedCredential::SshKey {
                 private_key_pem,
@@ -225,9 +225,9 @@ impl EphemeralCliEngine {
                     "GIT_SSH_COMMAND".to_string(),
                     "ssh -i /tmp/ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string(),
                 );
-                binding.repo_url.clone()
+                binding.repo_url.expose().to_string()
             }
-            None => binding.repo_url.clone(),
+            None => binding.repo_url.expose().to_string(),
         };
 
         // -- sparse checkout --
@@ -536,7 +536,7 @@ impl GitCloneExecutor {
     ///   passed into libgit2's credentials callback for the duration of
     ///   the clone and dropped immediately afterward.
     /// - `shallow == true` sets `depth = 1` on the fetch.
-    #[instrument(skip(self, credential), fields(binding_id = %binding.id, repo_url = %SensitiveUrl::new(binding.repo_url.as_str())))]
+    #[instrument(skip(self, credential), fields(binding_id = %binding.id, repo_url = %binding.repo_url.redacted()))]
     pub async fn clone_libgit2(
         &self,
         binding: &GitRepoBinding,
@@ -544,7 +544,8 @@ impl GitCloneExecutor {
         credential: Option<ResolvedCredential>,
         shallow: bool,
     ) -> Result<String, CloneError> {
-        let repo_url = binding.repo_url.clone();
+        // Read to connect: libgit2 clones from it.
+        let repo_url = binding.repo_url.expose().to_string();
         let target_dir: PathBuf = target_dir.to_path_buf();
         let sparse_paths = binding.sparse_paths.clone();
 
@@ -602,7 +603,8 @@ impl GitCloneExecutor {
     ) -> Result<String, CloneError> {
         let target_dir: PathBuf = target_dir.to_path_buf();
         let git_ref = binding.git_ref.clone();
-        let repo_url = binding.repo_url.clone();
+        // Read to connect: libgit2 fetches from it.
+        let repo_url = binding.repo_url.expose().to_string();
 
         let sha = tokio::task::spawn_blocking(move || -> Result<String, CloneError> {
             blocking_fetch_and_checkout(&repo_url, &target_dir, &git_ref, credential)

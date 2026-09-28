@@ -51,7 +51,8 @@ use crate::daemon::state::AppState;
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct CreateGitRepoRequest {
-    pub(crate) repo_url: String,
+    /// May carry a token as user info; prints redacted.
+    pub(crate) repo_url: aegis_orchestrator_core::domain::secrets::SensitiveUrl,
     #[serde(default)]
     pub(crate) credential_binding_id: Option<Uuid>,
     #[serde(default)]

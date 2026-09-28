@@ -416,7 +416,7 @@ async fn create_binding_succeeds_under_tier_limit() {
         .await
         .expect("should succeed");
     assert_eq!(
-        binding.repo_url,
+        binding.repo_url.expose(),
         "https://github.com/octocat/Hello-World.git"
     );
     assert_eq!(binding.label, "hello");
@@ -654,7 +654,7 @@ async fn handle_webhook_rejects_bad_signature() {
             owner: "alice".to_string(),
             zaru_tier: ZaruTier::Pro,
             credential_binding_id: None,
-            repo_url: "https://github.com/a/one.git".to_string(),
+            repo_url: "https://github.com/a/one.git".into(),
             git_ref: Default::default(),
             sparse_paths: None,
             label: "alice-one".to_string(),
@@ -667,7 +667,8 @@ async fn handle_webhook_rejects_bad_signature() {
     let secret = binding
         .webhook_secret
         .clone()
-        .expect("auto_refresh → secret");
+        .expect("auto_refresh → secret")
+        .expose_owned();
 
     let auth = WebhookAuth {
         provider: WebhookProvider::GitHub,
@@ -694,7 +695,7 @@ async fn handle_webhook_accepts_valid_github_signature() {
             owner: "alice".to_string(),
             zaru_tier: ZaruTier::Pro,
             credential_binding_id: None,
-            repo_url: "https://github.com/a/one.git".to_string(),
+            repo_url: "https://github.com/a/one.git".into(),
             git_ref: Default::default(),
             sparse_paths: None,
             label: "alice-one".to_string(),
@@ -703,7 +704,7 @@ async fn handle_webhook_accepts_valid_github_signature() {
         })
         .await
         .unwrap();
-    let secret = binding.webhook_secret.clone().unwrap();
+    let secret = binding.webhook_secret.clone().unwrap().expose_owned();
 
     let body = b"{\"ref\":\"refs/heads/main\"}";
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
@@ -753,7 +754,7 @@ async fn webhook_secret_is_persisted_as_ciphertext_plus_lookup_hash_only() {
             owner: "alice".to_string(),
             zaru_tier: ZaruTier::Pro,
             credential_binding_id: None,
-            repo_url: "https://github.com/a/audit13.git".to_string(),
+            repo_url: "https://github.com/a/audit13.git".into(),
             git_ref: Default::default(),
             sparse_paths: None,
             label: "audit13".to_string(),
@@ -768,7 +769,8 @@ async fn webhook_secret_is_persisted_as_ciphertext_plus_lookup_hash_only() {
     let cleartext = binding
         .webhook_secret
         .clone()
-        .expect("auto_refresh → cleartext returned to caller");
+        .expect("auto_refresh → cleartext returned to caller")
+        .expose_owned();
 
     // Persistent state carries the ciphertext + hash, NOT the cleartext.
     assert!(

@@ -536,7 +536,7 @@ async fn webhook_rejects_bad_signature() {
             owner: "alice".to_string(),
             zaru_tier: ZaruTier::Pro,
             credential_binding_id: None,
-            repo_url: "https://github.com/a/1.git".to_string(),
+            repo_url: "https://github.com/a/1.git".into(),
             git_ref: Default::default(),
             sparse_paths: None,
             label: "a1".to_string(),
@@ -545,7 +545,7 @@ async fn webhook_rejects_bad_signature() {
         })
         .await
         .unwrap();
-    let secret = binding.webhook_secret.clone().unwrap();
+    let secret = binding.webhook_secret.clone().unwrap().expose_owned();
     let auth = WebhookAuth {
         provider: WebhookProvider::GitHub,
         signature: "sha256=deadbeef".to_string(),
@@ -568,7 +568,7 @@ async fn webhook_accepts_valid_signature() {
             owner: "alice".to_string(),
             zaru_tier: ZaruTier::Pro,
             credential_binding_id: None,
-            repo_url: "https://github.com/a/1.git".to_string(),
+            repo_url: "https://github.com/a/1.git".into(),
             git_ref: Default::default(),
             sparse_paths: None,
             label: "a1".to_string(),
@@ -577,7 +577,7 @@ async fn webhook_accepts_valid_signature() {
         })
         .await
         .unwrap();
-    let secret = binding.webhook_secret.clone().unwrap();
+    let secret = binding.webhook_secret.clone().unwrap().expose_owned();
     let body = b"payload";
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(body);

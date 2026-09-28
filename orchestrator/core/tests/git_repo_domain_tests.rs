@@ -67,7 +67,10 @@ fn new_binding_emits_binding_created_event() {
             ..
         } => {
             assert_eq!(*id, binding.id);
-            assert_eq!(repo_url, "https://github.com/octocat/Hello-World.git");
+            assert_eq!(
+                repo_url.expose(),
+                "https://github.com/octocat/Hello-World.git"
+            );
             assert_eq!(*git_ref, GitRef::Branch("main".to_string()));
             assert_eq!(*volume_id, binding.volume_id);
         }
