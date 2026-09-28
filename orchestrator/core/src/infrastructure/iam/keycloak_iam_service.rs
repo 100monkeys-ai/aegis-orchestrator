@@ -625,7 +625,14 @@ impl IdentityProvider for StandardIamService {
             sub: claims.sub.clone(),
             realm_slug: realm.realm_slug.clone(),
             email: claims.email.clone(),
-            email_verified: false,
+            // Only the JSON value `true` counts. Read from the remaining
+            // claims so that an unexpected type fails closed instead of
+            // failing the whole token.
+            email_verified: claims
+                .extra
+                .get("email_verified")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
             name: claims
                 .extra
                 .get("name")

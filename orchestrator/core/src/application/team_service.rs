@@ -565,6 +565,14 @@ impl TeamService for StandardTeamService {
         &self,
         cmd: AcceptInvitationCommand,
     ) -> Result<Membership, TeamServiceError> {
+        // The email is what binds the invitation to a person, so it counts
+        // only when the identity provider says the caller proved it is
+        // theirs. Without that, anyone the realm lets sign in with an
+        // address they do not own could accept an invitation sent to it.
+        if !cmd.authenticated_email_verified {
+            return Err(TeamServiceError::EmailNotVerified);
+        }
+
         // The row is found by the digest of the presented token; the stored
         // digest itself, presented as a token, finds nothing.
         let invitation = self
