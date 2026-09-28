@@ -22,10 +22,15 @@ permissions:
   contents: read
 
 jobs:
-  # ── Stage 1: All checks in parallel ────────────────────────────────────────
-  fmt:
-    name: Format
+  # THROWAWAY, never merged: each job undoes one fix and runs the live
+  # Keycloak tests, which must go red.
+  mutation:
+    name: Mutation (${{ matrix.mutation }})
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mutation: [policy, enabled, lock, invite, saml]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,90 +47,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler libfuse3-dev libpq-dev pkg-config libssl-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
-        with:
-          toolchain: "1.98.1"
-          components: rustfmt
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v2-ubuntu22"
-          workspaces: aegis-orchestrator -> target
-
-      - name: Check formatting
-        working-directory: aegis-orchestrator
-        run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: aegis-orchestrator
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: 100monkeys-ai/aegis-proto
-          path: aegis-proto
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libfuse3-dev libpq-dev pkg-config libssl-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
-        with:
-          toolchain: "1.98.1"
-          components: clippy
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v2-ubuntu22"
-          workspaces: aegis-orchestrator -> target
-
-      - name: Clippy
-        working-directory: aegis-orchestrator
-        run: cargo clippy --workspace --locked -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-22.04
-    # A throwaway PostgreSQL for the tests that need a real database. The
-    # major version is production's. Each such test makes its own database
-    # on it and drops it at the end.
-    services:
-      postgres:
-        image: postgres:15-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: aegis-orchestrator
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: 100monkeys-ai/aegis-proto
-          path: aegis-proto
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libfuse3-dev libpq-dev pkg-config libssl-dev openssh-server
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03
         with:
           toolchain: "1.98.1"
 
@@ -134,10 +56,8 @@ jobs:
         with:
           prefix-key: "v2-ubuntu22"
           workspaces: aegis-orchestrator -> target
+          save-if: false
 
-      # The Keycloak the deployment runs (quay.io/keycloak/keycloak:24.0,
-      # pinned by digest), in development mode on the loopback interface,
-      # for the Keycloak admin client's tests against the real thing.
       - name: Start Keycloak
         run: |
           docker run -d --name aegis-test-keycloak -p 127.0.0.1:18080:8080 \
@@ -151,140 +71,13 @@ jobs:
           docker logs --tail 50 aegis-test-keycloak
           exit 1
 
-      - name: Run tests
+      - name: Undo the fix
+        working-directory: aegis-orchestrator
+        run: python3 .github/mutate.py ${{ matrix.mutation }}
+
+      - name: Run the live Keycloak tests
         working-directory: aegis-orchestrator
         env:
-          # With this set, the tests that need Keycloak fail when they cannot
-          # reach it, instead of skipping.
           AEGIS_TEST_KEYCLOAK: "1"
           AEGIS_TEST_KEYCLOAK_URL: http://127.0.0.1:18080
-          AEGIS_TEST_POSTGRES_URL: postgres://postgres@localhost:5432/postgres
-          # The runner has a container engine. With this set, a test that
-          # needs one fails when it cannot reach it, instead of skipping.
-          AEGIS_TEST_DOCKER: "1"
-          # openssh-server is installed above. With this set, a test that
-          # needs sshd fails when it cannot start one, instead of skipping.
-          AEGIS_TEST_SSHD: "1"
-        run: cargo test --workspace --locked
-
-  doc:
-    name: Documentation
-    runs-on: ubuntu-22.04
-    env:
-      RUSTDOCFLAGS: "--cfg docsrs -D warnings"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: aegis-orchestrator
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: 100monkeys-ai/aegis-proto
-          path: aegis-proto
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libfuse3-dev libpq-dev pkg-config libssl-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master @ 2026-09-03; this action publishes no version tag, and the SHA must be in master's history
-        with:
-          toolchain: "1.98.1"
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v2-ubuntu22"
-          workspaces: aegis-orchestrator -> target
-
-      - name: Build documentation
-        working-directory: aegis-orchestrator
-        run: |
-          cargo doc \
-            --workspace \
-            --locked \
-            --no-deps \
-            --document-private-items \
-            -p aegis-orchestrator-core \
-            -p aegis-orchestrator-swarm \
-            -p aegis-orchestrator-sdk \
-            -p aegis-orchestrator
-
-  # ── Stage 2: Build + Publish (only after ALL checks pass) ──────────────────
-  build-deploy:
-    name: Build, Deploy & Publish
-    needs: [fmt, clippy, test, doc]
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-22.04
-
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Ensure TMPDIR
-        run: mkdir -p /home/runner/_work/_tmp
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: aegis-orchestrator
-          clean: false
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: 100monkeys-ai/aegis-proto
-          path: aegis-proto
-          clean: false
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v2-ubuntu22"
-          workspaces: aegis-orchestrator
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libfuse3-dev libpq-dev pkg-config libssl-dev
-
-      # Build the release binary using the persistent cargo cache
-      - name: Build release binary
-        working-directory: aegis-orchestrator
-        run: cargo build --release --bin aegis --locked
-
-      # Build the runtime Docker image locally with Podman
-      - name: Build runtime image
-        run: |
-          cp aegis-orchestrator/target/release/aegis ./aegis
-          podman build \
-            -f aegis-orchestrator/docker/Dockerfile.runtime-slim \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7} \
-            .
-
-      # Push to GHCR in parallel with deploy (for external consumers)
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push to GHCR
-        run: |
-          podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}
-
-      # Semver tags for release pushes
-      - name: Tag and push semver (release only)
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          MAJOR=$(echo $VERSION | cut -d. -f1)
-          MINOR=$(echo $VERSION | cut -d. -f1-2)
-          podman tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION
-          podman tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MINOR
-          podman tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MAJOR
-          podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION
-          podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MINOR
-          podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MAJOR
+        run: cargo test -p aegis-orchestrator-core --lib --locked live_tests -- --test-threads=2
