@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use crate::domain::agent::AgentId;
 use crate::domain::seal_session::{SealSession, SessionId};
 use crate::domain::seal_session_repository::SealSessionRepository;
+use crate::domain::secrets::SensitiveString;
 
 pub struct InMemorySealSessionRepository {
     // Maps SessionId -> SealSession
@@ -43,12 +44,16 @@ impl SealSessionRepository for InMemorySealSessionRepository {
         Ok(guard.get(id).cloned())
     }
 
-    async fn find_active_by_security_token(&self, token: &str) -> Result<Option<SealSession>> {
+    async fn find_active_by_security_token(
+        &self,
+        token: &SensitiveString,
+    ) -> Result<Option<SealSession>> {
         let guard = self.sessions.read().await;
         Ok(guard
             .values()
             .filter(|s| {
-                s.security_token_raw == token
+                // `SensitiveString`'s equality is constant-time.
+                s.security_token_raw == *token
                     && s.status == crate::domain::seal_session::SessionStatus::Active
             })
             .max_by_key(|s| s.created_at)

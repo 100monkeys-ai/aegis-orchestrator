@@ -397,8 +397,10 @@ mod tests {
     }
 
     impl EnvelopeVerifier for DummyEnvelope {
-        fn security_token(&self) -> &str {
-            "token"
+        fn security_token(&self) -> &crate::domain::secrets::SensitiveString {
+            static TOKEN: std::sync::LazyLock<crate::domain::secrets::SensitiveString> =
+                std::sync::LazyLock::new(|| "token".into());
+            &TOKEN
         }
 
         fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SealSessionError> {

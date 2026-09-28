@@ -20,6 +20,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::domain::iam::RealmKind;
+use crate::domain::secrets::SensitiveString;
 use crate::domain::tenant::TenantId;
 
 /// The agent's initial attestation message sent to the orchestrator.
@@ -85,7 +86,8 @@ pub struct AttestationResponse {
     pub status: String,
     /// Signed JWT (`SecurityToken`) encoding `ContextClaims`.
     /// The agent must include this token in every subsequent `SealEnvelope`.
-    pub security_token: String,
+    /// A bearer credential: prints redacted.
+    pub security_token: SensitiveString,
     /// ISO-8601 UTC timestamp at which the token expires.
     pub expires_at: String,
     /// Optional session identifier for audit correlation.

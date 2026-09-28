@@ -155,6 +155,7 @@ mod tests {
             "the token is reused while fresh"
         );
     }
+
     /// The JSON the gateway receives for a session pre-creation. Captured
     /// from the derived serde form while `security_token` was a `String`.
     const SESSION_REQUEST_FIXTURE: &str = r#"{"execution_id":"exec-1","agent_id":"agent-1","security_context":"aegis-system-default","public_key_b64":"AAAA","security_token":"seal-token","session_status":"Active","expires_at":"2026-09-28T00:00:00Z","allowed_tool_patterns":["*"]}"#;

@@ -15,6 +15,7 @@ use crate::application::temporal_mapper::TemporalWorkflowDefinition;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
 use crate::domain::seal_session::SealSessionError;
+use crate::domain::secrets::SensitiveString;
 
 /// Parameters for starting a workflow execution.
 ///
@@ -224,7 +225,9 @@ pub struct SealSessionCreateRequest {
     pub agent_id: String,
     pub security_context: String,
     pub public_key_b64: String,
-    pub security_token: String,
+    /// The session's bearer token. Prints redacted; serialises as the bare
+    /// string, so the gateway receives the same JSON.
+    pub security_token: SensitiveString,
     pub session_status: String,
     pub expires_at: String,
     pub allowed_tool_patterns: Vec<String>,

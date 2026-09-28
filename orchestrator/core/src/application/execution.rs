@@ -2782,7 +2782,7 @@ impl StandardExecutionService {
                         agent_id: agent_id.0.to_string(),
                         security_context: seal_security_context.clone(),
                         public_key_b64: public_key_b64.clone(),
-                        security_token: token.clone(),
+                        security_token: token.as_str().into(),
                         session_status: "Active".to_string(),
                         expires_at: exp.to_rfc3339(),
                         allowed_tool_patterns: pre_create_tool_patterns,

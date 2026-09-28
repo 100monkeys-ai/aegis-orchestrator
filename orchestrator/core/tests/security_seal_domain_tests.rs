@@ -22,6 +22,7 @@ use aegis_orchestrator_core::domain::iam::RealmKind;
 use aegis_orchestrator_core::domain::seal_session::{
     EnvelopeVerifier, SealSession, SealSessionError, SessionStatus,
 };
+use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use aegis_orchestrator_core::domain::security_context::{
     Capability, PolicyViolation, SecurityContext, SecurityContextMetadata,
 };
@@ -118,7 +119,7 @@ fn make_session(context: SecurityContext) -> SealSession {
 
 /// Mock EnvelopeVerifier for SealSession::evaluate_call() tests.
 struct MockEnvelope {
-    token: String,
+    token: SensitiveString,
     signature_valid: bool,
     tool_name: Option<String>,
     arguments: Option<serde_json::Value>,
@@ -127,7 +128,7 @@ struct MockEnvelope {
 impl MockEnvelope {
     fn valid(tool_name: &str, args: serde_json::Value) -> Self {
         Self {
-            token: "test-token-abc".to_string(),
+            token: "test-token-abc".into(),
             signature_valid: true,
             tool_name: Some(tool_name.to_string()),
             arguments: Some(args),
@@ -136,7 +137,7 @@ impl MockEnvelope {
 }
 
 impl EnvelopeVerifier for MockEnvelope {
-    fn security_token(&self) -> &str {
+    fn security_token(&self) -> &SensitiveString {
         &self.token
     }
 
@@ -159,7 +160,7 @@ impl EnvelopeVerifier for MockEnvelope {
     }
 
     fn replay_nonce(&self) -> String {
-        format!("mock-nonce-{}", self.token)
+        format!("mock-nonce-{}", self.token.expose())
     }
 }
 
@@ -617,7 +618,7 @@ fn evaluate_call_rejects_token_mismatch() {
     let mut session = make_session(ctx);
 
     let envelope = MockEnvelope {
-        token: "wrong-token".to_string(),
+        token: "wrong-token".into(),
         signature_valid: true,
         tool_name: Some("fs.read".to_string()),
         arguments: Some(json!({})),
@@ -635,7 +636,7 @@ fn evaluate_call_rejects_invalid_signature() {
     let mut session = make_session(ctx);
 
     let envelope = MockEnvelope {
-        token: "test-token-abc".to_string(),
+        token: "test-token-abc".into(),
         signature_valid: false,
         tool_name: Some("fs.read".to_string()),
         arguments: Some(json!({})),
@@ -653,7 +654,7 @@ fn evaluate_call_rejects_missing_tool_name() {
     let mut session = make_session(ctx);
 
     let envelope = MockEnvelope {
-        token: "test-token-abc".to_string(),
+        token: "test-token-abc".into(),
         signature_valid: true,
         tool_name: None,
         arguments: Some(json!({})),
@@ -668,7 +669,7 @@ fn evaluate_call_rejects_missing_arguments() {
     let mut session = make_session(ctx);
 
     let envelope = MockEnvelope {
-        token: "test-token-abc".to_string(),
+        token: "test-token-abc".into(),
         signature_valid: true,
         tool_name: Some("fs.read".to_string()),
         arguments: None,

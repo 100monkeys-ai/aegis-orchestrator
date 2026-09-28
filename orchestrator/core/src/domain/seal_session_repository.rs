@@ -17,6 +17,7 @@ use async_trait::async_trait;
 
 use crate::domain::agent::AgentId;
 use crate::domain::seal_session::{SealSession, SessionId};
+use crate::domain::secrets::SensitiveString;
 
 /// Repository for [`SealSession`] aggregates (BC-12 SEAL Protocol, ADR-035).
 ///
@@ -43,7 +44,11 @@ pub trait SealSessionRepository: Send + Sync {
     ///
     /// Used by the tool invocation service to resolve a session from the opaque token string
     /// without requiring prior JWT decode; claim extraction then happens from the loaded session.
-    async fn find_active_by_security_token(&self, token: &str) -> Result<Option<SealSession>>;
+    /// Implementations compare tokens in constant time.
+    async fn find_active_by_security_token(
+        &self,
+        token: &SensitiveString,
+    ) -> Result<Option<SealSession>>;
 
     /// Return the single `Active` session for `agent_id`, or `None` if no active session exists.
     ///

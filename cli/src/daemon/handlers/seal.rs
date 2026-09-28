@@ -38,7 +38,8 @@ pub struct HttpAttestationRequest {
 #[derive(serde::Deserialize)]
 pub struct HttpSealEnvelope {
     pub protocol: Option<String>,
-    pub security_token: String,
+    /// The session's bearer token. Prints redacted.
+    pub security_token: aegis_orchestrator_core::domain::secrets::SensitiveString,
     pub signature: String,
     pub payload: serde_json::Value,
     pub timestamp: Option<String>,

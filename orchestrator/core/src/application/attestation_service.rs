@@ -49,6 +49,7 @@ use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
 use crate::domain::seal_session::SealSession;
 use crate::domain::seal_session_repository::SealSessionRepository;
+use crate::domain::secrets::SensitiveString;
 use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::security_context::validate_context_ownership;
 use crate::infrastructure::seal::attestation::{
@@ -242,7 +243,8 @@ impl AttestationServiceImpl {
         };
 
         // 3. Issue Token
-        let token = self.token_issuer.issue(&mut claims)?;
+        // A bearer credential from here on: held so that it prints redacted.
+        let token = SensitiveString::new(self.token_issuer.issue(&mut claims)?);
 
         // 4. Create and persist SEAL Session
         let public_key_bytes = normalize_public_key_bytes(&request.public_key_pem)?;
@@ -510,7 +512,7 @@ mod tests {
             .await
             .unwrap();
 
-        let token = verifier.verify(&response.security_token).unwrap();
+        let token = verifier.verify(response.security_token.expose()).unwrap();
         assert_eq!(token.claims.security_context, "zaru-pro");
         assert!(uuid::Uuid::parse_str(&token.claims.sub).is_ok());
         assert!(uuid::Uuid::parse_str(&token.claims.exec_id).is_ok());
@@ -755,7 +757,7 @@ mod tests {
                 .unwrap();
 
             verifier
-                .verify(&response.security_token)
+                .verify(response.security_token.expose())
                 .unwrap()
                 .claims
                 .task_summary

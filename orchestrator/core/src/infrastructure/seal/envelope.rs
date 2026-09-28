@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::seal_session::{EnvelopeVerifier, SealSessionError};
+use crate::domain::secrets::SensitiveString;
 
 /// The outer SEAL wrapper applied to every MCP message from an agent container.
 ///
@@ -48,7 +49,8 @@ pub struct SealEnvelope {
     /// Protocol identifier and version (`"seal/v1"`).
     pub protocol: String,
     /// Signed JWT (`SecurityToken`) issued during attestation. Encodes `ContextClaims`.
-    pub security_token: String,
+    /// A bearer credential: prints redacted, serialises as the bare string.
+    pub security_token: SensitiveString,
     /// Base64-encoded Ed25519 signature over the canonical message.
     pub signature: String,
     /// MCP JSON-RPC payload (method + params).
@@ -113,7 +115,7 @@ pub struct ContextClaims {
 }
 
 impl EnvelopeVerifier for SealEnvelope {
-    fn security_token(&self) -> &str {
+    fn security_token(&self) -> &SensitiveString {
         &self.security_token
     }
 
@@ -197,7 +199,9 @@ impl SealEnvelope {
                 "envelope timestamp is outside the 30 second freshness window ({age_seconds}s)"
             )));
         }
-        canonical_message(&self.security_token, &self.payload, timestamp)
+        // The token is part of the bytes the agent signed; the signature is
+        // checked over exactly those bytes.
+        canonical_message(self.security_token.expose(), &self.payload, timestamp)
     }
 }
 
@@ -371,6 +375,7 @@ mod tests {
         let normalized = normalize_public_key_bytes(&encoded).unwrap();
         assert_eq!(normalized, verifying_key.as_bytes());
     }
+
     /// The envelope as an agent sends it. Captured from the derived serde
     /// form while `security_token` was a `String`.
     const ENVELOPE_FIXTURE: &str = r#"{"protocol":"seal/v1","security_token":"Mk7-seal-envelope-token-marker","signature":"c2lnbmF0dXJl","payload":{"method":"tools/call","params":{"name":"fs.read"}},"timestamp":"2026-09-28T00:00:00.000Z"}"#;

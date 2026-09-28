@@ -776,7 +776,8 @@ impl AegisRuntime for AegisRuntimeService {
 
         match attestation_service.attest(attestation_req).await {
             Ok(res) => Ok(Response::new(AttestAgentResponse {
-                security_token: res.security_token,
+                // Sent to the agent that attested; the generated type holds a String.
+                security_token: res.security_token.expose_owned(),
             })),
             Err(e) => Err(Status::internal(format!("Attestation failed: {e}"))),
         }

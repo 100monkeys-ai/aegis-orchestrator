@@ -43,6 +43,7 @@ use uuid::Uuid;
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::PolicyViolation;
+use crate::domain::secrets::SensitiveString;
 use crate::domain::security_context::SecurityContext;
 use crate::domain::tenant::TenantId;
 
@@ -183,8 +184,9 @@ impl std::error::Error for SealSessionError {}
 /// Implementations **must** perform constant-time signature verification. Timing
 /// side-channels on `verify_signature` can leak private key material.
 pub trait EnvelopeVerifier {
-    /// Return the raw SEAL security token carried by the envelope.
-    fn security_token(&self) -> &str;
+    /// Return the SEAL security token carried by the envelope. It prints
+    /// redacted; read it with `expose()` only where it is compared or signed.
+    fn security_token(&self) -> &SensitiveString;
 
     /// Verify that the envelope's Ed25519 signature was produced by the holder of `public_key_bytes`.
     ///
@@ -240,8 +242,8 @@ pub struct SealSession {
     /// Agent's public key bytes (for signature verification)
     pub agent_public_key: Vec<u8>,
 
-    /// Issued SecurityToken raw string (abstracted)
-    pub security_token_raw: String,
+    /// Issued SecurityToken (a bearer JWT). Prints redacted.
+    pub security_token_raw: SensitiveString,
 
     /// Assigned SecurityContext
     pub security_context: SecurityContext,
@@ -277,7 +279,7 @@ impl SealSession {
         agent_id: AgentId,
         execution_id: ExecutionId,
         agent_public_key: Vec<u8>,
-        security_token_raw: String,
+        security_token_raw: impl Into<SensitiveString>,
         security_context: SecurityContext,
         tenant_id: TenantId,
     ) -> Self {
@@ -287,7 +289,7 @@ impl SealSession {
             agent_id,
             execution_id,
             agent_public_key,
-            security_token_raw,
+            security_token_raw: security_token_raw.into(),
             security_context,
             principal_subject: None,
             user_id: None,
@@ -373,7 +375,9 @@ impl SealSession {
         }
 
         // 3. Ensure the presented token matches the token issued for this session.
-        if envelope.security_token() != self.security_token_raw {
+        // Constant-time: the time taken must not tell a caller how much of a
+        // guessed token was right.
+        if envelope.security_token() != &self.security_token_raw {
             return Err(SealSessionError::SignatureVerificationFailed(
                 "security token does not match the active SEAL session".to_string(),
             ));

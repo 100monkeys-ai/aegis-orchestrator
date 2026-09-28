@@ -7,6 +7,7 @@ use crate::domain::fsal::{AegisFSAL, EventPublisher};
 use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
 use crate::domain::repository::AgentVersion;
 use crate::domain::seal_session::SealSession;
+use crate::domain::secrets::SensitiveString;
 use crate::domain::security_context::SecurityContext;
 use crate::infrastructure::repositories::InMemoryVolumeRepository;
 use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
@@ -91,20 +92,20 @@ fn make_fake_token(agent_id: AgentId) -> String {
 
 struct DummyEnvelope {
     valid: bool,
-    token: String,
+    token: SensitiveString,
 }
 
 impl DummyEnvelope {
     fn for_agent(valid: bool, agent_id: AgentId) -> Self {
         Self {
             valid,
-            token: make_fake_token(agent_id),
+            token: make_fake_token(agent_id).into(),
         }
     }
 }
 
 impl EnvelopeVerifier for DummyEnvelope {
-    fn security_token(&self) -> &str {
+    fn security_token(&self) -> &SensitiveString {
         &self.token
     }
 
@@ -124,7 +125,7 @@ impl EnvelopeVerifier for DummyEnvelope {
         Some(serde_json::json!({}))
     }
     fn replay_nonce(&self) -> String {
-        format!("dummy-nonce-{}", self.token)
+        format!("dummy-nonce-{}", self.token.expose())
     }
 }
 
@@ -1871,10 +1872,10 @@ async fn test_invoke_tool_execution_modes() {
 
     struct DummyRemoteEnvelope {
         valid: bool,
-        token: String,
+        token: SensitiveString,
     }
     impl EnvelopeVerifier for DummyRemoteEnvelope {
-        fn security_token(&self) -> &str {
+        fn security_token(&self) -> &SensitiveString {
             &self.token
         }
 
@@ -1892,13 +1893,13 @@ async fn test_invoke_tool_execution_modes() {
             Some(serde_json::json!({}))
         }
         fn replay_nonce(&self) -> String {
-            format!("dummy-remote-nonce-{}", self.token)
+            format!("dummy-remote-nonce-{}", self.token.expose())
         }
     }
 
     let remote_envelope = DummyRemoteEnvelope {
         valid: true,
-        token: make_fake_token(agent_id),
+        token: make_fake_token(agent_id).into(),
     };
     let result = service.invoke_tool(&remote_envelope).await.unwrap();
 
