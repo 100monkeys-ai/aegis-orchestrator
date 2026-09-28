@@ -270,6 +270,20 @@ impl CortexPatternPort for CortexGrpcClient {
 mod cortex_redaction_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cortex_client_debug_does_not_print_the_api_key() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = CortexGrpcClient {
+            client: CortexServiceClient::new(channel),
+            api_key: Some("Mk7-cortex-api-key-marker".into()),
+        };
+        let printed = format!("{client:?}");
+        assert!(
+            !printed.contains("Mk7-cortex-api-key-marker"),
+            "CortexGrpcClient's Debug printed its API key: {printed}"
+        );
+    }
+
     /// Audit 002 §4.37.3 regression — leaf values of every JSON type must
     /// be replaced with a type tag so customer content cannot egress to
     /// Cortex through `arguments_json`.

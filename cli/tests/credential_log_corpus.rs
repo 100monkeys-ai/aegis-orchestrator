@@ -25,8 +25,148 @@
 //! `SensitiveUrl`, `.redacted()` (a method only `SensitiveUrl` has),
 //! `redact_url(` or `sanitize_url(`. Anything else is reported, every
 //! offending site in one run.
+//!
+//! A second rule covers what a derived `Debug` prints. A struct or enum that
+//! derives `Debug` prints every field, so a `{:?}`, a `?value` field, an
+//! `#[instrument]` parameter, a `dbg!` or a panic message that formats it
+//! prints every secret it holds. No struct or enum that derives `Debug` may
+//! have a field named like a secret (`SECRET_FIELD_WORDS`) whose type is a raw
+//! string, byte vector or URL (`RAW_SECRET_TYPES`). Such a field is held as
+//! `SensitiveString`, `SensitiveBytes` or `SensitiveUrl`, which print
+//! redacted, and the struct keeps its derived `Debug`. A field that is named
+//! like a secret and is not one is listed in `SECRET_FIELD_EXEMPTIONS` with
+//! its reason.
 
 use std::path::{Path, PathBuf};
+
+// ── What a secret-holding field is: the one place these lists live ───────────
+
+/// A field whose lower-cased name contains one of these holds a secret, or a
+/// URL that can carry one. Found in this tree: `token`, `raw_token`,
+/// `security_token`, `node_security_token`, `access_token`, `refresh_token`,
+/// `client_secret`, `webhook_secret`, `password`, `api_key`, `auth_key`,
+/// `access_key`, `refresh_key`, `private_key`, `registry_credentials`,
+/// `connection_string`, `repo_url`, `token_url`, `authorization_url`.
+const SECRET_FIELD_WORDS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "auth_key",
+    "access_key",
+    "refresh_key",
+    "private_key",
+    "signing_key",
+    "session_key",
+    "hmac_key",
+    "client_key",
+    "credential",
+    "authorization",
+    "bearer",
+    "cookie",
+    "connection_string",
+    "database_url",
+    "repo_url",
+    "dsn",
+];
+
+/// Field types that print their value by `Debug`. `Option<…>` of any of these
+/// counts too.
+const RAW_SECRET_TYPES: &[&str] = &[
+    "String",
+    "std::string::String",
+    "&str",
+    "&'static str",
+    "Box<str>",
+    "Vec<u8>",
+    "Url",
+    "url::Url",
+];
+
+/// Why a `registry_credentials` field is exempt: it names where the
+/// credential is, never the credential.
+const REGISTRY_REFERENCE: &str = "a reference (`env:NAME` or `secret:engine/path`), never the credential; any other value is refused without being repeated (container_step_runner.rs)";
+
+/// Fields that are named like a secret and do not hold one, as
+/// `(type, field, reason)`. The type is the struct, or `Enum::Variant`.
+const SECRET_FIELD_EXEMPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "OAuthTokenResponse",
+        "token_type",
+        "the token's type name (\"bearer\"), not a token",
+    ),
+    (
+        "SecretBackendAppRoleConfig",
+        "secret_id_env_var",
+        "the name of the environment variable that holds the Secret ID, not the Secret ID",
+    ),
+    (
+        "SecretBackendTlsConfig",
+        "client_key",
+        "a path to the client key file, not the key",
+    ),
+    (
+        "SealConfig",
+        "private_key_path",
+        "a path to the key file, not the key",
+    ),
+    (
+        "IamEvent::TenantRealmProvisioned",
+        "secret_namespace",
+        "the name of an OpenBao namespace, not a secret",
+    ),
+    (
+        "StoreApiKeyRequest",
+        "credential_type",
+        "the kind of credential (api_key, oauth2), not a credential",
+    ),
+    (
+        "GitRepoBinding",
+        "webhook_secret_ciphertext",
+        "Transit ciphertext of the webhook secret; reading it needs the Transit key, held in OpenBao",
+    ),
+    ("ContainerStepConfig", "registry_credentials", REGISTRY_REFERENCE),
+    ("ContainerRunConfig", "registry_credentials", REGISTRY_REFERENCE),
+    ("StateKind::ContainerRun", "registry_credentials", REGISTRY_REFERENCE),
+    ("StateKindYaml::ContainerRun", "registry_credentials", REGISTRY_REFERENCE),
+    (
+        "TemporalWorkflowState",
+        "container_run_registry_credentials",
+        REGISTRY_REFERENCE,
+    ),
+    (
+        "LockToken",
+        "0",
+        "an in-process lock handle (a random UUID); releasing a lock also needs the owning tenant",
+    ),
+    (
+        "GitRepoError::SecretResolutionFailed",
+        "0",
+        "an error message (ids, a status, a repository or Transit error), never the secret",
+    ),
+    (
+        "SecretsError::DynamicSecretError",
+        "0",
+        "an error message (an HTTP status or a transport or parse error), never the secret",
+    ),
+    (
+        "SecretsError::CredentialResolutionError",
+        "0",
+        "an error message naming the environment variable, never its value",
+    ),
+    (
+        "CredentialError::UnparseableTokenUrl",
+        "0",
+        "the URL parser's error message, which does not repeat the URL",
+    ),
+    (
+        "KeycloakAdminError::TokenError",
+        "0",
+        "an error message: the HTTP status and the identity provider's RFC 6749 error body, which does not repeat the request's credentials",
+    ),
+];
 
 /// Crate source roots walked, relative to the workspace root.
 const ROOTS: &[&str] = &[
@@ -676,6 +816,421 @@ fn checker_catches_every_form_of_a_raw_connection_string() {
         scan.violations.is_empty(),
         "redacted, commented and test-only forms must pass:\n{}",
         scan.violations.join("\n")
+    );
+}
+
+// ── Rule 2: a derived `Debug` never holds a raw secret ──────────────────────
+
+/// Does a field of this name hold a secret?
+fn is_secret_field_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SECRET_FIELD_WORDS.iter().any(|w| lower.contains(w))
+}
+
+/// `SomeName` → `some_name`, so a tuple type's own name can be read with the
+/// same words as a field's.
+fn snake_case(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Is this type a raw string, byte vector or URL, or an `Option` of one?
+fn is_raw_secret_type(ty: &str) -> bool {
+    let ty: String = ty.split_whitespace().collect::<Vec<_>>().join(" ");
+    let ty = ty.trim();
+    let inner = ty
+        .strip_prefix("Option<")
+        .or_else(|| ty.strip_prefix("std::option::Option<"))
+        .and_then(|t| t.strip_suffix('>'))
+        .map(str::trim)
+        .unwrap_or(ty);
+    let inner = if inner.starts_with('&') {
+        // `&'a str` and `&str` read the same.
+        let rest = inner[1..].trim_start();
+        let rest = if rest.starts_with('\'') {
+            rest.split_once(' ').map(|(_, r)| r).unwrap_or(rest)
+        } else {
+            rest
+        };
+        format!("&{}", rest.trim())
+    } else {
+        inner.to_string()
+    };
+    RAW_SECRET_TYPES
+        .iter()
+        .any(|t| *t == inner || (t.starts_with("&'") && inner == "&str"))
+}
+
+/// Is `owner.field` exempt? Records the match, so an exemption that no
+/// longer matches any field can be reported as stale.
+fn is_exempt(owner: &str, field: &str, scan: &mut DebugScan) -> bool {
+    let hit = SECRET_FIELD_EXEMPTIONS
+        .iter()
+        .any(|(o, f, _)| *o == owner && *f == field);
+    if hit {
+        scan.exempted.push(format!("{owner}.{field}"));
+    }
+    hit
+}
+
+/// Replace every attribute `#[…]` in `s` with spaces.
+fn blank_attributes(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = b.to_vec();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(next) = skip_literal(b, i) {
+            i = next;
+            continue;
+        }
+        if b[i] == b'#' && b.get(i + 1) == Some(&b'[') {
+            if let Some(close) = matching_close(b, i + 1) {
+                for byte in &mut out[i..=close] {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8(out).expect("only ASCII bytes were replaced")
+}
+
+/// Split `name: Type` at its first single `:` (not `::`).
+fn split_field(part: &str) -> Option<(String, String)> {
+    let b = part.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b':' {
+            if b.get(i + 1) == Some(&b':') {
+                i += 2;
+                continue;
+            }
+            let name = part[..i].trim();
+            let name = name.rsplit(char::is_whitespace).next().unwrap_or(name);
+            return Some((name.to_string(), part[i + 1..].trim().to_string()));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Check one set of named fields `{ … }` belonging to `owner`.
+fn check_named_fields(relative: &str, line: usize, owner: &str, body: &str, scan: &mut DebugScan) {
+    for part in split_top_level(&blank_attributes(body)) {
+        let Some((name, ty)) = split_field(&part) else {
+            continue;
+        };
+        if is_secret_field_name(&name) && is_raw_secret_type(&ty) && !is_exempt(owner, &name, scan)
+        {
+            scan.violations.push(format!(
+                "{relative}:{line}: {owner}.{name}: {ty} is printed by the derived Debug"
+            ));
+        }
+    }
+}
+
+/// Check the positional fields `( … )` of a tuple type or variant named
+/// `owner`: a tuple has no field names, so its own name is read instead.
+fn check_tuple_fields(relative: &str, line: usize, owner: &str, body: &str, scan: &mut DebugScan) {
+    let own_name = owner.rsplit("::").next().unwrap_or(owner);
+    if !is_secret_field_name(&snake_case(own_name)) {
+        return;
+    }
+    for (index, ty) in split_top_level(&blank_attributes(body)).iter().enumerate() {
+        let ty = ty
+            .trim()
+            .trim_start_matches("pub(crate)")
+            .trim_start_matches("pub")
+            .trim();
+        if is_raw_secret_type(ty) && !is_exempt(owner, &index.to_string(), scan) {
+            scan.violations.push(format!(
+                "{relative}:{line}: {owner}.{index}: {ty} is printed by the derived Debug"
+            ));
+        }
+    }
+}
+
+/// Does the attribute text `#[…]` derive `Debug`?
+fn derives_debug(attr: &str) -> bool {
+    let compact: String = attr.split_whitespace().collect();
+    let Some(start) = compact.find("derive(") else {
+        return false;
+    };
+    compact[start + "derive(".len()..]
+        .split([',', ')'])
+        .any(|d| d == "Debug" || d.ends_with("::Debug"))
+}
+
+struct DebugScan {
+    violations: Vec<String>,
+    exempted: Vec<String>,
+    types: usize,
+}
+
+impl DebugScan {
+    fn new() -> Self {
+        Self {
+            violations: Vec::new(),
+            exempted: Vec::new(),
+            types: 0,
+        }
+    }
+}
+
+/// Find every struct and enum that derives `Debug` in one file's (comment-
+/// and test-stripped) source and check its fields.
+fn scan_debug_holders(relative: &str, src: &str, scan: &mut DebugScan) {
+    let b = src.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(next) = skip_literal(b, i) {
+            i = next;
+            continue;
+        }
+        if !(b[i] == b'#' && b.get(i + 1) == Some(&b'[')) {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_close(b, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if !derives_debug(&src[i..=close]) {
+            i = close + 1;
+            continue;
+        }
+        let line = line_of(src, i);
+        // Skip any further attributes, the visibility, and find the item.
+        let mut j = close + 1;
+        loop {
+            let rest = &src[j..];
+            let trimmed = rest.trim_start();
+            j += rest.len() - trimmed.len();
+            if trimmed.starts_with("#[") {
+                match matching_close(b, j + 1) {
+                    Some(c) => j = c + 1,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+        let item = &src[j..];
+        let item = item
+            .strip_prefix("pub(crate) ")
+            .or_else(|| item.strip_prefix("pub(super) "))
+            .or_else(|| item.strip_prefix("pub "))
+            .unwrap_or(item);
+        let (kind, after_kw) = if let Some(r) = item.strip_prefix("struct ") {
+            ("struct", r)
+        } else if let Some(r) = item.strip_prefix("enum ") {
+            ("enum", r)
+        } else {
+            i = close + 1;
+            continue;
+        };
+        let name_len = after_kw
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after_kw.len());
+        let name = &after_kw[..name_len];
+        let name_at = src.len() - after_kw.len();
+        // The body is the first `{` or `(` after the name and generics, or
+        // nothing for a unit struct (`;` first).
+        let Some(body_open) = src[name_at..]
+            .find(['{', '(', ';'])
+            .map(|p| name_at + p)
+            .filter(|p| b[*p] != b';')
+        else {
+            i = close + 1;
+            continue;
+        };
+        let Some(body_close) = matching_close(b, body_open) else {
+            i = close + 1;
+            continue;
+        };
+        let body = &src[body_open + 1..body_close];
+        scan.types += 1;
+        match (kind, b[body_open]) {
+            ("struct", b'{') => check_named_fields(relative, line, name, body, scan),
+            ("struct", _) => check_tuple_fields(relative, line, name, body, scan),
+            _ => {
+                for variant in split_top_level(&blank_attributes(body)) {
+                    let v = variant.trim();
+                    let vlen = v
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(v.len());
+                    let owner = format!("{name}::{}", &v[..vlen]);
+                    let rest = v[vlen..].trim_start();
+                    if rest.starts_with('{') || rest.starts_with('(') {
+                        let rb = rest.as_bytes();
+                        if let Some(c) = matching_close(rb, 0) {
+                            let inner = &rest[1..c];
+                            if rest.starts_with('{') {
+                                check_named_fields(relative, line, &owner, inner, scan);
+                            } else {
+                                check_tuple_fields(relative, line, &owner, inner, scan);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = body_close + 1;
+    }
+}
+
+fn walk_debug(root: &Path, dir: &Path, scan: &mut DebugScan, files: &mut usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("tests") {
+                continue;
+            }
+            walk_debug(root, &path, scan, files);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name.ends_with("_tests.rs") || file_name == "tests.rs" {
+                continue;
+            }
+            *files += 1;
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let src = blank_test_modules(&blank_comments(&src));
+            scan_debug_holders(&relative, &src, scan);
+        }
+    }
+}
+
+/// The checker itself: every form of a derived-`Debug` type holding a raw
+/// secret is caught, and a type holding its secrets in redacting types, a
+/// type that does not derive `Debug`, and an exempt field are not.
+#[test]
+fn debug_checker_catches_every_form_of_a_raw_secret_field() {
+    let raw = r#"
+        #[derive(Debug, Clone)]
+        pub struct A { pub token: String, other: u32 }
+        #[derive(Clone, Debug, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        pub(crate) struct B<'a> {
+            #[serde(default)]
+            pub api_key: Option<String>,
+            pub private_key: Vec<u8>,
+            pub repo_url: url::Url,
+            pub client_secret: &'a str,
+        }
+        #[derive(std::fmt::Debug)]
+        enum C {
+            Issued { raw_token: String },
+            Accepted(u32),
+        }
+        #[derive(Debug)]
+        struct BearerToken(pub String);
+    "#;
+    let mut scan = DebugScan::new();
+    scan_debug_holders("orchestrator/core/src/example.rs", raw, &mut scan);
+    assert_eq!(
+        scan.violations.len(),
+        7,
+        "every raw secret field must be reported once:\n{}",
+        scan.violations.join("\n")
+    );
+
+    let safe = r#"
+        #[derive(Debug, Clone)]
+        pub struct A { pub token: SensitiveString, pub max_tokens: u32, pub input_tokens: Option<u32> }
+        #[derive(Debug)]
+        struct B { pub repo_url: SensitiveUrl, pub signing_key: SensitiveBytes }
+        #[derive(Clone, Serialize)]
+        struct NotDebug { pub password: String }
+        #[derive(Debug)]
+        struct TokenUsage { pub total_tokens: u32 }
+        // #[derive(Debug)] struct Commented { token: String }
+        #[cfg(test)]
+        mod tests {
+            #[derive(Debug)]
+            struct T { token: String }
+        }
+    "#;
+    let mut scan = DebugScan::new();
+    let src = blank_test_modules(&blank_comments(safe));
+    scan_debug_holders("orchestrator/core/src/example.rs", &src, &mut scan);
+    assert!(
+        scan.violations.is_empty(),
+        "redacting, non-Debug, commented and test-only forms must pass:\n{}",
+        scan.violations.join("\n")
+    );
+    assert_eq!(
+        scan.types, 3,
+        "the three Debug types outside tests are read"
+    );
+
+    // Every exemption names a reason, and none is stale: each still matches
+    // a field that is named like a secret.
+    for (owner, field, reason) in SECRET_FIELD_EXEMPTIONS {
+        assert!(
+            !reason.trim().is_empty(),
+            "{owner}.{field} is exempt with no reason"
+        );
+        assert!(
+            field.chars().all(|c| c.is_ascii_digit()) || is_secret_field_name(field),
+            "{owner}.{field} is exempt but is not named like a secret"
+        );
+    }
+}
+
+#[test]
+fn no_type_that_derives_debug_holds_a_raw_secret() {
+    let root = workspace_root();
+    let mut scan = DebugScan::new();
+    let mut files = 0;
+    for crate_root in ROOTS {
+        walk_debug(&root, &root.join(crate_root), &mut scan, &mut files);
+    }
+    // A walk that found nothing would pass vacuously.
+    assert!(
+        files > 200 && scan.types > 600,
+        "precondition: the walk reached {files} files and {} types deriving Debug; the workspace has far more",
+        scan.types
+    );
+    let stale: Vec<String> = SECRET_FIELD_EXEMPTIONS
+        .iter()
+        .map(|(o, f, _)| format!("{o}.{f}"))
+        .filter(|e| !scan.exempted.contains(e))
+        .collect();
+    // One assertion, so a run reports every site and every stale exemption.
+    assert!(
+        scan.violations.is_empty() && stale.is_empty(),
+        "{} field(s) hold a secret in a raw type inside a type that derives Debug, so any \
+         `{{:?}}`, `?field`, unskipped `#[instrument]` parameter, `dbg!` or panic message that \
+         formats it prints the secret. Hold the value in `SensitiveString`, `SensitiveBytes` or \
+         `SensitiveUrl` (aegis_orchestrator_core::domain::secrets), or, if the field is not a \
+         secret, add it to SECRET_FIELD_EXEMPTIONS with the reason:\n{}\n\
+         {} exemption(s) match no field any more; remove them: {stale:?}",
+        scan.violations.len(),
+        scan.violations.join("\n"),
+        stale.len()
     );
 }
 

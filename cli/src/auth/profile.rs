@@ -125,3 +125,37 @@ fn decrypt_store(data: &[u8]) -> Result<Vec<u8>> {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A profile as `~/.aegis/auth.json` stores it. Captured from the derived
+    /// serde form while the keys were `String`s.
+    const PROFILE_FIXTURE: &str = r#"{"name":"default","env":"dev.example.com","client_id":"aegis-cli","access_key":"Mk7-profile-access-key-marker","refresh_key":"Mk7-profile-refresh-key-marker","expires_at":"2026-09-28T00:00:00Z","roles":["user"],"scopes":["openid"]}"#;
+
+    #[test]
+    fn aegis_profile_debug_does_not_print_the_keys() {
+        let profile: AegisProfile = serde_json::from_str(PROFILE_FIXTURE).unwrap();
+        let printed = format!("{profile:?}");
+        for marker in [
+            "Mk7-profile-access-key-marker",
+            "Mk7-profile-refresh-key-marker",
+        ] {
+            assert!(
+                !printed.contains(marker),
+                "AegisProfile's Debug printed a key: {printed}"
+            );
+        }
+        assert!(
+            printed.contains("dev.example.com"),
+            "Debug lost the env: {printed}"
+        );
+    }
+
+    #[test]
+    fn aegis_profile_stored_form_is_unchanged() {
+        let profile: AegisProfile = serde_json::from_str(PROFILE_FIXTURE).unwrap();
+        assert_eq!(serde_json::to_string(&profile).unwrap(), PROFILE_FIXTURE);
+    }
+}

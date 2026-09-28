@@ -583,3 +583,23 @@ impl From<serde_json::Error> for RepositoryError {
         RepositoryError::Serialization(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod postgres_config_tests {
+    #[test]
+    fn postgres_config_debug_does_not_print_the_password() {
+        let config = super::PostgresConfig {
+            connection_string: "postgres://aegis:Mk7-postgres-config-marker@db.internal:5432/aegis"
+                .into(),
+        };
+        let printed = format!("{config:?}");
+        assert!(
+            !printed.contains("Mk7-postgres-config-marker"),
+            "PostgresConfig's Debug printed the password: {printed}"
+        );
+        assert!(
+            printed.contains("db.internal"),
+            "Debug lost the host: {printed}"
+        );
+    }
+}

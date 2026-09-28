@@ -1557,6 +1557,25 @@ impl DaemonClient {
 }
 
 #[cfg(test)]
+mod debug_tests {
+    #[test]
+    fn daemon_client_debug_does_not_print_the_auth_key() {
+        let client = super::DaemonClient::new("localhost", 8088)
+            .unwrap()
+            .with_auth("Mk7-daemon-client-key-marker".to_string());
+        let printed = format!("{client:?}");
+        assert!(
+            !printed.contains("Mk7-daemon-client-key-marker"),
+            "DaemonClient's Debug printed its auth key: {printed}"
+        );
+        assert!(
+            printed.contains("localhost"),
+            "Debug lost the base URL: {printed}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         extract_iteration_error_message, format_event, is_error_event, CorrelatedActivityEvent,
