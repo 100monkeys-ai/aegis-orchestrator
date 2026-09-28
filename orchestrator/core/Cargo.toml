@@ -59,6 +59,8 @@ prost = { workspace = true }
 bytes = { workspace = true }
 prost-types = "0.14"
 tonic-prost = "0.14"
+# grpc.health.v1.Health on every gRPC server the orchestrator starts
+tonic-health = "0.14.5"
 tar = "0.4"
 regex = "1"
 jsonschema = "0.45.0"

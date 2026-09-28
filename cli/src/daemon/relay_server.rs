@@ -27,7 +27,15 @@ use tracing::{debug, info};
 use aegis_orchestrator_core::domain::cluster::NodeId;
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
 use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
+use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::NodeClusterServiceServer;
+use aegis_orchestrator_core::infrastructure::cluster::NodeClusterServiceHandler;
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+use aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager;
+use aegis_orchestrator_core::presentation::grpc::health::{postgres_readiness, ReadinessCheck};
+use std::future::Future;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tonic::transport::server::TcpIncoming;
 
 /// Run the relay-coordinator boot path: initialize the cluster gRPC server
 /// (NodeClusterService with edge + IssueEnrollmentToken capabilities) and
@@ -106,6 +114,102 @@ pub async fn run_relay_coordinator(
         .parse()
         .with_context(|| format!("Failed to parse cluster gRPC address: {cluster_addr_str}"))?;
 
+    let RelayCluster {
+        handler,
+        cluster_repo,
+    } = build_relay_cluster(
+        &config,
+        &pool,
+        &secrets_manager,
+        &iam_service,
+        &cluster_addr_str,
+    );
+
+    debug!(
+        address = %cluster_addr,
+        "RelayCoordinator: spawning cluster gRPC server (NodeClusterService only — no RemoteStorage, no ForwardExecution)"
+    );
+
+    let listener = TcpListener::bind(cluster_addr).await.with_context(|| {
+        format!("Failed to bind the relay's cluster gRPC server to {cluster_addr}")
+    })?;
+    let readiness = relay_readiness(&pool);
+    let server_handle = tokio::spawn(async move {
+        info!(
+            address = %cluster_addr,
+            "RelayCoordinator gRPC server listening on {cluster_grpc_port}"
+        );
+        if let Err(e) = serve_relay_cluster(
+            listener,
+            handler,
+            readiness,
+            RELAY_READINESS_INTERVAL,
+            std::future::pending(),
+        )
+        .await
+        {
+            tracing::error!(error = %e, "RelayCoordinator gRPC server failed");
+        }
+    });
+
+    // ADR-062: health sweeper for stale heartbeat detection (relay also
+    // tracks edge daemon liveness).
+    let stale_threshold = std::time::Duration::from_secs(
+        config
+            .spec
+            .cluster
+            .as_ref()
+            .and_then(|c| c.stale_threshold_secs)
+            .unwrap_or(90),
+    );
+    let sweep_interval = std::time::Duration::from_secs(
+        config
+            .spec
+            .cluster
+            .as_ref()
+            .and_then(|c| c.sweep_interval_secs)
+            .unwrap_or(30),
+    );
+    let sweeper = aegis_orchestrator_core::application::cluster::HealthSweeper::new(
+        cluster_repo,
+        event_bus,
+        stale_threshold,
+        sweep_interval,
+    );
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        sweeper.run(shutdown_rx).await;
+    });
+
+    info!(
+        "RelayCoordinator role: skipping HTTP listener — gRPC NodeClusterService is the only \
+         ingress (ADR-117). Idling on cluster gRPC server task."
+    );
+
+    // The cluster gRPC server task owns the lifetime of the process for
+    // this role. Await it; if it exits, the relay exits.
+    let _ = server_handle.await;
+
+    Ok(())
+}
+
+/// The relay's `NodeClusterService` handler, wired to its PostgreSQL
+/// repositories and secret store, and the cluster repository the health
+/// sweeper reads.
+pub(crate) struct RelayCluster {
+    pub(crate) handler: NodeClusterServiceHandler,
+    pub(crate) cluster_repo:
+        Arc<dyn aegis_orchestrator_core::domain::cluster::NodeClusterRepository>,
+}
+
+/// Build the relay coordinator's cluster service (ADR-059, ADR-117).
+pub(crate) fn build_relay_cluster(
+    config: &NodeConfigManifest,
+    pool: &PgPool,
+    secrets_manager: &SecretsManager,
+    iam_service: &Option<Arc<dyn IdentityProvider>>,
+    cluster_addr_str: &str,
+) -> RelayCluster {
     let controller_node_id = NodeId(
         uuid::Uuid::parse_str(&config.spec.node.id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
     );
@@ -115,11 +219,9 @@ pub async fn run_relay_coordinator(
         RegisterNodeUseCase, RouteExecutionUseCase, SyncConfigUseCase,
     };
     use aegis_orchestrator_core::application::edge::enroll_edge::EnrollEdgeService;
-    use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::NodeClusterServiceServer;
     use aegis_orchestrator_core::infrastructure::cluster::{
-        NodeClusterServiceHandler, PgClusterEnrolmentTokenRepository, PgConfigLayerRepository,
-        PgNodeChallengeRepository, PgNodeClusterRepository, PgNodeRegistryRepository,
-        RoundRobinNodeRouter,
+        PgClusterEnrolmentTokenRepository, PgConfigLayerRepository, PgNodeChallengeRepository,
+        PgNodeClusterRepository, PgNodeRegistryRepository, RoundRobinNodeRouter,
     };
     use aegis_orchestrator_core::infrastructure::edge::{
         EdgeConnectionRegistry, PgEdgeDaemonRepository, PgEnrollmentTokenRepository,
@@ -252,14 +354,14 @@ pub async fn run_relay_coordinator(
         .as_ref()
         .and_then(|c| c.ingress.as_ref())
         .and_then(|i| resolve_env_value(&i.public_endpoint).ok())
-        .unwrap_or_else(|| cluster_addr_str.clone());
+        .unwrap_or_else(|| cluster_addr_str.to_string());
     let local_signer = Arc::new(IssueEnrollmentToken::new(
         secrets_manager.secret_store(),
         issuer_url,
         cluster_public_endpoint,
         EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
     ));
-    let cluster_grpc_auth = match (&iam_service, config.spec.grpc_auth.clone()) {
+    let cluster_grpc_auth = match (iam_service, config.spec.grpc_auth.clone()) {
         (Some(iam), Some(cfg)) if cfg.enabled => Some(
             aegis_orchestrator_core::presentation::grpc::auth_interceptor::GrpcIamAuthInterceptor::new(
                 iam.clone(),
@@ -279,69 +381,197 @@ pub async fn run_relay_coordinator(
     };
     handler = handler.with_issue_enrollment_token(local_signer, cluster_grpc_auth);
 
-    debug!(
-        address = %cluster_addr,
-        "RelayCoordinator: spawning cluster gRPC server (NodeClusterService only — no RemoteStorage, no ForwardExecution)"
-    );
-
-    let server_handle = tokio::spawn(async move {
-        info!(
-            address = %cluster_addr,
-            "RelayCoordinator gRPC server listening on {cluster_grpc_port}"
-        );
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(NodeClusterServiceServer::new(handler))
-            .serve(cluster_addr)
-            .await
-        {
-            tracing::error!(error = %e, "RelayCoordinator gRPC server failed");
-        }
-    });
-
-    // ADR-062: health sweeper for stale heartbeat detection (relay also
-    // tracks edge daemon liveness).
-    let stale_threshold = std::time::Duration::from_secs(
-        config
-            .spec
-            .cluster
-            .as_ref()
-            .and_then(|c| c.stale_threshold_secs)
-            .unwrap_or(90),
-    );
-    let sweep_interval = std::time::Duration::from_secs(
-        config
-            .spec
-            .cluster
-            .as_ref()
-            .and_then(|c| c.sweep_interval_secs)
-            .unwrap_or(30),
-    );
-    let sweeper = aegis_orchestrator_core::application::cluster::HealthSweeper::new(
+    RelayCluster {
+        handler,
         cluster_repo,
-        event_bus,
-        stale_threshold,
-        sweep_interval,
-    );
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        sweeper.run(shutdown_rx).await;
-    });
+    }
+}
 
-    info!(
-        "RelayCoordinator role: skipping HTTP listener — gRPC NodeClusterService is the only \
-         ingress (ADR-117). Idling on cluster gRPC server task."
-    );
+/// How long the relay's readiness waits for `SELECT 1`.
+const RELAY_DATABASE_READINESS_TIMEOUT: Duration = Duration::from_secs(3);
 
-    // The cluster gRPC server task owns the lifetime of the process for
-    // this role. Await it; if it exits, the relay exits.
-    let _ = server_handle.await;
+/// What the relay needs in order to serve: its PostgreSQL database, which
+/// every `NodeClusterService` RPC it hosts reads or writes. OpenBao is not
+/// re-probed: the relay authenticates to it at boot and does not start if it
+/// cannot (`SecretsManager::from_config`).
+pub(crate) fn relay_readiness(pool: &PgPool) -> Vec<ReadinessCheck> {
+    vec![postgres_readiness(
+        pool.clone(),
+        RELAY_DATABASE_READINESS_TIMEOUT,
+    )]
+}
 
-    Ok(())
+/// How often the relay re-evaluates its readiness; the pod's readiness probe
+/// runs every 10 s.
+const RELAY_READINESS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Serve the relay's cluster gRPC server on `listener` until `shutdown`,
+/// re-evaluating `readiness` every `readiness_interval`.
+pub(crate) async fn serve_relay_cluster(
+    listener: TcpListener,
+    handler: NodeClusterServiceHandler,
+    readiness: Vec<ReadinessCheck>,
+    readiness_interval: Duration,
+    shutdown: impl Future<Output = ()> + Send,
+) -> Result<(), tonic::transport::Error> {
+    // The readiness checks are accepted here and reported by the next commit.
+    let _ = (readiness, readiness_interval);
+    tonic::transport::Server::builder()
+        .add_service(NodeClusterServiceServer::new(handler))
+        .serve_with_incoming_shutdown(
+            TcpIncoming::from(listener).with_nodelay(Some(true)),
+            shutdown,
+        )
+        .await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use aegis_orchestrator_core::domain::node_config::{NodeConfigManifest, NodeRole};
+    use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::SERVICE_NAME as NODE_CLUSTER_SERVICE;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::secrets_manager::{
+        SecretsManager, TestSecretStore,
+    };
+    use aegis_orchestrator_core::presentation::grpc::health::tonic_health::pb::{
+        health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
+    };
+    use aegis_orchestrator_core::presentation::grpc::health::{readiness_check, ReadinessCheck};
+    use sqlx::postgres::{PgPool, PgPoolOptions};
+    use tonic::transport::Channel;
+
+    use super::{build_relay_cluster, relay_readiness, serve_relay_cluster, RelayCluster};
+
+    /// The overall server, as `grpc_health_probe -addr=…` asks without `-service`.
+    const OVERALL: &str = "";
+
+    /// A pool that never connects until used, to a host under the reserved
+    /// `.invalid` domain: every query fails at once.
+    fn unreachable_pool() -> PgPool {
+        PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(1))
+            .connect_lazy("postgres://aegis@aegis-health-test.invalid:5432/aegis")
+            .expect("a well-formed URL builds a lazy pool")
+    }
+
+    /// Start the relay's real cluster gRPC server — the handler the relay
+    /// builds, served by the function the relay serves it with — on an
+    /// ephemeral loopback port. Returns a health client and the shutdown
+    /// sender.
+    async fn start_relay(
+        pool: &PgPool,
+        readiness: Vec<ReadinessCheck>,
+    ) -> (HealthClient<Channel>, tokio::sync::oneshot::Sender<()>) {
+        let config = NodeConfigManifest::default();
+        let secrets_manager = SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            Arc::new(EventBus::new(16)),
+        );
+        let RelayCluster { handler, .. } =
+            build_relay_cluster(&config, pool, &secrets_manager, &None, "127.0.0.1:0");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(serve_relay_cluster(
+            listener,
+            handler,
+            readiness,
+            Duration::from_millis(25),
+            async {
+                let _ = rx.await;
+            },
+        ));
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("valid URI")
+            .connect()
+            .await
+            .expect("connect to the relay's cluster server");
+        (HealthClient::new(channel), tx)
+    }
+
+    /// Ask for `service`'s status until it is `expected` or 10 s pass.
+    /// Fails at once, naming the cause, if the health service is absent.
+    async fn wait_for_status(
+        client: &mut HealthClient<Channel>,
+        service: &str,
+        expected: ServingStatus,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = client
+                .check(HealthCheckRequest {
+                    service: service.to_string(),
+                })
+                .await
+                .map_err(|e| {
+                    format!(
+                        "the relay's cluster gRPC server does not implement \
+                         grpc.health.v1.Health (service {service:?}): {e}"
+                    )
+                })?
+                .into_inner()
+                .status;
+            if status == expected as i32 {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "service {service:?} reported status {status}, expected {expected:?}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The pod probes `grpc_health_probe -addr=localhost:50056`. With the
+    /// relay's database unreachable, its server must answer the probe, and
+    /// answer NOT_SERVING, for the overall server and for NodeClusterService.
+    #[tokio::test]
+    async fn relay_server_answers_grpc_health_not_serving_while_its_database_is_unreachable() {
+        let pool = unreachable_pool();
+        let (mut client, _shutdown) = start_relay(&pool, relay_readiness(&pool)).await;
+        let mut failures = Vec::new();
+        for service in [OVERALL, NODE_CLUSTER_SERVICE] {
+            if let Err(e) = wait_for_status(&mut client, service, ServingStatus::NotServing).await {
+                failures.push(e);
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// With every dependency up, the relay's server answers SERVING; when a
+    /// dependency goes down it answers NOT_SERVING; when it returns, SERVING.
+    #[tokio::test]
+    async fn relay_server_reports_serving_and_not_serving_as_its_dependency_changes() {
+        let pool = unreachable_pool();
+        let up = Arc::new(AtomicBool::new(true));
+        let check_up = up.clone();
+        let readiness: Vec<ReadinessCheck> = vec![readiness_check(move || {
+            let up = check_up.load(Ordering::SeqCst);
+            async move { up }
+        })];
+        let (mut client, _shutdown) = start_relay(&pool, readiness).await;
+        let mut failures = Vec::new();
+        for (phase, dependency_up, expected) in [
+            ("dependency up", true, ServingStatus::Serving),
+            ("dependency down", false, ServingStatus::NotServing),
+            ("dependency back", true, ServingStatus::Serving),
+        ] {
+            up.store(dependency_up, Ordering::SeqCst);
+            for service in [OVERALL, NODE_CLUSTER_SERVICE] {
+                if let Err(e) = wait_for_status(&mut client, service, expected).await {
+                    failures.push(format!("{phase}: {e}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     /// Regression for the relay-coordinator startup crash-loop. Previously
     /// `cli/src/daemon/server.rs:631` hard-required `spec.storage` for every
