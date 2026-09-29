@@ -1,4 +1,26 @@
-# AGENTS.md — Bootstrap for aegis-orchestrator
+# Agent bootstrap: start at the Council
+
+This file is a bootstrap, not documentation. It holds the address of the contract, not the contract, and it loses every conflict with the cortex: where the two disagree, the cortex is right and this file is stale.
+
+## Ground in this order
+
+1. `cortex.ground` on instance `100monkeys-ai`; its payload lists every workspace with its UUID. Name the `council` workspace by that UUID and read the Council `home`, then `roster`.
+2. Ground in this repository's workspace, `aegis-architecture`, whose project manager is the `zaru-fleet` seat on the roster, and read its landing page.
+3. Read the brief you were handed, by your project manager where the roster names one.
+
+AEGIS public documentation is the `aegis` workspace, which has no seat; the `zaru-fleet` seat may claim it.
+
+## Every cortex call names its workspace
+
+"Pass your task's workspace as `workspace` on every call from here on; never call `me.set_current_workspace`, whose pointer every session on the token shares." The UUIDs come from `cortex.ground`; this file carries none.
+
+## Where the contract lives
+
+In the workspace grounding `cortex.ground` returns, and in the pages the roster names for this repository's seat, where it has one: contract, ledger, directives, rulings. Nothing here restates them.
+
+`CLAUDE.md` is a symlink to this file, `AGENTS.md`; edit only this file.
+
+## AGENTS.md — Bootstrap for aegis-orchestrator
 
 This file is a **bootstrap**, not the engineering contract. The contract — architecture, decisions, operating principles, testing, commit workflow, the autonomy boundary, every lesson already learned — lives in the AEGIS Architecture workspace of the cortex at `https://100monkeys-ai.cortex.page/aegis-architecture/`. Read this file once, ground against that workspace, and work from there. **Where this file and the workspace disagree, the workspace wins and this file is stale.**
 
@@ -18,9 +40,9 @@ This file is a **bootstrap**, not the engineering contract. The contract — arc
 
 **An agent's job ends at commit and push.** CI builds and publishes the image. Jeshua handles every deployment, dev and production alike.
 
-## The repository map is one directory up
+## The repository map is on the Council
 
-`../CLAUDE.md` in the local monorepo directory maps every 100monkeys-ai repository to the workspace that governs it, and carries the instructions for attaching the cortex MCP server if it is not present in your session. **`zaru-client` and `zaru-marketing` are governed by the `zaru` workspace, not by this one.**
+The Council page `repository-bootstrap` maps every 100monkeys-ai repository to the workspace and seat that govern it. **`zaru-client` and `zaru-marketing` are governed by the `zaru` workspace, not by this one.**
 
 ## Modifying this file
 
