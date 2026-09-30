@@ -34,8 +34,8 @@
 
 use crate::domain::events::ImageManagementEvent;
 use crate::domain::runtime::{
-    AgentRuntime, ContainerEngineKind, InstanceId, InstanceStatus, RuntimeConfig, RuntimeError,
-    TaskInput, TaskOutput,
+    AgentRuntime, ContainerEngineKind, InstanceId, InstanceStatus, ResourceLimits, RuntimeConfig,
+    RuntimeError, TaskInput, TaskOutput,
 };
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::image_manager::{
@@ -103,6 +103,102 @@ pub(crate) const FUSE_UNMOUNT_TIMEOUT_SECS: u64 = 10;
 /// probe is a pure registry read on the daemon side and must return in
 /// microseconds; a 2s ceiling means a wedged daemon is detected fast.
 pub(crate) const FUSE_HEALTH_TIMEOUT_SECS: u64 = 2;
+
+/// Environment variable holding the default memory cap, in bytes, for an agent
+/// container whose manifest sets none (AEGIS ADR-123, trigger clause 6).
+pub const AGENT_DEFAULT_MEMORY_BYTES_ENV: &str = "AEGIS_AGENT_DEFAULT_MEMORY_BYTES";
+
+/// Environment variable holding the default CPU cap, in millicores (1000 = one
+/// core), for an agent container whose manifest sets none (AEGIS ADR-123,
+/// trigger clause 6).
+pub const AGENT_DEFAULT_CPU_MILLIS_ENV: &str = "AEGIS_AGENT_DEFAULT_CPU_MILLIS";
+
+/// Memory and CPU caps applied to an agent container whose manifest sets none.
+///
+/// A value the manifest sets always wins. A `None` here means no default for
+/// that resource: the container is capped only if its manifest caps it. Read
+/// once, when the runtime is constructed, from
+/// [`AGENT_DEFAULT_MEMORY_BYTES_ENV`] and [`AGENT_DEFAULT_CPU_MILLIS_ENV`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentResourceDefaults {
+    /// Default memory cap in bytes (`HostConfig.Memory`).
+    pub memory_bytes: Option<u64>,
+    /// Default CPU cap in millicores (`HostConfig.NanoCpus` / 1_000_000).
+    pub cpu_millis: Option<u32>,
+}
+
+impl AgentResourceDefaults {
+    /// Read the defaults from the orchestrator's environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::SpawnFailed`] when a variable is set to anything
+    /// other than a positive integer, so a mistyped cap stops the orchestrator
+    /// at startup instead of leaving every agent container uncapped.
+    pub fn from_env() -> Result<Self, RuntimeError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Read the defaults through `lookup`, which maps a variable name to its
+    /// value. An unset or empty variable means no default.
+    pub(crate) fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, RuntimeError> {
+        let memory_bytes = parse_agent_default::<u64>(&lookup, AGENT_DEFAULT_MEMORY_BYTES_ENV)?;
+        if let Some(bytes) = memory_bytes {
+            if i64::try_from(bytes).is_err() {
+                return Err(RuntimeError::SpawnFailed(format!(
+                    "{AGENT_DEFAULT_MEMORY_BYTES_ENV} must be at most {}, got {bytes}",
+                    i64::MAX
+                )));
+            }
+        }
+        let cpu_millis = parse_agent_default::<u32>(&lookup, AGENT_DEFAULT_CPU_MILLIS_ENV)?;
+        Ok(Self {
+            memory_bytes,
+            cpu_millis,
+        })
+    }
+}
+
+fn parse_agent_default<T>(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<Option<T>, RuntimeError>
+where
+    T: std::str::FromStr + Default + PartialEq,
+{
+    let Some(raw) = lookup(name) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.parse::<T>() {
+        Ok(value) if value != T::default() => Ok(Some(value)),
+        _ => Err(RuntimeError::SpawnFailed(format!(
+            "{name} must be a positive integer, got {trimmed:?}"
+        ))),
+    }
+}
+
+/// Apply the memory and CPU caps to an agent container's host config: for each
+/// resource, the manifest's value when it sets one, else the configured default.
+pub(crate) fn apply_resource_limits(
+    host_config: &mut bollard::models::HostConfig,
+    limits: &ResourceLimits,
+    defaults: &AgentResourceDefaults,
+) {
+    if let Some(memory_bytes) = limits.memory_bytes.or(defaults.memory_bytes) {
+        host_config.memory = Some(memory_bytes as i64);
+    }
+    if let Some(cpu_millis) = limits.cpu_millis.or(defaults.cpu_millis) {
+        // Docker nano_cpus: 1 CPU = 1_000_000_000 (1e9) nano CPUs, 1000 millicores = 1 CPU
+        // Therefore: 1 millicore = 1_000_000 nano CPUs, so 1000m (1 CPU) = 1_000_000_000 nano CPUs.
+        host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000_000 / 1000);
+    }
+}
 
 /// Wrap a FUSE Mount call in [`FUSE_MOUNT_TIMEOUT_SECS`] and map the
 /// elapsed-deadline branch to [`RuntimeError::FuseMountTimeout`].
@@ -257,6 +353,9 @@ pub struct ContainerRuntime {
     /// Without this, agent containers using gRPC FUSE mounts leave orphaned
     /// mountpoints that spam `DirectoryListed` events every 2 seconds.
     grpc_fuse_mounts: RwLock<HashMap<String, Vec<(String, String)>>>,
+    /// Memory and CPU caps for an agent container whose manifest sets none
+    /// (AEGIS ADR-123, trigger clause 6).
+    agent_resource_defaults: AgentResourceDefaults,
 }
 
 /// Configuration bundle for constructing a [`ContainerRuntime`].
@@ -372,6 +471,13 @@ impl ContainerRuntime {
         };
         info!(engine = ?engine, "Container engine detected");
 
+        let agent_resource_defaults = AgentResourceDefaults::from_env()?;
+        info!(
+            memory_bytes = ?agent_resource_defaults.memory_bytes,
+            cpu_millis = ?agent_resource_defaults.cpu_millis,
+            "Agent container default resource caps (applied when the manifest sets none)"
+        );
+
         Ok(Self {
             docker,
             bootstrap_script_path: bootstrap_path,
@@ -390,6 +496,7 @@ impl ContainerRuntime {
             fuse_mount_client,
             fuse_mount_handles: RwLock::new(HashMap::new()),
             grpc_fuse_mounts: RwLock::new(HashMap::new()),
+            agent_resource_defaults,
         })
     }
 
@@ -865,15 +972,12 @@ impl AgentRuntime for ContainerRuntime {
             ..Default::default()
         };
 
-        // Apply resource limits if specified
-        if let Some(memory_bytes) = config.resources.memory_bytes {
-            host_config.memory = Some(memory_bytes as i64);
-        }
-        if let Some(cpu_millis) = config.resources.cpu_millis {
-            // Docker nano_cpus: 1 CPU = 1_000_000_000 (1e9) nano CPUs, 1000 millicores = 1 CPU
-            // Therefore: 1 millicore = 1_000_000 nano CPUs, so 1000m (1 CPU) = 1_000_000_000 nano CPUs.
-            host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000_000 / 1000);
-        }
+        // Apply resource limits: the manifest's, else the configured defaults
+        apply_resource_limits(
+            &mut host_config,
+            &config.resources,
+            &self.agent_resource_defaults,
+        );
 
         // ─── Volume mounts: gRPC FUSE (ADR-107) → local FUSE (ADR-107) → NFS (ADR-036) ──
         // FUSE mount handles must outlive the container. We collect them here and
@@ -2163,6 +2267,127 @@ mod tests {
                 assert!(msg.contains("vol"), "msg={msg}");
             }
             other => panic!("expected SpawnFailed, got {other:?}"),
+        }
+    }
+
+    // ── Agent container default caps (AEGIS ADR-123, trigger clause 6) ──────
+
+    fn resource_limits(memory_bytes: Option<u64>, cpu_millis: Option<u32>) -> ResourceLimits {
+        ResourceLimits {
+            cpu_millis,
+            memory_bytes,
+            disk_bytes: None,
+            timeout_seconds: None,
+        }
+    }
+
+    const DEFAULTS: super::AgentResourceDefaults = super::AgentResourceDefaults {
+        memory_bytes: Some(2 * 1024 * 1024 * 1024),
+        cpu_millis: Some(1000),
+    };
+
+    #[test]
+    fn container_config_without_limits_gets_the_configured_defaults() {
+        let mut host_config = bollard::models::HostConfig::default();
+
+        super::apply_resource_limits(&mut host_config, &resource_limits(None, None), &DEFAULTS);
+
+        assert_eq!(host_config.memory, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(host_config.nano_cpus, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn container_config_with_limits_keeps_its_own() {
+        let mut host_config = bollard::models::HostConfig::default();
+
+        super::apply_resource_limits(
+            &mut host_config,
+            &resource_limits(Some(512 * 1024 * 1024), Some(250)),
+            &DEFAULTS,
+        );
+
+        assert_eq!(host_config.memory, Some(512 * 1024 * 1024));
+        assert_eq!(host_config.nano_cpus, Some(250_000_000));
+    }
+
+    #[test]
+    fn container_config_with_one_limit_takes_the_default_for_the_other() {
+        let mut host_config = bollard::models::HostConfig::default();
+
+        super::apply_resource_limits(
+            &mut host_config,
+            &resource_limits(Some(512 * 1024 * 1024), None),
+            &DEFAULTS,
+        );
+
+        assert_eq!(host_config.memory, Some(512 * 1024 * 1024));
+        assert_eq!(host_config.nano_cpus, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn no_limits_and_no_defaults_leave_the_container_uncapped() {
+        let mut host_config = bollard::models::HostConfig::default();
+
+        super::apply_resource_limits(
+            &mut host_config,
+            &resource_limits(None, None),
+            &super::AgentResourceDefaults::default(),
+        );
+
+        assert_eq!(host_config.memory, None);
+        assert_eq!(host_config.nano_cpus, None);
+    }
+
+    fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn agent_defaults_are_read_from_the_two_variables() {
+        let defaults = super::AgentResourceDefaults::from_lookup(lookup_from(&[
+            (super::AGENT_DEFAULT_MEMORY_BYTES_ENV, "2147483648"),
+            (super::AGENT_DEFAULT_CPU_MILLIS_ENV, " 1000 "),
+        ]))
+        .expect("valid values parse");
+
+        assert_eq!(defaults, DEFAULTS);
+    }
+
+    #[test]
+    fn agent_defaults_unset_or_empty_mean_no_default() {
+        let unset =
+            super::AgentResourceDefaults::from_lookup(lookup_from(&[])).expect("unset parses");
+        let empty = super::AgentResourceDefaults::from_lookup(lookup_from(&[
+            (super::AGENT_DEFAULT_MEMORY_BYTES_ENV, ""),
+            (super::AGENT_DEFAULT_CPU_MILLIS_ENV, "  "),
+        ]))
+        .expect("empty parses");
+
+        assert_eq!(unset, super::AgentResourceDefaults::default());
+        assert_eq!(empty, super::AgentResourceDefaults::default());
+    }
+
+    #[test]
+    fn agent_defaults_refuse_a_value_that_is_not_a_positive_integer() {
+        for (name, value) in [
+            (super::AGENT_DEFAULT_MEMORY_BYTES_ENV, "2g"),
+            (super::AGENT_DEFAULT_MEMORY_BYTES_ENV, "0"),
+            (super::AGENT_DEFAULT_MEMORY_BYTES_ENV, "-1"),
+            (super::AGENT_DEFAULT_MEMORY_BYTES_ENV, "9223372036854775808"),
+            (super::AGENT_DEFAULT_CPU_MILLIS_ENV, "1.5"),
+            (super::AGENT_DEFAULT_CPU_MILLIS_ENV, "0"),
+        ] {
+            let result = super::AgentResourceDefaults::from_lookup(lookup_from(&[(name, value)]));
+            match result {
+                Err(super::RuntimeError::SpawnFailed(msg)) => {
+                    assert!(msg.contains(name), "{name}={value}: {msg}");
+                }
+                other => panic!("{name}={value}: expected SpawnFailed, got {other:?}"),
+            }
         }
     }
 }

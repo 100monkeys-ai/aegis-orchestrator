@@ -100,6 +100,8 @@ To build the Temporal Worker image locally, clone [aegis-temporal-worker](https:
 - **RUST_LOG**: Logging level (default: `info,aegis_orchestrator=debug`)
 - **TEMPORAL_ADDRESS**: Temporal server address (default: `temporal:7233`)
 - **TEMPORAL_WORKER_URL**: Temporal worker HTTP API URL (default: `http://temporal-worker:3000`)
+- **AEGIS_AGENT_DEFAULT_MEMORY_BYTES**: memory cap, in bytes, for an agent container whose manifest sets none (for example `2147483648` for 2 GiB). A manifest's own `memory` wins. Unset or empty: no default, and such a container has no memory cap. Anything other than a positive integer stops the orchestrator at startup.
+- **AEGIS_AGENT_DEFAULT_CPU_MILLIS**: CPU cap, in millicores (`1000` is one core), for an agent container whose manifest sets none. A manifest's own `cpu` wins. Unset or empty: no default, and such a container has no CPU cap. Anything other than a positive integer stops the orchestrator at startup.
 
 ## Development
 
