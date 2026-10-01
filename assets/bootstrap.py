@@ -21,6 +21,7 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE):
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -191,7 +192,10 @@ def post_json(payload: dict, timeout: int = 0) -> dict:
 
     timeout=0 means no timeout (required when waiting for LLM responses or
     long-running dispatch results — see ADR-040 §bootstrap.py Dispatch Loop).
-    Exits the process with status 1 if all candidates fail.
+    Only a failure to reach a candidate (refused, unresolvable, unreachable)
+    tries the next one. A request that was delivered and not answered within
+    ``timeout`` is not re-sent anywhere: the process exits with status 1
+    naming the URL and the seconds. Exits with status 1 if all candidates fail.
     """
     data = json.dumps(payload).encode("utf-8")
     errors = []
@@ -217,6 +221,21 @@ def post_json(payload: dict, timeout: int = 0) -> dict:
             debug_print(f"HTTP error: {base_url}: HTTP {e.code} {e.reason} — {body}")
             print(
                 f"Error: Orchestrator returned HTTP {e.code}: {body}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            # Raised while connecting or sending: the request did not reach
+            # this candidate, so the next one is tried.
+            err = f"{base_url}: {e}"
+            errors.append(err)
+            debug_print(f"Connection error: {err}")
+        except (socket.timeout, TimeoutError):
+            # The request was delivered and no answer came within the
+            # timeout. Re-sending it elsewhere would only repeat the work.
+            print(
+                f"Error: no answer from {url} within {timeout} s "
+                "(AEGIS_LLM_TIMEOUT_SECONDS)",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -309,6 +328,25 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
                 "exit_code": -1,
                 "stdout": "",
                 "stderr": f"[AEGIS] Command timed out after {timeout_secs}s",
+                "duration_ms": duration_ms,
+                "truncated": False,
+            }
+        except OSError as e:
+            # The command could not be started at all: a missing cwd or
+            # shell (FileNotFoundError), a cwd that is not a directory or
+            # not permitted. Reported as the shell would report it (127 for
+            # a missing file, 126 otherwise) so the model sees a tool error
+            # and the loop goes on.
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            exit_code = 127 if isinstance(e, FileNotFoundError) else 126
+            debug_print(f"exec could not start: {e}")
+            return {
+                "type": "dispatch_result",
+                "execution_id": execution_id,
+                "dispatch_id": dispatch_id,
+                "exit_code": exit_code,
+                "stdout": "",
+                "stderr": f"[AEGIS] cannot run command: {e}",
                 "duration_ms": duration_ms,
                 "truncated": False,
             }

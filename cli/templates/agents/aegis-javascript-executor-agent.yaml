@@ -95,6 +95,14 @@ spec:
 
       {{input}}
 
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+      mount_path: "/workspace"
+      access_mode: "read-write"
+      size_limit: "1Gi"
+      ttl_hours: 1
+
   execution:
     mode: iterative
     max_iterations: 3

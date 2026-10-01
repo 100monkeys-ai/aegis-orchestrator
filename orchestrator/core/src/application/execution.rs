@@ -322,6 +322,11 @@ impl StandardExecutionService {
     const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 3] =
         ["instruction", "iteration_number", "previous_error"];
 
+    /// First-class template variables a context override is left out for
+    /// rather than refused, because a workflow's blackboard always has them
+    /// ([`Self::render_task`]).
+    const FIRST_CLASS_TEMPLATE_KEYS: [&'static str; 2] = ["input", "intent"];
+
     fn resolve_tenant_from_payload(payload: &serde_json::Value) -> Result<TenantId> {
         let tenant = payload
             .get("tenant_id")
@@ -341,6 +346,17 @@ impl StandardExecutionService {
 
     fn is_workspace_mount(path: &str) -> bool {
         path == "/workspace" || path.starts_with("/workspace/")
+    }
+
+    /// The SeaweedFS filer a mount names, or the local fallback.
+    fn filer_url(&self) -> String {
+        self.config
+            .spec
+            .storage
+            .as_ref()
+            .and_then(|s| s.seaweedfs.as_ref())
+            .map(|sf| sf.filer_url.expose().to_string())
+            .unwrap_or_else(|| "http://localhost:8888".to_string())
     }
 
     fn build_borrowed_mount(
@@ -367,10 +383,39 @@ impl StandardExecutionService {
         // Look up actually-provisioned volumes for the parent execution (not the
         // agent manifest declarations, which may be absent for dynamically created
         // volumes).
-        let parent_volumes = self
+        let mut parent_volumes = self
             .volume_service
             .list_volumes_by_ownership(&VolumeOwnership::execution(parent_execution_id))
             .await?;
+        // A workflow's Agent state runs in its workflow's workspace, which the
+        // workflow execution owns, not the state's execution (ADR-087): it is
+        // found by the state's registration with the NFS gateway.
+        if let Some(gateway) = self.nfs_gateway.as_ref() {
+            for ctx in gateway
+                .volume_registry()
+                .find_all_by_execution(parent_execution_id)
+            {
+                let Some(workflow_execution_id) = ctx.workflow_execution_id else {
+                    continue;
+                };
+                if parent_volumes.iter().any(|v| v.id == ctx.volume_id) {
+                    continue;
+                }
+                let volume = self
+                    .volume_service
+                    .get_volume(ctx.volume_id)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Judge execution {child_execution_id}: workflow workspace {} of parent execution {parent_execution_id} not found",
+                            ctx.volume_id
+                        )
+                    })?;
+                if volume.ownership == VolumeOwnership::workflow(workflow_execution_id) {
+                    parent_volumes.push(volume);
+                }
+            }
+        }
         if parent_volumes.is_empty() {
             return Ok(Vec::new());
         }
@@ -437,14 +482,7 @@ impl StandardExecutionService {
             write: vec![],
         };
         let mut mounts = Vec::with_capacity(borrowed.len());
-        let filer_url = self
-            .config
-            .spec
-            .storage
-            .as_ref()
-            .and_then(|s| s.seaweedfs.as_ref())
-            .map(|sf| sf.filer_url.expose().to_string())
-            .unwrap_or_else(|| "http://localhost:8888".to_string());
+        let filer_url = self.filer_url();
         for (alias_volume_id, source_volume, mount_point) in borrowed {
             gateway.register_borrowed_volume(alias_volume_id, child_execution_id, source_volume);
             let mount =
@@ -1743,6 +1781,274 @@ mod tests {
         );
     }
 
+    /// T7: a workflow Agent state's context overrides are the worker's whole
+    /// blackboard (`aegis-temporal-worker` sends it as `context_json`), which
+    /// carries its own `input` (the workflow's input object) and `intent` (the
+    /// workflow's intent). They must not replace the state's own `{{input}}`
+    /// and `{{intent}}`: production rendered `[object]` for `{{input}}` and the
+    /// code validator never saw its state's input.
+    #[test]
+    fn render_task_keeps_the_states_input_and_intent_over_context_overrides() {
+        let mut agent = make_agent("validator-agent", None, None);
+        if let Some(task) = agent.manifest.spec.task.as_mut() {
+            task.prompt_template = Some("{{intent}}|{{input}}".to_string());
+        }
+
+        let input = ExecutionInput {
+            intent: Some("Validate /workspace/solution.py".to_string()),
+            input: serde_json::json!({
+                "workflow_input": "File: /workspace/solution.py",
+                "context_overrides": {
+                    "input": { "inputs": { "a": 1 } },
+                    "intent": "wf intent",
+                },
+            }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+
+        let rendered = StandardExecutionService::render_task(&input, &agent)
+            .unwrap()
+            .expect("structured input renders the template");
+
+        assert_eq!(
+            rendered,
+            "Validate /workspace/solution.py|File: /workspace/solution.py"
+        );
+    }
+
+    /// The other context override keys still reach the template as extras.
+    #[test]
+    fn render_task_still_renders_other_context_override_keys() {
+        let mut agent = make_agent("worker", None, None);
+        if let Some(task) = agent.manifest.spec.task.as_mut() {
+            task.prompt_template = Some("{{input}}|{{language}}".to_string());
+        }
+
+        let input = ExecutionInput {
+            intent: None,
+            input: serde_json::json!({
+                "workflow_input": "write it",
+                "context_overrides": { "input": { "x": 1 }, "language": "python" },
+            }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+
+        let rendered = StandardExecutionService::render_task(&input, &agent)
+            .unwrap()
+            .expect("structured input renders the template");
+
+        assert_eq!(rendered, "write it|python");
+    }
+
+    /// Build a service over in-memory repositories whose runtime records every
+    /// spawn, with an NFS gateway, for the workflow-workspace mount tests.
+    async fn workspace_mount_service(
+        tenant_id: &CoreTenantId,
+        agents: &[&Agent],
+        volumes: HashMap<VolumeId, Volume>,
+        executions: &[&Execution],
+    ) -> (
+        StandardExecutionService,
+        Arc<TestRuntime>,
+        Arc<NfsGatewayService>,
+    ) {
+        let storage_root = tempfile::tempdir().unwrap();
+        let storage_provider: Arc<dyn StorageProvider> =
+            Arc::new(LocalHostStorageProvider::new(storage_root.path()).unwrap());
+        let volume_repository: Arc<dyn VolumeRepository> =
+            Arc::new(InMemoryVolumeRepository::new());
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let nfs_gateway = Arc::new(NfsGatewayService::new(
+            storage_provider,
+            volume_repository,
+            Arc::new(EventBusPublisher::new(event_bus.clone())),
+            Some(0),
+        ));
+
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        for agent in agents {
+            agent_repo.save_for_tenant(tenant_id, agent).await.unwrap();
+        }
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        for execution in executions {
+            execution_repo
+                .save_for_tenant(tenant_id, execution)
+                .await
+                .unwrap();
+        }
+
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
+        let service = StandardExecutionService::new(
+            agent_repo,
+            Arc::new(TestVolumeService { volumes }),
+            supervisor,
+            execution_repo,
+            event_bus,
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        )
+        .with_nfs_gateway(nfs_gateway.clone());
+
+        (service, runtime, nfs_gateway)
+    }
+
+    fn workflow_step_input(
+        workspace_volume_id: VolumeId,
+        workflow_execution_id: uuid::Uuid,
+    ) -> ExecutionInput {
+        ExecutionInput {
+            intent: Some("write the code".to_string()),
+            input: serde_json::json!({
+                "tenant_id": "zaru-consumer",
+                "workflow_input": "Compute it",
+            }),
+            workspace_volume_id: Some(workspace_volume_id),
+            workspace_volume_mount_path: Some(PathBuf::from("/workspace")),
+            workspace_remote_path: Some(format!(
+                "/aegis/volumes/zaru-consumer/{workspace_volume_id}"
+            )),
+            workflow_execution_id: Some(workflow_execution_id),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// T1: an Agent state of a workflow runs in a container whose /workspace is
+    /// the workflow's workspace volume, the one fs.* writes to, so a cmd.run
+    /// with cwd /workspace sees the files fs.write wrote.
+    #[tokio::test]
+    async fn workflow_workspace_is_mounted_read_write_in_the_agents_container() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("executor", None, None);
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+
+        let workspace = VolumeId::new();
+        let workflow_execution_id = uuid::Uuid::new_v4();
+        service
+            .start_execution(
+                agent.id,
+                workflow_step_input(workspace, workflow_execution_id),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        assert_eq!(spawned.volumes.len(), 1, "volumes: {:?}", spawned.volumes);
+        assert_eq!(spawned.volumes[0].volume_id, workspace);
+        assert_eq!(spawned.volumes[0].mount_point, PathBuf::from("/workspace"));
+        assert_eq!(spawned.volumes[0].access_mode, AccessMode::ReadWrite);
+        assert_eq!(
+            spawned.volumes[0].remote_path,
+            format!("/aegis/volumes/zaru-consumer/{workspace}")
+        );
+        assert_eq!(spawned.workflow_execution_id, Some(workflow_execution_id));
+    }
+
+    /// T2: a manifest volume at the workflow workspace's mount path is not
+    /// created for a workflow execution; the workflow's workspace takes its
+    /// place, so the Agent state and the later ContainerRun see one volume.
+    #[tokio::test]
+    async fn manifest_volume_at_the_workspace_path_yields_to_the_workflow_workspace() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("executor", None, Some("/workspace"));
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+
+        let workspace = VolumeId::new();
+        service
+            .start_execution(
+                agent.id,
+                workflow_step_input(workspace, uuid::Uuid::new_v4()),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        assert_eq!(spawned.volumes.len(), 1, "volumes: {:?}", spawned.volumes);
+        assert_eq!(spawned.volumes[0].volume_id, workspace);
+        assert_eq!(spawned.volumes[0].mount_point, PathBuf::from("/workspace"));
+    }
+
+    /// A judge of a workflow's Agent state reads the workspace its worker wrote
+    /// to, read-only, as it reads a worker's own volumes (ADR-049).
+    #[tokio::test]
+    async fn judge_inherits_the_workflow_workspace_of_its_worker() {
+        let tenant_id = CoreTenantId::consumer();
+        let parent_agent = make_agent("worker", None, None);
+        let judge_agent = make_agent("judge", Some("judge"), None);
+        let parent_execution = make_parent_execution(parent_agent.id);
+        let workflow_execution_id = uuid::Uuid::new_v4();
+
+        let mut workspace = Volume::new(
+            format!("workspace-{}", parent_execution.id),
+            tenant_id.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: PathBuf::from("/tmp/workflow-workspace"),
+            },
+            1024 * 1024,
+            VolumeOwnership::workflow(workflow_execution_id),
+        )
+        .unwrap();
+        workspace.mark_available().unwrap();
+
+        let (service, runtime, gw) = workspace_mount_service(
+            &tenant_id,
+            &[&parent_agent, &judge_agent],
+            HashMap::from([(workspace.id, workspace.clone())]),
+            &[&parent_execution],
+        )
+        .await;
+        gw.register_volume(VolumeRegistration {
+            volume_id: workspace.id,
+            execution_id: parent_execution.id,
+            workflow_execution_id: Some(workflow_execution_id),
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: FsalAccessPolicy {
+                read: vec!["/*".to_string()],
+                write: vec!["/*".to_string()],
+            },
+            mount_point: PathBuf::from("/workspace"),
+            remote_path: String::new(),
+        });
+
+        service
+            .start_child_execution(
+                judge_agent.id,
+                ExecutionInput {
+                    intent: Some("judge".to_string()),
+                    input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                    attachments: Vec::new(),
+                },
+                parent_execution.id,
+            )
+            .await
+            .unwrap();
+
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        assert_eq!(spawned.volumes.len(), 1, "volumes: {:?}", spawned.volumes);
+        assert_eq!(spawned.volumes[0].mount_point, PathBuf::from("/workspace"));
+        assert_eq!(spawned.volumes[0].access_mode, AccessMode::ReadOnly);
+    }
+
     #[tokio::test]
     async fn cross_tenant_child_spawn_is_rejected() {
         let tenant_id = CoreTenantId::consumer();
@@ -2289,6 +2595,16 @@ impl StandardExecutionService {
     /// The template controls layout; the caller's `intent` is passed through
     /// unmodified (no hardcoded prepend logic).
     ///
+    /// The `context_overrides` object's keys are further template variables,
+    /// with one precedence: an override never replaces a first-class
+    /// variable. Its `input` and `intent` keys are left out, so `{{input}}`
+    /// and `{{intent}}` are always the caller's; `instruction`,
+    /// `iteration_number` and `previous_error` are refused outright
+    /// (`RESERVED_CONTEXT_OVERRIDE_KEYS`). A workflow's Agent state is the
+    /// case this exists for: the Temporal worker sends the whole blackboard
+    /// as the overrides, whose own `input` (the workflow's input object) and
+    /// `intent` (the workflow's intent) are not the state's.
+    ///
     /// This is the one rendering: the worker's prompt, the outer-loop judges'
     /// `task` (the supervisor's `ValidationContext.task`) and the inner-loop
     /// tool judge's `task` are all this text, the last rendered again from
@@ -2372,7 +2688,13 @@ impl StandardExecutionService {
                 context = context.intent(caller_intent.clone());
             }
 
-            context.extras = context_overrides.into_iter().collect();
+            // The overrides never replace the first-class variables (see the
+            // doc comment): a workflow's blackboard carries its own `input`
+            // and `intent`, which would otherwise win over the state's.
+            context.extras = context_overrides
+                .into_iter()
+                .filter(|(key, _)| !Self::FIRST_CLASS_TEMPLATE_KEYS.contains(&key.as_str()))
+                .collect();
 
             let template_engine = PromptTemplateEngine::new();
             let rendered_prompt_local = template_engine
@@ -2870,12 +3192,60 @@ impl StandardExecutionService {
             }
         };
 
+        // The workflow's workspace volume (ADR-087), when this execution is a
+        // workflow's Agent state: mounted read-write at its mount path in the
+        // agent's container, so cmd.run sees what fs.* writes. A manifest
+        // volume at the same path is not created for this execution; the
+        // workflow's workspace takes its place, so every state of the workflow
+        // and its ContainerRun steps see one volume.
+        let workflow_workspace = workspace_volume_id.map(|vol_id| {
+            let mount_path = workspace_volume_mount_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/workspace"));
+            let remote_path = workspace_remote_path
+                .clone()
+                .unwrap_or_else(|| format!("/aegis/volumes/{}/{}", tenant_id, vol_id));
+            VolumeMount::new(
+                vol_id,
+                mount_path,
+                AccessMode::ReadWrite,
+                FilerEndpoint::new(self.filer_url()).expect("valid fallback filer endpoint"),
+                remote_path,
+            )
+        });
+        let manifest_volume_specs = agent
+            .manifest
+            .spec
+            .volumes
+            .iter()
+            .filter(|spec| match &workflow_workspace {
+                Some(workspace) => {
+                    let declared = spec.mount_path.trim_end_matches('/');
+                    let workflow = workspace.mount_point.to_string_lossy();
+                    if declared == workflow.trim_end_matches('/') {
+                        tracing::info!(
+                            "Volume '{}' at {} yields to the workflow workspace {} for execution {}",
+                            spec.name,
+                            spec.mount_path,
+                            workspace.volume_id,
+                            execution_id.0
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
         // Create volumes from manifest if specified
         tracing::info!(
             "Checking for volumes in agent manifest: {} volume(s) specified",
             agent.manifest.spec.volumes.len()
         );
-        let volume_mounts = if !agent.manifest.spec.volumes.is_empty() {
+        let volume_mounts = if !manifest_volume_specs.is_empty() {
             tracing::info!("Creating volumes for execution {}", execution_id.0);
 
             // Get storage config from node config
@@ -2894,7 +3264,7 @@ impl StandardExecutionService {
                 .create_volumes_for_execution(
                     execution_id,
                     tenant_id.clone(),
-                    &agent.manifest.spec.volumes,
+                    &manifest_volume_specs,
                     &storage_config.backend,
                 )
                 .await?;
@@ -2906,10 +3276,7 @@ impl StandardExecutionService {
                 .iter()
                 .map(|volume| {
                     // Find corresponding spec to get mount_path and access_mode
-                    let spec = agent
-                        .manifest
-                        .spec
-                        .volumes
+                    let spec = manifest_volume_specs
                         .iter()
                         .find(|s| s.name == volume.name)
                         .expect("Volume spec not found for created volume");
@@ -2927,9 +3294,10 @@ impl StandardExecutionService {
         };
 
         // Mount policy: all mount points must live under /workspace, and must not overlap.
-        if !volume_mounts.is_empty() {
+        if !volume_mounts.is_empty() || workflow_workspace.is_some() {
             let mut mount_paths = volume_mounts
                 .iter()
+                .chain(workflow_workspace.iter())
                 .map(|m| m.mount_point.to_string_lossy().to_string())
                 .collect::<Vec<String>>();
             mount_paths.sort();
@@ -2992,12 +3360,10 @@ impl StandardExecutionService {
         // This volume already exists — we only need to register it, not create it.
         // We also persist a Volume record to the DB so AegisFSAL::authorize() finds it
         // on any replica (HA correctness — the NFS registry is in-memory/node-local).
-        if let (Some(vol_id), mount_path) = (
-            workspace_volume_id,
-            workspace_volume_mount_path.unwrap_or_else(|| std::path::PathBuf::from("/workspace")),
-        ) {
-            let remote_path = workspace_remote_path
-                .unwrap_or_else(|| format!("/aegis/volumes/{}/{}", tenant_id, vol_id));
+        if let Some(workspace) = &workflow_workspace {
+            let vol_id = workspace.volume_id;
+            let mount_path = workspace.mount_point.clone();
+            let remote_path = workspace.remote_path.clone();
 
             if let Some(ref gw) = self.nfs_gateway {
                 let policy = FsalAccessPolicy {
@@ -3063,7 +3429,12 @@ impl StandardExecutionService {
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
             execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
-            volumes: volume_mounts,
+            // The workflow's workspace first, so a manifest volume under it is
+            // bound on top of it.
+            volumes: workflow_workspace
+                .into_iter()
+                .chain(volume_mounts)
+                .collect(),
             container_uid: 1000,
             container_gid: 1000,
             keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")
@@ -3121,6 +3492,7 @@ impl StandardExecutionService {
                 .and_then(|a| a.bootstrap_path.clone()),
             // Attach execution_id so ContainerRuntime can correlate image events (ADR-045).
             execution_id,
+            workflow_execution_id,
         };
 
         execution.start();
@@ -3882,6 +4254,7 @@ impl ExecutionService for StandardExecutionService {
                 .as_ref()
                 .and_then(|a| a.bootstrap_path.clone()),
             execution_id: child_execution_id,
+            workflow_execution_id: None,
         };
 
         child_execution.start();

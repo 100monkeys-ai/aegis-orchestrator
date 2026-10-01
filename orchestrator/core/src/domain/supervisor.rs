@@ -823,6 +823,7 @@ mod tests {
             image: "python:3.12".to_string(),
             bootstrap_path: None,
             execution_id: crate::domain::execution::ExecutionId::new(),
+            workflow_execution_id: None,
         }
     }
 

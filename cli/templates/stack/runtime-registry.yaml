@@ -65,3 +65,8 @@ spec:
       "1.21":
         image: "golang:1.21-alpine"
         description: "Go 1.21 with Alpine base"
+
+    bash:
+      "5":
+        image: "python:3.11-slim"
+        description: "Bash 5 on the Python 3.11 slim Debian base, which carries python3 for the bootstrap"

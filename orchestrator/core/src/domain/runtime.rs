@@ -101,6 +101,11 @@ pub struct RuntimeConfig {
     /// that image pull telemetry can be correlated back to the specific execution
     /// (ADR-045).
     pub execution_id: ExecutionId,
+    /// The workflow execution this runtime instance runs a state of, when it
+    /// runs one (ADR-087). Sent with each FUSE mount request so the FSAL
+    /// authorises the workflow's workspace volume by its owner.
+    #[serde(default)]
+    pub workflow_execution_id: Option<uuid::Uuid>,
 }
 
 fn default_container_uid() -> u32 {

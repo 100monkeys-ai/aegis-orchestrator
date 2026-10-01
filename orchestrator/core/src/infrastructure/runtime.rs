@@ -373,7 +373,6 @@ pub struct ContainerRuntime {
     nfs_server_host: Option<String>, // NFS server hostname for volume mounts (ADR-036)
     nfs_port: u16,
     nfs_mountport: u16,
-    keep_container_on_failure: RwLock<HashMap<String, bool>>,
     /// Per-container custom bootstrap paths (ADR-044).
     /// Key: container ID. `Some(path)` → CustomRuntime bootstrap already in image at `path`.
     /// Absent → StandardRuntime; default `/usr/local/bin/aegis-bootstrap` is used.
@@ -541,7 +540,6 @@ impl ContainerRuntime {
             nfs_server_host,
             nfs_port,
             nfs_mountport,
-            keep_container_on_failure: RwLock::new(HashMap::new()),
             bootstrap_paths: RwLock::new(HashMap::new()),
             image_manager,
             event_bus,
@@ -718,6 +716,68 @@ impl ContainerRuntime {
             ))
         })?;
         Ok(())
+    }
+
+    /// The FUSE mount request the agent path sends for one of its volumes
+    /// (ADR-107).
+    fn agent_fuse_mount_request(
+        config: &RuntimeConfig,
+        volume_mount: &crate::domain::volume::VolumeMount,
+    ) -> crate::infrastructure::aegis_runtime_proto::FuseMountRequest {
+        let is_read_only = matches!(
+            volume_mount.access_mode,
+            crate::domain::volume::AccessMode::ReadOnly
+        );
+        crate::infrastructure::aegis_runtime_proto::FuseMountRequest {
+            volume_id: volume_mount.volume_id.0.to_string(),
+            execution_id: config.execution_id.0.to_string(),
+            mount_point: String::new(),
+            read_paths: vec!["/*".to_string()],
+            write_paths: if is_read_only {
+                vec![]
+            } else {
+                vec!["/*".to_string()]
+            },
+            container_uid: 1000,
+            container_gid: 1000,
+            workflow_execution_id: config
+                .workflow_execution_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The outcome of one run of the bootstrap script, from its exit code and
+    /// its captured streams. A non-zero exit is an execution failure carrying
+    /// the bootstrap's stderr, whether or not the container is kept for
+    /// debugging (`keep_container_on_failure` decides only that, in the
+    /// supervisor): the bootstrap died before it printed a final answer, so
+    /// its stdout is not the agent's output.
+    fn bootstrap_exec_result(
+        exit_code: i64,
+        stdout_logs: Vec<String>,
+        stderr_logs: Vec<String>,
+    ) -> Result<TaskOutput, RuntimeError> {
+        if exit_code != 0 {
+            let error_msg = if !stderr_logs.is_empty() {
+                stderr_logs.join("\n")
+            } else {
+                format!("Bootstrap script exited with code {exit_code}")
+            };
+            Err(RuntimeError::ExecutionFailed(error_msg))
+        } else {
+            let result = serde_json::Value::String(stdout_logs.join(""));
+            Ok(TaskOutput {
+                result,
+                logs: stderr_logs,
+                tool_calls: vec![],
+                exit_code,
+                // Trajectory is populated by the supervisor after execute() returns by
+                // querying the execution repository.  The runtime itself has no access
+                // to the inner-loop trajectory.
+                trajectory: vec![],
+            })
+        }
     }
 
     fn format_bootstrap_stdout_for_log(content: &str) -> String {
@@ -1149,20 +1209,7 @@ impl AgentRuntime for ContainerRuntime {
                         crate::domain::volume::AccessMode::ReadOnly
                     );
 
-                    let grpc_req = crate::infrastructure::aegis_runtime_proto::FuseMountRequest {
-                        volume_id: volume_mount.volume_id.0.to_string(),
-                        execution_id: config.execution_id.0.to_string(),
-                        mount_point: String::new(),
-                        read_paths: vec!["/*".to_string()],
-                        write_paths: if is_read_only {
-                            vec![]
-                        } else {
-                            vec!["/*".to_string()]
-                        },
-                        container_uid: 1000,
-                        container_gid: 1000,
-                        workflow_execution_id: String::new(),
-                    };
+                    let grpc_req = Self::agent_fuse_mount_request(&config, volume_mount);
 
                     let exec_id_str = config.execution_id.0.to_string();
                     let vid = volume_mount.volume_id.0.to_string();
@@ -1281,7 +1328,7 @@ impl AgentRuntime for ContainerRuntime {
                                 crate::infrastructure::fuse::daemon::FuseVolumeContext {
                                     execution_id: config.execution_id,
                                     volume_id: volume_mount.volume_id,
-                                    workflow_execution_id: None,
+                                    workflow_execution_id: config.workflow_execution_id,
                                     container_uid: 1000, // Default; overridden by manifest
                                     container_gid: 1000,
                                     policy,
@@ -1491,11 +1538,6 @@ impl AgentRuntime for ContainerRuntime {
                 .insert(id.clone(), pending_grpc_fuse_pairs_outer);
         }
 
-        self.keep_container_on_failure
-            .write()
-            .await
-            .insert(id.clone(), config.keep_container_on_failure);
-
         info!(target: "runtime_spawn", step = "start_container", container_id = %id);
         if let Err(e) = self
             .docker
@@ -1670,50 +1712,11 @@ impl AgentRuntime for ContainerRuntime {
             );
         }
 
-        // Check exit code and return error if bootstrap failed
-        let keep_on_failure = self
-            .keep_container_on_failure
-            .read()
-            .await
-            .get(container_id)
-            .copied()
-            .unwrap_or(false);
-
-        let execution_result = if exit_code != 0 && keep_on_failure {
-            let error_msg = if !stderr_logs.is_empty() {
-                stderr_logs.join("\n")
-            } else {
-                format!("Bootstrap script exited with code {exit_code}")
-            };
-            Err(RuntimeError::ExecutionFailed(error_msg))
-        } else {
-            let result = serde_json::Value::String(stdout_logs.join(""));
-            Ok(TaskOutput {
-                result,
-                logs: stderr_logs,
-                tool_calls: vec![],
-                exit_code,
-                // Trajectory is populated by the supervisor after execute() returns by
-                // querying the execution repository.  The runtime itself has no access
-                // to the inner-loop trajectory.
-                trajectory: vec![],
-            })
-        };
-
-        self.keep_container_on_failure
-            .write()
-            .await
-            .remove(container_id);
-
-        execution_result
+        // A bootstrap that exits non-zero failed its iteration.
+        Self::bootstrap_exec_result(exit_code, stdout_logs, stderr_logs)
     }
 
     async fn terminate(&self, id: &InstanceId) -> Result<(), RuntimeError> {
-        self.keep_container_on_failure
-            .write()
-            .await
-            .remove(id.as_str());
-
         self.bootstrap_paths.write().await.remove(id.as_str());
 
         // Inspect first. If the engine is already in the middle of removing the
@@ -2012,6 +2015,7 @@ mod tests {
             image: "python:3.12".to_string(),
             bootstrap_path: None,
             execution_id: ExecutionId::new(),
+            workflow_execution_id: None,
         };
 
         let labels =
@@ -2248,7 +2252,91 @@ mod tests {
             image: "python:3.12".to_string(),
             bootstrap_path: None,
             execution_id: ExecutionId::new(),
+            workflow_execution_id: None,
         }
+    }
+
+    fn workspace_mount(
+        volume_id: crate::domain::volume::VolumeId,
+    ) -> crate::domain::volume::VolumeMount {
+        crate::domain::volume::VolumeMount::new(
+            volume_id,
+            std::path::PathBuf::from("/workspace"),
+            crate::domain::volume::AccessMode::ReadWrite,
+            crate::domain::volume::FilerEndpoint::new("http://localhost:8888").unwrap(),
+            format!("/aegis/volumes/u-test/{volume_id}"),
+        )
+    }
+
+    /// T3: the agent path's FUSE mount request names the workflow execution
+    /// whose workspace it mounts, as the ContainerRun path's does, so the FSAL
+    /// authorises the workflow-owned volume by its owner.
+    #[test]
+    fn agent_fuse_mount_request_carries_the_workflow_execution_id() {
+        let workflow_execution_id = uuid::Uuid::new_v4();
+        let mut config = sample_runtime_config();
+        config.workflow_execution_id = Some(workflow_execution_id);
+        let volume_id = crate::domain::volume::VolumeId::new();
+
+        let req = ContainerRuntime::agent_fuse_mount_request(&config, &workspace_mount(volume_id));
+
+        assert_eq!(req.workflow_execution_id, workflow_execution_id.to_string());
+        assert_eq!(req.volume_id, volume_id.0.to_string());
+        assert_eq!(req.execution_id, config.execution_id.0.to_string());
+        assert_eq!(req.write_paths, vec!["/*".to_string()]);
+    }
+
+    /// Outside a workflow the request names none.
+    #[test]
+    fn agent_fuse_mount_request_outside_a_workflow_names_no_workflow() {
+        let config = sample_runtime_config();
+        let req = ContainerRuntime::agent_fuse_mount_request(
+            &config,
+            &workspace_mount(crate::domain::volume::VolumeId::new()),
+        );
+        assert_eq!(req.workflow_execution_id, "");
+    }
+
+    /// T6: a bootstrap that exits non-zero failed its iteration, whether or not
+    /// the container is kept for debugging (the function no longer reads it):
+    /// it is never a completed run with empty output.
+    #[test]
+    fn bootstrap_exiting_non_zero_is_an_execution_failure() {
+        let result = ContainerRuntime::bootstrap_exec_result(
+            1,
+            Vec::new(),
+            vec!["Traceback ...\nFileNotFoundError: [Errno 2] No such file or directory: '/workspace'\n".to_string()],
+        );
+        match result {
+            Err(super::RuntimeError::ExecutionFailed(msg)) => assert!(
+                msg.contains("FileNotFoundError"),
+                "the failure carries the bootstrap's stderr: {msg}"
+            ),
+            other => panic!("expected ExecutionFailed, got {other:?}"),
+        }
+
+        match ContainerRuntime::bootstrap_exec_result(127, Vec::new(), Vec::new()) {
+            Err(super::RuntimeError::ExecutionFailed(msg)) => {
+                assert_eq!(msg, "Bootstrap script exited with code 127")
+            }
+            other => panic!("expected ExecutionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_exiting_zero_returns_its_stdout() {
+        let output = ContainerRuntime::bootstrap_exec_result(
+            0,
+            vec!["391\n".to_string()],
+            vec!["[BOOTSTRAP DEBUG] x".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            output.result,
+            serde_json::Value::String("391\n".to_string())
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.logs, vec!["[BOOTSTRAP DEBUG] x".to_string()]);
     }
 
     /// Regression: a `client.mount()` call that never completes must be
