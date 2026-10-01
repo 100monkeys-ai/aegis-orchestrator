@@ -95,6 +95,28 @@ fn is_non_retryable(e: &LLMError) -> bool {
     )
 }
 
+/// A generation with no text and no tool call is a provider fault, not an
+/// answer: an empty string handed back as the agent's final output becomes the
+/// iteration's output and goes to the judge as if the agent had written it
+/// (execution 9c5b304e, iteration 1, 2026-10-01). Returns the fault for such a
+/// response, retryable like any other `LLMError::Provider`.
+fn empty_generation_fault(
+    response: &ChatResponse,
+    alias: &str,
+    model: &str,
+    attempt: u32,
+    attempts: u32,
+) -> Option<LLMError> {
+    match response {
+        ChatResponse::FinalText(r) if r.text.trim().is_empty() => Some(LLMError::Provider(
+            format!(
+                "empty generation: model '{model}' on alias '{alias}' returned no text and no tool call (attempt {attempt} of {attempts})"
+            ),
+        )),
+        _ => None,
+    }
+}
+
 impl ProviderRegistry {
     /// Create provider registry from node configuration.
     ///
@@ -349,10 +371,22 @@ impl ProviderRegistry {
             let mut last_error: Option<LLMError> = None;
 
             for attempt in 0..self.max_retries {
-                match provider
+                let outcome = provider
                     .generate_chat(messages, tools, &effective_options)
                     .await
-                {
+                    .and_then(|response| {
+                        match empty_generation_fault(
+                            &response,
+                            alias,
+                            model_name,
+                            attempt + 1,
+                            self.max_retries,
+                        ) {
+                            Some(fault) => Err(fault),
+                            None => Ok(response),
+                        }
+                    });
+                match outcome {
                     Ok(response) => {
                         info!(
                             "generate_chat successful: alias='{}', model='{}', attempt={}",
@@ -388,7 +422,22 @@ impl ProviderRegistry {
                         if attempt == self.max_retries - 1 {
                             if let Some((fallback_model, fallback)) = &self.fallback_provider {
                                 info!("Trying fallback provider (model='{}')", fallback_model);
-                                match fallback.generate_chat(messages, tools, options).await {
+                                let outcome = fallback
+                                    .generate_chat(messages, tools, options)
+                                    .await
+                                    .and_then(|r| {
+                                        match empty_generation_fault(
+                                            &r,
+                                            alias,
+                                            fallback_model,
+                                            1,
+                                            1,
+                                        ) {
+                                            Some(fault) => Err(fault),
+                                            None => Ok(r),
+                                        }
+                                    });
+                                match outcome {
                                     Ok(r) => return Ok(r),
                                     Err(fe) => {
                                         if is_non_retryable(&fe) {
@@ -1055,5 +1104,83 @@ mod tests {
         let registry = ProviderRegistry::from_config(&config).unwrap();
         assert!(registry.has_alias("default"));
         assert_eq!(registry.available_aliases().len(), 1);
+    }
+
+    // ── Empty generation (regression: execution 9c5b304e, iteration 1) ─────
+    //
+    // A generation with no text and no tool call came back as a successful
+    // final answer, and the empty string went to the judge as the iteration's
+    // output. It is a provider fault: retried inside `max_retries`, and an
+    // error that says so once the retries are spent.
+
+    fn empty_response() -> ChatResponse {
+        ChatResponse::FinalText(GenerationResponse {
+            text: "  \n".to_string(),
+            usage: TokenUsage::default(),
+            provider: "mock".to_string(),
+            model: "test-model".to_string(),
+            finish_reason: FinishReason::Stop,
+        })
+    }
+
+    #[tokio::test]
+    async fn empty_generation_is_retried() {
+        let primary = MockProvider::with_responses(vec![Ok(empty_response()), Ok(ok_response())]);
+        let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert_eq!(
+            primary.call_count(),
+            2,
+            "an empty generation must be retried, not returned as the answer"
+        );
+        match res {
+            Ok(ChatResponse::FinalText(r)) => assert_eq!(r.text, "ok"),
+            other => panic!("expected the retried answer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_generation_after_retries_is_an_error_that_says_so() {
+        let primary = MockProvider::with_responses(vec![
+            Ok(empty_response()),
+            Ok(empty_response()),
+            Ok(empty_response()),
+        ]);
+        let fallback = MockProvider::with_responses(vec![Ok(empty_response())]);
+        let registry = make_registry(
+            primary.clone() as Arc<dyn LLMProvider>,
+            Some(fallback.clone() as Arc<dyn LLMProvider>),
+            30,
+        );
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert_eq!(primary.call_count(), 3, "every retry is spent");
+        assert_eq!(fallback.call_count(), 1, "the fallback is tried once");
+        match res {
+            Err(LLMError::Provider(msg)) => assert!(
+                msg.contains("empty generation") && msg.contains("no text and no tool call"),
+                "the error must say the generation was empty, got: {msg}"
+            ),
+            other => panic!("an empty generation must end as a provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_without_text_are_not_an_empty_generation() {
+        let calls = ChatResponse::ToolCalls(vec![crate::domain::llm::ChatToolCall {
+            id: "1".to_string(),
+            name: "fs.read".to_string(),
+            arguments: serde_json::json!({}),
+        }]);
+        let primary = MockProvider::with_responses(vec![Ok(calls)]);
+        let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+        assert_eq!(primary.call_count(), 1);
+        assert!(matches!(res, Ok(ChatResponse::ToolCalls(_))));
     }
 }

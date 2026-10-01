@@ -26,10 +26,15 @@
 //!
 //! ## Gradient Evaluation
 //!
-//! Judge agents return structured `GradientResult` with:
-//! - Continuous score 0.0–1.0 (not binary pass/fail)
+//! Judge agents return a verdict read as a `GradientResult` with:
+//! - Continuous score 0.0–1.0 (not binary pass/fail), the one required field
 //! - Confidence score (0.0–1.0)
 //! - Detailed reasoning
+//!
+//! The verdict is read by [`read_judge_verdict`], whose contract is on
+//! [`GradientResult`]; an output it cannot read is a
+//! [`crate::domain::validation::JudgeFault`] naming the judge, not a fault in
+//! the worker's output.
 //!
 //! # Example
 //!
@@ -66,12 +71,12 @@ use crate::domain::agent::{AgentId, ValidatorSpec};
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::shared_kernel::TenantId;
 use crate::domain::validation::{
-    extract_json_from_text, GradientResult, GradientValidator, MultiJudgeConsensus,
-    OutputGradientValidator, SystemGradientValidator, ValidationContext, ValidationPipeline,
-    ValidationRequest, ValidatorEntry, ValidatorKind,
+    extract_json_from_text, read_judge_verdict, GradientResult, GradientValidator,
+    MultiJudgeConsensus, OutputGradientValidator, SystemGradientValidator, ValidationContext,
+    ValidationPipeline, ValidationRequest, ValidatorEntry, ValidatorKind,
 };
 use crate::domain::workflow::{ConfidenceWeighting, ConsensusConfig, ConsensusStrategy};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -326,15 +331,9 @@ impl ValidationService {
                         .last()
                         .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
 
-                    let output_str = last_iter
-                        .output
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("Judge completed but has no output"))?;
-
-                    let json_str = Self::extract_json(output_str).unwrap_or(output_str.clone());
-
-                    let result: GradientResult = serde_json::from_str(&json_str)
-                        .context(format!("Failed to parse judge output: {json_str}"))?;
+                    let output_str = last_iter.output.as_deref().unwrap_or_default();
+                    let result =
+                        read_judge_verdict(&judge_name, output_str).map_err(anyhow::Error::new)?;
 
                     return Ok((judge_id, result));
                 }
@@ -347,10 +346,6 @@ impl ValidationService {
                 }
             }
         }
-    }
-
-    fn extract_json(text: &str) -> Option<String> {
-        crate::domain::validation::extract_json_from_text(text)
     }
 
     fn compute_consensus(
@@ -551,7 +546,7 @@ pub struct SemanticAgentValidatorConfig {
 ///
 /// The judge agent is identified by name via [`AgentLifecycleService::lookup_agent_for_tenant`].
 /// It is spawned via [`ExecutionService::start_child_execution`] and polled for
-/// completion.  Its stdout must be a JSON [`GradientResult`].
+/// completion.  Its last output is read as a verdict by [`read_judge_verdict`].
 pub struct SemanticAgentValidator {
     judge_agent_name: String,
     criteria: String,
@@ -667,15 +662,9 @@ impl GradientValidator for SemanticAgentValidator {
                         .iterations()
                         .last()
                         .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
-                    let output_str = last_iter
-                        .output
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("Judge completed but has no output"))?;
-                    let json_str =
-                        extract_json_from_text(output_str).unwrap_or_else(|| output_str.clone());
-                    let result: GradientResult = serde_json::from_str(&json_str)
-                        .context(format!("Failed to parse semantic judge output: {json_str}"))?;
-                    return Ok(result);
+                    let output_str = last_iter.output.as_deref().unwrap_or_default();
+                    return read_judge_verdict(&self.judge_agent_name, output_str)
+                        .map_err(anyhow::Error::new);
                 }
                 ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
                     return Err(anyhow!(
@@ -759,14 +748,14 @@ impl GradientValidator for MultiJudgeAgentValidator {
         // 1. Resolve all judge agent ids — use visible (cross-tenant) lookup so
         //    aegis-system scoped judges are found even when the caller's tenant
         //    is not aegis-system.
-        let mut judge_ids: Vec<(AgentId, f64)> = Vec::new();
+        let mut judge_ids: Vec<(AgentId, String, f64)> = Vec::new();
         for name in &self.judges {
             let id = self
                 .agent_lifecycle_service
                 .lookup_agent_visible_for_tenant(&self.tenant_id, name)
                 .await?
                 .ok_or_else(|| anyhow!("Judge agent '{name}' not found"))?;
-            judge_ids.push((id, 1.0)); // Equal weight by default.
+            judge_ids.push((id, name.clone(), 1.0)); // Equal weight by default.
         }
 
         // 2. Build shared input.
@@ -780,10 +769,11 @@ impl GradientValidator for MultiJudgeAgentValidator {
 
         // 3. Spawn all judges as parallel child executions.
         let mut futures = Vec::new();
-        for (judge_id, weight) in &judge_ids {
+        for (judge_id, judge_name, weight) in &judge_ids {
             let svc = self.execution_service.clone();
             let payload = input_payload.clone();
             let jid = *judge_id;
+            let judge_name = judge_name.clone();
             let w = *weight;
             let parent_id = self.parent_execution_id;
             let timeout = self.timeout_seconds;
@@ -819,15 +809,9 @@ impl GradientValidator for MultiJudgeAgentValidator {
                                 .iterations()
                                 .last()
                                 .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
-                            let output_str = last_iter
-                                .output
-                                .as_ref()
-                                .ok_or_else(|| anyhow!("Judge completed but has no output"))?;
-                            let json_str =
-                                crate::domain::validation::extract_json_from_text(output_str)
-                                    .unwrap_or_else(|| output_str.clone());
-                            let result: GradientResult = serde_json::from_str(&json_str)
-                                .context(format!("Failed to parse judge output: {json_str}"))?;
+                            let output_str = last_iter.output.as_deref().unwrap_or_default();
+                            let result = read_judge_verdict(&judge_name, output_str)
+                                .map_err(anyhow::Error::new)?;
                             return Ok((jid, result, w));
                         }
                         ExecutionStatus::Failed | ExecutionStatus::Cancelled => {

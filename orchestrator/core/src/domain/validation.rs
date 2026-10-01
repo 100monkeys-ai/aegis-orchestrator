@@ -32,8 +32,30 @@ use thiserror::Error;
 /// Score between 0.0 and 1.0 representing confidence/quality
 pub type ValidationScore = f64;
 
-/// Result from a single judge's assessment
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Result from a single judge's assessment.
+///
+/// # The judge verdict contract, as read (ADR-016, ADR-017)
+///
+/// A judge agent is any agent, a tenant's own included, so the orchestrator
+/// reads its verdict by what it carries rather than by one exact field set.
+/// `Deserialize` is hand-written to that contract:
+///
+/// - `score` is required: a number from 0.0 to 1.0. A verdict without one, or
+///   with one out of range, is refused.
+/// - `confidence`, when absent or null, reads as [`ABSENT_CONFIDENCE`]
+///   (ADR-017's `confidence.unwrap_or(0.8)`); when present it is a number from
+///   0.0 to 1.0.
+/// - `reasoning`, when absent, reads from `feedback`, then `message`, when
+///   either is a string, else as an empty string.
+/// - `signals`, when absent, reads from a `dimensions` map: each entry whose
+///   value is a number, or an object with a numeric `score`, becomes a signal
+///   named for its key.
+/// - Every other top-level field is kept in `metadata`, beside the verdict's
+///   own `metadata` object when it has one.
+///
+/// The canonical shape (`score`, `confidence`, `reasoning`, `signals`,
+/// `metadata`) round-trips unchanged.
+#[derive(Debug, Clone, Serialize)]
 pub struct GradientResult {
     /// The score assigned by the judge (0.0 - 1.0)
     pub score: ValidationScore,
@@ -45,12 +67,162 @@ pub struct GradientResult {
     pub reasoning: String,
 
     /// Specific signals identified (e.g., "syntax_error", "security_risk")
-    #[serde(default)]
     pub signals: Vec<ValidationSignal>,
 
     /// Extensible metadata for future enhancements
-    #[serde(default)]
     pub metadata: HashMap<String, Value>,
+}
+
+/// The confidence a verdict that states none reads as: ADR-017's
+/// `SemanticGradientValidator` reads `judge_output.confidence.unwrap_or(0.8)`.
+pub const ABSENT_CONFIDENCE: f64 = 0.8;
+
+impl<'de> Deserialize<'de> for GradientResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        GradientResult::from_verdict_value(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl GradientResult {
+    /// Read a judge's verdict from a JSON value by the contract on
+    /// [`GradientResult`]. The error is the sentence a reader needs: what the
+    /// verdict lacked.
+    pub fn from_verdict_value(value: Value) -> Result<Self, String> {
+        let Value::Object(mut fields) = value else {
+            return Err(format!(
+                "the verdict is not a JSON object (it is {})",
+                json_kind(&value)
+            ));
+        };
+
+        let score = match fields.remove("score") {
+            None | Some(Value::Null) => return Err("the verdict has no score".to_string()),
+            Some(v) => unit_interval("score", &v)?,
+        };
+        let confidence = match fields.remove("confidence") {
+            None | Some(Value::Null) => ABSENT_CONFIDENCE,
+            Some(v) => unit_interval("confidence", &v)?,
+        };
+        let reasoning = match fields.remove("reasoning") {
+            Some(Value::String(s)) => s,
+            _ => ["feedback", "message"]
+                .iter()
+                .find_map(|k| fields.get(*k).and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default(),
+        };
+
+        let mut metadata: HashMap<String, Value> = match fields.remove("metadata") {
+            Some(Value::Object(m)) => m.into_iter().collect(),
+            Some(Value::Null) | None => HashMap::new(),
+            Some(other) => HashMap::from([("metadata".to_string(), other)]),
+        };
+
+        let signals = match fields.remove("signals") {
+            Some(Value::Null) | None => fields
+                .get("dimensions")
+                .map(signals_from_dimensions)
+                .unwrap_or_default(),
+            Some(raw) => match serde_json::from_value::<Vec<ValidationSignal>>(raw.clone()) {
+                Ok(signals) => signals,
+                Err(_) => {
+                    metadata.insert("signals".to_string(), raw);
+                    Vec::new()
+                }
+            },
+        };
+
+        metadata.extend(fields);
+
+        Ok(GradientResult {
+            score,
+            confidence,
+            reasoning,
+            signals,
+            metadata,
+        })
+    }
+}
+
+fn unit_interval(name: &str, value: &Value) -> Result<f64, String> {
+    let n = value
+        .as_f64()
+        .ok_or_else(|| format!("the verdict's {name} is not a number (it is {value})"))?;
+    if !(0.0..=1.0).contains(&n) {
+        return Err(format!("the verdict's {name} {n} is outside 0.0 to 1.0"));
+    }
+    Ok(n)
+}
+
+fn signals_from_dimensions(dimensions: &Value) -> Vec<ValidationSignal> {
+    let Value::Object(map) = dimensions else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(name, v)| {
+            let (score, message) = match v {
+                Value::Object(o) => (
+                    o.get("score")?.as_f64()?,
+                    ["message", "feedback", "reasoning"]
+                        .iter()
+                        .find_map(|k| o.get(*k).and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                other => (other.as_f64()?, String::new()),
+            };
+            Some(ValidationSignal {
+                category: name.clone(),
+                score,
+                message,
+            })
+        })
+        .collect()
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// A judge agent's output that cannot be read as a verdict: not JSON, or JSON
+/// without a usable score. It is the judge's fault, not the worker's, so it
+/// names the judge and quotes what the judge wrote.
+#[derive(Debug, Clone, Error)]
+#[error("judge fault: judge agent '{judge_agent}' returned a verdict the orchestrator cannot read ({reason}); its output was: {output}")]
+pub struct JudgeFault {
+    /// The judge agent's name.
+    pub judge_agent: String,
+    /// Why the verdict could not be read.
+    pub reason: String,
+    /// The judge's last output, as written.
+    pub output: String,
+}
+
+/// Read a judge agent's final output as a verdict (ADR-016, ADR-017).
+///
+/// The verdict is the first fenced block when the output has one, else the
+/// whole output; it is read by the contract on [`GradientResult`]. Anything
+/// that cannot be read is a [`JudgeFault`] naming `judge_agent`.
+pub fn read_judge_verdict(judge_agent: &str, output: &str) -> Result<GradientResult, JudgeFault> {
+    let fault = |reason: String| JudgeFault {
+        judge_agent: judge_agent.to_string(),
+        reason,
+        output: output.to_string(),
+    };
+    let candidate = extract_json_from_text(output).unwrap_or_else(|| output.trim().to_string());
+    let value: Value = serde_json::from_str(&candidate)
+        .map_err(|e| fault(format!("the output is not JSON: {e}")))?;
+    GradientResult::from_verdict_value(value).map_err(fault)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -668,6 +840,117 @@ mod tests {
             .metadata
             .insert("judge_id".to_string(), serde_json::json!("judge-1"));
         assert_eq!(result.metadata.len(), 1);
+    }
+
+    // ── Reading a judge's verdict (regression: execution 9c5b304e) ────────────
+
+    /// The shape `haiku-judge-agent` wrote for iteration 2 of execution 9c5b304e.
+    const ITERATION_2_VERDICT: &str = r#"{"valid": true, "score": 1.0, "dimensions": {"accuracy": 1.0, "completeness": 0.9}, "feedback": "The triangulation is correct."}"#;
+
+    #[test]
+    fn verdict_without_confidence_or_reasoning_is_read() {
+        let result = serde_json::from_str::<GradientResult>(ITERATION_2_VERDICT);
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => panic!("a verdict carrying a score was refused: {e}"),
+        };
+        assert_eq!(result.score, 1.0, "score is read as given");
+        assert_eq!(
+            result.confidence, ABSENT_CONFIDENCE,
+            "absent confidence reads as the ADR-017 default"
+        );
+        assert_eq!(
+            result.reasoning, "The triangulation is correct.",
+            "absent reasoning reads from feedback"
+        );
+        let mut signals: Vec<(String, f64)> = result
+            .signals
+            .iter()
+            .map(|s| (s.category.clone(), s.score))
+            .collect();
+        signals.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            signals,
+            vec![
+                ("accuracy".to_string(), 1.0),
+                ("completeness".to_string(), 0.9)
+            ],
+            "a dimensions map of name to score reads as signals"
+        );
+        assert_eq!(
+            result.metadata.get("valid"),
+            Some(&serde_json::json!(true)),
+            "unknown fields are kept in metadata"
+        );
+        assert!(result.metadata.contains_key("dimensions"));
+        assert!(result.metadata.contains_key("feedback"));
+    }
+
+    #[test]
+    fn verdict_reasoning_falls_back_to_message_then_empty() {
+        let r: GradientResult =
+            serde_json::from_str(r#"{"score": 0.5, "message": "meh"}"#).unwrap();
+        assert_eq!(r.reasoning, "meh");
+        let r: GradientResult = serde_json::from_str(r#"{"score": 0.5}"#).unwrap();
+        assert_eq!(r.reasoning, "");
+        let r: GradientResult =
+            serde_json::from_str(r#"{"score": 0.5, "reasoning": "own", "feedback": "other"}"#)
+                .unwrap();
+        assert_eq!(r.reasoning, "own", "a stated reasoning wins over feedback");
+    }
+
+    #[test]
+    fn verdict_score_is_required_and_bounded() {
+        let e = serde_json::from_str::<GradientResult>(r#"{"valid": true}"#).unwrap_err();
+        assert!(e.to_string().contains("no score"), "got: {e}");
+        let e = serde_json::from_str::<GradientResult>(r#"{"score": 1.5}"#).unwrap_err();
+        assert!(e.to_string().contains("outside 0.0 to 1.0"), "got: {e}");
+        let e = serde_json::from_str::<GradientResult>(r#"{"score": -0.1}"#).unwrap_err();
+        assert!(e.to_string().contains("outside 0.0 to 1.0"), "got: {e}");
+        let e = serde_json::from_str::<GradientResult>(r#"{"score": "high"}"#).unwrap_err();
+        assert!(e.to_string().contains("score"), "got: {e}");
+        let e = serde_json::from_str::<GradientResult>(r#"{"score": 0.5, "confidence": 2.0}"#)
+            .unwrap_err();
+        assert!(e.to_string().contains("confidence"), "got: {e}");
+        let e = serde_json::from_str::<GradientResult>(r#"[0.5]"#).unwrap_err();
+        assert!(e.to_string().contains("JSON object"), "got: {e}");
+    }
+
+    #[test]
+    fn canonical_verdict_round_trips_unchanged() {
+        let canonical = GradientResult {
+            score: 0.85,
+            confidence: 0.9,
+            reasoning: "fine".to_string(),
+            signals: vec![ValidationSignal {
+                category: "security".to_string(),
+                score: 0.8,
+                message: "ok".to_string(),
+            }],
+            metadata: HashMap::from([("judge".to_string(), serde_json::json!("j1"))]),
+        };
+        let json = serde_json::to_value(&canonical).unwrap();
+        let back: GradientResult = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn read_judge_verdict_reads_fenced_and_bare_verdicts_and_names_the_judge_on_fault() {
+        let fenced = format!("Verdict:\n```json\n{ITERATION_2_VERDICT}\n```");
+        assert_eq!(read_judge_verdict("j", &fenced).unwrap().score, 1.0);
+        assert_eq!(
+            read_judge_verdict("j", ITERATION_2_VERDICT).unwrap().score,
+            1.0
+        );
+
+        let fault = read_judge_verdict("haiku-judge-agent", "I think it is fine").unwrap_err();
+        assert_eq!(fault.judge_agent, "haiku-judge-agent");
+        assert_eq!(fault.output, "I think it is fine");
+        let text = fault.to_string();
+        assert!(
+            text.contains("judge fault") && text.contains("haiku-judge-agent"),
+            "got: {text}"
+        );
     }
 
     // ── MultiJudgeConsensus ───────────────────────────────────────────────────
