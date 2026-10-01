@@ -150,14 +150,16 @@ jobs:
           prefix-key: "v2-ubuntu22"
           workspaces: aegis-orchestrator -> target
 
-      # The Keycloak the deployment runs (quay.io/keycloak/keycloak:24.0,
-      # pinned by digest), in development mode on the loopback interface,
-      # for the Keycloak admin client's tests against the real thing.
+      # The Keycloak the deployment moves to under AEGIS ADR-128
+      # (quay.io/keycloak/keycloak:26.8.0, pinned by its linux/amd64 digest),
+      # in development mode on the loopback interface, for the Keycloak admin
+      # client's tests against the real thing. 26 reads the bootstrap admin
+      # from KC_BOOTSTRAP_ADMIN_USERNAME and KC_BOOTSTRAP_ADMIN_PASSWORD.
       - name: Start Keycloak
         run: |
           docker run -d --name aegis-test-keycloak -p 127.0.0.1:18080:8080 \
-            -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin \
-            quay.io/keycloak/keycloak@sha256:f8ade94c1d0ad2f2fa7734a455fee5392764f402c43ca35e9af6bf63a2541dc9 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad \
             start-dev
           for i in $(seq 1 90); do
             if curl -sf http://127.0.0.1:18080/realms/master >/dev/null; then exit 0; fi
