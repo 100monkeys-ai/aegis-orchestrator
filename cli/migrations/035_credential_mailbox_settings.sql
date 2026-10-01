@@ -5,5 +5,7 @@
 --
 -- Forward-only and additive: one nullable column, no default, no existing
 -- row rewritten. Every binding that is not an `imap` mailbox keeps NULL.
+-- Idempotent, like every migration after 033: running it again over a
+-- migrated schema changes nothing.
 
-ALTER TABLE credential_bindings ADD COLUMN mailbox_settings JSONB NULL;
+ALTER TABLE credential_bindings ADD COLUMN IF NOT EXISTS mailbox_settings JSONB NULL;
