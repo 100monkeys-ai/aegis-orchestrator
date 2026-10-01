@@ -15,6 +15,7 @@
 //! | ≥ success threshold | Mark `Success`, stop loop |
 //! | < threshold, iterations remaining | Apply `Refinement`, continue |
 //! | < threshold, max iterations reached | Mark `Failed` |
+//! | judge fault (unreadable verdict, twice) | Mark `Failed` with the fault as reason, no feedback |
 //!
 //! See ADR-005 (Iterative Execution Strategy).
 
@@ -36,7 +37,9 @@
 use crate::domain::execution::{ExecutionId, ExecutionInput, TrajectoryStep};
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::{AgentRuntime, InstanceId, RuntimeConfig, RuntimeError, TaskInput};
-use crate::domain::validation::{ValidationContext, ValidationPipeline, ValidationResults};
+use crate::domain::validation::{
+    JudgeFault, ValidationContext, ValidationPipeline, ValidationResults,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -568,6 +571,23 @@ impl Supervisor {
                         }));
                         continue;
                     }
+                    Err(e)
+                        if e.chain()
+                            .any(|cause| cause.downcast_ref::<JudgeFault>().is_some()) =>
+                    {
+                        // A judge whose verdict cannot be read, after its one re-run,
+                        // is the judge's fault, not the worker's (ADR-017's Update of
+                        // 2026-10-01): the execution ends failed with the fault as its
+                        // reason, the worker is handed no feedback on its own output,
+                        // and no further iteration is spent on it.
+                        let reason = format!("{e:#}");
+                        warn!(
+                            iteration = attempts,
+                            reason = %reason,
+                            "Judge fault — ending the execution as failed"
+                        );
+                        return Err(RuntimeError::ExecutionFailed(reason));
+                    }
                     Err(e) => {
                         let reason = format!("validation error: {e}");
                         warn!(
@@ -629,6 +649,9 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::domain::runtime::{InstanceStatus, ResourceLimits, TaskOutput};
+    use crate::domain::validation::{
+        GradientResult, GradientValidator, ValidatorEntry, ValidatorKind,
+    };
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -640,6 +663,8 @@ mod tests {
         execute_results: Arc<Mutex<Vec<Result<TaskOutput, RuntimeError>>>>,
         execute_inputs: Arc<Mutex<Vec<TaskInput>>>,
         terminate_calls: Arc<Mutex<Vec<InstanceId>>>,
+        /// The environment each spawn was given, in spawn order.
+        spawn_envs: Arc<Mutex<Vec<HashMap<String, String>>>>,
         /// Optional delay injected into `execute()` to simulate long-running work.
         execute_delay: Option<Duration>,
     }
@@ -651,6 +676,7 @@ mod tests {
                 execute_results: Arc::new(Mutex::new(Vec::new())),
                 execute_inputs: Arc::new(Mutex::new(Vec::new())),
                 terminate_calls: Arc::new(Mutex::new(Vec::new())),
+                spawn_envs: Arc::new(Mutex::new(Vec::new())),
                 execute_delay: None,
             }
         }
@@ -695,7 +721,8 @@ mod tests {
 
     #[async_trait]
     impl AgentRuntime for TestRuntime {
-        async fn spawn(&self, _config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+        async fn spawn(&self, config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+            self.spawn_envs.lock().await.push(config.env.clone());
             let mut results = self.spawn_results.lock().await;
             results.remove(0)
         }
@@ -1112,5 +1139,183 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    // ── A judge fault is not the worker's failed validation (ADR-017) ─────────
+
+    /// A validator that answers each call with the next scripted result.
+    struct ScriptedValidator {
+        results: std::sync::Mutex<Vec<anyhow::Result<GradientResult>>>,
+    }
+
+    #[async_trait]
+    impl GradientValidator for ScriptedValidator {
+        async fn validate(&self, _ctx: &ValidationContext) -> anyhow::Result<GradientResult> {
+            self.results.lock().unwrap().remove(0)
+        }
+    }
+
+    fn semantic_pipeline(results: Vec<anyhow::Result<GradientResult>>) -> Arc<ValidationPipeline> {
+        Arc::new(ValidationPipeline::new(vec![ValidatorEntry {
+            kind: ValidatorKind::Semantic,
+            validator: Box::new(ScriptedValidator {
+                results: std::sync::Mutex::new(results),
+            }),
+            min_score: 0.7,
+            min_confidence: 0.0,
+        }]))
+    }
+
+    fn verdict(score: f64, reasoning: &str) -> GradientResult {
+        GradientResult {
+            score,
+            confidence: 0.9,
+            reasoning: reasoning.to_string(),
+            signals: vec![],
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn faulted_twice() -> JudgeFault {
+        JudgeFault {
+            judge_agent: "haiku-judge-agent".to_string(),
+            reason: "it faulted twice, on two fresh runs; the first: the output is not JSON; \
+                     the second: the output is not JSON"
+                .to_string(),
+            output: "I think the answer is fine.".to_string(),
+        }
+    }
+
+    async fn run_with_pipeline(
+        runtime: Arc<TestRuntime>,
+        observer: Arc<TestObserver>,
+        pipeline: Arc<ValidationPipeline>,
+    ) -> Result<String, RuntimeError> {
+        Supervisor::new(runtime)
+            .run_loop(
+                create_test_config(),
+                create_test_input(),
+                3,
+                observer,
+                CancellationToken::new(),
+                Some(pipeline),
+            )
+            .await
+    }
+
+    /// Every way the run broke the judge-fault rule, so one red reports them all:
+    /// a further worker iteration, feedback handed to the worker, and an ending
+    /// that is not a failure saying judge fault and naming the judge.
+    async fn judge_fault_complaints(
+        runtime: &TestRuntime,
+        observer: &TestObserver,
+        result: Result<String, RuntimeError>,
+    ) -> Vec<String> {
+        let mut complaints = Vec::new();
+        let worker_iterations = observer.iteration_starts.lock().await.len();
+        if worker_iterations != 1 {
+            complaints.push(format!(
+                "a judge fault must consume no further worker iteration, but the worker ran {worker_iterations} times"
+            ));
+        }
+        let handed_feedback = runtime
+            .spawn_envs
+            .lock()
+            .await
+            .iter()
+            .filter(|env| env.contains_key("AEGIS_ITERATION_HISTORY"))
+            .count();
+        if handed_feedback != 0 {
+            complaints.push(format!(
+                "the judge fault must not be handed to the worker as feedback on its own output, but {handed_feedback} iterations were handed history"
+            ));
+        }
+        match result {
+            Err(RuntimeError::ExecutionFailed(reason))
+                if reason.contains("judge fault") && reason.contains("haiku-judge-agent") => {}
+            other => complaints.push(format!(
+                "a judge fault must end the execution failed with a reason that says judge fault and names the judge, got: {other:?}"
+            )),
+        }
+        complaints
+    }
+
+    /// The worker's output is fine; its judge's verdict could not be read twice.
+    /// The execution ends failed with the judge fault as its reason, after one
+    /// worker iteration, and no feedback is ever handed to the worker.
+    #[tokio::test]
+    async fn judge_fault_ends_the_execution_failed_without_feedback_or_another_iteration() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(3)
+                .with_execute_success(vec!["the answer".to_string(); 3]),
+        );
+        let observer = Arc::new(TestObserver::default());
+        let pipeline = semantic_pipeline(vec![
+            Err(anyhow::Error::new(faulted_twice())),
+            Err(anyhow::Error::new(faulted_twice())),
+            Err(anyhow::Error::new(faulted_twice())),
+        ]);
+
+        let result = run_with_pipeline(runtime.clone(), observer.clone(), pipeline).await;
+
+        let complaints = judge_fault_complaints(&runtime, &observer, result).await;
+        assert!(complaints.is_empty(), "{}", complaints.join("; "));
+    }
+
+    /// The multi-judge shortfall carries the fault beneath its own message; the
+    /// supervisor finds it there and ends the execution the same way.
+    #[tokio::test]
+    async fn judge_fault_beneath_a_multi_judge_shortfall_ends_the_execution_failed() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(3)
+                .with_execute_success(vec!["the answer".to_string(); 3]),
+        );
+        let observer = Arc::new(TestObserver::default());
+        let shortfall = || {
+            Err(anyhow::Error::new(faulted_twice())
+                .context("MultiJudge: insufficient judges succeeded: 0 of 1 required (total: 1)"))
+        };
+        let pipeline = semantic_pipeline(vec![shortfall(), shortfall(), shortfall()]);
+
+        let result = run_with_pipeline(runtime.clone(), observer.clone(), pipeline).await;
+
+        let complaints = judge_fault_complaints(&runtime, &observer, result).await;
+        assert!(complaints.is_empty(), "{}", complaints.join("; "));
+    }
+
+    /// The control: a worker whose output the judge scores below the threshold
+    /// still gets the verdict as feedback and another iteration.
+    #[tokio::test]
+    async fn ordinary_failed_validation_still_gets_feedback_and_another_iteration() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(2)
+                .with_execute_success(vec!["a wrong answer".to_string(), "the answer".to_string()]),
+        );
+        let observer = Arc::new(TestObserver::default());
+        let pipeline = semantic_pipeline(vec![
+            Ok(verdict(0.2, "the answer is wrong")),
+            Ok(verdict(1.0, "the answer is right")),
+        ]);
+
+        let result = run_with_pipeline(runtime.clone(), observer.clone(), pipeline).await;
+
+        assert_eq!(result.unwrap(), "the answer");
+        assert_eq!(
+            observer.iteration_starts.lock().await.len(),
+            2,
+            "a failed validation of the worker's output earns another iteration"
+        );
+        let envs = runtime.spawn_envs.lock().await;
+        let history = envs[1]
+            .get("AEGIS_ITERATION_HISTORY")
+            .expect("the second iteration is handed the first one's history");
+        assert!(
+            history.contains("\"validation_failed\":true")
+                && history.contains("the answer is wrong"),
+            "the worker is handed the judge's verdict as feedback, got: {history}"
+        );
     }
 }

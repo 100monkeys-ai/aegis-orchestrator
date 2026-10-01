@@ -34,7 +34,12 @@
 //! The verdict is read by [`read_judge_verdict`], whose contract is on
 //! [`GradientResult`]; an output it cannot read is a
 //! [`crate::domain::validation::JudgeFault`] naming the judge, not a fault in
-//! the worker's output.
+//! the worker's output. A judge whose verdict cannot be read is run once more
+//! as a fresh child execution with the same input; each fault publishes
+//! [`crate::domain::events::ValidationEvent::JudgeFault`], and a second fault is
+//! returned as the error, a `JudgeFault` saying the judge faulted twice (ADR-017's
+//! Update of 2026-10-01). The supervisor ends the execution on it rather than
+//! handing it to the worker as feedback.
 //!
 //! # Example
 //!
@@ -71,7 +76,7 @@ use crate::domain::agent::{AgentId, ValidatorSpec};
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::shared_kernel::TenantId;
 use crate::domain::validation::{
-    extract_json_from_text, read_judge_verdict, GradientResult, GradientValidator,
+    extract_json_from_text, read_judge_verdict, GradientResult, GradientValidator, JudgeFault,
     MultiJudgeConsensus, OutputGradientValidator, SystemGradientValidator, ValidationContext,
     ValidationPipeline, ValidationRequest, ValidatorEntry, ValidatorKind,
 };
@@ -143,6 +148,7 @@ impl ValidationService {
             let poll_interval = poll_interval_ms;
             let parent_id = execution_id;
             let tenant = tenant_id.clone();
+            let event_bus = self.event_bus.clone();
 
             futures.push(tokio::spawn(async move {
                 match Self::run_judge(
@@ -154,6 +160,7 @@ impl ValidationService {
                     tenant,
                     timeout,
                     poll_interval,
+                    event_bus,
                 )
                 .await
                 {
@@ -164,6 +171,7 @@ impl ValidationService {
         }
 
         let mut results = Vec::new();
+        let mut first_fault: Option<JudgeFault> = None;
         for future in futures {
             match future.await {
                 Ok(Ok((agent_id, result, weight))) => {
@@ -182,18 +190,24 @@ impl ValidationService {
                     );
                     results.push((agent_id, result, weight));
                 }
-                Ok(Err(e)) => tracing::warn!("Judge execution failed: {}", e),
+                Ok(Err(e)) => {
+                    tracing::warn!("Judge execution failed: {}", e);
+                    keep_first_judge_fault(&mut first_fault, &e);
+                }
                 Err(e) => tracing::error!("Join error: {}", e),
             }
         }
 
         // Check minimum judges requirement
         if results.len() < config.min_judges_required {
-            return Err(anyhow!(
-                "Insufficient judges succeeded: {} of {} required (total: {})",
-                results.len(),
-                config.min_judges_required,
-                judges.len()
+            return Err(insufficient_judges_error(
+                format!(
+                    "Insufficient judges succeeded: {} of {} required (total: {})",
+                    results.len(),
+                    config.min_judges_required,
+                    judges.len()
+                ),
+                first_fault,
             ));
         }
 
@@ -229,6 +243,7 @@ impl ValidationService {
         tenant_id: TenantId,
         timeout_seconds: u64,
         poll_interval_ms: u64,
+        event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     ) -> Result<(AgentId, GradientResult)> {
         // Fetch the judge agent manifest to read its declared input_schema.
         // Use the system tenant so global judge agents (aegis-system scope) are always found.
@@ -305,47 +320,21 @@ impl ValidationService {
             }
         };
 
-        // Spawn as a child execution (ADR-016: judges are isolated peer agents).
-        let exec_id = service
-            .start_child_execution(judge_id, input, parent_execution_id)
-            .await?;
-
-        // Poll for completion with configurable timeout and interval.
-        let max_attempts = calculate_max_attempts(timeout_seconds, poll_interval_ms)?;
-        let mut attempts = 0;
-
-        loop {
-            if attempts >= max_attempts {
-                return Err(anyhow!(
-                    "Judge execution timed out after {timeout_seconds} seconds"
-                ));
-            }
-
-            let exec = service
-                .get_execution_for_tenant(&tenant_id, exec_id)
-                .await?;
-            match exec.status {
-                ExecutionStatus::Completed => {
-                    let last_iter = exec
-                        .iterations()
-                        .last()
-                        .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
-
-                    let output_str = last_iter.output.as_deref().unwrap_or_default();
-                    let result =
-                        read_judge_verdict(&judge_name, output_str).map_err(anyhow::Error::new)?;
-
-                    return Ok((judge_id, result));
-                }
-                ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
-                    return Err(anyhow!("Judge execution failed or cancelled"));
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
-                    attempts += 1;
-                }
-            }
-        }
+        // Spawn as a child execution (ADR-016: judges are isolated peer agents),
+        // once more on an unreadable verdict (ADR-017's Update of 2026-10-01).
+        let result = run_judge_with_one_rerun(JudgeRun {
+            service: service.as_ref(),
+            tenant_id: &tenant_id,
+            judge_id,
+            judge_name: &judge_name,
+            input,
+            parent_execution_id,
+            timeout_seconds,
+            poll_interval_ms,
+            event_bus: Some(event_bus.as_ref()),
+        })
+        .await?;
+        Ok((judge_id, result))
     }
 
     fn compute_consensus(
@@ -364,6 +353,140 @@ fn calculate_max_attempts(timeout_seconds: u64, poll_interval_ms: u64) -> Result
 
     let timeout_ms = timeout_seconds.saturating_mul(1000);
     Ok(timeout_ms.saturating_add(poll_interval_ms - 1) / poll_interval_ms)
+}
+
+// ── Running a judge (ADR-016) and its one re-run on a fault (ADR-017) ─────────
+
+/// One judge to run as a child execution of the execution it validates.
+struct JudgeRun<'a> {
+    service: &'a dyn ExecutionService,
+    tenant_id: &'a TenantId,
+    judge_id: AgentId,
+    judge_name: &'a str,
+    input: ExecutionInput,
+    parent_execution_id: ExecutionId,
+    timeout_seconds: u64,
+    poll_interval_ms: u64,
+    /// Where each [`JudgeFault`] is published; `None` publishes nothing.
+    event_bus: Option<&'a crate::infrastructure::event_bus::EventBus>,
+}
+
+/// Start the judge as a fresh child execution with `input`, wait for it, and
+/// read its last output as a verdict. The outer error is the run itself failing
+/// (start, poll, timeout, the judge failed or cancelled); the inner is a verdict
+/// that cannot be read.
+async fn run_judge_once(
+    run: &JudgeRun<'_>,
+    input: ExecutionInput,
+) -> Result<std::result::Result<GradientResult, JudgeFault>> {
+    let exec_id = run
+        .service
+        .start_child_execution(run.judge_id, input, run.parent_execution_id)
+        .await?;
+
+    let max_attempts = calculate_max_attempts(run.timeout_seconds, run.poll_interval_ms)?;
+    let mut attempts = 0;
+    loop {
+        if attempts >= max_attempts {
+            return Err(anyhow!(
+                "Judge '{}' timed out after {} seconds",
+                run.judge_name,
+                run.timeout_seconds
+            ));
+        }
+        let exec = run
+            .service
+            .get_execution_for_tenant(run.tenant_id, exec_id)
+            .await?;
+        match exec.status {
+            ExecutionStatus::Completed => {
+                let last_iter = exec
+                    .iterations()
+                    .last()
+                    .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
+                let output_str = last_iter.output.as_deref().unwrap_or_default();
+                return Ok(read_judge_verdict(run.judge_name, output_str));
+            }
+            ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
+                return Err(anyhow!(
+                    "Judge '{}' execution failed or was cancelled",
+                    run.judge_name
+                ));
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_millis(run.poll_interval_ms)).await;
+                attempts += 1;
+            }
+        }
+    }
+}
+
+/// Run a judge; when its verdict cannot be read, run it once more as a fresh
+/// child execution with the same input (ADR-017's Update of 2026-10-01). Every
+/// fault publishes [`crate::domain::events::ValidationEvent::JudgeFault`]. A
+/// second fault is returned as the error: a [`JudgeFault`] naming the judge and
+/// saying it faulted twice, which the supervisor ends the execution on.
+async fn run_judge_with_one_rerun(run: JudgeRun<'_>) -> Result<GradientResult> {
+    let first = match run_judge_once(&run, run.input.clone()).await? {
+        Ok(verdict) => return Ok(verdict),
+        Err(fault) => fault,
+    };
+    publish_judge_fault(&run, &first);
+    tracing::warn!(
+        judge_agent = %first.judge_agent,
+        reason = %first.reason,
+        "Judge verdict cannot be read — running the judge once more"
+    );
+
+    match run_judge_once(&run, run.input.clone()).await? {
+        Ok(verdict) => Ok(verdict),
+        Err(second) => {
+            publish_judge_fault(&run, &second);
+            Err(anyhow::Error::new(JudgeFault {
+                reason: format!(
+                    "it faulted twice, on two fresh runs; the first: {}; the second: {}",
+                    first.reason, second.reason
+                ),
+                judge_agent: second.judge_agent,
+                output: second.output,
+            }))
+        }
+    }
+}
+
+fn publish_judge_fault(run: &JudgeRun<'_>, fault: &JudgeFault) {
+    if let Some(event_bus) = run.event_bus {
+        event_bus.publish_execution_event(crate::domain::events::ExecutionEvent::Validation(
+            crate::domain::events::ValidationEvent::JudgeFault {
+                execution_id: run.parent_execution_id,
+                judge_agent: fault.judge_agent.clone(),
+                reason: fault.reason.clone(),
+                judge_output: fault.output.clone(),
+                faulted_at: chrono::Utc::now(),
+            },
+        ));
+    }
+}
+
+/// Keep the first [`JudgeFault`] among the judges that failed, so a shortfall
+/// of judges that faulted is reported as the judge fault it is.
+fn keep_first_judge_fault(first_fault: &mut Option<JudgeFault>, error: &anyhow::Error) {
+    if first_fault.is_none() {
+        *first_fault = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<JudgeFault>())
+            .cloned();
+    }
+}
+
+/// Too few judges succeeded. When one of them faulted, the error carries that
+/// [`JudgeFault`] beneath the shortfall, so the supervisor can tell it from a
+/// failed validation of the worker's output.
+fn insufficient_judges_error(message: String, first_fault: Option<JudgeFault>) -> anyhow::Error {
+    match first_fault {
+        Some(fault) => anyhow::Error::new(fault).context(message),
+        None => anyhow!(message),
+    }
 }
 
 // ── Consensus helpers (free functions so validators can reuse them) ───────────
@@ -554,6 +677,7 @@ pub struct SemanticAgentValidator {
     poll_interval_ms: u64,
     agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
     execution_service: Arc<dyn ExecutionService>,
+    event_bus: Option<Arc<crate::infrastructure::event_bus::EventBus>>,
     parent_execution_id: ExecutionId,
     tenant_id: TenantId,
 }
@@ -571,9 +695,19 @@ impl SemanticAgentValidator {
             poll_interval_ms: config.poll_interval_ms,
             agent_lifecycle_service,
             execution_service,
+            event_bus: None,
             parent_execution_id: config.parent_execution_id,
             tenant_id: config.tenant_id,
         }
+    }
+
+    /// Publish each [`JudgeFault`] of this validator's judge on `event_bus`.
+    pub fn with_event_bus(
+        mut self,
+        event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
+    ) -> Self {
+        self.event_bus = Some(event_bus);
+        self
     }
 }
 
@@ -635,49 +769,19 @@ impl GradientValidator for SemanticAgentValidator {
             attachments: Vec::new(),
         };
 
-        // 3. Start child execution.
-        let exec_id = self
-            .execution_service
-            .start_child_execution(judge_id, input, self.parent_execution_id)
-            .await?;
-
-        // 4. Poll for completion.
-        let max_attempts = calculate_max_attempts(self.timeout_seconds, self.poll_interval_ms)?;
-        let mut attempts = 0;
-        loop {
-            if attempts >= max_attempts {
-                return Err(anyhow!(
-                    "Semantic judge '{}' timed out after {} seconds",
-                    self.judge_agent_name,
-                    self.timeout_seconds
-                ));
-            }
-            let exec = self
-                .execution_service
-                .get_execution_for_tenant(&self.tenant_id, exec_id)
-                .await?;
-            match exec.status {
-                ExecutionStatus::Completed => {
-                    let last_iter = exec
-                        .iterations()
-                        .last()
-                        .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
-                    let output_str = last_iter.output.as_deref().unwrap_or_default();
-                    return read_judge_verdict(&self.judge_agent_name, output_str)
-                        .map_err(anyhow::Error::new);
-                }
-                ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
-                    return Err(anyhow!(
-                        "Semantic judge '{}' execution failed or was cancelled",
-                        self.judge_agent_name
-                    ));
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(self.poll_interval_ms)).await;
-                    attempts += 1;
-                }
-            }
-        }
+        // 3. Run the judge as a child execution, once more on an unreadable verdict.
+        run_judge_with_one_rerun(JudgeRun {
+            service: self.execution_service.as_ref(),
+            tenant_id: &self.tenant_id,
+            judge_id,
+            judge_name: &self.judge_agent_name,
+            input,
+            parent_execution_id: self.parent_execution_id,
+            timeout_seconds: self.timeout_seconds,
+            poll_interval_ms: self.poll_interval_ms,
+            event_bus: self.event_bus.as_deref(),
+        })
+        .await
     }
 }
 
@@ -779,6 +883,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
             let timeout = self.timeout_seconds;
             let poll_interval = self.poll_interval_ms;
             let tenant = self.tenant_id.clone();
+            let event_bus = self.event_bus.clone();
 
             futures.push(tokio::spawn(async move {
                 let exec_input = ExecutionInput {
@@ -790,58 +895,45 @@ impl GradientValidator for MultiJudgeAgentValidator {
                     workflow_execution_id: None,
                     attachments: Vec::new(),
                 };
-                let exec_id = svc
-                    .start_child_execution(jid, exec_input, parent_id)
-                    .await?;
-                // Poll for completion.
-                let max_attempts = calculate_max_attempts(timeout, poll_interval)?;
-                let mut attempts = 0;
-                loop {
-                    if attempts >= max_attempts {
-                        return Err::<(AgentId, GradientResult, f64), _>(anyhow!(
-                            "Judge timed out after {timeout} seconds"
-                        ));
-                    }
-                    let exec = svc.get_execution_for_tenant(&tenant, exec_id).await?;
-                    match exec.status {
-                        ExecutionStatus::Completed => {
-                            let last_iter = exec
-                                .iterations()
-                                .last()
-                                .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
-                            let output_str = last_iter.output.as_deref().unwrap_or_default();
-                            let result = read_judge_verdict(&judge_name, output_str)
-                                .map_err(anyhow::Error::new)?;
-                            return Ok((jid, result, w));
-                        }
-                        ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
-                            return Err(anyhow!("Judge execution failed or was cancelled"));
-                        }
-                        _ => {
-                            tokio::time::sleep(Duration::from_millis(poll_interval)).await;
-                            attempts += 1;
-                        }
-                    }
-                }
+                let result = run_judge_with_one_rerun(JudgeRun {
+                    service: svc.as_ref(),
+                    tenant_id: &tenant,
+                    judge_id: jid,
+                    judge_name: &judge_name,
+                    input: exec_input,
+                    parent_execution_id: parent_id,
+                    timeout_seconds: timeout,
+                    poll_interval_ms: poll_interval,
+                    event_bus: Some(event_bus.as_ref()),
+                })
+                .await?;
+                Ok::<(AgentId, GradientResult, f64), anyhow::Error>((jid, result, w))
             }));
         }
 
         // 4. Collect results.
         let mut results: Vec<(AgentId, GradientResult, f64)> = Vec::new();
+        let mut first_fault: Option<JudgeFault> = None;
         for future in futures {
             match future.await {
                 Ok(Ok(triple)) => results.push(triple),
-                Ok(Err(e)) => tracing::warn!("MultiJudge: judge failed: {}", e),
+                Ok(Err(e)) => {
+                    tracing::warn!("MultiJudge: judge failed: {}", e);
+                    keep_first_judge_fault(&mut first_fault, &e);
+                }
                 Err(e) => tracing::error!("MultiJudge: join error: {}", e),
             }
         }
 
         if results.len() < self.min_judges_required {
-            return Err(anyhow!(
-                "MultiJudge: insufficient judges succeeded: {} of {} required (total: {})",
-                results.len(),
-                self.min_judges_required,
-                self.judges.len()
+            return Err(insufficient_judges_error(
+                format!(
+                    "MultiJudge: insufficient judges succeeded: {} of {} required (total: {})",
+                    results.len(),
+                    self.min_judges_required,
+                    self.judges.len()
+                ),
+                first_fault,
             ));
         }
 
@@ -952,18 +1044,21 @@ pub fn build_validation_pipeline(
             } => {
                 entries.push(ValidatorEntry {
                     kind: ValidatorKind::Semantic,
-                    validator: Box::new(SemanticAgentValidator::new(
-                        SemanticAgentValidatorConfig {
-                            judge_agent_name: judge_agent.clone(),
-                            criteria: criteria.clone(),
-                            timeout_seconds: *timeout_seconds,
-                            poll_interval_ms: 500,
-                            parent_execution_id,
-                            tenant_id: tenant_id.clone(),
-                        },
-                        agent_lifecycle_service.clone(),
-                        execution_service.clone(),
-                    )),
+                    validator: Box::new(
+                        SemanticAgentValidator::new(
+                            SemanticAgentValidatorConfig {
+                                judge_agent_name: judge_agent.clone(),
+                                criteria: criteria.clone(),
+                                timeout_seconds: *timeout_seconds,
+                                poll_interval_ms: 500,
+                                parent_execution_id,
+                                tenant_id: tenant_id.clone(),
+                            },
+                            agent_lifecycle_service.clone(),
+                            execution_service.clone(),
+                        )
+                        .with_event_bus(event_bus.clone()),
+                    ),
                     min_score: *min_score,
                     min_confidence: *min_confidence,
                 });

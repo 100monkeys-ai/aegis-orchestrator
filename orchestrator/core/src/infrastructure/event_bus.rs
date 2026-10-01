@@ -185,7 +185,8 @@ impl DomainEvent {
                 | ExecutionEvent::ChildExecutionCompleted { execution_id, .. } => *execution_id,
                 ExecutionEvent::Validation(validation) => match validation {
                     ValidationEvent::GradientValidationPerformed { execution_id, .. }
-                    | ValidationEvent::MultiJudgeConsensus { execution_id, .. } => *execution_id,
+                    | ValidationEvent::MultiJudgeConsensus { execution_id, .. }
+                    | ValidationEvent::JudgeFault { execution_id, .. } => *execution_id,
                 },
                 ExecutionEvent::OutputHandlerStarted { execution_id, .. }
                 | ExecutionEvent::OutputHandlerCompleted { execution_id, .. }
@@ -349,10 +350,11 @@ impl DomainEvent {
                 | ExecutionEvent::InstanceTerminated { agent_id, .. }
                 | ExecutionEvent::ChildExecutionSpawned { agent_id, .. }
                 | ExecutionEvent::ChildExecutionCompleted { agent_id, .. } => Some(*agent_id),
-                ExecutionEvent::Validation(validation) => Some(match validation {
+                ExecutionEvent::Validation(validation) => match validation {
                     ValidationEvent::GradientValidationPerformed { agent_id, .. }
-                    | ValidationEvent::MultiJudgeConsensus { agent_id, .. } => *agent_id,
-                }),
+                    | ValidationEvent::MultiJudgeConsensus { agent_id, .. } => Some(*agent_id),
+                    ValidationEvent::JudgeFault { .. } => None,
+                },
                 ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }
                 | ExecutionEvent::OutputHandlerFailed { .. } => None,
@@ -445,6 +447,7 @@ impl DomainEvent {
                         *validated_at
                     }
                     ValidationEvent::MultiJudgeConsensus { reached_at, .. } => *reached_at,
+                    ValidationEvent::JudgeFault { faulted_at, .. } => *faulted_at,
                 },
                 ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }
@@ -697,6 +700,7 @@ impl DomainEvent {
                         "gradient_validation_performed"
                     }
                     ValidationEvent::MultiJudgeConsensus { .. } => "multi_judge_consensus",
+                    ValidationEvent::JudgeFault { .. } => "judge_fault",
                 },
                 ExecutionEvent::OutputHandlerStarted { .. } => "output_handler_started",
                 ExecutionEvent::OutputHandlerCompleted { .. } => "output_handler_completed",
@@ -980,7 +984,8 @@ impl DomainEvent {
                     ValidationEvent::GradientValidationPerformed {
                         iteration_number, ..
                     } => Some(*iteration_number),
-                    ValidationEvent::MultiJudgeConsensus { .. } => None,
+                    ValidationEvent::MultiJudgeConsensus { .. }
+                    | ValidationEvent::JudgeFault { .. } => None,
                 },
                 ExecutionEvent::ExecutionStarted { .. }
                 | ExecutionEvent::ExecutionCompleted { .. }
@@ -1423,6 +1428,9 @@ impl ExecutionEventReceiver {
                 ValidationEvent::MultiJudgeConsensus { execution_id, .. } => {
                     execution_id == &self.execution_id
                 }
+                ValidationEvent::JudgeFault { execution_id, .. } => {
+                    execution_id == &self.execution_id
+                }
             },
             ExecutionEvent::OutputHandlerStarted { execution_id, .. }
             | ExecutionEvent::OutputHandlerCompleted { execution_id, .. }
@@ -1548,6 +1556,7 @@ impl AgentEventReceiver {
                     ValidationEvent::MultiJudgeConsensus { agent_id, .. } => {
                         agent_id == &self.agent_id
                     }
+                    ValidationEvent::JudgeFault { .. } => false, // names the judge, not an agent id
                 },
                 ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }

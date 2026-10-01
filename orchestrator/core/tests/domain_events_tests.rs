@@ -70,6 +70,27 @@ fn execution_id_returns_some_for_validation_event() {
     assert_eq!(event.execution_id(), Some(eid));
 }
 
+/// A judge fault is scoped to the execution whose output the judge was judging;
+/// it names the judge by name, so it carries no agent id and no iteration.
+#[test]
+fn judge_fault_event_is_scoped_to_the_judged_execution() {
+    let eid = ExecutionId::new();
+    let faulted_at = Utc::now();
+    let event = DomainEvent::Execution(ExecutionEvent::Validation(ValidationEvent::JudgeFault {
+        execution_id: eid,
+        judge_agent: "haiku-judge-agent".to_string(),
+        reason: "the output is not JSON".to_string(),
+        judge_output: "I think the answer is fine.".to_string(),
+        faulted_at,
+    }));
+    assert_eq!(event.execution_id(), Some(eid));
+    assert_eq!(event.agent_id(), None);
+    assert_eq!(event.iteration_number(), None);
+    assert_eq!(event.timestamp(), faulted_at);
+    assert_eq!(event.event_type_name(), "judge_fault");
+    assert_eq!(event.category(), "execution");
+}
+
 #[test]
 fn execution_id_returns_none_for_agent_lifecycle() {
     let aid = AgentId::new();

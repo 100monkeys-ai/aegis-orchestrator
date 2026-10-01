@@ -23,7 +23,7 @@ use aegis_orchestrator_core::domain::agent::{
     Agent, AgentId, AgentManifest, AgentScope, AgentSpec, AgentStatus, ManifestMetadata,
     RuntimeConfig,
 };
-use aegis_orchestrator_core::domain::events::ExecutionEvent;
+use aegis_orchestrator_core::domain::events::{ExecutionEvent, ValidationEvent};
 use aegis_orchestrator_core::domain::execution::{
     Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction, TrajectoryStep,
 };
@@ -476,4 +476,378 @@ async fn multi_judge_reads_the_iteration_2_verdict() {
         ),
         Err(e) => panic!("the multi-judge path refused a verdict with a score: {e}"),
     }
+}
+
+// ── A judge fault is the judge's, not the worker's (ADR-017, Update 2026-10-01) ──
+//
+// A judge whose verdict cannot be read is run once more as a fresh child
+// execution with the same input; each fault publishes a `JudgeFault` event, and
+// a second fault is returned as the error, a `JudgeFault` that names the judge
+// and says it faulted twice.
+
+/// Execution service whose judge child executions answer, in start order, with
+/// the outputs it was given; it records each start's input.
+struct SequencedJudgeExecutionService {
+    outputs: Vec<String>,
+    started: std::sync::Mutex<Vec<(ExecutionId, ExecutionInput)>>,
+}
+
+impl SequencedJudgeExecutionService {
+    fn new(outputs: &[&str]) -> Self {
+        Self {
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+            started: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn started_inputs(&self) -> Vec<serde_json::Value> {
+        self.started
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, input)| input.input.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ExecutionService for SequencedJudgeExecutionService {
+    async fn start_execution(
+        &self,
+        _agent_id: AgentId,
+        _input: ExecutionInput,
+        _security_context_name: String,
+        _identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+    ) -> anyhow::Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _agent_id: AgentId,
+        _input: ExecutionInput,
+        _security_context_name: String,
+        _identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+    ) -> anyhow::Result<ExecutionId> {
+        Ok(execution_id)
+    }
+
+    async fn start_child_execution(
+        &self,
+        _agent_id: AgentId,
+        input: ExecutionInput,
+        _parent_execution_id: ExecutionId,
+    ) -> anyhow::Result<ExecutionId> {
+        let mut started = self.started.lock().unwrap();
+        if started.len() >= self.outputs.len() {
+            anyhow::bail!(
+                "judge started {} times, more than the {} runs scripted",
+                started.len() + 1,
+                self.outputs.len()
+            );
+        }
+        let id = ExecutionId::new();
+        started.push((id, input));
+        Ok(id)
+    }
+
+    async fn get_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> anyhow::Result<Execution> {
+        let index = self
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|(started_id, _)| *started_id == id)
+            .ok_or_else(|| anyhow::anyhow!("Execution not found"))?;
+        let mut exec = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: None,
+                input: serde_json::Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            3,
+            "aegis-system-operator".to_string(),
+        );
+        exec.start();
+        exec.start_iteration("validate".to_string()).unwrap();
+        exec.complete_iteration(self.outputs[index].clone());
+        exec.complete();
+        Ok(exec)
+    }
+
+    async fn get_execution_unscoped(&self, _id: ExecutionId) -> anyhow::Result<Execution> {
+        anyhow::bail!("get_execution_unscoped must not be used by validator pollers")
+    }
+
+    async fn get_iterations_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _exec_id: ExecutionId,
+    ) -> anyhow::Result<Vec<Iteration>> {
+        anyhow::bail!("not exercised")
+    }
+
+    async fn cancel_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn stream_execution(
+        &self,
+        _id: ExecutionId,
+    ) -> anyhow::Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<ExecutionEvent>> + Send>>,
+    > {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn stream_agent_events(
+        &self,
+        _id: AgentId,
+    ) -> anyhow::Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<DomainEvent>> + Send>>,
+    > {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn list_executions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: Option<AgentId>,
+        _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<Execution>> {
+        Ok(vec![])
+    }
+
+    async fn delete_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn record_llm_interaction(
+        &self,
+        _execution_id: ExecutionId,
+        _iteration: u8,
+        _interaction: LlmInteraction,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn store_iteration_trajectory(
+        &self,
+        _execution_id: ExecutionId,
+        _iteration: u8,
+        _trajectory: Vec<TrajectoryStep>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// The JudgeFault events published on `receiver` so far, as
+/// (execution id, judge agent, reason, judge output).
+fn judge_fault_events(
+    receiver: &mut aegis_orchestrator_core::infrastructure::event_bus::EventReceiver,
+) -> Vec<(ExecutionId, String, String, String)> {
+    let mut faults = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let DomainEvent::Execution(ExecutionEvent::Validation(ValidationEvent::JudgeFault {
+            execution_id,
+            judge_agent,
+            reason,
+            judge_output,
+            ..
+        })) = event
+        {
+            faults.push((execution_id, judge_agent, reason, judge_output));
+        }
+    }
+    faults
+}
+
+const UNREADABLE_VERDICT: &str = "I think the answer is fine.";
+
+/// A judge whose first verdict cannot be read and whose second can: the
+/// validator yields the second verdict, the judge was started twice with the
+/// same input, and one JudgeFault event names the judge and quotes its output.
+#[tokio::test]
+async fn a_judge_unreadable_once_is_run_again_and_its_second_verdict_is_read() {
+    let parent = ExecutionId::new();
+    let exec_service = Arc::new(SequencedJudgeExecutionService::new(&[
+        UNREADABLE_VERDICT,
+        ITERATION_2_VERDICT,
+    ]));
+    let event_bus = Arc::new(EventBus::new(64));
+    let mut receiver = event_bus.subscribe();
+    let validator = SemanticAgentValidator::new(
+        SemanticAgentValidatorConfig {
+            judge_agent_name: "haiku-judge-agent".to_string(),
+            criteria: "evaluate the output".to_string(),
+            timeout_seconds: 5,
+            poll_interval_ms: 20,
+            parent_execution_id: parent,
+            tenant_id: tenant(),
+        },
+        Arc::new(StubAgentLifecycleService {
+            judge_id: AgentId::new(),
+        }),
+        exec_service.clone(),
+    )
+    .with_event_bus(event_bus.clone());
+
+    let result = validator.validate(&validation_ctx()).await;
+    let verdict = match result {
+        Ok(v) => v,
+        Err(e) => panic!(
+            "a judge unreadable once must be run again and its readable second verdict read, got: {e}"
+        ),
+    };
+    assert_eq!(verdict.score, 1.0, "the second verdict's score is read");
+
+    let inputs = exec_service.started_inputs();
+    assert_eq!(
+        inputs.len(),
+        2,
+        "the judge is started once more as a fresh child execution, no more"
+    );
+    assert_eq!(inputs[0], inputs[1], "the second run has the same input");
+
+    let faults = judge_fault_events(&mut receiver);
+    assert_eq!(
+        faults.len(),
+        1,
+        "one JudgeFault event for the one unreadable verdict, got: {faults:?}"
+    );
+    let (execution_id, judge_agent, _reason, judge_output) = &faults[0];
+    assert_eq!(
+        *execution_id, parent,
+        "the event names the judged execution"
+    );
+    assert_eq!(judge_agent, "haiku-judge-agent");
+    assert_eq!(judge_output, UNREADABLE_VERDICT);
+}
+
+/// A judge unreadable twice: the error is a JudgeFault naming the judge and
+/// saying it faulted twice; the judge was started twice, not more; and each
+/// fault published its event.
+#[tokio::test]
+async fn a_judge_unreadable_twice_is_a_judge_fault_saying_it_faulted_twice() {
+    let parent = ExecutionId::new();
+    let exec_service = Arc::new(SequencedJudgeExecutionService::new(&[
+        UNREADABLE_VERDICT,
+        UNREADABLE_VERDICT,
+        ITERATION_2_VERDICT,
+    ]));
+    let event_bus = Arc::new(EventBus::new(64));
+    let mut receiver = event_bus.subscribe();
+    let validator = SemanticAgentValidator::new(
+        SemanticAgentValidatorConfig {
+            judge_agent_name: "haiku-judge-agent".to_string(),
+            criteria: "evaluate the output".to_string(),
+            timeout_seconds: 5,
+            poll_interval_ms: 20,
+            parent_execution_id: parent,
+            tenant_id: tenant(),
+        },
+        Arc::new(StubAgentLifecycleService {
+            judge_id: AgentId::new(),
+        }),
+        exec_service.clone(),
+    )
+    .with_event_bus(event_bus.clone());
+
+    let err = validator
+        .validate(&validation_ctx())
+        .await
+        .expect_err("a judge unreadable twice cannot yield a verdict");
+    let fault = err
+        .downcast_ref::<JudgeFault>()
+        .unwrap_or_else(|| panic!("the error must be a typed JudgeFault, got: {err}"));
+    assert_eq!(fault.judge_agent, "haiku-judge-agent");
+    let text = err.to_string();
+    assert!(
+        text.contains("judge fault")
+            && text.contains("haiku-judge-agent")
+            && text.contains("faulted twice"),
+        "the error must say judge fault, name the judge and say it faulted twice, got: {text}"
+    );
+    assert_eq!(
+        exec_service.started_inputs().len(),
+        2,
+        "the judge is run once more after its first fault, and not a third time"
+    );
+    assert_eq!(
+        judge_fault_events(&mut receiver).len(),
+        2,
+        "each of the two faults publishes a JudgeFault event"
+    );
+}
+
+/// The multi-judge path: its one judge unreadable twice makes the shortfall of
+/// judges an error that carries the JudgeFault, after one re-run of the judge.
+#[tokio::test]
+async fn multi_judge_with_its_judge_unreadable_twice_carries_the_judge_fault() {
+    let exec_service = Arc::new(SequencedJudgeExecutionService::new(&[
+        UNREADABLE_VERDICT,
+        UNREADABLE_VERDICT,
+        ITERATION_2_VERDICT,
+    ]));
+    let event_bus = Arc::new(EventBus::new(64));
+    let mut receiver = event_bus.subscribe();
+    let validator = MultiJudgeAgentValidator::new(
+        MultiJudgeAgentValidatorConfig {
+            judges: vec!["haiku-judge-agent".to_string()],
+            consensus_config: ConsensusConfig {
+                strategy: ConsensusStrategy::WeightedAverage,
+                threshold: None,
+                min_agreement_confidence: None,
+                n: None,
+                min_judges_required: 1,
+                confidence_weighting: None,
+            },
+            min_judges_required: 1,
+            criteria: "evaluate the output".to_string(),
+            timeout_seconds: 5,
+            poll_interval_ms: 20,
+            parent_execution_id: ExecutionId::new(),
+            tenant_id: tenant(),
+        },
+        Arc::new(StubAgentLifecycleService {
+            judge_id: AgentId::new(),
+        }),
+        exec_service.clone(),
+        event_bus.clone(),
+    );
+
+    let err = validator
+        .validate(&validation_ctx())
+        .await
+        .expect_err("no judge produced a readable verdict");
+    let fault = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<JudgeFault>())
+        .unwrap_or_else(|| panic!("the shortfall must carry the JudgeFault, got: {err:#}"));
+    assert_eq!(fault.judge_agent, "haiku-judge-agent");
+    assert_eq!(
+        exec_service.started_inputs().len(),
+        2,
+        "the multi-judge's judge is run once more after its first fault, and not a third time"
+    );
+    assert_eq!(judge_fault_events(&mut receiver).len(), 2);
 }

@@ -724,6 +724,7 @@ pub enum LearningEvent {
 /// Published by [`crate::application::validation_service::ValidationService`] after each
 /// iteration is evaluated. `score` and `confidence` are both in `[0.0, 1.0]`.
 /// For multi-judge runs, individual judge scores are aggregated into `MultiJudgeConsensus`.
+/// A judge whose verdict cannot be read publishes `JudgeFault`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ValidationEvent {
     GradientValidationPerformed {
@@ -741,6 +742,22 @@ pub enum ValidationEvent {
         final_score: f64,
         confidence: f64,
         reached_at: DateTime<Utc>,
+    },
+    /// A judge agent's verdict could not be read: a
+    /// [`crate::domain::validation::JudgeFault`]. The judge is at fault, not the
+    /// worker whose output it was judging (ADR-017's Update of 2026-10-01).
+    /// Published once for every judge run that faults; the judge is run once
+    /// more, and a second fault ends the execution with the fault as its reason.
+    JudgeFault {
+        /// The execution whose output the judge was validating.
+        execution_id: ExecutionId,
+        /// The judge agent's name.
+        judge_agent: String,
+        /// Why the verdict could not be read.
+        reason: String,
+        /// The judge's last output, as written.
+        judge_output: String,
+        faulted_at: DateTime<Utc>,
     },
 }
 
