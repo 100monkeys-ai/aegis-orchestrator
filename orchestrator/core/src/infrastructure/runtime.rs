@@ -200,6 +200,61 @@ pub(crate) fn apply_resource_limits(
     }
 }
 
+/// The agent container's main process. It only keeps the container alive: the
+/// agent itself runs through `execute()`'s exec of the bootstrap script.
+///
+/// It runs as PID 1, and the kernel delivers a signal to a PID namespace's
+/// init only when that process has a handler for it (pid_namespaces(7)), so a
+/// bare `tail -f /dev/null` ignores the engine's SIGTERM and every stop waited
+/// out its whole grace period. The shell traps TERM, and POSIX makes a trapped
+/// signal end `wait` at once and run the trap, so the container exits as soon
+/// as it is told to. A shell rather than the engine's init (`HostConfig.init`)
+/// because that init is a binary on the host (Docker's `docker-init`, Podman's
+/// `init_path`), while `/bin/sh` and `tail` are in every agent image.
+const AGENT_MAIN_PROCESS_SCRIPT: &str = "trap 'exit 0' TERM; tail -f /dev/null & wait";
+
+/// The create request for an agent container.
+pub(crate) fn agent_container_body(
+    image: String,
+    env_vars: Vec<String>,
+    labels: HashMap<String, String>,
+    host_config: bollard::models::HostConfig,
+) -> ContainerCreateBody {
+    let cmd = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        AGENT_MAIN_PROCESS_SCRIPT.to_string(),
+    ];
+    ContainerCreateBody {
+        image: Some(image),
+        tty: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        cmd: Some(cmd),
+        env: Some(env_vars),
+        labels: Some(labels),
+        host_config: Some(host_config),
+        ..Default::default()
+    }
+}
+
+/// Whether `terminate()` still has to SIGKILL a container after its stop call.
+///
+/// A stop that returned has ended the container: the engine sends the stop
+/// signal and kills the container itself when the grace period runs out. 304
+/// says it was already stopped and 404 that it is gone. A kill after any of
+/// them only draws a 409 "can only kill running containers". Any other failure
+/// may have left it running, so the kill follows.
+pub(crate) fn kill_needed_after_stop(stop_result: &Result<(), bollard::errors::Error>) -> bool {
+    match stop_result {
+        Ok(()) => false,
+        Err(bollard::errors::Error::DockerResponseServerError { status_code, .. }) => {
+            !matches!(status_code, 304 | 404)
+        }
+        Err(_) => true,
+    }
+}
+
 /// Wrap a FUSE Mount call in [`FUSE_MOUNT_TIMEOUT_SECS`] and map the
 /// elapsed-deadline branch to [`RuntimeError::FuseMountTimeout`].
 ///
@@ -1398,25 +1453,12 @@ impl AgentRuntime for ContainerRuntime {
             debug!("Enabled bootstrap.py verbose mode (AEGIS_BOOTSTRAP_DEBUG=true)");
         }
 
-        // Keep container alive - actual agent execution happens via bootstrap script in execute()
-        let cmd = vec![
-            "tail".to_string(),
-            "-f".to_string(),
-            "/dev/null".to_string(),
-        ];
-
-        // Create container configuration
-        let container_config = ContainerCreateBody {
-            image: Some(image.clone()),
-            tty: Some(true),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            cmd: Some(cmd),
-            env: Some(env_vars),
-            labels: Some(Self::managed_container_labels(&config, self.engine.kind())),
-            host_config: Some(host_config),
-            ..Default::default()
-        };
+        let container_config = agent_container_body(
+            image.clone(),
+            env_vars,
+            Self::managed_container_labels(&config, self.engine.kind()),
+            host_config,
+        );
 
         // Create the container
         info!(target: "runtime_spawn", step = "create_container", "creating container");
@@ -1711,50 +1753,54 @@ impl AgentRuntime for ContainerRuntime {
             return Ok(());
         }
 
-        // Step 1: graceful stop with a 5s timeout (libpod honors `t` and gives
-        // conmon a clean SIGTERM grace window before escalating).
+        // Step 1: graceful stop. The main process exits on SIGTERM at once;
+        // the 5s timeout bounds a container that does not (libpod honors `t`
+        // and gives conmon a clean SIGTERM grace window before escalating).
         let stop_opts = StopContainerOptions {
             t: Some(5),
             signal: None,
         };
-        if let Err(error) = self
+        let stop_result = self
             .docker
             .stop_container(id.as_str(), Some(stop_opts))
-            .await
-        {
-            if let Some(unkillable) = self.map_unkillable(id.as_str(), &error) {
+            .await;
+        if let Err(ref error) = stop_result {
+            if let Some(unkillable) = self.map_unkillable(id.as_str(), error) {
                 return Err(unkillable);
             }
             // Stop can legitimately fail with 304 ("container already stopped")
-            // or 404 ("no such container"); fall through to kill+remove which
-            // will surface a real error if anything is genuinely wrong.
+            // or 404 ("no such container"); fall through to remove, after a
+            // kill for any other failure, which will surface a real error if
+            // anything is genuinely wrong.
             debug!(
                 container_id = id.as_str(),
                 error = %error,
-                "stop_container returned non-fatal error; continuing to kill+remove"
+                "stop_container returned non-fatal error; continuing to remove"
             );
         }
 
-        // Step 2: explicit SIGKILL. On Podman this is what triggers conmon to
-        // send SIGKILL through to the container PID; if the PID is wedged in a
-        // D-state syscall, libpod returns 500 "did not die within timeout".
-        let kill_opts = KillContainerOptions {
-            signal: "SIGKILL".to_string(),
-        };
-        if let Err(error) = self
-            .docker
-            .kill_container(id.as_str(), Some(kill_opts))
-            .await
-        {
-            if let Some(unkillable) = self.map_unkillable(id.as_str(), &error) {
-                return Err(unkillable);
+        // Step 2: explicit SIGKILL, only when the stop did not end the
+        // container. On Podman this is what triggers conmon to send SIGKILL
+        // through to the container PID; if the PID is wedged in a D-state
+        // syscall, libpod returns 500 "did not die within timeout".
+        if kill_needed_after_stop(&stop_result) {
+            let kill_opts = KillContainerOptions {
+                signal: "SIGKILL".to_string(),
+            };
+            if let Err(error) = self
+                .docker
+                .kill_container(id.as_str(), Some(kill_opts))
+                .await
+            {
+                if let Some(unkillable) = self.map_unkillable(id.as_str(), &error) {
+                    return Err(unkillable);
+                }
+                debug!(
+                    container_id = id.as_str(),
+                    error = %error,
+                    "kill_container returned non-fatal error; continuing to remove"
+                );
             }
-            // 409 "container not running" is expected if stop already ended it.
-            debug!(
-                container_id = id.as_str(),
-                error = %error,
-                "kill_container returned non-fatal error; continuing to remove"
-            );
         }
 
         // Step 3: remove with v=true to drop anonymous volumes (Podman supports
@@ -2389,6 +2435,118 @@ mod tests {
                 other => panic!("{name}={value}: expected SpawnFailed, got {other:?}"),
             }
         }
+    }
+
+    // ── Agent container stop (the stop paid about 5 s on every iteration) ───
+
+    fn sample_agent_container_body() -> bollard::models::ContainerCreateBody {
+        super::agent_container_body(
+            "python:3.11-slim".to_string(),
+            vec!["A=1".to_string()],
+            HashMap::new(),
+            bollard::models::HostConfig::default(),
+        )
+    }
+
+    /// Regression: the agent container's main process is PID 1, and the
+    /// kernel delivers SIGTERM to a PID 1 only when it has a handler for it
+    /// (pid_namespaces(7)). `tail -f /dev/null` has none, so every stop waited
+    /// out the whole grace period and then killed. The create request must
+    /// start a main process that installs a SIGTERM handler.
+    #[test]
+    fn agent_container_main_process_handles_sigterm() {
+        let body = sample_agent_container_body();
+        let cmd = body.cmd.expect("the create request names a command");
+        assert_eq!(
+            cmd.first().map(String::as_str),
+            Some("/bin/sh"),
+            "the main process must be a shell that can trap SIGTERM, got {cmd:?}"
+        );
+        assert_eq!(cmd.get(1).map(String::as_str), Some("-c"), "{cmd:?}");
+        let script = cmd.get(2).expect("a script for the shell");
+        assert!(
+            script.contains("trap") && script.contains("TERM"),
+            "the script must install a SIGTERM trap, got {script:?}"
+        );
+        assert_eq!(cmd.len(), 3, "{cmd:?}");
+        assert!(body.entrypoint.is_none(), "the image's entrypoint is kept");
+    }
+
+    /// The same command, run here as an ordinary process: SIGTERM ends it at
+    /// once and cleanly, which is what lets the engine's stop return before
+    /// its grace period.
+    #[cfg(unix)]
+    #[test]
+    fn agent_container_main_process_exits_cleanly_on_sigterm() {
+        use std::time::{Duration, Instant};
+
+        let cmd = sample_agent_container_body()
+            .cmd
+            .expect("the create request names a command");
+        let mut child = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .spawn()
+            .expect("spawn the container's main process locally");
+        // Give the shell time to install its trap before the signal.
+        std::thread::sleep(Duration::from_millis(300));
+        let sent = Instant::now();
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -TERM failed: {status:?}");
+        loop {
+            if let Some(exit) = child.try_wait().expect("wait for the process") {
+                assert!(
+                    exit.success(),
+                    "the main process must exit 0 on SIGTERM, got {exit:?}"
+                );
+                break;
+            }
+            if sent.elapsed() > Duration::from_secs(2) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the main process did not exit within 2 s of SIGTERM");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            sent.elapsed() < Duration::from_secs(1),
+            "exit took {:?}",
+            sent.elapsed()
+        );
+    }
+
+    /// Regression: `terminate()` sent SIGKILL after every stop, and after a
+    /// stop that had succeeded the engine answers 409 "can only kill running
+    /// containers", logged on every clean stop. A successful stop has already
+    /// ended the container (the engine kills it itself at the end of the
+    /// grace period); 304 and 404 say it is already stopped or gone.
+    #[test]
+    fn kill_is_sent_only_when_the_stop_did_not_end_the_container() {
+        let server = |status_code: u16| {
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code,
+                message: "x".to_string(),
+            })
+        };
+        assert!(
+            !super::kill_needed_after_stop(&Ok(())),
+            "after a clean stop"
+        );
+        assert!(
+            !super::kill_needed_after_stop(&server(304)),
+            "already stopped"
+        );
+        assert!(
+            !super::kill_needed_after_stop(&server(404)),
+            "no such container"
+        );
+        assert!(super::kill_needed_after_stop(&server(500)), "a failed stop");
+        assert!(
+            super::kill_needed_after_stop(&Err(bollard::errors::Error::RequestTimeoutError)),
+            "a stop that timed out"
+        );
     }
 }
 // Private helper methods for ContainerRuntime (Docker/Podman)
