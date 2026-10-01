@@ -393,21 +393,11 @@ pub(crate) fn create_router(
     }));
 
     // Model alias lookup (AEGIS ADR-124 D3): the model an alias resolves to,
-    // from a provider registry built from the node configuration the
-    // daemon's own registry is built from (`server.rs`), so it holds the same
-    // alias table. Beneath the same authentication layers as `/v1/credentials`.
-    let llm_registry =
-        match aegis_orchestrator_core::infrastructure::llm::ProviderRegistry::from_config(
-            &app_state.config,
-        ) {
-            Ok(registry) => Some(Arc::new(registry)),
-            Err(e) => {
-                tracing::warn!(error = %e, "LLM alias lookup unavailable: provider registry not built");
-                None
-            }
-        };
+    // read from the daemon's one provider registry, the instance the inner
+    // loop routes every model call through (`AppState::llm_registry`).
+    // Beneath the same authentication layers as `/v1/credentials`.
     let router = router.merge(llm_aliases_router(LlmAliasesState {
-        registry: llm_registry,
+        registry: app_state.llm_registry.clone(),
     }));
 
     // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed

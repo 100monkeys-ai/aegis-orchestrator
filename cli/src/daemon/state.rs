@@ -43,6 +43,11 @@ pub(crate) struct AppState {
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) inner_loop_service:
         Arc<aegis_orchestrator_core::application::inner_loop_service::InnerLoopService>,
+    /// The daemon's one LLM provider registry: the instance the inner loop
+    /// routes every model call through, which `GET /v1/llm/aliases/{alias}`
+    /// reads (AEGIS ADR-124 D3). Never a second registry built from the
+    /// config: two instances can come apart the day one of them is rebuilt.
+    pub(crate) llm_registry: Arc<aegis_orchestrator_core::infrastructure::llm::ProviderRegistry>,
     pub(crate) human_input_service: Arc<aegis_orchestrator_core::infrastructure::HumanInputService>,
     pub(crate) temporal_event_listener: Arc<TemporalEventListener>,
     pub(crate) register_workflow_use_case: Arc<StandardRegisterWorkflowUseCase>,

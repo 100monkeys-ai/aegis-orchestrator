@@ -28,11 +28,11 @@ use axum::{
 };
 use serde_json::json;
 
-/// State of the alias-lookup sub-router: the provider registry whose alias
-/// table it reads, `None` when the registry could not be built.
+/// State of the alias-lookup sub-router: the daemon's one provider registry
+/// (`AppState::llm_registry`), whose alias table it reads.
 #[derive(Clone)]
 pub(crate) struct LlmAliasesState {
-    pub(crate) registry: Option<Arc<ProviderRegistry>>,
+    pub(crate) registry: Arc<ProviderRegistry>,
 }
 
 /// The `/v1/llm/aliases/{alias}` route. Merged into the daemon router by
@@ -57,15 +57,7 @@ async fn get_llm_alias_handler(
             .into_response();
     }
 
-    let Some(registry) = state.registry.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "LLM provider registry not configured"})),
-        )
-            .into_response();
-    };
-
-    match registry.model_for_alias(&alias) {
+    match state.registry.model_for_alias(&alias) {
         Some(model) => (
             StatusCode::OK,
             Json(json!({"alias": alias, "model": model})),
@@ -133,7 +125,7 @@ models:
         ]);
         serve(
             llm_aliases_router(LlmAliasesState {
-                registry: Some(registry()),
+                registry: registry(),
             }),
             Some(iam),
             None,
@@ -240,7 +232,7 @@ models:
         // handler sees no identity and must refuse.
         let unauthenticated = serve(
             llm_aliases_router(LlmAliasesState {
-                registry: Some(registry()),
+                registry: registry(),
             }),
             None,
             None,

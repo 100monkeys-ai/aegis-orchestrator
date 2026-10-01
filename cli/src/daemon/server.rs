@@ -1841,12 +1841,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         });
     }
 
-    let inner_loop_service = {
+    let (inner_loop_service, llm_registry) = share_llm_registry(llm_registry, |registry| {
         let mut ils =
             aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
                 tool_invocation_service.clone(),
                 execution_service.clone(),
-                llm_registry,
+                registry,
             );
         if let (Some(ref enforcer), Some(ref resolver)) =
             (&rate_limit_enforcer, &rate_limit_resolver)
@@ -1854,7 +1854,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ils = ils.with_rate_limiting(enforcer.clone(), resolver.clone());
         }
         Arc::new(ils)
-    };
+    });
 
     let workflow_scope_service = Arc::new(
         aegis_orchestrator_core::application::workflow_scope::WorkflowScopeService::new(
@@ -2350,6 +2350,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         cluster_repo: cluster_repo.clone(),
         event_bus: event_bus.clone(),
         inner_loop_service: inner_loop_service.clone(),
+        llm_registry,
         human_input_service: human_input_service.clone(),
         temporal_event_listener,
         register_workflow_use_case: register_workflow_use_case.clone(),
@@ -3345,6 +3346,17 @@ async fn shutdown_signal() {
 
 // create_router moved to router.rs
 
+/// Hand the daemon's one LLM provider registry to the inner loop `build`
+/// constructs over it, and return that same instance for `AppState`, where
+/// `GET /v1/llm/aliases/{alias}` reads it (AEGIS ADR-124 D3): the route
+/// answers from the alias table every agent call is routed through.
+fn share_llm_registry<L>(
+    registry: Arc<ProviderRegistry>,
+    build: impl FnOnce(Arc<ProviderRegistry>) -> L,
+) -> (L, Arc<ProviderRegistry>) {
+    (build(registry.clone()), registry)
+}
+
 // Application state is defined in state.rs and re-exported via AppState import above.
 
 // health_handler, readiness_handler moved to handlers/health.rs
@@ -3393,6 +3405,83 @@ mod tests {
         dir.push(format!("aegis-server-test-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// AEGIS ADR-124 D3, as the coordinator ruled it (correction C1): the
+    /// alias route reads the daemon's one provider registry, the instance
+    /// the inner loop is built over, never a second one built from config.
+    #[tokio::test]
+    async fn the_alias_route_and_the_inner_loop_answer_from_one_registry() {
+        use crate::daemon::handlers::llm::{llm_aliases_router, LlmAliasesState};
+        use crate::daemon::handlers::test_support::{consumer, identity_provider, send, serve};
+        use aegis_orchestrator_core::domain::node_config::{LLMProviderConfig, NodeConfigManifest};
+        use aegis_orchestrator_core::infrastructure::llm::ProviderRegistry;
+        use std::sync::Arc;
+
+        let provider: LLMProviderConfig = serde_yaml::from_str(
+            r#"name: workers-ai
+type: openai-compatible
+endpoint: "https://api.example.invalid/v1"
+api_key: "literal-provider-key-value"
+enabled: true
+models:
+  - alias: "zaru-chat"
+    model: "@cf/zai-org/glm-5.3-flash"
+    capabilities: ["chat"]
+    context_window: 8192
+"#,
+        )
+        .expect("provider block parses");
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.llm_providers = vec![provider];
+        let built = Arc::new(ProviderRegistry::from_config(&manifest).expect("registry builds"));
+
+        // The inner loop's side: the instance `build` is handed, which the
+        // daemon passes to `InnerLoopService::new`.
+        let (inner_loop_registry, app_state_registry) =
+            super::share_llm_registry(built.clone(), |registry| registry);
+
+        let mut failures = Vec::new();
+        if !Arc::ptr_eq(&inner_loop_registry, &built) {
+            failures.push(
+                "the inner loop must be built over the registry the daemon built".to_string(),
+            );
+        }
+        if !Arc::ptr_eq(&app_state_registry, &inner_loop_registry) {
+            failures.push(
+                "AppState's registry, which the alias route reads, must be the inner loop's instance, not a second registry".to_string(),
+            );
+        }
+
+        // And the route served from that instance answers its table.
+        let base = serve(
+            llm_aliases_router(LlmAliasesState {
+                registry: app_state_registry,
+            }),
+            Some(identity_provider(&[(
+                "consumer-token",
+                consumer("user-1"),
+                "",
+            )])),
+            None,
+        )
+        .await;
+        let (status, body) = send(
+            &base,
+            &reqwest::Method::GET,
+            "/v1/llm/aliases/zaru-chat",
+            &None,
+            Some("consumer-token"),
+        )
+        .await;
+        let expected =
+            serde_json::json!({"alias": "zaru-chat", "model": "@cf/zai-org/glm-5.3-flash"});
+        if status != 200 || body != expected {
+            failures.push(format!(
+                "the route over the shared registry must answer 200 {expected}, got {status} {body}"
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
     #[test]
