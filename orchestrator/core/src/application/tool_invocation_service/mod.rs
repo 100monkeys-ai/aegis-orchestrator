@@ -69,6 +69,18 @@ const JUDGE_POLL_INTERVAL_MS: u64 = 500;
 const COMPACT_JSON_INLINE_LIMIT: usize = 256;
 const COMPACT_STRING_PREVIEW_LIMIT: usize = 96;
 const COMPACT_ERROR_PREVIEW_LIMIT: usize = 3;
+/// The `validation_context` the inner-loop tool judge receives (ADR-049).
+const INNER_LOOP_VALIDATION_CONTEXT: &str = "semantic_judge_pre_execution_inner_loop";
+/// A string argument of a file tool reaches the tool judge verbatim up to
+/// this many characters, and above it as its size, head and tail.
+const JUDGE_FILE_ARGUMENT_INLINE_CHARS: usize = 800;
+const JUDGE_FILE_ARGUMENT_HEAD_CHARS: usize = 600;
+const JUDGE_FILE_ARGUMENT_TAIL_CHARS: usize = 200;
+/// A `cmd.run` command reaches the tool judge verbatim up to this many bytes,
+/// and above it as its size, head and tail, so no command hides its verb.
+const JUDGE_COMMAND_INLINE_BYTES: usize = 4096;
+const JUDGE_COMMAND_HEAD_CHARS: usize = 2048;
+const JUDGE_COMMAND_TAIL_CHARS: usize = 1024;
 
 #[derive(Debug)]
 pub enum ToolInvocationResult {

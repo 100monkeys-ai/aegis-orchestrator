@@ -1452,28 +1452,6 @@ mod tests {
         );
     }
 
-    /// Helper: build a minimal `StandardExecutionService` for unit-testing
-    /// pure helpers like `prepare_execution_input`.
-    fn make_test_service() -> StandardExecutionService {
-        let agent_repo = Arc::new(InMemoryAgentRepository::new());
-        let execution_repo: Arc<dyn ExecutionRepository> =
-            Arc::new(InMemoryExecutionRepository::new());
-        let runtime = Arc::new(TestRuntime::default());
-        let supervisor = Arc::new(Supervisor::new(runtime));
-        let event_bus = Arc::new(EventBus::with_default_capacity());
-        let volume_service = Arc::new(TestVolumeService {
-            volumes: HashMap::new(),
-        });
-        StandardExecutionService::new(
-            agent_repo,
-            volume_service,
-            supervisor,
-            execution_repo,
-            event_bus,
-            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
-        )
-    }
-
     /// ADR-113 regression: dispatch attachments must be merged into the
     /// JSON `input` object before the prompt template renders, so the
     /// generated agent's LLM sees `input.attachments` as part of its
@@ -1482,7 +1460,6 @@ mod tests {
     /// only mechanism that makes them visible to the LLM.
     #[test]
     fn prepare_execution_input_merges_attachments_into_input_object() {
-        let service = make_test_service();
         // Agent with a prompt template that surfaces the input JSON verbatim
         // so the test can inspect the merged shape.
         let mut agent = make_agent("attachments-consumer", None, None);
@@ -1513,7 +1490,8 @@ mod tests {
             attachments: vec![attachment.clone()],
         };
 
-        let (_persisted, runtime) = service.prepare_execution_input(input, &agent).unwrap();
+        let (_persisted, runtime) =
+            StandardExecutionService::prepare_execution_input(input, &agent).unwrap();
         let rendered = runtime
             .intent
             .as_deref()
@@ -1547,7 +1525,6 @@ mod tests {
     /// must NOT have an `attachments` key spuriously injected.
     #[test]
     fn prepare_execution_input_leaves_input_unchanged_when_no_attachments() {
-        let service = make_test_service();
         let mut agent = make_agent("no-attachments", None, None);
         if let Some(task) = agent.manifest.spec.task.as_mut() {
             task.prompt_template = Some("INPUT={{input}}".to_string());
@@ -1564,7 +1541,8 @@ mod tests {
             attachments: Vec::new(),
         };
 
-        let (_persisted, runtime) = service.prepare_execution_input(input, &agent).unwrap();
+        let (_persisted, runtime) =
+            StandardExecutionService::prepare_execution_input(input, &agent).unwrap();
         let rendered = runtime.intent.as_deref().unwrap();
         assert!(
             !rendered.contains("\"attachments\""),
@@ -1578,7 +1556,6 @@ mod tests {
     /// becomes a sibling, so `input.attachments` is addressable.
     #[test]
     fn prepare_execution_input_wraps_scalar_input_when_attachments_present() {
-        let service = make_test_service();
         let mut agent = make_agent("scalar-input", None, None);
         if let Some(task) = agent.manifest.spec.task.as_mut() {
             task.prompt_template = Some("INPUT={{input}}".to_string());
@@ -1606,7 +1583,8 @@ mod tests {
             attachments: vec![attachment],
         };
 
-        let (_persisted, runtime) = service.prepare_execution_input(input, &agent).unwrap();
+        let (_persisted, runtime) =
+            StandardExecutionService::prepare_execution_input(input, &agent).unwrap();
         let rendered = runtime.intent.as_deref().unwrap();
         assert!(
             rendered.contains("\"value\""),
@@ -1635,7 +1613,6 @@ mod tests {
     /// regardless of what the user actually asked for.
     #[test]
     fn execution_intent_carries_caller_input_not_manifest_instruction() {
-        let service = make_test_service();
         let mut agent = make_agent("monitor-agent", None, None);
         if let Some(task) = agent.manifest.spec.task.as_mut() {
             task.instruction =
@@ -1654,7 +1631,8 @@ mod tests {
             attachments: Vec::new(),
         };
 
-        let (persisted, runtime) = service.prepare_execution_input(input, &agent).unwrap();
+        let (persisted, runtime) =
+            StandardExecutionService::prepare_execution_input(input, &agent).unwrap();
 
         // Persisted intent: the caller's text, untouched.
         assert_eq!(
@@ -1685,7 +1663,6 @@ mod tests {
     /// manifest instruction.
     #[test]
     fn execution_intent_is_none_when_caller_provides_no_intent() {
-        let service = make_test_service();
         let mut agent = make_agent("judge-agent", None, None);
         if let Some(task) = agent.manifest.spec.task.as_mut() {
             task.instruction =
@@ -1703,7 +1680,8 @@ mod tests {
             attachments: Vec::new(),
         };
 
-        let (persisted, _runtime) = service.prepare_execution_input(input, &agent).unwrap();
+        let (persisted, _runtime) =
+            StandardExecutionService::prepare_execution_input(input, &agent).unwrap();
         assert!(
             persisted.intent.is_none(),
             "persisted intent must be None when caller provides no intent, got {:?}",
@@ -1721,7 +1699,6 @@ mod tests {
     /// `Value::String` pass-through branch.
     #[test]
     fn prepare_execution_input_routes_workflow_input_string_into_prompt() {
-        let service = make_test_service();
         let mut agent = make_agent("validator-agent", None, None);
         if let Some(task) = agent.manifest.spec.task.as_mut() {
             task.instruction = Some("You validate code.".to_string());
@@ -1746,7 +1723,8 @@ mod tests {
             attachments: Vec::new(),
         };
 
-        let (_persisted, runtime) = service.prepare_execution_input(input, &agent).unwrap();
+        let (_persisted, runtime) =
+            StandardExecutionService::prepare_execution_input(input, &agent).unwrap();
         let rendered = runtime
             .intent
             .as_deref()
@@ -2298,9 +2276,12 @@ impl StandardExecutionService {
         }
     }
 
-    /// Prepare execution input by rendering the agent's prompt template (ADR-092).
+    /// The task text an agent's worker is given for `input` (ADR-092): the
+    /// agent's prompt template rendered with `{{instruction}}`, the caller's
+    /// `{{intent}}` and the structured `{{input}}`, or the caller's intent
+    /// as-is when there is no structured input to render.
     ///
-    /// The prompt template receives three first-class variables:
+    /// The template receives three first-class variables:
     /// - `{{intent}}` — caller-supplied free-text (from `ExecutionInput.intent`)
     /// - `{{input}}` / `{{input.KEY}}` — structured user input
     /// - `{{instruction}}` — agent's task instruction from the manifest
@@ -2308,44 +2289,20 @@ impl StandardExecutionService {
     /// The template controls layout; the caller's `intent` is passed through
     /// unmodified (no hardcoded prepend logic).
     ///
-    /// Three cases:
-    /// - **Only `input`**: render template; store result in `intent`.
-    /// - **Only `intent`**: use caller's free-text directly; skip rendering.
-    /// - **Both**: render template with both `{{intent}}` and `{{input}}`
-    ///   available; store result in `intent`.
-    ///
-    /// Prepare execution input for both persistence and runtime dispatch.
-    ///
-    /// Returns `(persisted, runtime)`:
-    /// - `persisted` carries the caller's original `intent` unchanged so it
-    ///   accurately represents what the user asked for. This is the copy
-    ///   stored on the `Execution` aggregate and surfaced by introspection
-    ///   tools such as `aegis.task.list`.
-    /// - `runtime` carries the rendered prompt (assembled from the agent's
-    ///   manifest `task.instruction` + the caller's intent + the structured
-    ///   `input`) on its `intent` field. The supervisor reads this as the
-    ///   prompt to send to the LLM. It is NEVER persisted.
-    ///
-    /// Conflating the two — overwriting `persisted.intent` with the rendered
-    /// prompt — caused every execution by the same agent to surface the
-    /// agent's static manifest instruction as its summary regardless of
-    /// per-call user input.
-    fn prepare_execution_input(
-        &self,
-        mut input: ExecutionInput,
+    /// This is the one rendering: the worker's prompt, the outer-loop judges'
+    /// `task` (the supervisor's `ValidationContext.task`) and the inner-loop
+    /// tool judge's `task` are all this text, the last rendered again from
+    /// the persisted `ExecutionInput`, which is why the persisted copy keeps
+    /// the caller's input exactly as given.
+    pub(crate) fn render_task(
+        input: &ExecutionInput,
         agent: &crate::domain::agent::Agent,
-    ) -> Result<(ExecutionInput, ExecutionInput)> {
+    ) -> Result<Option<String>> {
         let context_overrides = Self::extract_context_overrides(&input.input)?;
 
         // Attempt to extract structured user input.
         let user_input_result = Self::extract_user_input(&input.input);
         let has_input = user_input_result.is_ok();
-
-        // Capture the caller's intent before any local mutation so the
-        // persisted copy reflects exactly what the caller asked for.
-        let caller_intent = input.intent.clone();
-
-        let mut rendered_prompt: Option<String> = None;
 
         if has_input {
             const DEFAULT_PROMPT_TEMPLATE: &str = "{{instruction}}{{#if intent}}\n\nTask: {{intent}}{{/if}}\n\nUser: {{input}}\nAgent:";
@@ -2415,38 +2372,55 @@ impl StandardExecutionService {
                 context = context.intent(caller_intent.clone());
             }
 
-            context.extras = context_overrides.clone().into_iter().collect();
+            context.extras = context_overrides.into_iter().collect();
 
             let template_engine = PromptTemplateEngine::new();
             let rendered_prompt_local = template_engine
                 .render(prompt_template, &context)
                 .map_err(|e| ExecutionError::PromptRenderFailed(e.to_string()))?;
 
-            rendered_prompt = Some(rendered_prompt_local);
+            return Ok(Some(rendered_prompt_local));
         }
-        // else: only intent was supplied — no template to render. The
-        // supervisor will receive the caller's intent as-is.
+        // Only intent was supplied — no template to render. The worker
+        // receives the caller's intent as-is.
+        Ok(input.intent.clone())
+    }
 
-        if let serde_json::Value::Object(input_obj) = &mut input.input {
+    /// Prepare execution input for both persistence and runtime dispatch.
+    ///
+    /// Returns `(persisted, runtime)`:
+    /// - `persisted` is the caller's input exactly as given: its `intent`
+    ///   unchanged, so it accurately represents what the user asked for, and
+    ///   its `input` without the normalised `context_overrides`, so that
+    ///   [`Self::render_task`] over it yields the runtime prompt again. This
+    ///   is the copy stored on the `Execution` aggregate and surfaced by
+    ///   introspection tools such as `aegis.task.list`.
+    /// - `runtime` carries the rendered prompt ([`Self::render_task`]) on its
+    ///   `intent` field and the validated `context_overrides` object in its
+    ///   `input`. The supervisor reads this as the prompt to send to the LLM.
+    ///   It is NEVER persisted.
+    ///
+    /// Conflating the two — overwriting `persisted.intent` with the rendered
+    /// prompt — caused every execution by the same agent to surface the
+    /// agent's static manifest instruction as its summary regardless of
+    /// per-call user input.
+    pub(crate) fn prepare_execution_input(
+        input: ExecutionInput,
+        agent: &crate::domain::agent::Agent,
+    ) -> Result<(ExecutionInput, ExecutionInput)> {
+        let context_overrides = Self::extract_context_overrides(&input.input)?;
+        let rendered_prompt = Self::render_task(&input, agent)?;
+
+        let persisted = input.clone();
+
+        let mut runtime = input;
+        if let serde_json::Value::Object(input_obj) = &mut runtime.input {
             input_obj.insert(
                 "context_overrides".to_string(),
                 JsonValue::Object(context_overrides),
             );
         }
-
-        // Persisted copy: keep caller's intent untouched so introspection
-        // surfaces (aegis.task.list, etc.) reflect the per-call user input,
-        // not the agent's static manifest instruction.
-        let mut persisted = input.clone();
-        persisted.intent = caller_intent;
-
-        // Runtime copy: hand the supervisor the rendered prompt under
-        // `intent` (its existing channel for "the prompt to send to the
-        // LLM"). When no template was rendered (intent-only dispatch),
-        // fall back to the caller's intent so the LLM still receives
-        // something meaningful.
-        let mut runtime = input;
-        runtime.intent = rendered_prompt.or_else(|| persisted.intent.clone());
+        runtime.intent = rendered_prompt;
 
         Ok((persisted, runtime))
     }
@@ -2666,7 +2640,7 @@ impl StandardExecutionService {
         // `persisted_input` carries the caller's untouched intent and is what
         // the Execution aggregate stores; `runtime_input` carries the
         // rendered prompt and is handed to the supervisor only.
-        let (persisted_input, runtime_input) = self.prepare_execution_input(input, &agent)?;
+        let (persisted_input, runtime_input) = Self::prepare_execution_input(input, &agent)?;
 
         // 3. Create Execution Record
         let max_retries = if let Some(exec) = &agent.manifest.spec.execution {
@@ -3589,7 +3563,7 @@ impl ExecutionService for StandardExecutionService {
         // 3. Prepare input (render judge's prompt template). The persisted
         // copy preserves the caller's intent; the runtime copy carries the
         // rendered prompt for the supervisor.
-        let (persisted_input, runtime_input) = self.prepare_execution_input(input, &agent)?;
+        let (persisted_input, runtime_input) = Self::prepare_execution_input(input, &agent)?;
 
         // 4. Create child execution record with hierarchy.
         let max_retries = agent

@@ -131,8 +131,80 @@ impl ToolInvocationService {
         }
     }
 
+    /// A text argument as the tool judge sees it: verbatim when `inline`,
+    /// otherwise its byte size with its first and last characters.
+    fn judge_text_view(value: &str, inline: bool, head_chars: usize, tail_chars: usize) -> Value {
+        if inline {
+            return Value::String(value.to_string());
+        }
+        let char_count = value.chars().count();
+        let head: String = value.chars().take(head_chars).collect();
+        let tail: String = value
+            .chars()
+            .skip(char_count.saturating_sub(tail_chars))
+            .collect();
+        serde_json::json!({
+            "bytes": value.len(),
+            "head": head,
+            "tail": tail,
+        })
+    }
+
+    /// The arguments of a file tool as the tool judge sees them: `path`
+    /// verbatim, every other string verbatim up to
+    /// `JUDGE_FILE_ARGUMENT_INLINE_CHARS` and above it as size, head and tail,
+    /// at any depth (so `fs.multi_edit`'s edits are shown, not counted).
+    fn file_tool_argument_view(value: &Value) -> Value {
+        match value {
+            Value::String(text) => Self::judge_text_view(
+                text,
+                text.chars().count() <= JUDGE_FILE_ARGUMENT_INLINE_CHARS,
+                JUDGE_FILE_ARGUMENT_HEAD_CHARS,
+                JUDGE_FILE_ARGUMENT_TAIL_CHARS,
+            ),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(Self::file_tool_argument_view).collect())
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, value)| {
+                        let view = if key == "path" {
+                            value.clone()
+                        } else {
+                            Self::file_tool_argument_view(value)
+                        };
+                        (key.clone(), view)
+                    })
+                    .collect(),
+            ),
+            Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        }
+    }
+
     pub(super) fn compact_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
         match tool_name {
+            "fs.write" | "fs.edit" | "fs.multi_edit" | "fs.create_dir" | "fs.delete" => {
+                Self::file_tool_argument_view(arguments)
+            }
+            "cmd.run" => match arguments {
+                Value::Object(map) => Value::Object(
+                    map.iter()
+                        .map(|(key, value)| {
+                            let view = match (key.as_str(), value) {
+                                ("command", Value::String(command)) => Self::judge_text_view(
+                                    command,
+                                    command.len() <= JUDGE_COMMAND_INLINE_BYTES,
+                                    JUDGE_COMMAND_HEAD_CHARS,
+                                    JUDGE_COMMAND_TAIL_CHARS,
+                                ),
+                                _ => Self::file_tool_argument_view(value),
+                            };
+                            (key.clone(), view)
+                        })
+                        .collect(),
+                ),
+                _ => Self::file_tool_argument_view(arguments),
+            },
             "aegis.schema.get" => serde_json::json!({
                 "key": arguments.get("key").and_then(Value::as_str).unwrap_or("unknown"),
             }),
@@ -287,6 +359,35 @@ impl ToolInvocationService {
             "latest_schema_get": latest_schema_get,
             "latest_schema_validate": latest_schema_validate,
         })
+    }
+
+    /// The `task` the inner-loop tool judge receives (ADR-049): the worker's
+    /// own task text, rendered from the persisted `ExecutionInput` and the
+    /// worker's manifest by the one function that renders the worker's prompt
+    /// and the outer-loop judges' `task`
+    /// ([`StandardExecutionService::render_task`]). An execution whose task
+    /// cannot be rendered, or renders empty, fails the judged call rather
+    /// than being judged without its objective.
+    ///
+    /// [`StandardExecutionService::render_task`]: crate::application::execution::StandardExecutionService::render_task
+    pub(super) fn semantic_judge_task(
+        execution_id: crate::domain::execution::ExecutionId,
+        input: &ExecutionInput,
+        agent: &crate::domain::agent::Agent,
+    ) -> Result<String, SealSessionError> {
+        let task =
+            crate::application::execution::StandardExecutionService::render_task(input, agent)
+                .map_err(|e| {
+                    SealSessionError::InternalError(format!(
+                "Inner-loop semantic judge: cannot render the task of execution {execution_id}: {e}"
+            ))
+                })?;
+        match task {
+            Some(task) if !task.trim().is_empty() => Ok(task),
+            _ => Err(SealSessionError::InternalError(format!(
+                "Inner-loop semantic judge: execution {execution_id} has no task to judge the tool call against"
+            ))),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

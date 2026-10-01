@@ -613,30 +613,20 @@ impl ToolInvocationService {
                                     ))
                                 })?;
 
-                            let execution_objective = self
+                            let worker_execution = self
                                 .execution_service
                                 .get_execution_unscoped(execution_id)
                                 .await
-                                .ok()
-                                .and_then(|exec| {
-                                    exec.input
-                                        .intent
-                                        .or_else(|| {
-                                            exec.input
-                                                .input
-                                                .get("input")
-                                                .and_then(|v| v.as_str())
-                                                .map(String::from)
-                                        })
-                                        .or_else(|| {
-                                            exec.input
-                                                .input
-                                                .get("workflow_input")
-                                                .and_then(|v| v.as_str())
-                                                .map(String::from)
-                                        })
-                                })
-                                .unwrap_or_else(|| "No objective available".to_string());
+                                .map_err(|e| {
+                                    SealSessionError::InternalError(format!(
+                                        "Inner-loop semantic judge: cannot read execution {execution_id}: {e}"
+                                    ))
+                                })?;
+                            let execution_objective = Self::semantic_judge_task(
+                                execution_id,
+                                &worker_execution.input,
+                                agent,
+                            )?;
                             let available_tools = self
                                 .get_available_tools_for_agent(tenant_id, *agent_id)
                                 .await
@@ -661,7 +651,7 @@ impl ToolInvocationService {
                                     available_tools,
                                     worker_mounts,
                                     criteria,
-                                    "semantic_judge_pre_execution_inner_loop",
+                                    INNER_LOOP_VALIDATION_CONTEXT,
                                     iteration_number,
                                     &tool_audit_history,
                                 ),

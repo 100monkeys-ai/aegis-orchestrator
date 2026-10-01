@@ -1394,6 +1394,233 @@ fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
     );
 }
 
+// --- The inner-loop tool judge's input (ADR-049) ---------------------------
+//
+// The built-in templates are the manifests production deploys
+// (`cli/src/commands/builtins.rs` embeds the same files).
+const HELLO_WORLD_AGENT_TEMPLATE: &str =
+    include_str!("../../../../../cli/templates/agents/hello-world-agent.yaml");
+const TOOL_CALL_POLICY_JUDGE_AGENT_TEMPLATE: &str =
+    include_str!("../../../../../cli/templates/agents/tool-call-policy-judge.yaml");
+
+fn agent_from_manifest_yaml(manifest_yaml: &str) -> Agent {
+    let manifest: AgentManifest = serde_yaml::from_str(manifest_yaml).unwrap();
+    Agent {
+        id: AgentId::new(),
+        tenant_id: crate::domain::tenant::TenantId::default(),
+        scope: crate::domain::agent::AgentScope::default(),
+        name: manifest.metadata.name.clone(),
+        manifest,
+        status: AgentStatus::Active,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn execution_input(intent: Option<&str>, input: Value) -> ExecutionInput {
+    ExecutionInput {
+        intent: intent.map(str::to_string),
+        input,
+        workspace_volume_id: None,
+        workspace_volume_mount_path: None,
+        workspace_remote_path: None,
+        workflow_execution_id: None,
+        attachments: Vec::new(),
+    }
+}
+
+/// What `aegis.task.execute` stores for hello-world: the caller's `input`
+/// object with the injected `tenant_id`, and no `intent` (`tasks.rs`).
+fn hello_world_task_input() -> ExecutionInput {
+    execution_input(
+        None,
+        serde_json::json!({ "task": "Write is_palindrome", "tenant_id": "u-test" }),
+    )
+}
+
+fn judge_payload_for(task: String, tool_name: &str, arguments: &Value) -> Value {
+    ToolInvocationService::build_semantic_judge_payload(
+        ExecutionId::new(),
+        task,
+        tool_name,
+        arguments,
+        vec!["fs.write".to_string(), "cmd.run".to_string()],
+        vec!["/workspace".to_string()],
+        "Strictly assess the proposed tool call.",
+        INNER_LOOP_VALIDATION_CONTEXT,
+        1,
+        &[],
+    )
+}
+
+#[test]
+fn inner_loop_judge_objective_is_the_rendered_task_for_a_task_keyed_input() {
+    let agent = agent_from_manifest_yaml(HELLO_WORLD_AGENT_TEMPLATE);
+    let (persisted, _runtime) =
+        crate::application::execution::StandardExecutionService::prepare_execution_input(
+            hello_world_task_input(),
+            &agent,
+        )
+        .unwrap();
+
+    let execution_id = ExecutionId::new();
+    let task =
+        ToolInvocationService::semantic_judge_task(execution_id, &persisted, &agent).unwrap();
+    let payload = judge_payload_for(
+        task,
+        "fs.write",
+        &serde_json::json!({ "path": "/workspace/solution.py", "content": "pass\n" }),
+    );
+
+    let task = payload["task"].as_str().unwrap_or_default();
+    assert!(
+        task.contains("Write is_palindrome") && !task.contains("No objective available"),
+        "the inner-loop judge's task must carry the worker's objective, got: {task:?}"
+    );
+}
+
+#[test]
+fn inner_loop_judge_objective_equals_outer_judge_task() {
+    let agent = agent_from_manifest_yaml(HELLO_WORLD_AGENT_TEMPLATE);
+    let inputs = [
+        hello_world_task_input(),
+        execution_input(
+            Some("Validate /workspace/solution.py"),
+            serde_json::json!({ "input": "guide content please", "tenant_id": "u-test" }),
+        ),
+        execution_input(
+            None,
+            serde_json::json!({
+                "context_overrides": { "repo": "aegis" },
+                "tenant_id": "u-test",
+                "workflow_input": "File: /workspace/solution.py",
+            }),
+        ),
+    ];
+
+    for input in inputs {
+        let (persisted, runtime) =
+            crate::application::execution::StandardExecutionService::prepare_execution_input(
+                input, &agent,
+            )
+            .unwrap();
+        // The supervisor's `ValidationContext.task` is the runtime intent
+        // (`domain/supervisor.rs`: `input.intent.clone().unwrap_or_default()`).
+        let outer_task = runtime.intent.clone().unwrap_or_default();
+        let inner_task =
+            ToolInvocationService::semantic_judge_task(ExecutionId::new(), &persisted, &agent)
+                .unwrap();
+        assert_eq!(
+            inner_task, outer_task,
+            "the inner-loop judge must read the text the worker and the outer judges read"
+        );
+    }
+}
+
+#[test]
+fn fs_write_arguments_reach_the_judge_with_path_and_content_head() {
+    let header = "def is_palindrome(s):\n";
+    let content = format!("{header}{}", "#".repeat(1054 - header.len()));
+    assert_eq!(content.len(), 1054);
+
+    let payload = judge_payload_for(
+        "Write is_palindrome".to_string(),
+        "fs.write",
+        &serde_json::json!({ "path": "/workspace/solution.py", "content": content }),
+    );
+
+    let arguments = &payload["proposed_tool_call"]["arguments"];
+    assert_eq!(
+        arguments["path"], "/workspace/solution.py",
+        "the judge must see the path, got arguments: {arguments}"
+    );
+    assert_eq!(
+        arguments["content"]["bytes"], 1054,
+        "the judge must see the content's size, got arguments: {arguments}"
+    );
+    assert!(
+        arguments["content"]["head"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(header),
+        "the judge must see the content's head, got arguments: {arguments}"
+    );
+}
+
+#[test]
+fn long_cmd_run_cannot_hide_its_command() {
+    let verb = "cat /workspace/secret";
+    let command = format!("{verb} {}", "x".repeat(300 - verb.len() - 1));
+    assert_eq!(command.len(), 300);
+
+    let payload = judge_payload_for(
+        "Write is_palindrome".to_string(),
+        "cmd.run",
+        &serde_json::json!({ "command": command }),
+    );
+    let arguments = &payload["proposed_tool_call"]["arguments"];
+    assert!(
+        arguments["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(verb),
+        "a 300-byte command must reach the judge verbatim, got arguments: {arguments}"
+    );
+
+    let command = format!("{verb} {}", "x".repeat(10_000));
+    let payload = judge_payload_for(
+        "Write is_palindrome".to_string(),
+        "cmd.run",
+        &serde_json::json!({ "command": command }),
+    );
+    let arguments = &payload["proposed_tool_call"]["arguments"];
+    assert!(
+        arguments["command"]["head"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(verb),
+        "a long command must keep its verb, got arguments: {arguments}"
+    );
+    assert_eq!(arguments["command"]["bytes"], command.len());
+}
+
+#[test]
+fn judge_template_field_list_matches_payload_keys() {
+    let judge = agent_from_manifest_yaml(TOOL_CALL_POLICY_JUDGE_AGENT_TEMPLATE);
+    let instruction = judge
+        .manifest
+        .spec
+        .task
+        .as_ref()
+        .and_then(|task| task.instruction.clone())
+        .unwrap_or_default();
+
+    // The field list is the instruction's lines of the form `- "name": ...`.
+    let mut listed: Vec<String> = instruction
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("- \""))
+        .filter_map(|rest| rest.split_once("\":").map(|(name, _)| name.to_string()))
+        .collect();
+    listed.sort();
+
+    let payload = judge_payload_for(
+        "Write is_palindrome".to_string(),
+        "fs.write",
+        &serde_json::json!({ "path": "/workspace/solution.py", "content": "pass\n" }),
+    );
+    let mut sent: Vec<String> = payload.as_object().unwrap().keys().cloned().collect();
+    sent.sort();
+
+    assert_eq!(
+        listed, sent,
+        "the judge's instruction must list exactly the fields the payload carries"
+    );
+    assert!(
+        instruction.contains(INNER_LOOP_VALIDATION_CONTEXT),
+        "the instruction must name the validation_context value the code sends"
+    );
+}
+
 #[tokio::test]
 async fn workflow_run_tool_forwards_blackboard() {
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());

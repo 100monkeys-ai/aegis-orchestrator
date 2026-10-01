@@ -88,6 +88,8 @@ spec:
     - "fs.delete"           # Delete files
     - "fs.edit"             # Edit files
     - "fs.multi_edit"       # Edit multiple items in file
+    - "fs.grep"             # Search file contents
+    - "fs.glob"             # Find files by pattern
 
   input_schema:
     type: object
