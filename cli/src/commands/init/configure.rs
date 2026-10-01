@@ -688,6 +688,11 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 8192
           cost_per_1k_tokens: 0.0
+        - alias: "tool-judge"
+          model: "{model}"
+          capabilities: ["reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
 "#,
                     model = config.ollama_model
                 ),
@@ -716,6 +721,11 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 128000
           cost_per_1k_tokens: 0.005
+        - alias: "tool-judge"
+          model: "gpt-4o"
+          capabilities: ["reasoning"]
+          context_window: 128000
+          cost_per_1k_tokens: 0.005
 "#
                 .to_string(),
                 "openai",
@@ -739,6 +749,11 @@ impl ConfigWizard {
           context_window: 200000
           cost_per_1k_tokens: 0.003
         - alias: "judge"
+          model: "claude-sonnet-4-5"
+          capabilities: ["reasoning"]
+          context_window: 200000
+          cost_per_1k_tokens: 0.003
+        - alias: "tool-judge"
           model: "claude-sonnet-4-5"
           capabilities: ["reasoning"]
           context_window: 200000
@@ -771,6 +786,11 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 1048576
           cost_per_1k_tokens: 0.0
+        - alias: "tool-judge"
+          model: "{model}"
+          capabilities: ["reasoning"]
+          context_window: 1048576
+          cost_per_1k_tokens: 0.0
 "#,
                     model = config.gemini_model.as_deref().unwrap_or("gemini-2.5-flash")
                 ),
@@ -796,6 +816,11 @@ impl ConfigWizard {
           context_window: 8192
           cost_per_1k_tokens: 0.0
         - alias: "judge"
+          model: "{model}"
+          capabilities: ["reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
+        - alias: "tool-judge"
           model: "{model}"
           capabilities: ["reasoning"]
           context_window: 8192
@@ -832,6 +857,11 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 8192
           cost_per_1k_tokens: 0.0
+        - alias: "tool-judge"
+          model: "{judge_model}"
+          capabilities: ["reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
 "#,
                 endpoint = config.advanced.lmstudio_endpoint,
                 smart_model = config.advanced.lmstudio_smart_model,
@@ -861,6 +891,11 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
+        - alias: "tool-judge"
+          model: "{judge_model}"
+          capabilities: ["reasoning"]
+          context_window: 200000
+          cost_per_1k_tokens: 0.003
 "#,
                 smart_model = config.advanced.anthropic_smart_model,
                 judge_model = config.advanced.anthropic_judge_model,
@@ -883,6 +918,11 @@ impl ConfigWizard {
           context_window: 1048576
           cost_per_1k_tokens: 0.0
         - alias: "judge"
+          model: "{judge_model}"
+          capabilities: ["reasoning"]
+          context_window: 1048576
+          cost_per_1k_tokens: 0.0
+        - alias: "tool-judge"
           model: "{judge_model}"
           capabilities: ["reasoning"]
           context_window: 1048576
@@ -1650,6 +1690,180 @@ mod tests {
         assert!(rendered.contains(r#"endpoint: "https://api.anthropic.com/v1""#));
         assert!(rendered.contains(r#"model: "claude-sonnet-4-5""#));
         assert!(!rendered.contains(r#"endpoint: "https://api.anthropic.com""#));
+    }
+
+    /// A wizard configuration with every optional provider enabled or none.
+    fn alias_test_config(extras: bool) -> NodeConfig {
+        NodeConfig {
+            node_name: "test-node".to_string(),
+            node_id: "test-node-id".to_string(),
+            ollama_model: "llama3.2:latest".to_string(),
+            api_key: None,
+            working_dir: PathBuf::from("/tmp"),
+            gemini_model: None,
+            openai_compatible_endpoint: None,
+            openai_compatible_model: None,
+            advanced: AdvancedConfig {
+                node_type: "hybrid".to_string(),
+                bind_address: "0.0.0.0".to_string(),
+                api_port: 8088,
+                log_level: "info".to_string(),
+                docker_network: "aegis-network".to_string(),
+                orchestrator_url: "http://aegis-runtime:8088".to_string(),
+                nfs_host: "127.0.0.1".to_string(),
+                database_url: SensitiveUrl::new("postgresql://aegis:aegis@postgres:5432/aegis"),
+                keep_container: false,
+                enable_lmstudio: extras,
+                lmstudio_endpoint: "http://host.docker.internal:1234/v1".to_string(),
+                lmstudio_smart_model: "lmstudio-smart".to_string(),
+                lmstudio_judge_model: "lmstudio-judge".to_string(),
+                enable_anthropic_extra: extras,
+                anthropic_api_key: SensitiveString::new(""),
+                anthropic_smart_model: "anthropic-smart".to_string(),
+                anthropic_judge_model: "anthropic-judge".to_string(),
+                enable_gemini: extras,
+                gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
+                    .to_string(),
+                gemini_api_key: SensitiveString::new(""),
+                gemini_smart_model: "gemini-smart".to_string(),
+                gemini_judge_model: "gemini-judge".to_string(),
+                enable_otlp_logging: false,
+                otlp_endpoint: "http://localhost:4317".to_string(),
+                otlp_protocol: "grpc".to_string(),
+                otlp_min_level: "info".to_string(),
+                otlp_service_name: "aegis-orchestrator".to_string(),
+                enable_metrics: true,
+                metrics_port: 9091,
+                metrics_path: "/metrics".to_string(),
+                enable_cluster: false,
+                cluster_role: "hybrid".to_string(),
+                cluster_grpc_port: 50056,
+                cluster_controller_endpoint: "https://aegis-controller.example.com:50056"
+                    .to_string(),
+                cluster_token: SensitiveString::new("env:AEGIS_CLUSTER_TOKEN"),
+                cpu_cores: 4,
+                memory_gb: 16,
+                disk_gb: 100,
+                gpu_count: 0,
+                vram_gb: 0,
+            },
+        }
+    }
+
+    /// Every alias a built-in agent template names on a `model:` key.
+    fn template_model_aliases() -> std::collections::BTreeSet<String> {
+        fn walk(value: &serde_yaml::Value, out: &mut std::collections::BTreeSet<String>) {
+            match value {
+                serde_yaml::Value::Mapping(map) => {
+                    for (k, v) in map {
+                        if k.as_str() == Some("model") {
+                            if let Some(alias) = v.as_str() {
+                                out.insert(alias.to_string());
+                            }
+                        }
+                        walk(v, out);
+                    }
+                }
+                serde_yaml::Value::Sequence(seq) => seq.iter().for_each(|v| walk(v, out)),
+                _ => {}
+            }
+        }
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/agents");
+        let mut out = std::collections::BTreeSet::new();
+        for entry in fs::read_dir(&dir).expect("templates/agents is readable") {
+            let path = entry.expect("directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("template is readable");
+            let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("{} parses: {e}", path.display()));
+            walk(&doc, &mut out);
+        }
+        out
+    }
+
+    /// Regression (AEGIS known defects volume 5, "`aegis init` maps no
+    /// `tool-judge` alias"): `tool-call-policy-judge` names `tool-judge`
+    /// since `b78bae8c`, and an unmapped alias fails every judged tool call
+    /// with "Model alias '<alias>' not found". Every provider block `aegis
+    /// init` can render maps `tool-judge`, and every rendered configuration
+    /// maps every alias a built-in template names.
+    #[test]
+    fn every_rendered_provider_maps_tool_judge_and_every_template_alias() {
+        let wizard = ConfigWizard::new(true, PathBuf::from("/tmp"), None);
+        let template_aliases = template_model_aliases();
+        assert!(
+            template_aliases.contains("tool-judge"),
+            "the templates name tool-judge: {template_aliases:?}"
+        );
+        let mut variants = Vec::new();
+        for llm in [
+            LlmChoice::Ollama,
+            LlmChoice::OpenAI,
+            LlmChoice::Anthropic,
+            LlmChoice::Gemini,
+            LlmChoice::OpenAICompatible,
+        ] {
+            variants.push((llm, false));
+        }
+        // The three optional providers (lmstudio, anthropic-extra, gemini)
+        // render beside a base provider other than Anthropic.
+        variants.push((LlmChoice::OpenAI, true));
+
+        let mut failures = Vec::new();
+        let mut providers_seen = std::collections::BTreeSet::new();
+        for (llm, extras) in variants {
+            let label = format!("{llm:?} (extras {extras})");
+            let components = SelectedComponents {
+                temporal: false,
+                storage: false,
+                seal_gateway: false,
+                ollama_llm: false,
+                observability: false,
+                llm,
+            };
+            let rendered =
+                wizard.render_aegis_config(&alias_test_config(extras), &components, "test-tag");
+            let doc: serde_yaml::Value =
+                serde_yaml::from_str(&rendered).expect("rendered configuration parses");
+            let providers = doc["spec"]["llm_providers"]
+                .as_sequence()
+                .expect("spec.llm_providers is a list");
+            let mut mapped = std::collections::BTreeSet::new();
+            for provider in providers {
+                let name = provider["name"].as_str().unwrap_or("?").to_string();
+                let aliases: std::collections::BTreeMap<String, String> = provider["models"]
+                    .as_sequence()
+                    .expect("models is a list")
+                    .iter()
+                    .map(|m| {
+                        (
+                            m["alias"].as_str().unwrap_or_default().to_string(),
+                            m["model"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                providers_seen.insert(name.clone());
+                match (aliases.get("tool-judge"), aliases.get("judge")) {
+                    (Some(tool_judge), Some(judge)) if tool_judge == judge => {}
+                    (tool_judge, judge) => failures.push(format!(
+                        "{label}: provider {name} must map tool-judge on its judge model {judge:?}, maps {tool_judge:?}"
+                    )),
+                }
+                mapped.extend(aliases.into_keys());
+            }
+            let missing: Vec<_> = template_aliases.difference(&mapped).collect();
+            if !missing.is_empty() {
+                failures.push(format!("{label}: unmapped template aliases {missing:?}"));
+            }
+        }
+        assert_eq!(
+            providers_seen.len(),
+            7,
+            "every provider block is rendered (gemini is both a base and an extra name): {providers_seen:?}"
+        );
+        assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
     /// Build a `NodeConfig` whose every credential field is set to a
