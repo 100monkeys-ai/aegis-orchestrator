@@ -590,6 +590,16 @@ impl ToolRouter {
                 "command": {
                     "type": "string",
                     "description": "Command to execute"
+                },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Arguments passed to the command, as an array of strings, such as [\"-c\", \"env\"]."
+                },
+                "env_additions": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Environment variables added for this command, as an object of string values, such as {\"INTENT_INPUTS\": \"{\\\"text\\\": \\\"hello\\\"}\"}. env_additions is an object, not a JSON string."
                 }
             },
             "required": ["command"]
@@ -2807,6 +2817,42 @@ mod tests {
             .as_array()
             .expect("cmd.run must declare a `required` array");
         assert!(cmd_required.iter().any(|v| v.as_str() == Some("command")));
+    }
+
+    /// The model reads this schema as the function's `parameters`; on
+    /// 2026-10-01 it declared only `command`, and the model sent
+    /// `env_additions` and `args` as JSON-encoded strings.
+    #[test]
+    fn cmd_run_schema_declares_args_and_env_additions_shapes() {
+        let cmd_run = ToolRouter::schema_for_builtin("cmd.run");
+        let props = &cmd_run["properties"];
+        assert_eq!(
+            props["args"]["type"],
+            json!("array"),
+            "cmd.run schema: {cmd_run}"
+        );
+        assert_eq!(
+            props["args"]["items"]["type"],
+            json!("string"),
+            "cmd.run schema: {cmd_run}"
+        );
+        assert_eq!(
+            props["env_additions"]["type"],
+            json!("object"),
+            "cmd.run schema: {cmd_run}"
+        );
+        assert_eq!(
+            props["env_additions"]["additionalProperties"]["type"],
+            json!("string"),
+            "cmd.run schema: {cmd_run}"
+        );
+        let env_desc = props["env_additions"]["description"]
+            .as_str()
+            .expect("env_additions must carry a description");
+        assert!(
+            env_desc.contains("not a JSON string"),
+            "env_additions description: {env_desc}"
+        );
     }
 
     #[test]
