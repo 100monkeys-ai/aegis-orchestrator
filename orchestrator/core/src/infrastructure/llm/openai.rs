@@ -22,6 +22,52 @@ use crate::domain::secrets::SensitiveUrl;
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// The tool names one request sends, mapped back to each tool's own name.
+///
+/// OpenAI, Anthropic and Gemini forbid `.` in a tool name, so every adapter
+/// sends `fs.read` as `fs_read`. Replacing each `_` with `.` on the way back
+/// is not the inverse: `fs.create_dir` is sent as `fs_create_dir` and would
+/// come back as `fs.create.dir`, a tool that does not exist. The way back is
+/// a lookup among the names the request sent. A returned name that matches
+/// none of them is passed through unchanged, with a warning, so the loop's
+/// own unknown-tool handling answers it.
+pub(super) struct SentToolNames {
+    original_by_sent: HashMap<String, String>,
+}
+
+impl SentToolNames {
+    /// The form in which a tool's name is sent to a provider.
+    pub(super) fn sent_form(name: &str) -> String {
+        name.replace('.', "_")
+    }
+
+    /// The map for a request that sends `tools`.
+    pub(super) fn new(tools: &[ToolSchema]) -> Self {
+        Self {
+            original_by_sent: tools
+                .iter()
+                .map(|t| (Self::sent_form(&t.name), t.name.clone()))
+                .collect(),
+        }
+    }
+
+    /// The tool's own name for a name the provider returned.
+    pub(super) fn original(&self, provider: &str, returned: &str) -> String {
+        match self.original_by_sent.get(returned) {
+            Some(original) => original.clone(),
+            None => {
+                tracing::warn!(
+                    provider,
+                    returned_tool_name = returned,
+                    "the model returned a tool name this request did not send; passed through unchanged"
+                );
+                returned.to_string()
+            }
+        }
+    }
+}
 
 pub struct OpenAIAdapter {
     client: reqwest::Client,
@@ -155,12 +201,22 @@ impl LLMProvider for OpenAIAdapter {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
-        // Map domain ChatMessage → OpenAI message shape
+        // Map domain ChatMessage → OpenAI message shape.
+        //
+        // An assistant message that carries tool calls and no text is sent
+        // with `content: ""`, never without the key: Workers AI's
+        // `gpt-oss-120b`, `gpt-oss-20b`, `llama-3.3-70b-instruct-fp8-fast`,
+        // `qwen3-30b-a3b-fp8` and `granite-4.0-h-micro` refuse a message with
+        // no `content` (HTTP 400, "required properties at '/messages/2' are
+        // 'role,content'"), which failed every tool cycle's second request.
         let oai_messages: Vec<OpenAIMessage> = messages
             .iter()
             .map(|m| OpenAIMessage {
                 role: m.role.clone(),
-                content: if m.content.is_empty() && m.role == "assistant" {
+                content: if m.content.is_empty()
+                    && m.role == "assistant"
+                    && !m.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty())
+                {
                     None
                 } else {
                     Some(m.content.clone())
@@ -171,7 +227,7 @@ impl LLMProvider for OpenAIAdapter {
                             id: tc.id.clone(),
                             call_type: "function".to_string(),
                             function: OpenAIToolFunction {
-                                name: tc.name.replace('.', "_"),
+                                name: SentToolNames::sent_form(&tc.name),
                                 arguments: tc.arguments.to_string(),
                             },
                         })
@@ -182,7 +238,9 @@ impl LLMProvider for OpenAIAdapter {
             .collect();
 
         // OpenAI strictly forbids `.` in tool names (`^[a-zA-Z0-9_-]{1,64}$`).
-        // We map `.` to `_` outbound, and back to `.` when receiving.
+        // We map `.` to `_` outbound, and a returned name back to the tool's
+        // own name by looking it up among the names sent (`SentToolNames`).
+        let sent_names = SentToolNames::new(tools);
         let oai_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
             None
         } else {
@@ -193,7 +251,7 @@ impl LLMProvider for OpenAIAdapter {
                         serde_json::json!({
                             "type": "function",
                             "function": {
-                                "name": t.name.replace('.', "_"),
+                                "name": SentToolNames::sent_form(&t.name),
                                 "description": t.description,
                                 "parameters": t.parameters,
                             }
@@ -301,8 +359,7 @@ impl LLMProvider for OpenAIAdapter {
                     .iter()
                     .map(|tc| ChatToolCall {
                         id: tc.id.clone(),
-                        // Map internal `_` back to the standard Aegis `.`
-                        name: tc.function.name.replace('_', "."),
+                        name: sent_names.original("openai", &tc.function.name),
                         arguments: serde_json::from_str(&tc.function.arguments)
                             .unwrap_or(serde_json::Value::Object(Default::default())),
                     })
@@ -330,7 +387,7 @@ impl LLMProvider for OpenAIAdapter {
                             ) {
                                 calls.push(ChatToolCall {
                                     id: id.to_string(),
-                                    name: name.replace('_', "."),
+                                    name: sent_names.original("openai", name),
                                     arguments: serde_json::from_str(args_str)
                                         .unwrap_or(serde_json::Value::Object(Default::default())),
                                 });

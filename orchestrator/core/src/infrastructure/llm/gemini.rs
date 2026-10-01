@@ -4,6 +4,7 @@
 //!
 //! Native Google Gemini adapter using the Generative Language API.
 
+use super::openai::SentToolNames;
 use crate::domain::llm::{
     ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
     LLMError, LLMProvider, ToolSchema,
@@ -152,14 +153,6 @@ impl GeminiAdapter {
         }
     }
 
-    fn sanitize_tool_name(name: &str) -> String {
-        name.replace('.', "_")
-    }
-
-    fn desanitize_tool_name(name: &str) -> String {
-        name.replace('_', ".")
-    }
-
     /// Recursively strip JSON Schema fields that Gemini's function calling API does not support.
     fn strip_unsupported_schema_fields(schema: &serde_json::Value) -> serde_json::Value {
         match schema {
@@ -241,7 +234,7 @@ impl LLMProvider for GeminiAdapter {
                         parts.push(GeminiPart {
                             text: None,
                             function_call: Some(GeminiFunctionCall {
-                                name: Self::sanitize_tool_name(&tc.name),
+                                name: SentToolNames::sent_form(&tc.name),
                                 args: tc.arguments.clone(),
                             }),
                             function_response: None,
@@ -283,6 +276,11 @@ impl LLMProvider for GeminiAdapter {
             })
             .collect();
 
+        // Gemini forbids `.` in function names: `.` → `_` outbound, and a
+        // returned name back to the tool's own name by looking it up among
+        // the names sent (`SentToolNames`).
+        let sent_names = SentToolNames::new(tools);
+
         let request = GeminiGenerateContentRequest {
             contents,
             system_instruction: if system_text.is_empty() {
@@ -304,7 +302,7 @@ impl LLMProvider for GeminiAdapter {
                     function_declarations: tools
                         .iter()
                         .map(|t| GeminiFunctionDeclaration {
-                            name: Self::sanitize_tool_name(&t.name),
+                            name: SentToolNames::sent_form(&t.name),
                             description: t.description.clone(),
                             parameters: Self::strip_unsupported_schema_fields(&t.parameters),
                         })
@@ -421,7 +419,7 @@ impl LLMProvider for GeminiAdapter {
             .filter_map(|p| {
                 p.function_call.as_ref().map(|fc| ChatToolCall {
                     id: uuid::Uuid::new_v4().to_string(),
-                    name: Self::desanitize_tool_name(&fc.name),
+                    name: sent_names.original("gemini", &fc.name),
                     arguments: fc.args.clone(),
                 })
             })

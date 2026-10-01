@@ -7,6 +7,7 @@
 //!
 //! Default base URL: `http://localhost:11434` (configurable via node config).
 
+use super::openai::SentToolNames;
 use crate::domain::llm::{
     ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
     LLMError, LLMProvider, ToolSchema,
@@ -121,8 +122,10 @@ impl LLMProvider for OllamaAdapter {
             })
             .collect();
 
-        // Sanitize tool names: `.` → `_` outbound, reversed on inbound.
-        // Consistent with OpenAI/Anthropic adapters.
+        // Tool names: `.` → `_` outbound, and a returned name back to the
+        // tool's own name by looking it up among the names sent
+        // (`SentToolNames`), as the OpenAI and Anthropic adapters do.
+        let sent_names = SentToolNames::new(tools);
         let ollama_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
             None
         } else {
@@ -133,7 +136,7 @@ impl LLMProvider for OllamaAdapter {
                         serde_json::json!({
                             "type": "function",
                             "function": {
-                                "name": t.name.replace('.', "_"),
+                                "name": SentToolNames::sent_form(&t.name),
                                 "description": t.description,
                                 "parameters": t.parameters,
                             }
@@ -189,7 +192,7 @@ impl LLMProvider for OllamaAdapter {
                 .enumerate()
                 .map(|(i, tc)| ChatToolCall {
                     id: format!("ollama-call-{i}"),
-                    name: tc.function.name.replace('_', "."), // Reverse outbound sanitization
+                    name: sent_names.original("ollama", &tc.function.name),
                     arguments: tc.function.arguments,
                 })
                 .collect();

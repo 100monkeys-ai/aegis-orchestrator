@@ -7,6 +7,7 @@
 //! Anthropic Messages API payloads and back, including native `tool_use`
 //! content blocks for function-calling.
 
+use super::openai::SentToolNames;
 use crate::domain::llm::{
     ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
     LLMError, LLMProvider, ToolSchema,
@@ -205,7 +206,7 @@ impl LLMProvider for AnthropicAdapter {
                         content_blocks.push(serde_json::json!({
                             "type": "tool_use",
                             "id": tc.id,
-                            "name": tc.name.replace('.', "_"),
+                            "name": SentToolNames::sent_form(&tc.name),
                             "input": tc.arguments,
                         }));
                     }
@@ -223,7 +224,9 @@ impl LLMProvider for AnthropicAdapter {
             .collect();
 
         // Anthropic strictly forbids `.` in tool names (`^[a-zA-Z0-9_-]{1,128}$`).
-        // We map `.` to `_` outbound, and reverse (`_` → `.`) when receiving tool_use blocks.
+        // We map `.` to `_` outbound, and a returned tool_use name back to the
+        // tool's own name by looking it up among the names sent (`SentToolNames`).
+        let sent_names = SentToolNames::new(tools);
         let anthropic_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
             None
         } else {
@@ -232,7 +235,7 @@ impl LLMProvider for AnthropicAdapter {
                     .iter()
                     .map(|t| {
                         serde_json::json!({
-                            "name": t.name.replace('.', "_"),
+                            "name": SentToolNames::sent_form(&t.name),
                             "description": t.description,
                             "input_schema": t.parameters,
                         })
@@ -322,7 +325,7 @@ impl LLMProvider for AnthropicAdapter {
             .filter(|b| b.block_type == "tool_use")
             .map(|b| ChatToolCall {
                 id: b.id.clone(),
-                name: b.name.replace('_', "."), // Reverse outbound sanitization
+                name: sent_names.original("anthropic", &b.name),
                 arguments: b.input.clone(),
             })
             .collect();
