@@ -10,13 +10,11 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use aegis_orchestrator_core::application::execution::ExecutionService;
-use aegis_orchestrator_core::domain::iam::{
-    AegisRole, IdentityKind, RealmKind, UserIdentity, ZaruTier,
-};
+use aegis_orchestrator_core::domain::iam::{IdentityKind, RealmKind, UserIdentity};
 use aegis_orchestrator_core::domain::shared_kernel::ExecutionId;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 
-use crate::daemon::handlers::api_keys::hash_key;
+use crate::daemon::api_key_identity::{identity_from_api_key, key_hash_prefix, lookup_from_repo};
 use crate::daemon::state::AppState;
 
 #[derive(serde::Deserialize)]
@@ -282,115 +280,6 @@ where
     Ok(canonical)
 }
 
-/// Returns the first 12 hex chars of the SHA-256 hash of an API key for
-/// safe correlation in logs. Never log the raw key, never log the full
-/// hash — this prefix is enough to grep DB rows or correlate across
-/// services without leaking material that could be used to reconstruct
-/// the key.
-fn key_hash_prefix(raw_token: &str) -> String {
-    let h = hash_key(raw_token);
-    h.chars().take(12).collect()
-}
-
-/// Synthesize a [`UserIdentity`] from an `aegis_*` API key row by looking
-/// the key up in the api_keys repository. Returns `None` if the key is
-/// unknown / revoked / expired.
-async fn identity_from_api_key(state: &AppState, raw_token: &str) -> Option<UserIdentity> {
-    let prefix = key_hash_prefix(raw_token);
-    let repo = match state.api_key_repo.as_ref() {
-        Some(r) => r,
-        None => {
-            tracing::warn!(
-                target: "aegis::seal::attest",
-                key_prefix = %prefix,
-                "api_key_repo not configured; cannot validate API key"
-            );
-            return None;
-        }
-    };
-    let hash = hash_key(raw_token);
-    let row = match repo.find_by_key_hash(&hash).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            tracing::warn!(
-                target: "aegis::seal::attest",
-                key_prefix = %prefix,
-                "API key hash not found in repository"
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "aegis::seal::attest",
-                key_prefix = %prefix,
-                error = %e,
-                "API key repository lookup errored"
-            );
-            return None;
-        }
-    };
-    tracing::info!(
-        target: "aegis::seal::attest",
-        key_prefix = %prefix,
-        user_id = %row.user_id,
-        tenant_id = %row.tenant_id,
-        has_aegis_role = row.aegis_role.is_some(),
-        has_zaru_tier = row.zaru_tier.is_some(),
-        "API key row found"
-    );
-    let realm_slug = if row.aegis_role.is_some() {
-        "aegis-system".to_string()
-    } else {
-        "zaru-consumer".to_string()
-    };
-    let identity_kind = if let Some(role_str) = row.aegis_role.as_deref() {
-        let role = match AegisRole::from_claim(role_str) {
-            Some(r) => r,
-            None => {
-                tracing::warn!(
-                    target: "aegis::seal::attest",
-                    key_prefix = %prefix,
-                    aegis_role = %role_str,
-                    "AegisRole::from_claim returned None for stored aegis_role"
-                );
-                return None;
-            }
-        };
-        IdentityKind::Operator { aegis_role: role }
-    } else {
-        let tenant_id = match TenantId::from_realm_slug(&row.tenant_id) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    target: "aegis::seal::attest",
-                    key_prefix = %prefix,
-                    stored_tenant_id = %row.tenant_id,
-                    error = %e,
-                    "TenantId::from_realm_slug failed; cannot synthesize ConsumerUser identity"
-                );
-                return None;
-            }
-        };
-        let zaru_tier = row
-            .zaru_tier
-            .as_deref()
-            .and_then(ZaruTier::from_claim)
-            .unwrap_or(ZaruTier::Free);
-        IdentityKind::ConsumerUser {
-            zaru_tier,
-            tenant_id,
-        }
-    };
-    Some(UserIdentity {
-        sub: row.user_id,
-        realm_slug,
-        email: None,
-        email_verified: false,
-        name: None,
-        identity_kind,
-    })
-}
-
 /// Authenticate the caller of `/v1/seal/attest` from the `Authorization`
 /// header. Accepts both JWTs (validated against the configured IAM
 /// service) and `aegis_*` API keys (validated against `api_key_repo`).
@@ -435,7 +324,11 @@ async fn authenticate_attest_request(
             key_prefix = %key_hash_prefix(raw),
             "attempting API key validation"
         );
-        return identity_from_api_key(state, raw).await;
+        return identity_from_api_key(
+            lookup_from_repo(state.api_key_repo.as_ref()).as_deref(),
+            raw,
+        )
+        .await;
     }
     tracing::info!(
         target: "aegis::seal::attest",

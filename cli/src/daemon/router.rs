@@ -12,6 +12,7 @@ use aegis_orchestrator_core::presentation::webhook_guard::MAX_WEBHOOK_BODY_BYTES
 
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
 
+use crate::daemon::api_key_identity::lookup_from_repo;
 use crate::daemon::handlers::admin::{
     admin_rate_limit_router, get_user_rate_limit_usage_handler, AdminRateLimitState,
     RateLimitOverrideStore,
@@ -62,7 +63,7 @@ use crate::daemon::handlers::git_repo::{
     push_git_repo, refresh_git_repo, webhook_git_repo,
 };
 use crate::daemon::handlers::health::{health_handler, readiness_handler};
-use crate::daemon::handlers::llm::{llm_aliases_router, LlmAliasesState};
+use crate::daemon::handlers::llm::{llm_aliases_router, with_api_key_lookup, LlmAliasesState};
 use crate::daemon::handlers::observability::{
     dashboard_summary_handler, get_stimulus_handler, list_security_incidents_handler,
     list_stimuli_handler, list_storage_violations_handler,
@@ -395,10 +396,16 @@ pub(crate) fn create_router(
     // Model alias lookup (AEGIS ADR-124 D3): the model an alias resolves to,
     // read from the daemon's one provider registry, the instance the inner
     // loop routes every model call through (`AppState::llm_registry`).
-    // Beneath the same authentication layers as `/v1/credentials`.
-    let router = router.merge(llm_aliases_router(LlmAliasesState {
-        registry: app_state.llm_registry.clone(),
-    }));
+    // Exempt from the JWT-only IAM layer, which still attaches a valid JWT's
+    // identity on this path; the handler also accepts an `aegis_*` API key
+    // by the lookup `/v1/seal/attest` uses (Zaru ADR-0049 D4) and refuses
+    // everything else with 401.
+    let router = router.merge(with_api_key_lookup(
+        llm_aliases_router(LlmAliasesState {
+            registry: app_state.llm_registry.clone(),
+        }),
+        lookup_from_repo(app_state.api_key_repo.as_ref()),
+    ));
 
     // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed
     // (i.e. a Postgres pool is available). Pure-worker deployments without a

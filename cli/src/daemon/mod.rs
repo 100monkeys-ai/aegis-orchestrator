@@ -24,6 +24,7 @@ use tracing::info;
 #[cfg(unix)]
 use tracing::warn;
 
+pub(crate) mod api_key_identity;
 pub mod billing_service;
 pub mod client;
 pub(crate) mod cluster_helpers;

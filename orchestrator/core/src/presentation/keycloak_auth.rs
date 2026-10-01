@@ -84,17 +84,74 @@ const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/v1/api-keys/validate",
     "/v1/billing/prices",
     "/v1/dispatch-gateway",
+    // Authenticated by its own handler (`cli/src/daemon/handlers/llm.rs`):
+    // a JWT, whose identity this middleware still attaches
+    // (`JWT_IDENTITY_ON_EXEMPT_PATH_PREFIXES`), or an `aegis_*` API key by
+    // the lookup `/v1/seal/attest` uses; anything else is 401 (Zaru ADR-0049
+    // D4, AEGIS ADR-124's Update of 2026-10-01).
+    "/v1/llm/aliases",
     "/v1/seal/attest",
     "/v1/seal/invoke",
     "/v1/seal/tools",
     "/v1/webhooks",
 ];
 
+/// Exempt paths on which the middleware still attaches the identity (and
+/// scopes) of a valid JWT, but refuses nothing: a request with no token, an
+/// `aegis_*` key or an invalid token passes with no identity, and the
+/// path's handler decides.
+const JWT_IDENTITY_ON_EXEMPT_PATH_PREFIXES: &[&str] = &["/v1/llm/aliases"];
+
+/// Whether an exempt path still receives a valid JWT's identity.
+fn attaches_jwt_identity_when_exempt(path: &str) -> bool {
+    JWT_IDENTITY_ON_EXEMPT_PATH_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 /// Check whether a request path is exempt from IAM/OIDC auth.
 fn is_exempt(path: &str) -> bool {
     EXEMPT_PATH_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
+}
+
+/// On a path of `JWT_IDENTITY_ON_EXEMPT_PATH_PREFIXES`: attach the identity
+/// and scopes of a valid Bearer JWT, as the authenticated branch below does.
+/// A missing header, a non-Bearer header, an `aegis_*` API key (never a JWT)
+/// or an invalid token attaches nothing and refuses nothing.
+async fn attach_jwt_identity_if_valid(
+    iam_service: &dyn IdentityProvider,
+    request: &mut Request,
+    route: &str,
+) {
+    let Some(token) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if token.starts_with("aegis_") {
+        return;
+    }
+    match iam_service.validate_token(&token).await {
+        Ok(validated) => {
+            request.extensions_mut().insert(validated.identity);
+            let scope_str = validated
+                .raw_claims
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let scopes: Vec<String> = scope_str.split_whitespace().map(String::from).collect();
+            request.extensions_mut().insert(ScopeGuard(scopes));
+        }
+        Err(e) => {
+            warn!(route = %route, error = %e, "HTTP JWT validation failed");
+        }
+    }
 }
 
 /// Axum middleware function for IAM/OIDC JWT authentication.
@@ -120,6 +177,9 @@ pub async fn iam_auth_middleware(
 
     // Skip auth for exempt paths
     if is_exempt(&path) {
+        if attaches_jwt_identity_when_exempt(&path) {
+            attach_jwt_identity_if_valid(iam_service.as_ref(), &mut request, &route).await;
+        }
         return next.run(request).await;
     }
 
@@ -200,6 +260,31 @@ mod tests {
         assert!(!is_exempt("/v1/temporal-events"));
         // api-keys CRUD requires JWT; only /validate is exempt
         assert!(!is_exempt("/v1/api-keys"));
+    }
+
+    /// Zaru ADR-0049 D4: the alias route authenticates itself (a JWT or an
+    /// `aegis_*` key), and is the only `/v1/llm` path; the JWT-only routes
+    /// an API key must not reach stay non-exempt.
+    #[test]
+    fn the_alias_route_alone_is_exempt_and_attaches_a_jwt_identity() {
+        assert!(is_exempt("/v1/llm/aliases/zaru-chat"));
+        assert!(attaches_jwt_identity_when_exempt(
+            "/v1/llm/aliases/zaru-chat"
+        ));
+        for path in [
+            "/v1/credentials",
+            "/v1/credentials/some-id",
+            "/v1/agents",
+            "/v1/agents/some-id",
+        ] {
+            assert!(!is_exempt(path), "{path} must stay behind the JWT layer");
+        }
+        for path in ["/v1/seal/attest", "/v1/webhooks/github", "/health"] {
+            assert!(
+                !attaches_jwt_identity_when_exempt(path),
+                "{path} keeps the exempt behaviour it had"
+            );
+        }
     }
 
     /// Regression: the broad `/v1/executions` prefix was previously exempt,
