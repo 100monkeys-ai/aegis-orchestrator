@@ -5,7 +5,7 @@
 //! No `MAIL FROM`, `RCPT TO` or `DATA` is sent.
 
 use super::wire::{failure, Wire};
-use super::{MailConnector, MailProtocol, MailboxCheckFailure};
+use super::{AdmittedTarget, MailConnector, MailProtocol, MailboxCheckFailure};
 use crate::domain::credential::{MailSecurity, MailboxSettings};
 use crate::domain::secrets::SensitiveString;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -13,23 +13,22 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 /// The name the client gives in `EHLO`.
 const EHLO_NAME: &str = "localhost";
 
-/// Run the SMTP session with `settings` and `password`.
+/// Run the SMTP session with `settings` and `password`, over the
+/// endpoint the connector admitted.
 pub async fn check(
     connector: &dyn MailConnector,
+    admitted: &AdmittedTarget,
     settings: &MailboxSettings,
     password: &SensitiveString,
 ) -> Result<(), MailboxCheckFailure> {
     let host = settings.smtp_host.as_str();
-    let stream = connector
-        .connect(host, settings.smtp_port, settings.smtp_security.clone())
-        .await
-        .map_err(|e| {
-            failure(
-                MailProtocol::Smtp,
-                &format!("connect to {host}:{} failed: {e}", settings.smtp_port),
-                password,
-            )
-        })?;
+    let stream = connector.connect(admitted).await.map_err(|e| {
+        failure(
+            MailProtocol::Smtp,
+            &format!("connect to {host}:{} failed: {e}", settings.smtp_port),
+            password,
+        )
+    })?;
     let mut wire = Wire::new(stream, MailProtocol::Smtp, password);
 
     expect(&mut wire, 220).await?;

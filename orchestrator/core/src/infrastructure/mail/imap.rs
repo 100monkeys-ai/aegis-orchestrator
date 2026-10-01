@@ -4,27 +4,26 @@
 //! optional `STARTTLS`, `LOGIN`, `SELECT INBOX`, `LOGOUT`.
 
 use super::wire::{failure, Wire};
-use super::{MailConnector, MailProtocol, MailboxCheckFailure};
+use super::{AdmittedTarget, MailConnector, MailProtocol, MailboxCheckFailure};
 use crate::domain::credential::{MailSecurity, MailboxSettings};
 use crate::domain::secrets::SensitiveString;
 
-/// Run the IMAP session with `settings` and `password`.
+/// Run the IMAP session with `settings` and `password`, over the
+/// endpoint the connector admitted.
 pub async fn check(
     connector: &dyn MailConnector,
+    admitted: &AdmittedTarget,
     settings: &MailboxSettings,
     password: &SensitiveString,
 ) -> Result<(), MailboxCheckFailure> {
     let host = settings.imap_host.as_str();
-    let stream = connector
-        .connect(host, settings.imap_port, settings.imap_security.clone())
-        .await
-        .map_err(|e| {
-            failure(
-                MailProtocol::Imap,
-                &format!("connect to {host}:{} failed: {e}", settings.imap_port),
-                password,
-            )
-        })?;
+    let stream = connector.connect(admitted).await.map_err(|e| {
+        failure(
+            MailProtocol::Imap,
+            &format!("connect to {host}:{} failed: {e}", settings.imap_port),
+            password,
+        )
+    })?;
     let mut wire = Wire::new(stream, MailProtocol::Imap, password);
 
     let greeting = wire.line().await?;

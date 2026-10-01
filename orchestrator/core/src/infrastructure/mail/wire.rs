@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Line reading and reply sanitising shared by the IMAP and SMTP sessions.
 
-use super::{BoxedMailStream, MailProtocol, MailboxCheckFailure};
+use super::{AdmissionError, BoxedMailStream, CheckFailureKind, MailProtocol, MailboxCheckFailure};
 use crate::domain::secrets::SensitiveString;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// The longest line either session reads; a server sending more is refused.
 const MAX_LINE: u64 = 16 * 1024;
-/// The longest reply text kept for the user.
-const MAX_REPLY: usize = 1024;
+/// The longest reply text kept for the user, in characters.
+pub(super) const MAX_REPLY: usize = 512;
 
 /// One session's buffered stream, with the protocol it speaks and the
 /// password to redact from anything the server says.
@@ -100,24 +100,39 @@ impl<'a> Wire<'a> {
 }
 
 /// A sanitised failure: control characters removed, the password redacted,
-/// the length bounded.
+/// at most [`MAX_REPLY`] characters.
 pub(super) fn failure(
     protocol: MailProtocol,
     reply: &str,
     password: &SensitiveString,
 ) -> MailboxCheckFailure {
-    let mut text: String = reply
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    MailboxCheckFailure {
+        protocol,
+        reply: sanitise(reply, password),
+        kind: CheckFailureKind::Unreachable,
+    }
+}
+
+/// The failure for an endpoint the connector did not admit.
+pub(super) fn failure_of(
+    protocol: MailProtocol,
+    error: AdmissionError,
+    password: &SensitiveString,
+) -> MailboxCheckFailure {
+    match error {
+        AdmissionError::NotAllowed { field, reason } => MailboxCheckFailure {
+            protocol,
+            reply: sanitise(&reason, password),
+            kind: CheckFailureKind::HostNotAllowed { field },
+        },
+        AdmissionError::Unresolvable(reason) => failure(protocol, &reason, password),
+    }
+}
+
+fn sanitise(reply: &str, password: &SensitiveString) -> String {
+    let mut text: String = reply.chars().filter(|c| !c.is_control()).collect();
     if !password.is_empty() {
         text = text.replace(password.expose(), "[REDACTED]");
     }
-    let text = text.trim().to_string();
-    let reply = if text.chars().count() > MAX_REPLY {
-        text.chars().take(MAX_REPLY).collect::<String>() + "…"
-    } else {
-        text
-    };
-    MailboxCheckFailure { protocol, reply }
+    text.trim().chars().take(MAX_REPLY).collect()
 }

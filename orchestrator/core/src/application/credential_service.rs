@@ -35,7 +35,7 @@ use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, Sensiti
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::mail::{MailboxProbe, SessionMailboxProbe};
+use crate::infrastructure::mail::{CheckFailureKind, MailboxProbe, SessionMailboxProbe};
 use crate::infrastructure::secrets_manager::SecretsManager;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -295,6 +295,12 @@ pub enum CredentialError {
     /// `reply` is the server's answer, the password redacted (ADR-125 D1).
     #[error("mailbox_unreachable: the {protocol} server answered: {reply}")]
     MailboxUnreachable { protocol: String, reply: String },
+    /// The mailbox check's guard refused a host or port before any
+    /// connection: only the mail ports and public unicast addresses are
+    /// reached (ADR-125 D1, its server-side request forgery rule). `field`
+    /// is the setting refused; `reason` the sentence naming it.
+    #[error("mailbox_host_not_allowed: {reason}")]
+    MailboxHostNotAllowed { field: String, reason: String },
     /// Mailbox settings no session could use.
     #[error("invalid mailbox settings: {0}")]
     InvalidMailboxSettings(String),
@@ -999,6 +1005,19 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
         // The live check, before anything is stored.
         if let Err(failure) = self.mailbox_probe.check(&settings, &password).await {
+            if let CheckFailureKind::HostNotAllowed { field } = failure.kind {
+                tracing::warn!(
+                    address = %settings.address,
+                    field,
+                    reason = %failure.reply,
+                    "Mailbox check refused an endpoint outside the rule; no connection made"
+                );
+                return Err(CredentialError::MailboxHostNotAllowed {
+                    field: field.to_string(),
+                    reason: failure.reply,
+                }
+                .into());
+            }
             tracing::info!(
                 address = %settings.address,
                 protocol = %failure.protocol,

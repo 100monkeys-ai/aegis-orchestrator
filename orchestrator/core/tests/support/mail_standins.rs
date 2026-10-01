@@ -19,8 +19,9 @@
 
 #![allow(dead_code)]
 
-use aegis_orchestrator_core::domain::credential::MailSecurity;
-use aegis_orchestrator_core::infrastructure::mail::{BoxedMailStream, MailConnector};
+use aegis_orchestrator_core::infrastructure::mail::{
+    AdmissionError, AdmittedTarget, BoxedMailStream, MailConnector, MailTarget,
+};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::net::SocketAddr;
@@ -38,6 +39,8 @@ pub const SMTP_REFUSAL: &str = "535 5.7.8 Authentication credentials invalid (sm
 pub struct StandIn {
     pub addr: SocketAddr,
     pub commands: Arc<Mutex<Vec<String>>>,
+    /// Every connection accepted, whether or not it sent a command.
+    pub accepted: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StandIn {
@@ -47,6 +50,9 @@ impl StandIn {
     pub fn commands(&self) -> Vec<String> {
         self.commands.lock().unwrap().clone()
     }
+    pub fn connections(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Plaintext connector: TCP to the stand-in, STARTTLS is the identity.
@@ -54,13 +60,18 @@ pub struct PlainConnector;
 
 #[async_trait]
 impl MailConnector for PlainConnector {
-    async fn connect(
-        &self,
-        host: &str,
-        port: u16,
-        _security: MailSecurity,
-    ) -> std::io::Result<BoxedMailStream> {
-        let stream = TcpStream::connect((host, port)).await?;
+    /// Admits every endpoint: the stand-ins are on loopback and on random
+    /// ports, which the production rule refuses.
+    async fn admit(&self, target: MailTarget) -> Result<AdmittedTarget, AdmissionError> {
+        Ok(AdmittedTarget {
+            target,
+            addrs: Vec::new(),
+        })
+    }
+
+    async fn connect(&self, admitted: &AdmittedTarget) -> std::io::Result<BoxedMailStream> {
+        let stream =
+            TcpStream::connect((admitted.target.host.as_str(), admitted.target.port)).await?;
         Ok(Box::new(stream))
     }
 
@@ -156,10 +167,13 @@ pub async fn imap_standin(user: &str, password: &str) -> StandIn {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind imap");
     let addr = listener.local_addr().unwrap();
     let commands = Arc::new(Mutex::new(Vec::new()));
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = commands.clone();
+    let count = accepted.clone();
     let (user, password) = (user.to_string(), password.to_string());
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (read, mut write) = socket.into_split();
             let mut reader = BufReader::new(read);
             let seen = seen.clone();
@@ -206,7 +220,11 @@ pub async fn imap_standin(user: &str, password: &str) -> StandIn {
             });
         }
     });
-    StandIn { addr, commands }
+    StandIn {
+        addr,
+        commands,
+        accepted,
+    }
 }
 
 /// An SMTP stand-in accepting `user`/`password` on AUTH PLAIN or LOGIN.
@@ -214,10 +232,13 @@ pub async fn smtp_standin(user: &str, password: &str) -> StandIn {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind smtp");
     let addr = listener.local_addr().unwrap();
     let commands = Arc::new(Mutex::new(Vec::new()));
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = commands.clone();
+    let count = accepted.clone();
     let (user, password) = (user.to_string(), password.to_string());
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (read, mut write) = socket.into_split();
             let mut reader = BufReader::new(read);
             let seen = seen.clone();
@@ -296,7 +317,11 @@ pub async fn smtp_standin(user: &str, password: &str) -> StandIn {
             });
         }
     });
-    StandIn { addr, commands }
+    StandIn {
+        addr,
+        commands,
+        accepted,
+    }
 }
 
 /// Whether any recorded SMTP command would submit a message.

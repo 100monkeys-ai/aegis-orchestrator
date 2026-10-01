@@ -20,7 +20,14 @@
 //! The sessions run over a [`MailConnector`]: production uses
 //! [`RustlsMailConnector`] (rustls with the Mozilla roots of `webpki-roots`),
 //! and tests use a plaintext connector against loopback stand-ins.
+//!
+//! **What may be reached** is the production connector's [`guard`]: the
+//! mail ports only, and public unicast addresses only, each host resolved
+//! once and connected to at the addresses that were checked. Both endpoints
+//! are admitted before either session opens, so a refusal opens no
+//! connection.
 
+pub mod guard;
 pub mod imap;
 pub mod smtp;
 pub mod tls;
@@ -29,11 +36,12 @@ mod wire;
 use crate::domain::credential::{MailSecurity, MailboxSettings};
 use crate::domain::secrets::SensitiveString;
 use async_trait::async_trait;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub use tls::RustlsMailConnector;
+pub use tls::{RustlsMailConnector, SystemResolver, TcpDialer};
 
 /// A byte stream a mail session runs over: TCP, or TLS over TCP.
 pub trait MailStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -42,18 +50,46 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> MailStream for T {}
 /// A boxed [`MailStream`], so plaintext and TLS streams share one type.
 pub type BoxedMailStream = Box<dyn MailStream>;
 
+/// One endpoint a session connects to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailTarget {
+    pub protocol: MailProtocol,
+    pub host: String,
+    pub port: u16,
+    pub security: MailSecurity,
+}
+
+/// An endpoint the connector admitted, with the addresses it checked. A
+/// connector that resolves connects only to `addrs`.
+#[derive(Debug, Clone)]
+pub struct AdmittedTarget {
+    pub target: MailTarget,
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// Why an endpoint was not admitted.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmissionError {
+    /// The rule refuses the endpoint; `field` is the setting it names.
+    #[error("{reason}")]
+    NotAllowed { field: &'static str, reason: String },
+    /// The host could not be resolved.
+    #[error("{0}")]
+    Unresolvable(String),
+}
+
 /// Opens the connections a mail session needs.
 #[async_trait]
 pub trait MailConnector: Send + Sync {
-    /// Connect to `host:port`. For [`MailSecurity::Tls`] the returned stream
-    /// is TLS from the first byte; for [`MailSecurity::Starttls`] it is
-    /// plaintext until [`start_tls`](Self::start_tls).
-    async fn connect(
-        &self,
-        host: &str,
-        port: u16,
-        security: MailSecurity,
-    ) -> std::io::Result<BoxedMailStream>;
+    /// Decide whether `target` may be reached, resolving its host when the
+    /// connector resolves. Called for both endpoints before either session.
+    async fn admit(&self, target: MailTarget) -> Result<AdmittedTarget, AdmissionError>;
+
+    /// Connect to an admitted endpoint. For [`MailSecurity::Tls`] the
+    /// returned stream is TLS from the first byte; for
+    /// [`MailSecurity::Starttls`] it is plaintext until
+    /// [`start_tls`](Self::start_tls).
+    async fn connect(&self, admitted: &AdmittedTarget) -> std::io::Result<BoxedMailStream>;
 
     /// Upgrade a plaintext stream to TLS after the server accepted
     /// `STARTTLS`, verifying the server's certificate for `host`.
@@ -62,6 +98,18 @@ pub trait MailConnector: Send + Sync {
         stream: BoxedMailStream,
         host: &str,
     ) -> std::io::Result<BoxedMailStream>;
+}
+
+/// Resolves a host name to the addresses the production connector checks.
+#[async_trait]
+pub trait MailResolver: Send + Sync {
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>>;
+}
+
+/// Opens a TCP connection to one checked address.
+#[async_trait]
+pub trait MailDialer: Send + Sync {
+    async fn dial(&self, addr: SocketAddr) -> std::io::Result<BoxedMailStream>;
 }
 
 /// Which session refused.
@@ -80,14 +128,26 @@ impl std::fmt::Display for MailProtocol {
     }
 }
 
+/// Why a mailbox check failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckFailureKind {
+    /// The server refused, failed or could not be reached.
+    Unreachable,
+    /// The [`guard`] refused the endpoint before any connection; `field`
+    /// is the setting it names (`imap_host`, `smtp_host`, `imap_port`,
+    /// `smtp_port`).
+    HostNotAllowed { field: &'static str },
+}
+
 /// A mail session that did not complete: the protocol and the server's
 /// reply (or what failed before the server could reply), with the password
-/// redacted.
+/// redacted, control characters removed and at most 512 characters.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{protocol} session failed: {reply}")]
 pub struct MailboxCheckFailure {
     pub protocol: MailProtocol,
     pub reply: String,
+    pub kind: CheckFailureKind,
 }
 
 /// The check the credential service runs before storing an `imap` mailbox.
@@ -113,6 +173,20 @@ pub struct SessionMailboxProbe {
 }
 
 impl SessionMailboxProbe {
+    /// Admit one endpoint within the session timeout.
+    async fn admit(&self, target: MailTarget) -> Result<AdmittedTarget, AdmissionError> {
+        let protocol = target.protocol;
+        tokio::time::timeout(self.timeout, self.connector.admit(target))
+            .await
+            .map_err(|_| {
+                AdmissionError::Unresolvable(format!(
+                    "{} could not be resolved within {} seconds",
+                    guard::field(protocol, true),
+                    self.timeout.as_secs()
+                ))
+            })?
+    }
+
     pub fn new(connector: Arc<dyn MailConnector>) -> Self {
         Self {
             connector,
@@ -137,16 +211,37 @@ impl MailboxProbe for SessionMailboxProbe {
         let timed_out = |protocol| MailboxCheckFailure {
             protocol,
             reply: format!("no answer within {} seconds", self.timeout.as_secs()),
+            kind: CheckFailureKind::Unreachable,
         };
+        // Both endpoints are admitted before either session opens, so an
+        // endpoint the guard refuses is never preceded by a connection.
+        let imap_target = self
+            .admit(MailTarget {
+                protocol: MailProtocol::Imap,
+                host: settings.imap_host.clone(),
+                port: settings.imap_port,
+                security: settings.imap_security.clone(),
+            })
+            .await
+            .map_err(|e| wire::failure_of(MailProtocol::Imap, e, password))?;
+        let smtp_target = self
+            .admit(MailTarget {
+                protocol: MailProtocol::Smtp,
+                host: settings.smtp_host.clone(),
+                port: settings.smtp_port,
+                security: settings.smtp_security.clone(),
+            })
+            .await
+            .map_err(|e| wire::failure_of(MailProtocol::Smtp, e, password))?;
         tokio::time::timeout(
             self.timeout,
-            imap::check(self.connector.as_ref(), settings, password),
+            imap::check(self.connector.as_ref(), &imap_target, settings, password),
         )
         .await
         .map_err(|_| timed_out(MailProtocol::Imap))??;
         tokio::time::timeout(
             self.timeout,
-            smtp::check(self.connector.as_ref(), settings, password),
+            smtp::check(self.connector.as_ref(), &smtp_target, settings, password),
         )
         .await
         .map_err(|_| timed_out(MailProtocol::Smtp))??;

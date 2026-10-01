@@ -553,8 +553,10 @@ pub(crate) async fn store_api_key_handler(
 /// `POST /v1/credentials/mailboxes` — create an SMTP-with-IMAP mailbox
 /// (AEGIS ADR-125 D1). The service checks both servers before it stores
 /// anything: 201 with the binding's metadata when both accept, 422
-/// `mailbox_unreachable` with the refusing server's reply otherwise. The
-/// password is never in a response or a log line.
+/// `mailbox_unreachable` with the refusing server's reply otherwise, and 422
+/// `mailbox_host_not_allowed` naming the field when a host or port is
+/// outside the rule (mail ports, public addresses), with no connection
+/// made. The password is never in a response or a log line.
 pub(crate) async fn create_mailbox_handler(
     State(state): State<CredentialsMailboxesState>,
     request: axum::extract::Request,
@@ -643,6 +645,15 @@ pub(crate) async fn create_mailbox_handler(
                     "error": "mailbox_unreachable",
                     "protocol": protocol,
                     "reply": reply,
+                })),
+            )
+                .into_response(),
+            Some(CredentialError::MailboxHostNotAllowed { field, reason }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "mailbox_host_not_allowed",
+                    "field": field,
+                    "message": reason,
                 })),
             )
                 .into_response(),
@@ -2106,6 +2117,77 @@ mod mailbox_route_tests {
         )
         .await;
         assert_eq!(status, 403);
+        assert!(r.bindings.rows.read().await.is_empty());
+    }
+
+    /// The route over the production mailbox check, as the daemon builds it.
+    async fn production_route() -> Route {
+        let bindings = Arc::new(Bindings::default());
+        let event_bus = Arc::new(EventBus::new(64));
+        let secrets = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            event_bus.clone(),
+        ));
+        let service = StandardCredentialManagementService::new(
+            bindings.clone(),
+            secrets.clone(),
+            event_bus,
+            Arc::new(OAuthProviderRegistry::new()),
+        );
+        let base = serve(
+            credentials_mailboxes_router(CredentialsMailboxesState {
+                credential_service: Some(Arc::new(service) as Arc<dyn CredentialManagementService>),
+            }),
+            Some(identity_provider(&[(
+                "owner-token",
+                consumer(OWNER),
+                SCOPES,
+            )])),
+            None,
+        )
+        .await;
+        Route {
+            base,
+            bindings,
+            secrets,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_or_port_outside_the_rule_is_422_mailbox_host_not_allowed_and_opens_no_connection(
+    ) {
+        // Stand-ins on loopback: the production rule refuses both their
+        // address and their port, so neither may see a connection.
+        let imap = imap_standin("outreach@example.test", PASSWORD).await;
+        let smtp = smtp_standin("outreach@example.test", PASSWORD).await;
+        let r = production_route().await;
+        let mut cases = Vec::new();
+        let mut b = body(imap.port(), smtp.port()).unwrap();
+        cases.push((b.clone(), "imap_port"));
+        b["imap_port"] = serde_json::json!(993);
+        cases.push((b.clone(), "imap_host"));
+        b["imap_host"] = serde_json::json!("203.0.113.10");
+        cases.push((b.clone(), "smtp_port"));
+        b["smtp_port"] = serde_json::json!(465);
+        cases.push((b.clone(), "smtp_host"));
+        for (case, field) in cases {
+            let (status, answer) = send(
+                &r.base,
+                &reqwest::Method::POST,
+                "/v1/credentials/mailboxes",
+                &Some(case),
+                Some("owner-token"),
+            )
+            .await;
+            assert_eq!(status, 422, "{field}: {answer}");
+            assert_eq!(answer["error"], "mailbox_host_not_allowed", "{answer}");
+            assert_eq!(answer["field"], field, "{answer}");
+            let message = answer["message"].as_str().unwrap_or("");
+            assert!(message.contains(field), "{message}");
+            assert!(!answer.to_string().contains(PASSWORD));
+        }
+        assert_eq!(imap.connections(), 0, "the IMAP stand-in was reached");
+        assert_eq!(smtp.connections(), 0, "the SMTP stand-in was reached");
         assert!(r.bindings.rows.read().await.is_empty());
     }
 
