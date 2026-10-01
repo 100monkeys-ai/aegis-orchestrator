@@ -117,6 +117,11 @@ pub enum CredentialType {
     OAuth2,
     /// Machine identity / service account credential (JSON blob).
     ServiceAccount,
+    /// A mailbox connection (AEGIS ADR-125 D1), in one of two forms: Google
+    /// OAuth (provider `google_mail`, the OpenBao fields of an OAuth token)
+    /// or SMTP with IMAP (provider `imap`, the settings in
+    /// [`CredentialMetadata::mailbox`] and the field `password` in OpenBao).
+    Mailbox,
 }
 
 /// The external service or platform this credential authenticates with.
@@ -127,6 +132,11 @@ pub enum CredentialProvider {
     Anthropic,
     GitHub,
     Google,
+    /// A Google mailbox reached through the Gmail API by OAuth (ADR-125 D1).
+    GoogleMail,
+    /// A mailbox reached by IMAP and SMTP with the user's own server
+    /// settings and password (ADR-125 D1).
+    Imap,
     /// Any provider not explicitly enumerated above; the inner string is the
     /// canonical service identifier chosen by the user (e.g. `"stripe"`).
     Custom(String),
@@ -139,8 +149,83 @@ impl std::fmt::Display for CredentialProvider {
             CredentialProvider::Anthropic => write!(f, "anthropic"),
             CredentialProvider::GitHub => write!(f, "github"),
             CredentialProvider::Google => write!(f, "google"),
+            CredentialProvider::GoogleMail => write!(f, "google_mail"),
+            CredentialProvider::Imap => write!(f, "imap"),
             CredentialProvider::Custom(name) => write!(f, "{name}"),
         }
+    }
+}
+
+impl CredentialProvider {
+    /// The provider a configuration or request names: an enumerated
+    /// provider by its [`Display`](std::fmt::Display) name, anything else
+    /// as [`CredentialProvider::Custom`].
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "openai" => CredentialProvider::OpenAI,
+            "anthropic" => CredentialProvider::Anthropic,
+            "github" => CredentialProvider::GitHub,
+            "google" => CredentialProvider::Google,
+            "google_mail" => CredentialProvider::GoogleMail,
+            "imap" => CredentialProvider::Imap,
+            other => CredentialProvider::Custom(other.to_string()),
+        }
+    }
+}
+
+/// How a mail session is secured (ADR-125 D1): TLS from the first byte
+/// (`tls`, IMAP 993 and SMTP 465 by convention) or a plaintext greeting
+/// upgraded by `STARTTLS` before any credential is sent (`starttls`, IMAP
+/// 143 and SMTP 587). There is no unencrypted form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailSecurity {
+    Tls,
+    Starttls,
+}
+
+/// The non-secret settings of an SMTP-with-IMAP mailbox (ADR-125 D1's
+/// table). The password is never here: it lives in OpenBao under the field
+/// `password` at the binding's secret path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxSettings {
+    /// The mailbox's address, the `From` of what it sends.
+    pub address: String,
+    /// The name shown beside the address, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_security: MailSecurity,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: MailSecurity,
+    /// The login name both servers accept.
+    pub username: String,
+}
+
+impl MailboxSettings {
+    /// Refuse settings no session could use, before any connection is made.
+    pub fn validate(&self) -> Result<(), String> {
+        let address = self.address.trim();
+        if address.is_empty() || !address.contains('@') {
+            return Err("address must be an email address".to_string());
+        }
+        for (name, host) in [
+            ("imap_host", &self.imap_host),
+            ("smtp_host", &self.smtp_host),
+        ] {
+            if host.trim().is_empty() || host.chars().any(|c| c.is_whitespace() || c == '/') {
+                return Err(format!("{name} must be a host name"));
+            }
+        }
+        if self.imap_port == 0 || self.smtp_port == 0 {
+            return Err("imap_port and smtp_port must be ports".to_string());
+        }
+        if self.username.is_empty() || self.username.contains(['\r', '\n', '\0']) {
+            return Err("username must be one line".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -205,6 +290,10 @@ pub struct CredentialMetadata {
     pub external_account_id: Option<String>,
     /// OAuth2 scopes requested during the authorisation flow.
     pub oauth_scopes: Option<Vec<String>>,
+    /// The non-secret settings of an `imap` mailbox (ADR-125 D1); `None`
+    /// for every other binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox: Option<MailboxSettings>,
 }
 
 // ============================================================================
@@ -403,6 +492,7 @@ mod tests {
                 service_url: None,
                 external_account_id: None,
                 oauth_scopes: None,
+                mailbox: None,
             },
             grants: Vec::new(),
             created_at: Utc::now(),

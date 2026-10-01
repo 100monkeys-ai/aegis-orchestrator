@@ -581,6 +581,34 @@ spec:
   #   url: "http://aegis-seal-gateway:50055"
 
   # --------------------------------------------------------------------------
+  # OAuth Providers (Optional, ADR-078, AEGIS ADR-125 D2)
+  # --------------------------------------------------------------------------
+  # Providers users connect a credential through: POST /v1/credentials/oauth/initiate
+  # with one of these provider names. Omit the block and every initiate answers
+  # that the provider is not configured. Each entry is validated at startup:
+  # HTTPS endpoints, a non-empty client_id, at least one HTTPS redirect URI; the
+  # flow's own parameters (client_id, redirect_uri, scope, state, ...) cannot be
+  # set in extra_authorization_params. client_id and client_secret take the
+  # env:VAR_NAME form; an unset variable fails startup.
+  # oauth_providers:
+  #   - provider: google_mail
+  #     authorization_url: "https://accounts.google.com/o/oauth2/v2/auth"
+  #     token_url: "https://oauth2.googleapis.com/token"
+  #     client_id: "env:GOOGLE_MAIL_OAUTH_CLIENT_ID"
+  #     client_secret: "env:GOOGLE_MAIL_OAUTH_CLIENT_SECRET"
+  #     redirect_uri_allowlist:
+  #       - "https://ask.example.com/vault/connections/callback"
+  #     # Sent space-separated as `scope`.
+  #     scopes:
+  #       - "https://www.googleapis.com/auth/gmail.modify"
+  #       - "openid"
+  #       - "email"
+  #     # Appended to the authorization URL; offline + consent yields a refresh token.
+  #     extra_authorization_params:
+  #       access_type: "offline"
+  #       prompt: "consent"
+
+  # --------------------------------------------------------------------------
   # Billing (SaaS mode only, Optional)
   # --------------------------------------------------------------------------
   # Stripe integration for subscription management.

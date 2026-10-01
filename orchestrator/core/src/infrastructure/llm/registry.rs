@@ -1142,6 +1142,7 @@ mod tests {
                 max_execution_list_limit: None,
                 billing: None,
                 zaru: None,
+                oauth_providers: Vec::new(),
             },
         };
 

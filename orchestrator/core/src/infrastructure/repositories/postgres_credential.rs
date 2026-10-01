@@ -50,6 +50,7 @@ fn credential_type_to_str(ct: &CredentialType) -> &'static str {
         CredentialType::OAuth2 => "oauth2",
         CredentialType::Variable => "variable",
         CredentialType::ServiceAccount => "service_account",
+        CredentialType::Mailbox => "mailbox",
     }
 }
 
@@ -59,6 +60,7 @@ fn str_to_credential_type(s: &str) -> anyhow::Result<CredentialType> {
         "oauth2" => Ok(CredentialType::OAuth2),
         "variable" => Ok(CredentialType::Variable),
         "service_account" => Ok(CredentialType::ServiceAccount),
+        "mailbox" => Ok(CredentialType::Mailbox),
         other => Err(anyhow::anyhow!("Unknown credential_type: {other}")),
     }
 }
@@ -69,6 +71,8 @@ fn provider_to_str(p: &CredentialProvider) -> String {
         CredentialProvider::Anthropic => "anthropic".to_string(),
         CredentialProvider::GitHub => "github".to_string(),
         CredentialProvider::Google => "google".to_string(),
+        CredentialProvider::GoogleMail => "google_mail".to_string(),
+        CredentialProvider::Imap => "imap".to_string(),
         CredentialProvider::Custom(name) => format!("custom:{name}"),
     }
 }
@@ -79,6 +83,8 @@ fn str_to_provider(s: &str) -> CredentialProvider {
         "anthropic" => CredentialProvider::Anthropic,
         "github" => CredentialProvider::GitHub,
         "google" => CredentialProvider::Google,
+        "google_mail" => CredentialProvider::GoogleMail,
+        "imap" => CredentialProvider::Imap,
         other => {
             let name = other.strip_prefix("custom:").unwrap_or(other);
             CredentialProvider::Custom(name.to_string())
@@ -158,6 +164,12 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> anyhow::Result<UserCredential
     let external_account_id: Option<String> = row.try_get("external_account_id")?;
     let service_url: Option<String> = row.try_get("service_url")?;
     let tags: Option<serde_json::Value> = row.try_get("tags")?;
+    // Migration 035 (AEGIS ADR-125 D1); NULL for every non-mailbox row.
+    let mailbox_settings: Option<serde_json::Value> = row.try_get("mailbox_settings")?;
+    let mailbox = mailbox_settings
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid mailbox_settings for binding {id}: {e}"))?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -196,6 +208,7 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> anyhow::Result<UserCredential
             service_url,
             external_account_id,
             oauth_scopes,
+            mailbox,
         },
         grants: Vec::new(),
         created_at,
@@ -238,6 +251,13 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
             CredentialScope::Personal => ("personal", None),
             CredentialScope::Team { team_id } => ("team", Some(*team_id)),
         };
+        let mailbox_settings: Option<serde_json::Value> = binding
+            .metadata
+            .mailbox
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Failed to encode mailbox_settings: {e}"))?;
 
         sqlx::query(
             r#"
@@ -245,9 +265,9 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
                 id, owner_user_id, tenant_id, credential_type, provider,
                 label, secret_path, scope, scope_team_id, status,
                 oauth_scopes, external_account_id, service_url, tags,
-                created_at, updated_at
+                created_at, updated_at, mailbox_settings
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (id) DO UPDATE SET
                 owner_user_id       = EXCLUDED.owner_user_id,
                 tenant_id           = EXCLUDED.tenant_id,
@@ -262,7 +282,8 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
                 external_account_id = EXCLUDED.external_account_id,
                 service_url         = EXCLUDED.service_url,
                 tags                = EXCLUDED.tags,
-                updated_at          = EXCLUDED.updated_at
+                updated_at          = EXCLUDED.updated_at,
+                mailbox_settings    = EXCLUDED.mailbox_settings
             "#,
         )
         .bind(binding.id.0)
@@ -281,6 +302,7 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
         .bind(&binding.metadata.tags)
         .bind(binding.created_at)
         .bind(binding.updated_at)
+        .bind(&mailbox_settings)
         .execute(&self.pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to save credential binding {}: {e}", binding.id))?;

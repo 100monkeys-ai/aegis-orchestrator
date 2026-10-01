@@ -96,6 +96,12 @@ lru = "0.18"
 git2 = { version = "0.21", default-features = false, features = ["https", "ssh", "vendored-libgit2", "vendored-openssl"] }
 scopeguard = "1.2"
 
+# Mailbox session checks (AEGIS ADR-125 D1): the IMAP and SMTP sessions are
+# written in infrastructure/mail/; these two give them TLS. rustls with the
+# ring provider and the Mozilla roots keeps the rustls-only posture above.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
+
 [dev-dependencies]
 # `services-fs` is dev-only: under resolver 2 a feature enabled through a
 # dev-dependency is not enabled for the normal build, so the shipped binary

@@ -1575,6 +1575,13 @@ pub enum CredentialEvent {
         agent_id: AgentId,
         tenant_id: TenantId,
     },
+    /// The provider refused to refresh the binding's OAuth token
+    /// (`invalid_grant`, or no refresh token is held): the binding is now
+    /// `Expired` and its user must reconnect it (AEGIS ADR-125 D3).
+    CredentialExpired {
+        binding_id: CredentialBindingId,
+        tenant_id: TenantId,
+    },
 }
 
 #[cfg(test)]

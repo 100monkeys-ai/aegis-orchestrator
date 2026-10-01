@@ -49,9 +49,10 @@ use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
 use crate::daemon::handlers::credentials::{
-    credentials_by_id_router, delete_secret_handler, device_poll_handler, get_secret_handler,
-    list_credentials_handler, list_secrets_handler, oauth_callback_handler, oauth_initiate_handler,
-    store_api_key_handler, write_secret_handler, CredentialsByIdState,
+    credentials_by_id_router, credentials_mailboxes_router, delete_secret_handler,
+    device_poll_handler, get_secret_handler, list_credentials_handler, list_secrets_handler,
+    oauth_callback_handler, oauth_initiate_handler, store_api_key_handler, write_secret_handler,
+    CredentialsByIdState, CredentialsMailboxesState,
 };
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
@@ -390,6 +391,13 @@ pub(crate) fn create_router(
     // their own narrow state so the service-side reach rule is driven
     // through the real middleware stack by the handler tests.
     let router = router.merge(credentials_by_id_router(CredentialsByIdState {
+        credential_service: app_state.credential_service.clone(),
+    }));
+
+    // Mailbox connections by SMTP and IMAP (AEGIS ADR-125 D1), over their
+    // own narrow state and beneath the same authentication layers as
+    // `/v1/credentials/api-keys`.
+    let router = router.merge(credentials_mailboxes_router(CredentialsMailboxesState {
         credential_service: app_state.credential_service.clone(),
     }));
 

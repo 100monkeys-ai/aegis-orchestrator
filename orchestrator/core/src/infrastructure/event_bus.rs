@@ -871,6 +871,7 @@ impl DomainEvent {
                 CredentialEvent::CredentialGranted { .. } => "credential_granted",
                 CredentialEvent::CredentialGrantRevoked { .. } => "credential_grant_revoked",
                 CredentialEvent::CredentialAccessed { .. } => "credential_accessed",
+                CredentialEvent::CredentialExpired { .. } => "credential_expired",
             },
             DomainEvent::GitRepo(event) => match event {
                 GitRepoEvent::BindingCreated { .. } => "git_repo_binding_created",
@@ -1612,7 +1613,8 @@ impl AgentEventReceiver {
                 | CredentialEvent::CredentialRevoked { .. }
                 | CredentialEvent::CredentialRotated { .. }
                 | CredentialEvent::CredentialGranted { .. }
-                | CredentialEvent::CredentialGrantRevoked { .. } => false,
+                | CredentialEvent::CredentialGrantRevoked { .. }
+                | CredentialEvent::CredentialExpired { .. } => false,
             },
             DomainEvent::GitRepo(_) => false, // Git repo binding events are tenant-scoped, not per-agent
             DomainEvent::Canvas(_) => false, // Canvas session events are tenant-scoped, not per-agent

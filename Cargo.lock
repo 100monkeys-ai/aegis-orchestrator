@@ -134,6 +134,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-test",
  "tokio-util",
@@ -148,6 +149,7 @@ dependencies = [
  "uuid",
  "vaultrs",
  "walkdir",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

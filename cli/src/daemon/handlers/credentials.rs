@@ -10,6 +10,7 @@
 //! |----------------|-------------------|----------------|
 //! | `GET /v1/credentials` | ConsumerUser \| TenantUser | `CredentialList` |
 //! | `POST /v1/credentials/api-keys` | ConsumerUser \| TenantUser | `CredentialCreate` |
+//! | `POST /v1/credentials/mailboxes` | ConsumerUser \| TenantUser | `CredentialCreate` |
 //! | `GET /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialRead` |
 //! | `DELETE /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialDelete` |
 //! | `POST /v1/credentials/{id}/rotate` | ConsumerUser \| TenantUser \| Operator | `CredentialRotate` |
@@ -31,12 +32,13 @@
 
 use crate::daemon::state::AppState;
 use aegis_orchestrator_core::application::credential_service::{
-    CredentialActor, CredentialManagementService, StoreApiKeyCommand,
+    CreateImapMailboxCommand, CredentialActor, CredentialError, CredentialManagementService,
+    StoreApiKeyCommand,
 };
 use aegis_orchestrator_core::domain::api_scope::ApiScope;
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialScope, CredentialType,
-    GrantTarget,
+    GrantTarget, MailSecurity, MailboxSettings,
 };
 use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::secrets::{AccessContext, SensitiveString};
@@ -166,6 +168,21 @@ pub(crate) fn credentials_by_id_router(state: CredentialsByIdState) -> Router {
         .with_state(state)
 }
 
+/// The state of `POST /v1/credentials/mailboxes` (AEGIS ADR-125 D1).
+#[derive(Clone)]
+pub(crate) struct CredentialsMailboxesState {
+    pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+}
+
+/// `POST /v1/credentials/mailboxes`, over its own narrow state. Merged into
+/// the daemon router by `router::create_router`, beneath the same
+/// authentication layers as `/v1/credentials/api-keys`.
+pub(crate) fn credentials_mailboxes_router(state: CredentialsMailboxesState) -> Router {
+    Router::new()
+        .route("/v1/credentials/mailboxes", post(create_mailbox_handler))
+        .with_state(state)
+}
+
 /// Require that the caller holds `Operator` or `Admin` role.
 #[allow(clippy::result_large_err)]
 fn require_operator_or_admin(
@@ -205,6 +222,29 @@ pub(crate) struct StoreApiKeyRequest {
     pub(crate) value: String,
     /// "secret" | "variable" | "service_account" | "oauth2"
     pub(crate) credential_type: String,
+}
+
+/// The body of `POST /v1/credentials/mailboxes`: ADR-125 D1's settings and
+/// the password. `password` is a [`SensitiveString`], so the derived
+/// `Debug` prints it redacted.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateMailboxRequest {
+    pub(crate) address: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    pub(crate) imap_host: String,
+    pub(crate) imap_port: u16,
+    pub(crate) imap_security: MailSecurity,
+    pub(crate) smtp_host: String,
+    pub(crate) smtp_port: u16,
+    pub(crate) smtp_security: MailSecurity,
+    pub(crate) username: String,
+    pub(crate) password: SensitiveString,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    /// "personal" | "team:\<uuid\>"
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +294,8 @@ fn parse_provider(s: &str) -> Result<CredentialProvider, Response> {
         "anthropic" => CredentialProvider::Anthropic,
         "github" => CredentialProvider::GitHub,
         "google" => CredentialProvider::Google,
+        "google_mail" => CredentialProvider::GoogleMail,
+        "imap" => CredentialProvider::Imap,
         other if !other.is_empty() => CredentialProvider::Custom(other.to_string()),
         _ => {
             return Err((
@@ -505,6 +547,116 @@ pub(crate) async fn store_api_key_handler(
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+/// `POST /v1/credentials/mailboxes` — create an SMTP-with-IMAP mailbox
+/// (AEGIS ADR-125 D1). The service checks both servers before it stores
+/// anything: 201 with the binding's metadata when both accept, 422
+/// `mailbox_unreachable` with the refusing server's reply otherwise. The
+/// password is never in a response or a log line.
+pub(crate) async fn create_mailbox_handler(
+    State(state): State<CredentialsMailboxesState>,
+    request: axum::extract::Request,
+) -> Response {
+    let (user_id, tenant_id) =
+        match require_credential_scope(request.extensions(), ApiScope::CredentialCreate) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    // serde's message can quote the offending value, which may be the
+    // password, so only its position is answered.
+    let payload: CreateMailboxRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "Invalid mailbox body at line {} column {}: expected the fields address, imap_host, imap_port, imap_security (tls or starttls), smtp_host, smtp_port, smtp_security, username and password",
+                        e.line(),
+                        e.column()
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let scope = match parse_credential_scope(payload.scope.as_deref()) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+
+    let svc = match &state.credential_service {
+        Some(s) => s.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Credential service not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let command = CreateImapMailboxCommand {
+        owner_user_id: user_id,
+        tenant_id,
+        label: payload.label,
+        scope,
+        settings: MailboxSettings {
+            address: payload.address,
+            display_name: payload.display_name,
+            imap_host: payload.imap_host,
+            imap_port: payload.imap_port,
+            imap_security: payload.imap_security,
+            smtp_host: payload.smtp_host,
+            smtp_port: payload.smtp_port,
+            smtp_security: payload.smtp_security,
+            username: payload.username,
+        },
+        password: payload.password,
+    };
+
+    match svc.create_imap_mailbox(command).await {
+        Ok(binding) => (
+            StatusCode::CREATED,
+            Json(json!({"id": binding.id.to_string(), "credential": binding})),
+        )
+            .into_response(),
+        Err(e) => match e.downcast_ref::<CredentialError>() {
+            Some(CredentialError::MailboxUnreachable { protocol, reply }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "mailbox_unreachable",
+                    "protocol": protocol,
+                    "reply": reply,
+                })),
+            )
+                .into_response(),
+            Some(CredentialError::InvalidMailboxSettings(detail)) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid mailbox settings: {detail}")})),
+            )
+                .into_response(),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
     }
 }
 
@@ -1633,5 +1785,344 @@ mod tests {
             "a caller entitled to a credential binding was refused:\n{}",
             failures.join("\n")
         );
+    }
+}
+
+/// The loopback IMAP and SMTP stand-ins shared with the core crate's tests.
+#[cfg(test)]
+#[path = "../../../../orchestrator/core/tests/support/mail_standins.rs"]
+mod mail_standins;
+
+#[cfg(test)]
+mod mailbox_route_tests {
+    //! `POST /v1/credentials/mailboxes` (AEGIS ADR-125 D1), driven through
+    //! the daemon's real authentication stack against the real
+    //! `StandardCredentialManagementService`, whose mailbox check talks to
+    //! the loopback IMAP and SMTP stand-ins. Every log line the request
+    //! produces is captured and searched for the password.
+
+    use super::mail_standins::{
+        imap_standin, smtp_standin, smtp_submitted_a_message, PlainConnector, IMAP_REFUSAL,
+        SMTP_REFUSAL,
+    };
+    use super::{credentials_mailboxes_router, CredentialsMailboxesState};
+    use crate::daemon::handlers::test_support::{
+        consumer, identity_provider, operator, send, serve,
+    };
+    use aegis_orchestrator_core::application::credential_service::{
+        CredentialManagementService, OAuthProviderRegistry, StandardCredentialManagementService,
+    };
+    use aegis_orchestrator_core::domain::credential::{
+        CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialProvider,
+        GrantTarget, OAuthPendingState, UserCredentialBinding,
+    };
+    use aegis_orchestrator_core::domain::iam::AegisRole;
+    use aegis_orchestrator_core::domain::secrets::AccessContext;
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::mail::SessionMailboxProbe;
+    use aegis_orchestrator_core::infrastructure::secrets_manager::{
+        SecretsManager, TestSecretStore,
+    };
+    use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::RwLock;
+
+    const OWNER: &str = "mailbox-owner-sub";
+    const PASSWORD: &str = "Mk7-route-mailbox-password";
+    const SCOPES: &str = "credential:create credential:list";
+
+    #[derive(Default)]
+    struct Bindings {
+        rows: RwLock<HashMap<CredentialBindingId, UserCredentialBinding>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialBindingRepository for Bindings {
+        async fn save(&self, binding: &UserCredentialBinding) -> anyhow::Result<()> {
+            self.rows.write().await.insert(binding.id, binding.clone());
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            id: &CredentialBindingId,
+        ) -> anyhow::Result<Option<UserCredentialBinding>> {
+            Ok(self.rows.read().await.get(id).cloned())
+        }
+        async fn find_by_owner(
+            &self,
+            _t: &TenantId,
+            _o: &str,
+        ) -> anyhow::Result<Vec<UserCredentialBinding>> {
+            Ok(self.rows.read().await.values().cloned().collect())
+        }
+        async fn find_active_grants_for_target(
+            &self,
+            _t: &TenantId,
+            _o: &str,
+            _p: &CredentialProvider,
+            _g: &GrantTarget,
+        ) -> anyhow::Result<Vec<CredentialGrant>> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, id: &CredentialBindingId) -> anyhow::Result<()> {
+            self.rows.write().await.remove(id);
+            Ok(())
+        }
+        async fn save_oauth_state(
+            &self,
+            _s: &str,
+            _b: &CredentialBindingId,
+            _v: &str,
+            _r: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_oauth_state(&self, _s: &str) -> anyhow::Result<Option<OAuthPendingState>> {
+            Ok(None)
+        }
+        async fn delete_oauth_state(&self, _s: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_expired_oauth_states(&self, _o: DateTime<Utc>) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Every formatted log line, from every level, into one buffer.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    struct Route {
+        base: String,
+        bindings: Arc<Bindings>,
+        secrets: Arc<SecretsManager>,
+    }
+
+    async fn route() -> Route {
+        let bindings = Arc::new(Bindings::default());
+        let event_bus = Arc::new(EventBus::new(64));
+        let secrets = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            event_bus.clone(),
+        ));
+        let service = StandardCredentialManagementService::new(
+            bindings.clone(),
+            secrets.clone(),
+            event_bus,
+            Arc::new(OAuthProviderRegistry::new()),
+        )
+        .with_mailbox_probe(Arc::new(SessionMailboxProbe::new(Arc::new(PlainConnector))));
+        let base = serve(
+            credentials_mailboxes_router(CredentialsMailboxesState {
+                credential_service: Some(Arc::new(service) as Arc<dyn CredentialManagementService>),
+            }),
+            Some(identity_provider(&[
+                ("owner-token", consumer(OWNER), SCOPES),
+                ("operator-token", operator(AegisRole::Admin), SCOPES),
+            ])),
+            None,
+        )
+        .await;
+        Route {
+            base,
+            bindings,
+            secrets,
+        }
+    }
+
+    fn body(imap_port: u16, smtp_port: u16) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "address": "outreach@example.test",
+            "display_name": "Outreach",
+            "imap_host": "127.0.0.1",
+            "imap_port": imap_port,
+            "imap_security": "starttls",
+            "smtp_host": "127.0.0.1",
+            "smtp_port": smtp_port,
+            "smtp_security": "tls",
+            "username": "outreach@example.test",
+            "password": PASSWORD,
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_mailbox_both_standins_accept_is_created_201_and_its_password_is_nowhere_but_openbao()
+    {
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let imap = imap_standin("outreach@example.test", PASSWORD).await;
+        let smtp = smtp_standin("outreach@example.test", PASSWORD).await;
+        let r = route().await;
+        let (status, answer) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            "/v1/credentials/mailboxes",
+            &body(imap.port(), smtp.port()),
+            Some("owner-token"),
+        )
+        .await;
+
+        assert_eq!(status, 201, "{answer}");
+        let credential = &answer["credential"];
+        assert_eq!(credential["credential_type"], "mailbox");
+        assert_eq!(credential["provider"], "imap");
+        assert_eq!(credential["status"], "active");
+        assert_eq!(credential["metadata"]["mailbox"]["imap_port"], imap.port());
+        assert_eq!(credential["metadata"]["mailbox"]["smtp_security"], "tls");
+        assert!(!answer.to_string().contains(PASSWORD), "{answer}");
+
+        let id = answer["id"].as_str().expect("id").to_string();
+        let rows = r.bindings.rows.read().await;
+        let stored = rows
+            .values()
+            .find(|b| b.id.0.to_string() == id)
+            .expect("binding saved");
+        let secret = r
+            .secrets
+            .read_secret(
+                &stored.secret_path.effective_mount(),
+                &stored.secret_path.path,
+                &AccessContext::system("test"),
+            )
+            .await
+            .expect("secret written");
+        assert_eq!(secret.get("password").map(|s| s.expose()), Some(PASSWORD));
+        assert!(!smtp_submitted_a_message(&smtp.commands()));
+
+        let captured = logs.text();
+        assert!(
+            captured.contains("outreach@example.test"),
+            "the capture saw none of the request's log lines: {captured}"
+        );
+        assert!(
+            !captured.contains(PASSWORD),
+            "a log line carried the password: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imap_refusal_answers_422_mailbox_unreachable_with_the_reply() {
+        let imap = imap_standin("outreach@example.test", "another-password").await;
+        let smtp = smtp_standin("outreach@example.test", PASSWORD).await;
+        let r = route().await;
+        let (status, answer) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            "/v1/credentials/mailboxes",
+            &body(imap.port(), smtp.port()),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 422, "{answer}");
+        assert_eq!(answer["error"], "mailbox_unreachable");
+        assert_eq!(answer["protocol"], "imap");
+        assert!(
+            answer["reply"]
+                .as_str()
+                .unwrap_or("")
+                .contains(IMAP_REFUSAL),
+            "{answer}"
+        );
+        assert!(!answer.to_string().contains(PASSWORD));
+        assert!(r.bindings.rows.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_smtp_refusal_answers_422_mailbox_unreachable_with_the_reply() {
+        let imap = imap_standin("outreach@example.test", PASSWORD).await;
+        let smtp = smtp_standin("outreach@example.test", "another-password").await;
+        let r = route().await;
+        let (status, answer) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            "/v1/credentials/mailboxes",
+            &body(imap.port(), smtp.port()),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 422, "{answer}");
+        assert_eq!(answer["error"], "mailbox_unreachable");
+        assert_eq!(answer["protocol"], "smtp");
+        assert!(
+            answer["reply"]
+                .as_str()
+                .unwrap_or("")
+                .contains(SMTP_REFUSAL),
+            "{answer}"
+        );
+        assert!(r.bindings.rows.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_route_answers_as_the_api_keys_route_does_to_the_unauthenticated_and_operators() {
+        let r = route().await;
+        let b = body(1, 1);
+        let (status, _) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            "/v1/credentials/mailboxes",
+            &b,
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+        let (status, _) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            "/v1/credentials/mailboxes",
+            &b,
+            Some("operator-token"),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(r.bindings.rows.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_a_mailbox_is_400_and_does_not_echo_the_password() {
+        let r = route().await;
+        let mut b = body(1, 1).unwrap();
+        b["imap_port"] = serde_json::json!(PASSWORD);
+        let (status, answer) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            "/v1/credentials/mailboxes",
+            &Some(b),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 400, "{answer}");
+        assert!(!answer.to_string().contains(PASSWORD), "{answer}");
     }
 }

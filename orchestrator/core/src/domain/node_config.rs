@@ -227,6 +227,131 @@ pub struct NodeConfigSpec {
     /// Zaru consumer product configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zaru: Option<ZaruConfig>,
+
+    /// OAuth 2.0 providers users may connect a credential through (ADR-078,
+    /// AEGIS ADR-125 D2). Each entry becomes one provider of the credential
+    /// service's registry; an absent block leaves the registry empty and
+    /// every initiate answers that the provider is not configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oauth_providers: Vec<OAuthProviderEntry>,
+}
+
+/// One entry of `spec.oauth_providers` (AEGIS ADR-125 D2).
+///
+/// `client_id` and `client_secret` take the `env:VAR_NAME` form, resolved
+/// when the daemon builds its registry; `client_secret` is held as a
+/// [`SensitiveString`] so the configuration prints it redacted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthProviderEntry {
+    /// The provider's name as credential bindings carry it, e.g. `google_mail`.
+    pub provider: String,
+    /// The provider's authorization endpoint; HTTPS. A URL can carry a
+    /// credential, so it prints redacted.
+    pub authorization_url: SensitiveUrl,
+    /// The provider's token endpoint; HTTPS. Prints redacted.
+    pub token_url: SensitiveUrl,
+    /// The OAuth client id, literal or `env:VAR_NAME`.
+    pub client_id: String,
+    /// The OAuth client secret, `env:VAR_NAME`; absent for a public client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<SensitiveString>,
+    /// The exact `redirect_uri` values a flow may use; at least one, each an
+    /// absolute HTTPS URL.
+    pub redirect_uri_allowlist: Vec<String>,
+    /// The scopes requested, sent space-separated as `scope`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Further authorization-request parameters, e.g. `access_type: offline`
+    /// and `prompt: consent` for Google.
+    #[serde(default)]
+    pub extra_authorization_params: std::collections::BTreeMap<String, String>,
+}
+
+/// The authorization-request parameters the flow itself sets; an entry's
+/// `extra_authorization_params` may not name one.
+pub const OAUTH_FLOW_PARAMETERS: [&str; 7] = [
+    "response_type",
+    "client_id",
+    "state",
+    "code_challenge",
+    "code_challenge_method",
+    "redirect_uri",
+    "scope",
+];
+
+impl OAuthProviderEntry {
+    /// Refuse an entry no flow could use safely. Run when the node
+    /// configuration is validated and again when the daemon builds its
+    /// registry, before any `env:` value is resolved.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let p = self.provider.trim();
+        if p.is_empty() {
+            anyhow::bail!("spec.oauth_providers: an entry has an empty provider");
+        }
+        if self.client_id.trim().is_empty() || self.client_id.trim() == "env:" {
+            anyhow::bail!("spec.oauth_providers[{p}]: client_id must not be empty");
+        }
+        if let Some(secret) = &self.client_secret {
+            if secret.expose().trim().is_empty() || secret.expose().trim() == "env:" {
+                anyhow::bail!(
+                    "spec.oauth_providers[{p}]: client_secret must not be empty when present"
+                );
+            }
+        }
+        for (field, value) in [
+            ("authorization_url", &self.authorization_url),
+            ("token_url", &self.token_url),
+        ] {
+            // Read to validate its form; the error does not repeat it.
+            let url = url::Url::parse(value.expose()).map_err(|e| {
+                anyhow::anyhow!("spec.oauth_providers[{p}]: {field} is not a URL: {e}")
+            })?;
+            if url.scheme() != "https" {
+                anyhow::bail!("spec.oauth_providers[{p}]: {field} must be HTTPS");
+            }
+        }
+        if self.redirect_uri_allowlist.is_empty() {
+            anyhow::bail!(
+                "spec.oauth_providers[{p}]: redirect_uri_allowlist must hold at least one URI"
+            );
+        }
+        for entry in &self.redirect_uri_allowlist {
+            let url = url::Url::parse(entry).map_err(|e| {
+                anyhow::anyhow!(
+                    "spec.oauth_providers[{p}]: redirect_uri_allowlist entry {entry} is not a URL: {e}"
+                )
+            })?;
+            if url.scheme() != "https" || url.fragment().is_some() {
+                anyhow::bail!(
+                    "spec.oauth_providers[{p}]: redirect_uri_allowlist entry {entry} must be an HTTPS URL without a fragment"
+                );
+            }
+        }
+        for scope in &self.scopes {
+            if scope.is_empty()
+                || scope
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+            {
+                anyhow::bail!(
+                    "spec.oauth_providers[{p}]: scope {scope:?} must be one non-empty token"
+                );
+            }
+        }
+        for key in self.extra_authorization_params.keys() {
+            if key.is_empty() {
+                anyhow::bail!(
+                    "spec.oauth_providers[{p}]: extra_authorization_params has an empty name"
+                );
+            }
+            if OAUTH_FLOW_PARAMETERS.contains(&key.as_str()) {
+                anyhow::bail!(
+                    "spec.oauth_providers[{p}]: extra_authorization_params may not set {key}, which the flow sets"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1831,6 +1956,7 @@ impl Default for NodeConfigSpec {
             max_execution_list_limit: None,
             billing: None,
             zaru: None,
+            oauth_providers: Vec::new(),
         }
     }
 }
@@ -2205,6 +2331,18 @@ impl NodeConfigManifest {
             anyhow::bail!("spec.node.id cannot be empty");
         }
 
+        // Validate OAuth providers (AEGIS ADR-125 D2)
+        let mut seen_oauth_providers = std::collections::HashSet::new();
+        for entry in &self.spec.oauth_providers {
+            entry.validate()?;
+            if !seen_oauth_providers.insert(entry.provider.trim()) {
+                anyhow::bail!(
+                    "spec.oauth_providers: provider {} is configured twice",
+                    entry.provider.trim()
+                );
+            }
+        }
+
         // Validate LLM providers
         for provider in &self.spec.llm_providers {
             if provider.name.is_empty() {
@@ -2505,6 +2643,7 @@ mod tests {
                 max_execution_list_limit: None,
                 billing: None,
                 zaru: None,
+                oauth_providers: Vec::new(),
             },
         };
 

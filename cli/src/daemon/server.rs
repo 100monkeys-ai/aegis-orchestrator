@@ -144,7 +144,7 @@ use aegis_orchestrator_core::{
 };
 
 use aegis_orchestrator_core::application::credential_service::{
-    validate_oauth_provider_registry, CredentialManagementService, OAuthProviderRegistry,
+    oauth_provider_registry_from_config, CredentialManagementService,
     StandardCredentialManagementService,
 };
 use aegis_orchestrator_core::domain::credential::CredentialBindingRepository;
@@ -1600,17 +1600,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Some(pool) => {
             let repo = Arc::new(PostgresCredentialBindingRepository::new(pool.clone()))
                 as Arc<dyn CredentialBindingRepository>;
-            // OAuth provider registry (RFC 6749 §4.1.3 token exchange). Empty
-            // for now — providers are loaded from node config in a follow-up.
+            // OAuth provider registry (RFC 6749 §4.1.3 token exchange),
+            // loaded from `spec.oauth_providers` (AEGIS ADR-125 D2).
             // Requests against unregistered providers return
-            // `CredentialError::ProviderNotConfigured`. The registry is
-            // validated at startup (security audit 002 §4.11, §4.18): any
-            // configured provider MUST have a real HTTPS authorization URL
-            // (no `placeholder` substring) and a non-empty
-            // `redirect_uri_allowlist`. Boot fails if validation fails.
-            let registry = OAuthProviderRegistry::new();
-            validate_oauth_provider_registry(&registry)
+            // `CredentialError::ProviderNotConfigured`. Each entry is
+            // validated and its `env:` values resolved at startup (security
+            // audit 002 §4.11, §4.18): a real HTTPS authorization URL (no
+            // `placeholder` substring), a non-empty client_id and a
+            // non-empty `redirect_uri_allowlist`. Boot fails if any fails.
+            let registry = oauth_provider_registry_from_config(&config.spec.oauth_providers)
                 .context("OAuth provider registry failed startup validation")?;
+            tracing::info!(
+                providers = ?registry.keys().map(|p| p.to_string()).collect::<Vec<_>>(),
+                "OAuth provider registry loaded from spec.oauth_providers"
+            );
             let oauth_providers = Arc::new(registry);
             // Team-scoped bindings are authorised against ADR-111
             // memberships (security audit 003 F-1).

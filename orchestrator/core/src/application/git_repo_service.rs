@@ -1039,6 +1039,9 @@ impl GitRepoService {
             CredentialType::Variable => Err(GitRepoError::SecretResolutionFailed(
                 "non-secret credentials cannot be used for git authentication".into(),
             )),
+            CredentialType::Mailbox => Err(GitRepoError::SecretResolutionFailed(
+                "mailbox credentials cannot be used for git authentication".into(),
+            )),
         }
     }
 

@@ -10,6 +10,10 @@
 //! ## Responsibilities
 //!
 //! - Store API-key credentials securely in OpenBao and record the binding in Postgres
+//! - Create an SMTP-with-IMAP mailbox binding after a live check of both
+//!   servers (AEGIS ADR-125 D1)
+//! - Hand out a mailbox's OAuth access token, refreshing it when it is
+//!   within 60 seconds of expiry (ADR-125 D3)
 //! - Initiate and complete OAuth2 PKCE flows, managing pending state lifecycle
 //! - Rotate credential values in OpenBao without changing the binding id
 //! - Add / revoke grants that control which agents and workflows may use a credential
@@ -23,22 +27,28 @@
 use crate::domain::credential::{
     CredentialBindingId, CredentialBindingRepository, CredentialGrantId, CredentialMetadata,
     CredentialProvider, CredentialScope, CredentialStatus, CredentialType, GrantTarget,
-    OAuthPendingState, UserCredentialBinding,
+    MailboxSettings, OAuthPendingState, UserCredentialBinding,
 };
 use crate::domain::events::CredentialEvent;
+use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry};
 use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, SensitiveUrl};
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
+use crate::infrastructure::mail::{MailboxProbe, SessionMailboxProbe};
 use crate::infrastructure::secrets_manager::SecretsManager;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use url::Url;
+
+/// An access token whose `expires_at` is nearer than this is refreshed
+/// before it is handed out (ADR-125 D3).
+pub const ACCESS_TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
 
 // ============================================================================
 // OAuth Provider Configuration
@@ -72,6 +82,12 @@ pub struct OAuthProviderConfig {
     /// permitted to use. The caller-supplied `redirect_uri` is rejected
     /// unless it appears verbatim in this list.
     pub redirect_uri_allowlist: Vec<String>,
+    /// Scopes requested, sent space-separated as `scope` on the
+    /// authorization URL; none sends no `scope` (ADR-125 D2).
+    pub scopes: Vec<String>,
+    /// Further authorization-request parameters, appended in key order
+    /// (e.g. `access_type=offline`, `prompt=consent`).
+    pub extra_authorization_params: BTreeMap<String, String>,
 }
 
 /// Registry mapping `CredentialProvider` → `OAuthProviderConfig`.
@@ -103,6 +119,84 @@ pub enum OAuthRegistryError {
     EmptyRedirectAllowlist { provider: String },
     #[error("OAuth provider {provider}: redirect_uri_allowlist entry is unparseable: {detail}")]
     UnparseableRedirectUri { provider: String, detail: String },
+    #[error("OAuth provider {provider}: {detail}")]
+    InvalidEntry { provider: String, detail: String },
+    #[error("OAuth provider {provider} is configured more than once")]
+    DuplicateProvider { provider: String },
+    #[error("OAuth provider {provider}: {field} could not be resolved: {detail}")]
+    UnresolvedValue {
+        provider: String,
+        field: &'static str,
+        detail: String,
+    },
+    #[error("OAuth provider {provider}: client_id must not be empty")]
+    EmptyClientId { provider: String },
+}
+
+/// Build the registry from the node configuration's `spec.oauth_providers`
+/// (AEGIS ADR-125 D2): each entry validated, its `env:` values resolved, and
+/// the whole registry validated by [`validate_oauth_provider_registry`].
+/// The daemon refuses to boot on any error.
+pub fn oauth_provider_registry_from_config(
+    entries: &[OAuthProviderEntry],
+) -> Result<OAuthProviderRegistry, OAuthRegistryError> {
+    let mut registry = OAuthProviderRegistry::new();
+    for entry in entries {
+        let name = entry.provider.trim().to_string();
+        entry
+            .validate()
+            .map_err(|e| OAuthRegistryError::InvalidEntry {
+                provider: name.clone(),
+                detail: e.to_string(),
+            })?;
+        let provider = CredentialProvider::from_name(&name);
+        if registry.contains_key(&provider) {
+            return Err(OAuthRegistryError::DuplicateProvider { provider: name });
+        }
+        let client_id = resolve_env_value(entry.client_id.trim()).map_err(|e| {
+            OAuthRegistryError::UnresolvedValue {
+                provider: name.clone(),
+                field: "client_id",
+                detail: e.to_string(),
+            }
+        })?;
+        if client_id.trim().is_empty() {
+            return Err(OAuthRegistryError::EmptyClientId { provider: name });
+        }
+        let client_secret = match &entry.client_secret {
+            None => None,
+            Some(raw) => {
+                let value = resolve_env_value(raw.expose().trim()).map_err(|e| {
+                    OAuthRegistryError::UnresolvedValue {
+                        provider: name.clone(),
+                        field: "client_secret",
+                        detail: e.to_string(),
+                    }
+                })?;
+                if value.is_empty() {
+                    return Err(OAuthRegistryError::InvalidEntry {
+                        provider: name,
+                        detail: "client_secret resolves to an empty value".to_string(),
+                    });
+                }
+                Some(SensitiveString::new(value))
+            }
+        };
+        registry.insert(
+            provider,
+            OAuthProviderConfig {
+                authorization_url: entry.authorization_url.clone(),
+                token_url: entry.token_url.clone(),
+                client_id: client_id.trim().to_string(),
+                client_secret,
+                redirect_uri_allowlist: entry.redirect_uri_allowlist.clone(),
+                scopes: entry.scopes.clone(),
+                extra_authorization_params: entry.extra_authorization_params.clone(),
+            },
+        );
+    }
+    validate_oauth_provider_registry(&registry)?;
+    Ok(registry)
 }
 
 /// Validate every entry in the registry before the service is constructed.
@@ -197,6 +291,20 @@ pub enum CredentialError {
     /// (security audit 002 §4.18 — open-redirect prevention).
     #[error("OAuth redirect_uri not in provider allowlist")]
     RedirectUriNotAllowlisted,
+    /// The IMAP or the SMTP session of a mailbox check did not complete;
+    /// `reply` is the server's answer, the password redacted (ADR-125 D1).
+    #[error("mailbox_unreachable: the {protocol} server answered: {reply}")]
+    MailboxUnreachable { protocol: String, reply: String },
+    /// Mailbox settings no session could use.
+    #[error("invalid mailbox settings: {0}")]
+    InvalidMailboxSettings(String),
+    /// The binding is not `Active` (expired, revoked or pending), so no
+    /// token is handed out for it.
+    #[error("credential binding {binding_id} is not active (status: {status})")]
+    BindingNotActive { binding_id: String, status: String },
+    /// The binding holds no OAuth access token to hand out or refresh.
+    #[error("credential binding {binding_id} holds no OAuth access token")]
+    NoAccessToken { binding_id: String },
 }
 
 /// Enforce HTTPS on the token URL per RFC 6749 §3.1.2.1, with a development
@@ -236,6 +344,8 @@ struct OAuthTokenResponse {
     expires_in: Option<u64>,
     refresh_token: Option<SensitiveString>,
     scope: Option<String>,
+    /// The OpenID Connect ID token, present when `openid` was requested.
+    id_token: Option<SensitiveString>,
 }
 
 /// RFC 6749 §5.2 error response.
@@ -262,6 +372,22 @@ pub struct StoreApiKeyCommand {
     pub scope: CredentialScope,
     pub api_key_value: SensitiveString,
     pub credential_type: CredentialType,
+}
+
+/// Command object for [`CredentialManagementService::create_imap_mailbox`]
+/// (AEGIS ADR-125 D1).
+#[derive(Debug)]
+pub struct CreateImapMailboxCommand {
+    pub owner_user_id: String,
+    pub tenant_id: TenantId,
+    /// Display label; the address when absent.
+    pub label: Option<String>,
+    pub scope: CredentialScope,
+    /// The non-secret settings, stored as the binding's metadata.
+    pub settings: MailboxSettings,
+    /// The password both servers accept; stored only in OpenBao, under the
+    /// field `password`.
+    pub password: SensitiveString,
 }
 
 // ============================================================================
@@ -333,6 +459,27 @@ pub trait CredentialManagementService: Send + Sync {
     ///
     /// Returns the [`CredentialBindingId`] of the newly created binding.
     async fn store_api_key(&self, cmd: StoreApiKeyCommand) -> anyhow::Result<CredentialBindingId>;
+
+    /// Create an `imap` mailbox binding (AEGIS ADR-125 D1) after an IMAP
+    /// session (LOGIN, SELECT INBOX, LOGOUT) and an SMTP session (EHLO,
+    /// AUTH, QUIT) both succeed with the supplied settings and password.
+    /// Either refusal is [`CredentialError::MailboxUnreachable`] and nothing
+    /// is stored. The password is written only to OpenBao, under `password`.
+    async fn create_imap_mailbox(
+        &self,
+        cmd: CreateImapMailboxCommand,
+    ) -> anyhow::Result<UserCredentialBinding>;
+
+    /// The binding's OAuth access token (ADR-125 D3): the stored one when
+    /// its `expires_at` is more than 60 seconds away, otherwise a fresh one
+    /// from the provider's token endpoint, written back to the same OpenBao
+    /// path. A refresh answered `invalid_grant` (or impossible for want of a
+    /// refresh token) sets the binding `Expired` and publishes
+    /// [`CredentialEvent::CredentialExpired`].
+    async fn access_token_for(
+        &self,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<SensitiveString>;
 
     /// Begin an OAuth2 PKCE authorisation flow for `provider`.
     ///
@@ -451,6 +598,8 @@ pub struct StandardCredentialManagementService {
     /// `team:<uuid>` binding is scoped to". `None` denies every team-scope
     /// reach, leaving owner and operator access.
     membership_repo: Option<Arc<dyn MembershipRepository>>,
+    /// The live IMAP and SMTP check run before an `imap` mailbox is stored.
+    mailbox_probe: Arc<dyn MailboxProbe>,
 }
 
 impl StandardCredentialManagementService {
@@ -479,6 +628,7 @@ impl StandardCredentialManagementService {
                 .expect("default reqwest client must build"),
             oauth_providers,
             membership_repo: None,
+            mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
         }
     }
 
@@ -499,7 +649,14 @@ impl StandardCredentialManagementService {
             http,
             oauth_providers,
             membership_repo: None,
+            mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
         }
+    }
+
+    /// Replace the mailbox check (tests point it at loopback stand-ins).
+    pub fn with_mailbox_probe(mut self, probe: Arc<dyn MailboxProbe>) -> Self {
+        self.mailbox_probe = probe;
+        self
     }
 
     /// Wire the team-membership repository that team-scoped bindings are
@@ -576,6 +733,46 @@ impl StandardCredentialManagementService {
         code: &str,
         pending: &OAuthPendingState,
     ) -> Result<OAuthTokenResponse, CredentialError> {
+        self.post_token_request(
+            provider,
+            "authorization-code exchange",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", &pending.redirect_uri),
+                ("code_verifier", &pending.pkce_verifier),
+            ],
+        )
+        .await
+    }
+
+    /// RFC 6749 §6 refresh-token grant (ADR-125 D3).
+    async fn refresh_access_token(
+        &self,
+        provider: &CredentialProvider,
+        refresh_token: &SensitiveString,
+    ) -> Result<OAuthTokenResponse, CredentialError> {
+        self.post_token_request(
+            provider,
+            "refresh-token grant",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token.expose()),
+            ],
+        )
+        .await
+    }
+
+    /// Post `grant` to the provider's token endpoint with the client's
+    /// credentials, as `application/x-www-form-urlencoded`. `client_secret`
+    /// is included only for confidential clients. Logs the provider, the
+    /// redacted URL and the outcome; never a code, verifier, secret or token.
+    async fn post_token_request(
+        &self,
+        provider: &CredentialProvider,
+        purpose: &'static str,
+        grant: &[(&str, &str)],
+    ) -> Result<OAuthTokenResponse, CredentialError> {
         let cfg = self
             .oauth_providers
             .get(provider)
@@ -584,15 +781,8 @@ impl StandardCredentialManagementService {
         // Read to check its scheme before any request is sent.
         ensure_secure_token_url(cfg.token_url.expose())?;
 
-        // Build application/x-www-form-urlencoded body per RFC 6749 §4.1.3.
-        // `client_secret` is included only for confidential clients.
-        let mut form: Vec<(&str, &str)> = vec![
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", &pending.redirect_uri),
-            ("client_id", &cfg.client_id),
-            ("code_verifier", &pending.pkce_verifier),
-        ];
+        let mut form: Vec<(&str, &str)> = grant.to_vec();
+        form.push(("client_id", &cfg.client_id));
         let secret_holder;
         if let Some(s) = &cfg.client_secret {
             secret_holder = s.expose().to_string();
@@ -602,12 +792,12 @@ impl StandardCredentialManagementService {
         tracing::info!(
             provider = %provider,
             token_url = %cfg.token_url.redacted(),
-            "Posting OAuth authorization-code exchange to provider token endpoint"
+            "Posting OAuth {purpose} to provider token endpoint"
         );
 
         let resp = self
             .http
-            // Read to send the exchange to the token endpoint.
+            // Read to send the request to the token endpoint.
             .post(cfg.token_url.expose())
             .header("Accept", "application/json")
             .form(&form)
@@ -631,7 +821,7 @@ impl StandardCredentialManagementService {
                 scope = ?token.scope,
                 expires_in = ?token.expires_in,
                 has_refresh_token = token.refresh_token.is_some(),
-                "OAuth authorization-code exchange succeeded"
+                "OAuth {purpose} succeeded"
             );
             Ok(token)
         } else if status.is_client_error() {
@@ -644,7 +834,7 @@ impl StandardCredentialManagementService {
                     tracing::warn!(
                         provider = %provider,
                         error = %err.error,
-                        "Provider rejected OAuth authorization-code exchange"
+                        "Provider rejected OAuth {purpose}"
                     );
                     Err(CredentialError::OAuthExchangeFailed {
                         error: err.error,
@@ -663,6 +853,54 @@ impl StandardCredentialManagementService {
             )))
         }
     }
+
+    /// Mark `binding` `Expired` and publish [`CredentialEvent::CredentialExpired`].
+    async fn expire(&self, mut binding: UserCredentialBinding) -> anyhow::Result<()> {
+        binding.status = CredentialStatus::Expired;
+        binding.updated_at = Utc::now();
+        self.repo.save(&binding).await?;
+        tracing::warn!(
+            binding_id = %binding.id,
+            provider = %binding.provider,
+            "OAuth token can no longer be refreshed; binding set Expired"
+        );
+        self.event_bus
+            .publish_credential_event(CredentialEvent::CredentialExpired {
+                binding_id: binding.id,
+                tenant_id: binding.tenant_id,
+            });
+        Ok(())
+    }
+}
+
+/// The email address in an OpenID Connect ID token's claims. The token came
+/// straight from the token endpoint over TLS, which OpenID Connect Core
+/// §3.1.3.7 accepts in place of validating its signature; an address the
+/// provider marks unverified is refused.
+fn email_from_id_token(id_token: &SensitiveString) -> Result<String, CredentialError> {
+    let claims = id_token
+        .expose()
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| CredentialError::InvalidResponse("id_token is not a JWT".to_string()))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(claims.trim_end_matches('='))
+        .map_err(|e| CredentialError::InvalidResponse(format!("id_token claims: {e}")))?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| CredentialError::InvalidResponse(format!("id_token claims: {e}")))?;
+    if claims.get("email_verified") == Some(&serde_json::Value::Bool(false)) {
+        return Err(CredentialError::InvalidResponse(
+            "the id_token's email is not verified".to_string(),
+        ));
+    }
+    claims
+        .get("email")
+        .and_then(|e| e.as_str())
+        .filter(|e| e.contains('@'))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CredentialError::InvalidResponse("the id_token carries no email claim".to_string())
+        })
 }
 
 #[async_trait]
@@ -712,6 +950,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 service_url: None,
                 external_account_id: None,
                 oauth_scopes: None,
+                mailbox: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -730,6 +969,205 @@ impl CredentialManagementService for StandardCredentialManagementService {
             });
 
         Ok(binding_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // create_imap_mailbox (ADR-125 D1)
+    // -----------------------------------------------------------------------
+
+    async fn create_imap_mailbox(
+        &self,
+        cmd: CreateImapMailboxCommand,
+    ) -> anyhow::Result<UserCredentialBinding> {
+        let CreateImapMailboxCommand {
+            owner_user_id,
+            tenant_id,
+            label,
+            scope,
+            settings,
+            password,
+        } = cmd;
+        settings
+            .validate()
+            .map_err(CredentialError::InvalidMailboxSettings)?;
+        if password.is_empty() {
+            return Err(CredentialError::InvalidMailboxSettings(
+                "password must not be empty".into(),
+            )
+            .into());
+        }
+
+        // The live check, before anything is stored.
+        if let Err(failure) = self.mailbox_probe.check(&settings, &password).await {
+            tracing::info!(
+                address = %settings.address,
+                protocol = %failure.protocol,
+                reply = %failure.reply,
+                "Mailbox check failed; no binding stored"
+            );
+            return Err(CredentialError::MailboxUnreachable {
+                protocol: failure.protocol.to_string(),
+                reply: failure.reply,
+            }
+            .into());
+        }
+
+        let binding_id = CredentialBindingId::new();
+        let secret_path = user_credential_path(&tenant_id, &owner_user_id, &binding_id);
+        let mut secret_data = HashMap::new();
+        secret_data.insert("password".to_string(), password);
+        self.secrets
+            .write_secret(
+                &secret_path.effective_mount(),
+                &secret_path.path,
+                secret_data,
+                &AccessContext::system("aegis-credential-service"),
+            )
+            .await?;
+
+        let now = Utc::now();
+        let binding = UserCredentialBinding {
+            id: binding_id,
+            owner_user_id: owner_user_id.clone(),
+            tenant_id: tenant_id.clone(),
+            credential_type: CredentialType::Mailbox,
+            provider: CredentialProvider::Imap,
+            secret_path,
+            scope,
+            status: CredentialStatus::Active,
+            metadata: CredentialMetadata {
+                label: label.unwrap_or_else(|| settings.address.clone()),
+                tags: None,
+                service_url: None,
+                external_account_id: Some(settings.address.clone()),
+                oauth_scopes: None,
+                mailbox: Some(settings),
+            },
+            grants: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.repo.save(&binding).await?;
+
+        tracing::info!(
+            binding_id = %binding_id,
+            address = ?binding.metadata.external_account_id,
+            "Mailbox checks passed; imap binding stored"
+        );
+        self.event_bus
+            .publish_credential_event(CredentialEvent::CredentialCreated {
+                binding_id,
+                owner_user_id,
+                tenant_id,
+                provider: CredentialProvider::Imap,
+                credential_type: CredentialType::Mailbox,
+            });
+
+        Ok(binding)
+    }
+
+    // -----------------------------------------------------------------------
+    // access_token_for (ADR-125 D3)
+    // -----------------------------------------------------------------------
+
+    async fn access_token_for(
+        &self,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<SensitiveString> {
+        let binding = self
+            .repo
+            .find_by_id(binding_id)
+            .await?
+            .ok_or_else(|| anyhow!("Credential binding not found: {}", binding_id))?;
+        if binding.status != CredentialStatus::Active {
+            return Err(CredentialError::BindingNotActive {
+                binding_id: binding_id.to_string(),
+                status: format!("{:?}", binding.status).to_lowercase(),
+            }
+            .into());
+        }
+
+        let ctx = AccessContext::system("aegis-credential-service");
+        let mount = binding.secret_path.effective_mount();
+        let mut stored = self
+            .secrets
+            .read_secret(&mount, &binding.secret_path.path, &ctx)
+            .await?;
+        let access_token =
+            stored
+                .get("access_token")
+                .cloned()
+                .ok_or_else(|| CredentialError::NoAccessToken {
+                    binding_id: binding_id.to_string(),
+                })?;
+
+        // A token stored without `expires_at` was issued without
+        // `expires_in` and is used as it is.
+        let fresh = match stored.get("expires_at") {
+            None => true,
+            Some(at) => chrono::DateTime::parse_from_rfc3339(at.expose())
+                .map(|at| {
+                    at.with_timezone(&Utc)
+                        > Utc::now() + chrono::Duration::seconds(ACCESS_TOKEN_REFRESH_MARGIN_SECS)
+                })
+                .unwrap_or(false),
+        };
+        if fresh {
+            return Ok(access_token);
+        }
+
+        let Some(refresh_token) = stored.get("refresh_token").cloned() else {
+            // Nothing to refresh with: the user must reconnect.
+            self.expire(binding).await?;
+            return Err(CredentialError::OAuthExchangeFailed {
+                error: "invalid_grant".to_string(),
+                description: Some("no refresh token is held for this binding".to_string()),
+            }
+            .into());
+        };
+
+        let refreshed = match self
+            .refresh_access_token(&binding.provider, &refresh_token)
+            .await
+        {
+            Ok(token) => token,
+            Err(CredentialError::OAuthExchangeFailed { error, description })
+                if error == "invalid_grant" =>
+            {
+                self.expire(binding).await?;
+                return Err(CredentialError::OAuthExchangeFailed { error, description }.into());
+            }
+            Err(other) => return Err(other.into()),
+        };
+
+        stored.insert("access_token".to_string(), refreshed.access_token.clone());
+        match refreshed.expires_in {
+            Some(expires_in) => {
+                let expires_at = Utc::now() + chrono::Duration::seconds(expires_in as i64);
+                stored.insert(
+                    "expires_at".to_string(),
+                    SensitiveString::new(expires_at.to_rfc3339()),
+                );
+            }
+            None => {
+                stored.remove("expires_at");
+            }
+        }
+        if let Some(rotated) = refreshed.refresh_token {
+            stored.insert("refresh_token".to_string(), rotated);
+        }
+        if let Some(scope) = refreshed.scope {
+            stored.insert("scope".to_string(), SensitiveString::new(scope));
+        }
+        self.secrets
+            .write_secret(&mount, &binding.secret_path.path, stored, &ctx)
+            .await?;
+        tracing::info!(
+            binding_id = %binding_id,
+            provider = %binding.provider,
+            "OAuth access token refreshed and stored"
+        );
+        Ok(refreshed.access_token)
     }
 
     // -----------------------------------------------------------------------
@@ -784,12 +1222,18 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
         let binding_id = CredentialBindingId::new();
         let now = Utc::now();
+        // A Google mailbox is a credential of type `mailbox` in its OAuth
+        // form (ADR-125 D1); every other provider's token is `oauth2`.
+        let credential_type = match provider {
+            CredentialProvider::GoogleMail => CredentialType::Mailbox,
+            _ => CredentialType::OAuth2,
+        };
 
         let binding = UserCredentialBinding {
             id: binding_id,
             owner_user_id: owner_user_id.to_string(),
             tenant_id: tenant_id.clone(),
-            credential_type: CredentialType::OAuth2,
+            credential_type,
             provider: provider.clone(),
             // Placeholder path — updated to real path once the flow completes.
             secret_path: SecretPath::new("PENDING_OAUTH", "PENDING_OAUTH", "PENDING_OAUTH"),
@@ -801,6 +1245,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 service_url: None,
                 external_account_id: None,
                 oauth_scopes: None,
+                mailbox: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -832,6 +1277,17 @@ impl CredentialManagementService for StandardCredentialManagementService {
             .append_pair("code_challenge", &code_challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("redirect_uri", &redirect_uri);
+        // ADR-125 D2: the configured scopes, space-separated, and every
+        // extra parameter (e.g. Google's `access_type` and `prompt`).
+        {
+            let mut query = auth_url.query_pairs_mut();
+            if !cfg.scopes.is_empty() {
+                query.append_pair("scope", &cfg.scopes.join(" "));
+            }
+            for (key, value) in &cfg.extra_authorization_params {
+                query.append_pair(key, value);
+            }
+        }
 
         Ok(OAuthInitiation {
             authorization_url: SensitiveUrl::new(auth_url.to_string()),
@@ -893,6 +1349,31 @@ impl CredentialManagementService for StandardCredentialManagementService {
         let secret_path =
             user_credential_path(&binding.tenant_id, &binding.owner_user_id, &binding.id);
 
+        // A Google mailbox records its address and the scopes Google granted
+        // (ADR-125 D1). Without the address the mailbox cannot be used, so
+        // the callback fails before anything is stored.
+        if binding.credential_type == CredentialType::Mailbox {
+            let id_token = token_response.id_token.as_ref().ok_or_else(|| {
+                CredentialError::InvalidResponse(
+                    "the token response carries no id_token; request the openid and email scopes"
+                        .to_string(),
+                )
+            })?;
+            let address = email_from_id_token(id_token)?;
+            // RFC 6749 §5.1: an absent `scope` means the scopes requested.
+            let granted: Vec<String> = match &token_response.scope {
+                Some(scope) => scope.split_whitespace().map(str::to_string).collect(),
+                None => self
+                    .oauth_providers
+                    .get(&binding.provider)
+                    .map(|c| c.scopes.clone())
+                    .unwrap_or_default(),
+            };
+            binding.metadata.label = address.clone();
+            binding.metadata.external_account_id = Some(address);
+            binding.metadata.oauth_scopes = Some(granted);
+        }
+
         // Persist the tokens returned by the provider. Compute an absolute
         // `expires_at` so the refresh path doesn't need clock math on read.
         let mut secret_data = HashMap::new();
@@ -933,7 +1414,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 owner_user_id: binding.owner_user_id.clone(),
                 tenant_id: binding.tenant_id.clone(),
                 provider: binding.provider.clone(),
-                credential_type: CredentialType::OAuth2,
+                credential_type: binding.credential_type.clone(),
             });
 
         Ok(binding.id)
@@ -1118,6 +1599,8 @@ mod debug_tests {
             client_id: "client".to_string(),
             client_secret: Some(SensitiveString::new("Mk7-oauth-client-secret-marker")),
             redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
+            scopes: Vec::new(),
+            extra_authorization_params: BTreeMap::new(),
         };
         let printed = format!("{cfg:?}");
         for marker in [

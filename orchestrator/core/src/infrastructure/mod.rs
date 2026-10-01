@@ -56,6 +56,7 @@ pub mod iam;
 pub mod image_manager;
 pub mod llm;
 pub mod log_sanitizer;
+pub mod mail;
 pub mod nfs;
 pub mod prompt_template_engine;
 pub mod rate_limit;
