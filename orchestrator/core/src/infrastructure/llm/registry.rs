@@ -15,6 +15,7 @@ use crate::domain::node_config::{
 };
 use crate::domain::secrets::SensitiveString;
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -307,18 +308,52 @@ impl ProviderRegistry {
         };
 
         let provider: Arc<dyn LLMProvider> = match config.provider_type.as_str() {
-            "openai" => Arc::new(OpenAIAdapter::new(endpoint, api_key, model.to_string())),
+            "openai" => Arc::new(OpenAIAdapter::new(
+                endpoint,
+                api_key,
+                model.to_string(),
+                Self::provider_headers(config)?,
+            )),
             "ollama" => Arc::new(OllamaAdapter::new(endpoint, model.to_string())),
             "anthropic" => Arc::new(AnthropicAdapter::new(endpoint, api_key, model.to_string())),
             "gemini" => Arc::new(GeminiAdapter::new(endpoint, api_key, model.to_string())),
             // OpenAI-compatible APIs (LM Studio, vLLM, etc.)
-            "openai-compatible" => {
-                Arc::new(OpenAIAdapter::new(endpoint, api_key, model.to_string()))
-            }
+            "openai-compatible" => Arc::new(OpenAIAdapter::new(
+                endpoint,
+                api_key,
+                model.to_string(),
+                Self::provider_headers(config)?,
+            )),
             _ => anyhow::bail!("Unsupported provider type: {}", config.provider_type),
         };
 
         Ok(provider)
+    }
+
+    /// The provider's configured `headers` as a request header map (AEGIS
+    /// ADR-124 D3). A name or value that is not a valid HTTP header refuses
+    /// the adapter, naming the provider and the header, never its value.
+    fn provider_headers(config: &LLMProviderConfig) -> anyhow::Result<HeaderMap> {
+        let mut map = HeaderMap::new();
+        for (name, value) in config.headers.iter().flatten() {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                anyhow::anyhow!(
+                    "provider '{}': '{}' is not a valid header name: {}",
+                    config.name,
+                    name,
+                    e
+                )
+            })?;
+            let header_value = HeaderValue::from_str(value).map_err(|_| {
+                anyhow::anyhow!(
+                    "provider '{}': the value of header '{}' is not a valid header value",
+                    config.name,
+                    name
+                )
+            })?;
+            map.insert(header_name, header_value);
+        }
+        Ok(map)
     }
 
     /// Resolve API key from config (supports "env:VAR_NAME" syntax)
@@ -568,6 +603,14 @@ impl ProviderRegistry {
     /// Check if a model alias exists
     pub fn has_alias(&self, alias: &str) -> bool {
         self.alias_map.contains_key(alias)
+    }
+
+    /// The model a call on `alias` is sent to, read from the alias map this
+    /// registry routes every call through (AEGIS ADR-124 D3): the winner of
+    /// the selection strategy whose adapter was built. `None` for an alias
+    /// the registry does not hold.
+    pub fn model_for_alias(&self, alias: &str) -> Option<&str> {
+        self.alias_map.get(alias).map(|(model, _)| model.as_str())
     }
 
     /// Determine whether the API key for a given model alias is platform-managed
@@ -1063,6 +1106,7 @@ mod tests {
                     provider_type: "ollama".to_string(),
                     endpoint: "http://localhost:11434".into(),
                     api_key: None,
+                    headers: None,
                     enabled: true,
                     models: vec![ModelConfig {
                         alias: "default".to_string(),

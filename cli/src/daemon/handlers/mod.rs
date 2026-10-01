@@ -22,6 +22,7 @@ pub(crate) mod dispatch;
 pub(crate) mod executions;
 pub(crate) mod git_repo;
 pub(crate) mod health;
+pub(crate) mod llm;
 pub(crate) mod observability;
 pub(crate) mod script;
 pub(crate) mod seal;

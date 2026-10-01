@@ -29,7 +29,7 @@
 // - Network and observability settings
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -299,6 +299,15 @@ pub struct LLMProviderConfig {
     /// API key (supports "env:VAR_NAME" for environment variables)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<SensitiveString>,
+
+    /// Request headers sent on every request to this provider, beside
+    /// `Authorization` (AEGIS ADR-124 D3), e.g. `cf-aig-gateway-id`, which
+    /// routes a Workers AI request through a Cloudflare AI Gateway. Sent by
+    /// the `openai` and `openai-compatible` adapters. A header value is
+    /// configuration, not a secret; the key has its own field, so a header
+    /// named `authorization`, in any letter case, is refused by `validate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
 
     /// Whether this provider is active
     #[serde(default = "default_true")]
@@ -2209,6 +2218,20 @@ impl NodeConfigManifest {
                 );
             }
 
+            if let Some(name) = provider
+                .headers
+                .iter()
+                .flatten()
+                .map(|(name, _)| name)
+                .find(|name| name.eq_ignore_ascii_case("authorization"))
+            {
+                anyhow::bail!(
+                    "LLM provider '{}' configures a header named '{}': the provider's key is set by api_key, never as a header",
+                    provider.name,
+                    name
+                );
+            }
+
             if provider.models.is_empty() {
                 anyhow::bail!(
                     "LLM provider must have at least one model: {}",
@@ -2446,6 +2469,7 @@ mod tests {
                     provider_type: "ollama".to_string(),
                     endpoint: "http://localhost:11434".into(),
                     api_key: None,
+                    headers: None,
                     enabled: true,
                     models: vec![ModelConfig {
                         alias: "default".to_string(),
@@ -2567,6 +2591,7 @@ mod tests {
             provider_type: "openai".to_string(),
             endpoint: "https://api.openai.com".into(),
             api_key: None,
+            headers: None,
             enabled: true,
             models: vec![],
         });
@@ -2911,6 +2936,7 @@ path: "/metrics"
             provider_type: "ollama".to_string(),
             endpoint: "http://localhost:11434".into(),
             api_key: None,
+            headers: None,
             enabled: true,
             models: vec![ModelConfig {
                 alias: "default".to_string(),

@@ -2866,7 +2866,7 @@ impl StandardExecutionService {
         );
 
         // Inject model alias so bootstrap.py routes this agent's LLM calls to the
-        // correct provider (e.g. "judge" → anthropic/claude-haiku, "smart" → local).
+        // model the node configuration maps that alias to (`spec.llm_providers`).
         // Falls back to "default" when spec.runtime.model is not set in the manifest.
         env.insert(
             "AEGIS_MODEL_ALIAS".to_string(),
@@ -3669,7 +3669,7 @@ impl ExecutionService for StandardExecutionService {
         );
 
         // Inject model alias so bootstrap.py routes this child agent's LLM calls to the
-        // correct provider (e.g. "judge" → anthropic/claude-haiku, "smart" → local).
+        // model the node configuration maps that alias to (`spec.llm_providers`).
         // Falls back to "default" when spec.runtime.model is not set in the manifest.
         env.insert(
             "AEGIS_MODEL_ALIAS".to_string(),

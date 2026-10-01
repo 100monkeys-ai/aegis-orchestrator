@@ -9,6 +9,10 @@
 //!
 //! Also handles `openai-compatible` endpoints (LM Studio, vLLM, etc.) — pass
 //! the custom `base_url` as `endpoint`.
+//!
+//! A provider's configured `headers` (AEGIS ADR-124 D3) are sent on every
+//! request beside `Authorization`: Workers AI is reached through a Cloudflare
+//! AI Gateway named by `cf-aig-gateway-id`.
 
 use crate::domain::llm::{
     ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
@@ -16,6 +20,7 @@ use crate::domain::llm::{
 };
 use crate::domain::secrets::SensitiveUrl;
 use async_trait::async_trait;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 pub struct OpenAIAdapter {
@@ -23,6 +28,9 @@ pub struct OpenAIAdapter {
     endpoint: String,
     api_key: String,
     model: String,
+    /// The provider's configured request headers, sent on every request
+    /// beside `Authorization`. Empty when the configuration has none.
+    headers: HeaderMap,
 }
 
 // ─── Request types ────────────────────────────────────────────────────────────
@@ -92,12 +100,13 @@ struct OpenAIUsage {
 // ─── Adapter ──────────────────────────────────────────────────────────────────
 
 impl OpenAIAdapter {
-    pub fn new(endpoint: String, api_key: String, model: String) -> Self {
+    pub fn new(endpoint: String, api_key: String, model: String, headers: HeaderMap) -> Self {
         Self {
             client: reqwest::Client::new(),
             endpoint,
             api_key,
             model,
+            headers,
         }
     }
 
@@ -209,6 +218,7 @@ impl LLMProvider for OpenAIAdapter {
             provider = "openai",
             model = %self.model,
             endpoint_url = %SensitiveUrl::new(url.as_str()),
+            headers = ?self.headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
             "LLM HTTP request"
         );
         let http_started_at = std::time::Instant::now();
@@ -216,6 +226,7 @@ impl LLMProvider for OpenAIAdapter {
         let response = self
             .client
             .post(&url)
+            .headers(self.headers.clone())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&request)
@@ -347,6 +358,7 @@ impl LLMProvider for OpenAIAdapter {
         let response = self
             .client
             .get(&url)
+            .headers(self.headers.clone())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await
@@ -373,6 +385,7 @@ mod tests {
             "https://api.openai.com/v1".to_string(),
             "test-key".to_string(),
             "gpt-4o".to_string(),
+            HeaderMap::new(),
         );
         assert_eq!(adapter.endpoint, "https://api.openai.com/v1");
         assert_eq!(adapter.model, "gpt-4o");

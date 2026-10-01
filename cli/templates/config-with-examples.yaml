@@ -128,7 +128,25 @@ spec:
     #       # Defaults to 8192 if omitted. Increase for models whose thinking mode
     #       # consumes output tokens for internal reasoning (e.g. Gemini 2.5 Pro).
     #       max_output_tokens: 16384
-  
+
+    # Example 5: Cloudflare Workers AI through an AI Gateway (OpenAI-compatible)
+    # `headers` are sent on every request beside Authorization; the gateway is
+    # named by cf-aig-gateway-id. The key has its own field: a header named
+    # Authorization is refused at validation.
+    # - name: "workers-ai"
+    #   type: "openai-compatible"
+    #   endpoint: "https://api.cloudflare.com/client/v4/accounts/<account id>/ai/v1"
+    #   api_key: "env:CLOUDFLARE_AI_API_TOKEN"
+    #   headers:
+    #     cf-aig-gateway-id: "<gateway name>"
+    #   enabled: true
+    #   models:
+    #     - alias: "default"
+    #       model: "@cf/zai-org/glm-5.3-flash"
+    #       capabilities: ["chat", "code", "reasoning"]
+    #       context_window: 1048576
+    #       cost_per_1k_tokens: 0.00015
+
   # --------------------------------------------------------------------------
   # LLM Selection Strategy
   # --------------------------------------------------------------------------

@@ -62,6 +62,7 @@ use crate::daemon::handlers::git_repo::{
     push_git_repo, refresh_git_repo, webhook_git_repo,
 };
 use crate::daemon::handlers::health::{health_handler, readiness_handler};
+use crate::daemon::handlers::llm::{llm_aliases_router, LlmAliasesState};
 use crate::daemon::handlers::observability::{
     dashboard_summary_handler, get_stimulus_handler, list_security_incidents_handler,
     list_stimuli_handler, list_storage_violations_handler,
@@ -389,6 +390,24 @@ pub(crate) fn create_router(
     // through the real middleware stack by the handler tests.
     let router = router.merge(credentials_by_id_router(CredentialsByIdState {
         credential_service: app_state.credential_service.clone(),
+    }));
+
+    // Model alias lookup (AEGIS ADR-124 D3): the model an alias resolves to,
+    // from a provider registry built from the node configuration the
+    // daemon's own registry is built from (`server.rs`), so it holds the same
+    // alias table. Beneath the same authentication layers as `/v1/credentials`.
+    let llm_registry =
+        match aegis_orchestrator_core::infrastructure::llm::ProviderRegistry::from_config(
+            &app_state.config,
+        ) {
+            Ok(registry) => Some(Arc::new(registry)),
+            Err(e) => {
+                tracing::warn!(error = %e, "LLM alias lookup unavailable: provider registry not built");
+                None
+            }
+        };
+    let router = router.merge(llm_aliases_router(LlmAliasesState {
+        registry: llm_registry,
     }));
 
     // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed
