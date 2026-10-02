@@ -33,7 +33,7 @@ spec:
       agent: agent-creator-agent
       input: |
         Use this planner output:
-        {{PLAN.output}}
+        {{{json PLAN.output}}}
 
         Create all missing agents listed in `missing_agents` and `missing_judge_agents`
         using `generation_prompts` and `judge_generation_prompts`.
@@ -52,10 +52,10 @@ spec:
         {{input.input}}
 
         Planner output:
-        {{PLAN.output}}
+        {{{json PLAN.output}}}
 
         Agent generation output:
-        {{GENERATE_MISSING_AGENTS.output}}
+        {{{json GENERATE_MISSING_AGENTS.output}}}
 
         Generate and register the final workflow so it is runnable immediately.
         Use only resolved existing judge agents or judges created in this generation flow.

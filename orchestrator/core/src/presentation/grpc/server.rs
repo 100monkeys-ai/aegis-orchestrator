@@ -3600,11 +3600,29 @@ mod tests {
             out
         }
 
+        /// The worker's `json` helper, `JSON.stringify(value)`
+        /// (`aegis-temporal-worker` `ad1ba6c` `aegis-workflow.ts` 74).
+        fn worker_json<'reg, 'rc>(
+            h: &handlebars::Helper<'rc>,
+            _: &'reg handlebars::Handlebars<'reg>,
+            _: &'rc handlebars::Context,
+            _: &mut handlebars::RenderContext<'reg, 'rc>,
+            out: &mut dyn handlebars::Output,
+        ) -> handlebars::HelperResult {
+            let value = h
+                .param(0)
+                .map(|p| p.value().clone())
+                .unwrap_or(serde_json::Value::Null);
+            out.write(&serde_json::to_string(&value).expect("a JSON value serializes"))?;
+            Ok(())
+        }
+
         /// The worker's `renderTemplate`: the blackboard is also exposed
         /// under `blackboard`, and a missing path renders as "".
         fn render_like_worker(template: &str, blackboard: &serde_json::Value) -> String {
             let mut handlebars = handlebars::Handlebars::new();
             handlebars.register_escape_fn(worker_escape);
+            handlebars.register_helper("json", Box::new(worker_json));
             let mut context = blackboard.clone();
             context["blackboard"] = blackboard.clone();
             handlebars
@@ -3764,6 +3782,69 @@ mod tests {
                 prompt.contains(body),
                 "PARSE_AND_VALIDATE's prompt must hold the fetched SKILL.md verbatim; it is:\n{prompt}"
             );
+        }
+
+        /// The regression: COMPOSE_MANIFEST's prompt and FAILED's feedback
+        /// rendered `{{PARSE_AND_VALIDATE.output}}`, an object when the
+        /// validator answers JSON (`aegis-temporal-worker` `ad1ba6c`
+        /// `src/activities/index.ts` 95-121), so the worker printed
+        /// "[object Object]" and the composer wrote a manifest named
+        /// imported-skill with an empty instruction (production run 300bd457,
+        /// child c2ba5c1c, on `sha-14ea8c0`). Each must hold the parsed skill
+        /// as JSON text, quotes, ampersands and angle brackets as answered.
+        #[test]
+        fn skill_import_parsed_skill_reaches_compose_manifest_and_failed_feedback_as_json() {
+            let parsed = serde_json::json!({
+                "name": "weather-note",
+                "description": "it's <short> & sweet = yes",
+                "allowed_tools": ["web.fetch"],
+                "compatibility": null,
+                "instruction_body": "Write a \"haiku\" about the weather.\nKeep it short.",
+                "safety_assessment": {
+                    "verdict": "safe",
+                    "reasoning": "No injection, no request to bypass controls."
+                },
+                "score": 0.95
+            });
+            let parsed_json = serde_json::to_string(&parsed).unwrap();
+            let blackboard = serde_json::json!({
+                "input": { "skill_url": "https://example.com/SKILL.md" },
+                "workflow": { "context": { "security_preset": "minimal" } },
+                "PARSE_AND_VALIDATE": {
+                    "status": "completed",
+                    "output": parsed,
+                    "iterations": 1,
+                    "score": 0.95
+                }
+            });
+
+            let prompt = render_like_worker(&agent_state_input("COMPOSE_MANIFEST"), &blackboard);
+            assert!(
+                !prompt.contains("[object"),
+                "COMPOSE_MANIFEST's prompt must not print an object's placeholder; it is:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(&format!("Parsed skill:\n{parsed_json}\n")),
+                "COMPOSE_MANIFEST's prompt must hold the parsed skill as JSON text; it is:\n{prompt}"
+            );
+
+            let raw: serde_yaml::Value = serde_yaml::from_str(SKILL_IMPORT).unwrap();
+            let transitions = raw["spec"]["states"]["PARSE_AND_VALIDATE"]["transitions"]
+                .as_sequence()
+                .expect("PARSE_AND_VALIDATE has transitions");
+            let feedbacks: Vec<&str> = transitions
+                .iter()
+                .filter_map(|t| t["feedback"].as_str())
+                .collect();
+            assert_eq!(feedbacks.len(), 2, "both FAILED routes carry a feedback");
+            for feedback in feedbacks {
+                let text = render_like_worker(feedback, &blackboard);
+                assert_eq!(
+                    text,
+                    format!("Skill failed validation: {parsed_json}"),
+                    "FAILED's feedback must hold the validator's answer as JSON text"
+                );
+            }
         }
 
         /// FETCH receives the caller's `skill_url`: a value carrying a quote,

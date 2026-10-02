@@ -472,7 +472,7 @@ mod tests {
             .as_str()
             .expect("GENERATE_MISSING_AGENTS input should be a string");
         assert!(
-            generate_missing_agents_input.contains("{{PLAN.output}}"),
+            generate_missing_agents_input.contains("{{{json PLAN.output}}}"),
             "GENERATE_MISSING_AGENTS should reference the planner state's output payload"
         );
         assert!(
@@ -485,11 +485,11 @@ mod tests {
             .as_str()
             .expect("GENERATE_AND_REGISTER_WORKFLOW input should be a string");
         assert!(
-            generate_and_register_workflow_input.contains("{{PLAN.output}}"),
+            generate_and_register_workflow_input.contains("{{{json PLAN.output}}}"),
             "GENERATE_AND_REGISTER_WORKFLOW should reference the planner state's output payload"
         );
         assert!(
-            generate_and_register_workflow_input.contains("{{GENERATE_MISSING_AGENTS.output}}"),
+            generate_and_register_workflow_input.contains("{{{json GENERATE_MISSING_AGENTS.output}}}"),
             "GENERATE_AND_REGISTER_WORKFLOW should reference the agent generation state's output payload"
         );
         assert!(
@@ -669,7 +669,7 @@ mod tests {
         assert!(
             input.contains(
                 "- score: 0.0-1.0 rating of instruction clarity and coherence; \
-                 0.0 when safety_assessment is \"unsafe\""
+                 0.0 when safety_assessment.verdict is \"unsafe\""
             ),
             "PARSE_AND_VALIDATE must ask its agent for `score`, 0.0 when unsafe; its input is:\n{input}"
         );
@@ -711,6 +711,32 @@ mod tests {
                 "a PARSE_AND_VALIDATE score of {score} must route to {expected}"
             );
         }
+    }
+
+    /// Regression test for the unsafe verdict that carried no reason
+    /// (production run 9d052c2c on `sha-14ea8c0`: "unsafe", score 0.0, no
+    /// reasoning, where the well-formed run answered an object with verdict
+    /// and reasoning): the validator was asked for `"safe" | "unsafe" with
+    /// reasoning`, which names no field for the reasoning. It is asked for one
+    /// shape, an object whose `reasoning` is always present.
+    #[test]
+    fn skill_import_validator_is_asked_for_one_verdict_shape_that_carries_its_reasoning() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(SKILL_IMPORT_WORKFLOW_TEMPLATE).unwrap();
+        let input = raw["spec"]["states"]["PARSE_AND_VALIDATE"]["input"]
+            .as_str()
+            .expect("PARSE_AND_VALIDATE must have an input");
+        assert!(
+            input.contains(
+                "- safety_assessment: an object {\"verdict\": \"safe\" or \"unsafe\", \
+                 \"reasoning\": \"why\"}, the reasoning always present, whatever the verdict"
+            ),
+            "PARSE_AND_VALIDATE must ask for one safety_assessment shape carrying its reasoning; \
+             its input is:\n{input}"
+        );
+        assert!(
+            !input.contains("\"safe\" | \"unsafe\" with reasoning"),
+            "the shapeless verdict line must be gone; the input is:\n{input}"
+        );
     }
 
     /// No built-in workflow splices an input or a state's output into shell
@@ -759,6 +785,81 @@ mod tests {
             splices.is_empty(),
             "these states splice a template expression into shell text:\n{}",
             splices.join("\n")
+        );
+    }
+
+    /// An Agent state's output is its agent's answer parsed as JSON when the
+    /// answer is a JSON object or array (`aegis-temporal-worker` `ad1ba6c`
+    /// `src/activities/index.ts` 95-121), and the worker renders an object
+    /// with Handlebars as "[object Object]" (production run 300bd457: the
+    /// skill-import composer received "Parsed skill: [object Object]"). So no
+    /// built-in workflow renders an Agent state's whole `output` without the
+    /// worker's `json` helper (`aegis-workflow.ts` 74), except a state whose
+    /// prompt asks for text, named here with the words that ask for it.
+    #[test]
+    fn no_builtin_workflow_renders_an_agent_states_whole_output_without_json() {
+        use aegis_orchestrator_core::domain::workflow::StateKind;
+
+        const TEXT_ANSWERS: &[(&str, &str, &str)] = &[(
+            "skill-import",
+            "COMPOSE_MANIFEST",
+            "Output ONLY the complete YAML manifest, no commentary.",
+        )];
+
+        let mut bare = Vec::new();
+        for (name, yaml) in BUILTIN_WORKFLOWS {
+            let workflow =
+                aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                    yaml,
+                )
+                .unwrap();
+            let raw: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let agent_states: Vec<String> = workflow
+                .spec
+                .states
+                .iter()
+                .filter(|(_, state)| matches!(state.kind, StateKind::Agent { .. }))
+                .map(|(state_name, _)| state_name.as_str().to_string())
+                .collect();
+            let text_answers: Vec<&str> = TEXT_ANSWERS
+                .iter()
+                .filter(|(workflow_name, _, _)| workflow_name == name)
+                .map(|(_, state, asks)| {
+                    let input = raw["spec"]["states"][*state]["input"]
+                        .as_str()
+                        .unwrap_or("");
+                    assert!(
+                        input.contains(asks),
+                        "{name} {state} is exempt only while its prompt asks for text: {asks:?}"
+                    );
+                    *state
+                })
+                .collect();
+
+            for (line_number, line) in yaml.lines().enumerate() {
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                let mut rest = line;
+                while let Some(start) = rest.find("{{") {
+                    let opened = &rest[start..];
+                    let Some(end) = opened.find("}}") else { break };
+                    let expression = opened[..end].trim_start_matches('{').trim();
+                    rest = &opened[end + 2..];
+                    let path = expression.strip_prefix("blackboard.").unwrap_or(expression);
+                    if let Some(state) = path.strip_suffix(".output") {
+                        if agent_states.iter().any(|s| s == state) && !text_answers.contains(&state)
+                        {
+                            bare.push(format!("{name}:{}: {}", line_number + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "these lines render an Agent state's whole output without the json helper:\n{}",
+            bare.join("\n")
         );
     }
 
