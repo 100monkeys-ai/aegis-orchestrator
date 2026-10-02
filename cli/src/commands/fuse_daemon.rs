@@ -14,8 +14,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
@@ -65,12 +65,107 @@ pub enum FuseDaemonCommand {
 /// Active mount handles keyed by `"{execution_id}/{volume_id}"`.
 type MountHandleMap = Arc<RwLock<HashMap<String, FuseMountHandle>>>;
 
+/// The mountpoints whose mount has begun and whose handle is not yet in the
+/// [`MountHandleMap`], with how many mounts of each are under way.
+///
+/// A mount creates its directory before it has a handle
+/// (`FuseFsalDaemon::mount` creates it, then mounts on it), so the orphan
+/// reaper, which removes every directory no handle names, took a mount in
+/// progress for an orphan: on 2026-10-02 the daemon logged "Mounting
+/// /tmp/aegis-fuse-mounts/35b82af3-…" and, 11 ms later, "Reaped orphaned FUSE
+/// mount directory" for the same path; the mount then failed with
+/// "fusermount3: failed to access mountpoint". The mount path records its
+/// mountpoint here before the directory exists and clears it only once the
+/// handle is registered; the reaper reads this record and the handle map
+/// together, so no mount is ever seen in neither.
+#[derive(Clone, Default)]
+struct MountsInProgress(Arc<std::sync::Mutex<HashMap<String, usize>>>);
+
+impl MountsInProgress {
+    /// Records a mount of `mountpoint` as under way until the guard drops.
+    fn begin(&self, mountpoint: &str) -> MountInProgress {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(mountpoint.to_string())
+            .or_insert(0) += 1;
+        MountInProgress {
+            registry: self.clone(),
+            mountpoint: mountpoint.to_string(),
+        }
+    }
+}
+
+/// A mount under way; dropping it ends the record.
+struct MountInProgress {
+    registry: MountsInProgress,
+    mountpoint: String,
+}
+
+impl Drop for MountInProgress {
+    fn drop(&mut self) {
+        let mut in_progress = self.registry.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = in_progress.get_mut(&self.mountpoint) {
+            *count -= 1;
+            if *count == 0 {
+                in_progress.remove(&self.mountpoint);
+            }
+        }
+    }
+}
+
+/// One pass of the orphan reaper: lazily unmounts and removes each directory
+/// under `prefix` that no mount names, active or in progress. Returns the
+/// directories removed.
+///
+/// The caller holds the handle map's read lock for the whole pass, so no
+/// handle is registered between the read of `active_mountpoints` and the
+/// removal; the pass holds the in-progress record's lock, so no mount begins
+/// between its check and its removal. A mount clears its record only after
+/// its handle is registered, so every mount is seen in one or the other.
+fn reap_orphaned_mount_dirs(
+    prefix: &Path,
+    active_mountpoints: &HashSet<String>,
+    in_progress: &MountsInProgress,
+) -> Vec<PathBuf> {
+    let mut reaped = Vec::new();
+    let Ok(entries) = std::fs::read_dir(prefix) else {
+        return reaped;
+    };
+    let in_progress = in_progress.0.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let named = |mp: &String| Path::new(mp) == path;
+        if active_mountpoints.iter().any(named) || in_progress.keys().any(named) {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        let _ = std::process::Command::new("fusermount")
+            .args(["-uz", &path_str])
+            .output();
+        if let Ok(()) = std::fs::remove_dir(&path) {
+            info!(
+                path = %path.display(),
+                "Reaped orphaned FUSE mount directory"
+            );
+            reaped.push(path);
+        }
+    }
+    reaped
+}
+
 /// FuseMountService gRPC implementation — receives mount/unmount commands
 /// from the orchestrator and creates/destroys FUSE mounts on the host.
 struct FuseMountServiceImpl {
     daemon: Arc<FuseFsalDaemon>,
     mount_prefix: String,
     handles: MountHandleMap,
+    /// Mounts begun and not yet in `handles`, read by the orphan reaper.
+    mounts_in_progress: MountsInProgress,
     /// Daemon-wide degraded-mount registry, shared with the in-process
     /// `FuseFsalDaemon` instance. Read by the `Health` RPC.
     degraded_registry: DegradedMountRegistry,
@@ -121,6 +216,11 @@ impl FuseMountService for FuseMountServiceImpl {
             },
         };
 
+        // Recorded before the mount creates its directory, cleared once the
+        // handle is registered (or the mount fails): the orphan reaper never
+        // sees this directory without one or the other.
+        let in_progress = self.mounts_in_progress.begin(&mountpoint);
+
         let handle = self
             .daemon
             .mount(Path::new(&mountpoint), context)
@@ -128,7 +228,10 @@ impl FuseMountService for FuseMountServiceImpl {
 
         let key = mount_key(&req.execution_id, &req.volume_id);
         let actual_mountpoint = handle.mountpoint().to_string();
-        self.handles.write().await.insert(key, handle);
+        let mut handles = self.handles.write().await;
+        handles.insert(key, handle);
+        drop(in_progress);
+        drop(handles);
 
         info!(
             mountpoint = %actual_mountpoint,
@@ -395,10 +498,13 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             // the Health RPC can report `degraded_mount_count`.
             let degraded_registry = daemon.degraded_registry();
 
+            let mounts_in_progress = MountsInProgress::default();
+
             let service = FuseMountServiceImpl {
                 daemon,
                 mount_prefix: mount_prefix.clone(),
                 handles: handles.clone(),
+                mounts_in_progress: mounts_in_progress.clone(),
                 degraded_registry: degraded_registry.clone(),
             };
 
@@ -406,33 +512,23 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             // directories that have no corresponding active handle (e.g. after
             // a crash or missed unmount RPC).
             let reaper_handles = handles.clone();
-            let reaper_prefix = mount_prefix.clone();
+            let reaper_in_progress = mounts_in_progress.clone();
+            let reaper_prefix = PathBuf::from(&mount_prefix);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    if let Ok(entries) = std::fs::read_dir(&reaper_prefix) {
-                        let active = reaper_handles.read().await;
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                let path_str = path.to_string_lossy().to_string();
-                                // A directory is active if any handle's mountpoint matches it
-                                let is_active = active.values().any(|h| h.mountpoint() == path_str);
-                                if !is_active {
-                                    let _ = std::process::Command::new("fusermount")
-                                        .args(["-uz", &path_str])
-                                        .output();
-                                    if let Ok(()) = std::fs::remove_dir(&path) {
-                                        info!(
-                                            path = %path.display(),
-                                            "Reaped orphaned FUSE mount directory"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let active = reaper_handles.read().await;
+                    let active_mountpoints: HashSet<String> = active
+                        .values()
+                        .map(|h| h.mountpoint().to_string())
+                        .collect();
+                    reap_orphaned_mount_dirs(
+                        &reaper_prefix,
+                        &active_mountpoints,
+                        &reaper_in_progress,
+                    );
+                    drop(active);
                 }
             });
 
@@ -503,10 +599,83 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
 
 #[cfg(test)]
 mod tests {
-    use super::{mount_key, shutdown_lazy_unmount, MountHandleMap};
-    use std::collections::HashMap;
+    use super::{
+        mount_key, reap_orphaned_mount_dirs, shutdown_lazy_unmount, MountHandleMap,
+        MountsInProgress,
+    };
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    fn mount_prefix() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temporary mount prefix")
+    }
+
+    /// Regression (production, 2026-10-02, execution 85197647 iteration 3): a
+    /// mount whose directory exists and whose handle is not yet registered is
+    /// in progress, not an orphan; the reaper removed it 11 ms after the
+    /// daemon began mounting there, and the agent then ran without
+    /// `/workspace`.
+    #[test]
+    fn reaper_keeps_the_directory_of_a_mount_in_progress() {
+        let prefix = mount_prefix();
+        let mountpoint = prefix.path().join("35b82af3-0000-0000-0000-000000000000");
+        let in_progress = MountsInProgress::default();
+
+        // The mount path's order: record, then create the directory.
+        let mount = in_progress.begin(&mountpoint.to_string_lossy());
+        std::fs::create_dir_all(&mountpoint).unwrap();
+
+        let reaped = reap_orphaned_mount_dirs(prefix.path(), &HashSet::new(), &in_progress);
+
+        assert!(reaped.is_empty(), "reaped a mount in progress: {reaped:?}");
+        assert!(mountpoint.is_dir(), "the mount's directory must survive");
+        drop(mount);
+    }
+
+    /// A directory that no handle names and no mount is setting up is still
+    /// an orphan, and so is the directory of a mount that has ended.
+    #[test]
+    fn reaper_removes_a_directory_with_no_handle_and_no_mount_in_progress() {
+        let prefix = mount_prefix();
+        let orphan = prefix.path().join("aaaaaaaa-0000-0000-0000-000000000000");
+        let ended = prefix.path().join("bbbbbbbb-0000-0000-0000-000000000000");
+        let active = prefix.path().join("cccccccc-0000-0000-0000-000000000000");
+        for dir in [&orphan, &ended, &active] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let in_progress = MountsInProgress::default();
+        drop(in_progress.begin(&ended.to_string_lossy()));
+        let active_mountpoints = HashSet::from([active.to_string_lossy().to_string()]);
+
+        let mut reaped = reap_orphaned_mount_dirs(prefix.path(), &active_mountpoints, &in_progress);
+        reaped.sort();
+
+        assert_eq!(reaped, vec![orphan.clone(), ended.clone()]);
+        assert!(!orphan.exists() && !ended.exists());
+        assert!(active.is_dir(), "an active mount's directory is kept");
+    }
+
+    /// Two mounts of one mountpoint under way: the record holds until both end.
+    #[test]
+    fn a_mountpoint_stays_in_progress_until_its_last_mount_ends() {
+        let prefix = mount_prefix();
+        let mountpoint = prefix.path().join("dddddddd-0000-0000-0000-000000000000");
+        std::fs::create_dir_all(&mountpoint).unwrap();
+        let in_progress = MountsInProgress::default();
+        let first = in_progress.begin(&mountpoint.to_string_lossy());
+        let second = in_progress.begin(&mountpoint.to_string_lossy());
+
+        drop(first);
+        assert!(reap_orphaned_mount_dirs(prefix.path(), &HashSet::new(), &in_progress).is_empty());
+        assert!(mountpoint.is_dir());
+
+        drop(second);
+        assert_eq!(
+            reap_orphaned_mount_dirs(prefix.path(), &HashSet::new(), &in_progress),
+            vec![mountpoint.clone()]
+        );
+    }
 
     /// Regression: wildcard unmount must correctly identify all mount keys
     /// matching a given volume_id, regardless of execution_id. Before this fix,

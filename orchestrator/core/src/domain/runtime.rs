@@ -298,6 +298,22 @@ pub enum RuntimeError {
         /// Wall-clock budget in seconds that elapsed before timeout.
         timeout_secs: u64,
     },
+    /// A volume the agent declares could not be mounted, so the agent is not
+    /// started: it would run without the volume (production, 2026-10-02:
+    /// every command of an agent whose `/workspace` mount failed ended "No
+    /// such file or directory: '/workspace'"). The iteration fails naming the
+    /// volume and the mount's error.
+    #[error("Volume {volume_id} of execution {execution_id} could not be mounted at {mount_point}: {error}")]
+    VolumeMountFailed {
+        /// Execution whose agent declared the volume.
+        execution_id: String,
+        /// The volume that failed to mount.
+        volume_id: String,
+        /// Where the agent declared it, inside its container.
+        mount_point: String,
+        /// The mount's error, as the FUSE daemon reported it.
+        error: String,
+    },
     /// The pre-spawn FUSE daemon `Health` probe reported the daemon as
     /// unhealthy (or did not respond within the probe budget). Surfaces a
     /// degraded daemon to the iteration error path before any Mount RPC is

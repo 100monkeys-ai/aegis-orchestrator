@@ -777,6 +777,42 @@ impl ContainerRuntime {
         }
     }
 
+    /// Unmounts, on the host's FUSE daemon, the volumes a spawn mounted before
+    /// it failed, so no mount outlives an agent that never started.
+    async fn unmount_grpc_fuse_pairs(
+        client: &mut crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+        pairs: &[(String, String)],
+    ) {
+        for (execution_id, volume_id) in pairs {
+            let request = crate::infrastructure::aegis_runtime_proto::FuseUnmountRequest {
+                volume_id: volume_id.clone(),
+                execution_id: execution_id.clone(),
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(FUSE_UNMOUNT_TIMEOUT_SECS),
+                client.unmount(request),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(
+                    error = %e,
+                    execution_id = %execution_id,
+                    volume_id = %volume_id,
+                    "gRPC FUSE unmount after a failed spawn failed — mount may linger"
+                ),
+                Err(_elapsed) => warn!(
+                    execution_id = %execution_id,
+                    volume_id = %volume_id,
+                    timeout_secs = FUSE_UNMOUNT_TIMEOUT_SECS,
+                    "gRPC FUSE unmount after a failed spawn timed out — mount may be leaked"
+                ),
+            }
+        }
+    }
+
     /// The FUSE mount request the agent path sends for one of its volumes
     /// (ADR-107). `identity` is the agent container's process identity
     /// ([`Self::agent_container_identity`]); the daemon reports it on the host.
@@ -1365,6 +1401,8 @@ impl AgentRuntime for ContainerRuntime {
                             // error path classifies it correctly. A wedged
                             // FUSE daemon must NOT silently degrade the run
                             // by quietly omitting the volume.
+                            Self::unmount_grpc_fuse_pairs(&mut client, &pending_grpc_fuse_pairs)
+                                .await;
                             return Err(RuntimeError::FuseMountTimeout {
                                 execution_id,
                                 volume_id,
@@ -1372,11 +1410,29 @@ impl AgentRuntime for ContainerRuntime {
                             });
                         }
                         Err(e) => {
-                            warn!(
-                                error = %e,
-                                volume_id = %volume_mount.volume_id,
-                                "gRPC FUSE mount failed — volume will not be available"
+                            // A declared volume that did not mount fails the
+                            // spawn: started without it, the agent ran with
+                            // no /workspace and every command failed.
+                            let error = match e {
+                                RuntimeError::SpawnFailed(message) => message,
+                                other => other.to_string(),
+                            };
+                            error!(
+                                target: "runtime_spawn",
+                                step = "fuse_mount_failed",
+                                execution_id = %exec_id_str,
+                                volume_id = %vid,
+                                error = %error,
+                                "gRPC FUSE mount failed; the agent is not started"
                             );
+                            Self::unmount_grpc_fuse_pairs(&mut client, &pending_grpc_fuse_pairs)
+                                .await;
+                            return Err(RuntimeError::VolumeMountFailed {
+                                execution_id: exec_id_str,
+                                volume_id: vid,
+                                mount_point: container_path,
+                                error,
+                            });
                         }
                     }
                 }
@@ -1399,11 +1455,13 @@ impl AgentRuntime for ContainerRuntime {
                 // ── FUSE + bind mount path (ADR-107) ─────────────────────────────
                 // Collect (handle, mount) pairs so FuseMountHandle values are kept
                 // alive until terminate() is called. Dropping a handle unmounts.
+                // A declared volume that does not mount fails the spawn; the
+                // handles already taken drop on the return and unmount.
                 let fuse_pairs: Vec<(crate::infrastructure::fuse::daemon::FuseMountHandle, Mount)> =
                     config
                         .volumes
                         .iter()
-                        .filter_map(|volume_mount| {
+                        .map(|volume_mount| {
                             let container_path = volume_mount.mount_point.display().to_string();
                             let is_read_only = matches!(
                                 volume_mount.access_mode,
@@ -1441,7 +1499,7 @@ impl AgentRuntime for ContainerRuntime {
                                         read_only = is_read_only,
                                         "Configured FUSE bind mount for agent container (ADR-107)"
                                     );
-                                    Some((
+                                    Ok((
                                         handle,
                                         Mount {
                                             target: Some(container_path),
@@ -1453,16 +1511,21 @@ impl AgentRuntime for ContainerRuntime {
                                     ))
                                 }
                                 Err(e) => {
-                                    warn!(
+                                    error!(
                                         error = %e,
                                         volume_id = %volume_mount.volume_id,
-                                        "FUSE mount failed — skipping volume"
+                                        "FUSE mount failed; the agent is not started"
                                     );
-                                    None
+                                    Err(RuntimeError::VolumeMountFailed {
+                                        execution_id: config.execution_id.0.to_string(),
+                                        volume_id: volume_mount.volume_id.0.to_string(),
+                                        mount_point: container_path,
+                                        error: e.to_string(),
+                                    })
                                 }
                             }
                         })
-                        .collect();
+                        .collect::<Result<_, RuntimeError>>()?;
 
                 // Split into handles (stored per-container) and mounts (passed to Docker).
                 let (fuse_handles, mounts): (Vec<_>, Vec<_>) = fuse_pairs.into_iter().unzip();
@@ -2740,6 +2803,209 @@ mod tests {
     }
 
     // ── Agent container stop (the stop paid about 5 s on every iteration) ───
+
+    /// A Docker Engine API stand-in on a unix socket: answers `/version` and
+    /// image inspection, records every other request, and refuses to start
+    /// a container.
+    async fn fake_engine(
+        socket: std::path::PathBuf,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use axum::http::{Method, StatusCode, Uri};
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let app = axum::Router::new().fallback(move |method: Method, uri: Uri| {
+            let seen = seen.clone();
+            async move {
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(format!("{method} {path}"));
+                if path.ends_with("/version") {
+                    (StatusCode::OK, "{}".to_string())
+                } else if method == Method::GET && path.contains("/images/") {
+                    (
+                        StatusCode::OK,
+                        r#"{"Id":"sha256:0","Config":{"User":""}}"#.to_string(),
+                    )
+                } else if path.ends_with("/containers/create") {
+                    (
+                        StatusCode::CREATED,
+                        r#"{"Id":"fake-container","Warnings":[]}"#.to_string(),
+                    )
+                } else {
+                    (
+                        StatusCode::NOT_FOUND,
+                        r#"{"message":"not in the stand-in"}"#.to_string(),
+                    )
+                }
+            }
+        });
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        requests
+    }
+
+    /// A FUSE daemon stand-in: healthy, mounts every volume but `failing`,
+    /// which fails as production's did, and records each unmount.
+    struct FakeFuseDaemon {
+        failing: String,
+        unmounts: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::infrastructure::aegis_runtime_proto::fuse_mount_service_server::FuseMountService
+        for FakeFuseDaemon
+    {
+        async fn mount(
+            &self,
+            request: tonic::Request<crate::infrastructure::aegis_runtime_proto::FuseMountRequest>,
+        ) -> Result<
+            tonic::Response<crate::infrastructure::aegis_runtime_proto::FuseMountResponse>,
+            tonic::Status,
+        > {
+            let req = request.into_inner();
+            let mountpoint = format!("/tmp/aegis-fuse-mounts/{}", req.volume_id);
+            if req.volume_id == self.failing {
+                return Err(tonic::Status::internal(format!(
+                    "FUSE mount failed: Failed to mount FUSE filesystem at {mountpoint}: \
+                     fusermount3: failed to access mountpoint {mountpoint}: No such file or directory"
+                )));
+            }
+            Ok(tonic::Response::new(
+                crate::infrastructure::aegis_runtime_proto::FuseMountResponse { mountpoint },
+            ))
+        }
+
+        async fn unmount(
+            &self,
+            request: tonic::Request<crate::infrastructure::aegis_runtime_proto::FuseUnmountRequest>,
+        ) -> Result<
+            tonic::Response<crate::infrastructure::aegis_runtime_proto::FuseUnmountResponse>,
+            tonic::Status,
+        > {
+            let req = request.into_inner();
+            self.unmounts
+                .lock()
+                .unwrap()
+                .push((req.execution_id, req.volume_id));
+            Ok(tonic::Response::new(
+                crate::infrastructure::aegis_runtime_proto::FuseUnmountResponse { unmounted: true },
+            ))
+        }
+
+        async fn health(
+            &self,
+            _request: tonic::Request<crate::infrastructure::aegis_runtime_proto::FuseHealthRequest>,
+        ) -> Result<
+            tonic::Response<crate::infrastructure::aegis_runtime_proto::FuseHealthResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                crate::infrastructure::aegis_runtime_proto::FuseHealthResponse {
+                    healthy: true,
+                    active_mount_count: 0,
+                    degraded_mount_count: 0,
+                    oldest_mount_age_secs: 0,
+                    version: "stand-in".to_string(),
+                },
+            ))
+        }
+    }
+
+    /// Regression (production, 2026-10-02, execution 85197647 iteration 3):
+    /// the core logged "gRPC FUSE mount failed — volume will not be available"
+    /// and started the agent anyway, and every command it ran failed "No such
+    /// file or directory: '/workspace'". A spawn whose declared volume fails
+    /// to mount now fails naming the volume and the mount's error, creates no
+    /// container (so no bootstrap runs), and unmounts the volumes it had
+    /// already mounted.
+    #[tokio::test]
+    async fn spawn_fails_naming_the_volume_when_a_declared_volume_fails_to_mount() {
+        use crate::domain::volume::VolumeId;
+        use crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient;
+        use crate::infrastructure::aegis_runtime_proto::fuse_mount_service_server::FuseMountServiceServer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let engine_requests = fake_engine(socket.clone()).await;
+
+        let mounted = VolumeId::new();
+        let failing = VolumeId::new();
+        let unmounts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fuse = FakeFuseDaemon {
+            failing: failing.0.to_string(),
+            unmounts: unmounts.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fuse_addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FuseMountServiceServer::new(fuse))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let fuse_client = FuseMountServiceClient::connect(format!("http://{fuse_addr}"))
+            .await
+            .unwrap();
+
+        let bootstrap = dir.path().join("bootstrap.py");
+        std::fs::write(&bootstrap, "print('never run')\n").unwrap();
+        let runtime = ContainerRuntime::new(super::ContainerRuntimeConfig {
+            bootstrap_script: bootstrap.display().to_string(),
+            socket_path: Some(socket.display().to_string()),
+            network_mode: None,
+            orchestrator_url: "http://127.0.0.1:9".to_string(),
+            nfs_server_host: None,
+            nfs_port: 2049,
+            nfs_mountport: 2049,
+            event_bus: std::sync::Arc::new(crate::infrastructure::event_bus::EventBus::new(16)),
+            credential_resolver: std::sync::Arc::new(
+                crate::infrastructure::image_manager::NodeConfigCredentialResolver::new(Vec::new()),
+            ),
+            fuse_daemon: None,
+            fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
+            fuse_mount_client: Some(fuse_client),
+        })
+        .await
+        .unwrap();
+
+        let mut config = sample_runtime_config();
+        let execution_id = config.execution_id.0.to_string();
+        config.volumes = vec![workspace_mount(mounted), workspace_mount(failing)];
+
+        let result = crate::domain::runtime::AgentRuntime::spawn(&runtime, config).await;
+
+        let created: Vec<String> = engine_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.contains("/containers/create") || r.contains("/exec"))
+            .cloned()
+            .collect();
+        assert!(
+            created.is_empty(),
+            "no container may be created, so no bootstrap runs: {created:?} (spawn: {result:?})"
+        );
+        match result {
+            Err(super::RuntimeError::VolumeMountFailed {
+                execution_id: failed_execution,
+                volume_id,
+                mount_point,
+                error,
+            }) => {
+                assert_eq!(failed_execution, execution_id);
+                assert_eq!(volume_id, failing.0.to_string());
+                assert_eq!(mount_point, "/workspace");
+                assert!(
+                    error.contains("failed to access mountpoint"),
+                    "the mount's error is carried: {error}"
+                );
+            }
+            other => panic!("expected VolumeMountFailed, got {other:?}"),
+        }
+        assert_eq!(
+            *unmounts.lock().unwrap(),
+            vec![(execution_id, mounted.0.to_string())],
+            "the volume already mounted is unmounted"
+        );
+    }
 
     fn sample_agent_container_body() -> bollard::models::ContainerCreateBody {
         super::agent_container_body(
