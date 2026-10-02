@@ -78,6 +78,7 @@ use crate::daemon::handlers::seal::{
 use crate::daemon::handlers::stimulus::{ingest_stimulus_handler, webhook_handler};
 use crate::daemon::handlers::swarms::{get_swarm_handler, list_swarms_handler};
 use crate::daemon::handlers::tenant_provisioning::keycloak_event_handler;
+use crate::daemon::handlers::tool_approvals::{tool_approvals_router, ToolApprovalsState};
 use crate::daemon::handlers::volumes;
 use crate::daemon::handlers::workflow_executions::{
     cancel_workflow_execution_handler, get_workflow_execution_handler, get_workflow_logs_handler,
@@ -385,6 +386,14 @@ pub(crate) fn create_router(
     // middleware stack by the handler tests.
     let router = router.merge(approvals_router(ApprovalsState {
         human_input_service: app_state.human_input_service.clone(),
+    }));
+
+    // Tool approvals (AEGIS ADR-126 D4): a user answers a gated tool call
+    // and manages "always allow". Over their own narrow state: the gate's
+    // service and the tool invocation service, which runs an approved call.
+    let router = router.merge(tool_approvals_router(ToolApprovalsState {
+        service: app_state.tool_invocation_service.tool_approvals(),
+        runner: app_state.tool_invocation_service.clone(),
     }));
 
     // Credential bindings by id (ADR-078; security audit 003 F-1), over

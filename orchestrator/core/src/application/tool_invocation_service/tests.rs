@@ -2152,6 +2152,7 @@ async fn get_available_tools_returns_builtin_dispatcher_metadata() {
             capabilities: vec![CapabilityConfig {
                 name: "fs.read".to_string(),
                 skip_judge: true,
+                requires_approval: false,
             }],
             api_key: None,
         }],
@@ -2200,6 +2201,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
                 capabilities: vec![CapabilityConfig {
                     name: "fs.read".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2210,6 +2212,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
                 capabilities: vec![CapabilityConfig {
                     name: "cmd.run".to_string(),
                     skip_judge: false,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2281,6 +2284,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2291,6 +2295,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.delete".to_string(),
                     skip_judge: false,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2457,6 +2462,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
                 capabilities: vec![CapabilityConfig {
                     name: "fs.read".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2467,6 +2473,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
                 capabilities: vec![CapabilityConfig {
                     name: "cmd.run".to_string(),
                     skip_judge: false,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -3407,6 +3414,7 @@ async fn list_tools_does_not_duplicate_when_dispatchers_present() {
         capabilities: vec![CapabilityConfig {
             name: "aegis.workflow.wait".to_string(),
             skip_judge: true,
+            requires_approval: false,
         }],
         api_key: None,
     }];
@@ -3587,6 +3595,7 @@ mod gateway_timeout_regression {
                 capabilities: vec![CapabilityConfig {
                     name: "fs.read".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             }],

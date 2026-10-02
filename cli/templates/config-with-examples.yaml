@@ -394,6 +394,12 @@ spec:
   #     capabilities:
   #       - name: "fs.read"
   #         skip_judge: true
+  #       - name: "fs.write"
+  #         # AEGIS ADR-126: an agent's call waits for its user's answer
+  #         # (approve once, always allow, deny) at the approval gate; it
+  #         # returns approval_pending and the tool runs only on approval.
+  #         # Default: false. An agent manifest cannot clear it.
+  #         requires_approval: true
   #     credentials:
   #       API_KEY: "env:FILESYSTEM_MCP_API_KEY"
   #     health_check:
@@ -415,6 +421,17 @@ spec:
   #     enabled: true
   #     capabilities:
   #       - name: "cmd.run"
+  #
+  # Gate a built-in tool behind its user's approval (AEGIS ADR-126) by its
+  # capability entry. An entry here replaces the built-in entry of the same
+  # name, so restate its description:
+  #   - name: "aegis.system.info"
+  #     description: "Returns system version, status, and capabilities."
+  #     enabled: true
+  #     capabilities:
+  #       - name: "aegis.system.info"
+  #         skip_judge: true
+  #         requires_approval: true
 
   # --------------------------------------------------------------------------
   # Registry Credentials (Optional)

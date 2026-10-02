@@ -53,6 +53,9 @@ pub enum ApiScope {
     ApprovalList,
     ApprovalApprove,
     ApprovalReject,
+    // tool approval (ADR-126): a user's own gated tool calls
+    ToolApprovalRead,
+    ToolApprovalDecide,
     // stimulus
     StimulusIngest,
     // node
@@ -125,6 +128,8 @@ impl ApiScope {
             Self::ApprovalList => "approval:list",
             Self::ApprovalApprove => "approval:approve",
             Self::ApprovalReject => "approval:reject",
+            Self::ToolApprovalRead => "tool_approval:read",
+            Self::ToolApprovalDecide => "tool_approval:decide",
             Self::StimulusIngest => "stimulus:ingest",
             Self::NodeRead => "node:read",
             Self::NodeList => "node:list",
@@ -192,6 +197,8 @@ impl ApiScope {
             "approval:list" => Some(Self::ApprovalList),
             "approval:approve" => Some(Self::ApprovalApprove),
             "approval:reject" => Some(Self::ApprovalReject),
+            "tool_approval:read" => Some(Self::ToolApprovalRead),
+            "tool_approval:decide" => Some(Self::ToolApprovalDecide),
             "stimulus:ingest" => Some(Self::StimulusIngest),
             "node:read" => Some(Self::NodeRead),
             "node:list" => Some(Self::NodeList),
@@ -249,6 +256,8 @@ impl ApiScope {
             Self::ApprovalList,
             Self::ApprovalApprove,
             Self::ApprovalReject,
+            Self::ToolApprovalRead,
+            Self::ToolApprovalDecide,
         ]);
         scopes
     }
@@ -319,6 +328,8 @@ impl ApiScope {
             Self::ApprovalList,
             Self::ApprovalApprove,
             Self::ApprovalReject,
+            Self::ToolApprovalRead,
+            Self::ToolApprovalDecide,
             Self::StimulusIngest,
             Self::NodeRead,
             Self::NodeList,
@@ -347,5 +358,31 @@ impl ApiScope {
 impl fmt::Display for ApiScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiScope;
+
+    /// Every scope round-trips through its text, the two tool approval
+    /// scopes (AEGIS ADR-126 D4) among them, and an execution key holds both.
+    #[test]
+    fn tool_approval_scopes_parse_and_are_granted_with_execution() {
+        for scope in ApiScope::all() {
+            assert_eq!(ApiScope::parse(scope.as_str()), Some(scope.clone()));
+        }
+        assert_eq!(
+            ApiScope::parse("tool_approval:read"),
+            Some(ApiScope::ToolApprovalRead)
+        );
+        assert_eq!(
+            ApiScope::parse("tool_approval:decide"),
+            Some(ApiScope::ToolApprovalDecide)
+        );
+        let execution = ApiScope::preset_execution();
+        assert!(execution.contains(&ApiScope::ToolApprovalRead));
+        assert!(execution.contains(&ApiScope::ToolApprovalDecide));
+        assert!(!ApiScope::preset_readonly().contains(&ApiScope::ToolApprovalDecide));
     }
 }

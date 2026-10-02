@@ -104,7 +104,26 @@ impl ToolInvocationService {
             edge_resolver: None,
             edge_fleet_dispatcher: None,
             edge_fleet_cancel: None,
+            tool_approval_service: None,
         }
+    }
+
+    /// AEGIS ADR-126: enable the approval gate. A call of a tool the router
+    /// marks `requires_approval` then waits for its user's answer.
+    pub fn with_tool_approvals(
+        mut self,
+        service: Arc<crate::application::tool_approval_service::ToolApprovalService>,
+    ) -> Self {
+        self.tool_approval_service = Some(service);
+        self
+    }
+
+    /// The approval gate's service, when enabled (the daemon's
+    /// `/v1/tool-approvals` routes answer through it).
+    pub fn tool_approvals(
+        &self,
+    ) -> Option<Arc<crate::application::tool_approval_service::ToolApprovalService>> {
+        self.tool_approval_service.clone()
     }
 
     /// Authenticate calls to the SEAL gateway's gRPC services with this
@@ -563,6 +582,114 @@ impl ToolInvocationService {
             );
             return Err(SealSessionError::PolicyViolation(violation));
         }
+
+        // --- Approval gate (ADR-126 D2) ---
+        // After the security context allowed the call and before the
+        // inner-loop judge: a call the policy forbids never reaches a person,
+        // and a person is never asked about a call that is then rejected for
+        // a reason they could not see.
+        let mut auto_allowed = None;
+        if let Some(approvals) = &self.tool_approval_service {
+            if self.tool_router.requires_approval(&tool_name) {
+                use crate::application::tool_approval_service::{
+                    GateOutcome, GatedCall, ToolApprovalError,
+                };
+                let gated = approvals
+                    .gate(GatedCall {
+                        tenant_id,
+                        user_sub: caller_identity.map(|id| id.sub.as_str()),
+                        execution_id,
+                        agent_id: *agent_id,
+                        tool_name: &tool_name,
+                        arguments: &args,
+                        security_context_name: &security_context.name,
+                    })
+                    .await;
+                match gated {
+                    Ok(GateOutcome::Proceed { approval_id }) => auto_allowed = Some(approval_id),
+                    Ok(GateOutcome::Pending { result }) => {
+                        self.publish_invocation_completed(
+                            invocation_id,
+                            execution_id,
+                            *agent_id,
+                            &result,
+                            started_at,
+                        );
+                        return Ok(ToolInvocationResult::Direct(result));
+                    }
+                    Err(e) => {
+                        self.publish_invocation_failed(
+                            invocation_id,
+                            execution_id,
+                            *agent_id,
+                            e.to_string(),
+                        );
+                        return Err(match e {
+                            ToolApprovalError::RequiresUser(_) => {
+                                SealSessionError::ConfigurationError(e.to_string())
+                            }
+                            other => SealSessionError::InternalError(other.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        let outcome = self
+            .dispatch_after_gate(
+                agent_id,
+                execution_id,
+                tenant_scope,
+                security_context,
+                tool_name,
+                args,
+                iteration_number,
+                tool_audit_history,
+                caller_identity,
+                invocation_id,
+                started_at,
+            )
+            .await;
+        if let (Some(approval_id), Some(approvals)) = (auto_allowed, &self.tool_approval_service) {
+            let recorded = match &outcome {
+                Ok(ToolInvocationResult::Direct(value)) => Ok(value.clone()),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => {
+                    Ok(serde_json::json!({"status": "dispatch_required"}))
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = approvals.record_outcome(approval_id, &recorded).await {
+                tracing::warn!(
+                    approval_id = %approval_id,
+                    error = %e,
+                    "Failed to record the outcome of an auto-allowed tool call"
+                );
+            }
+        }
+        outcome
+    }
+
+    /// The dispatch stages after the approval gate (ADR-126 D2): the
+    /// inner-loop judge, then edge, `aegis.*`, built-in, router and gateway
+    /// dispatch. Called by [`Self::dispatch_tool_core`] for every call the
+    /// gate lets through, and by the run of a stored call on its user's
+    /// approval (`approvals.rs`), with the stored arguments.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn dispatch_after_gate(
+        &self,
+        agent_id: &AgentId,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_scope: &TenantScope,
+        security_context: &crate::domain::security_context::SecurityContext,
+        tool_name: String,
+        mut args: Value,
+        iteration_number: u8,
+        tool_audit_history: Vec<TrajectoryStep>,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        invocation_id: ToolInvocationId,
+        started_at: Instant,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        let tenant_id = &tenant_scope.authenticated_tenant;
 
         // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
         // Agent lookup is optional — Zaru SEAL sessions use synthetic agent IDs
@@ -1146,6 +1273,10 @@ impl ToolInvocationService {
             }
             "aegis.system.info" => Some(self.invoke_aegis_system_info_tool().await),
             "aegis.system.config" => Some(self.invoke_aegis_system_config_tool().await),
+            "aegis.approval.status" => Some(
+                self.invoke_aegis_approval_status_tool(args, caller_identity, tenant_scope)
+                    .await,
+            ),
             // ── ADR-117 Edge fleet system tools ────────────────────
             "aegis.edge.fleet.list" => Some(
                 self.invoke_aegis_edge_fleet_list_tool(args, tenant_scope)

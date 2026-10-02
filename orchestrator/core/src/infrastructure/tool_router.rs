@@ -134,6 +134,9 @@ pub struct ToolRouter {
     servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
     capabilities_index: Arc<RwLock<HashMap<String, ToolServerId>>>,
     builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
+    /// MCP server tools whose capability entry carries `requires_approval`
+    /// (AEGIS ADR-126 D1), from `spec.mcp_servers`.
+    mcp_approval_tools: std::collections::HashSet<String>,
 }
 
 /// Canonical structured definition of one builtin tool dispatcher.
@@ -162,12 +165,18 @@ pub struct ToolRouter {
 /// out via `aegis.edge.fleet.invoke`. Currently only that tool itself; the
 /// list / cancel siblings are operator-tier coordination tools that do not
 /// fan out further.
+///
+/// `requires_approval`: AEGIS ADR-126 D1 outbound tools: an agent's call
+/// waits for its user's answer at the approval gate. A node configuration's
+/// capability entry may gate further tools; it cannot clear this mark.
+/// No tool carries it yet: `mail.send` and `mail.reply` (ADR-125 D4) will.
 struct BuiltinToolDefinition {
     name: &'static str,
     description: &'static str,
     skip_judge: bool,
     edge_executor: bool,
     fleet_capable: bool,
+    requires_approval: bool,
 }
 
 impl BuiltinToolDefinition {
@@ -178,6 +187,7 @@ impl BuiltinToolDefinition {
             skip_judge: false,
             edge_executor: false,
             fleet_capable: false,
+            requires_approval: false,
         }
     }
 
@@ -193,6 +203,13 @@ impl BuiltinToolDefinition {
 
     const fn fleet_capable(mut self) -> Self {
         self.fleet_capable = true;
+        self
+    }
+
+    /// Mark an outbound tool for the approval gate (AEGIS ADR-126 D1).
+    #[allow(dead_code)] // the mail tools (ADR-125 D4) are the first to carry it
+    const fn requires_approval(mut self) -> Self {
+        self.requires_approval = true;
         self
     }
 
@@ -268,6 +285,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.edge.fleet.list", "ADR-117: resolve an edge fleet target (selector / group / @node / all) and return the matched node ids without dispatching. Operator-tier.").skip_judge().edge_executor(),
     BuiltinToolDefinition::new("aegis.edge.fleet.invoke", "ADR-117: dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /v1/edge/fleet/invoke. Operator-tier, fleet-capable.").skip_judge().edge_executor().fleet_capable(),
     BuiltinToolDefinition::new("aegis.edge.fleet.cancel", "ADR-117: cancel an in-flight fleet operation by fleet_command_id. Operator-tier.").skip_judge().edge_executor(),
+    BuiltinToolDefinition::new("aegis.approval.status", "Returns the status of a tool call that waited for its user's approval (approval_pending, approved_once, approved_always, denied, expired, auto_allowed) and, once it ran, its result. Only the call's own user can read it.").skip_judge(),
 ];
 
 impl ToolRouter {
@@ -284,6 +302,7 @@ impl ToolRouter {
                 capabilities: vec![crate::domain::node_config::CapabilityConfig {
                     name: def.name.to_string(),
                     skip_judge: def.skip_judge,
+                    requires_approval: def.requires_approval,
                 }],
                 api_key: None,
             })
@@ -321,7 +340,24 @@ impl ToolRouter {
             servers,
             capabilities_index: Arc::new(RwLock::new(HashMap::new())),
             builtin_dispatchers,
+            mcp_approval_tools: std::collections::HashSet::new(),
         }
+    }
+
+    /// Gate the MCP server tools whose capability entry in `spec.mcp_servers`
+    /// carries `requires_approval` (AEGIS ADR-126 D1).
+    pub fn with_mcp_server_approvals(
+        mut self,
+        configs: &[crate::domain::node_config::McpServerConfig],
+    ) -> Self {
+        self.mcp_approval_tools = configs
+            .iter()
+            .filter(|c| c.enabled)
+            .flat_map(|c| c.capabilities.iter())
+            .filter(|cap| cap.requires_approval)
+            .map(|cap| cap.name.clone())
+            .collect();
+        self
     }
 
     /// Find and authorize the server that can handle this tool for the given execution.
@@ -578,6 +614,7 @@ impl ToolRouter {
             "aegis.runtime.list" => Self::schema_aegis_runtime_list(),
             "aegis.execution.file" => Self::schema_aegis_execution_file(),
             "aegis.attachment.read" => Self::schema_aegis_attachment_read(),
+            "aegis.approval.status" => Self::schema_aegis_approval_status(),
             _ => json!({ "type": "object" }),
         }
     }
@@ -1403,6 +1440,20 @@ impl ToolRouter {
         })
     }
 
+    /// JSON schema for the `aegis.approval.status` builtin tool (ADR-126 D4).
+    fn schema_aegis_approval_status() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "approval_id": {
+                    "type": "string",
+                    "description": "The approval_id an approval_pending result returned."
+                }
+            },
+            "required": ["approval_id"]
+        })
+    }
+
     /// JSON schema for the `aegis.task.status` builtin tool.
     fn schema_aegis_task_status() -> Value {
         json!({
@@ -1771,6 +1822,26 @@ impl ToolRouter {
         }
 
         false
+    }
+
+    /// Whether a call of `tool_name` waits for its user at the approval gate
+    /// (AEGIS ADR-126 D1): the tool catalogue's entry is marked, or a
+    /// capability entry of the node configuration (a builtin dispatcher's or
+    /// an MCP server's) carries `requires_approval: true`. Either mark gates;
+    /// neither can clear the other.
+    pub fn requires_approval(&self, tool_name: &str) -> bool {
+        if BuiltinToolDefinition::lookup(tool_name).is_some_and(|d| d.requires_approval) {
+            return true;
+        }
+        if self
+            .builtin_dispatchers
+            .iter()
+            .flat_map(|d| d.capabilities.iter())
+            .any(|cap| cap.name == tool_name && cap.requires_approval)
+        {
+            return true;
+        }
+        self.mcp_approval_tools.contains(tool_name)
     }
 }
 
@@ -2284,6 +2355,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.agent.create".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2294,6 +2366,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.create".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2304,6 +2377,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.task.logs".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2314,6 +2388,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2390,6 +2465,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.cancel".to_string(),
                     skip_judge: false,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2400,6 +2476,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.signal".to_string(),
                     skip_judge: false,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2410,6 +2487,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.remove".to_string(),
                     skip_judge: false,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2420,6 +2498,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2515,6 +2594,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.task.execute".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2526,6 +2606,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.agent.generate".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2536,6 +2617,7 @@ mod tests {
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.execute.intent".to_string(),
                     skip_judge: true,
+                    requires_approval: false,
                 }],
                 api_key: None,
             },
@@ -2674,6 +2756,8 @@ mod tests {
         "aegis.edge.fleet.list",
         "aegis.edge.fleet.invoke",
         "aegis.edge.fleet.cancel",
+        // AEGIS ADR-126 D4: a read-only status lookup, added deliberately.
+        "aegis.approval.status",
     ];
 
     /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).
@@ -2895,5 +2979,48 @@ mod tests {
             description.contains(bound) && description.contains("offset"),
             "the description states the bound and the offset argument: {description}"
         );
+    }
+
+    /// AEGIS ADR-126 D1: a capability entry of the node configuration gates
+    /// its tool, a builtin dispatcher's or an MCP server's; no catalogue
+    /// entry is marked yet, so with no entry nothing is gated, and an entry
+    /// without the flag does not gate.
+    #[test]
+    fn requires_approval_follows_capability_entries_of_the_node_configuration() {
+        let registry: Arc<dyn ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(RwLock::new(HashMap::new()));
+        let plain = ToolRouter::new(
+            registry.clone(),
+            servers.clone(),
+            ToolRouter::builtin_dispatchers(),
+        );
+        for def in BUILTIN_TOOL_DEFINITIONS {
+            assert!(
+                !plain.requires_approval(def.name),
+                "{} is gated with no capability entry marking it",
+                def.name
+            );
+        }
+
+        let dispatchers = vec![BuiltinDispatcherConfig {
+            name: "aegis.system.info".to_string(),
+            description: "info".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
+                name: "aegis.system.info".to_string(),
+                skip_judge: true,
+                requires_approval: true,
+            }],
+            api_key: None,
+        }];
+        let mcp: Vec<crate::domain::node_config::McpServerConfig> = serde_yaml::from_str(
+            "- name: mail\n  executable: /bin/true\n  capabilities:\n    - name: gmail.send\n      requires_approval: true\n    - name: gmail.list\n",
+        )
+        .expect("MCP server entries parse");
+        let gated = ToolRouter::new(registry, servers, dispatchers).with_mcp_server_approvals(&mcp);
+        assert!(gated.requires_approval("aegis.system.info"));
+        assert!(gated.requires_approval("gmail.send"));
+        assert!(!gated.requires_approval("gmail.list"));
+        assert!(!gated.requires_approval("fs.read"));
     }
 }

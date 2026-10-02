@@ -966,6 +966,32 @@ pub enum MCPToolEvent {
         details: String,
         blocked_at: DateTime<Utc>,
     },
+
+    // ========== Tool Approval Events (ADR-126) ==========
+    /// A call of a gated tool is waiting for its user's answer; the call
+    /// returned `approval_pending` and the tool did not run.
+    ApprovalRequested {
+        approval_id: crate::domain::tool_approval::ToolApprovalId,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        tenant_id: crate::domain::tenant::TenantId,
+        user_sub: String,
+        tool_name: String,
+        summary: String,
+        requested_at: DateTime<Utc>,
+    },
+
+    /// A pending request was answered (`approved_once`, `approved_always`,
+    /// `denied`) or expired by the sweep (`expired`, `decided_by` none).
+    ApprovalDecided {
+        approval_id: crate::domain::tool_approval::ToolApprovalId,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        tool_name: String,
+        status: crate::domain::tool_approval::ToolApprovalStatus,
+        decided_by: Option<String>,
+        decided_at: DateTime<Utc>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

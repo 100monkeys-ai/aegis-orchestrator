@@ -1360,7 +1360,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             tool_registry.clone(),
             tool_servers.clone(),
             builtin_dispatchers,
-        ),
+        )
+        .with_mcp_server_approvals(config.spec.mcp_servers.as_deref().unwrap_or_default()),
     );
 
     // Build initial capabilities index
@@ -1887,6 +1888,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     } else {
         None
     };
+
+    // ─── Tool approval gate (AEGIS ADR-126) ─────────────────────────────────
+    // Requests and "always allow" policies live in PostgreSQL (migration
+    // 036), so a pending request outlives the agent and this process; a node
+    // without a database keeps them in process. The sweep expires requests
+    // pending for 72 hours, every ten minutes.
+    let tool_approval_repo: Arc<
+        dyn aegis_orchestrator_core::domain::tool_approval::ToolApprovalRepository,
+    > = match db_pool.as_ref() {
+        Some(pool) => Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::PostgresToolApprovalRepository::new(pool.clone()),
+        ),
+        None => Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository::new(),
+        ),
+    };
+    let tool_approval_service = Arc::new(
+        aegis_orchestrator_core::application::tool_approval_service::ToolApprovalService::new(
+            tool_approval_repo,
+            event_bus.clone(),
+        ),
+    );
+    tool_approval_service.clone().spawn_expiry_sweep(
+        aegis_orchestrator_core::application::tool_approval_service::EXPIRY_SWEEP_INTERVAL,
+    );
+    tool_invocation_service_builder =
+        tool_invocation_service_builder.with_tool_approvals(tool_approval_service);
 
     let tool_invocation_service = Arc::new(tool_invocation_service_builder);
 

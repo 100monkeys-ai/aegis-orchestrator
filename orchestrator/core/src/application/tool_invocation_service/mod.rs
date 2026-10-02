@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0
 
 mod agents;
+#[cfg(test)]
+mod approval_gate_tests;
+mod approvals;
 mod attachment_args;
 mod attachments;
 mod audit;
@@ -160,4 +163,7 @@ pub struct ToolInvocationService {
         Option<Arc<crate::application::edge::fleet::dispatcher::FleetDispatcher>>,
     /// ADR-117: cancel handle for fleet operations.
     edge_fleet_cancel: Option<Arc<crate::application::edge::fleet::CancelFleetService>>,
+    /// ADR-126: the approval gate; `None` leaves every tool ungated.
+    tool_approval_service:
+        Option<Arc<crate::application::tool_approval_service::ToolApprovalService>>,
 }

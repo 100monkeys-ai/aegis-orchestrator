@@ -61,6 +61,7 @@ pub mod postgres_script;
 pub mod postgres_storage_event;
 pub mod postgres_team;
 pub mod postgres_tenant;
+pub mod postgres_tool_approval;
 pub mod postgres_volume;
 pub use postgres_api_key::PostgresApiKeyRepository;
 pub use postgres_canvas::PostgresCanvasSessionRepository;

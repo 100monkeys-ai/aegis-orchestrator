@@ -88,6 +88,7 @@ pub mod supervisor;
 pub mod team;
 pub mod tenancy;
 pub mod tenant;
+pub mod tool_approval;
 pub mod validation;
 pub mod volume;
 pub mod workflow;

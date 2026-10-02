@@ -52,6 +52,7 @@ pub mod execution;
 pub mod lifecycle;
 pub mod schema_registry;
 pub mod scope_requester;
+pub mod tool_approval_service;
 pub mod tool_catalog;
 pub mod tool_invocation_service;
 pub mod tools;

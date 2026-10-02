@@ -31,6 +31,7 @@ pub(crate) mod swarms;
 pub(crate) mod tenant_provisioning;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod tool_approvals;
 pub(crate) mod volumes;
 pub(crate) mod workflow_executions;
 pub(crate) mod workflows;

@@ -1027,6 +1027,17 @@ pub struct CapabilityConfig {
     /// node configuration, not an agent-level privilege. Agents cannot influence this flag.
     #[serde(default)]
     pub skip_judge: bool,
+
+    /// When `true`, an agent's call of this tool waits for its user's answer
+    /// (approve once, always allow, deny) at the approval gate (AEGIS
+    /// ADR-126 D1): the call returns `approval_pending` and the tool runs
+    /// only on approval. Defaults to `false`.
+    ///
+    /// **Security note**: like `skip_judge`, an operator-level flag of the
+    /// node configuration. An agent manifest cannot clear it, and it cannot
+    /// clear a tool catalogue entry's own mark.
+    #[serde(default)]
+    pub requires_approval: bool,
 }
 
 /// Built-in tools configured directly inside the Orchestrator via Dispatch Protocol (ADR-040)
@@ -3384,5 +3395,18 @@ grpc_port: 50051
         }
         assert_eq!(manifest.spec.llm_selection.llm_overall_timeout_secs, 300);
         assert_eq!(manifest.spec.llm_selection.max_retries, 3);
+    }
+
+    /// A capability entry carries `requires_approval` (AEGIS ADR-126 D1);
+    /// an entry that does not name it is not gated.
+    #[test]
+    fn capability_requires_approval_parses_and_defaults_to_false() {
+        let capabilities: Vec<CapabilityConfig> = serde_yaml::from_str(
+            "- name: aegis.system.info\n  skip_judge: true\n  requires_approval: true\n- name: fs.read\n",
+        )
+        .expect("capability entries parse");
+        assert!(capabilities[0].requires_approval);
+        assert!(capabilities[0].skip_judge);
+        assert!(!capabilities[1].requires_approval);
     }
 }
