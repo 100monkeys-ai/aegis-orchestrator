@@ -217,7 +217,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("fs.grep", "Recursively searches for a regex pattern within files in a given directory.").skip_judge(),
     BuiltinToolDefinition::new("fs.glob", "Recursively matches files against a glob pattern.").skip_judge(),
     BuiltinToolDefinition::new("web.search", "Performs an internet search query.").skip_judge(),
-    BuiltinToolDefinition::new("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown.").skip_judge(),
+    BuiltinToolDefinition::new("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown. Returns at most 50,000 characters of the page per call: a longer page comes back cut, with truncated, total_chars, next_offset and a notice, and the offset argument reads on.").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
@@ -790,6 +790,11 @@ impl ToolRouter {
                 "url": {
                     "type": "string",
                     "description": "URL to fetch content from."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Character position in the page to start from (default 0). One call returns at most 50,000 characters; when the page is longer the result says truncated, total_chars and next_offset, and calling again with the same url and offset set to next_offset reads the next part."
                 }
             },
             "required": ["url"]
@@ -2859,5 +2864,36 @@ mod tests {
     fn schema_for_builtin_returns_empty_object_for_unknown_tool() {
         let bogus = ToolRouter::schema_for_builtin("totally.unknown.tool");
         assert_eq!(bogus, json!({ "type": "object" }));
+    }
+
+    /// web.fetch's schema and description state the bound on what one call
+    /// returns and the argument that reads on (AEGIS ADR-124, the measured
+    /// Update of 2026-10-01).
+    #[test]
+    fn web_fetch_schema_states_the_bound_and_the_offset_argument() {
+        use crate::application::tools::builtin_web::WEB_FETCH_MAX_CHARS;
+        let bound = "50,000";
+        assert_eq!(WEB_FETCH_MAX_CHARS, 50_000, "the stated bound is the bound");
+
+        let schema = ToolRouter::schema_for_builtin("web.fetch");
+        let offset = &schema["properties"]["offset"];
+        assert_eq!(offset["type"], json!("integer"), "schema: {schema}");
+        assert_eq!(offset["minimum"], json!(0), "schema: {schema}");
+        let offset_doc = offset["description"].as_str().unwrap_or_default();
+        assert!(
+            offset_doc.contains(bound) && offset_doc.contains("next_offset"),
+            "the offset argument states the bound and how to read on: {offset_doc}"
+        );
+        assert_eq!(schema["required"], json!(["url"]), "offset is optional");
+
+        let description = BUILTIN_TOOL_DEFINITIONS
+            .iter()
+            .find(|d| d.name == "web.fetch")
+            .expect("web.fetch is a builtin")
+            .description;
+        assert!(
+            description.contains(bound) && description.contains("offset"),
+            "the description states the bound and the offset argument: {description}"
+        );
     }
 }
