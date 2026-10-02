@@ -19,13 +19,12 @@ use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution as TemporalWorkflowExecution;
-use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::workflowservice::v1::{
-    DeleteWorkflowExecutionRequest, RequestCancelWorkflowExecutionRequest,
-};
+use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::workflowservice::v1::DeleteWorkflowExecutionRequest;
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
+use crate::daemon::ports::{cancel_workflow_run, CancelOutcome, TemporalGrpcRunControl};
 use crate::daemon::state::AppState;
 use crate::daemon::temporal_helpers::{connect_temporal_workflow_client, temporal_namespace};
 
@@ -955,49 +954,44 @@ pub(crate) async fn cancel_workflow_execution_handler(
                 .into_response());
         }
     }
-    let namespace = match temporal_namespace(&state.config) {
-        Ok(namespace) => namespace,
-        Err(error) => {
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": error.to_string()})),
-            )
-                .into_response());
-        }
-    };
-
-    match connect_temporal_workflow_client(&state.config).await {
-        Ok(mut client) => {
-            let request = RequestCancelWorkflowExecutionRequest {
-                namespace,
-                workflow_execution: Some(TemporalWorkflowExecution {
-                    workflow_id: execution_id.to_string(),
-                    run_id: String::new(),
-                }),
-                identity: "aegis-daemon".to_string(),
-                request_id: Uuid::new_v4().to_string(),
-                first_execution_run_id: String::new(),
-                reason: "Cancelled by aegis workflow cancel".to_string(),
-                links: Vec::new(),
-            };
-            match client.request_cancel_workflow_execution(request).await {
-                Ok(_) => Ok((
-                    StatusCode::ACCEPTED,
-                    Json(serde_json::json!({
-                        "status": "cancel_requested",
-                        "execution_id": execution_id
-                    })),
-                )
-                    .into_response()),
-                Err(error) => Ok((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": error.to_string()})),
-                )
-                    .into_response()),
-            }
-        }
-        Err(error) => Ok((
+    if let Err(error) = temporal_namespace(&state.config) {
+        return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response());
+    }
+
+    match cancel_workflow_run(
+        &TemporalGrpcRunControl {
+            config: &state.config,
+        },
+        &state.workflow_execution_repo,
+        &state.event_bus,
+        &tenant_id,
+        ExecutionId(execution_id),
+        "Cancelled by aegis workflow cancel",
+    )
+    .await
+    {
+        Ok(CancelOutcome::CancelRequested) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "cancel_requested",
+                "execution_id": execution_id
+            })),
+        )
+            .into_response()),
+        Ok(CancelOutcome::Ended) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "cancelled",
+                "execution_id": execution_id
+            })),
+        )
+            .into_response()),
+        Err(error) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response()),

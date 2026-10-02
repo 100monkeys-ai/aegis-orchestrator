@@ -1743,6 +1743,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_workflow_execution_control(Arc::new(DaemonWorkflowExecutionControl {
             config: config.clone(),
             temporal_client_container: temporal_client_container.clone(),
+            workflow_execution_repo: workflow_execution_repo.clone(),
+            event_bus: event_bus.clone(),
         }))
         .with_agent_activity(Arc::new(DaemonAgentActivity {
             execution_repo: execution_repo.clone(),

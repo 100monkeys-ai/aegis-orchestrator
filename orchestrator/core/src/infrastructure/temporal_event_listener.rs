@@ -60,7 +60,7 @@ use crate::application::complete_workflow_execution::{
     StandardCompleteWorkflowExecutionUseCase,
 };
 use crate::domain::events::{ContainerRunEvent, ContainerRunFailureReason, WorkflowEvent};
-use crate::domain::execution::ExecutionId;
+use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use crate::domain::repository::WorkflowExecutionRepository;
 use crate::domain::shared_kernel::VolumeId;
 use crate::domain::tenant::TenantId;
@@ -225,6 +225,14 @@ pub struct TemporalEventPayload {
     #[serde(default)]
     pub failed_at_state: Option<String>,
 
+    /// The state's visit limit (WorkflowStateVisitLimitExceeded)
+    #[serde(default)]
+    pub max_visits: Option<u32>,
+
+    /// The state's visits before the refused one (WorkflowStateVisitLimitExceeded)
+    #[serde(default)]
+    pub actual_visits: Option<u32>,
+
     /// Event timestamp
     pub timestamp: String,
 }
@@ -384,6 +392,31 @@ impl TemporalEventMapper {
                     .error
                     .clone()
                     .ok_or_else(|| anyhow!("error required for WorkflowExecutionFailed event"))?;
+
+                Ok(WorkflowEvent::WorkflowExecutionFailed {
+                    execution_id,
+                    reason,
+                    failed_at: timestamp,
+                })
+            }
+
+            // A state entered more often than its `max_state_visits` ends the
+            // run: the worker returns `failed` after this event, and before the
+            // worker of `temporal-visit-limit-terminal` it sent no
+            // WorkflowExecutionFailed, so this event is the execution's failure.
+            "WorkflowStateVisitLimitExceeded" => {
+                let state_name = payload.state_name.clone().ok_or_else(|| {
+                    anyhow!("state_name required for WorkflowStateVisitLimitExceeded event")
+                })?;
+                let max_visits = payload.max_visits.ok_or_else(|| {
+                    anyhow!("max_visits required for WorkflowStateVisitLimitExceeded event")
+                })?;
+                let mut reason = format!(
+                    "State \"{state_name}\" exceeded max_state_visits limit of {max_visits}"
+                );
+                if let Some(actual_visits) = payload.actual_visits {
+                    reason.push_str(&format!(" ({actual_visits} visits)"));
+                }
 
                 Ok(WorkflowEvent::WorkflowExecutionFailed {
                     execution_id,
@@ -654,6 +687,29 @@ impl TemporalEventListener {
             .await
             .context("Failed to resolve workflow execution tenant")?
             .ok_or_else(|| anyhow!("Workflow execution not found: {}", execution_id.0))?;
+
+        // A run ends once: after WorkflowStateVisitLimitExceeded the worker of
+        // `temporal-visit-limit-terminal` also sends WorkflowExecutionFailed,
+        // and a cancel may have ended the record first. A terminal event for an
+        // execution already terminal changes nothing.
+        let current = self
+            .execution_repository
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .context("Failed to load workflow execution")?
+            .ok_or_else(|| anyhow!("Workflow execution not found: {}", execution_id.0))?;
+        if matches!(
+            current.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+        ) {
+            tracing::info!(
+                execution_id = %execution_id.0,
+                status = ?current.status,
+                event_type = %payload.event_type,
+                "Workflow execution already terminal; terminal event changes nothing"
+            );
+            return Ok(());
+        }
 
         let completion_request = match domain_event {
             WorkflowEvent::WorkflowExecutionCompleted { .. } => CompleteWorkflowExecutionRequest {
@@ -1515,5 +1571,134 @@ mod tests {
             }
             other => panic!("expected workflow completion event, got {other:?}"),
         }
+    }
+
+    /// The worker's payload for a state over its `max_state_visits`, as
+    /// `aegis-workflow.ts` emits it (8a9b9c1, lines 269-299).
+    fn visit_limit_payload(execution_id: ExecutionId, workflow: &Workflow) -> TemporalEventPayload {
+        serde_json::from_value(json!({
+            "event_type": "WorkflowStateVisitLimitExceeded",
+            "execution_id": execution_id.to_string(),
+            "temporal_sequence_number": 41,
+            "workflow_id": workflow.id.to_string(),
+            "timestamp": "2026-10-01T22:55:24.939Z",
+            "state_name": "END",
+            "max_visits": 2,
+            "actual_visits": 2
+        }))
+        .expect("the worker's visit-limit payload deserializes")
+    }
+
+    async fn running_execution(
+        tenant_id: &TenantId,
+    ) -> (
+        Workflow,
+        ExecutionId,
+        Arc<InMemoryWorkflowExecutionRepository>,
+    ) {
+        let workflow = build_test_workflow("listener-visit-limit");
+        let execution_id = ExecutionId::new();
+        let execution = WorkflowExecution::new(&workflow, execution_id, json!({"task": "loop"}));
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        repo.save_for_tenant(tenant_id, &execution).await.unwrap();
+        (workflow, execution_id, repo)
+    }
+
+    /// A state over its visit limit ends the workflow execution: the worker
+    /// returns without WorkflowExecutionFailed (8a9b9c1), so the
+    /// WorkflowStateVisitLimitExceeded event is the execution's failure, with
+    /// the state and the limit in its reason.
+    #[tokio::test]
+    async fn visit_limit_exceeded_event_fails_the_workflow_execution() {
+        let tenant_id = TenantId::from_string("tenant-blue").unwrap();
+        let (workflow, execution_id, repo) = running_execution(&tenant_id).await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let listener = TemporalEventListener::new(event_bus.clone(), repo.clone());
+        let mut receiver = event_bus.subscribe();
+
+        listener
+            .handle_event(visit_limit_payload(execution_id, &workflow))
+            .await
+            .expect("the visit-limit event is handled");
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status,
+            crate::domain::execution::ExecutionStatus::Failed
+        );
+        assert_eq!(saved.current_state.as_str(), "END");
+
+        match receiver.recv().await.unwrap() {
+            DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionFailed {
+                execution_id: published_id,
+                reason,
+                ..
+            }) => {
+                assert_eq!(published_id, execution_id);
+                assert_eq!(
+                    reason,
+                    "State \"END\" exceeded max_state_visits limit of 2 (2 visits)"
+                );
+            }
+            other => panic!("expected workflow failure event, got {other:?}"),
+        }
+    }
+
+    /// A worker that also emits WorkflowExecutionFailed after the visit-limit
+    /// event (the peer `temporal-visit-limit-terminal`'s worker): the second
+    /// terminal event changes nothing and is not an error.
+    #[tokio::test]
+    async fn workflow_execution_failed_after_the_visit_limit_changes_nothing() {
+        let tenant_id = TenantId::from_string("tenant-blue").unwrap();
+        let (workflow, execution_id, repo) = running_execution(&tenant_id).await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let listener = TemporalEventListener::new(event_bus.clone(), repo.clone());
+
+        listener
+            .handle_event(visit_limit_payload(execution_id, &workflow))
+            .await
+            .expect("the visit-limit event is handled");
+        let after_limit = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut receiver = event_bus.subscribe();
+
+        let failed = TemporalEventPayload {
+            event_type: "WorkflowExecutionFailed".to_string(),
+            execution_id: execution_id.to_string(),
+            temporal_sequence_number: 42,
+            workflow_id: Some(workflow.id.to_string()),
+            state_name: Some("START".to_string()),
+            error: Some("State \"END\" exceeded max_state_visits limit of 2".to_string()),
+            final_blackboard: Some(json!({"late": true})),
+            timestamp: "2026-10-01T22:55:25Z".to_string(),
+            ..Default::default()
+        };
+        listener
+            .handle_event(failed)
+            .await
+            .expect("a terminal event after the visit limit is not an error");
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status,
+            crate::domain::execution::ExecutionStatus::Failed
+        );
+        assert_eq!(saved.current_state, after_limit.current_state);
+        assert_eq!(saved.blackboard.get("late"), None);
+        assert!(
+            receiver.try_recv().is_err(),
+            "no second terminal event is published"
+        );
     }
 }
