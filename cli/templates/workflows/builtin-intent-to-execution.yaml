@@ -175,7 +175,9 @@ spec:
     EXECUTION_FAILED:
       kind: System
       max_state_visits: 2
-      command: "echo 'Pipeline failed at EXECUTE_CODE, exit_code={{blackboard.EXECUTE_CODE.output.exit_code}}'"
+      command: 'echo "Pipeline failed at EXECUTE_CODE, exit_code=$EXIT_CODE"'
+      env:
+        EXIT_CODE: "{{blackboard.EXECUTE_CODE.output.exit_code}}"
       transitions:
         - condition: on_success
           target: WRITE_CODE

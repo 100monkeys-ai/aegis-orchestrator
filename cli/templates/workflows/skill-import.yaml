@@ -13,7 +13,13 @@ metadata:
     properties:
       skill_url:
         type: string
-        description: URL of the SKILL.md file to import
+        description: >-
+          URL of the SKILL.md file to import: http:// or https://, a host of
+          letters, digits, dots and hyphens, an optional :port, then an optional
+          path, query and fragment of letters, digits and - . _ ~ % / ? # & = + , : @
+          (no quote, space, semicolon, $, backtick, parenthesis or user info).
+        maxLength: 2048
+        pattern: "^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?([/?#][A-Za-z0-9._~%/?#&=+,:@-]*)?$"
       agent_name_override:
         type: string
         description: Optional override for the agent name derived from the skill
@@ -24,15 +30,21 @@ spec:
   context:
     security_preset: "minimal"
   states:
+    # A System state's command runs with `sh -c` in the core process, so no
+    # value is ever spliced into it: values arrive through `env` and the
+    # command names them in double-quoted expansions. A System state's output
+    # is {status, exit_code, stdout, stderr}, so the body is FETCH.stdout.
     FETCH:
       kind: System
-      command: "curl -sfL '{{input.skill_url}}' -o /tmp/skill.md"
+      command: 'curl -fsSL --proto =http,https --proto-redir =http,https -- "$SKILL_URL"'
+      env:
+        SKILL_URL: "{{{input.skill_url}}}"
       transitions:
         - condition: exit_code_zero
           target: PARSE_AND_VALIDATE
         - condition: exit_code_non_zero
           target: FAILED
-          feedback: "Failed to fetch SKILL.md from {{input.skill_url}}: {{FETCH.output.stderr}}"
+          feedback: "Failed to fetch SKILL.md from {{{input.skill_url}}}: {{{FETCH.stderr}}}"
 
     PARSE_AND_VALIDATE:
       kind: Agent
@@ -41,7 +53,7 @@ spec:
         Parse and validate the following SKILL.md content. Extract structured data and assess safety.
 
         SKILL.md content:
-        {{FETCH.output.stdout}}
+        {{{FETCH.stdout}}}
 
         Output a JSON object with these fields:
         - name: skill name from frontmatter
@@ -129,13 +141,15 @@ spec:
 
     REGISTER:
       kind: System
-      command: "echo '{{COMPOSE_MANIFEST.output}}' > /tmp/agent-manifest.yaml && aegis agent deploy /tmp/agent-manifest.yaml"
+      command: 'manifest="$(mktemp)" && printf "%s\n" "$SKILL_MANIFEST" > "$manifest" && aegis agent deploy "$manifest"; status=$?; rm -f "$manifest"; exit "$status"'
+      env:
+        SKILL_MANIFEST: "{{{COMPOSE_MANIFEST.output}}}"
       transitions:
         - condition: exit_code_zero
           target: COMPLETE
         - condition: exit_code_non_zero
           target: FAILED
-          feedback: "Agent registration failed: {{REGISTER.output.stderr}}"
+          feedback: "Agent registration failed: {{{REGISTER.stderr}}}"
 
     COMPLETE:
       kind: System

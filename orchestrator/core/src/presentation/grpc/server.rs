@@ -3550,4 +3550,426 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().0, exec_id);
     }
+
+    /// The built-in `skill-import` workflow's System states, run the way the
+    /// Temporal worker and this server run them: the worker renders a System
+    /// state's `command` and every `env` value against the blackboard
+    /// (`aegis-temporal-worker` `ad1ba6c` `src/workflows/aegis-workflow.ts`
+    /// 712-733) and sends them to `execute_system_command`, which runs the
+    /// command with `sh -c` and the env values as the process environment.
+    /// `curl` and `aegis` are stubs on `PATH` that record what they receive.
+    #[cfg(unix)]
+    mod skill_import_system_states {
+        use super::*;
+        use crate::application::ports::{StartWorkflowParams, WorkflowEnginePort};
+        use crate::application::start_workflow_execution::{
+            StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
+            StartWorkflowExecutionUseCase,
+        };
+        use crate::domain::repository::WorkflowRepository;
+        use crate::domain::workflow::StateKind;
+        use crate::infrastructure::repositories::{
+            InMemoryWorkflowExecutionRepository, InMemoryWorkflowRepository,
+        };
+        use crate::infrastructure::workflow_parser::WorkflowParser;
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+
+        const SKILL_IMPORT: &str =
+            include_str!("../../../../../cli/templates/workflows/skill-import.yaml");
+
+        /// Handlebars 4.7.9's `escapeExpression` (`lib/handlebars/utils.js`
+        /// 1-9), which the worker's `renderTemplate` applies to every `{{…}}`
+        /// because it compiles with the default options
+        /// (`aegis-workflow.ts` 1330-1339); `{{{…}}}` is not escaped.
+        fn worker_escape(data: &str) -> String {
+            let mut out = String::with_capacity(data.len());
+            for c in data.chars() {
+                match c {
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '"' => out.push_str("&quot;"),
+                    '\'' => out.push_str("&#x27;"),
+                    '`' => out.push_str("&#x60;"),
+                    '=' => out.push_str("&#x3D;"),
+                    other => out.push(other),
+                }
+            }
+            out
+        }
+
+        /// The worker's `renderTemplate`: the blackboard is also exposed
+        /// under `blackboard`, and a missing path renders as "".
+        fn render_like_worker(template: &str, blackboard: &serde_json::Value) -> String {
+            let mut handlebars = handlebars::Handlebars::new();
+            handlebars.register_escape_fn(worker_escape);
+            let mut context = blackboard.clone();
+            context["blackboard"] = blackboard.clone();
+            handlebars
+                .render_template(template, &context)
+                .expect("template renders")
+        }
+
+        fn system_state(name: &str) -> (String, HashMap<String, String>) {
+            let workflow = WorkflowParser::parse_yaml(SKILL_IMPORT).expect("skill-import parses");
+            let (_, state) = workflow
+                .spec
+                .states
+                .iter()
+                .find(|(state_name, _)| state_name.as_str() == name)
+                .unwrap_or_else(|| panic!("skill-import has a {name} state"));
+            match &state.kind {
+                StateKind::System { command, env, .. } => (command.clone(), env.clone()),
+                _ => panic!("{name} is a System state"),
+            }
+        }
+
+        fn agent_state_input(name: &str) -> String {
+            let raw: serde_yaml::Value = serde_yaml::from_str(SKILL_IMPORT).unwrap();
+            raw["spec"]["states"][name]["input"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name} has an input"))
+                .to_string()
+        }
+
+        /// Stub programs: `curl` writes each argument to `curl-arg-<n>` and
+        /// prints `body` to stdout, or to `curl-output-file` when given `-o`;
+        /// `aegis` writes its arguments to `aegis-argv` and copies the file it
+        /// is given (its third argument) to `aegis-manifest`.
+        fn write_stubs(dir: &Path) -> std::path::PathBuf {
+            let bin = dir.join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let curl = "#!/bin/sh\n\
+                i=0; out=\"\"; prev=\"\"\n\
+                for a in \"$@\"; do\n\
+                  i=$((i+1)); printf '%s' \"$a\" > \"$STUB_DIR/curl-arg-$i\"\n\
+                  [ \"$prev\" = \"-o\" ] && out=\"$a\"\n\
+                  prev=\"$a\"\n\
+                done\n\
+                if [ -n \"$out\" ]; then cat \"$STUB_DIR/body\" > \"$STUB_DIR/curl-output-file\"; \
+                else cat \"$STUB_DIR/body\"; fi\n";
+            let aegis = "#!/bin/sh\n\
+                printf '%s\\n' \"$@\" > \"$STUB_DIR/aegis-argv\"\n\
+                cp \"$3\" \"$STUB_DIR/aegis-manifest\"\n";
+            for (name, text) in [("curl", curl), ("aegis", aegis)] {
+                let path = bin.join(name);
+                std::fs::write(&path, text).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            bin
+        }
+
+        /// A System state's request as the worker builds it, with the stubs
+        /// first on `PATH`, `STUB_DIR` and `TMPDIR` set to the scratch
+        /// directory, and the scratch directory as the working directory.
+        fn worker_request(
+            command: &str,
+            env: &HashMap<String, String>,
+            blackboard: &serde_json::Value,
+            dir: &Path,
+            bin: &Path,
+        ) -> ExecuteSystemCommandRequest {
+            let mut rendered: HashMap<String, String> = env
+                .iter()
+                .map(|(key, value)| (key.clone(), render_like_worker(value, blackboard)))
+                .collect();
+            rendered.insert(
+                "PATH".to_string(),
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+            rendered.insert("STUB_DIR".to_string(), dir.display().to_string());
+            rendered.insert("TMPDIR".to_string(), dir.display().to_string());
+            ExecuteSystemCommandRequest {
+                command: render_like_worker(command, blackboard),
+                env: rendered,
+                workdir: Some(dir.display().to_string()),
+                timeout_seconds: Some(30),
+            }
+        }
+
+        fn service() -> AegisRuntimeService {
+            let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+                execution_id: ExecutionId::new(),
+                stream_events: Vec::new(),
+                persisted_execution: None,
+                tenant_lookups: Mutex::new(Vec::new()),
+            });
+            let validation_service = test_validation_service(execution_service.clone());
+            AegisRuntimeService::new(execution_service, validation_service)
+        }
+
+        async fn run(request: ExecuteSystemCommandRequest) -> ExecuteSystemCommandResponse {
+            service()
+                .execute_system_command(Request::new(request))
+                .await
+                .expect("execute_system_command answers")
+                .into_inner()
+        }
+
+        /// The output a System state leaves on the blackboard
+        /// (`aegis-temporal-worker` `ad1ba6c` `src/activities/index.ts` 264-269).
+        fn system_state_output(response: &ExecuteSystemCommandResponse) -> serde_json::Value {
+            serde_json::json!({
+                "status": if response.exit_code == 0 { "success" } else { "failed" },
+                "exit_code": response.exit_code,
+                "stdout": response.stdout,
+                "stderr": response.stderr,
+            })
+        }
+
+        fn curl_args(dir: &Path) -> Vec<String> {
+            (1..)
+                .map(|n| dir.join(format!("curl-arg-{n}")))
+                .take_while(|path| path.exists())
+                .map(|path| std::fs::read_to_string(path).unwrap())
+                .collect()
+        }
+
+        /// The regression: FETCH wrote the body to a file and PARSE_AND_VALIDATE
+        /// read `FETCH.output.stdout`, a path a System state's output does not
+        /// have, so the validator was asked to judge "" (production runs
+        /// e48925b3 and a1ccc8a5 on `sha-3618e47`). The fetched body, quotes,
+        /// angle brackets, ampersands and equals signs included, must reach
+        /// the validator's prompt as it was served.
+        #[tokio::test]
+        async fn skill_import_fetch_body_reaches_parse_and_validate_prompt() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = write_stubs(dir.path());
+            let body = "---\nname: weather-note\ndescription: \"it's <short> & sweet = yes\"\n\
+                        allowed-tools: [web.fetch]\n---\n\nWrite a `haiku` about $WEATHER.\n";
+            std::fs::write(dir.path().join("body"), body).unwrap();
+
+            let skill_url = "https://example.com/skills/weather-note/SKILL.md";
+            let mut blackboard = serde_json::json!({ "input": { "skill_url": skill_url } });
+            let (command, env) = system_state("FETCH");
+            let response = run(worker_request(
+                &command,
+                &env,
+                &blackboard,
+                dir.path(),
+                &bin,
+            ))
+            .await;
+            assert_eq!(response.exit_code, 0, "FETCH exits 0: {response:?}");
+
+            blackboard["FETCH"] = system_state_output(&response);
+            let prompt = render_like_worker(&agent_state_input("PARSE_AND_VALIDATE"), &blackboard);
+            assert!(
+                prompt.contains(body),
+                "PARSE_AND_VALIDATE's prompt must hold the fetched SKILL.md verbatim; it is:\n{prompt}"
+            );
+        }
+
+        /// FETCH receives the caller's `skill_url`: a value carrying a quote,
+        /// a semicolon and command substitutions must reach `curl` as one
+        /// argument, byte for byte, and no second command may run.
+        #[tokio::test]
+        async fn skill_import_fetch_passes_skill_url_to_curl_as_one_argument() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = write_stubs(dir.path());
+            std::fs::write(dir.path().join("body"), "body").unwrap();
+            let marker = dir.path().join("MARKER");
+            let skill_url = format!(
+                "https://example.com/a'; touch {m}; echo '$(touch {m})`touch {m}`",
+                m = marker.display()
+            );
+
+            let blackboard = serde_json::json!({ "input": { "skill_url": skill_url } });
+            let (command, env) = system_state("FETCH");
+            let response = run(worker_request(
+                &command,
+                &env,
+                &blackboard,
+                dir.path(),
+                &bin,
+            ))
+            .await;
+
+            assert!(
+                !marker.exists(),
+                "a second command ran from skill_url: {response:?}"
+            );
+            let args = curl_args(dir.path());
+            assert!(
+                args.iter().any(|arg| arg == &skill_url),
+                "curl must receive skill_url as one argument, byte for byte; it received {args:?}"
+            );
+        }
+
+        /// REGISTER receives COMPOSE_MANIFEST's output, text a model wrote
+        /// from community content: it must reach `aegis agent deploy` byte for
+        /// byte, through the file it deploys, and no second command may run.
+        #[tokio::test]
+        async fn skill_import_register_passes_manifest_verbatim_and_runs_no_second_command() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = write_stubs(dir.path());
+            let marker = dir.path().join("MARKER");
+            let manifest = format!(
+                "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: x'; touch {m}; echo '\n  \
+                 description: \"a <b> & c = d\" $(touch {m}) `touch {m}`\n",
+                m = marker.display()
+            );
+
+            let blackboard = serde_json::json!({
+                "input": { "skill_url": "https://example.com/SKILL.md" },
+                "COMPOSE_MANIFEST": {
+                    "status": "completed",
+                    "output": manifest,
+                    "iterations": 1,
+                    "execution_id": "00000000-0000-0000-0000-000000000000",
+                },
+            });
+            let (command, env) = system_state("REGISTER");
+            let response = run(worker_request(
+                &command,
+                &env,
+                &blackboard,
+                dir.path(),
+                &bin,
+            ))
+            .await;
+
+            assert!(
+                !marker.exists(),
+                "a second command ran from the manifest text: {response:?}"
+            );
+            let deployed = std::fs::read_to_string(dir.path().join("aegis-manifest"))
+                .unwrap_or_else(|e| {
+                    panic!("aegis agent deploy was not given a file ({e}): {response:?}")
+                });
+            assert_eq!(
+                deployed.trim_end_matches('\n'),
+                manifest.trim_end_matches('\n'),
+                "aegis agent deploy must receive COMPOSE_MANIFEST's output byte for byte"
+            );
+            let argv = std::fs::read_to_string(dir.path().join("aegis-argv")).unwrap();
+            assert!(argv.starts_with("agent\ndeploy\n"), "argv: {argv:?}");
+        }
+
+        /// The means a System state receives a value without shell text: a
+        /// value in the request's `env` reaches the program as one argument
+        /// through a quoted expansion, and nothing in it runs.
+        #[tokio::test]
+        async fn system_command_env_value_reaches_program_as_one_argument() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("MARKER");
+            let value = format!(
+                "a'; touch {m}; echo '\" $(touch {m}) `touch {m}` \\ \n done",
+                m = marker.display()
+            );
+            let response = run(ExecuteSystemCommandRequest {
+                command: "printf '%s' \"$VALUE\"".to_string(),
+                env: HashMap::from([("VALUE".to_string(), value.clone())]),
+                workdir: Some(dir.path().display().to_string()),
+                timeout_seconds: Some(30),
+            })
+            .await;
+            assert_eq!(response.exit_code, 0, "{response:?}");
+            assert_eq!(response.stdout, value);
+            assert!(!marker.exists(), "a second command ran from the env value");
+        }
+
+        struct RecordingEngine {
+            starts: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl WorkflowEnginePort for RecordingEngine {
+            async fn register_workflow(
+                &self,
+                _definition: &crate::application::temporal_mapper::TemporalWorkflowDefinition,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn start_workflow(&self, _params: StartWorkflowParams<'_>) -> Result<String> {
+                *self.starts.lock().unwrap() += 1;
+                Ok("run".to_string())
+            }
+        }
+
+        /// A `skill_url` that is not an http or https URL of the form the
+        /// template states is refused when the run is asked for, before the
+        /// workflow engine is called and so before any state's command runs.
+        #[tokio::test]
+        async fn skill_import_refuses_skill_url_not_of_its_form_before_any_state_runs() {
+            let workflow = WorkflowParser::parse_yaml(SKILL_IMPORT).unwrap();
+            let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+            workflow_repo
+                .save_for_tenant(&TenantId::consumer(), &workflow)
+                .await
+                .unwrap();
+            let engine = Arc::new(RecordingEngine {
+                starts: Mutex::new(0),
+            });
+            let use_case = StandardStartWorkflowExecutionUseCase::new(
+                workflow_repo,
+                Arc::new(InMemoryWorkflowExecutionRepository::new()),
+                Arc::new(tokio::sync::RwLock::new(Some(
+                    engine.clone() as Arc<dyn WorkflowEnginePort>
+                ))),
+                Arc::new(EventBus::new(8)),
+            );
+            let start = |skill_url: &str| StartWorkflowExecutionRequest {
+                workflow_id: "skill-import".to_string(),
+                input: serde_json::json!({ "skill_url": skill_url }),
+                blackboard: None,
+                version: None,
+                tenant_id: Some(TenantId::consumer()),
+                security_context_name: None,
+                intent: None,
+            };
+
+            for refused in [
+                "https://example.com/a'b/SKILL.md",
+                "https://example.com/a b/SKILL.md",
+                "https://example.com/a;b/SKILL.md",
+                "https://example.com/SKILL.md'; touch /tmp/x; echo '",
+                "file:///etc/passwd",
+                "ftp://example.com/SKILL.md",
+                "gopher://example.com/SKILL.md",
+                "javascript:alert(1)",
+                "example.com/SKILL.md",
+                "https://user:secret@example.com/SKILL.md",
+                "https://example.com/$(id)",
+                "https://example.com/`id`",
+                "https://example.com/SKILL.md\n",
+                "",
+            ] {
+                let err = use_case
+                    .start_execution(start(refused))
+                    .await
+                    .expect_err(&format!("skill_url {refused:?} must be refused"));
+                assert!(
+                    err.to_string().contains("Input validation failed"),
+                    "skill_url {refused:?}: expected an input validation error, got: {err}"
+                );
+            }
+            assert_eq!(
+                *engine.starts.lock().unwrap(),
+                0,
+                "no refused skill_url may reach the workflow engine"
+            );
+
+            let accepted = [
+                "https://raw.githubusercontent.com/org/repo/main/skills/weather-note/SKILL.md",
+                "http://example.com:8080/skills/SKILL.md?ref=main&raw=1#top",
+                "https://httpbin.org/base64/LS0tCm5hbWU6IHgKLS0t",
+                "https://example.com/~user/a%20b/SKILL.md",
+            ];
+            for skill_url in accepted {
+                use_case
+                    .start_execution(start(skill_url))
+                    .await
+                    .unwrap_or_else(|e| panic!("skill_url {skill_url:?} must be accepted: {e}"));
+            }
+            assert_eq!(*engine.starts.lock().unwrap(), accepted.len());
+        }
+    }
 }

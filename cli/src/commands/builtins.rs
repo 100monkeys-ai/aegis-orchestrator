@@ -713,6 +713,55 @@ mod tests {
         }
     }
 
+    /// No built-in workflow splices an input or a state's output into shell
+    /// text: a System state's `command` runs with `sh -c` inside the core
+    /// process (`orchestrator/core/src/presentation/grpc/server.rs`
+    /// `execute_system_command`), and a ContainerRun state with `shell: true`
+    /// runs its joined command with `sh -c`, so a template expression there
+    /// would be parsed by a shell. A value reaches such a state through `env`,
+    /// which the worker renders and the process receives as its environment,
+    /// and the command names it in a double-quoted expansion.
+    #[test]
+    fn no_builtin_workflow_splices_a_value_into_shell_text() {
+        use aegis_orchestrator_core::domain::workflow::StateKind;
+
+        let mut splices = Vec::new();
+        for (name, yaml) in BUILTIN_WORKFLOWS {
+            let workflow =
+                aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                    yaml,
+                )
+                .unwrap();
+            for (state_name, state) in &workflow.spec.states {
+                let shell_text = match &state.kind {
+                    StateKind::System { command, .. } => Some(command.clone()),
+                    StateKind::ContainerRun { command, shell, .. } if *shell => {
+                        Some(command.join(" "))
+                    }
+                    StateKind::ParallelContainerRun { steps, .. } => {
+                        let joined: Vec<String> = steps
+                            .iter()
+                            .filter(|step| step.shell)
+                            .map(|step| step.command.join(" "))
+                            .collect();
+                        (!joined.is_empty()).then(|| joined.join("\n"))
+                    }
+                    _ => None,
+                };
+                if let Some(text) = shell_text {
+                    if text.contains("{{") {
+                        splices.push(format!("{name} {}: {text}", state_name.as_str()));
+                    }
+                }
+            }
+        }
+        assert!(
+            splices.is_empty(),
+            "these states splice a template expression into shell text:\n{}",
+            splices.join("\n")
+        );
+    }
+
     /// Regression test for ADR-113 attachment-layering bug.
     ///
     /// The three generation entry-point templates (agent-creator-agent,
