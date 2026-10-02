@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod down;
 pub mod edge;
 pub mod fuse_daemon;
+mod fuse_mount_cleanup;
 pub mod init;
 pub mod node;
 pub mod restart;

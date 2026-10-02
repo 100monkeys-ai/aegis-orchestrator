@@ -39,6 +39,7 @@ use aegis_orchestrator_core::infrastructure::fuse::daemon::{
 };
 use aegis_orchestrator_core::infrastructure::fuse::grpc_backend::GrpcFsalBackend;
 
+use super::fuse_mount_cleanup::{cleanup_stale_mounts, HostMountSystem};
 use crate::output::OutputFormat;
 
 #[derive(Subcommand)]
@@ -136,7 +137,10 @@ fn reap_orphaned_mount_dirs(
     let in_progress = in_progress.0.lock().unwrap_or_else(|e| e.into_inner());
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        // The entry's type from the directory listing, not `stat(2)`: a stat
+        // of a FUSE mount point whose server has exited fails with ENOTCONN,
+        // and `is_dir()` then passed exactly the dead mounts by.
+        if matches!(entry.file_type(), Ok(t) if !t.is_dir()) {
             continue;
         }
         let named = |mp: &String| Path::new(mp) == path;
@@ -460,34 +464,8 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             std::fs::create_dir_all(&mount_prefix)
                 .context("Failed to create mount prefix directory")?;
 
-            // Clean up stale FUSE mounts from previous daemon instances
-            info!("Cleaning up stale FUSE mounts in {}", mount_prefix);
-            if let Ok(entries) = std::fs::read_dir(&mount_prefix) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        // Lazy unmount (best-effort) — try fusermount first, fall back to umount
-                        let fusermount_result = std::process::Command::new("fusermount")
-                            .args(["-uz", &path.to_string_lossy()])
-                            .output();
-                        if fusermount_result.is_err() {
-                            let _ = std::process::Command::new("umount")
-                                .args(["-l", &path.to_string_lossy()])
-                                .output();
-                        }
-                        // Remove empty directory
-                        match std::fs::remove_dir(&path) {
-                            Ok(()) => {
-                                info!(path = %path.display(), "Reaped stale FUSE mount directory")
-                            }
-                            Err(_) => warn!(
-                                path = %path.display(),
-                                "Could not remove FUSE mount directory (may still be in use)"
-                            ),
-                        }
-                    }
-                }
-            }
+            // Unmount and remove what an earlier instance left under the prefix.
+            cleanup_stale_mounts(Path::new(&mount_prefix), &HostMountSystem);
 
             // Start FuseMountService gRPC server
             let addr = listen_addr.parse().context("Invalid listen address")?;
@@ -654,6 +632,28 @@ mod tests {
         assert_eq!(reaped, vec![orphan.clone(), ended.clone()]);
         assert!(!orphan.exists() && !ended.exists());
         assert!(active.is_dir(), "an active mount's directory is kept");
+    }
+
+    /// Regression (production, nuclear-vm-1, 2026-10-02): a mount whose
+    /// server has exited answers `stat` with ENOTCONN, so the reaper's
+    /// `is_dir()` passed it by on every pass; it is unmounted and removed.
+    #[test]
+    #[ignore = "needs fuse-overlayfs and /dev/fuse"]
+    fn reaper_unmounts_and_removes_a_dead_mount() {
+        use crate::commands::fuse_mount_cleanup::tests::{mounted, overlay};
+        let root = mount_prefix();
+        let prefix = root.path().join("mounts");
+        let mut dead = overlay(
+            root.path(),
+            &prefix.join("9c0f7a9e-0000-0000-0000-000000000000"),
+        );
+        dead.kill();
+
+        let reaped =
+            reap_orphaned_mount_dirs(&prefix, &HashSet::new(), &MountsInProgress::default());
+
+        assert_eq!(reaped, vec![dead.mountpoint.clone()]);
+        assert!(!mounted(&dead.mountpoint) && !dead.mountpoint.exists());
     }
 
     /// Two mounts of one mountpoint under way: the record holds until both end.
