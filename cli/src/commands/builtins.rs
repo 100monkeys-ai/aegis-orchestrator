@@ -628,6 +628,91 @@ mod tests {
         }
     }
 
+    /// The transition a score takes, by the Temporal worker's comparisons
+    /// (`aegis-temporal-worker` `src/workflows/aegis-workflow.ts`
+    /// `evaluateCondition` at `ad1ba6c`): `score_above` and `score_below` are
+    /// strict, `score_between` is inclusive at both ends, the first match wins.
+    fn score_route(
+        transitions: &[aegis_orchestrator_core::domain::workflow::TransitionRule],
+        score: f64,
+    ) -> Option<String> {
+        use aegis_orchestrator_core::domain::workflow::TransitionCondition;
+        transitions
+            .iter()
+            .find(|t| match t.condition {
+                TransitionCondition::ScoreAbove { threshold } => score > threshold,
+                TransitionCondition::ScoreBelow { threshold } => score < threshold,
+                TransitionCondition::ScoreBetween { min, max } => score >= min && score <= max,
+                _ => false,
+            })
+            .map(|t| t.target.as_str().to_string())
+    }
+
+    /// Regression test for the built-in `skill-import` workflow ending in
+    /// FAILED on every run (AEGIS ADR-017, Update of 2026-10-02): its
+    /// validation state asked its agent for `quality_score`, while the worker
+    /// routes on the `score` an Agent state carries, so the state carried no
+    /// score; it routed on quality alone, so an unsafe skill could pass; and a
+    /// score of exactly the threshold matched neither strict comparison, so
+    /// the run would end inside the validation state.
+    #[test]
+    fn skill_import_validation_state_carries_a_score_with_a_route_for_every_value() {
+        assert!(
+            !SKILL_IMPORT_WORKFLOW_TEMPLATE.contains("quality_score"),
+            "no state of skill-import may ask for or read `quality_score`: the worker routes on `score`"
+        );
+
+        let raw: serde_yaml::Value = serde_yaml::from_str(SKILL_IMPORT_WORKFLOW_TEMPLATE).unwrap();
+        let input = raw["spec"]["states"]["PARSE_AND_VALIDATE"]["input"]
+            .as_str()
+            .expect("PARSE_AND_VALIDATE must have an input");
+        assert!(
+            input.contains(
+                "- score: 0.0-1.0 rating of instruction clarity and coherence; \
+                 0.0 when safety_assessment is \"unsafe\""
+            ),
+            "PARSE_AND_VALIDATE must ask its agent for `score`, 0.0 when unsafe; its input is:\n{input}"
+        );
+
+        let workflow =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                SKILL_IMPORT_WORKFLOW_TEMPLATE,
+            )
+            .unwrap();
+        let state = workflow
+            .spec
+            .states
+            .iter()
+            .find(|(name, _)| name.as_str() == "PARSE_AND_VALIDATE")
+            .map(|(_, state)| state)
+            .expect("skill-import must have a PARSE_AND_VALIDATE state");
+
+        // The platform's rule for thresholded states (`aegis.workflow.create`'s
+        // `collect_thresholded_transition_semantic_violations`): low scores
+        // route by an explicit `score_below` branch.
+        assert!(
+            state.transitions.iter().any(|t| matches!(
+                t.condition,
+                aegis_orchestrator_core::domain::workflow::TransitionCondition::ScoreBelow { .. }
+            )),
+            "PARSE_AND_VALIDATE must keep an explicit `score_below` branch for low scores"
+        );
+
+        for (score, expected) in [
+            (0.0, "FAILED"),
+            (0.5, "FAILED"),
+            (0.7, "FAILED"),
+            (0.71, "COMPOSE_MANIFEST"),
+            (1.0, "COMPOSE_MANIFEST"),
+        ] {
+            assert_eq!(
+                score_route(&state.transitions, score).as_deref(),
+                Some(expected),
+                "a PARSE_AND_VALIDATE score of {score} must route to {expected}"
+            );
+        }
+    }
+
     /// Regression test for ADR-113 attachment-layering bug.
     ///
     /// The three generation entry-point templates (agent-creator-agent,
