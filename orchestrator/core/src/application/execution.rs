@@ -2049,6 +2049,183 @@ mod tests {
         assert_eq!(spawned.volumes[0].access_mode, AccessMode::ReadOnly);
     }
 
+    /// An agent whose `input_schema` requires `goal`, as the evaluation set's
+    /// `eval-planner-agent` declares it.
+    fn make_agent_requiring_goal() -> Agent {
+        let mut agent = make_agent("planner", None, None);
+        agent.manifest.spec.input_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "goal": { "type": "string" },
+                "constraints": { "type": "string" }
+            },
+            "required": ["goal"]
+        }));
+        agent
+    }
+
+    /// The execution input the gRPC entry builds for a workflow's Agent
+    /// state (`server.rs`): the blackboard as `context_overrides`, the tenant,
+    /// and the state's rendered input as the string `workflow_input`.
+    fn workflow_state_input(
+        rendered_input: &str,
+        workflow_execution_id: Option<uuid::Uuid>,
+    ) -> ExecutionInput {
+        ExecutionInput {
+            intent: None,
+            input: serde_json::json!({
+                "context_overrides": {
+                    "input": { "goal": "the workflow's own input" },
+                    "tenant_id": "zaru-consumer"
+                },
+                "tenant_id": "zaru-consumer",
+                "workflow_input": rendered_input,
+            }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id,
+            attachments: Vec::new(),
+        }
+    }
+
+    async fn input_schema_service(agent: &Agent) -> StandardExecutionService {
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&CoreTenantId::consumer(), &[agent], HashMap::new(), &[]).await;
+        service
+    }
+
+    /// ADR-092 D7 for a workflow's Agent state: the schema is checked against
+    /// the state's own input, which the gRPC entry carries as `workflow_input`.
+    /// A state whose input renders the object with `goal` as JSON text starts.
+    #[tokio::test]
+    async fn workflow_state_input_object_with_the_required_field_starts() {
+        let agent = make_agent_requiring_goal();
+        let service = input_schema_service(&agent).await;
+
+        service
+            .start_execution(
+                agent.id,
+                workflow_state_input(
+                    r#"{"goal": "plan the module", "constraints": "none"}"#,
+                    Some(uuid::Uuid::new_v4()),
+                ),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .expect("a state whose input is the object with goal must start");
+    }
+
+    /// A ParallelAgents state's agents reach the gRPC entry without a
+    /// workflow execution id; their input is the state's input all the same.
+    #[tokio::test]
+    async fn parallel_agents_state_input_object_with_the_required_field_starts() {
+        let agent = make_agent_requiring_goal();
+        let service = input_schema_service(&agent).await;
+
+        service
+            .start_execution(
+                agent.id,
+                workflow_state_input(r#"{"goal": "judge it"}"#, None),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .expect("a parallel state's agent whose input is the object with goal must start");
+    }
+
+    /// The same state rendering an object without `goal` is refused with the
+    /// schema's own sentence.
+    #[tokio::test]
+    async fn workflow_state_input_object_without_the_required_field_is_refused() {
+        let agent = make_agent_requiring_goal();
+        let service = input_schema_service(&agent).await;
+
+        let err = service
+            .start_execution(
+                agent.id,
+                workflow_state_input(r#"{"constraints": "none"}"#, Some(uuid::Uuid::new_v4())),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(r#"Input validation failed: "goal" is a required property"#),
+            "got: {err}"
+        );
+    }
+
+    /// A state whose input renders a plain string, for an agent whose schema
+    /// wants an object, is refused with a sentence that says so.
+    #[tokio::test]
+    async fn workflow_state_input_string_for_an_object_schema_is_refused_as_a_string() {
+        let agent = make_agent_requiring_goal();
+        let service = input_schema_service(&agent).await;
+
+        let err = service
+            .start_execution(
+                agent.id,
+                workflow_state_input("Goal: plan the module", Some(uuid::Uuid::new_v4())),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Input validation failed")
+                && message.contains("the workflow state's input is a string")
+                && message.contains("input_schema wants an object"),
+            "got: {message}"
+        );
+    }
+
+    /// A direct execution (`aegis.task.execute`: the caller's object with the
+    /// tenant added) is validated against that object, as before: with
+    /// `goal` it starts, without it it is refused.
+    #[tokio::test]
+    async fn direct_execution_input_is_validated_as_before() {
+        let agent = make_agent_requiring_goal();
+        let service = input_schema_service(&agent).await;
+        let direct = |input: serde_json::Value| ExecutionInput {
+            intent: Some("plan".to_string()),
+            input,
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+
+        service
+            .start_execution(
+                agent.id,
+                direct(serde_json::json!({ "goal": "plan it", "tenant_id": "zaru-consumer" })),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .expect("a direct execution with goal must start");
+
+        let err = service
+            .start_execution(
+                agent.id,
+                direct(serde_json::json!({ "tenant_id": "zaru-consumer" })),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(r#"Input validation failed: "goal" is a required property"#),
+            "got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn cross_tenant_child_spawn_is_rejected() {
         let tenant_id = CoreTenantId::consumer();
@@ -2487,6 +2664,22 @@ impl SupervisorObserver for ExecutionMonitor {
     }
 }
 
+/// What an agent's `input_schema` is checked against (ADR-092 D7): a direct
+/// caller's input as given, or a workflow state's own input.
+enum SchemaInstance<'a> {
+    Direct(&'a JsonValue),
+    WorkflowState(JsonValue),
+}
+
+impl SchemaInstance<'_> {
+    fn value(&self) -> &JsonValue {
+        match self {
+            Self::Direct(value) => value,
+            Self::WorkflowState(value) => value,
+        }
+    }
+}
+
 impl StandardExecutionService {
     /// Extract structured user input from `ExecutionInput.input` (ADR-092).
     ///
@@ -2542,6 +2735,41 @@ impl StandardExecutionService {
 
             // Other types (bool, number, array): return as-is
             _ => Ok(input.clone()),
+        }
+    }
+
+    /// The value an agent's `input_schema` is checked against (ADR-092 D7).
+    ///
+    /// A workflow state's agent (an Agent or ParallelAgents state through the
+    /// gRPC entry, which the Temporal worker calls) carries the state's own
+    /// input under `workflow_input`, beside the blackboard (`context_overrides`)
+    /// and the tenant; that input is what `extract_user_input` hands the agent,
+    /// so it is what the schema is checked against, never the wrapper. The
+    /// worker renders every state input as text, so text that is a JSON object
+    /// is checked as that object. Any other execution input (a direct caller's)
+    /// is checked as given.
+    fn input_schema_instance(input: &JsonValue) -> Result<SchemaInstance<'_>> {
+        if input.get("workflow_input").is_none() {
+            return Ok(SchemaInstance::Direct(input));
+        }
+        let state_input = Self::extract_user_input(input)?;
+        if let JsonValue::String(text) = &state_input {
+            if let Ok(object @ JsonValue::Object(_)) = serde_json::from_str::<JsonValue>(text) {
+                return Ok(SchemaInstance::WorkflowState(object));
+            }
+        }
+        Ok(SchemaInstance::WorkflowState(state_input))
+    }
+
+    /// Whether a JSON Schema admits only objects at its root (`type: object`,
+    /// or a type list naming `object` and not `string`).
+    fn schema_wants_object(schema: &JsonValue) -> bool {
+        match schema.get("type") {
+            Some(JsonValue::String(kind)) => kind == "object",
+            Some(JsonValue::Array(kinds)) => {
+                kinds.iter().any(|k| k == "object") && !kinds.iter().any(|k| k == "string")
+            }
+            _ => false,
         }
     }
 
@@ -2918,13 +3146,27 @@ impl StandardExecutionService {
             .unwrap_or(security_context_name);
 
         // ADR-092 D7: Validate structured input against agent's declared input_schema.
-        // The `intent` field is excluded from schema validation — only `input.input` is checked.
+        // The `intent` field is excluded from schema validation. A workflow state's
+        // agent is checked against the state's own input (`input_schema_instance`);
+        // any other caller's `input.input` is checked as given.
         if let Some(schema) = &agent.manifest.spec.input_schema {
             let compiled = jsonschema::validator_for(schema).map_err(|e| {
                 ExecutionError::InvalidExecutionInput(format!("Agent input_schema is invalid: {e}"))
             })?;
+            let instance = Self::input_schema_instance(&input.input)?;
+            if let SchemaInstance::WorkflowState(serde_json::Value::String(_)) = &instance {
+                if Self::schema_wants_object(schema) {
+                    return Err(ExecutionError::InvalidExecutionInput(
+                        "Input validation failed: the workflow state's input is a string, and \
+                         the agent's input_schema wants an object; render the state's input \
+                         as a JSON object"
+                            .to_string(),
+                    )
+                    .into());
+                }
+            }
             let errors: Vec<String> = compiled
-                .iter_errors(&input.input)
+                .iter_errors(instance.value())
                 .map(|e| e.to_string())
                 .collect();
             if !errors.is_empty() {
