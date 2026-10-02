@@ -14,6 +14,7 @@ import io
 import os
 import pathlib
 import socketserver
+import subprocess
 import sys
 import threading
 import unittest
@@ -150,6 +151,50 @@ class PostJsonTimeoutTests(unittest.TestCase):
                 self.bootstrap.post_json({"type": "generate"}, timeout=1)
 
         self.assertEqual(self.servers[0].requests_seen, 1, stderr.getvalue())
+
+
+class ReadPromptTests(unittest.TestCase):
+    """The orchestrator sends the prompt on the exec's standard input, because
+    Linux refuses one exec argument over 128 KiB ("argument list too long",
+    eval-rubric-judge on 2026-10-02). The prompt must arrive byte for byte."""
+
+    # Quotes, shell metacharacters, newlines at both ends, a carriage return,
+    # tabs and non-ASCII text, repeated past the 128 KiB argument limit.
+    UNIT = " He said \"don't\" — 'quoted' $HOME `ls` \\n\n\ttab, naïve café 日本語 🙂\r\n"
+    PROMPT = "\n  " + UNIT * 4000 + "\n\n"
+
+    def run_bootstrap_reading(self, stdin_bytes):
+        """Reads the prompt in a fresh interpreter whose standard input is a
+        pipe and whose locale is C, as in a slim container image."""
+        reader = (
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('b', {str(BOOTSTRAP)!r})\n"
+            "b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)\n"
+            "sys.stdout.buffer.write(b.read_prompt(sys.argv[:1], sys.stdin).encode('utf-8'))\n"
+        )
+        env = dict(os.environ, LC_ALL="C", LANG="C", AEGIS_MODEL_ALIAS="default")
+        env.pop("PYTHONIOENCODING", None)
+        return subprocess.run(
+            [sys.executable, "-B", "-c", reader],
+            input=stdin_bytes,
+            capture_output=True,
+            env=env,
+            check=True,
+        ).stdout
+
+    def test_prompt_on_standard_input_arrives_byte_for_byte(self):
+        sent = self.PROMPT.encode("utf-8")
+        self.assertGreater(len(sent), 128 * 1024)
+        received = self.run_bootstrap_reading(sent)
+        self.assertEqual(len(received), len(sent))
+        self.assertEqual(received, sent)
+
+    def test_prompt_given_as_argument_is_still_read(self):
+        bootstrap = load_bootstrap()
+        self.assertEqual(
+            bootstrap.read_prompt(["bootstrap", self.UNIT], io.StringIO("ignored")),
+            self.UNIT,
+        )
 
 
 if __name__ == "__main__":

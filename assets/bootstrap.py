@@ -410,6 +410,20 @@ def build_history_context(history_json: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def read_prompt(argv, stdin) -> str:
+    """The rendered prompt: argv[1] when given, else standard input.
+
+    The orchestrator writes the fully rendered prompt to the exec's standard
+    input and closes it: Linux refuses one exec argument over 128 KiB, and a
+    judge's prompt carrying a worker's tool history is longer. The bytes are
+    read whole and decoded as UTF-8 whatever the container's locale, nothing
+    stripped, so the prompt arrives byte for byte.
+    """
+    if len(argv) > 1:
+        return argv[1]
+    return stdin.buffer.read().decode("utf-8")
+
+
 def _parse_timeout() -> int:
     """Parse AEGIS_LLM_TIMEOUT_SECONDS; return default 300 on invalid input."""
     raw = os.environ.get("AEGIS_LLM_TIMEOUT_SECONDS", "300")
@@ -454,11 +468,7 @@ def main():
     )
 
     # -- Prompt ---------------------------------------------------------------
-    # The orchestrator fully renders the prompt before passing it in (argv[1] or stdin).
-    if len(sys.argv) > 1:
-        rendered_prompt = sys.argv[1]
-    else:
-        rendered_prompt = sys.stdin.read().strip()
+    rendered_prompt = read_prompt(sys.argv, sys.stdin)
 
     if not rendered_prompt:
         print("Error: No prompt provided", file=sys.stderr)

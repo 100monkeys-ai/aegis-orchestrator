@@ -808,6 +808,37 @@ impl ContainerRuntime {
         }
     }
 
+    /// The exec that starts the bootstrap script in an agent container, and
+    /// the bytes written to its standard input.
+    ///
+    /// The prompt travels on standard input, never as an argument: Linux
+    /// refuses a single exec argument over 128 KiB (`MAX_ARG_STRLEN`), so a
+    /// judge's prompt carrying a worker's tool history failed "exec: Argument
+    /// list too long" before the bootstrap ran. `bootstrap.py` reads its
+    /// standard input to end of file when it has no argument.
+    fn bootstrap_exec(bootstrap_path: &str, prompt: &str) -> (CreateExecOptions<String>, Vec<u8>) {
+        let options = CreateExecOptions {
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            cmd: Some(vec!["python".to_string(), bootstrap_path.to_string()]),
+            ..Default::default()
+        };
+        (options, prompt.as_bytes().to_vec())
+    }
+
+    /// Writes the bootstrap's standard input and closes it, so the bootstrap
+    /// reads the whole prompt and then end of file.
+    async fn send_bootstrap_stdin<W>(mut input: W, payload: &[u8]) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        input.write_all(payload).await?;
+        input.flush().await?;
+        input.shutdown().await
+    }
+
     /// The outcome of one run of the bootstrap script, from its exit code and
     /// its captured streams. A non-zero exit is an execution failure carrying
     /// the bootstrap's stderr, whether or not the container is kept for
@@ -1668,24 +1699,12 @@ impl AgentRuntime for ContainerRuntime {
         );
 
         // Execute bootstrap script via Docker exec API
-        let exec_config = CreateExecOptions {
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            // Pass input as argument. Note: Shell escaping might be needed if input has special chars.
-            // Using list form avoids shell: ["python", ...")
-            cmd: Some(vec![
-                "python".to_string(),
-                bootstrap_path.clone(),
-                input.prompt.clone(),
-            ]),
-            // env: Some(vec!["PYTHONUNBUFFERED=1".to_string()]), // Commented out to ensure inheritance from container
-            ..Default::default()
-        };
+        let (exec_config, stdin_payload) = Self::bootstrap_exec(&bootstrap_path, &input.prompt);
 
         debug!(
             container_id = container_id,
             bootstrap_path = %bootstrap_path,
-            "Exec command: python <bootstrap_path> <prompt>"
+            "Exec command: python <bootstrap_path>, the prompt on stdin"
         );
 
         info!(target: "runtime_spawn", step = "exec_create", container_id = %container_id);
@@ -1715,7 +1734,13 @@ impl AgentRuntime for ContainerRuntime {
             "Starting bootstrap.py execution"
         );
 
-        if let StartExecResults::Attached { mut output, .. } = res {
+        if let StartExecResults::Attached { mut output, input } = res {
+            // The prompt is written while the output is read, so neither side
+            // waits on a full pipe; the bootstrap reads to end of file.
+            let stdin_writer =
+                tokio::spawn(
+                    async move { Self::send_bootstrap_stdin(input, &stdin_payload).await },
+                );
             info!(target: "runtime_spawn", step = "stream_attached", container_id = %container_id, "awaiting first output chunk");
             while let Some(msg) = output.next().await {
                 match msg {
@@ -1749,6 +1774,21 @@ impl AgentRuntime for ContainerRuntime {
                     }
                     _ => {}
                 }
+            }
+            // A bootstrap that exits before reading its prompt (a missing
+            // variable) closes the pipe; its exit code and stderr tell why.
+            match stdin_writer.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    container_id = container_id,
+                    error = %error,
+                    "Writing the prompt to the bootstrap's stdin failed"
+                ),
+                Err(error) => warn!(
+                    container_id = container_id,
+                    error = %error,
+                    "The bootstrap's stdin writer did not finish"
+                ),
             }
         }
 
@@ -2441,6 +2481,60 @@ mod tests {
             }
             other => panic!("expected ExecutionFailed, got {other:?}"),
         }
+    }
+
+    /// A prompt of quotes, newlines and non-ASCII text, past the 128 KiB that
+    /// Linux allows one exec argument (MAX_ARG_STRLEN).
+    fn long_special_prompt() -> String {
+        let unit = " He said \"don't\" — 'quoted' $HOME `ls` \\n\n\ttab, naïve café 日本語 🙂\r\n";
+        let prompt = format!("\n  {}\n\n", unit.repeat(4000));
+        assert!(prompt.len() > 128 * 1024);
+        prompt
+    }
+
+    /// The bootstrap's prompt is not an exec argument: every `eval-rubric-judge`
+    /// judgment of a long tool history failed "exec: Argument list too long"
+    /// (production, 2026-10-02). It goes on the exec's standard input.
+    #[test]
+    fn bootstrap_exec_carries_the_prompt_on_stdin_not_as_an_argument() {
+        let prompt = long_special_prompt();
+        let (options, stdin) =
+            ContainerRuntime::bootstrap_exec("/usr/local/bin/aegis-bootstrap", &prompt);
+
+        assert_eq!(
+            options.cmd,
+            Some(vec![
+                "python".to_string(),
+                "/usr/local/bin/aegis-bootstrap".to_string()
+            ]),
+            "the exec's arguments are the interpreter and the bootstrap only"
+        );
+        assert_eq!(options.attach_stdin, Some(true));
+        assert_eq!(options.attach_stdout, Some(true));
+        assert_eq!(options.attach_stderr, Some(true));
+        assert_eq!(stdin, prompt.as_bytes(), "the prompt is the exec's stdin");
+    }
+
+    /// What the runtime writes to the exec's standard input reaches the reader
+    /// byte for byte, followed by end of file.
+    #[tokio::test]
+    async fn bootstrap_stdin_delivers_the_prompt_byte_for_byte_then_eof() {
+        use tokio::io::AsyncReadExt;
+        let prompt = long_special_prompt();
+        let (_, payload) =
+            ContainerRuntime::bootstrap_exec("/usr/local/bin/aegis-bootstrap", &prompt);
+
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let send =
+            tokio::spawn(
+                async move { ContainerRuntime::send_bootstrap_stdin(writer, &payload).await },
+            );
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        send.await.unwrap().unwrap();
+
+        assert_eq!(received.len(), prompt.len());
+        assert_eq!(String::from_utf8(received).unwrap(), prompt);
     }
 
     #[test]
