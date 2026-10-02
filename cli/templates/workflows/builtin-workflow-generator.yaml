@@ -31,13 +31,14 @@ spec:
     GENERATE_MISSING_AGENTS:
       kind: Agent
       agent: agent-creator-agent
+      # agent-creator-agent's input_schema wants an object with `input`, so
+      # this input renders as one JSON object (ADR-092 D7): the request in
+      # `input`, the planner's answer as JSON in `planner_output`.
       input: |
-        Use this planner output:
-        {{{json PLAN.output}}}
-
-        Create all missing agents listed in `missing_agents` and `missing_judge_agents`
-        using `generation_prompts` and `judge_generation_prompts`.
-        If there are no missing agents or judges, return a JSON no-op summary with empty `created`.
+        {
+          "input": "Use the planner output in `planner_output`. Create all missing agents listed in its `missing_agents` and `missing_judge_agents` using its `generation_prompts` and `judge_generation_prompts`. If there are no missing agents or judges, return a JSON no-op summary with empty `created`.",
+          "planner_output": {{{json PLAN.output}}}
+        }
       transitions:
         - condition: on_success
           target: GENERATE_AND_REGISTER_WORKFLOW

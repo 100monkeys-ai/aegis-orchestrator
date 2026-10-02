@@ -3551,39 +3551,14 @@ mod tests {
         assert_eq!(result.unwrap().0, exec_id);
     }
 
-    /// The built-in `skill-import` workflow's System states, run the way the
-    /// Temporal worker and this server run them: the worker renders a System
-    /// state's `command` and every `env` value against the blackboard
-    /// (`aegis-temporal-worker` `ad1ba6c` `src/workflows/aegis-workflow.ts`
-    /// 712-733) and sends them to `execute_system_command`, which runs the
-    /// command with `sh -c` and the env values as the process environment.
-    /// `curl` and `aegis` are stubs on `PATH` that record what they receive.
-    #[cfg(unix)]
-    mod skill_import_system_states {
-        use super::*;
-        use crate::application::ports::{StartWorkflowParams, WorkflowEnginePort};
-        use crate::application::start_workflow_execution::{
-            StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
-            StartWorkflowExecutionUseCase,
-        };
-        use crate::domain::repository::WorkflowRepository;
-        use crate::domain::workflow::StateKind;
-        use crate::infrastructure::repositories::{
-            InMemoryWorkflowExecutionRepository, InMemoryWorkflowRepository,
-        };
-        use crate::infrastructure::workflow_parser::WorkflowParser;
-        use std::collections::HashMap;
-        use std::os::unix::fs::PermissionsExt;
-        use std::path::Path;
-
-        const SKILL_IMPORT: &str =
-            include_str!("../../../../../cli/templates/workflows/skill-import.yaml");
-
+    /// How the Temporal worker renders a state's templates, for the tests
+    /// that read what a built-in workflow hands its agents and programs.
+    mod worker_render {
         /// Handlebars 4.7.9's `escapeExpression` (`lib/handlebars/utils.js`
         /// 1-9), which the worker's `renderTemplate` applies to every `{{…}}`
         /// because it compiles with the default options
         /// (`aegis-workflow.ts` 1330-1339); `{{{…}}}` is not escaped.
-        fn worker_escape(data: &str) -> String {
+        pub(super) fn worker_escape(data: &str) -> String {
             let mut out = String::with_capacity(data.len());
             for c in data.chars() {
                 match c {
@@ -3602,7 +3577,7 @@ mod tests {
 
         /// The worker's `json` helper, `JSON.stringify(value)`
         /// (`aegis-temporal-worker` `ad1ba6c` `aegis-workflow.ts` 74).
-        fn worker_json<'reg, 'rc>(
+        pub(super) fn worker_json<'reg, 'rc>(
             h: &handlebars::Helper<'rc>,
             _: &'reg handlebars::Handlebars<'reg>,
             _: &'rc handlebars::Context,
@@ -3617,18 +3592,311 @@ mod tests {
             Ok(())
         }
 
+        /// The worker's `keys` helper (`aegis-workflow.ts` 81-95 at `ad1ba6c`):
+        /// a JSON string is parsed first; an object's keys as a JSON array,
+        /// anything else "[]".
+        fn worker_keys<'reg, 'rc>(
+            h: &handlebars::Helper<'rc>,
+            _: &'reg handlebars::Handlebars<'reg>,
+            _: &'rc handlebars::Context,
+            _: &mut handlebars::RenderContext<'reg, 'rc>,
+            out: &mut dyn handlebars::Output,
+        ) -> handlebars::HelperResult {
+            let mut value = h
+                .param(0)
+                .map(|p| p.value().clone())
+                .unwrap_or(serde_json::Value::Null);
+            if let serde_json::Value::String(text) = &value {
+                value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+            }
+            let keys = match &value {
+                serde_json::Value::Object(map) => {
+                    serde_json::to_string(&map.keys().cloned().collect::<Vec<String>>())
+                        .expect("keys serialize")
+                }
+                _ => "[]".to_string(),
+            };
+            out.write(&keys)?;
+            Ok(())
+        }
+
         /// The worker's `renderTemplate`: the blackboard is also exposed
         /// under `blackboard`, and a missing path renders as "".
-        fn render_like_worker(template: &str, blackboard: &serde_json::Value) -> String {
+        pub(super) fn render_like_worker(template: &str, blackboard: &serde_json::Value) -> String {
             let mut handlebars = handlebars::Handlebars::new();
             handlebars.register_escape_fn(worker_escape);
             handlebars.register_helper("json", Box::new(worker_json));
+            handlebars.register_helper("keys", Box::new(worker_keys));
             let mut context = blackboard.clone();
             context["blackboard"] = blackboard.clone();
             handlebars
                 .render_template(template, &context)
                 .expect("template renders")
         }
+    }
+
+    /// ADR-092 D7 for every Agent state of every built-in workflow: the state's
+    /// input, rendered as the Temporal worker renders it, must be accepted by
+    /// the `input_schema` of the built-in agent the state names. Production
+    /// run 2eca5fc5 (`sha-a56a451`) failed at `builtin-workflow-generator`'s
+    /// GENERATE_MISSING_AGENTS because its input was prose and
+    /// `agent-creator-agent` declares an object schema.
+    mod builtin_agent_state_inputs {
+        use super::worker_render::render_like_worker;
+        use serde_json::Value as JsonValue;
+        use std::collections::HashMap;
+
+        const WORKFLOWS: &[(&str, &str)] = &[
+            (
+                "builtin-workflow-generator",
+                include_str!(
+                    "../../../../../cli/templates/workflows/builtin-workflow-generator.yaml"
+                ),
+            ),
+            (
+                "builtin-intent-to-execution",
+                include_str!(
+                    "../../../../../cli/templates/workflows/builtin-intent-to-execution.yaml"
+                ),
+            ),
+            (
+                "skill-import",
+                include_str!("../../../../../cli/templates/workflows/skill-import.yaml"),
+            ),
+        ];
+
+        const AGENTS: &[&str] = &[
+            include_str!("../../../../../cli/templates/agents/aegis-bash-executor-agent.yaml"),
+            include_str!("../../../../../cli/templates/agents/aegis-code-validator-agent.yaml"),
+            include_str!(
+                "../../../../../cli/templates/agents/aegis-javascript-executor-agent.yaml"
+            ),
+            include_str!("../../../../../cli/templates/agents/aegis-output-formatter-agent.yaml"),
+            include_str!("../../../../../cli/templates/agents/aegis-python-executor-agent.yaml"),
+            include_str!("../../../../../cli/templates/agents/agent-creator-agent.yaml"),
+            include_str!("../../../../../cli/templates/agents/agent-generator-judge.yaml"),
+            include_str!("../../../../../cli/templates/agents/code-quality-judge.yaml"),
+            include_str!("../../../../../cli/templates/agents/hello-world-agent.yaml"),
+            include_str!("../../../../../cli/templates/agents/skill-validator.yaml"),
+            include_str!("../../../../../cli/templates/agents/tool-call-policy-judge.yaml"),
+            include_str!(
+                "../../../../../cli/templates/agents/workflow-creator-validator-agent.yaml"
+            ),
+            include_str!("../../../../../cli/templates/agents/workflow-generator-judge.yaml"),
+            include_str!(
+                "../../../../../cli/templates/agents/workflow-generator-planner-agent.yaml"
+            ),
+        ];
+
+        /// Each built-in agent's name and its `spec.input_schema`, if any.
+        fn agent_input_schemas() -> HashMap<String, Option<JsonValue>> {
+            AGENTS
+                .iter()
+                .map(|yaml| {
+                    let raw: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+                    let name = raw["metadata"]["name"].as_str().unwrap().to_string();
+                    let schema = raw["spec"]
+                        .get("input_schema")
+                        .map(|s| serde_json::to_value(s).unwrap());
+                    (name, schema)
+                })
+                .collect()
+        }
+
+        /// The orchestrator's rule, mirrored from `application/execution.rs`
+        /// (`input_schema_instance`, `schema_wants_object` and the check in
+        /// `start_execution`): a state's rendered text that parses as a JSON
+        /// object is checked as that object; any other text is a string, which
+        /// is refused when the schema wants an object; then the schema's own
+        /// errors. Returns the refusal, if any.
+        fn refusal(schema: &JsonValue, state_input: &str) -> Option<String> {
+            let instance = match serde_json::from_str::<JsonValue>(state_input) {
+                Ok(object @ JsonValue::Object(_)) => object,
+                _ => JsonValue::String(state_input.to_string()),
+            };
+            let wants_object = match schema.get("type") {
+                Some(JsonValue::String(kind)) => kind == "object",
+                Some(JsonValue::Array(kinds)) => {
+                    kinds.iter().any(|k| k == "object") && !kinds.iter().any(|k| k == "string")
+                }
+                _ => false,
+            };
+            if instance.is_string() && wants_object {
+                return Some(
+                    "the workflow state's input is a string, and the agent's input_schema \
+                     wants an object"
+                        .to_string(),
+                );
+            }
+            let validator = jsonschema::validator_for(schema).expect("the schema compiles");
+            let errors: Vec<String> = validator
+                .iter_errors(&instance)
+                .map(|e| e.to_string())
+                .collect();
+            (!errors.is_empty()).then(|| errors.join("; "))
+        }
+
+        /// A stand-in output for an Agent state: the worker stores an agent's
+        /// JSON answer parsed (`aegis-temporal-worker` `ad1ba6c`
+        /// `src/activities/index.ts` 95-121), here one shaped like the
+        /// planner's, with quotes, a newline and markup in its text.
+        fn stand_in_output() -> JsonValue {
+            serde_json::json!({
+                "summary": "a \"quoted\" plan\nline two <b> & more",
+                "missing_agents": ["report-writer-agent"],
+                "missing_judge_agents": [],
+                "generation_prompts": {
+                    "report-writer-agent": "Create an agent that writes a \"report\"."
+                },
+                "judge_generation_prompts": {},
+                "created": []
+            })
+        }
+
+        /// A blackboard with every workflow input (its default, or text with
+        /// quotes and markup) and every state completed with a stand-in output.
+        fn stand_in_blackboard(raw: &serde_yaml::Value) -> JsonValue {
+            let mut input = serde_json::Map::new();
+            if let Some(properties) = raw["metadata"]["input_schema"]["properties"].as_mapping() {
+                for (key, property) in properties {
+                    let value = match property.get("default") {
+                        Some(default) => serde_json::to_value(default).unwrap(),
+                        None => JsonValue::String(
+                            "Build a \"daily report\" workflow\nfor <team> & friends".to_string(),
+                        ),
+                    };
+                    input.insert(key.as_str().unwrap().to_string(), value);
+                }
+            }
+            let mut blackboard = serde_json::json!({
+                "input": input,
+                "intent": "an \"intent\" with <markup>",
+            });
+            for (state, _) in raw["spec"]["states"].as_mapping().unwrap() {
+                blackboard[state.as_str().unwrap()] = serde_json::json!({
+                    "status": "completed",
+                    "output": stand_in_output(),
+                    "iterations": 1,
+                    "score": 0.9
+                });
+            }
+            blackboard
+        }
+
+        /// Every (workflow, state, agent, rendered input) an Agent or
+        /// ParallelAgents state of a built-in workflow hands an agent.
+        fn rendered_agent_inputs() -> Vec<(String, String, String, String)> {
+            let mut rendered = Vec::new();
+            for (workflow, yaml) in WORKFLOWS {
+                let raw: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+                let blackboard = stand_in_blackboard(&raw);
+                for (state, body) in raw["spec"]["states"].as_mapping().unwrap() {
+                    let state = state.as_str().unwrap().to_string();
+                    let calls: Vec<&serde_yaml::Value> = match body["kind"].as_str() {
+                        Some("Agent") => vec![body],
+                        Some("ParallelAgents") => body["agents"]
+                            .as_sequence()
+                            .map(|agents| agents.iter().collect())
+                            .unwrap_or_default(),
+                        _ => continue,
+                    };
+                    for call in calls {
+                        let agent =
+                            render_like_worker(call["agent"].as_str().unwrap(), &blackboard);
+                        let input =
+                            render_like_worker(call["input"].as_str().unwrap(), &blackboard);
+                        rendered.push((workflow.to_string(), state.clone(), agent, input));
+                    }
+                }
+            }
+            rendered
+        }
+
+        #[test]
+        fn every_builtin_agent_state_input_is_accepted_by_its_agents_input_schema() {
+            let schemas = agent_input_schemas();
+            let mut refused = Vec::new();
+            for (workflow, state, agent, input) in rendered_agent_inputs() {
+                let schema = schemas.get(&agent).unwrap_or_else(|| {
+                    panic!("{workflow} {state} names no built-in agent: {agent}")
+                });
+                if let Some(schema) = schema {
+                    if let Some(reason) = refusal(schema, &input) {
+                        refused.push(format!(
+                            "{workflow} {state} -> {agent}: {reason}\nrendered input:\n{input}"
+                        ));
+                    }
+                }
+            }
+            assert!(
+                refused.is_empty(),
+                "these Agent states hand their agent an input its input_schema refuses:\n{}",
+                refused.join("\n\n")
+            );
+        }
+
+        /// GENERATE_MISSING_AGENTS hands `agent-creator-agent` one JSON object:
+        /// the request in `input`, the field its schema requires, and the
+        /// planner's answer as JSON under `planner_output`.
+        #[test]
+        fn workflow_generator_hands_the_agent_creator_its_request_and_the_plan_as_one_object() {
+            let (_, _, agent, input) = rendered_agent_inputs()
+                .into_iter()
+                .find(|(workflow, state, _, _)| {
+                    workflow == "builtin-workflow-generator" && state == "GENERATE_MISSING_AGENTS"
+                })
+                .expect("the generator has GENERATE_MISSING_AGENTS");
+            assert_eq!(agent, "agent-creator-agent");
+            let object: JsonValue = serde_json::from_str(&input)
+                .unwrap_or_else(|e| panic!("the rendered input is not JSON ({e}):\n{input}"));
+            let request = object["input"]
+                .as_str()
+                .expect("`input` is the request text");
+            for field in [
+                "planner_output",
+                "missing_agents",
+                "missing_judge_agents",
+                "generation_prompts",
+                "judge_generation_prompts",
+                "created",
+            ] {
+                assert!(
+                    request.contains(field),
+                    "the request names `{field}`: {request}"
+                );
+            }
+            assert_eq!(object["planner_output"], stand_in_output());
+        }
+    }
+
+    /// The built-in `skill-import` workflow's System states, run the way the
+    /// Temporal worker and this server run them: the worker renders a System
+    /// state's `command` and every `env` value against the blackboard
+    /// (`aegis-temporal-worker` `ad1ba6c` `src/workflows/aegis-workflow.ts`
+    /// 712-733) and sends them to `execute_system_command`, which runs the
+    /// command with `sh -c` and the env values as the process environment.
+    /// `curl` and `aegis` are stubs on `PATH` that record what they receive.
+    #[cfg(unix)]
+    mod skill_import_system_states {
+        use super::worker_render::render_like_worker;
+        use super::*;
+        use crate::application::ports::{StartWorkflowParams, WorkflowEnginePort};
+        use crate::application::start_workflow_execution::{
+            StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
+            StartWorkflowExecutionUseCase,
+        };
+        use crate::domain::repository::WorkflowRepository;
+        use crate::domain::workflow::StateKind;
+        use crate::infrastructure::repositories::{
+            InMemoryWorkflowExecutionRepository, InMemoryWorkflowRepository,
+        };
+        use crate::infrastructure::workflow_parser::WorkflowParser;
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+
+        const SKILL_IMPORT: &str =
+            include_str!("../../../../../cli/templates/workflows/skill-import.yaml");
 
         fn system_state(name: &str) -> (String, HashMap<String, String>) {
             let workflow = WorkflowParser::parse_yaml(SKILL_IMPORT).expect("skill-import parses");
