@@ -253,6 +253,13 @@ pub struct AttachmentRef {
     pub sha256: Option<String>,
 }
 
+/// The reason an execution carries when the orchestrator process that ran
+/// it ended while it was running ([`Execution::fail_cut_by_restart`]). It is
+/// the execution's error, its in-flight iteration's error and the reason of
+/// its `ExecutionFailed` event, so every reader of the execution sees it.
+pub const ORCHESTRATOR_RESTART_FAILURE_REASON: &str =
+    "The orchestrator restarted while this execution was running; no process supervises it any more, so it was ended as failed";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionStatus {
     Pending,
@@ -561,6 +568,41 @@ impl Execution {
         self.status = ExecutionStatus::Failed;
         self.error = Some(reason);
         self.ended_at = Some(Utc::now());
+    }
+
+    /// End an execution that the orchestrator process supervising it no
+    /// longer exists to finish: the process ended (a deploy, a crash, a
+    /// restart) while the execution was pending or running, and nothing in
+    /// the new process runs it.
+    ///
+    /// The iteration in flight, if any, fails with
+    /// [`ORCHESTRATOR_RESTART_FAILURE_REASON`], and the execution fails with
+    /// the same reason. Returns the number of the iteration it failed, or
+    /// `None` when there was none in flight. An execution that has already
+    /// ended is left exactly as it is and `None` is returned.
+    pub fn fail_cut_by_restart(&mut self) -> Option<u8> {
+        if self.is_completed() {
+            return None;
+        }
+        let reason = ORCHESTRATOR_RESTART_FAILURE_REASON.to_string();
+        let failed_iteration = match self.iterations.last() {
+            Some(iteration)
+                if matches!(
+                    iteration.status,
+                    IterationStatus::Running | IterationStatus::Refining
+                ) =>
+            {
+                let number = iteration.number;
+                self.fail_iteration(IterationError {
+                    message: reason.clone(),
+                    details: None,
+                });
+                Some(number)
+            }
+            _ => None,
+        };
+        self.fail(reason);
+        failed_iteration
     }
 
     /// Check if execution is completed (success, failure, or cancellation)

@@ -5339,6 +5339,32 @@ async fn aegis_task_cancel_rejects_cross_tenant_execution_id() {
     );
 }
 
+/// `aegis.task.cancel` of an execution the orchestrator's restart pass
+/// already failed answers with its terminal state: not cancelled, status
+/// failed.
+#[tokio::test]
+async fn aegis_task_cancel_of_an_ended_execution_answers_with_its_terminal_state() {
+    let tenant = TenantId::for_consumer_user("cancel-ended-sub").unwrap();
+    let mut exec = make_execution_with_tenant(tenant.clone());
+    exec.start();
+    exec.fail_cut_by_restart();
+    let exec_id = exec.id;
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(tenant.clone(), exec));
+    let service = build_task_service_with(svc);
+
+    let scope = consumer_tenant_scope(tenant);
+    let mut args = serde_json::json!({ "execution_id": exec_id.0.to_string() });
+    let ToolInvocationResult::Direct(payload) = service
+        .invoke_aegis_task_cancel_tool(&mut args, &scope)
+        .await
+        .expect("cancel tool returns a Direct payload")
+    else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["cancelled"], false, "payload: {payload}");
+    assert_eq!(payload["status"], "failed", "payload: {payload}");
+}
+
 /// Bug 2 — `aegis.task.remove` regression: a caller in tenant A must not
 /// be able to delete an execution owned by tenant B by guessing its
 /// UUID. Asserts both that the repo was called with the caller's tenant

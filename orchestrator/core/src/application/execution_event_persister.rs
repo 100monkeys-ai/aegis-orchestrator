@@ -22,6 +22,14 @@
 //! same `(execution_id, sequence_number)` UNIQUE space without colliding,
 //! and `find_events_by_execution` returns them interleaved by sequence.
 //!
+//! The counter lives in this process. The first time this process persists
+//! an event of an execution, it continues after the highest in-process
+//! sequence number already stored for that execution, so an execution that
+//! outlived the process that started it (the restart pass's
+//! `ExecutionFailed` for an execution an earlier process left running) gets
+//! its later events recorded instead of colliding with the earlier
+//! process's and being dropped by `ON CONFLICT DO NOTHING`.
+//!
 //! # Architecture
 //!
 //! - **Layer:** Application Layer
@@ -75,8 +83,11 @@ impl ExecutionEventPersister {
     pub fn start(self: Arc<Self>) -> JoinHandle<()> {
         info!("ExecutionEvent persister started (audit trail enabled)");
 
+        // Subscribe before the task is spawned, so an event published right
+        // after `start` returns (the start-up restart pass publishes at once)
+        // is received rather than published before the task subscribed.
+        let mut receiver = self.event_bus.subscribe();
         tokio::spawn(async move {
-            let mut receiver = self.event_bus.subscribe();
             loop {
                 match receiver.recv().await {
                     Ok(DomainEvent::Execution(event)) => {
@@ -123,7 +134,12 @@ impl ExecutionEventPersister {
 
         let sequence_number = {
             let mut counters = self.sequence_counters.lock().await;
-            let counter = counters.entry(execution_id).or_insert(LOCAL_SEQUENCE_START);
+            let counter = match counters.entry(execution_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(self.next_sequence_after_stored(execution_id).await)
+                }
+            };
             let n = *counter;
             *counter = counter.saturating_add(1);
             n
@@ -139,6 +155,47 @@ impl ExecutionEventPersister {
             )
             .await
             .map_err(|e| format!("repository.append_event: {e}"))
+    }
+
+    /// The first in-process sequence number this process may use for
+    /// `execution_id`: one past the highest in-process number already stored
+    /// for it (an earlier process's events), else [`LOCAL_SEQUENCE_START`].
+    /// A failed read is logged and falls back to the start, which is what
+    /// every event used before this lookup existed.
+    async fn next_sequence_after_stored(&self, execution_id: ExecutionId) -> i64 {
+        const PAGE: usize = 500;
+        let mut offset = 0usize;
+        let mut highest: Option<i64> = None;
+        loop {
+            match self
+                .repository
+                .find_events_by_execution(execution_id, PAGE, offset)
+                .await
+            {
+                Ok(page) => {
+                    let len = page.len();
+                    highest = page
+                        .iter()
+                        .map(|record| record.sequence)
+                        .filter(|sequence| *sequence >= LOCAL_SEQUENCE_START)
+                        .chain(highest)
+                        .max();
+                    if len < PAGE {
+                        break;
+                    }
+                    offset += len;
+                }
+                Err(e) => {
+                    warn!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "could not read the stored events of an execution; its in-process sequence starts at the beginning"
+                    );
+                    break;
+                }
+            }
+        }
+        highest.map_or(LOCAL_SEQUENCE_START, |h| h.saturating_add(1))
     }
 }
 
@@ -361,11 +418,29 @@ mod tests {
 
         async fn find_events_by_execution(
             &self,
-            _id: ExecutionId,
-            _limit: usize,
-            _offset: usize,
+            id: ExecutionId,
+            limit: usize,
+            offset: usize,
         ) -> Result<Vec<WorkflowExecutionEventRecord>, RepositoryError> {
-            Ok(vec![])
+            let mut stored: Vec<WorkflowExecutionEventRecord> = self
+                .events
+                .read()
+                .await
+                .iter()
+                .filter(|(execution_id, ..)| *execution_id == id)
+                .map(|(_, sequence, event_type, payload, iteration_number)| {
+                    WorkflowExecutionEventRecord {
+                        sequence: *sequence,
+                        event_type: event_type.clone(),
+                        state_name: None,
+                        iteration_number: *iteration_number,
+                        payload: payload.clone(),
+                        recorded_at: chrono::Utc::now(),
+                    }
+                })
+                .collect();
+            stored.sort_by_key(|record| record.sequence);
+            Ok(stored.into_iter().skip(offset).take(limit).collect())
         }
 
         async fn find_tenant_id_by_execution(
@@ -384,6 +459,87 @@ mod tests {
             action: "test".to_string(),
             started_at: chrono::Utc::now(),
         }
+    }
+
+    fn execution_failed(execution_id: ExecutionId) -> ExecutionEvent {
+        ExecutionEvent::ExecutionFailed {
+            execution_id,
+            agent_id: AgentId::new(),
+            reason: crate::domain::execution::ORCHESTRATOR_RESTART_FAILURE_REASON.to_string(),
+            total_iterations: 1,
+            failed_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The daemon's restart pass publishes as soon as the persister has
+    /// started; an event published right after `start` returns, before the
+    /// persister's task has run, is persisted.
+    #[tokio::test]
+    async fn persister_records_an_event_published_right_after_start() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repo = Arc::new(RecordingRepo::new());
+        let persister = Arc::new(ExecutionEventPersister::new(
+            repo.clone(),
+            event_bus.clone(),
+        ));
+        let _h = persister.start();
+
+        let exec_id = ExecutionId::new();
+        event_bus.publish_execution_event(execution_failed(exec_id));
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        let events = repo.events.read().await.clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "the event published right after start was not persisted: {events:?}"
+        );
+    }
+
+    /// An execution an earlier process started already has in-process events
+    /// stored from LOCAL_SEQUENCE_START on. The first event this process
+    /// persists for it (the restart pass's ExecutionFailed) continues after
+    /// them, so the store's ON CONFLICT DO NOTHING does not drop it.
+    #[tokio::test]
+    async fn persister_continues_after_the_sequence_an_earlier_process_stored() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repo = Arc::new(RecordingRepo::new());
+        let exec_id = ExecutionId::new();
+        for (offset, event) in [iteration_started(exec_id, 0), iteration_started(exec_id, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            repo.append_event(
+                exec_id,
+                LOCAL_SEQUENCE_START + offset as i64,
+                event_type_str(&event).to_string(),
+                serde_json::to_value(&event).unwrap(),
+                iteration_number_for(&event),
+            )
+            .await
+            .unwrap();
+        }
+        let persister = Arc::new(ExecutionEventPersister::new(
+            repo.clone(),
+            event_bus.clone(),
+        ));
+        let _h = persister.start();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        event_bus.publish_execution_event(execution_failed(exec_id));
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        let events = repo.events.read().await.clone();
+        let failed: Vec<i64> = events
+            .iter()
+            .filter(|(_, _, event_type, ..)| event_type == "ExecutionFailed")
+            .map(|(_, sequence, ..)| *sequence)
+            .collect();
+        assert_eq!(
+            failed,
+            vec![LOCAL_SEQUENCE_START + 2],
+            "ExecutionFailed must take the next free sequence number"
+        );
     }
 
     #[tokio::test]

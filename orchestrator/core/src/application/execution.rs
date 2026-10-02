@@ -277,6 +277,90 @@ pub trait ExecutionService: Send + Sync {
     }
 }
 
+/// End, as failed, every execution an earlier orchestrator process left
+/// pending or running, and return their ids in the order they were ended.
+///
+/// An execution is run by a task of the process that started it
+/// ([`StandardExecutionService::start_execution`] spawns the supervisor loop
+/// in that process, and a judge is awaited inside its parent's loop). When
+/// the process ends, nothing resumes that task, so its record would read
+/// `running` for ever: a wait on it never returns and the container reaper
+/// keeps its container ([`crate::domain::execution::ORCHESTRATOR_RESTART_FAILURE_REASON`]
+/// says why it ended instead).
+///
+/// The daemon calls this once at start-up, before it accepts work and
+/// before the container reaper's first pass, so no task of this process
+/// supervises any execution yet: every unfinished record it finds belongs
+/// to an earlier process. It is therefore only correct where this process
+/// is the only one running executions against the database (a standalone
+/// node); the daemon does not call it on a node with clustering enabled.
+///
+/// Each execution is ended newest first, so a judge is ended before the
+/// execution that was waiting on it: its in-flight iteration fails with the
+/// reason, the execution fails with the reason, the record is saved under
+/// its own tenant, and `IterationFailed` (when an iteration was in flight)
+/// and `ExecutionFailed` are published as for any other failure. An
+/// execution the pass cannot save is logged and left for the next start.
+pub async fn fail_executions_cut_by_restart(
+    repository: &dyn ExecutionRepository,
+    event_bus: &EventBus,
+) -> Result<Vec<ExecutionId>> {
+    let unfinished = repository
+        .find_unfinished_unscoped()
+        .await
+        .context("list the executions an earlier process left unfinished")?;
+
+    let mut ended = Vec::with_capacity(unfinished.len());
+    for mut execution in unfinished {
+        let previous_status = execution.status.clone();
+        let failed_iteration = execution.fail_cut_by_restart();
+        let reason = execution.error.clone().unwrap_or_default();
+        let tenant_id = execution.tenant_id.clone();
+
+        if let Err(e) = repository.save_for_tenant(&tenant_id, &execution).await {
+            tracing::error!(
+                execution_id = %execution.id,
+                tenant_id = %tenant_id,
+                error = %e,
+                "Could not end an execution an earlier orchestrator process left unfinished; it stays as it was until the next start"
+            );
+            continue;
+        }
+
+        let now = Utc::now();
+        if let Some(iteration_number) = failed_iteration {
+            event_bus.publish_execution_event(ExecutionEvent::IterationFailed {
+                execution_id: execution.id,
+                agent_id: execution.agent_id,
+                iteration_number,
+                error: crate::domain::execution::IterationError {
+                    message: reason.clone(),
+                    details: None,
+                },
+                failed_at: now,
+            });
+        }
+        event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
+            execution_id: execution.id,
+            agent_id: execution.agent_id,
+            reason,
+            total_iterations: execution.iterations().len() as u8,
+            failed_at: now,
+        });
+
+        tracing::info!(
+            execution_id = %execution.id,
+            tenant_id = %tenant_id,
+            agent_id = %execution.agent_id.0,
+            parent_execution_id = ?execution.hierarchy.parent_execution_id.map(|p| p.0),
+            previous_status = ?previous_status,
+            "Ended an execution an earlier orchestrator process left unfinished: failed, orchestrator restarted"
+        );
+        ended.push(execution.id);
+    }
+    Ok(ended)
+}
+
 pub struct StandardExecutionService {
     agent_service: Arc<dyn AgentLifecycleService>,
     volume_service: Arc<dyn VolumeService>,
@@ -539,19 +623,24 @@ impl StandardExecutionService {
         }
 
         let mut execution = self.get_execution_for_tenant(tenant_id, id).await?;
-        execution.status = ExecutionStatus::Cancelled;
-        execution.ended_at = Some(Utc::now());
-        self.repository
-            .save_for_tenant(tenant_id, &execution)
-            .await?;
+        // An execution that has already ended (completed, failed — by the
+        // restart pass among others — or cancelled) keeps its terminal state
+        // and reason, and a read after this cancel answers with them.
+        if !execution.is_completed() {
+            execution.status = ExecutionStatus::Cancelled;
+            execution.ended_at = Some(Utc::now());
+            self.repository
+                .save_for_tenant(tenant_id, &execution)
+                .await?;
 
-        self.event_bus
-            .publish_execution_event(ExecutionEvent::ExecutionCancelled {
-                execution_id: id,
-                agent_id: execution.agent_id,
-                reason: None,
-                cancelled_at: Utc::now(),
-            });
+            self.event_bus
+                .publish_execution_event(ExecutionEvent::ExecutionCancelled {
+                    execution_id: id,
+                    agent_id: execution.agent_id,
+                    reason: None,
+                    cancelled_at: Utc::now(),
+                });
+        }
 
         // Cascade cancellation to any child swarm associated with this execution (BC-6).
         if let Some(ref port) = self.swarm_cancellation {
@@ -2453,6 +2542,208 @@ mod tests {
         assert!(
             err.to_string().contains("Cross-tenant spawn forbidden"),
             "expected cross-tenant error, got: {err}"
+        );
+    }
+
+    // ── Executions an earlier process left running ─────────────────────────
+
+    /// An execution an earlier orchestrator process started and was running
+    /// when that process ended: status Running, one iteration in flight.
+    fn execution_left_running(
+        agent_id: AgentId,
+        tenant_id: &CoreTenantId,
+        started_at: chrono::DateTime<Utc>,
+    ) -> Execution {
+        let mut execution = make_parent_execution(agent_id);
+        execution.tenant_id = tenant_id.clone();
+        execution.started_at = started_at;
+        execution.start();
+        execution
+            .start_iteration("generate".to_string())
+            .expect("first iteration starts");
+        execution
+    }
+
+    fn drain_execution_events(
+        receiver: &mut crate::infrastructure::event_bus::EventReceiver,
+    ) -> Vec<ExecutionEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let DomainEvent::Execution(event) = event {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// A judge (child) and the worker waiting on it (parent), both left
+    /// running by an earlier process, are both ended as failed with the
+    /// restart reason, the judge first; each in-flight iteration fails with
+    /// the reason; IterationFailed and ExecutionFailed are published for
+    /// each. An execution that had already ended is untouched.
+    #[tokio::test]
+    async fn the_restart_pass_fails_a_judge_and_its_parent_and_leaves_ended_executions_alone() {
+        let repo = InMemoryExecutionRepository::new();
+        let bus = EventBus::with_default_capacity();
+        let tenant = CoreTenantId::for_consumer_user("restart-owner").unwrap();
+        let agent_id = AgentId::new();
+        let t0 = Utc::now() - chrono::Duration::minutes(10);
+
+        let parent = execution_left_running(agent_id, &tenant, t0);
+        let mut judge =
+            Execution::new_child(AgentId::new(), parent.input.clone(), 1, &parent).unwrap();
+        judge.started_at = t0 + chrono::Duration::seconds(30);
+        judge.start();
+        judge.start_iteration("judge".to_string()).unwrap();
+        let mut done = make_parent_execution(agent_id);
+        done.tenant_id = tenant.clone();
+        done.start();
+        done.complete();
+        let done_before = (done.status.clone(), done.ended_at, done.error.clone());
+
+        for e in [&parent, &judge, &done] {
+            repo.save_for_tenant(&tenant, e).await.unwrap();
+        }
+
+        let mut receiver = bus.subscribe();
+        let ended = fail_executions_cut_by_restart(&repo, &bus).await.unwrap();
+
+        assert_eq!(
+            ended,
+            vec![judge.id, parent.id],
+            "the pass must end the judge, then its parent, and nothing else"
+        );
+        for id in [judge.id, parent.id] {
+            let e = repo
+                .find_by_id_for_tenant(&tenant, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                e.status,
+                ExecutionStatus::Failed,
+                "execution {id} still {:?}",
+                e.status
+            );
+            assert_eq!(
+                e.error.as_deref(),
+                Some(crate::domain::execution::ORCHESTRATOR_RESTART_FAILURE_REASON)
+            );
+            assert!(e.ended_at.is_some());
+            let last = e.iterations().last().unwrap();
+            assert_eq!(
+                last.status,
+                crate::domain::execution::IterationStatus::Failed
+            );
+            assert_eq!(
+                last.error.as_ref().map(|err| err.message.as_str()),
+                Some(crate::domain::execution::ORCHESTRATOR_RESTART_FAILURE_REASON)
+            );
+        }
+        let after = repo
+            .find_by_id_for_tenant(&tenant, done.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((after.status, after.ended_at, after.error), done_before);
+
+        let events = drain_execution_events(&mut receiver);
+        let failed: Vec<ExecutionId> = events
+            .iter()
+            .filter_map(|e| match e {
+                ExecutionEvent::ExecutionFailed {
+                    execution_id,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(
+                        reason,
+                        crate::domain::execution::ORCHESTRATOR_RESTART_FAILURE_REASON
+                    );
+                    Some(*execution_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed, vec![judge.id, parent.id]);
+        let iteration_failed = events
+            .iter()
+            .filter(|e| matches!(e, ExecutionEvent::IterationFailed { .. }))
+            .count();
+        assert_eq!(
+            iteration_failed, 2,
+            "one IterationFailed per in-flight iteration"
+        );
+    }
+
+    /// Run twice, the pass changes nothing the second time: no execution is
+    /// ended again and no event is published.
+    #[tokio::test]
+    async fn the_restart_pass_run_twice_changes_nothing_the_second_time() {
+        let repo = InMemoryExecutionRepository::new();
+        let bus = EventBus::with_default_capacity();
+        let tenant = CoreTenantId::for_consumer_user("restart-twice").unwrap();
+        let left = execution_left_running(AgentId::new(), &tenant, Utc::now());
+        repo.save_for_tenant(&tenant, &left).await.unwrap();
+
+        let first = fail_executions_cut_by_restart(&repo, &bus).await.unwrap();
+        assert_eq!(first, vec![left.id]);
+        let after_first = repo
+            .find_by_id_for_tenant(&tenant, left.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut receiver = bus.subscribe();
+        let second = fail_executions_cut_by_restart(&repo, &bus).await.unwrap();
+        assert!(second.is_empty(), "the second pass ended {second:?}");
+        assert!(drain_execution_events(&mut receiver).is_empty());
+        let after_second = repo
+            .find_by_id_for_tenant(&tenant, left.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_second.ended_at, after_first.ended_at);
+        assert_eq!(after_second.status, ExecutionStatus::Failed);
+    }
+
+    /// A cancel of an execution that has already ended answers with, and
+    /// keeps, its terminal state: the execution the restart pass failed
+    /// stays failed with its reason, and no ExecutionCancelled is published.
+    #[tokio::test]
+    async fn a_cancel_of_an_ended_execution_keeps_its_terminal_state() {
+        let tenant = CoreTenantId::consumer();
+        let agent = make_agent("worker", None, None);
+        let mut ended = execution_left_running(agent.id, &tenant, Utc::now());
+        ended.fail_cut_by_restart();
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&tenant, &[&agent], HashMap::new(), &[&ended]).await;
+
+        let mut receiver = service.event_bus.subscribe();
+        service
+            .cancel_execution_for_tenant(&tenant, ended.id)
+            .await
+            .expect("a cancel of an ended execution is not an error");
+
+        let after = service
+            .get_execution_for_tenant(&tenant, ended.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.status,
+            ExecutionStatus::Failed,
+            "the cancel rewrote it to {:?}",
+            after.status
+        );
+        assert_eq!(
+            after.error.as_deref(),
+            Some(crate::domain::execution::ORCHESTRATOR_RESTART_FAILURE_REASON)
+        );
+        assert!(
+            drain_execution_events(&mut receiver)
+                .iter()
+                .all(|e| !matches!(e, ExecutionEvent::ExecutionCancelled { .. })),
+            "no ExecutionCancelled for an execution that had already ended"
         );
     }
 }

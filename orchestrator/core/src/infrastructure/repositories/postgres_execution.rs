@@ -904,4 +904,25 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(count.max(0) as u64)
     }
+
+    async fn find_unfinished_unscoped(&self) -> Result<Vec<Execution>, RepositoryError> {
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM executions
+            WHERE status IN ('running', 'pending')
+            ORDER BY started_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut executions = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(execution) = self.find_by_id_unscoped(ExecutionId(id)).await? {
+                executions.push(execution);
+            }
+        }
+        Ok(executions)
+    }
 }

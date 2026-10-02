@@ -633,6 +633,24 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .cloned())
     }
 
+    async fn find_unfinished_unscoped(&self) -> Result<Vec<Execution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let mut unfinished: Vec<Execution> = executions
+            .values()
+            .flat_map(|tenant_execs| tenant_execs.values())
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    crate::domain::execution::ExecutionStatus::Running
+                        | crate::domain::execution::ExecutionStatus::Pending
+                )
+            })
+            .cloned()
+            .collect();
+        unfinished.sort_by_key(|e| Reverse(e.started_at));
+        Ok(unfinished)
+    }
+
     async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError> {
         let executions = self.executions.read().unwrap();
         let count = executions

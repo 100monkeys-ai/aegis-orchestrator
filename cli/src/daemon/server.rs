@@ -185,6 +185,68 @@ fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
     raw_value.unwrap_or(30).max(1)
 }
 
+/// Whether this node ends, at start-up, the executions an earlier process
+/// left unfinished.
+///
+/// An execution record names no node, so the start-up pass cannot tell an
+/// execution an earlier process of this node left running from one another
+/// live node is running against the same database. It therefore runs only
+/// on a standalone node (`spec.cluster` absent or `enabled: false`), where
+/// this process is the only one that runs executions against its database.
+/// A clustered node skips it and says so; making it safe there needs the
+/// running node's identity on the record.
+pub(crate) fn restart_pass_applies(config: &NodeConfigManifest) -> bool {
+    !config.spec.cluster.as_ref().is_some_and(|c| c.enabled)
+}
+
+/// The start-up pass: end, as failed, every execution an earlier orchestrator
+/// process left pending or running
+/// ([`aegis_orchestrator_core::application::execution::fail_executions_cut_by_restart`]).
+///
+/// Called once, after the execution event persister has started (so each
+/// `ExecutionFailed` is recorded) and before the container reaper's first
+/// pass and before any listener accepts work (so no task of this process
+/// supervises an execution yet, and the reaper's first pass removes the
+/// containers of the executions this pass ended). Returns the ids it ended.
+pub(crate) async fn end_executions_cut_by_restart(
+    config: &NodeConfigManifest,
+    execution_repo: &dyn aegis_orchestrator_core::domain::repository::ExecutionRepository,
+    event_bus: &EventBus,
+) -> Vec<aegis_orchestrator_core::domain::execution::ExecutionId> {
+    if !restart_pass_applies(config) {
+        info!(
+            "Skipping the startup pass over executions an earlier process left unfinished: \
+             clustering is enabled, and an execution record names no node, so an execution \
+             another live node runs cannot be told apart"
+        );
+        return Vec::new();
+    }
+    info!("Running startup pass over executions an earlier process left unfinished");
+    match aegis_orchestrator_core::application::execution::fail_executions_cut_by_restart(
+        execution_repo,
+        event_bus,
+    )
+    .await
+    {
+        Ok(ended) => {
+            info!(
+                count = ended.len(),
+                "Startup pass ended {} execution(s) an earlier process left unfinished",
+                ended.len()
+            );
+            ended
+        }
+        Err(e) => {
+            error!(
+                error = %e,
+                "Startup pass over executions an earlier process left unfinished failed; \
+                 their records stay as they are until the next start"
+            );
+            Vec::new()
+        }
+    }
+}
+
 // ClusterNodeView, ClusterStatusView moved to cluster_helpers.rs
 // SwarmMessageView, SwarmLockView, SwarmView moved to handlers/swarms.rs
 // DashboardSummaryView moved to handlers/observability.rs
@@ -820,6 +882,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
     let _execution_persister_handle = execution_event_persister.start();
+
+    // End the executions an earlier process left running, now that their
+    // failure events are recorded and before the container reaper's first
+    // pass and any listener: see `end_executions_cut_by_restart`.
+    end_executions_cut_by_restart(&config, execution_repo.as_ref(), &event_bus).await;
 
     // Initialize NFS Server Gateway (ADR-036)
     info!("Initializing NFS Server Gateway...");
@@ -3583,5 +3650,355 @@ models:
             managed_container_reap_reason(&running_container, None),
             Some("missing_execution_record")
         );
+    }
+
+    // ── The start-up pass over executions an earlier process left running ──
+
+    mod restart_pass {
+        use super::super::{end_executions_cut_by_restart, restart_pass_applies};
+        use crate::daemon::container_helpers::managed_container_reap_reason;
+        use crate::daemon::handlers::executions::execution_status;
+        use crate::daemon::handlers::test_support::service_account;
+        use aegis_orchestrator_core::application::execution_event_persister::ExecutionEventPersister;
+        use aegis_orchestrator_core::domain::agent::AgentId;
+        use aegis_orchestrator_core::domain::execution::{
+            Execution, ExecutionId, ExecutionInput, ExecutionStatus, IterationStatus,
+            ORCHESTRATOR_RESTART_FAILURE_REASON,
+        };
+        use aegis_orchestrator_core::domain::node_config::{ClusterConfig, NodeConfigManifest};
+        use aegis_orchestrator_core::domain::repository::{
+            ExecutionRepository, WorkflowExecutionRepository,
+        };
+        use aegis_orchestrator_core::domain::shared_kernel::TenantId;
+        use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+        use aegis_orchestrator_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository;
+        use aegis_orchestrator_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
+        use aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository;
+        use aegis_orchestrator_core::infrastructure::runtime::ManagedAgentContainer;
+        use chrono::Utc;
+        use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+        use std::sync::Arc;
+
+        /// The first sequence number an orchestrator process gives its own
+        /// events of an execution (`execution_event_persister.rs`).
+        const LOCAL_SEQUENCE_START: i64 = 1_000_000_000_000;
+
+        fn postgres_url() -> Option<String> {
+            match std::env::var("AEGIS_TEST_POSTGRES_URL") {
+                Ok(url) if !url.is_empty() => Some(url),
+                _ if std::env::var_os("CI").is_some() => {
+                    panic!("AEGIS_TEST_POSTGRES_URL is not set; in CI these tests must reach PostgreSQL")
+                }
+                _ => {
+                    eprintln!("skipped: AEGIS_TEST_POSTGRES_URL is not set");
+                    None
+                }
+            }
+        }
+
+        struct TestDb {
+            server: PgPool,
+            name: String,
+            pool: PgPool,
+        }
+
+        impl TestDb {
+            async fn create() -> Option<Self> {
+                let url = postgres_url()?;
+                let server = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&url)
+                    .await
+                    .expect("connect to the test PostgreSQL");
+                let name = format!("aegis_restart_{}", uuid::Uuid::new_v4().simple());
+                sqlx::query(&format!("CREATE DATABASE {name}"))
+                    .execute(&server)
+                    .await
+                    .expect("create the test database");
+                let options: PgConnectOptions =
+                    url.parse::<PgConnectOptions>().unwrap().database(&name);
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect_with(options)
+                    .await
+                    .expect("connect to the test database");
+                crate::daemon::migrations::MIGRATOR
+                    .run(&pool)
+                    .await
+                    .expect("apply the migrations");
+                Some(Self { server, name, pool })
+            }
+
+            async fn remove(self) {
+                self.pool.close().await;
+                sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", self.name))
+                    .execute(&self.server)
+                    .await
+                    .expect("drop the test database");
+            }
+        }
+
+        async fn insert_agent(pool: &PgPool, tenant: &TenantId) -> AgentId {
+            sqlx::query(
+                "INSERT INTO tenants (slug, display_name, keycloak_realm, openbao_namespace) \
+                 VALUES ($1, $1, 'zaru-consumer', $1) ON CONFLICT DO NOTHING",
+            )
+            .bind(tenant.as_str())
+            .execute(pool)
+            .await
+            .expect("insert the tenant");
+            let id = AgentId::new();
+            sqlx::query(
+                "INSERT INTO agents (id, tenant_id, name, manifest_yaml, manifest_json, runtime, security_policy) \
+                 VALUES ($1, $2, $3, '', '{}'::jsonb, 'python:3.11', '{}'::jsonb)",
+            )
+            .bind(id.0)
+            .bind(tenant.as_str())
+            .bind(format!("restart-agent-{}", &id.0.simple().to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert an agent");
+            id
+        }
+
+        fn input() -> ExecutionInput {
+            ExecutionInput {
+                intent: Some("work".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            }
+        }
+
+        /// An execution an earlier process was running when it ended.
+        fn left_running(
+            agent_id: AgentId,
+            tenant: &TenantId,
+            started_at: chrono::DateTime<Utc>,
+        ) -> Execution {
+            let mut e = Execution::new(agent_id, input(), 3, "aegis-system-operator".to_string());
+            e.tenant_id = tenant.clone();
+            e.started_at = started_at;
+            e.start();
+            e.start_iteration("generate".to_string()).unwrap();
+            e
+        }
+
+        fn container_of(execution_id: ExecutionId) -> ManagedAgentContainer {
+            ManagedAgentContainer {
+                id: format!("aegis-agent-{}", &execution_id.0.simple().to_string()[..8]),
+                execution_id: Some(execution_id.0.to_string()),
+                debug_retain: false,
+                state: Some("running".to_string()),
+            }
+        }
+
+        async fn status_of(repo: &dyn ExecutionRepository, id: ExecutionId) -> ExecutionStatus {
+            repo.find_by_id_unscoped(id).await.unwrap().unwrap().status
+        }
+
+        async fn events_of(
+            events: &PostgresWorkflowExecutionRepository,
+            id: ExecutionId,
+        ) -> Vec<(i64, String, serde_json::Value)> {
+            events
+                .find_events_by_execution(id, 1000, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.sequence, r.event_type, r.payload))
+                .collect()
+        }
+
+        /// The production case against PostgreSQL: a worker execution and
+        /// the judge it was waiting on, both left running by an earlier
+        /// process whose own events are stored, and one execution that had
+        /// completed. The start-up pass of the new process fails the two
+        /// with the restart reason and records each ExecutionFailed; the
+        /// status route then answers Failed to the worker's poll; the
+        /// reaper gives their containers "execution_not_running"; the
+        /// completed execution is untouched; a second pass changes nothing.
+        #[tokio::test]
+        async fn the_startup_pass_ends_executions_an_earlier_process_left_running() {
+            let Some(db) = TestDb::create().await else {
+                return;
+            };
+            let tenant = TenantId::for_consumer_user("restart-owner").unwrap();
+            let agent_id = insert_agent(&db.pool, &tenant).await;
+            let repo = PostgresExecutionRepository::new(db.pool.clone());
+            let events = PostgresWorkflowExecutionRepository::new(db.pool.clone());
+
+            // The earlier process.
+            let t0 = Utc::now() - chrono::Duration::minutes(5);
+            let worker = left_running(agent_id, &tenant, t0);
+            let mut judge = Execution::new_child(agent_id, input(), 1, &worker).unwrap();
+            judge.started_at = t0 + chrono::Duration::seconds(20);
+            judge.start();
+            judge.start_iteration("judge".to_string()).unwrap();
+            let mut done =
+                Execution::new(agent_id, input(), 1, "aegis-system-operator".to_string());
+            done.tenant_id = tenant.clone();
+            done.started_at = t0 - chrono::Duration::minutes(1);
+            done.start();
+            done.complete();
+            for e in [&worker, &judge, &done] {
+                repo.save_for_tenant(&tenant, e).await.unwrap();
+            }
+            events
+                .append_event(
+                    worker.id,
+                    LOCAL_SEQUENCE_START,
+                    "ExecutionStarted".to_string(),
+                    serde_json::json!({ "ExecutionStarted": { "execution_id": worker.id.0 } }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                managed_container_reap_reason(
+                    &container_of(worker.id),
+                    Some(&status_of(&repo, worker.id).await)
+                ),
+                None,
+                "before the pass the reaper keeps the container of a running execution"
+            );
+
+            // The new process starts.
+            let bus = Arc::new(EventBus::with_default_capacity());
+            let _persister = Arc::new(ExecutionEventPersister::new(
+                Arc::new(PostgresWorkflowExecutionRepository::new(db.pool.clone())),
+                bus.clone(),
+            ))
+            .start();
+            let config = NodeConfigManifest::default();
+            let ended = end_executions_cut_by_restart(&config, &repo, &bus).await;
+            assert_eq!(ended, vec![judge.id, worker.id]);
+
+            for id in [judge.id, worker.id] {
+                let e = repo.find_by_id_unscoped(id).await.unwrap().unwrap();
+                assert_eq!(
+                    e.status,
+                    ExecutionStatus::Failed,
+                    "{id} still {:?}",
+                    e.status
+                );
+                assert_eq!(
+                    e.error.as_deref(),
+                    Some(ORCHESTRATOR_RESTART_FAILURE_REASON)
+                );
+                assert!(e.ended_at.is_some());
+                let last = e.iterations().last().unwrap();
+                assert_eq!(last.status, IterationStatus::Failed);
+            }
+            let done_after = repo.find_by_id_unscoped(done.id).await.unwrap().unwrap();
+            assert_eq!(done_after.status, ExecutionStatus::Completed);
+            assert_eq!(done_after.error, None);
+
+            // Each failure event is recorded, the worker's after the earlier
+            // process's own event.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (worker_events, judge_events) = loop {
+                let w = events_of(&events, worker.id).await;
+                let j = events_of(&events, judge.id).await;
+                let failed = |v: &Vec<(i64, String, serde_json::Value)>| {
+                    v.iter().any(|(_, t, _)| t == "ExecutionFailed")
+                };
+                if (failed(&w) && failed(&j)) || std::time::Instant::now() > deadline {
+                    break (w, j);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            for (name, recorded) in [("worker", &worker_events), ("judge", &judge_events)] {
+                assert_eq!(
+                    recorded
+                        .iter()
+                        .filter(|(_, t, _)| t == "IterationFailed")
+                        .count(),
+                    1,
+                    "every event the pass published for the {name} is recorded: {recorded:?}"
+                );
+                let failed: Vec<_> = recorded
+                    .iter()
+                    .filter(|(_, t, _)| t == "ExecutionFailed")
+                    .collect();
+                assert_eq!(failed.len(), 1, "{name}'s events: {recorded:?}");
+                assert_eq!(
+                    failed[0].2["ExecutionFailed"]["reason"], ORCHESTRATOR_RESTART_FAILURE_REASON,
+                    "{name}'s ExecutionFailed: {:?}",
+                    failed[0]
+                );
+            }
+            let worker_failed_seq = worker_events
+                .iter()
+                .find(|(_, t, _)| t == "ExecutionFailed")
+                .map(|(s, _, _)| *s);
+            assert!(
+                worker_failed_seq > Some(LOCAL_SEQUENCE_START),
+                "the worker's ExecutionFailed must follow the earlier process's event: {worker_events:?}"
+            );
+
+            // What the worker's status poll reads now.
+            let (code, body) = execution_status(
+                &repo,
+                Some(&service_account()),
+                Some(tenant.as_str()),
+                worker.id.0,
+            )
+            .await;
+            assert_eq!(code.as_u16(), 200, "body: {body:?}");
+            assert_eq!(body.0["status"], "Failed");
+
+            // The reaper's start-up pass now removes their containers.
+            for id in [judge.id, worker.id] {
+                assert_eq!(
+                    managed_container_reap_reason(
+                        &container_of(id),
+                        Some(&status_of(&repo, id).await)
+                    ),
+                    Some("execution_not_running")
+                );
+            }
+
+            // A second start changes nothing.
+            let failed_count = |v: &Vec<(i64, String, serde_json::Value)>| {
+                v.iter().filter(|(_, t, _)| t == "ExecutionFailed").count()
+            };
+            let ended_again = end_executions_cut_by_restart(&config, &repo, &bus).await;
+            assert!(
+                ended_again.is_empty(),
+                "the second pass ended {ended_again:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert_eq!(failed_count(&events_of(&events, worker.id).await), 1);
+            assert_eq!(failed_count(&events_of(&events, judge.id).await), 1);
+
+            db.remove().await;
+        }
+
+        /// On a node with clustering enabled the pass does not run: an
+        /// execution record names no node, so a running execution of another
+        /// live node would be failed. The record stays as it is.
+        #[tokio::test]
+        async fn a_clustered_node_skips_the_startup_pass() {
+            let mut config = NodeConfigManifest::default();
+            assert!(restart_pass_applies(&config));
+            let cluster: ClusterConfig =
+                serde_json::from_value(serde_json::json!({ "enabled": true })).unwrap();
+            config.spec.cluster = Some(cluster);
+            assert!(!restart_pass_applies(&config));
+
+            let repo = InMemoryExecutionRepository::new();
+            let tenant = TenantId::for_consumer_user("cluster-owner").unwrap();
+            let running = left_running(AgentId::new(), &tenant, Utc::now());
+            repo.save_for_tenant(&tenant, &running).await.unwrap();
+            let bus = EventBus::with_default_capacity();
+            assert!(end_executions_cut_by_restart(&config, &repo, &bus)
+                .await
+                .is_empty());
+            assert_eq!(status_of(&repo, running.id).await, ExecutionStatus::Running);
+        }
     }
 }

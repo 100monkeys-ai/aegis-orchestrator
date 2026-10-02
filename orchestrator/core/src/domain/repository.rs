@@ -224,6 +224,24 @@ pub trait ExecutionRepository: Send + Sync {
 
     /// Count executions with `status IN ('running', 'pending')` for a tenant (quota enforcement).
     async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError>;
+
+    /// Every execution of every tenant whose status is `pending` or
+    /// `running`, newest first.
+    ///
+    /// Read once, at start-up, by the pass that ends the executions an
+    /// earlier orchestrator process left unfinished
+    /// ([`crate::application::execution::fail_executions_cut_by_restart`]).
+    /// Each returned [`Execution`] carries its own `tenant_id`, which the
+    /// caller MUST use for the write that follows.
+    ///
+    /// A repository that cannot list them answers an error rather than an
+    /// empty list, so the pass reports that it could not run instead of
+    /// reporting that there was nothing to end.
+    async fn find_unfinished_unscoped(&self) -> Result<Vec<Execution>, RepositoryError> {
+        Err(RepositoryError::Unknown(
+            "this execution repository does not list unfinished executions".to_string(),
+        ))
+    }
 }
 
 /// Repository interface for Workflow aggregates

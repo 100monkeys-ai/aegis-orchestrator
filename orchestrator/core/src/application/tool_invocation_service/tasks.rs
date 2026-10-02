@@ -431,11 +431,27 @@ impl ToolInvocationService {
             .cancel_execution_for_tenant(&tenant_id, exec_id)
             .await
         {
-            Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.task.cancel",
-                "cancelled": true,
-                "execution_id": exec_id_str
-            }))),
+            // A cancel of an execution that had already ended leaves it as it
+            // was; the answer carries the state the execution is in after the
+            // cancel, so the caller sees "failed" (with the reason in
+            // aegis.task.status) rather than a cancellation that did not happen.
+            Ok(_) => match self
+                .execution_service
+                .get_execution_for_tenant(&tenant_id, exec_id)
+                .await
+            {
+                Ok(exec) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.cancel",
+                    "cancelled": exec.status == crate::domain::execution::ExecutionStatus::Cancelled,
+                    "status": format!("{:?}", exec.status).to_lowercase(),
+                    "execution_id": exec_id_str
+                }))),
+                Err(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.cancel",
+                    "cancelled": true,
+                    "execution_id": exec_id_str
+                }))),
+            },
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.task.cancel",
                 "cancelled": false,
