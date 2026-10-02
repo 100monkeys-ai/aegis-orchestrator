@@ -621,11 +621,15 @@ pub enum ExecutionLanguage {
 }
 
 impl ExecutionLanguage {
+    /// The image the pipeline's EXECUTE_CODE runs the code in: the image the
+    /// runtime registry gives the runtime of this language's executor agent
+    /// (`aegis-<language>-executor-agent`), so the code runs where WRITE_CODE
+    /// tested it. A test holds the two equal.
     pub fn container_image(&self) -> &'static str {
         match self {
             Self::Python => "python:3.11-slim",
-            Self::JavaScript => "node:20-slim",
-            Self::Bash => "ubuntu:22.04",
+            Self::JavaScript => "node:20-alpine",
+            Self::Bash => "python:3.11-slim",
         }
     }
     pub fn runner_command(&self) -> &'static str {
@@ -1513,6 +1517,52 @@ impl WorkflowValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The intent pipeline's EXECUTE_CODE runs the code in the image its
+    /// WRITE_CODE executor tested it in: for every language, the table's image
+    /// is the image the template runtime registry gives the runtime that the
+    /// language's executor agent template (`aegis-<language>-executor-agent`,
+    /// as `builtin-intent-to-execution` names it) declares.
+    #[test]
+    fn container_image_is_the_executor_agents_registry_image() {
+        let templates =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cli/templates");
+        let read_yaml = |path: std::path::PathBuf| -> serde_yaml::Value {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+        };
+        let registry = read_yaml(templates.join("stack/runtime-registry.yaml"));
+
+        let mut mismatches = Vec::new();
+        for language in [
+            ExecutionLanguage::Python,
+            ExecutionLanguage::JavaScript,
+            ExecutionLanguage::Bash,
+        ] {
+            let name = serde_json::to_value(language).unwrap();
+            let name = name.as_str().unwrap();
+            let agent =
+                read_yaml(templates.join(format!("agents/aegis-{name}-executor-agent.yaml")));
+            let runtime = &agent["spec"]["runtime"];
+            let runtime_language = runtime["language"].as_str().unwrap();
+            let runtime_version = runtime["version"].as_str().unwrap();
+            let registry_image = registry["spec"]["runtimes"][runtime_language][runtime_version]
+                ["image"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("registry has no image for {runtime_language} {runtime_version}")
+                });
+            if language.container_image() != registry_image {
+                mismatches.push(format!(
+                    "{name}: the pipeline runs {} but aegis-{name}-executor-agent \
+                     ({runtime_language} {runtime_version}) runs {registry_image}",
+                    language.container_image()
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("; "));
+    }
 
     #[test]
     fn test_workflow_id_creation() {
