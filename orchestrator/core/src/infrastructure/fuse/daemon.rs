@@ -100,9 +100,72 @@ pub struct FuseVolumeContext {
     pub execution_id: ExecutionId,
     pub volume_id: VolumeId,
     pub workflow_execution_id: Option<uuid::Uuid>,
+    /// The identity the container's process has inside its own namespace,
+    /// as the mount request names it. The mount reports it on the host as
+    /// [`MountOwner::for_container`] translates it.
     pub container_uid: u32,
     pub container_gid: u32,
     pub policy: FsalAccessPolicy,
+}
+
+/// The owner a FUSE mount reports on every inode (ADR-107 D8, "UID/GID
+/// squashing"): the identity the container's process has on the host.
+///
+/// The kernel reads a FUSE daemon's attributes in the daemon's own user
+/// namespace, and with `default_permissions` it checks every access against
+/// them, so the owner must be the host identity of the process that uses the
+/// mount. A mount request names that process's identity inside its container.
+/// A container's root is the user that runs the container engine: under
+/// rootless Podman, the unprivileged user that runs both Podman and this
+/// daemon (ADR-107 D11; `aegis` in production); under a rootful engine, root,
+/// as this daemon then is (and root passes the check in any case). In both it
+/// is this daemon's own identity, so root is reported as that. Any other
+/// identity is reported as the request names it: under a rootful engine that
+/// is its host identity; under rootless Podman it maps to a subordinate id the
+/// daemon cannot see, as before.
+///
+/// The storage layer's policy (the request's read and write paths) stays the
+/// authority on what may be written: every write is still proxied to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountOwner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl MountOwner {
+    /// The owner reported for a container process `container_uid:container_gid`
+    /// by a daemon running as `daemon_uid:daemon_gid`.
+    pub fn for_container(
+        container_uid: u32,
+        container_gid: u32,
+        daemon_uid: u32,
+        daemon_gid: u32,
+    ) -> Self {
+        Self {
+            uid: if container_uid == 0 {
+                daemon_uid
+            } else {
+                container_uid
+            },
+            gid: if container_gid == 0 {
+                daemon_gid
+            } else {
+                container_gid
+            },
+        }
+    }
+
+    /// The owner reported for `context` by this process.
+    fn for_context(context: &FuseVolumeContext) -> Self {
+        // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+        let (daemon_uid, daemon_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Self::for_container(
+            context.container_uid,
+            context.container_gid,
+            daemon_uid,
+            daemon_gid,
+        )
+    }
 }
 
 /// Wrapper to make `fuser::BackgroundSession` `Send + Sync`.
@@ -360,7 +423,9 @@ impl FuseFsalDaemon {
 
         // Mount options:
         // - allow_other: let the container user access the mount (requires /etc/fuse.conf)
-        // - default_permissions: let the kernel enforce basic permission checks
+        // - default_permissions: let the kernel enforce basic permission checks,
+        //   against the owner `MountOwner` reports (the container's process on
+        //   the host); writes are then still refused by the FSAL's policy
         // - fsname: identifies this mount in /proc/mounts
         let mut config = FuseConfig::default();
         config.mount_options = vec![
@@ -484,6 +549,11 @@ impl FuseFsal {
         }
     }
 
+    /// The owner this mount reports on every inode.
+    fn owner(&self) -> MountOwner {
+        MountOwner::for_context(&self.context)
+    }
+
     /// Convert FSAL `FileAttributes` to `fuser::FileAttr`, applying UID/GID squashing.
     fn convert_attrs(&self, attrs: &crate::domain::storage::FileAttributes, ino: u64) -> FileAttr {
         let kind = match attrs.file_type {
@@ -491,6 +561,7 @@ impl FuseFsal {
             FileType::Directory => FuseFileType::Directory,
             FileType::Symlink => FuseFileType::Symlink,
         };
+        let owner = self.owner();
 
         FileAttr {
             ino: INodeNo(ino),
@@ -503,8 +574,8 @@ impl FuseFsal {
             kind,
             perm: attrs.mode as u16,
             nlink: attrs.nlink,
-            uid: self.context.container_uid, // UID squashing per ADR-036
-            gid: self.context.container_gid, // GID squashing per ADR-036
+            uid: owner.uid, // UID squashing per ADR-036
+            gid: owner.gid, // GID squashing per ADR-036
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -513,6 +584,7 @@ impl FuseFsal {
 
     /// Synthesize directory attributes for the volume root.
     fn root_attr(&self) -> FileAttr {
+        let owner = self.owner();
         FileAttr {
             ino: INodeNo(ROOT_INODE),
             size: 4096,
@@ -524,8 +596,8 @@ impl FuseFsal {
             kind: FuseFileType::Directory,
             perm: 0o755,
             nlink: 2,
-            uid: self.context.container_uid,
-            gid: self.context.container_gid,
+            uid: owner.uid,
+            gid: owner.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -917,8 +989,8 @@ impl Filesystem for FuseFsal {
                             kind: FuseFileType::RegularFile,
                             perm: 0o644,
                             nlink: 1,
-                            uid: self.context.container_uid,
-                            gid: self.context.container_gid,
+                            uid: self.owner().uid,
+                            gid: self.owner().gid,
                             rdev: 0,
                             blksize: 4096,
                             flags: 0,
@@ -1007,8 +1079,8 @@ impl Filesystem for FuseFsal {
                     kind: FuseFileType::Directory,
                     perm: 0o755,
                     nlink: 2,
-                    uid: self.context.container_uid,
-                    gid: self.context.container_gid,
+                    uid: self.owner().uid,
+                    gid: self.owner().gid,
                     rdev: 0,
                     blksize: 4096,
                     flags: 0,
@@ -1470,14 +1542,23 @@ mod tests {
 
     /// Build a `FuseFsal` with the given runtime handle and a stub backend.
     fn make_fuse_fsal(runtime: tokio::runtime::Handle) -> FuseFsal {
+        make_fuse_fsal_for(runtime, 1000, 1000)
+    }
+
+    /// Build a `FuseFsal` for a mount request naming `container_uid:container_gid`.
+    fn make_fuse_fsal_for(
+        runtime: tokio::runtime::Handle,
+        container_uid: u32,
+        container_gid: u32,
+    ) -> FuseFsal {
         FuseFsal {
             backend: Arc::new(StubBackend),
             context: FuseVolumeContext {
                 execution_id: ExecutionId::new(),
                 volume_id: VolumeId::new(),
                 workflow_execution_id: None,
-                container_uid: 1000,
-                container_gid: 1000,
+                container_uid,
+                container_gid,
                 policy: FsalAccessPolicy::default(),
             },
             inode_table: Arc::new(InodeTable::new()),
@@ -1573,6 +1654,94 @@ mod tests {
             fs.is_degraded(),
             "callbacks must see the degraded flag and short-circuit to EIO"
         );
+    }
+
+    /// Regression (eval-long-doc-agent, execution ff93baf9): a mount whose
+    /// request names the container's root reports every inode as owned by the
+    /// identity that root has on the host, this daemon's own, so the kernel's
+    /// `default_permissions` check lets the container's root write a
+    /// read-write volume. Before the fix the mount reported the request's
+    /// identity unchanged, an owner the container's root is not on the host.
+    #[test]
+    fn a_root_containers_mount_is_owned_by_the_daemons_own_identity() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let fs = make_fuse_fsal_for(rt.handle().clone(), 0, 0);
+        // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+        let (daemon_uid, daemon_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+
+        let root = fs.root_attr();
+        assert_eq!(
+            (root.uid, root.gid, root.perm),
+            (daemon_uid, daemon_gid, 0o755),
+            "the volume root is owned by the daemon's identity, mode 0755"
+        );
+
+        let file = fs.convert_attrs(
+            &FileAttributes {
+                file_type: FileType::File,
+                size: 4,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                nlink: 1,
+            },
+            7,
+        );
+        assert_eq!(
+            (file.uid, file.gid, file.perm),
+            (daemon_uid, daemon_gid, 0o644),
+            "a file is owned by the daemon's identity and keeps the storage layer's mode"
+        );
+    }
+
+    /// The rule for a rootless and a rootful runtime. Under rootless Podman
+    /// the daemon runs as the unprivileged user that runs Podman (production:
+    /// `aegis`, uid 1003), and the container's root is that user on the host;
+    /// under a rootful runtime the daemon and the container's root are both
+    /// root. A non-root identity is reported as the request names it.
+    #[test]
+    fn mount_owner_follows_the_container_root_under_rootless_and_rootful_runtimes() {
+        // Rootless Podman: the agent path's request names root, 0:0.
+        assert_eq!(
+            MountOwner::for_container(0, 0, 1003, 1003),
+            MountOwner {
+                uid: 1003,
+                gid: 1003
+            }
+        );
+        // Rootful runtime: the daemon runs as root.
+        assert_eq!(
+            MountOwner::for_container(0, 0, 0, 0),
+            MountOwner { uid: 0, gid: 0 }
+        );
+        // A container process with its own non-root identity, either runtime.
+        assert_eq!(
+            MountOwner::for_container(65534, 65534, 1003, 1003),
+            MountOwner {
+                uid: 65534,
+                gid: 65534
+            }
+        );
+        assert_eq!(
+            MountOwner::for_container(1000, 0, 0, 0),
+            MountOwner { uid: 1000, gid: 0 }
+        );
+    }
+
+    /// A request naming a non-root identity is reported as it names it.
+    #[test]
+    fn a_non_root_identity_is_reported_as_the_request_names_it() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let fs = make_fuse_fsal_for(rt.handle().clone(), 65534, 65534);
+        let root = fs.root_attr();
+        assert_eq!((root.uid, root.gid), (65534, 65534));
     }
 
     /// Regression: the supervisor task must mark a mount degraded when ops

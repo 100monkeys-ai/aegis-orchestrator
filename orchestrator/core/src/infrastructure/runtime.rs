@@ -718,11 +718,72 @@ impl ContainerRuntime {
         Ok(())
     }
 
+    /// The identity a container's process has inside its own namespace, from
+    /// the engine's user string for it (the create request's `User`, else the
+    /// image's `Config.User`): root when it names none or names root; numbers
+    /// as they are, a missing group being root's for root and `fallback`'s
+    /// otherwise. A name is not resolved here (that needs the image's
+    /// `/etc/passwd`): it leaves `fallback` in its place.
+    pub(crate) fn container_process_identity(
+        user: Option<&str>,
+        fallback: (u32, u32),
+    ) -> (u32, u32) {
+        let user = user.unwrap_or("").trim();
+        if user.is_empty() {
+            return (0, 0);
+        }
+        let (user_part, group_part) = match user.split_once(':') {
+            Some((u, g)) => (u, Some(g)),
+            None => (user, None),
+        };
+        let id = |part: &str| -> Option<u32> {
+            if part == "root" {
+                Some(0)
+            } else {
+                part.parse().ok()
+            }
+        };
+        let Some(uid) = id(user_part) else {
+            return fallback;
+        };
+        let gid = match group_part {
+            Some(g) => id(g).unwrap_or(fallback.1),
+            None if uid == 0 => 0,
+            None => fallback.1,
+        };
+        (uid, gid)
+    }
+
+    /// The identity of the agent container's process: the agent container
+    /// names no user (`agent_container_body`), so its process runs as its
+    /// image's user, root for every registry image. `config.container_uid`
+    /// and `container_gid` stand where the image cannot be read or names a
+    /// user by name.
+    async fn agent_container_identity(&self, config: &RuntimeConfig) -> (u32, u32) {
+        let fallback = (config.container_uid, config.container_gid);
+        match self.docker.inspect_image(&config.image).await {
+            Ok(image) => Self::container_process_identity(
+                image.config.and_then(|c| c.user).as_deref(),
+                fallback,
+            ),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    image = %config.image,
+                    "could not read the agent image's user; its volumes report the configured identity"
+                );
+                fallback
+            }
+        }
+    }
+
     /// The FUSE mount request the agent path sends for one of its volumes
-    /// (ADR-107).
+    /// (ADR-107). `identity` is the agent container's process identity
+    /// ([`Self::agent_container_identity`]); the daemon reports it on the host.
     fn agent_fuse_mount_request(
         config: &RuntimeConfig,
         volume_mount: &crate::domain::volume::VolumeMount,
+        identity: (u32, u32),
     ) -> crate::infrastructure::aegis_runtime_proto::FuseMountRequest {
         let is_read_only = matches!(
             volume_mount.access_mode,
@@ -738,8 +799,8 @@ impl ContainerRuntime {
             } else {
                 vec!["/*".to_string()]
             },
-            container_uid: 1000,
-            container_gid: 1000,
+            container_uid: identity.0,
+            container_gid: identity.1,
             workflow_execution_id: config
                 .workflow_execution_id
                 .map(|id| id.to_string())
@@ -1104,6 +1165,9 @@ impl AgentRuntime for ContainerRuntime {
         // terminate() can call unmount on the remote daemon.
         let mut pending_grpc_fuse_pairs_outer: Vec<(String, String)> = Vec::new();
         if !config.volumes.is_empty() {
+            // The identity each FUSE mount reports as its owner, on the host,
+            // through the daemon (`fuse::daemon::MountOwner`).
+            let container_identity = self.agent_container_identity(&config).await;
             if let Some(ref _fuse_mount_client) = self.fuse_mount_client {
                 // ── gRPC FuseMountService path (ADR-107) ─────────────────────────
                 // Delegate mount requests to the host-side FUSE daemon over gRPC.
@@ -1209,7 +1273,8 @@ impl AgentRuntime for ContainerRuntime {
                         crate::domain::volume::AccessMode::ReadOnly
                     );
 
-                    let grpc_req = Self::agent_fuse_mount_request(&config, volume_mount);
+                    let grpc_req =
+                        Self::agent_fuse_mount_request(&config, volume_mount, container_identity);
 
                     let exec_id_str = config.execution_id.0.to_string();
                     let vid = volume_mount.volume_id.0.to_string();
@@ -1329,8 +1394,8 @@ impl AgentRuntime for ContainerRuntime {
                                     execution_id: config.execution_id,
                                     volume_id: volume_mount.volume_id,
                                     workflow_execution_id: config.workflow_execution_id,
-                                    container_uid: 1000, // Default; overridden by manifest
-                                    container_gid: 1000,
+                                    container_uid: container_identity.0,
+                                    container_gid: container_identity.1,
                                     policy,
                                 };
 
@@ -2278,7 +2343,11 @@ mod tests {
         config.workflow_execution_id = Some(workflow_execution_id);
         let volume_id = crate::domain::volume::VolumeId::new();
 
-        let req = ContainerRuntime::agent_fuse_mount_request(&config, &workspace_mount(volume_id));
+        let req = ContainerRuntime::agent_fuse_mount_request(
+            &config,
+            &workspace_mount(volume_id),
+            (0, 0),
+        );
 
         assert_eq!(req.workflow_execution_id, workflow_execution_id.to_string());
         assert_eq!(req.volume_id, volume_id.0.to_string());
@@ -2293,8 +2362,59 @@ mod tests {
         let req = ContainerRuntime::agent_fuse_mount_request(
             &config,
             &workspace_mount(crate::domain::volume::VolumeId::new()),
+            (0, 0),
         );
         assert_eq!(req.workflow_execution_id, "");
+    }
+
+    /// Regression (eval-long-doc-agent, execution ff93baf9): the agent path's
+    /// mount request names the identity the agent container's process has in
+    /// its own namespace, the user its image runs as, root for every registry
+    /// image, where it named a fixed 1000:1000 that is not that process.
+    /// The request is the same under a rootless and a rootful runtime: the
+    /// daemon, which runs as the engine's user, translates it to the host
+    /// (`fuse::daemon::MountOwner`). A read-only volume still asks for no
+    /// write path.
+    #[test]
+    fn agent_fuse_mount_request_names_the_containers_process_identity() {
+        let config = sample_runtime_config();
+        let identity = ContainerRuntime::container_process_identity(
+            None,
+            (config.container_uid, config.container_gid),
+        );
+        let req = ContainerRuntime::agent_fuse_mount_request(
+            &config,
+            &workspace_mount(crate::domain::volume::VolumeId::new()),
+            identity,
+        );
+        assert_eq!((req.container_uid, req.container_gid), (0, 0));
+        assert_eq!(req.write_paths, vec!["/*".to_string()]);
+
+        let mut read_only = workspace_mount(crate::domain::volume::VolumeId::new());
+        read_only.access_mode = crate::domain::volume::AccessMode::ReadOnly;
+        let req = ContainerRuntime::agent_fuse_mount_request(&config, &read_only, identity);
+        assert_eq!((req.container_uid, req.container_gid), (0, 0));
+        assert!(req.write_paths.is_empty());
+    }
+
+    /// The forms an engine's user string takes (`Config.User`, `--user`):
+    /// empty and root are root; numbers are taken as they are; a name is not
+    /// resolved here and leaves the fallback in its place.
+    #[test]
+    fn container_process_identity_reads_the_engines_user_forms() {
+        let fallback = (1000, 1000);
+        let id = |user: Option<&str>| ContainerRuntime::container_process_identity(user, fallback);
+        assert_eq!(id(None), (0, 0));
+        assert_eq!(id(Some("")), (0, 0));
+        assert_eq!(id(Some("root")), (0, 0));
+        assert_eq!(id(Some("0")), (0, 0));
+        assert_eq!(id(Some("0:0")), (0, 0));
+        assert_eq!(id(Some("root:root")), (0, 0));
+        assert_eq!(id(Some("65534:65534")), (65534, 65534));
+        assert_eq!(id(Some("1001")), (1001, 1000));
+        assert_eq!(id(Some("1001:staff")), (1001, 1000));
+        assert_eq!(id(Some("node")), (1000, 1000));
+        assert_eq!(id(Some("node:node")), (1000, 1000));
     }
 
     /// T6: a bootstrap that exits non-zero failed its iteration, whether or not

@@ -462,6 +462,36 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             let mut grpc_mounted_volumes: Vec<(String, String)> = Vec::new();
 
             // ─── Volume mounts: gRPC FUSE (ADR-107) → local FUSE (ADR-107) ────────────────
+            // The user the step's container runs as when the step names none:
+            // its image's, read once for every volume's mount request. `None`
+            // when the image could not be read.
+            let image_user: Option<Option<String>> = if config.volumes.is_empty()
+                || config.run_as_user.is_some()
+            {
+                Some(None)
+            } else {
+                match self.docker.inspect_image(&config.image).await {
+                    Ok(image) => Some(image.config.and_then(|c| c.user)),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            image = %config.image,
+                            "could not read the step image's user; its volumes report the registered identity"
+                        );
+                        None
+                    }
+                }
+            };
+            // The identity of the step container's process, for one volume
+            // registered with `registered`.
+            let step_identity = |registered: (u32, u32)| match &image_user {
+                Some(image_user) => step_container_identity(
+                    config.run_as_user.as_deref(),
+                    image_user.as_deref(),
+                    registered,
+                ),
+                None => registered,
+            };
             if !config.volumes.is_empty() {
                 if let Some(ref _fuse_mount_client) = self.fuse_mount_client {
                     // ── gRPC FuseMountService path (ADR-107) ─────────────────────────
@@ -493,6 +523,8 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             }
                         };
 
+                        let identity =
+                            step_identity((existing_ctx.container_uid, existing_ctx.container_gid));
                         let grpc_req =
                             crate::infrastructure::aegis_runtime_proto::FuseMountRequest {
                                 volume_id: volume_id.0.to_string(),
@@ -504,8 +536,8 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                 } else {
                                     vec!["/*".to_string()]
                                 },
-                                container_uid: existing_ctx.container_uid,
-                                container_gid: existing_ctx.container_gid,
+                                container_uid: identity.0,
+                                container_gid: identity.1,
                                 workflow_execution_id: existing_ctx
                                     .workflow_execution_id
                                     .or(config.workflow_execution_id)
@@ -601,6 +633,10 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             };
 
                             let mountpoint_path = format!("{}/{}", self.fuse_mount_prefix, vm.name);
+                            let identity = step_identity((
+                                existing_ctx.container_uid,
+                                existing_ctx.container_gid,
+                            ));
                             let fuse_context =
                                 crate::infrastructure::fuse::daemon::FuseVolumeContext {
                                     execution_id: config.execution_id,
@@ -608,8 +644,8 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                     workflow_execution_id: existing_ctx
                                         .workflow_execution_id
                                         .or(config.workflow_execution_id),
-                                    container_uid: existing_ctx.container_uid,
-                                    container_gid: existing_ctx.container_gid,
+                                    container_uid: identity.0,
+                                    container_gid: identity.1,
                                     policy,
                                 };
 
@@ -1168,6 +1204,21 @@ fn parse_memory_string(s: &str) -> Option<i64> {
     }
 }
 
+/// The identity a step container's process has inside its own namespace,
+/// which its FUSE mount requests name: the step's `run_as_user`, else
+/// `image_user`, the user its image runs as (ADR-107 D8). `registered`, the
+/// volume's registered identity, stands where that user is given by name.
+fn step_container_identity(
+    run_as_user: Option<&str>,
+    image_user: Option<&str>,
+    registered: (u32, u32),
+) -> (u32, u32) {
+    crate::infrastructure::runtime::ContainerRuntime::container_process_identity(
+        run_as_user.or(image_user),
+        registered,
+    )
+}
+
 /// The error text for a step's `registry_credentials` value that is neither
 /// `env:VAR_NAME` nor `secret:engine/path`.
 ///
@@ -1189,8 +1240,38 @@ fn unrecognised_registry_credentials_message(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_memory_string, unrecognised_registry_credentials_message, ContainerStepRunnerConfig,
+        parse_memory_string, step_container_identity, unrecognised_registry_credentials_message,
+        ContainerStepRunnerConfig,
     };
+
+    /// A ContainerRun step's FUSE mount request names the identity its
+    /// container's process has in its own namespace: the step's `run_as_user`,
+    /// else the user its image runs as, root when neither names one (the
+    /// intent pipeline's python:3.11-slim and node:20-alpine). It named the
+    /// registered 1000:1000, which no such process is. A user given by name is
+    /// not resolved and keeps the registered identity.
+    #[test]
+    fn step_mount_identity_is_the_step_containers_process() {
+        let registered = (1000, 1000);
+        assert_eq!(step_container_identity(None, None, registered), (0, 0));
+        assert_eq!(step_container_identity(None, Some(""), registered), (0, 0));
+        assert_eq!(
+            step_container_identity(Some("65534:65534"), Some(""), registered),
+            (65534, 65534)
+        );
+        assert_eq!(
+            step_container_identity(None, Some("1001:1001"), registered),
+            (1001, 1001)
+        );
+        assert_eq!(
+            step_container_identity(Some("0"), Some("1001:1001"), registered),
+            (0, 0)
+        );
+        assert_eq!(
+            step_container_identity(None, Some("node"), registered),
+            registered
+        );
+    }
     use crate::domain::runtime::ContainerStepConfig;
     use std::collections::HashMap;
 
