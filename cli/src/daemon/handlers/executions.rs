@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use futures::StreamExt;
@@ -15,9 +15,12 @@ use aegis_orchestrator_core::application::file_operations_service::FileOperation
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
+use aegis_orchestrator_core::domain::repository::ExecutionRepository;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
+use crate::daemon::handlers::{
+    is_operator, tenant_id_from_identity, tenant_id_from_request, TENANT_DELEGATION_HEADER,
+};
 use crate::daemon::state::AppState;
 
 pub(crate) use crate::daemon::handlers::DEFAULT_MAX_EXECUTION_LIST_LIMIT;
@@ -33,34 +36,53 @@ pub(crate) async fn get_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(execution_id): Path<Uuid>,
 ) -> Result<
     impl axum::response::IntoResponse,
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("execution:read")?;
-    let identity_ref = identity.as_ref().map(|identity| &identity.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let exec_result = if is_operator(identity_ref) {
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    Ok(execution_status(
+        state.execution_repo.as_ref(),
+        identity.as_ref().map(|identity| &identity.0),
+        delegation,
+        execution_id,
+    )
+    .await)
+}
+
+/// The status route's answer for `execution_id` as `identity` sees it.
+///
+/// An operator reads any tenant's execution (ADR-097). Any other caller
+/// reads only executions of the tenant its request resolves to, resolved as
+/// on every delegated route (ADR-100, [`tenant_id_from_request`]): a service
+/// account takes the tenant it names in `X-Tenant-Id` — the Temporal
+/// worker's status poll of a user's agent execution — and every other
+/// identity keeps its own tenant whatever the header says.
+pub(crate) async fn execution_status(
+    execution_repo: &dyn ExecutionRepository,
+    identity: Option<&UserIdentity>,
+    delegation: Option<&str>,
+    execution_id: Uuid,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    let tenant_id = tenant_id_from_request(identity, delegation);
+    let exec_result = if is_operator(identity) {
         // Operator cross-tenant fetch (ADR-097). Each Execution carries its
         // own `tenant_id` for the projection.
-        match state
-            .execution_repo
+        execution_repo
             .find_by_id_unscoped(ExecutionId(execution_id))
             .await
-        {
-            Ok(Some(e)) => Ok(e),
-            Ok(None) => Err(anyhow::anyhow!("Execution not found")),
-            Err(e) => Err(anyhow::anyhow!("{e}")),
-        }
     } else {
-        state
-            .execution_service
-            .get_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
+        execution_repo
+            .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
             .await
     };
     match exec_result {
-        Ok(exec) => Ok((
+        Ok(Some(exec)) => (
             StatusCode::OK,
             axum::Json(serde_json::json!({
                 "id": exec.id.0,
@@ -68,15 +90,19 @@ pub(crate) async fn get_execution_handler(
                 "status": format!("{:?}", exec.status),
                 "tenant_id": exec.tenant_id.as_str(),
             })),
-        )),
+        ),
         // Audit 002 §4.37.6 — collapse not-found / not-visible to 404 instead
         // of returning 200 with an error body.
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "Execution not found"})),
+        ),
         Err(e) => {
             tracing::debug!(error = %e, %execution_id, "get_execution failed");
-            Ok((
+            (
                 StatusCode::NOT_FOUND,
                 axum::Json(serde_json::json!({"error": "Execution not found"})),
-            ))
+            )
         }
     }
 }
@@ -304,4 +330,162 @@ pub(crate) async fn get_execution_file_handler(
             };
             (status, axum::Json(serde_json::json!({"error": message})))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    //! The status route `GET /v1/executions/{id}` resolves its tenant as the
+    //! other delegated routes do (ADR-100): a service account that names a
+    //! tenant in `X-Tenant-Id` reads that tenant's execution — the Temporal
+    //! worker's status poll of a user's agent execution — and any other
+    //! caller stays in its own tenant. Driven through the daemon's real
+    //! authentication stack (`test_support::serve`).
+
+    use super::execution_status;
+    use crate::daemon::handlers::test_support::{
+        consumer, identity_provider, serve, service_account,
+    };
+    use aegis_orchestrator_core::domain::agent::AgentId;
+    use aegis_orchestrator_core::domain::execution::{Execution, ExecutionId, ExecutionInput};
+    use aegis_orchestrator_core::domain::iam::UserIdentity;
+    use aegis_orchestrator_core::domain::repository::ExecutionRepository;
+    use aegis_orchestrator_core::domain::shared_kernel::TenantId;
+    use aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository;
+    use axum::extract::{Extension, Path, State};
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+    use axum::Router;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const SCOPES: &str = "execution:read";
+
+    async fn status_route(
+        State(repo): State<Arc<InMemoryExecutionRepository>>,
+        identity: Option<Extension<UserIdentity>>,
+        headers: HeaderMap,
+        Path(execution_id): Path<Uuid>,
+    ) -> impl axum::response::IntoResponse {
+        let delegation = headers
+            .get(super::TENANT_DELEGATION_HEADER)
+            .and_then(|v| v.to_str().ok());
+        execution_status(
+            repo.as_ref(),
+            identity.as_ref().map(|identity| &identity.0),
+            delegation,
+            execution_id,
+        )
+        .await
+    }
+
+    /// One running execution in the tenant of the consumer `owner-sub`.
+    async fn owner_execution(repo: &InMemoryExecutionRepository) -> (TenantId, ExecutionId) {
+        let tenant = TenantId::for_consumer_user("owner-sub").expect("owner tenant");
+        let mut execution = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("work".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        execution.tenant_id = tenant.clone();
+        execution.start();
+        repo.save_for_tenant(&tenant, &execution).await.unwrap();
+        (tenant, execution.id)
+    }
+
+    async fn get_status(
+        repo: Arc<InMemoryExecutionRepository>,
+        caller: UserIdentity,
+        execution_id: ExecutionId,
+        tenant_header: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        let router = Router::new()
+            .route("/v1/executions/{execution_id}", get(status_route))
+            .with_state(repo);
+        let base = serve(
+            router,
+            Some(identity_provider(&[("caller", caller, SCOPES)])),
+            None,
+        )
+        .await;
+        let mut request = reqwest::Client::new()
+            .get(format!("{base}/v1/executions/{}", execution_id.0))
+            .bearer_auth("caller");
+        if let Some(tenant) = tenant_header {
+            request = request.header("x-tenant-id", tenant);
+        }
+        let response = request.send().await.expect("loopback request");
+        let status = response.status().as_u16();
+        let body = response.json().await.unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// The Temporal worker's status poll: a service account naming the
+    /// execution's tenant reads it (today: 404, "execution not found in
+    /// tenant scope tenant_id=aegis-system").
+    #[tokio::test]
+    async fn a_service_account_naming_the_tenant_reads_its_execution() {
+        let repo = Arc::new(InMemoryExecutionRepository::new());
+        let (tenant, id) = owner_execution(&repo).await;
+        let (status, body) = get_status(repo, service_account(), id, Some(tenant.as_str())).await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["status"], "Running");
+        assert_eq!(body["tenant_id"], tenant.as_str());
+    }
+
+    /// A service account that names no tenant stays in the system tenant,
+    /// as today: another tenant's execution is not found.
+    #[tokio::test]
+    async fn a_service_account_without_the_header_stays_in_the_system_tenant() {
+        let repo = Arc::new(InMemoryExecutionRepository::new());
+        let (_tenant, id) = owner_execution(&repo).await;
+        let (status, body) = get_status(repo, service_account(), id, None).await;
+        assert_eq!(status, 404, "body: {body}");
+    }
+
+    /// A user naming another user's tenant is refused by the tenant
+    /// middleware (`forbidden_tenant_switch`), as on every delegated route.
+    #[tokio::test]
+    async fn a_user_naming_another_tenant_is_refused() {
+        let repo = Arc::new(InMemoryExecutionRepository::new());
+        let (tenant, id) = owner_execution(&repo).await;
+        let (status, body) =
+            get_status(repo, consumer("intruder-sub"), id, Some(tenant.as_str())).await;
+        assert_eq!(status, 403, "body: {body}");
+    }
+
+    /// The owner reads its own execution without any header, as today.
+    #[tokio::test]
+    async fn the_owner_reads_its_execution_without_the_header() {
+        let repo = Arc::new(InMemoryExecutionRepository::new());
+        let (_tenant, id) = owner_execution(&repo).await;
+        let (status, body) = get_status(repo, consumer("owner-sub"), id, None).await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["status"], "Running");
+    }
+
+    /// Past the middleware, the handler itself ignores the header for a
+    /// caller that may not delegate (`resolve_effective_tenant`): a user
+    /// naming another tenant is scoped to its own and does not see it.
+    #[tokio::test]
+    async fn the_handler_scopes_a_user_naming_another_tenant_to_its_own() {
+        let repo = InMemoryExecutionRepository::new();
+        let (tenant, id) = owner_execution(&repo).await;
+        let (status, _) = execution_status(
+            &repo,
+            Some(&consumer("intruder-sub")),
+            Some(tenant.as_str()),
+            id.0,
+        )
+        .await;
+        assert_eq!(status.as_u16(), 404);
+    }
 }
