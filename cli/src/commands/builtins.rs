@@ -618,6 +618,84 @@ mod tests {
         }
     }
 
+    /// Every `timeout_seconds` a validator of `execution` carries, after the
+    /// orchestrator's own defaults are applied.
+    fn validator_timeouts(value: &serde_yaml::Value, out: &mut Vec<u64>) {
+        match value {
+            serde_yaml::Value::Mapping(map) => {
+                for (key, child) in map {
+                    if key.as_str() == Some("timeout_seconds") {
+                        if let Some(secs) = child.as_u64() {
+                            out.push(secs);
+                        }
+                    }
+                    validator_timeouts(child, out);
+                }
+            }
+            serde_yaml::Value::Sequence(items) => {
+                for item in items {
+                    validator_timeouts(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Regression test for the built-in workflow generator failing in
+    /// production (2026-10-02, generation c1fc25b9 on `sha-fbb3a68`): the
+    /// agent creator's execution ended at its `resources.timeout` of 300 s
+    /// while its judge was still working, although the template gives one
+    /// validation 600 s. A validation runs inside the execution, so an
+    /// execution bound below a validator's bound contradicts the template.
+    /// The overall bound is `security.resources.timeout`
+    /// (`ResourceLimits::parse_timeout_seconds`, read by the supervisor's
+    /// `run_loop`); unset, it is `DEFAULT_EXECUTION_TIMEOUT_SECONDS`.
+    /// `llm_timeout_seconds` is deliberately not part of the rule: the judges'
+    /// clocks are AEGIS ADR-124's and do not move here.
+    #[test]
+    fn builtin_agent_execution_timeout_is_not_below_its_validators_timeouts() {
+        use aegis_orchestrator_core::domain::agent::{ExecutionStrategy, ResourceLimits};
+        use aegis_orchestrator_core::domain::supervisor::DEFAULT_EXECUTION_TIMEOUT_SECONDS;
+
+        let mut violations = Vec::new();
+        for (name, yaml) in BUILTIN_AGENTS {
+            let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let spec = &doc["spec"];
+            let execution: ExecutionStrategy = serde_yaml::from_value(spec["execution"].clone())
+                .unwrap_or_else(|e| {
+                    panic!("builtin agent '{name}': execution does not parse: {e}")
+                });
+            let resources: ResourceLimits =
+                serde_yaml::from_value(spec["security"]["resources"].clone()).unwrap_or_else(|e| {
+                    panic!("builtin agent '{name}': resources do not parse: {e}")
+                });
+            let execution_timeout = resources
+                .parse_timeout_seconds()
+                .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
+
+            let mut validators = Vec::new();
+            for config in [&execution.validation, &execution.tool_validation]
+                .into_iter()
+                .flatten()
+            {
+                validator_timeouts(&serde_yaml::to_value(config).unwrap(), &mut validators);
+            }
+
+            for secs in validators {
+                if execution_timeout < secs {
+                    violations.push(format!(
+                        "{name}: execution timeout {execution_timeout} s is below its validator timeout_seconds {secs} s"
+                    ));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "built-in agents whose execution would end inside one of their own validations:\n{}",
+            violations.join("\n")
+        );
+    }
+
     #[test]
     fn all_builtin_workflow_templates_parse_successfully() {
         for (name, yaml) in BUILTIN_WORKFLOWS {

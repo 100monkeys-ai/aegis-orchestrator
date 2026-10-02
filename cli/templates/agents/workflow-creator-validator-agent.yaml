@@ -198,4 +198,4 @@ spec:
       cpu: 1000
       memory: 512Mi
       disk: 1Gi
-      timeout: 300s
+      timeout: 600s
