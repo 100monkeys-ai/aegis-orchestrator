@@ -268,3 +268,64 @@ async fn elapsed_attempts_count_against_max_retries() {
         "two 1 s attempts and one short backoff: {elapsed:?}"
     );
 }
+
+// ── Item 2: a provider's 400 is not retried ─────────────────────────────────
+
+/// Workers AI's refusal of a prompt longer than the model's window, as R2
+/// received it 21 times.
+const CONTEXT_LENGTH_400: &str = r#"{"errors":[{"message":"AiError: Bad input: maximum context length is 262144 tokens. However, you requested 16384 output tokens and your prompt contains at least 245761 input tokens."}],"success":false}"#;
+
+/// A 400 cannot succeed on a retry: the stand-in answers every request with
+/// the same 400, and the call fails after one request, with the provider's
+/// message in the error.
+#[tokio::test]
+async fn a_provider_400_fails_at_once_with_the_providers_message() {
+    let (endpoint, count) = stand_in(vec![error_answer(400, CONTEXT_LENGTH_400)]).await;
+    let registry = registry(
+        &endpoint,
+        "max_retries: 3\nretry_delay_ms: 10\nllm_overall_timeout_secs: 30\n",
+    );
+
+    let res = chat(&registry).await;
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "a 400 is sent once, not retried; the call returned {res:?}"
+    );
+    let err = res.expect_err("a 400 fails the call");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("400") && msg.contains("maximum context length is 262144 tokens"),
+        "the error carries the status and the provider's message, got: {msg}"
+    );
+}
+
+/// The failures a retry can cure are still retried: a 408, a 429, a 500 and
+/// a 503 each come back once and the call succeeds on the second request.
+#[tokio::test]
+async fn a_408_a_429_and_a_5xx_are_still_retried() {
+    for status in [408_u16, 429, 500, 503] {
+        let (endpoint, count) = stand_in(vec![
+            error_answer(status, r#"{"errors":[{"message":"transient"}]}"#),
+            ok_answer(Duration::ZERO),
+        ])
+        .await;
+        let registry = registry(
+            &endpoint,
+            "max_retries: 3\nretry_delay_ms: 10\nllm_overall_timeout_secs: 30\n",
+        );
+
+        let res = chat(&registry).await;
+
+        assert!(
+            matches!(&res, Ok(ChatResponse::FinalText(r)) if r.text == "ok"),
+            "HTTP {status} must be retried to the answer, got {res:?}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "HTTP {status}: one failed request, one retry"
+        );
+    }
+}

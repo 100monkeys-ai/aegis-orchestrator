@@ -130,6 +130,12 @@ impl AnthropicAdapter {
             }
         } else if status == StatusCode::SERVICE_UNAVAILABLE {
             LLMError::ServiceUnavailable(error_text.to_string())
+        } else if status == StatusCode::BAD_REQUEST {
+            // A 400 is the provider refusing this request as sent (a prompt
+            // over the model's context window, among others): no retry can
+            // change the answer, so it is InvalidInput, which the registry
+            // does not retry, carrying the provider's message.
+            LLMError::InvalidInput(format!("HTTP {status}: {error_text}"))
         } else {
             LLMError::Provider(format!("HTTP {status}: {error_text}"))
         }
@@ -514,6 +520,28 @@ mod tests {
                 assert!(message.contains("Route not found"));
             }
             other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_error_returns_invalid_input_for_400_with_the_message() {
+        let adapter = AnthropicAdapter::new(
+            "https://api.anthropic.com/v1".to_string(),
+            "k".to_string(),
+            "claude-sonnet-4-5".to_string(),
+        );
+
+        let error = adapter.classify_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+        );
+
+        match error {
+            LLMError::InvalidInput(message) => {
+                assert!(message.contains("400"), "got: {message}");
+                assert!(message.contains("prompt is too long"), "got: {message}");
+            }
+            other => panic!("expected InvalidInput for a 400, got {other:?}"),
         }
     }
 

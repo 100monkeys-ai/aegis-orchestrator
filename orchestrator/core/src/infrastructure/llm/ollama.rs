@@ -174,6 +174,12 @@ impl LLMProvider for OllamaAdapter {
                 LLMError::ModelNotFound(self.model.clone())
             } else if status == 503 {
                 LLMError::ServiceUnavailable(error_text)
+            } else if status == 400 {
+                // A 400 is the provider refusing this request as sent (a prompt
+                // over the model's context window, among others): no retry can
+                // change the answer, so it is InvalidInput, which the registry
+                // does not retry, carrying the provider's message.
+                LLMError::InvalidInput(format!("HTTP {status}: {error_text}"))
             } else {
                 LLMError::Provider(format!("HTTP {status}: {error_text}"))
             });

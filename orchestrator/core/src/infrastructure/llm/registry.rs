@@ -88,6 +88,12 @@ pub struct ProviderRegistry {
 /// rejections — retrying or swapping to a fallback provider with the same
 /// credentials/region won't change the answer.
 ///
+/// `InvalidInput` is what every adapter returns for a provider's HTTP 400:
+/// the request as sent is refused (a prompt over the model's context window,
+/// among others), so the call fails at once with the provider's message,
+/// where each such 400 was sent `max_retries` times (AEGIS ADR-124, the
+/// measured Update of 2026-10-01). A 408, a 429 and a 5xx stay retryable.
+///
 /// NOTE: `ServiceUnavailable` (HTTP 503) is intentionally NOT in this list.
 /// 503 indicates transient upstream load (e.g. Gemini "high demand"); it must
 /// run through the exponential-backoff retry loop and, on exhaustion, fall
