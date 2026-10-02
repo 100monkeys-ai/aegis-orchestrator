@@ -511,6 +511,15 @@ pub struct LLMSelection {
     /// timeout after Ns")`. Default: 30s.
     #[serde(default = "default_llm_overall_timeout_secs")]
     pub llm_overall_timeout_secs: u64,
+
+    /// Bound in seconds on one attempt of a model call (AEGIS ADR-124, the
+    /// measured Update of 2026-10-01). An attempt that has not answered when
+    /// it elapses is abandoned and fails like an HTTP 408: retried, counted
+    /// against `max_retries`, and inside `llm_overall_timeout_secs`. Absent:
+    /// no bound on an attempt. When set, a positive number not above
+    /// `llm_overall_timeout_secs` (checked by `validate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_attempt_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1917,6 +1926,7 @@ impl Default for LLMSelection {
             max_retries: 3,
             retry_delay_ms: 1000,
             llm_overall_timeout_secs: 30,
+            llm_attempt_timeout_secs: None,
         }
     }
 }
@@ -2411,6 +2421,21 @@ impl NodeConfigManifest {
                 .any(|p| &p.name == fallback_provider)
             {
                 anyhow::bail!("Fallback provider '{fallback_provider}' not found in llm_providers");
+            }
+        }
+
+        let selection = &self.spec.llm_selection;
+        if let Some(attempt_secs) = selection.llm_attempt_timeout_secs {
+            if attempt_secs == 0 {
+                anyhow::bail!(
+                    "spec.llm_selection.llm_attempt_timeout_secs must be a positive number of seconds, got 0"
+                );
+            }
+            if attempt_secs > selection.llm_overall_timeout_secs {
+                anyhow::bail!(
+                    "spec.llm_selection.llm_attempt_timeout_secs ({attempt_secs}) is above llm_overall_timeout_secs ({}): an attempt is never given longer than the whole call",
+                    selection.llm_overall_timeout_secs
+                );
             }
         }
 
@@ -3274,5 +3299,90 @@ grpc_port: 50051
         manifest
             .validate()
             .expect("clustered external bind WITH mTLS must validate");
+    }
+
+    // ── llm_selection.llm_attempt_timeout_secs (AEGIS ADR-124, measured Update of 2026-10-01) ──
+    //
+    // One model call had no bound of its own: a stalled attempt ended only at
+    // the provider's 408 after about 235 s, leaving about 64 s of a 300 s
+    // judgment for the retry. The key bounds each attempt; it must be a
+    // positive number of seconds and not above the overall budget, which it
+    // could never reach.
+
+    fn manifest_with_llm_selection(yaml: &str) -> NodeConfigManifest {
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.llm_selection =
+            serde_yaml::from_str(yaml).expect("the llm_selection block parses");
+        manifest
+    }
+
+    #[test]
+    fn llm_attempt_timeout_of_zero_is_refused() {
+        let manifest = manifest_with_llm_selection(
+            "llm_overall_timeout_secs: 300\nllm_attempt_timeout_secs: 0\n",
+        );
+        let err = manifest
+            .validate()
+            .expect_err("an attempt timeout of 0 seconds must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("llm_attempt_timeout_secs") && msg.contains("positive"),
+            "the refusal must name the key and say it must be positive, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn llm_attempt_timeout_above_the_overall_timeout_is_refused() {
+        let manifest = manifest_with_llm_selection(
+            "llm_overall_timeout_secs: 300\nllm_attempt_timeout_secs: 301\n",
+        );
+        let err = manifest
+            .validate()
+            .expect_err("an attempt timeout above the overall timeout must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("llm_attempt_timeout_secs")
+                && msg.contains("301")
+                && msg.contains("llm_overall_timeout_secs")
+                && msg.contains("300"),
+            "the refusal must name both keys and both values, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn llm_attempt_timeout_within_the_overall_timeout_is_accepted() {
+        for attempt in ["190", "300"] {
+            let manifest = manifest_with_llm_selection(&format!(
+                "llm_overall_timeout_secs: 300\nllm_attempt_timeout_secs: {attempt}\n"
+            ));
+            manifest
+                .validate()
+                .unwrap_or_else(|e| panic!("attempt timeout {attempt} of 300 must validate: {e}"));
+            let written = serde_yaml::to_value(&manifest.spec.llm_selection).unwrap();
+            assert_eq!(
+                written
+                    .get("llm_attempt_timeout_secs")
+                    .and_then(|v| v.as_u64()),
+                Some(attempt.parse::<u64>().unwrap()),
+                "the key must be read and written back as configured"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_attempt_timeout_absent_is_no_bound() {
+        let manifest = manifest_with_llm_selection("llm_overall_timeout_secs: 300\n");
+        manifest
+            .validate()
+            .expect("a configuration without the key must validate");
+        for selection in [&manifest.spec.llm_selection, &LLMSelection::default()] {
+            let written = serde_yaml::to_value(selection).unwrap();
+            assert!(
+                written.get("llm_attempt_timeout_secs").is_none(),
+                "absent, the key stays absent (no bound): {written:?}"
+            );
+        }
+        assert_eq!(manifest.spec.llm_selection.llm_overall_timeout_secs, 300);
+        assert_eq!(manifest.spec.llm_selection.max_retries, 3);
     }
 }

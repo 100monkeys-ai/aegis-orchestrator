@@ -77,6 +77,11 @@ pub struct ProviderRegistry {
     /// `generate`. On elapsed: return `LLMError::Network("upstream timeout
     /// after Ns")`. Sourced from `LLMSelection::llm_overall_timeout_secs`.
     llm_overall_timeout_secs: u64,
+    /// Bound on one attempt (primary or fallback) in `generate_chat` /
+    /// `generate`. On elapsed: the attempt fails with `LLMError::Network(
+    /// "attempt timeout after Ns: ...")`, retryable like an HTTP 408. `None`:
+    /// no bound. Sourced from `LLMSelection::llm_attempt_timeout_secs`.
+    llm_attempt_timeout_secs: Option<u64>,
 }
 
 /// Returns true for `LLMError` variants that are deterministic upstream
@@ -280,6 +285,7 @@ impl ProviderRegistry {
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
             llm_overall_timeout_secs: config.spec.llm_selection.llm_overall_timeout_secs,
+            llm_attempt_timeout_secs: config.spec.llm_selection.llm_attempt_timeout_secs,
         })
     }
 
@@ -379,6 +385,37 @@ impl ProviderRegistry {
         opts
     }
 
+    /// Run one attempt of a model call, bounded by `llm_attempt_timeout_secs`
+    /// when it is set (AEGIS ADR-124, the measured Update of 2026-10-01: a
+    /// stalled attempt ended only at the provider's own 408 after about 235 s,
+    /// leaving too little of the judgment's budget for the retry). An elapsed
+    /// attempt is abandoned and returned as `LLMError::Network`, which the
+    /// retry loop treats as it treats a 408.
+    async fn bounded_attempt<T>(
+        &self,
+        alias: &str,
+        model: &str,
+        attempt: u32,
+        attempts: u32,
+        call: impl std::future::Future<Output = Result<T, LLMError>>,
+    ) -> Result<T, LLMError> {
+        let Some(secs) = self.llm_attempt_timeout_secs else {
+            return call.await;
+        };
+        match tokio::time::timeout(tokio::time::Duration::from_secs(secs), call).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    "LLM attempt timeout: alias='{}', model='{}', attempt={}/{}, bound={}s",
+                    alias, model, attempt, attempts, secs
+                );
+                Err(LLMError::Network(format!(
+                    "attempt timeout after {secs}s: model '{model}' on alias '{alias}' gave no answer (attempt {attempt} of {attempts})"
+                )))
+            }
+        }
+    }
+
     /// Generate a chat response for the given model alias.
     ///
     /// Resolves the alias directly to a pre-configured `Arc<dyn LLMProvider>` adapter;
@@ -406,8 +443,14 @@ impl ProviderRegistry {
             let mut last_error: Option<LLMError> = None;
 
             for attempt in 0..self.max_retries {
-                let outcome = provider
-                    .generate_chat(messages, tools, &effective_options)
+                let outcome = self
+                    .bounded_attempt(
+                        alias,
+                        model_name,
+                        attempt + 1,
+                        self.max_retries,
+                        provider.generate_chat(messages, tools, &effective_options),
+                    )
                     .await
                     .and_then(|response| {
                         match empty_generation_fault(
@@ -457,8 +500,14 @@ impl ProviderRegistry {
                         if attempt == self.max_retries - 1 {
                             if let Some((fallback_model, fallback)) = &self.fallback_provider {
                                 info!("Trying fallback provider (model='{}')", fallback_model);
-                                let outcome = fallback
-                                    .generate_chat(messages, tools, options)
+                                let outcome = self
+                                    .bounded_attempt(
+                                        alias,
+                                        fallback_model,
+                                        1,
+                                        1,
+                                        fallback.generate_chat(messages, tools, options),
+                                    )
                                     .await
                                     .and_then(|r| {
                                         match empty_generation_fault(
@@ -542,7 +591,16 @@ impl ProviderRegistry {
         let mut last_error = None;
 
         for attempt in 0..self.max_retries {
-            match provider.generate(prompt, &effective_options).await {
+            let outcome = self
+                .bounded_attempt(
+                    alias,
+                    model_name,
+                    attempt + 1,
+                    self.max_retries,
+                    provider.generate(prompt, &effective_options),
+                )
+                .await;
+            match outcome {
                 Ok(response) => {
                     info!(
                         "Generation successful on attempt {} (model='{}')",
@@ -563,7 +621,15 @@ impl ProviderRegistry {
                     if attempt == self.max_retries - 1 {
                         if let Some((fallback_model, fallback)) = &self.fallback_provider {
                             info!("Trying fallback provider (model='{}')", fallback_model);
-                            return fallback.generate(prompt, options).await;
+                            return self
+                                .bounded_attempt(
+                                    alias,
+                                    fallback_model,
+                                    1,
+                                    1,
+                                    fallback.generate(prompt, options),
+                                )
+                                .await;
                         }
                     }
 
@@ -694,6 +760,7 @@ impl ProviderRegistry {
             max_retries,
             retry_delay_ms,
             llm_overall_timeout_secs,
+            llm_attempt_timeout_secs: None,
         }
     }
 }

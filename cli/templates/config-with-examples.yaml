@@ -168,6 +168,13 @@ spec:
     max_retries: 3
     retry_delay_ms: 1000  # Initial delay, doubles on each retry (exponential backoff)
 
+    # Optional: bound in seconds on one attempt of a model call. An attempt
+    # with no answer when it elapses is abandoned and retried like an HTTP 408,
+    # counted against max_retries and inside llm_overall_timeout_secs (the
+    # budget of the whole call, default 30). Absent: no bound on an attempt.
+    # Must be positive and not above llm_overall_timeout_secs.
+    # llm_attempt_timeout_secs: 190
+
   # --------------------------------------------------------------------------
   # Execution Limits
   # --------------------------------------------------------------------------
