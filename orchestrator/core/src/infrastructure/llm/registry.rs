@@ -94,7 +94,7 @@ pub struct ProviderRegistry {
 /// where each such 400 was sent `max_retries` times (AEGIS ADR-124, the
 /// measured Update of 2026-10-01). A 429, a 5xx and a 408 stay retryable,
 /// except Workers AI's 408 with code 3046, its time limit, which
-/// [`provider_timeout_for_alias`] ends at once.
+/// [`provider_timeout_for_alias`] sends to the fallback at once, or returns.
 ///
 /// NOTE: `ServiceUnavailable` (HTTP 503) is intentionally NOT in this list.
 /// 503 indicates transient upstream load (e.g. Gemini "high demand"); it must
@@ -104,9 +104,11 @@ pub struct ProviderRegistry {
 /// pattern in `application::inner_loop_service`.
 /// The provider's time-limit error with the alias put in, when `e` is one
 /// (`openai::is_provider_timeout`). The identical request meets the same limit
-/// again, so the call ends at once with it: in AEGIS execution 18d8e0ca each
-/// retry of a 3046 answer took another 120 s and the iteration ended at the
-/// 300 s budget as "upstream timeout after 300s", saying nothing of why.
+/// again, so it is not sent to the same model again: in AEGIS execution
+/// 18d8e0ca each retry of a 3046 answer took another 120 s and the iteration
+/// ended at the 300 s budget as "upstream timeout after 300s", saying nothing
+/// of why. A configured fallback, a different model, is still tried once, as
+/// after the last retry; the error is returned where there is none.
 fn provider_timeout_for_alias(e: &LLMError, alias: &str) -> Option<LLMError> {
     match e {
         LLMError::Provider(msg) if super::openai::is_provider_timeout(e) => {
@@ -118,6 +120,18 @@ fn provider_timeout_for_alias(e: &LLMError, alias: &str) -> Option<LLMError> {
         }
         _ => None,
     }
+}
+
+/// The primary's time-limit error, with the failure of the fallback tried
+/// after it, so the error names both models.
+fn with_fallback_failure(timeout: LLMError, fallback_model: &str, fallback: &LLMError) -> LLMError {
+    LLMError::Provider(format!(
+        "{}; the fallback model '{fallback_model}' was tried once and failed: {fallback}",
+        match timeout {
+            LLMError::Provider(msg) => msg,
+            other => other.to_string(),
+        }
+    ))
 }
 
 fn is_non_retryable(e: &LLMError) -> bool {
@@ -509,15 +523,15 @@ impl ProviderRegistry {
                             e
                         );
 
-                        if let Some(timeout) = provider_timeout_for_alias(&e, alias) {
+                        let time_limit = provider_timeout_for_alias(&e, alias);
+                        if time_limit.is_some() {
                             warn!(
-                                "LLM provider time limit; not sent again: alias='{}', model='{}', attempt={}/{}",
+                                "LLM provider time limit; not sent again to this model: alias='{}', model='{}', attempt={}/{}",
                                 alias,
                                 model_name,
                                 attempt + 1,
                                 self.max_retries
                             );
-                            return Err(timeout);
                         }
 
                         // Short-circuit on deterministic upstream rejections — retrying with
@@ -534,7 +548,9 @@ impl ProviderRegistry {
 
                         last_error = Some(e);
 
-                        if attempt == self.max_retries - 1 {
+                        // A time limit ends the primary's attempts: the fallback, a
+                        // different model, is tried as after the last retry.
+                        if time_limit.is_some() || attempt == self.max_retries - 1 {
                             if let Some((fallback_model, fallback)) = &self.fallback_provider {
                                 info!("Trying fallback provider (model='{}')", fallback_model);
                                 let outcome = self
@@ -561,12 +577,17 @@ impl ProviderRegistry {
                                 match outcome {
                                     Ok(r) => return Ok(r),
                                     Err(fe) => {
-                                        if is_non_retryable(&fe) {
-                                            return Err(fe);
-                                        }
-                                        return Err(fe);
+                                        return Err(match time_limit {
+                                            Some(timeout) => {
+                                                with_fallback_failure(timeout, fallback_model, &fe)
+                                            }
+                                            None => fe,
+                                        });
                                     }
                                 }
+                            }
+                            if let Some(timeout) = time_limit {
+                                return Err(timeout);
                             }
                         }
 
@@ -653,22 +674,24 @@ impl ProviderRegistry {
                         self.max_retries,
                         e
                     );
-                    if let Some(timeout) = provider_timeout_for_alias(&e, alias) {
+                    let time_limit = provider_timeout_for_alias(&e, alias);
+                    if time_limit.is_some() {
                         warn!(
-                            "LLM provider time limit; not sent again: alias='{}', model='{}', attempt={}/{}",
+                            "LLM provider time limit; not sent again to this model: alias='{}', model='{}', attempt={}/{}",
                             alias,
                             model_name,
                             attempt + 1,
                             self.max_retries
                         );
-                        return Err(timeout);
                     }
                     last_error = Some(e);
 
-                    if attempt == self.max_retries - 1 {
+                    // A time limit ends the primary's attempts: the fallback, a
+                    // different model, is tried as after the last retry.
+                    if time_limit.is_some() || attempt == self.max_retries - 1 {
                         if let Some((fallback_model, fallback)) = &self.fallback_provider {
                             info!("Trying fallback provider (model='{}')", fallback_model);
-                            return self
+                            let outcome = self
                                 .bounded_attempt(
                                     alias,
                                     fallback_model,
@@ -677,6 +700,15 @@ impl ProviderRegistry {
                                     fallback.generate(prompt, options),
                                 )
                                 .await;
+                            return match (outcome, time_limit) {
+                                (Err(fe), Some(timeout)) => {
+                                    Err(with_fallback_failure(timeout, fallback_model, &fe))
+                                }
+                                (outcome, _) => outcome,
+                            };
+                        }
+                        if let Some(timeout) = time_limit {
+                            return Err(timeout);
                         }
                     }
 
@@ -1428,6 +1460,139 @@ mod tests {
             matches!(&res, Err(LLMError::Provider(msg)) if msg.starts_with("provider timeout: alias 'default'")),
             "got {res:?}"
         );
+    }
+
+    /// A primary and a fallback, each the real OpenAI-compatible adapter
+    /// pointed at its own endpoint, under the alias `default`.
+    fn openai_registry_with_fallback(primary: String, fallback: String) -> ProviderRegistry {
+        let adapter = |endpoint: String, model: &str| {
+            Arc::new(crate::infrastructure::llm::openai::OpenAIAdapter::new(
+                endpoint,
+                "test-key".to_string(),
+                model.to_string(),
+                reqwest::header::HeaderMap::new(),
+            )) as Arc<dyn LLMProvider>
+        };
+        ProviderRegistry::new_for_test(
+            adapter(primary, "test-model"),
+            Some(adapter(fallback, "test-fallback-model")),
+            3,
+            1,
+            60,
+        )
+    }
+
+    const FALLBACK_ANSWER_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"fallback answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+
+    /// A fallback is another model, not the identical request: a primary 3046
+    /// skips the primary's remaining retries and goes to the fallback, whose
+    /// answer is returned.
+    #[tokio::test]
+    async fn workers_ai_408_code_3046_goes_to_the_fallback_once() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fallback = mockito::Server::new_async().await;
+        let primary_mock = primary
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let fallback_mock = fallback
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FALLBACK_ANSWER_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let registry = openai_registry_with_fallback(primary.url(), fallback.url());
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+
+        primary_mock.assert_async().await;
+        fallback_mock.assert_async().await;
+        match res {
+            Ok(ChatResponse::FinalText(r)) => assert_eq!(r.text, "fallback answer"),
+            other => panic!("the fallback's answer must be returned, got {other:?}"),
+        }
+    }
+
+    /// The single-prompt path goes to the fallback the same way.
+    #[tokio::test]
+    async fn workers_ai_408_code_3046_goes_to_the_fallback_once_on_generate() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fallback = mockito::Server::new_async().await;
+        let primary_mock = primary
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let fallback_mock = fallback
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FALLBACK_ANSWER_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let registry = openai_registry_with_fallback(primary.url(), fallback.url());
+
+        let res = registry
+            .generate("default", "hello", &GenerationOptions::default())
+            .await;
+
+        primary_mock.assert_async().await;
+        fallback_mock.assert_async().await;
+        assert!(
+            matches!(&res, Ok(r) if r.text == "fallback answer"),
+            "got {res:?}"
+        );
+    }
+
+    /// A fallback that also meets its limit is not retried, and the error
+    /// names both models.
+    #[tokio::test]
+    async fn workers_ai_408_code_3046_on_both_names_both_models() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fallback = mockito::Server::new_async().await;
+        let primary_mock = primary
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let fallback_mock = fallback
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let registry = openai_registry_with_fallback(primary.url(), fallback.url());
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+
+        primary_mock.assert_async().await;
+        fallback_mock.assert_async().await;
+        match res {
+            Err(LLMError::Provider(msg)) => {
+                assert!(
+                    msg.starts_with("provider timeout: alias 'default'"),
+                    "got: {msg}"
+                );
+                assert!(msg.contains("model 'test-model'"), "got: {msg}");
+                assert!(msg.contains("model 'test-fallback-model'"), "got: {msg}");
+            }
+            other => panic!("both 3046 answers must end as a provider timeout, got {other:?}"),
+        }
     }
 
     /// Every other 408 keeps its retries: only the 3046 body is the limit.
