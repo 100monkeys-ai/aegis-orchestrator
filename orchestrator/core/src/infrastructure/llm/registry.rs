@@ -92,7 +92,9 @@ pub struct ProviderRegistry {
 /// the request as sent is refused (a prompt over the model's context window,
 /// among others), so the call fails at once with the provider's message,
 /// where each such 400 was sent `max_retries` times (AEGIS ADR-124, the
-/// measured Update of 2026-10-01). A 408, a 429 and a 5xx stay retryable.
+/// measured Update of 2026-10-01). A 429, a 5xx and a 408 stay retryable,
+/// except Workers AI's 408 with code 3046, its time limit, which
+/// [`provider_timeout_for_alias`] ends at once.
 ///
 /// NOTE: `ServiceUnavailable` (HTTP 503) is intentionally NOT in this list.
 /// 503 indicates transient upstream load (e.g. Gemini "high demand"); it must
@@ -100,6 +102,24 @@ pub struct ProviderRegistry {
 /// back to the secondary provider — same as other retryable errors. This
 /// aligns with the SEAL classifier's `UpstreamUnavailable = Recoverable`
 /// pattern in `application::inner_loop_service`.
+/// The provider's time-limit error with the alias put in, when `e` is one
+/// (`openai::is_provider_timeout`). The identical request meets the same limit
+/// again, so the call ends at once with it: in AEGIS execution 18d8e0ca each
+/// retry of a 3046 answer took another 120 s and the iteration ended at the
+/// 300 s budget as "upstream timeout after 300s", saying nothing of why.
+fn provider_timeout_for_alias(e: &LLMError, alias: &str) -> Option<LLMError> {
+    match e {
+        LLMError::Provider(msg) if super::openai::is_provider_timeout(e) => {
+            let detail = &msg[super::openai::PROVIDER_TIMEOUT_PREFIX.len()..];
+            Some(LLMError::Provider(format!(
+                "{}alias '{alias}': {detail}",
+                super::openai::PROVIDER_TIMEOUT_PREFIX
+            )))
+        }
+        _ => None,
+    }
+}
+
 fn is_non_retryable(e: &LLMError) -> bool {
     matches!(
         e,
@@ -489,6 +509,17 @@ impl ProviderRegistry {
                             e
                         );
 
+                        if let Some(timeout) = provider_timeout_for_alias(&e, alias) {
+                            warn!(
+                                "LLM provider time limit; not sent again: alias='{}', model='{}', attempt={}/{}",
+                                alias,
+                                model_name,
+                                attempt + 1,
+                                self.max_retries
+                            );
+                            return Err(timeout);
+                        }
+
                         // Short-circuit on deterministic upstream rejections — retrying with
                         // the same credentials (or with the fallback that shares them) is futile.
                         if is_non_retryable(&e) {
@@ -622,6 +653,16 @@ impl ProviderRegistry {
                         self.max_retries,
                         e
                     );
+                    if let Some(timeout) = provider_timeout_for_alias(&e, alias) {
+                        warn!(
+                            "LLM provider time limit; not sent again: alias='{}', model='{}', attempt={}/{}",
+                            alias,
+                            model_name,
+                            attempt + 1,
+                            self.max_retries
+                        );
+                        return Err(timeout);
+                    }
                     last_error = Some(e);
 
                     if attempt == self.max_retries - 1 {
@@ -1300,5 +1341,116 @@ mod tests {
             .await;
         assert_eq!(primary.call_count(), 1);
         assert!(matches!(res, Ok(ChatResponse::ToolCalls(_))));
+    }
+
+    /// Workers AI's answer when it ends a generation at its time limit, as the
+    /// core pod logged it for execution 18d8e0ca on 2026-10-03.
+    const WORKERS_AI_408_BODY: &str = r#"{"errors":[{"message":"AiError: AiError: Request timeout (df1159f0-0e44-40d5-b6ba-66bfec32483f)","code":3046}],"success":false,"result":{},"messages":[]}"#;
+
+    /// A registry whose only alias, `default`, is the real OpenAI-compatible
+    /// adapter pointed at `endpoint`.
+    fn openai_registry(endpoint: String, max_retries: u32) -> ProviderRegistry {
+        let adapter = crate::infrastructure::llm::openai::OpenAIAdapter::new(
+            endpoint,
+            "test-key".to_string(),
+            "test-model".to_string(),
+            reqwest::header::HeaderMap::new(),
+        );
+        ProviderRegistry::new_for_test(Arc::new(adapter), None, max_retries, 1, 60)
+    }
+
+    /// AEGIS execution 18d8e0ca (2026-10-03): `smart` on nemotron-3-120b-a12b
+    /// answered HTTP 408 with code 3046 at about 120 s, the registry sent the
+    /// identical request again into the same limit, and every iteration ended
+    /// at the 300 s budget as "upstream timeout after 300s". The 3046 answer
+    /// is sent once and comes back at once as a provider timeout naming the
+    /// alias, the model and the seconds.
+    #[tokio::test]
+    async fn workers_ai_408_code_3046_is_not_sent_again_and_is_a_provider_timeout() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_header("content-type", "application/json")
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let registry = openai_registry(server.url(), 3);
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+
+        mock.assert_async().await;
+        match res {
+            Err(LLMError::Provider(msg)) => {
+                assert!(
+                    msg.starts_with("provider timeout: "),
+                    "the error must say it is a provider timeout, got: {msg}"
+                );
+                assert!(
+                    msg.contains("alias 'default'"),
+                    "the error must name the alias, got: {msg}"
+                );
+                assert!(
+                    msg.contains("model 'test-model'"),
+                    "the error must name the model, got: {msg}"
+                );
+                assert!(
+                    msg.contains(" s ") && msg.contains("code 3046"),
+                    "the error must give the seconds and the code, got: {msg}"
+                );
+            }
+            other => panic!("a 3046 answer must end as a provider timeout, got {other:?}"),
+        }
+    }
+
+    /// The single-prompt path takes the same rule.
+    #[tokio::test]
+    async fn workers_ai_408_code_3046_is_not_sent_again_on_generate() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let registry = openai_registry(server.url(), 3);
+
+        let res = registry
+            .generate("default", "hello", &GenerationOptions::default())
+            .await;
+
+        mock.assert_async().await;
+        assert!(
+            matches!(&res, Err(LLMError::Provider(msg)) if msg.starts_with("provider timeout: alias 'default'")),
+            "got {res:?}"
+        );
+    }
+
+    /// Every other 408 keeps its retries: only the 3046 body is the limit.
+    #[tokio::test]
+    async fn a_408_without_code_3046_is_still_retried() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(r#"{"error":"request timeout"}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        let registry = openai_registry(server.url(), 3);
+
+        let res = registry
+            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .await;
+
+        mock.assert_async().await;
+        assert!(
+            matches!(&res, Err(LLMError::Provider(msg)) if msg.starts_with("HTTP 408")),
+            "got {res:?}"
+        );
     }
 }

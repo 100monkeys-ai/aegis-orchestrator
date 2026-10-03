@@ -69,6 +69,43 @@ impl SentToolNames {
     }
 }
 
+/// Workers AI's error code for a generation it ended at its time limit
+/// (`"AiError: AiError: Request timeout"`, HTTP 408).
+const WORKERS_AI_TIME_LIMIT_CODE: i64 = 3046;
+
+/// The start of the message of the error a provider's time limit becomes.
+/// The registry recognises the error by it ([`is_provider_timeout`]) and adds
+/// the alias, which only it knows.
+pub(super) const PROVIDER_TIMEOUT_PREFIX: &str = "provider timeout: ";
+
+/// True for Workers AI's answer that it ended the generation at its time
+/// limit: HTTP 408 with an `errors` entry of code 3046.
+///
+/// The limit is the provider's, about 120 s on `@cf/nvidia/nemotron-3-120b-a12b`
+/// whether the request is streamed or not (AEGIS ADR-124, the measurements of
+/// 2026-10-03), so the identical request meets it again: in execution 18d8e0ca
+/// each of three iterations sent it twice more and ended at the 300 s budget.
+fn is_workers_ai_time_limit(status: u16, body: &str) -> bool {
+    status == 408
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("errors")?.as_array().map(|errors| {
+                    errors.iter().any(|e| {
+                        e.get("code").and_then(serde_json::Value::as_i64)
+                            == Some(WORKERS_AI_TIME_LIMIT_CODE)
+                    })
+                })
+            })
+            .unwrap_or(false)
+}
+
+/// True for the error a provider's time limit becomes. The registry does not
+/// send the identical request again for it.
+pub(super) fn is_provider_timeout(e: &LLMError) -> bool {
+    matches!(e, LLMError::Provider(msg) if msg.starts_with(PROVIDER_TIMEOUT_PREFIX))
+}
+
 pub struct OpenAIAdapter {
     client: reqwest::Client,
     endpoint: String,
@@ -313,7 +350,13 @@ impl LLMProvider for OpenAIAdapter {
                 body_excerpt = %excerpt,
                 "LLM upstream non-2xx"
             );
-            return Err(if status == 401 || status == 403 {
+            return Err(if is_workers_ai_time_limit(status.as_u16(), &error_text) {
+                LLMError::Provider(format!(
+                    "{PROVIDER_TIMEOUT_PREFIX}model '{}' was ended by the provider at its time limit after {:.1} s (HTTP 408, code {WORKERS_AI_TIME_LIMIT_CODE}); the identical request is not sent again: {excerpt}",
+                    self.model,
+                    http_elapsed_ms as f64 / 1000.0,
+                ))
+            } else if status == 401 || status == 403 {
                 LLMError::Authentication(error_text)
             } else if status == 429 {
                 LLMError::RateLimit
@@ -517,6 +560,18 @@ mod tests {
             OpenAIAdapter::map_finish_reason("tool_calls"),
             FinishReason::Stop
         );
+    }
+
+    #[test]
+    fn workers_ai_time_limit_is_a_408_with_code_3046_only() {
+        let body = r#"{"errors":[{"message":"AiError: AiError: Request timeout (df1159f0)","code":3046}],"success":false,"result":{},"messages":[]}"#;
+        assert!(is_workers_ai_time_limit(408, body));
+        assert!(!is_workers_ai_time_limit(504, body), "another status");
+        assert!(
+            !is_workers_ai_time_limit(408, r#"{"errors":[{"code":3040}]}"#),
+            "another code"
+        );
+        assert!(!is_workers_ai_time_limit(408, "request timeout"), "no JSON");
     }
 
     #[test]
