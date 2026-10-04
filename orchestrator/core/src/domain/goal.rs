@@ -13,6 +13,8 @@
 //! a row of the orchestrator's database, and the decision whether a round is
 //! granted is the orchestrator's (D1, D6, D10).
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::domain::execution::ExecutionId;
-use crate::domain::node_config::GoalsConfig;
+use crate::domain::node_config::{GoalsConfig, LLMProviderConfig};
 use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
 use crate::domain::validation::GradientResult;
@@ -33,6 +35,144 @@ pub const MAX_STATEMENT_CHARS: usize = 32_768;
 /// each output and the answer whole (U14); this bounds only the text quoted
 /// back from a judge whose verdict could not be read.
 pub const FAULT_OUTPUT_SHOWN_CHARS: usize = 8_192;
+
+/// The output allowance of an alias whose entry names no
+/// `max_output_tokens`: `GenerationOptions`' default (`domain/llm.rs`), the
+/// one `ModelConfig::max_output_tokens` overrides.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
+/// The bytes a judge's prompt holds beside its input, for goal-judge: its
+/// instruction and prompt template (2,777 bytes at this writing, pinned
+/// below this bound by the template's test in `cli/src/commands/builtins.rs`)
+/// and the chat template's own tokens (U16).
+pub const JUDGE_PROMPT_RESERVE_BYTES: usize = 8_192;
+
+/// A judge model's room, read at run time from its alias's entry in the
+/// node configuration's alias table (`spec.llm_providers[].models[]`:
+/// `context_window` and `max_output_tokens`) (U16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JudgeContext {
+    pub context_window: u32,
+    pub max_output_tokens: u32,
+}
+
+impl JudgeContext {
+    /// The stated default for an alias the configuration does not map: 32,768
+    /// tokens of context with [`DEFAULT_MAX_OUTPUT_TOKENS`] for output. It is
+    /// used with a warning log line; a prompt is never sent unbounded.
+    pub const UNCONFIGURED: Self = Self {
+        context_window: 32_768,
+        max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+    };
+
+    /// The prompt, in UTF-8 bytes, that always fits: every token of a
+    /// byte-level or byte-fallback vocabulary covers at least one byte, so a
+    /// prompt of at most `context_window - max_output_tokens` bytes leaves
+    /// the output its allowance.
+    pub fn prompt_limit_bytes(&self) -> usize {
+        self.context_window.saturating_sub(self.max_output_tokens) as usize
+    }
+}
+
+/// Where a judge alias's room is read at run time (U16).
+pub trait JudgeContextSource: Send + Sync {
+    fn judge_context(&self, alias: &str) -> Option<JudgeContext>;
+}
+
+/// [`JudgeContextSource`] over the node configuration's alias table. Where
+/// several enabled providers map one alias, the entry with the smallest
+/// prompt limit is taken, so the prompt fits whichever entry the selection
+/// strategy picks.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AliasTableJudgeContext {
+    by_alias: HashMap<String, JudgeContext>,
+}
+
+impl AliasTableJudgeContext {
+    pub fn from_providers(providers: &[LLMProviderConfig]) -> Self {
+        let mut by_alias: HashMap<String, JudgeContext> = HashMap::new();
+        for model in providers
+            .iter()
+            .filter(|p| p.enabled)
+            .flat_map(|p| p.models.iter())
+        {
+            let context = JudgeContext {
+                context_window: model.context_window,
+                max_output_tokens: model.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+            };
+            by_alias
+                .entry(model.alias.clone())
+                .and_modify(|held| {
+                    if context.prompt_limit_bytes() < held.prompt_limit_bytes() {
+                        *held = context;
+                    }
+                })
+                .or_insert(context);
+        }
+        Self { by_alias }
+    }
+}
+
+impl JudgeContextSource for AliasTableJudgeContext {
+    fn judge_context(&self, alias: &str) -> Option<JudgeContext> {
+        self.by_alias.get(alias).copied()
+    }
+}
+
+/// The alias's room from `source`, or [`JudgeContext::UNCONFIGURED`] with a
+/// warning when no source is given or it does not map the alias.
+pub fn judge_context_or_default(
+    source: Option<&dyn JudgeContextSource>,
+    alias: &str,
+) -> JudgeContext {
+    match source.and_then(|s| s.judge_context(alias)) {
+        Some(context) => context,
+        None => {
+            tracing::warn!(
+                alias,
+                context_window = JudgeContext::UNCONFIGURED.context_window,
+                max_output_tokens = JudgeContext::UNCONFIGURED.max_output_tokens,
+                "No configured context for the judge's alias: its prompt is bounded by the \
+                 stated default"
+            );
+            JudgeContext::UNCONFIGURED
+        }
+    }
+}
+
+/// A judge's input larger than its model holds (U16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverLimit {
+    /// The input's size in characters.
+    pub size_chars: usize,
+    /// The whole prompt's size in UTF-8 bytes.
+    pub size_bytes: usize,
+    /// The prompt limit in bytes ([`JudgeContext::prompt_limit_bytes`]).
+    pub limit_bytes: usize,
+}
+
+impl OverLimit {
+    /// Measure a prompt of `reserve_bytes` beside `input_text` against
+    /// `context`; `None` when it fits.
+    pub fn check(input_text: &str, reserve_bytes: usize, context: JudgeContext) -> Option<Self> {
+        let size_bytes = input_text.len().saturating_add(reserve_bytes);
+        let limit_bytes = context.prompt_limit_bytes();
+        (size_bytes > limit_bytes).then(|| Self {
+            size_chars: input_text.chars().count(),
+            size_bytes,
+            limit_bytes,
+        })
+    }
+
+    /// The sentence a person reads.
+    pub fn sentence(&self) -> String {
+        format!(
+            "The input is too large to judge: {} characters ({} bytes) against a limit of {} \
+             bytes.",
+            self.size_chars, self.size_bytes, self.limit_bytes
+        )
+    }
+}
 
 /// The signal category whose score decides "cannot be met" (D5).
 pub const FEASIBILITY_SIGNAL: &str = "feasibility";
@@ -476,5 +616,84 @@ mod tests {
         };
         assert!(!goal.has_outlived(1800, created + chrono::Duration::seconds(1799)));
         assert!(goal.has_outlived(1800, created + chrono::Duration::seconds(1800)));
+    }
+
+    fn providers(yaml: &str) -> Vec<LLMProviderConfig> {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// U16: the alias table gives each alias its context and output
+    /// allowance; an entry without `max_output_tokens` takes the default;
+    /// a disabled provider is not read; of two entries for one alias the
+    /// smaller prompt limit holds.
+    #[test]
+    fn the_alias_table_gives_each_judge_alias_its_room() {
+        let table = AliasTableJudgeContext::from_providers(&providers(
+            "- name: a
+  type: openai-compatible
+  endpoint: https://a.invalid/v1
+  models:
+    - {alias: judge, model: m1, capabilities: [chat], context_window: 256000, max_output_tokens: 16384}
+    - {alias: tool-judge, model: m2, capabilities: [chat], context_window: 24000, max_output_tokens: 4096}
+    - {alias: plain, model: m3, capabilities: [chat], context_window: 100000}
+- name: b
+  type: openai-compatible
+  endpoint: https://b.invalid/v1
+  models:
+    - {alias: judge, model: m4, capabilities: [chat], context_window: 128000, max_output_tokens: 16384}
+- name: c
+  type: openai-compatible
+  endpoint: https://c.invalid/v1
+  enabled: false
+  models:
+    - {alias: tool-judge, model: m5, capabilities: [chat], context_window: 1000, max_output_tokens: 500}
+",
+        ));
+        assert_eq!(
+            table.judge_context("judge").unwrap().prompt_limit_bytes(),
+            128_000 - 16_384
+        );
+        assert_eq!(
+            table
+                .judge_context("tool-judge")
+                .unwrap()
+                .prompt_limit_bytes(),
+            19_904
+        );
+        assert_eq!(
+            table.judge_context("plain"),
+            Some(JudgeContext {
+                context_window: 100_000,
+                max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS
+            })
+        );
+        assert_eq!(table.judge_context("absent"), None);
+        assert_eq!(
+            judge_context_or_default(Some(&table), "absent"),
+            JudgeContext::UNCONFIGURED
+        );
+        assert_eq!(
+            judge_context_or_default(None, "judge"),
+            JudgeContext::UNCONFIGURED
+        );
+    }
+
+    #[test]
+    fn over_limit_counts_bytes_and_characters_and_fits_at_the_limit() {
+        let room = JudgeContext {
+            context_window: 1_000,
+            max_output_tokens: 100,
+        };
+        assert_eq!(OverLimit::check(&"a".repeat(800), 100, room), None);
+        let over = OverLimit::check(&"é".repeat(401), 100, room).unwrap();
+        assert_eq!(
+            (over.size_chars, over.size_bytes, over.limit_bytes),
+            (401, 902, 900)
+        );
+        assert_eq!(
+            over.sentence(),
+            "The input is too large to judge: 401 characters (902 bytes) against a limit of 900 \
+             bytes."
+        );
     }
 }

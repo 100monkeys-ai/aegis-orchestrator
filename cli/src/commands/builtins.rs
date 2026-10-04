@@ -633,6 +633,20 @@ mod tests {
         assert_eq!(doc["metadata"]["labels"]["builtin"].as_str(), Some("true"));
         assert_eq!(doc["spec"]["runtime"]["model"].as_str(), Some("judge"));
         assert_eq!(
+            doc["spec"]["runtime"]["model"].as_str(),
+            Some(aegis_orchestrator_core::application::goal_service::GOAL_JUDGE_ALIAS),
+            "U16 reads the room of the alias goal-judge runs on"
+        );
+        let prompt_bytes = doc["spec"]["task"]["instruction"].as_str().unwrap().len()
+            + doc["spec"]["task"]["prompt_template"]
+                .as_str()
+                .unwrap()
+                .len();
+        assert!(
+            prompt_bytes < aegis_orchestrator_core::domain::goal::JUDGE_PROMPT_RESERVE_BYTES,
+            "U16's reserve holds goal-judge's instruction and template ({prompt_bytes} bytes)"
+        );
+        assert_eq!(
             doc["spec"]["execution"]["llm_timeout_seconds"].as_u64(),
             Some(300)
         );

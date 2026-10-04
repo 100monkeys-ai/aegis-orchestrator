@@ -35,9 +35,10 @@ use uuid::Uuid;
 use crate::domain::events::GoalEvent;
 use crate::domain::execution::ExecutionId;
 use crate::domain::goal::{
-    judge_input_digest, outcome_of, truncate_chars, BoundExecution, BoundKind, Goal, GoalChannel,
-    GoalEvaluation, GoalId, GoalOutcome, GoalRepository, GoalState, StopReason,
-    FAULT_OUTPUT_SHOWN_CHARS, MAX_STATEMENT_CHARS,
+    judge_context_or_default, judge_input_digest, outcome_of, truncate_chars, BoundExecution,
+    BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome, GoalRepository, GoalState,
+    JudgeContextSource, OverLimit, StopReason, FAULT_OUTPUT_SHOWN_CHARS,
+    JUDGE_PROMPT_RESERVE_BYTES, MAX_STATEMENT_CHARS,
 };
 use crate::domain::node_config::GoalsConfig;
 use crate::domain::repository::RepositoryError;
@@ -47,6 +48,11 @@ use crate::infrastructure::event_bus::EventBus;
 
 /// The built-in judge agent every goal is judged by (D3).
 pub const GOAL_JUDGE_AGENT_NAME: &str = "goal-judge";
+
+/// The alias `goal-judge` runs on (D3; `cli/templates/agents/goal-judge.yaml`
+/// `spec.runtime.model`, pinned by the template's test). Its room is read
+/// from the alias table at run time (U16).
+pub const GOAL_JUDGE_ALIAS: &str = "judge";
 
 /// The longest one `aegis.goal.evaluate` call waits for the judge before it
 /// answers `judging` (U7).
@@ -163,6 +169,9 @@ pub struct GoalService {
     clock: Clock,
     wait_bound: Duration,
     poll_interval: Duration,
+    /// The alias table's room for `goal-judge`'s alias (U16); `None` bounds
+    /// its prompt by [`crate::domain::goal::JudgeContext::UNCONFIGURED`].
+    judge_context: Option<Arc<dyn JudgeContextSource>>,
 }
 
 impl GoalService {
@@ -178,7 +187,17 @@ impl GoalService {
             clock: Arc::new(Utc::now),
             wait_bound: EVALUATE_WAIT_BOUND,
             poll_interval: JUDGE_POLL_INTERVAL,
+            judge_context: None,
         }
+    }
+
+    /// Read the judge alias's context and output allowance from `source`
+    /// at every evaluation (U16): the daemon passes the node configuration's
+    /// alias table, so a different judge model changes the limit with no
+    /// change of code.
+    pub fn with_judge_context(mut self, source: Arc<dyn JudgeContextSource>) -> Self {
+        self.judge_context = Some(source);
+        self
     }
 
     pub fn with_clock(mut self, clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
@@ -437,6 +456,28 @@ impl GoalService {
     ) -> Result<Attempt, GoalError> {
         let input = self.judge_input(world, goal, companion_answer).await?;
         let digest = judge_input_digest(&input);
+        // U16: a prompt the judge's model cannot hold is never sent and
+        // never cut; the round ends with the sizes, in a sentence.
+        let input_text = serde_json::to_string(&input).unwrap_or_default();
+        let context = judge_context_or_default(self.judge_context.as_deref(), GOAL_JUDGE_ALIAS);
+        if let Some(over) = OverLimit::check(&input_text, JUDGE_PROMPT_RESERVE_BYTES, context) {
+            return self
+                .stop_round(
+                    world,
+                    goal,
+                    companion_answer,
+                    digest,
+                    StopReason::TooLarge,
+                    over.sentence(),
+                    json!({
+                        "size_chars": over.size_chars,
+                        "size_bytes": over.size_bytes,
+                        "limit_bytes": over.limit_bytes,
+                    }),
+                )
+                .await
+                .map(Attempt::Stopped);
+        }
         if attempt == 1 && repeats_the_last_round(goal, evaluations, &digest) {
             let previous = goal.rounds.saturating_sub(1);
             let reasoning = format!(
@@ -1015,6 +1056,7 @@ fn fault_json(fault: &JudgeFault) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::goal::{AliasTableJudgeContext, JudgeContext};
     use crate::infrastructure::event_bus::DomainEvent;
     use crate::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
     use std::collections::VecDeque;
@@ -1142,6 +1184,20 @@ mod tests {
         format!("Dispatching it now (round {}).", round.unwrap_or(0))
     }
 
+    /// The alias table as a node configuration writes it, with `judge` at
+    /// `context_window` and `max_output_tokens` (production's entry at
+    /// `aegis-platform-deployment` d27c51d is 256,000 and 16,384).
+    fn alias_table(context_window: u32, max_output_tokens: u32) -> AliasTableJudgeContext {
+        let providers: Vec<crate::domain::node_config::LLMProviderConfig> =
+            serde_yaml::from_str(&format!(
+                "- name: workers-ai\n  type: openai-compatible\n  endpoint: https://example.invalid/v1\n  \
+                 models:\n    - alias: judge\n      model: gemma\n      capabilities: [chat]\n      \
+                 context_window: {context_window}\n      max_output_tokens: {max_output_tokens}\n"
+            ))
+            .unwrap();
+        AliasTableJudgeContext::from_providers(&providers)
+    }
+
     struct Harness {
         service: GoalService,
         repo: Arc<InMemoryGoalRepository>,
@@ -1158,7 +1214,8 @@ mod tests {
             let clock = now.clone();
             let service = GoalService::new(repo.clone(), bus.clone(), GoalsConfig::default())
                 .with_clock(move || *clock.lock().unwrap())
-                .with_wait(Duration::from_millis(60), Duration::from_millis(5));
+                .with_wait(Duration::from_millis(60), Duration::from_millis(5))
+                .with_judge_context(Arc::new(alias_table(256_000, 16_384)));
             Self {
                 service,
                 repo,
@@ -1805,5 +1862,93 @@ mod tests {
             .unwrap();
         assert_eq!(answer["state"], "open");
         assert_eq!(world.judges_started(), 2);
+    }
+
+    // ── U16: a judge whose model cannot hold its input does not judge ─────
+
+    fn service_with(h: &Harness, source: Option<AliasTableJudgeContext>) -> GoalService {
+        let clock = h.now.clone();
+        let service = GoalService::new(h.repo.clone(), h.bus.clone(), GoalsConfig::default())
+            .with_clock(move || *clock.lock().unwrap())
+            .with_wait(Duration::from_millis(60), Duration::from_millis(5));
+        match source {
+            Some(source) => service.with_judge_context(Arc::new(source)),
+            None => service,
+        }
+    }
+
+    /// AEGIS ADR-131 U16: an input whose prompt is larger than the judge
+    /// alias's context less its output allowance starts no judge and is
+    /// never cut: the goal stops with the sizes in the answer and a sentence.
+    #[tokio::test]
+    async fn an_input_larger_than_the_judges_context_starts_no_judge_and_stops_with_the_sizes() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let service = service_with(&h, Some(alias_table(30_000, 4_000)));
+        let report = complete_report_of_13010_chars();
+        let world = World::scripted(vec![says(0.9, 0.9, 0.9)]);
+        *world.output.lock().unwrap() = Some(report.clone());
+        let input = service.judge_input(&world, &goal, &report).await.unwrap();
+        let input_text = serde_json::to_string(&input).unwrap();
+        let answer = service
+            .evaluate(&world, &h.caller, goal.id, &report, None)
+            .await
+            .unwrap();
+        assert_eq!(world.judges_started(), 0, "no judge reads a fragment");
+        assert_eq!(answer["state"], "stopped");
+        assert_eq!(answer["continue"], false);
+        assert_eq!(answer["stopped"]["reason"], "too_large");
+        let size_bytes = input_text.len() + JUDGE_PROMPT_RESERVE_BYTES;
+        assert_eq!(answer["stopped"]["size_bytes"], size_bytes);
+        assert_eq!(answer["stopped"]["size_chars"], input_text.chars().count());
+        assert_eq!(answer["stopped"]["limit_bytes"], 26_000);
+        assert_eq!(
+            answer["verdict"]["reasoning"],
+            format!(
+                "The input is too large to judge: {} characters ({size_bytes} bytes) against a \
+                 limit of 26000 bytes.",
+                input_text.chars().count()
+            )
+        );
+        assert_eq!(h.stored(&goal).await.state, GoalState::Stopped);
+        let stored = h.repo.list_evaluations(goal.id).await.unwrap();
+        assert_eq!(stored[0].stop_reason, Some(StopReason::TooLarge));
+        assert_eq!(stored[0].companion_answer, report, "stored whole, not cut");
+    }
+
+    /// The limit is read from the alias table at each evaluation: the same
+    /// input is judged under production's `judge` entry (256,000 and 16,384).
+    #[tokio::test]
+    async fn the_limit_follows_the_alias_table_with_no_change_of_code() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let service = service_with(&h, Some(alias_table(256_000, 16_384)));
+        let report = complete_report_of_13010_chars();
+        let world = World::scripted(vec![says(0.9, 0.9, 0.9)]);
+        *world.output.lock().unwrap() = Some(report.clone());
+        let answer = service
+            .evaluate(&world, &h.caller, goal.id, &report, None)
+            .await
+            .unwrap();
+        assert_eq!(answer["outcome"], "met");
+        assert_eq!(world.judges_started(), 1);
+    }
+
+    /// With no configured context for the alias, the stated default (32,768
+    /// tokens, 8,192 for output) bounds the prompt: never an unbounded send.
+    #[tokio::test]
+    async fn an_unconfigured_alias_is_bounded_by_the_stated_default() {
+        assert_eq!(JudgeContext::UNCONFIGURED.prompt_limit_bytes(), 24_576);
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let service = service_with(&h, None);
+        let world = World::scripted(vec![says(0.9, 0.9, 0.9)]);
+        let answer = service
+            .evaluate(&world, &h.caller, goal.id, &"a".repeat(20_000), None)
+            .await
+            .unwrap();
+        assert_eq!(answer["stopped"]["reason"], "too_large");
+        assert_eq!(answer["stopped"]["limit_bytes"], 24_576);
+        assert_eq!(world.judges_started(), 0);
     }
 }
