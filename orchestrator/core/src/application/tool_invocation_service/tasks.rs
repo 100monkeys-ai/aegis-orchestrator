@@ -29,6 +29,16 @@ impl ToolInvocationService {
                 )
             })?;
 
+        // AEGIS ADR-131 U6: the goal this execution is started for, checked
+        // before anything starts.
+        let goal_id = match self
+            .goal_for_start("aegis.task.execute", args, caller_identity, _scope)
+            .await?
+        {
+            Ok(goal_id) => goal_id,
+            Err(refused) => return Ok(refused),
+        };
+
         let mut input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
         let intent = args
             .get("intent")
@@ -114,11 +124,19 @@ impl ToolInvocationService {
             )
             .await
         {
-            Ok(exec_id) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.task.execute",
-                "execution_id": exec_id.to_string(),
-                "status": "started"
-            }))),
+            Ok(exec_id) => {
+                self.bind_to_goal(
+                    goal_id,
+                    &exec_id.to_string(),
+                    crate::domain::goal::BoundKind::Agent,
+                )
+                .await;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.execute",
+                    "execution_id": exec_id.to_string(),
+                    "status": "started"
+                })))
+            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.task.execute",
                 "error": format!("Failed to start task execution: {e}")

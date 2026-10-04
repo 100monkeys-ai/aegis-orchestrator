@@ -7,6 +7,35 @@ use super::*;
 use std::time::Instant;
 
 impl ToolInvocationService {
+    /// `aegis.execute.intent` with its optional `goal_id` (AEGIS ADR-131
+    /// U6): the goal is checked before the pipeline starts, and the pipeline
+    /// execution the handler answers is bound to it.
+    pub(super) async fn invoke_aegis_execute_intent_for_goal(
+        &self,
+        args: &mut Value,
+        security_context: &crate::domain::security_context::SecurityContext,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        scope: &crate::domain::iam::TenantScope,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        let goal_id = match self
+            .goal_for_start("aegis.execute.intent", args, caller_identity, scope)
+            .await?
+        {
+            Ok(goal_id) => goal_id,
+            Err(refused) => return Ok(refused),
+        };
+        let result = self
+            .invoke_aegis_execute_intent_tool(args, security_context, scope)
+            .await?;
+        if let ToolInvocationResult::Direct(answer) = &result {
+            if let Some(pipeline) = answer.get("pipeline_execution_id").and_then(Value::as_str) {
+                self.bind_to_goal(goal_id, pipeline, crate::domain::goal::BoundKind::Workflow)
+                    .await;
+            }
+        }
+        Ok(result)
+    }
+
     /// Handle `aegis.execute.intent` — start the intent-to-execution pipeline.
     pub(super) async fn invoke_aegis_execute_intent_tool(
         &self,

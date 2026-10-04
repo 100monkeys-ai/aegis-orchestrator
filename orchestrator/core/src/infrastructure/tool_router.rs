@@ -286,6 +286,9 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.edge.fleet.invoke", "ADR-117: dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /v1/edge/fleet/invoke. Operator-tier, fleet-capable.").skip_judge().edge_executor().fleet_capable(),
     BuiltinToolDefinition::new("aegis.edge.fleet.cancel", "ADR-117: cancel an in-flight fleet operation by fleet_command_id. Operator-tier.").skip_judge().edge_executor(),
     BuiltinToolDefinition::new("aegis.approval.status", "Returns the status of a tool call that waited for its user's approval (approval_pending, approved_once, approved_always, denied, expired, auto_allowed) and, once it ran, its result. Only the call's own user can read it.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.create", "AEGIS ADR-131: hold the user's request as a goal that the executions started for it are bound to. Called by the turn, never by a model.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.evaluate", "AEGIS ADR-131: judge the goal after an execution turn with the built-in judge agent goal-judge, and answer whether a round is granted. Blocks at most 45 s, answering judging until the verdict is in. Called by the turn, never by a model.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.status", "AEGIS ADR-131: the goal, its bound executions with their states, and every verdict. Read-only.").skip_judge(),
 ];
 
 impl ToolRouter {
@@ -615,6 +618,9 @@ impl ToolRouter {
             "aegis.execution.file" => Self::schema_aegis_execution_file(),
             "aegis.attachment.read" => Self::schema_aegis_attachment_read(),
             "aegis.approval.status" => Self::schema_aegis_approval_status(),
+            "aegis.goal.create" => Self::schema_aegis_goal_create(),
+            "aegis.goal.evaluate" => Self::schema_aegis_goal_evaluate(),
+            "aegis.goal.status" => Self::schema_aegis_goal_status(),
             _ => json!({ "type": "object" }),
         }
     }
@@ -1451,6 +1457,60 @@ impl ToolRouter {
                 }
             },
             "required": ["approval_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.goal.create` builtin tool (ADR-131 D2, U8).
+    fn schema_aegis_goal_create() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "statement": {
+                    "type": "string",
+                    "description": "The user's request, verbatim; at most 32,768 characters."
+                },
+                "client_ref": {
+                    "type": "string",
+                    "description": "The caller's opaque reference, for Zaru Web the conversation id. An open goal under the same reference is closed superseded."
+                },
+                "channel": {
+                    "type": "string",
+                    "enum": ["web", "api"]
+                }
+            },
+            "required": ["statement", "client_ref", "channel"]
+        })
+    }
+
+    /// JSON schema for the `aegis.goal.evaluate` builtin tool (ADR-131 D2,
+    /// U2, U8).
+    fn schema_aegis_goal_evaluate() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string" },
+                "companion_answer": {
+                    "type": "string",
+                    "description": "The text the companion showed the user in the turn just ended; read to 8,192 characters."
+                },
+                "round": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The round asked about: absent on a goal's first evaluation, then the round the last answer carried."
+                }
+            },
+            "required": ["goal_id", "companion_answer"]
+        })
+    }
+
+    /// JSON schema for the `aegis.goal.status` builtin tool (ADR-131 D2, U8).
+    fn schema_aegis_goal_status() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string" }
+            },
+            "required": ["goal_id"]
         })
     }
 
@@ -2758,6 +2818,11 @@ mod tests {
         "aegis.edge.fleet.cancel",
         // AEGIS ADR-126 D4: a read-only status lookup, added deliberately.
         "aegis.approval.status",
+        // AEGIS ADR-131 D2: the turn's goal tools, never an agent's inner
+        // loop (no agent context admits them), added deliberately.
+        "aegis.goal.create",
+        "aegis.goal.evaluate",
+        "aegis.goal.status",
     ];
 
     /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).

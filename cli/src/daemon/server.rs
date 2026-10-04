@@ -1954,6 +1954,32 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_operator_escalations(operator_escalations.clone())
         .with_execution_repository(execution_repo.clone());
 
+    // ─── Goals (AEGIS ADR-131) ──────────────────────────────────────────────
+    // Goals and their evaluations live in PostgreSQL (migration 039); a node
+    // without a database keeps them in process. The bounds are spec.goals
+    // (D7). The sweep closes goals open past their lifetime every ten
+    // minutes.
+    let goal_repo: Arc<dyn aegis_orchestrator_core::domain::goal::GoalRepository> =
+        match db_pool.as_ref() {
+            Some(pool) => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_goal::PostgresGoalRepository::new(pool.clone()),
+            ),
+            None => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_goal::InMemoryGoalRepository::new(),
+            ),
+        };
+    let goal_service = Arc::new(
+        aegis_orchestrator_core::application::goal_service::GoalService::new(
+            goal_repo,
+            event_bus.clone(),
+            config.spec.goals.clone(),
+        ),
+    );
+    goal_service.clone().spawn_expiry_sweep(
+        aegis_orchestrator_core::application::goal_service::EXPIRY_SWEEP_INTERVAL,
+    );
+    tool_invocation_service_builder = tool_invocation_service_builder.with_goals(goal_service);
+
     let tool_invocation_service = Arc::new(tool_invocation_service_builder);
 
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");

@@ -215,6 +215,16 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let raw_input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
 
+        // AEGIS ADR-131 U6: the goal this generation is started for, checked
+        // before anything starts.
+        let goal_id = match self
+            .goal_for_start("aegis.agent.generate", args, caller_identity, _scope)
+            .await?
+        {
+            Ok(goal_id) => goal_id,
+            Err(refused) => return Ok(refused),
+        };
+
         // ADR-113: parse attachments from the SEAL JSON-RPC tool call args so
         // they reach `ExecutionInput.attachments` and get merged into
         // `input.attachments` by `prepare_execution_input` downstream.
@@ -266,11 +276,19 @@ impl ToolInvocationService {
             )
             .await
         {
-            Ok(exec_id) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.agent.generate",
-                "execution_id": exec_id.to_string(),
-                "status": "started"
-            }))),
+            Ok(exec_id) => {
+                self.bind_to_goal(
+                    goal_id,
+                    &exec_id.to_string(),
+                    crate::domain::goal::BoundKind::Agent,
+                )
+                .await;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.generate",
+                    "execution_id": exec_id.to_string(),
+                    "status": "started"
+                })))
+            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.agent.generate",
                 "error": format!("Failed to start generation: {e}")

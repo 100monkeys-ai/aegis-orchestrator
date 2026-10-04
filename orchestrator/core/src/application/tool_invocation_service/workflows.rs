@@ -487,9 +487,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_generate_tool(
         &self,
         args: &mut Value,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
         _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
+        // AEGIS ADR-131 U6: the goal this generation is started for, checked
+        // before anything starts.
+        let goal_id = match self
+            .goal_for_start("aegis.workflow.generate", args, caller_identity, _scope)
+            .await?
+        {
+            Ok(goal_id) => goal_id,
+            Err(refused) => return Ok(refused),
+        };
         let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::InvalidArguments(
                 "aegis.workflow.generate requires 'input' string".to_string(),
@@ -520,11 +530,19 @@ impl ToolInvocationService {
             )
             .await
         {
-            Ok(started) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.workflow.generate",
-                "execution_id": started.workflow_id,
-                "status": "started"
-            }))),
+            Ok(started) => {
+                self.bind_to_goal(
+                    goal_id,
+                    &started.execution_id,
+                    crate::domain::goal::BoundKind::Workflow,
+                )
+                .await;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.generate",
+                    "execution_id": started.workflow_id,
+                    "status": "started"
+                })))
+            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.generate",
                 "error": format!("Failed to start workflow generation: {e}")

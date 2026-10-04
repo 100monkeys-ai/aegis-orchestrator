@@ -13,6 +13,9 @@ mod execute;
 mod facade;
 mod gateway;
 #[cfg(test)]
+mod goal_tests;
+mod goals;
+#[cfg(test)]
 mod operator_escalation_tests;
 mod runtime;
 mod storage;
@@ -176,4 +179,7 @@ pub struct ToolInvocationService {
     /// AEGIS ADR-129 D17: the execution store, for the all-tenant list an
     /// escalated `aegis.task.list` reads.
     execution_repository: Option<Arc<dyn repository::ExecutionRepository>>,
+    /// AEGIS ADR-131: goals, their evaluation by `goal-judge`, and the
+    /// `goal_id` of the four starting tools. `None` refuses every goal.
+    goal_service: Option<Arc<crate::application::goal_service::GoalService>>,
 }

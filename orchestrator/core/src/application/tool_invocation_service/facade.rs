@@ -112,6 +112,7 @@ impl ToolInvocationService {
             tool_approval_service: None,
             operator_escalations: None,
             execution_repository: None,
+            goal_service: None,
         }
     }
 
@@ -1322,7 +1323,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.workflow.generate" => Some(
-                self.invoke_aegis_workflow_generate_tool(args, tenant_scope)
+                self.invoke_aegis_workflow_generate_tool(args, caller_identity, tenant_scope)
                     .await,
             ),
             "aegis.workflow.logs" => Some(
@@ -1405,6 +1406,29 @@ impl ToolInvocationService {
                 self.invoke_aegis_approval_status_tool(args, caller_identity, tenant_scope)
                     .await,
             ),
+            // ── AEGIS ADR-131 goals ─────────────────────────────────────
+            "aegis.goal.create" => Some(
+                self.invoke_aegis_goal_create_tool(args, caller_identity, tenant_scope)
+                    .await,
+            ),
+            "aegis.goal.evaluate" => Some(
+                self.invoke_aegis_goal_evaluate_tool(
+                    args,
+                    security_context,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
+            ),
+            "aegis.goal.status" => Some(
+                self.invoke_aegis_goal_status_tool(
+                    args,
+                    security_context,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
+            ),
             // ── ADR-117 Edge fleet system tools ────────────────────
             "aegis.edge.fleet.list" => Some(
                 self.invoke_aegis_edge_fleet_list_tool(args, tenant_scope)
@@ -1431,8 +1455,13 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.execute.intent" => Some(
-                self.invoke_aegis_execute_intent_tool(args, security_context, tenant_scope)
-                    .await,
+                self.invoke_aegis_execute_intent_for_goal(
+                    args,
+                    security_context,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
             ),
             "aegis.execute.status" => Some(
                 self.invoke_aegis_execute_status_tool(args, tenant_scope)
