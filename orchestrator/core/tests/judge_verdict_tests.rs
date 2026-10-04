@@ -17,7 +17,7 @@ use aegis_orchestrator_core::application::agent::AgentLifecycleService;
 use aegis_orchestrator_core::application::execution::ExecutionService;
 use aegis_orchestrator_core::application::validation_service::{
     MultiJudgeAgentValidator, MultiJudgeAgentValidatorConfig, SemanticAgentValidator,
-    SemanticAgentValidatorConfig,
+    SemanticAgentValidatorConfig, ValidationService,
 };
 use aegis_orchestrator_core::domain::agent::{
     Agent, AgentId, AgentManifest, AgentScope, AgentSpec, AgentStatus, ManifestMetadata,
@@ -27,12 +27,14 @@ use aegis_orchestrator_core::domain::events::{ExecutionEvent, ValidationEvent};
 use aegis_orchestrator_core::domain::execution::{
     Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction, TrajectoryStep,
 };
+use aegis_orchestrator_core::domain::goal::{AliasTableJudgeContext, JudgeContextSource};
+use aegis_orchestrator_core::domain::node_config::LLMProviderConfig;
 use aegis_orchestrator_core::domain::repository::AgentVersion;
 use aegis_orchestrator_core::domain::shared_kernel::ImagePullPolicy;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::validation::{
-    GradientValidator, JudgeFault, ValidationContext, ValidationPipeline, ValidatorEntry,
-    ValidatorKind,
+    GradientValidator, JudgeFault, ValidationContext, ValidationPipeline, ValidationRequest,
+    ValidatorEntry, ValidatorKind,
 };
 use aegis_orchestrator_core::domain::workflow::{ConsensusConfig, ConsensusStrategy};
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
@@ -850,4 +852,247 @@ async fn multi_judge_with_its_judge_unreadable_twice_carries_the_judge_fault() {
         "the multi-judge's judge is run once more after its first fault, and not a third time"
     );
     assert_eq!(judge_fault_events(&mut receiver).len(), 2);
+}
+
+// ── U19: a validation judge's model holds its whole input, or no judge runs ──
+//
+// AEGIS ADR-131 U19 (Jeshua, 2026-10-04: "We need to make it so that judges
+// can see everything as it is"): the validation judges are given the output,
+// the task and the trajectory whole; before a judge starts, its prompt is
+// measured against its alias's `context_window - max_output_tokens` from the
+// alias table, and an input above it runs no judge on a fragment: the
+// iteration's validation ends with the sizes in a sentence.
+
+/// The alias table with `judge` at production's entry (`aegis-platform-
+/// deployment` d27c51d: 256,000 and 16,384): a prompt limit of 239,616 bytes.
+fn production_alias_table() -> Arc<dyn JudgeContextSource> {
+    let providers: Vec<LLMProviderConfig> = serde_yaml::from_str(
+        "- name: workers-ai\n  type: openai-compatible\n  endpoint: https://example.invalid/v1\n  \
+         models:\n    - {alias: judge, model: gemma, capabilities: [chat], context_window: 256000, max_output_tokens: 16384}\n",
+    )
+    .unwrap();
+    Arc::new(AliasTableJudgeContext::from_providers(&providers))
+}
+
+fn ctx_with_output(output: String) -> ValidationContext {
+    ValidationContext {
+        output,
+        ..validation_ctx()
+    }
+}
+
+fn semantic_with(
+    exec_service: Arc<SequencedJudgeExecutionService>,
+    event_bus: Arc<EventBus>,
+    source: Option<Arc<dyn JudgeContextSource>>,
+) -> SemanticAgentValidator {
+    SemanticAgentValidator::new(
+        SemanticAgentValidatorConfig {
+            judge_agent_name: "haiku-judge-agent".to_string(),
+            criteria: "evaluate the output".to_string(),
+            timeout_seconds: 5,
+            poll_interval_ms: 20,
+            parent_execution_id: ExecutionId::new(),
+            tenant_id: tenant(),
+        },
+        Arc::new(StubAgentLifecycleService {
+            judge_id: AgentId::new(),
+        }),
+        exec_service,
+    )
+    .with_event_bus(event_bus)
+    .with_judge_context(source)
+}
+
+/// The JudgeFault an error carries, if any.
+fn judge_fault_of(error: &anyhow::Error) -> Option<JudgeFault> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<JudgeFault>())
+        .cloned()
+}
+
+/// An output of 100,000 characters, far above the stated default's room and
+/// within production's `judge`, is given to the judge whole.
+#[tokio::test]
+async fn a_validation_judge_is_given_an_output_its_alias_holds_whole() {
+    let output = "a".repeat(100_000);
+    let exec_service = Arc::new(SequencedJudgeExecutionService::new(&[ITERATION_2_VERDICT]));
+    let validator = semantic_with(
+        exec_service.clone(),
+        Arc::new(EventBus::new(16)),
+        Some(production_alias_table()),
+    );
+    let verdict = validator
+        .validate(&ctx_with_output(output.clone()))
+        .await
+        .unwrap_or_else(|e| panic!("a 100,000-character output fits production's judge: {e:#}"));
+    assert_eq!(verdict.score, 1.0);
+    let inputs = exec_service.started_inputs();
+    assert_eq!(inputs.len(), 1, "the judge ran once");
+    assert_eq!(
+        inputs[0]["output"].as_str().map(str::len),
+        Some(100_000),
+        "the judge is given the output whole"
+    );
+}
+
+/// Above production's limit: no judge runs, the error is a JudgeFault whose
+/// reason is the sizes in a sentence, and one JudgeFault event is published.
+#[tokio::test]
+async fn a_semantic_judge_input_above_its_alias_limit_runs_no_judge_and_states_the_sizes() {
+    let exec_service = Arc::new(SequencedJudgeExecutionService::new(&[ITERATION_2_VERDICT]));
+    let event_bus = Arc::new(EventBus::new(64));
+    let mut receiver = event_bus.subscribe();
+    let validator = semantic_with(
+        exec_service.clone(),
+        event_bus,
+        Some(production_alias_table()),
+    );
+    let error = validator
+        .validate(&ctx_with_output("a".repeat(300_000)))
+        .await
+        .expect_err("a 300,000-character output is above production's 239,616 bytes");
+    let fault = judge_fault_of(&error).unwrap_or_else(|| panic!("a JudgeFault, got: {error:#}"));
+    assert_eq!(fault.judge_agent, "haiku-judge-agent");
+    assert!(
+        fault.reason.contains("The input is too large to judge: ")
+            && fault.reason.contains("against a limit of 239616 bytes."),
+        "the reason states the sizes against the alias's limit: {}",
+        fault.reason
+    );
+    assert!(
+        format!("{error:#}").starts_with("Judge 'haiku-judge-agent' was not run: "),
+        "the stated reason leads: {error:#}"
+    );
+    assert!(
+        exec_service.started_inputs().is_empty(),
+        "no judge runs on a fragment or on the whole"
+    );
+    assert_eq!(judge_fault_events(&mut receiver).len(), 1);
+}
+
+/// An alias the table does not map takes the stated default (32,768 and
+/// 8,192: 24,576 bytes): never an unbounded send.
+#[tokio::test]
+async fn a_validation_judge_without_a_configured_alias_is_bounded_by_the_stated_default() {
+    let exec_service = Arc::new(SequencedJudgeExecutionService::new(&[ITERATION_2_VERDICT]));
+    let validator = semantic_with(exec_service.clone(), Arc::new(EventBus::new(16)), None);
+    let error = validator
+        .validate(&ctx_with_output("a".repeat(20_000)))
+        .await
+        .expect_err("20,000 characters and the reserve are above the default's 24,576 bytes");
+    let fault = judge_fault_of(&error).unwrap_or_else(|| panic!("a JudgeFault, got: {error:#}"));
+    assert!(
+        fault.reason.contains("against a limit of 24576 bytes."),
+        "{}",
+        fault.reason
+    );
+    assert!(exec_service.started_inputs().is_empty());
+}
+
+/// The multi-judge form is measured the same way.
+#[tokio::test]
+async fn a_multi_judge_input_above_its_alias_limit_runs_no_judge() {
+    let exec_service = Arc::new(SequencedJudgeExecutionService::new(&[ITERATION_2_VERDICT]));
+    let validator = MultiJudgeAgentValidator::new(
+        MultiJudgeAgentValidatorConfig {
+            judges: vec!["haiku-judge-agent".to_string()],
+            consensus_config: ConsensusConfig {
+                strategy: ConsensusStrategy::WeightedAverage,
+                threshold: None,
+                min_agreement_confidence: None,
+                n: None,
+                min_judges_required: 1,
+                confidence_weighting: None,
+            },
+            min_judges_required: 1,
+            criteria: "evaluate the output".to_string(),
+            timeout_seconds: 5,
+            poll_interval_ms: 20,
+            parent_execution_id: ExecutionId::new(),
+            tenant_id: tenant(),
+        },
+        Arc::new(StubAgentLifecycleService {
+            judge_id: AgentId::new(),
+        }),
+        exec_service.clone(),
+        Arc::new(EventBus::new(16)),
+    )
+    .with_judge_context(Some(production_alias_table()));
+    let error = validator
+        .validate(&ctx_with_output("a".repeat(300_000)))
+        .await
+        .expect_err("above the limit");
+    let fault = judge_fault_of(&error).unwrap_or_else(|| panic!("a JudgeFault, got: {error:#}"));
+    assert!(
+        fault.reason.contains("The input is too large to judge: "),
+        "{}",
+        fault.reason
+    );
+    assert!(exec_service.started_inputs().is_empty());
+}
+
+/// `ValidationService::validate_with_judges` is measured the same way, and
+/// passes a content its alias holds whole.
+#[tokio::test]
+async fn validate_with_judges_is_bounded_by_the_alias_table_it_is_given() {
+    let judge = AgentId::new();
+    let within = Arc::new(SequencedJudgeExecutionService::new(&[ITERATION_2_VERDICT]));
+    let service = ValidationService::new(
+        Arc::new(EventBus::new(16)),
+        within.clone(),
+        Arc::new(StubAgentLifecycleService { judge_id: judge }),
+    )
+    .with_judge_context(production_alias_table());
+    let mut request = ValidationRequest {
+        content: "a".repeat(100_000),
+        criteria: "evaluate the output".to_string(),
+        context: None,
+    };
+    service
+        .validate_with_judges(
+            ExecutionId::new(),
+            AgentId::new(),
+            1,
+            request.clone(),
+            vec![(judge, 1.0)],
+            None,
+            5,
+            20,
+            &tenant(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("100,000 characters fit production's judge: {e:#}"));
+    assert_eq!(within.started_inputs().len(), 1);
+
+    let above = Arc::new(SequencedJudgeExecutionService::new(&[ITERATION_2_VERDICT]));
+    let service = ValidationService::new(
+        Arc::new(EventBus::new(16)),
+        above.clone(),
+        Arc::new(StubAgentLifecycleService { judge_id: judge }),
+    )
+    .with_judge_context(production_alias_table());
+    request.content = "a".repeat(300_000);
+    let error = service
+        .validate_with_judges(
+            ExecutionId::new(),
+            AgentId::new(),
+            1,
+            request,
+            vec![(judge, 1.0)],
+            None,
+            5,
+            20,
+            &tenant(),
+        )
+        .await
+        .expect_err("above the limit");
+    let fault = judge_fault_of(&error).unwrap_or_else(|| panic!("a JudgeFault, got: {error:#}"));
+    assert!(
+        fault.reason.contains("The input is too large to judge: "),
+        "{}",
+        fault.reason
+    );
+    assert!(above.started_inputs().is_empty());
 }

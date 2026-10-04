@@ -502,6 +502,9 @@ pub struct StandardExecutionService {
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
     /// Optional quota enforcement service (ADR-056). Checks concurrent execution limits.
     quota_service: Option<Arc<crate::application::tenant_quota::TenantQuotaService>>,
+    /// Where each validation judge alias's room is read (AEGIS ADR-131 U19);
+    /// `None` bounds every judge's prompt by the stated default.
+    judge_context: Option<Arc<dyn crate::domain::goal::JudgeContextSource>>,
 }
 
 impl StandardExecutionService {
@@ -822,7 +825,52 @@ impl StandardExecutionService {
             token_issuer: None,
             output_handler_service: None,
             quota_service: None,
+            judge_context: None,
         }
+    }
+
+    /// Read each validation judge alias's context and output allowance from
+    /// `source` (AEGIS ADR-131 U19): the daemon passes the node
+    /// configuration's alias table, and every validation pipeline this
+    /// service builds is given it.
+    pub fn with_judge_context(
+        mut self,
+        source: Arc<dyn crate::domain::goal::JudgeContextSource>,
+    ) -> Self {
+        self.judge_context = Some(source);
+        self
+    }
+
+    /// The gradient validation pipeline of `agent`'s manifest (ADR-017), for
+    /// `execution_id`, its judges bounded by this service's judge context
+    /// (AEGIS ADR-131 U19); `None` when the manifest declares no validation.
+    fn validation_pipeline(
+        &self,
+        agent: &crate::domain::agent::Agent,
+        execution_id: ExecutionId,
+        tenant_id: &TenantId,
+    ) -> Option<Arc<crate::domain::validation::ValidationPipeline>> {
+        let validators = agent
+            .manifest
+            .spec
+            .execution
+            .as_ref()
+            .and_then(|e| e.validation.as_ref())
+            .filter(|v| !v.is_empty())?;
+        let child_svc = self
+            .child_executor
+            .get()
+            .cloned()
+            .expect("child_executor not set; call set_child_execution_service() at startup");
+        Some(Arc::new(build_validation_pipeline(
+            validators,
+            self.agent_service.clone(),
+            child_svc,
+            self.event_bus.clone(),
+            execution_id,
+            tenant_id.clone(),
+            self.judge_context.clone(),
+        )))
     }
 
     /// Attach a quota enforcement service for per-tenant concurrent execution limits (ADR-056).
@@ -1181,6 +1229,103 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("runtime spawn was not observed");
+    }
+
+    /// AEGIS ADR-131 U19: every validation pipeline the service builds is
+    /// given the judge context the service was given, so a judge's room is
+    /// its alias's from the alias table, not the stated default. An output of
+    /// 100,000 characters is above the default's 24,576 bytes and within
+    /// production's `judge` (256,000 and 16,384).
+    #[tokio::test]
+    async fn validation_pipelines_are_bounded_by_the_judge_context_the_service_is_given() {
+        let tenant_id = CoreTenantId::consumer();
+        let mut worker = make_agent("worker", None, None);
+        worker.manifest.spec.execution = Some(crate::domain::agent::ExecutionStrategy {
+            validation: Some(vec![crate::domain::agent::ValidatorSpec::Semantic {
+                judge_agent: "output-judge".to_string(),
+                criteria: "the output answers the task".to_string(),
+                min_score: 0.7,
+                min_confidence: 0.0,
+                timeout_seconds: 1,
+            }]),
+            ..Default::default()
+        });
+        let mut judge = make_agent("output-judge", Some("judge"), None);
+        judge.manifest.spec.runtime.model = "judge".to_string();
+        let providers: Vec<crate::domain::node_config::LLMProviderConfig> = serde_yaml::from_str(
+            "- name: workers-ai\n  type: openai-compatible\n  endpoint: https://example.invalid/v1\n  \
+             models:\n    - {alias: judge, model: gemma, capabilities: [chat], context_window: 256000, max_output_tokens: 16384}\n",
+        )
+        .unwrap();
+        let table = Arc::new(crate::domain::goal::AliasTableJudgeContext::from_providers(
+            &providers,
+        ));
+
+        async fn service_with(
+            tenant_id: &CoreTenantId,
+            worker: &Agent,
+            judge: &Agent,
+            source: Option<Arc<crate::domain::goal::AliasTableJudgeContext>>,
+        ) -> Arc<StandardExecutionService> {
+            let agent_repo = Arc::new(InMemoryAgentRepository::new());
+            agent_repo.save_for_tenant(tenant_id, worker).await.unwrap();
+            agent_repo.save_for_tenant(tenant_id, judge).await.unwrap();
+            let runtime = Arc::new(TestRuntime::default());
+            let mut service = StandardExecutionService::new(
+                agent_repo,
+                Arc::new(TestVolumeService {
+                    volumes: HashMap::new(),
+                }),
+                Arc::new(Supervisor::new(runtime)),
+                Arc::new(InMemoryExecutionRepository::new()),
+                Arc::new(EventBus::new(16)),
+                Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+            );
+            if let Some(source) = source {
+                service = service.with_judge_context(source);
+            }
+            let service = Arc::new(service);
+            service.set_child_execution_service(service.clone());
+            service
+        }
+        let ctx = crate::domain::validation::ValidationContext {
+            task: "answer the task".to_string(),
+            output: "a".repeat(100_000),
+            exit_code: 0,
+            stderr: String::new(),
+            worker_mounts: vec![],
+            tool_trajectory: vec![],
+            policy_violations: vec![],
+        };
+        let too_large = |result: Result<crate::domain::validation::ValidationPipelineResult>| {
+            result.err().and_then(|e| {
+                e.chain()
+                    .find_map(|c| c.downcast_ref::<crate::domain::validation::JudgeFault>())
+                    .filter(|f| f.reason.contains("The input is too large to judge: "))
+                    .map(|f| f.reason.clone())
+            })
+        };
+
+        let unwired = service_with(&tenant_id, &worker, &judge, None).await;
+        let pipeline = unwired
+            .validation_pipeline(&worker, ExecutionId::new(), &tenant_id)
+            .expect("the worker declares validation");
+        let reason = too_large(pipeline.validate(&ctx).await)
+            .expect("without the table the judge is bounded by the stated default");
+        assert!(
+            reason.contains("against a limit of 24576 bytes."),
+            "{reason}"
+        );
+
+        let wired = service_with(&tenant_id, &worker, &judge, Some(table)).await;
+        let pipeline = wired
+            .validation_pipeline(&worker, ExecutionId::new(), &tenant_id)
+            .expect("the worker declares validation");
+        assert_eq!(
+            too_large(pipeline.validate(&ctx).await),
+            None,
+            "with the alias table a 100,000-character output fits the judge's model"
+        );
     }
 
     #[tokio::test]
@@ -4428,26 +4573,7 @@ impl StandardExecutionService {
         });
 
         // Build gradient validation pipeline from manifest config (ADR-017).
-        let validation_pipeline = agent
-            .manifest
-            .spec
-            .execution
-            .as_ref()
-            .and_then(|e| e.validation.as_ref())
-            .filter(|v| !v.is_empty())
-            .map(|v| {
-                let child_svc = self.child_executor.get().cloned().expect(
-                    "child_executor not set; call set_child_execution_service() at startup",
-                );
-                Arc::new(build_validation_pipeline(
-                    v,
-                    self.agent_service.clone(),
-                    child_svc,
-                    self.event_bus.clone(),
-                    execution_id,
-                    tenant_id.clone(),
-                ))
-            });
+        let validation_pipeline = self.validation_pipeline(&agent, execution_id, &tenant_id);
 
         // Create a cancellation token for this execution so cancel_execution() can
         // signal the Supervisor loop to stop cooperatively.
@@ -5191,28 +5317,7 @@ impl ExecutionService for StandardExecutionService {
         });
 
         // Judge agents may declare their own (nested) validation steps.
-        let validation_pipeline = agent
-            .manifest
-            .spec
-            .execution
-            .as_ref()
-            .and_then(|e| e.validation.as_ref())
-            .filter(|v| !v.is_empty())
-            .map(|v| {
-                let child_svc = self
-                    .child_executor
-                    .get()
-                    .cloned()
-                    .expect("child_executor not set");
-                Arc::new(build_validation_pipeline(
-                    v,
-                    self.agent_service.clone(),
-                    child_svc,
-                    self.event_bus.clone(),
-                    child_execution_id,
-                    tenant_id.clone(),
-                ))
-            });
+        let validation_pipeline = self.validation_pipeline(&agent, child_execution_id, &tenant_id);
 
         let cancellation_token = CancellationToken::new();
         self.cancellation_tokens

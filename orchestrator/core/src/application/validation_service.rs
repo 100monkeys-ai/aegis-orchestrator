@@ -72,8 +72,12 @@
 
 use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
-use crate::domain::agent::{AgentId, ValidatorSpec};
+use crate::domain::agent::{AgentId, AgentManifest, ValidatorSpec};
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
+use crate::domain::goal::{
+    judge_context_or_default, JudgeContext, JudgeContextSource, OverLimit,
+    JUDGE_PROMPT_RESERVE_BYTES,
+};
 use crate::domain::shared_kernel::TenantId;
 use crate::domain::validation::{
     extract_json_from_text, read_judge_verdict, GradientResult, GradientValidator, JudgeFault,
@@ -89,6 +93,9 @@ pub struct ValidationService {
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     execution_service: Arc<dyn ExecutionService>,
     agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
+    /// Where each judge alias's room is read (AEGIS ADR-131 U19); `None`
+    /// bounds every judge's prompt by [`JudgeContext::UNCONFIGURED`].
+    judge_context: Option<Arc<dyn JudgeContextSource>>,
 }
 
 impl ValidationService {
@@ -101,7 +108,21 @@ impl ValidationService {
             event_bus,
             execution_service,
             agent_lifecycle_service,
+            judge_context: None,
         }
+    }
+
+    /// Read each judge alias's context and output allowance from `source`
+    /// (U19): the daemon passes the node configuration's alias table.
+    pub fn with_judge_context(mut self, source: Arc<dyn JudgeContextSource>) -> Self {
+        self.judge_context = Some(source);
+        self
+    }
+
+    /// The source each judge alias's room is read from, as the composition
+    /// root gave it.
+    pub fn judge_context(&self) -> Option<&Arc<dyn JudgeContextSource>> {
+        self.judge_context.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -149,6 +170,7 @@ impl ValidationService {
             let parent_id = execution_id;
             let tenant = tenant_id.clone();
             let event_bus = self.event_bus.clone();
+            let judge_context = self.judge_context.clone();
 
             futures.push(tokio::spawn(async move {
                 match Self::run_judge(
@@ -161,6 +183,7 @@ impl ValidationService {
                     timeout,
                     poll_interval,
                     event_bus,
+                    judge_context,
                 )
                 .await
                 {
@@ -244,6 +267,7 @@ impl ValidationService {
         timeout_seconds: u64,
         poll_interval_ms: u64,
         event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
+        judge_context: Option<Arc<dyn JudgeContextSource>>,
     ) -> Result<(AgentId, GradientResult)> {
         // Fetch the judge agent manifest to read its declared input_schema.
         // Use the system tenant so global judge agents (aegis-system scope) are always found.
@@ -328,6 +352,7 @@ impl ValidationService {
             judge_id,
             judge_name: &judge_name,
             input,
+            bound: JudgeBound::of(judge_context.as_deref(), &judge_agent.manifest),
             parent_execution_id,
             timeout_seconds,
             poll_interval_ms,
@@ -364,11 +389,63 @@ struct JudgeRun<'a> {
     judge_id: AgentId,
     judge_name: &'a str,
     input: ExecutionInput,
+    /// The prompt the judge's model holds (U19).
+    bound: JudgeBound,
     parent_execution_id: ExecutionId,
     timeout_seconds: u64,
     poll_interval_ms: u64,
     /// Where each [`JudgeFault`] is published; `None` publishes nothing.
     event_bus: Option<&'a crate::infrastructure::event_bus::EventBus>,
+}
+
+/// The room a validation judge's prompt has (AEGIS ADR-131 U19, by U16a's
+/// measure): its alias's `context_window - max_output_tokens` from the alias
+/// table, in UTF-8 bytes, and beside the input the judge's own instruction
+/// and prompt template measured from its manifest, plus
+/// [`JUDGE_PROMPT_RESERVE_BYTES`] for the chat template, the tool
+/// definitions and the system's framing around them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JudgeBound {
+    context: JudgeContext,
+    reserve_bytes: usize,
+}
+
+impl JudgeBound {
+    fn of(source: Option<&dyn JudgeContextSource>, manifest: &AgentManifest) -> Self {
+        let task = manifest.spec.task.as_ref();
+        let own_bytes = task
+            .and_then(|t| t.instruction.as_deref())
+            .map_or(0, str::len)
+            + task
+                .and_then(|t| t.prompt_template.as_deref())
+                .map_or(0, str::len);
+        Self {
+            context: judge_context_or_default(source, &manifest.spec.runtime.model),
+            reserve_bytes: own_bytes + JUDGE_PROMPT_RESERVE_BYTES,
+        }
+    }
+
+    /// `None` when the judge's prompt with `input` fits its model; otherwise
+    /// the sizes. The input is measured as `{{input}}` renders it, compact
+    /// JSON, with the intent beside it when one is given.
+    fn over_limit(&self, input: &ExecutionInput) -> Option<OverLimit> {
+        let mut text = serde_json::to_string(&input.input).unwrap_or_default();
+        if let Some(intent) = &input.intent {
+            text.push_str(intent);
+        }
+        OverLimit::check(&text, self.reserve_bytes, self.context)
+    }
+}
+
+/// Resolve a judge's manifest and its [`JudgeBound`].
+async fn judge_bound(
+    lifecycle: &dyn AgentLifecycleService,
+    tenant_id: &TenantId,
+    judge_id: AgentId,
+    source: Option<&dyn JudgeContextSource>,
+) -> Result<JudgeBound> {
+    let judge = lifecycle.get_agent_visible(tenant_id, judge_id).await?;
+    Ok(JudgeBound::of(source, &judge.manifest))
 }
 
 /// Start the judge as a fresh child execution with `input`, wait for it, and
@@ -426,7 +503,31 @@ async fn run_judge_once(
 /// fault publishes [`crate::domain::events::ValidationEvent::JudgeFault`]. A
 /// second fault is returned as the error: a [`JudgeFault`] naming the judge and
 /// saying it faulted twice, which the supervisor ends the execution on.
+///
+/// A prompt the judge's model cannot hold is never sent and never cut (U19):
+/// no judge runs, and the error is a [`JudgeFault`] whose reason is the sizes
+/// in a sentence, which ends the iteration's validation with that reason.
 async fn run_judge_with_one_rerun(run: JudgeRun<'_>) -> Result<GradientResult> {
+    if let Some(over) = run.bound.over_limit(&run.input) {
+        let sentence = over.sentence();
+        let fault = JudgeFault {
+            judge_agent: run.judge_name.to_string(),
+            reason: format!("no judge ran: {sentence}"),
+            output: String::new(),
+        };
+        publish_judge_fault(&run, &fault);
+        tracing::warn!(
+            judge_agent = %run.judge_name,
+            size_chars = over.size_chars,
+            size_bytes = over.size_bytes,
+            limit_bytes = over.limit_bytes,
+            "Judge input larger than its model holds — no judge runs"
+        );
+        return Err(anyhow::Error::new(fault).context(format!(
+            "Judge '{}' was not run: {sentence}",
+            run.judge_name
+        )));
+    }
     let first = match run_judge_once(&run, run.input.clone()).await? {
         Ok(verdict) => return Ok(verdict),
         Err(fault) => fault,
@@ -680,6 +781,8 @@ pub struct SemanticAgentValidator {
     event_bus: Option<Arc<crate::infrastructure::event_bus::EventBus>>,
     parent_execution_id: ExecutionId,
     tenant_id: TenantId,
+    /// Where the judge alias's room is read (U19).
+    judge_context: Option<Arc<dyn JudgeContextSource>>,
 }
 
 impl SemanticAgentValidator {
@@ -698,7 +801,15 @@ impl SemanticAgentValidator {
             event_bus: None,
             parent_execution_id: config.parent_execution_id,
             tenant_id: config.tenant_id,
+            judge_context: None,
         }
+    }
+
+    /// Read the judge alias's context and output allowance from `source`
+    /// (U19).
+    pub fn with_judge_context(mut self, source: Option<Arc<dyn JudgeContextSource>>) -> Self {
+        self.judge_context = source;
+        self
     }
 
     /// Publish each [`JudgeFault`] of this validator's judge on `event_bus`.
@@ -769,13 +880,22 @@ impl GradientValidator for SemanticAgentValidator {
             attachments: Vec::new(),
         };
 
-        // 3. Run the judge as a child execution, once more on an unreadable verdict.
+        // 3. Run the judge as a child execution, once more on an unreadable
+        //    verdict, when its model holds the whole input (U19).
+        let bound = judge_bound(
+            self.agent_lifecycle_service.as_ref(),
+            &self.tenant_id,
+            judge_id,
+            self.judge_context.as_deref(),
+        )
+        .await?;
         run_judge_with_one_rerun(JudgeRun {
             service: self.execution_service.as_ref(),
             tenant_id: &self.tenant_id,
             judge_id,
             judge_name: &self.judge_agent_name,
             input,
+            bound,
             parent_execution_id: self.parent_execution_id,
             timeout_seconds: self.timeout_seconds,
             poll_interval_ms: self.poll_interval_ms,
@@ -817,6 +937,8 @@ pub struct MultiJudgeAgentValidator {
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     parent_execution_id: ExecutionId,
     tenant_id: TenantId,
+    /// Where each judge alias's room is read (U19).
+    judge_context: Option<Arc<dyn JudgeContextSource>>,
 }
 
 impl MultiJudgeAgentValidator {
@@ -838,7 +960,15 @@ impl MultiJudgeAgentValidator {
             event_bus,
             parent_execution_id: config.parent_execution_id,
             tenant_id: config.tenant_id,
+            judge_context: None,
         }
+    }
+
+    /// Read each judge alias's context and output allowance from `source`
+    /// (U19).
+    pub fn with_judge_context(mut self, source: Option<Arc<dyn JudgeContextSource>>) -> Self {
+        self.judge_context = source;
+        self
     }
 }
 
@@ -852,14 +982,21 @@ impl GradientValidator for MultiJudgeAgentValidator {
         // 1. Resolve all judge agent ids — use visible (cross-tenant) lookup so
         //    aegis-system scoped judges are found even when the caller's tenant
         //    is not aegis-system.
-        let mut judge_ids: Vec<(AgentId, String, f64)> = Vec::new();
+        let mut judge_ids: Vec<(AgentId, String, f64, JudgeBound)> = Vec::new();
         for name in &self.judges {
             let id = self
                 .agent_lifecycle_service
                 .lookup_agent_visible_for_tenant(&self.tenant_id, name)
                 .await?
                 .ok_or_else(|| anyhow!("Judge agent '{name}' not found"))?;
-            judge_ids.push((id, name.clone(), 1.0)); // Equal weight by default.
+            let bound = judge_bound(
+                self.agent_lifecycle_service.as_ref(),
+                &self.tenant_id,
+                id,
+                self.judge_context.as_deref(),
+            )
+            .await?;
+            judge_ids.push((id, name.clone(), 1.0, bound)); // Equal weight by default.
         }
 
         // 2. Build shared input.
@@ -873,8 +1010,9 @@ impl GradientValidator for MultiJudgeAgentValidator {
 
         // 3. Spawn all judges as parallel child executions.
         let mut futures = Vec::new();
-        for (judge_id, judge_name, weight) in &judge_ids {
+        for (judge_id, judge_name, weight, bound) in &judge_ids {
             let svc = self.execution_service.clone();
+            let bound = *bound;
             let payload = input_payload.clone();
             let jid = *judge_id;
             let judge_name = judge_name.clone();
@@ -901,6 +1039,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                     judge_id: jid,
                     judge_name: &judge_name,
                     input: exec_input,
+                    bound,
                     parent_execution_id: parent_id,
                     timeout_seconds: timeout,
                     poll_interval_ms: poll_interval,
@@ -991,6 +1130,7 @@ pub fn build_validation_pipeline(
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     parent_execution_id: ExecutionId,
     tenant_id: TenantId,
+    judge_context: Option<Arc<dyn JudgeContextSource>>,
 ) -> ValidationPipeline {
     let mut entries: Vec<ValidatorEntry> = Vec::new();
 
@@ -1057,7 +1197,8 @@ pub fn build_validation_pipeline(
                             agent_lifecycle_service.clone(),
                             execution_service.clone(),
                         )
-                        .with_event_bus(event_bus.clone()),
+                        .with_event_bus(event_bus.clone())
+                        .with_judge_context(judge_context.clone()),
                     ),
                     min_score: *min_score,
                     min_confidence: *min_confidence,
@@ -1082,21 +1223,24 @@ pub fn build_validation_pipeline(
                 };
                 entries.push(ValidatorEntry {
                     kind: ValidatorKind::MultiJudge,
-                    validator: Box::new(MultiJudgeAgentValidator::new(
-                        MultiJudgeAgentValidatorConfig {
-                            judges: judges.clone(),
-                            consensus_config,
-                            min_judges_required: *min_judges_required,
-                            criteria: criteria.clone(),
-                            timeout_seconds: *timeout_seconds,
-                            poll_interval_ms: 500,
-                            parent_execution_id,
-                            tenant_id: tenant_id.clone(),
-                        },
-                        agent_lifecycle_service.clone(),
-                        execution_service.clone(),
-                        event_bus.clone(),
-                    )),
+                    validator: Box::new(
+                        MultiJudgeAgentValidator::new(
+                            MultiJudgeAgentValidatorConfig {
+                                judges: judges.clone(),
+                                consensus_config,
+                                min_judges_required: *min_judges_required,
+                                criteria: criteria.clone(),
+                                timeout_seconds: *timeout_seconds,
+                                poll_interval_ms: 500,
+                                parent_execution_id,
+                                tenant_id: tenant_id.clone(),
+                            },
+                            agent_lifecycle_service.clone(),
+                            execution_service.clone(),
+                            event_bus.clone(),
+                        )
+                        .with_judge_context(judge_context.clone()),
+                    ),
                     min_score: *min_score,
                     min_confidence: *min_confidence,
                 });
