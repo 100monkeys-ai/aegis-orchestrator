@@ -12,12 +12,16 @@
 //! one evaluation only, against two racing deciders; a continuation is
 //! granted once; `goal_id` is written on an execution's and a workflow
 //! execution's rows and listed oldest first, and the executions' own upserts
-//! leave it in place; the sweep finds only goals open past the cutoff; and
-//! migration 039 run again changes nothing.
+//! leave it in place; the sweep finds only goals open past the cutoff;
+//! migration 039 run again changes nothing; and migration 040 (U16, U17),
+//! applied to a database holding goals and evaluations from before it,
+//! leaves them reading as they did, stores the `stopped` state and a stop
+//! reason, decides a stopped round once, and run again changes nothing.
 
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::goal::{
     BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome, GoalRepository, GoalState,
+    StopReason,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_goal::PostgresGoalRepository;
@@ -75,6 +79,35 @@ impl TestDb {
         Some(Self { server, name, pool })
     }
 
+    /// A database holding every migration before `version` and none after,
+    /// as production stood before that migration was deployed.
+    async fn create_before(version: i64) -> Option<Self> {
+        let url = postgres_url()?;
+        let server = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to the test PostgreSQL");
+        let name = format!("aegis_goals_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&server)
+            .await
+            .expect("create the test database");
+        let options: PgConnectOptions = url.parse::<PgConnectOptions>().unwrap().database(&name);
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("connect to the test database");
+        for migration in MIGRATOR.iter().filter(|m| m.version < version) {
+            sqlx::raw_sql(&migration.sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("migration {}: {e}", migration.version));
+        }
+        Some(Self { server, name, pool })
+    }
+
     async fn remove(self) {
         self.pool.close().await;
         sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", self.name))
@@ -121,6 +154,8 @@ fn evaluation(goal_id: GoalId, round: u32, attempt: u32) -> GoalEvaluation {
         answer: None,
         created_at: now(),
         decided_at: None,
+        stop_reason: None,
+        input_digest: Some("d".repeat(64)),
     }
 }
 
@@ -387,6 +422,153 @@ async fn migration_039_run_again_changes_nothing() {
         .execute(&db.pool)
         .await
         .expect("migration 039 run again");
+    assert_eq!(snapshot().await, before);
+    db.remove().await;
+}
+
+/// Migration 040 applied to a database holding a goal and an evaluation
+/// written before it: both read as they did, with no stop reason and no
+/// digest, and the evaluation's answer, cut to 8,192 characters before
+/// U14, stays as stored.
+#[tokio::test]
+async fn migration_040_over_rows_from_before_it_leaves_them_reading_as_they_did() {
+    let Some(db) = TestDb::create_before(40).await else {
+        return;
+    };
+    let goal_id = Uuid::new_v4();
+    let evaluation_id = Uuid::new_v4();
+    let cut = "a".repeat(8_192);
+    sqlx::query(
+        "INSERT INTO goals (id, tenant_id, user_sub, statement, client_ref, channel, state, \
+         rounds, created_at, closed_at) VALUES ($1, $2, 'owner-sub', 'the request', \
+         'conversation-1', 'web', 'exhausted', 3, NOW(), NOW())",
+    )
+    .bind(goal_id)
+    .bind(TENANT)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO goal_evaluations (id, goal_id, round, attempt, judge_execution_id, \
+         companion_answer, verdict, outcome, continue, waiting_on, answer, created_at, \
+         decided_at) VALUES ($1, $2, 3, 1, $3, $4, '{\"score\": 0.5}', 'not_met', false, \
+         NULL, '{\"state\": \"exhausted\"}', NOW(), NOW())",
+    )
+    .bind(evaluation_id)
+    .bind(goal_id)
+    .bind(Uuid::new_v4())
+    .bind(&cut)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 40)
+        .expect("migration 040 ships");
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 040 over the old rows");
+
+    let repo = PostgresGoalRepository::new(db.pool.clone());
+    let goal = repo.find_goal(GoalId(goal_id)).await.unwrap().unwrap();
+    assert_eq!((goal.state, goal.rounds), (GoalState::Exhausted, 3));
+    let evaluations = repo.list_evaluations(GoalId(goal_id)).await.unwrap();
+    assert_eq!(evaluations.len(), 1);
+    let old = &evaluations[0];
+    assert_eq!(old.companion_answer, cut, "the cut answer stays as stored");
+    assert_eq!(old.outcome, Some(GoalOutcome::NotMet));
+    assert_eq!(old.stop_reason, None);
+    assert_eq!(old.input_digest, None);
+    assert!(old.decides_round());
+    assert!(!old.is_fault());
+    assert_eq!(old.answer, Some(json!({"state": "exhausted"})));
+    db.remove().await;
+}
+
+/// U16, U17: a goal stops, its stopping evaluation keeps its reason and
+/// digest, and a stopped round is decided once.
+#[tokio::test]
+async fn a_stopped_goal_and_its_stop_reason_round_trip_and_stop_a_round_once() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = PostgresGoalRepository::new(db.pool.clone());
+    let g = goal("conversation-1");
+    repo.insert_goal(&g).await.unwrap();
+
+    let stopping = |reason| {
+        let mut e = evaluation(g.id, 0, 1);
+        e.judge_execution_id = None;
+        e.verdict = Some(json!({"score": null, "reasoning": "Round 0 brought nothing new."}));
+        e.answer = Some(json!({"state": "stopped", "continue": false}));
+        e.decided_at = Some(now());
+        e.stop_reason = Some(reason);
+        e
+    };
+    let first = stopping(StopReason::RepeatedRound);
+    repo.insert_evaluation(&first).await.unwrap();
+    assert!(
+        repo.insert_evaluation(&stopping(StopReason::TooLarge))
+            .await
+            .is_err(),
+        "a second stop of round 0 is refused"
+    );
+    assert_eq!(repo.list_evaluations(g.id).await.unwrap(), vec![first]);
+    assert!(repo
+        .close_goal(g.id, GoalState::Stopped, now())
+        .await
+        .unwrap());
+    assert_eq!(
+        repo.find_goal(g.id).await.unwrap().unwrap().state,
+        GoalState::Stopped
+    );
+    db.remove().await;
+}
+
+/// Migration 040 applied again over a migrated schema, with rows in it,
+/// changes nothing.
+#[tokio::test]
+async fn migration_040_run_again_changes_nothing() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = PostgresGoalRepository::new(db.pool.clone());
+    let g = goal("conversation-1");
+    repo.insert_goal(&g).await.unwrap();
+    repo.insert_evaluation(&evaluation(g.id, 0, 1))
+        .await
+        .unwrap();
+    let snapshot = || async {
+        sqlx::query(
+            "SELECT (SELECT count(*) FROM goals) AS goals, \
+                    (SELECT count(*) FROM goal_evaluations) AS evaluations, \
+                    (SELECT count(*) FROM pg_indexes WHERE tablename = 'goal_evaluations') AS indexes, \
+                    (SELECT count(*) FROM pg_constraint WHERE conrelid IN \
+                        ('goals'::regclass, 'goal_evaluations'::regclass)) AS constraints",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map(|row| {
+            (
+                row.get::<i64, _>("goals"),
+                row.get::<i64, _>("evaluations"),
+                row.get::<i64, _>("indexes"),
+                row.get::<i64, _>("constraints"),
+            )
+        })
+        .unwrap()
+    };
+    let before = snapshot().await;
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 40)
+        .expect("migration 040 ships");
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 040 run again");
     assert_eq!(snapshot().await, before);
     db.remove().await;
 }

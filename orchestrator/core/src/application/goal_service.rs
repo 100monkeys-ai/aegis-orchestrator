@@ -35,8 +35,9 @@ use uuid::Uuid;
 use crate::domain::events::GoalEvent;
 use crate::domain::execution::ExecutionId;
 use crate::domain::goal::{
-    outcome_of, truncate_chars, BoundExecution, BoundKind, Goal, GoalChannel, GoalEvaluation,
-    GoalId, GoalOutcome, GoalRepository, GoalState, FAULT_OUTPUT_SHOWN_CHARS, MAX_STATEMENT_CHARS,
+    judge_input_digest, outcome_of, truncate_chars, BoundExecution, BoundKind, Goal, GoalChannel,
+    GoalEvaluation, GoalId, GoalOutcome, GoalRepository, GoalState, StopReason,
+    FAULT_OUTPUT_SHOWN_CHARS, MAX_STATEMENT_CHARS,
 };
 use crate::domain::node_config::GoalsConfig;
 use crate::domain::repository::RepositoryError;
@@ -355,16 +356,21 @@ impl GoalService {
     ) -> Result<Value, GoalError> {
         let round = goal.rounds;
         let deadline = tokio::time::Instant::now() + self.wait_bound;
-        let mut current = match evaluations.iter().rev().find(|e| e.round == round) {
-            Some(e) if e.is_running() => e.clone(),
+        let attempt = match evaluations.iter().rev().find(|e| e.round == round) {
+            Some(e) if e.is_running() => Attempt::Started(e.clone()),
             Some(e) if e.is_fault() && e.attempt == 1 => {
-                self.start_attempt(world, &goal, 2, &e.companion_answer)
+                let answer = e.companion_answer.clone();
+                self.start_attempt(world, &goal, 2, &answer, &evaluations)
                     .await?
             }
             _ => {
-                self.start_attempt(world, &goal, 1, companion_answer)
+                self.start_attempt(world, &goal, 1, companion_answer, &evaluations)
                     .await?
             }
+        };
+        let mut current = match attempt {
+            Attempt::Started(evaluation) => evaluation,
+            Attempt::Stopped(answer) => return Ok(answer),
         };
         loop {
             let judge = current
@@ -409,18 +415,49 @@ impl GoalService {
             current.decided_at = Some((self.clock)());
             self.repo.finish_evaluation(&current).await?;
             let answer = current.companion_answer.clone();
-            current = self.start_attempt(world, &goal, 2, &answer).await?;
+            current = match self
+                .start_attempt(world, &goal, 2, &answer, &evaluations)
+                .await?
+            {
+                Attempt::Started(evaluation) => evaluation,
+                Attempt::Stopped(answer) => return Ok(answer),
+            };
         }
     }
 
+    /// Start `goal-judge` on the round, or stop the goal with a stated
+    /// reason when the round's input repeats the last decided round's (U17).
     async fn start_attempt(
         &self,
         world: &dyn GoalWorld,
         goal: &Goal,
         attempt: u32,
         companion_answer: &str,
-    ) -> Result<GoalEvaluation, GoalError> {
+        evaluations: &[GoalEvaluation],
+    ) -> Result<Attempt, GoalError> {
         let input = self.judge_input(world, goal, companion_answer).await?;
+        let digest = judge_input_digest(&input);
+        if attempt == 1 && repeats_the_last_round(goal, evaluations, &digest) {
+            let previous = goal.rounds.saturating_sub(1);
+            let reasoning = format!(
+                "Round {} brought nothing new: the same executions, the same outputs and the \
+                 same answer as round {previous}, so it was not judged again and the goal \
+                 stopped.",
+                goal.rounds
+            );
+            return self
+                .stop_round(
+                    world,
+                    goal,
+                    companion_answer,
+                    digest,
+                    StopReason::RepeatedRound,
+                    reasoning,
+                    json!({}),
+                )
+                .await
+                .map(Attempt::Stopped);
+        }
         let judge = world
             .start_judge(goal, input)
             .await
@@ -439,6 +476,8 @@ impl GoalService {
             answer: None,
             created_at: (self.clock)(),
             decided_at: None,
+            stop_reason: None,
+            input_digest: Some(digest),
         };
         self.repo.insert_evaluation(&evaluation).await?;
         tracing::info!(
@@ -448,7 +487,79 @@ impl GoalService {
             judge_execution_id = %judge,
             "goal-judge started"
         );
-        Ok(evaluation)
+        Ok(Attempt::Started(evaluation))
+    }
+
+    /// Decide the round with no judge run and close the goal `stopped`
+    /// (U16, U17): the answer carries `stopped` with the reason and its
+    /// sizes, `outcome` null, `continue: false`, and `verdict.reasoning` the
+    /// plain sentence a person reads.
+    #[allow(clippy::too_many_arguments)]
+    async fn stop_round(
+        &self,
+        world: &dyn GoalWorld,
+        goal: &Goal,
+        companion_answer: &str,
+        digest: String,
+        reason: StopReason,
+        reasoning: String,
+        mut stopped: Value,
+    ) -> Result<Value, GoalError> {
+        stopped["reason"] = json!(reason.as_str());
+        let verdict = json!({
+            "score": Value::Null,
+            "confidence": Value::Null,
+            "reasoning": reasoning,
+            "signals": [],
+        });
+        let answer = json!({
+            "goal_id": goal.id.to_string(),
+            "state": GoalState::Stopped.as_str(),
+            "round": goal.rounds,
+            "rounds_left": self.config.max_continuations.saturating_sub(goal.rounds),
+            "verdict": verdict,
+            "outcome": Value::Null,
+            "continue": false,
+            "stopped": stopped,
+            "executions": self.execution_summaries(world, goal).await?,
+        });
+        let now = (self.clock)();
+        let evaluation = GoalEvaluation {
+            id: Uuid::new_v4(),
+            goal_id: goal.id,
+            round: goal.rounds,
+            attempt: 1,
+            judge_execution_id: None,
+            companion_answer: companion_answer.to_string(),
+            verdict: Some(verdict),
+            outcome: None,
+            r#continue: false,
+            waiting_on: None,
+            answer: Some(answer.clone()),
+            created_at: now,
+            decided_at: Some(now),
+            stop_reason: Some(reason),
+            input_digest: Some(digest),
+        };
+        if let Err(e) = self.repo.insert_evaluation(&evaluation).await {
+            // Another call decided this round first: its answer stands.
+            let stored = self
+                .repo
+                .list_evaluations(goal.id)
+                .await?
+                .into_iter()
+                .find(|e| e.round == goal.rounds && e.decides_round())
+                .and_then(|e| e.answer);
+            return stored.ok_or(GoalError::Repository(e));
+        }
+        tracing::warn!(
+            goal_id = %goal.id,
+            round = goal.rounds,
+            reason = reason.as_str(),
+            "Goal stopped: its round was not judged"
+        );
+        self.close(goal, GoalState::Stopped, now).await?;
+        Ok(answer)
     }
 
     /// D4: the goal verbatim, every bound execution oldest first as the
@@ -744,6 +855,8 @@ impl GoalService {
                         .unwrap_or(Value::Null),
                     "continue": e.r#continue,
                     "waiting_on": e.waiting_on,
+                    // U16, U17: why the round was not judged, when it was not.
+                    "stop_reason": e.stop_reason.map(|r| r.as_str()),
                     // When this attempt's goal-judge execution was started,
                     // and when its outcome was stored (null while judging).
                     "judge_started_at": e.created_at,
@@ -841,6 +954,29 @@ impl GoalService {
             evaluated_at: (self.clock)(),
         });
     }
+}
+
+/// What starting a round's judgment came to.
+enum Attempt {
+    /// `goal-judge` runs; this is its evaluation.
+    Started(GoalEvaluation),
+    /// The round was not judged and the goal stopped; this is the answer.
+    Stopped(Value),
+}
+
+/// U17: the round's judge input equals the input the last decided round was
+/// judged on. An evaluation stored before migration 040 has no digest and
+/// never matches, so its goal is judged as before.
+fn repeats_the_last_round(goal: &Goal, evaluations: &[GoalEvaluation], digest: &str) -> bool {
+    let Some(previous) = goal.rounds.checked_sub(1) else {
+        return false;
+    };
+    evaluations.iter().any(|e| {
+        e.round == previous
+            && e.decides_round()
+            && e.stop_reason.is_none()
+            && e.input_digest.as_deref() == Some(digest)
+    })
 }
 
 /// The executions bound directly to the goal, whose own pending approvals
@@ -1000,6 +1136,12 @@ mod tests {
         }
     }
 
+    /// A companion answer that differs from round to round, as a round that
+    /// did something new answers (U17 stops a round that repeats the last).
+    fn answer_of_round(round: Option<u32>) -> String {
+        format!("Dispatching it now (round {}).", round.unwrap_or(0))
+    }
+
     struct Harness {
         service: GoalService,
         repo: Arc<InMemoryGoalRepository>,
@@ -1057,7 +1199,7 @@ mod tests {
 
         async fn evaluate(&self, world: &World, goal: &Goal, round: Option<u32>) -> Value {
             self.service
-                .evaluate(world, &self.caller, goal.id, "Dispatching it now.", round)
+                .evaluate(world, &self.caller, goal.id, &answer_of_round(round), round)
                 .await
                 .unwrap()
         }
@@ -1457,6 +1599,8 @@ mod tests {
             answer: Some(stored_answer.clone()),
             created_at: h.now(),
             decided_at: Some(h.now()),
+            stop_reason: None,
+            input_digest: None,
         };
         h.repo.insert_evaluation(&old).await.unwrap();
         let world = World::scripted(vec![]);
@@ -1548,5 +1692,118 @@ mod tests {
         let again = h.service.status(&world, &h.caller, goal.id).await.unwrap();
         assert_eq!(status, again);
         assert_eq!(world.judges_started(), 1);
+    }
+
+    // ── U17: a round that repeats the last one stops the goal ─────────────
+
+    /// AEGIS ADR-131 U17: a round whose judge input (the executions, their
+    /// states and outputs, and the answer) equals the last decided round's
+    /// is not judged again: the goal closes `stopped`, the answer says why in
+    /// plain words, and no round is spent.
+    #[tokio::test]
+    async fn a_round_that_repeats_the_last_one_stops_the_goal_and_says_why_with_no_judge() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![says(0.0, 1.0, 0.9), says(0.0, 1.0, 0.9)]);
+        let same = "Here is the full report again.";
+        let first = h
+            .service
+            .evaluate(&world, &h.caller, goal.id, same, None)
+            .await
+            .unwrap();
+        assert_eq!(first["continue"], true);
+        let second = h
+            .service
+            .evaluate(&world, &h.caller, goal.id, same, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            world.judges_started(),
+            1,
+            "the repeated round is not judged"
+        );
+        assert_eq!(second["state"], "stopped");
+        assert_eq!(second["continue"], false);
+        assert_eq!(second["outcome"], Value::Null);
+        assert_eq!(second["stopped"]["reason"], "repeated_round");
+        let reasoning = second["verdict"]["reasoning"].as_str().unwrap();
+        assert_eq!(
+            reasoning,
+            "Round 1 brought nothing new: the same executions, the same outputs and the same \
+             answer as round 0, so it was not judged again and the goal stopped."
+        );
+        assert_eq!(h.stored(&goal).await.state.as_str(), "stopped");
+        assert_eq!(h.stored(&goal).await.rounds, 1, "no round is spent");
+
+        let again = h
+            .service
+            .evaluate(&world, &h.caller, goal.id, same, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(again, second, "the stopped round answers the same");
+        assert_eq!(world.judges_started(), 1);
+
+        let status = h.service.status(&world, &h.caller, goal.id).await.unwrap();
+        assert_eq!(status["state"], "stopped");
+        let verdicts = status["verdicts"].as_array().unwrap();
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[1]["stop_reason"], "repeated_round");
+        assert_eq!(verdicts[1]["reasoning"], reasoning);
+    }
+
+    /// A round with a new answer, or whose executions changed, is judged.
+    #[tokio::test]
+    async fn a_round_with_something_new_is_judged() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![
+            says(0.0, 1.0, 0.9),
+            says(0.0, 1.0, 0.9),
+            says(0.9, 0.9, 0.9),
+        ]);
+        h.evaluate(&world, &goal, None).await;
+        let answer = h.evaluate(&world, &goal, Some(1)).await;
+        assert_eq!(answer["state"], "open", "a new answer is judged");
+        assert_eq!(world.judges_started(), 2);
+        // The same answer as round 1, but an execution's output changed.
+        *world.output.lock().unwrap() = Some("a new result".to_string());
+        let answer = h
+            .service
+            .evaluate(
+                &world,
+                &h.caller,
+                goal.id,
+                &answer_of_round(Some(1)),
+                Some(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer["outcome"], "met");
+        assert_eq!(world.judges_started(), 3);
+    }
+
+    /// An evaluation stored before migration 040 has no input digest: the
+    /// next round is judged as before, whatever its input.
+    #[tokio::test]
+    async fn a_round_after_an_evaluation_stored_before_040_is_judged() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![says(0.0, 1.0, 0.9), says(0.0, 1.0, 0.9)]);
+        let same = "Here is the full report again.";
+        h.service
+            .evaluate(&world, &h.caller, goal.id, same, None)
+            .await
+            .unwrap();
+        // As a row written before 040 reads: no digest.
+        let mut old = h.repo.list_evaluations(goal.id).await.unwrap().remove(0);
+        old.input_digest = None;
+        h.repo.finish_evaluation(&old).await.unwrap();
+        let answer = h
+            .service
+            .evaluate(&world, &h.caller, goal.id, same, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(answer["state"], "open");
+        assert_eq!(world.judges_started(), 2);
     }
 }

@@ -3,7 +3,9 @@
 //! # Goal repositories (AEGIS ADR-131 D1, Update U1)
 //!
 //! [`PostgresGoalRepository`] stores goals and their evaluations in the
-//! `goals` and `goal_evaluations` tables of migration `039_goals.sql`, and
+//! `goals` and `goal_evaluations` tables of migration `039_goals.sql`, with
+//! the `stopped` state and the `stop_reason` and `input_digest` columns of
+//! `040_goal_stopped.sql` (U16, U17), and
 //! binds an execution to its goal by the `goal_id` column that migration adds
 //! to `executions` and `workflow_executions`. [`InMemoryGoalRepository`]
 //! keeps them in process, for tests and for a daemon run without a database.
@@ -20,7 +22,7 @@ use uuid::Uuid;
 use crate::domain::execution::ExecutionId;
 use crate::domain::goal::{
     BoundExecution, BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome,
-    GoalRepository, GoalState,
+    GoalRepository, GoalState, StopReason,
 };
 use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
@@ -29,10 +31,12 @@ const GOAL_COLUMNS: &str =
     "id, tenant_id, user_sub, statement, client_ref, channel, state, rounds, created_at, closed_at";
 
 const EVALUATION_COLUMNS: &str = "id, goal_id, round, attempt, judge_execution_id, \
-     companion_answer, verdict, outcome, continue, waiting_on, answer, created_at, decided_at";
+     companion_answer, verdict, outcome, continue, waiting_on, answer, created_at, decided_at, \
+     stop_reason, input_digest";
 
 /// The SQLSTATE of a unique violation: a second evaluation deciding a round
-/// already decided (`uq_goal_evaluations_decided_round`).
+/// already decided (`uq_goal_evaluations_decided_round`, or
+/// `uq_goal_evaluations_stopped_round` for a stopping one).
 const UNIQUE_VIOLATION: &str = "23505";
 
 pub struct PostgresGoalRepository {
@@ -82,6 +86,7 @@ fn hydrate_goal(row: &PgRow) -> Result<Goal, RepositoryError> {
 fn hydrate_evaluation(row: &PgRow) -> Result<GoalEvaluation, RepositoryError> {
     let outcome: Option<String> = column(row, "outcome")?;
     let judge: Option<Uuid> = column(row, "judge_execution_id")?;
+    let stop_reason: Option<String> = column(row, "stop_reason")?;
     Ok(GoalEvaluation {
         id: column(row, "id")?,
         goal_id: GoalId(column(row, "goal_id")?),
@@ -101,6 +106,14 @@ fn hydrate_evaluation(row: &PgRow) -> Result<GoalEvaluation, RepositoryError> {
         answer: column(row, "answer")?,
         created_at: column(row, "created_at")?,
         decided_at: column(row, "decided_at")?,
+        stop_reason: stop_reason
+            .map(|r| {
+                StopReason::parse(&r).ok_or_else(|| {
+                    RepositoryError::Serialization(format!("unknown stop reason: {r}"))
+                })
+            })
+            .transpose()?,
+        input_digest: column(row, "input_digest")?,
     })
 }
 
@@ -234,7 +247,7 @@ impl GoalRepository for PostgresGoalRepository {
     async fn insert_evaluation(&self, evaluation: &GoalEvaluation) -> Result<(), RepositoryError> {
         sqlx::query(&format!(
             "INSERT INTO goal_evaluations ({EVALUATION_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
         ))
         .bind(evaluation.id)
         .bind(evaluation.goal_id.0)
@@ -249,6 +262,8 @@ impl GoalRepository for PostgresGoalRepository {
         .bind(&evaluation.answer)
         .bind(evaluation.created_at)
         .bind(evaluation.decided_at)
+        .bind(evaluation.stop_reason.map(|r| r.as_str()))
+        .bind(&evaluation.input_digest)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -260,7 +275,8 @@ impl GoalRepository for PostgresGoalRepository {
     ) -> Result<bool, RepositoryError> {
         let result = sqlx::query(
             "UPDATE goal_evaluations SET verdict = $2, outcome = $3, continue = $4, \
-             waiting_on = $5, answer = $6, decided_at = $7 WHERE id = $1",
+             waiting_on = $5, answer = $6, decided_at = $7, stop_reason = $8, \
+             input_digest = $9 WHERE id = $1",
         )
         .bind(evaluation.id)
         .bind(&evaluation.verdict)
@@ -269,6 +285,8 @@ impl GoalRepository for PostgresGoalRepository {
         .bind(&evaluation.waiting_on)
         .bind(&evaluation.answer)
         .bind(evaluation.decided_at)
+        .bind(evaluation.stop_reason.map(|r| r.as_str()))
+        .bind(&evaluation.input_digest)
         .execute(&self.pool)
         .await;
         match result {

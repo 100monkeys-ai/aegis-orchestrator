@@ -72,6 +72,10 @@ pub enum GoalState {
     Exhausted,
     Expired,
     Superseded,
+    /// A round was not judged, and the goal stopped with a stated reason:
+    /// its judge input was larger than the judge's model holds (U16), or the
+    /// round repeated the round before it (U17).
+    Stopped,
 }
 
 impl GoalState {
@@ -83,6 +87,7 @@ impl GoalState {
             Self::Exhausted => "exhausted",
             Self::Expired => "expired",
             Self::Superseded => "superseded",
+            Self::Stopped => "stopped",
         }
     }
 
@@ -94,6 +99,7 @@ impl GoalState {
             "exhausted" => Some(Self::Exhausted),
             "expired" => Some(Self::Expired),
             "superseded" => Some(Self::Superseded),
+            "stopped" => Some(Self::Stopped),
             _ => None,
         }
     }
@@ -150,6 +156,48 @@ impl GoalOutcome {
             _ => None,
         }
     }
+}
+
+/// Why a round was not judged and its goal stopped (U16, U17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The judge's prompt is larger than its model's context holds (U16).
+    TooLarge,
+    /// The round's judge input equals the last decided round's (U17).
+    RepeatedRound,
+}
+
+impl StopReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TooLarge => "too_large",
+            Self::RepeatedRound => "repeated_round",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "too_large" => Some(Self::TooLarge),
+            "repeated_round" => Some(Self::RepeatedRound),
+            _ => None,
+        }
+    }
+}
+
+/// The SHA-256, in hex, of a judge input without `round` and `rounds_left`
+/// (U17): two rounds with the same executions, in the same states, with the
+/// same outputs and the same answer have the same digest. serde_json's map
+/// keeps its keys sorted, so the serialisation is canonical.
+pub fn judge_input_digest(input: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut input = input.clone();
+    if let Value::Object(map) = &mut input {
+        map.remove("round");
+        map.remove("rounds_left");
+    }
+    let bytes = serde_json::to_vec(&input).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
 }
 
 /// D5: met at `score ≥ met_min_score` and `confidence ≥ met_min_confidence`;
@@ -256,6 +304,12 @@ pub struct GoalEvaluation {
     pub answer: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub decided_at: Option<DateTime<Utc>>,
+    /// Why the round was not judged and the goal stopped; no judge ran for
+    /// an evaluation that carries it (U16, U17).
+    pub stop_reason: Option<StopReason>,
+    /// [`judge_input_digest`] of the input this evaluation's round was
+    /// judged on; none on an evaluation stored before migration 040 (U17).
+    pub input_digest: Option<String>,
 }
 
 impl GoalEvaluation {
@@ -264,14 +318,17 @@ impl GoalEvaluation {
         self.decided_at.is_none()
     }
 
-    /// This evaluation decided its round.
+    /// This evaluation decided its round: by an outcome with no
+    /// `waiting_on`, or by stopping the goal (U17).
     pub fn decides_round(&self) -> bool {
-        self.decided_at.is_some() && self.outcome.is_some() && self.waiting_on.is_none()
+        self.decided_at.is_some()
+            && self.waiting_on.is_none()
+            && (self.outcome.is_some() || self.stop_reason.is_some())
     }
 
     /// The judge's verdict could not be read (ADR-017's Update of 2026-10-01).
     pub fn is_fault(&self) -> bool {
-        self.decided_at.is_some() && self.outcome.is_none()
+        self.decided_at.is_some() && self.outcome.is_none() && self.stop_reason.is_none()
     }
 }
 
