@@ -646,6 +646,25 @@ mod tests {
             prompt_bytes < aegis_orchestrator_core::domain::goal::JUDGE_PROMPT_RESERVE_BYTES,
             "U16's reserve holds goal-judge's instruction and template ({prompt_bytes} bytes)"
         );
+        // U14, U16: the prompt says in true words what the judge is given.
+        let instruction = doc["spec"]["task"]["instruction"].as_str().unwrap();
+        for words in [
+            "last_output is the execution's output whole, as it produced it",
+            "companion_answer: the text the user was shown at the end of the turn just ended, \
+             whole, as the user received it",
+            "Nothing you are given has been shortened, summarised or sampled",
+            "An input too large for you is never sent to you: the system stops the round itself \
+             and no judge runs.",
+        ] {
+            assert!(
+                instruction
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(words),
+                "goal-judge's instruction says: {words}"
+            );
+        }
         assert_eq!(
             doc["spec"]["execution"]["llm_timeout_seconds"].as_u64(),
             Some(300)

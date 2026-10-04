@@ -26,9 +26,15 @@ spec:
       - executions: every execution started for the goal, oldest first, as the orchestrator
         recorded it: execution_id, kind (agent, workflow or intent), agent_or_workflow, status,
         started_at, ended_at, iterations, last_output, last_error, and approval_pending (the ids
-        of tool calls waiting for the user's approval).
-      - companion_answer: the text the user was shown at the end of the turn just ended.
+        of tool calls waiting for the user's approval). last_output is the execution's output
+        whole, as it produced it.
+      - companion_answer: the text the user was shown at the end of the turn just ended, whole,
+        as the user received it.
       - round and rounds_left: how many continuations were granted and how many remain.
+
+      Nothing you are given has been shortened, summarised or sampled by the system. A text that
+      ends abruptly ended that way when it was written; judge it as written. An input too large
+      for you is never sent to you: the system stops the round itself and no judge runs.
 
       The executions are the orchestrator's own records and are the source of truth for what
       ran. The companion_answer is the only evidence of what reached the user. Never take the
@@ -138,10 +144,10 @@ spec:
         description: The user's request, verbatim
       executions:
         type: array
-        description: Every execution bound to the goal, oldest first, from the orchestrator's records
+        description: Every execution bound to the goal, oldest first, from the orchestrator's records, each output whole
       companion_answer:
         type: string
-        description: The text the user was shown in the turn just ended
+        description: The text the user was shown in the turn just ended, whole
       round:
         type: integer
         description: The continuations granted so far
