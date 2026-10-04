@@ -153,6 +153,251 @@ pub enum SealSessionError {
     /// ended (AEGIS ADR-129 D19): a call arriving after the end is refused.
     /// Displayed as the record's error code, `operator_escalation_expired`.
     OperatorEscalationExpired,
+    /// A refusal whose answer to the caller of `POST /v1/seal/invoke` was
+    /// decided where it was built (AEGIS ADR-035, Update of 2026-10-04, R5).
+    /// `shown` is the error as the inner loop and the operator's log have
+    /// always seen it: its text and its class are unchanged. `answer` is what
+    /// the route tells the caller, built only from the caller's own inputs.
+    Answered {
+        answer: CallerAnswer,
+        shown: Box<SealSessionError>,
+    },
+}
+
+/// What the tool invoke route tells its caller for a refusal built as
+/// [`SealSessionError::Answered`] (AEGIS ADR-035, Update of 2026-10-04, R4).
+/// Each caller-facing message holds only the caller's own business: what they
+/// sent, named as they named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallerAnswer {
+    /// The caller's arguments are invalid (422 `INVALID_ARGUMENTS`).
+    InvalidArguments(String),
+    /// A resource of the caller's was not found (404 `NOT_FOUND`).
+    NotFound(String),
+    /// The call conflicts with the caller's own state (409 `CONFLICT`).
+    Conflict(String),
+    /// The caller reached a quota or tier limit of their own (422 `QUOTA_EXCEEDED`).
+    QuotaExceeded(String),
+    /// The semantic judge rejected the caller's call (403 `JUDGE_REJECTED`).
+    JudgeRejected(String),
+    /// The caller's filesystem policy does not permit the path they named
+    /// (403 `PATH_NOT_ALLOWED`).
+    PathNotAllowed(String),
+    /// The caller named a resource of another tenant (403 `TENANT_MISMATCH`).
+    TenantMismatch(String),
+    /// The operation the caller asked for is not built yet (501 `NOT_IMPLEMENTED`).
+    NotImplemented(String),
+    /// The caller's own edge did not answer (503 `EDGE_UNAVAILABLE`).
+    EdgeUnavailable(String),
+    /// An internal failure: the caller is told only its class.
+    Internal(InternalFailure),
+}
+
+/// The class of an internal failure, which alone reaches the caller
+/// (AEGIS ADR-035, Update of 2026-10-04, R3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InternalFailure {
+    /// 500 `INTERNAL_ERROR`: a database, repository or platform-state failure.
+    Server,
+    /// 502 `UPSTREAM_UNAVAILABLE`: a service the tool depends on did not answer.
+    Upstream,
+    /// 503 `SERVICE_UNAVAILABLE`: the tool is not configured or not available on this node.
+    Unavailable,
+}
+
+/// The rate limit a 429 answer carries in its headers (AEGIS ADR-072 §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitHint {
+    pub limit: u64,
+    pub remaining: u64,
+    pub retry_after_seconds: u64,
+}
+
+/// The answer of `POST /v1/seal/invoke` to one refusal (AEGIS ADR-035,
+/// Update of 2026-10-04, R1 to R4): the status, the stable machine code,
+/// ADR-035's `status` member and the message. An internal failure's message
+/// is the fixed sentence of its class; its detail goes only to the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealRefusal {
+    /// HTTP status code.
+    pub http_status: u16,
+    /// `error.code`: the stable machine code.
+    pub code: &'static str,
+    /// The body's `status` member: `policy_violation` or `error`.
+    pub status: &'static str,
+    /// `error.message`.
+    pub message: String,
+    /// True when the refusal is an internal failure (5xx, detail logged at error level).
+    pub internal: bool,
+    /// The rate limit, on a 429.
+    pub rate_limit: Option<RateLimitHint>,
+}
+
+/// The fixed message of an internal failure of each class (R3).
+pub const INTERNAL_ERROR_MESSAGE: &str =
+    "The request could not be completed because of an internal error.";
+/// The fixed message of an upstream failure (R3).
+pub const UPSTREAM_UNAVAILABLE_MESSAGE: &str =
+    "A service this tool depends on did not answer. Try again in a moment.";
+/// The fixed message of a tool not available on this node (R3).
+pub const SERVICE_UNAVAILABLE_MESSAGE: &str = "This tool is not available right now.";
+
+impl SealRefusal {
+    fn caller(http_status: u16, code: &'static str, message: String) -> Self {
+        Self {
+            http_status,
+            code,
+            status: "error",
+            message,
+            internal: false,
+            rate_limit: None,
+        }
+    }
+
+    fn policy(http_status: u16, code: &'static str, message: String) -> Self {
+        Self {
+            status: "policy_violation",
+            ..Self::caller(http_status, code, message)
+        }
+    }
+
+    fn internal(class: InternalFailure) -> Self {
+        let (http_status, code, message) = match class {
+            InternalFailure::Server => (500, "INTERNAL_ERROR", INTERNAL_ERROR_MESSAGE),
+            InternalFailure::Upstream => {
+                (502, "UPSTREAM_UNAVAILABLE", UPSTREAM_UNAVAILABLE_MESSAGE)
+            }
+            InternalFailure::Unavailable => {
+                (503, "SERVICE_UNAVAILABLE", SERVICE_UNAVAILABLE_MESSAGE)
+            }
+        };
+        Self {
+            http_status,
+            code,
+            status: "error",
+            message: message.to_string(),
+            internal: true,
+            rate_limit: None,
+        }
+    }
+}
+
+impl SealSessionError {
+    /// Attach the answer the tool invoke route gives the caller, decided
+    /// where the error is built (R5). What the inner loop and the log see is
+    /// unchanged.
+    pub fn answered(self, answer: CallerAnswer) -> Self {
+        Self::Answered {
+            answer,
+            shown: Box::new(self),
+        }
+    }
+
+    /// The answer of `POST /v1/seal/invoke` to this refusal (AEGIS ADR-035,
+    /// Update of 2026-10-04, R4). One exhaustive match: a new variant does
+    /// not compile until it is classified. Never reads an error's text to
+    /// classify it.
+    pub fn refusal(&self) -> SealRefusal {
+        match self {
+            Self::SessionInactive(_) => SealRefusal::caller(
+                401,
+                "SESSION_INACTIVE",
+                "Your session is no longer active. Attest again to start a new one.".to_string(),
+            ),
+            Self::SessionExpired => SealRefusal::caller(
+                401,
+                "SESSION_EXPIRED",
+                "Your session has expired. Attest again to start a new one.".to_string(),
+            ),
+            Self::OperatorEscalationExpired => SealRefusal::caller(
+                401,
+                "OPERATOR_ESCALATION_EXPIRED",
+                "Your operator escalation has ended.".to_string(),
+            ),
+            Self::SignatureVerificationFailed(_) => SealRefusal::caller(
+                401,
+                "SIGNATURE_INVALID",
+                "The request's signature or security token did not verify. Attest again to start a new session."
+                    .to_string(),
+            ),
+            Self::ReplayProtectionFailed(_) => {
+                SealRefusal::caller(401, "ENVELOPE_REPLAYED", self.to_string())
+            }
+            Self::MalformedPayload(_) => {
+                SealRefusal::caller(400, "MALFORMED_ENVELOPE", self.to_string())
+            }
+            Self::PolicyViolation(violation) => {
+                let code = match violation {
+                    PolicyViolation::ToolNotAllowed { .. } => "TOOL_NOT_ALLOWED",
+                    PolicyViolation::ToolExplicitlyDenied { .. } => "TOOL_DENIED",
+                    PolicyViolation::RateLimitExceeded {
+                        limit,
+                        current,
+                        retry_after_seconds,
+                        ..
+                    } => {
+                        let mut refusal =
+                            SealRefusal::policy(429, "RATE_LIMIT_EXCEEDED", self.to_string());
+                        refusal.rate_limit = Some(RateLimitHint {
+                            limit: *limit,
+                            remaining: limit.saturating_sub(*current),
+                            retry_after_seconds: *retry_after_seconds,
+                        });
+                        return refusal;
+                    }
+                    PolicyViolation::PathOutsideBoundary { .. } => "PATH_NOT_ALLOWED",
+                    PolicyViolation::PathTraversalAttempt { .. } => "PATH_TRAVERSAL",
+                    PolicyViolation::DomainNotAllowed { .. } => "DOMAIN_NOT_ALLOWED",
+                    PolicyViolation::MissingRequiredArgument(_) => "POLICY_ARGUMENT_REQUIRED",
+                    PolicyViolation::CommandNotAllowed { .. } => "COMMAND_NOT_ALLOWED",
+                    PolicyViolation::SubcommandNotAllowed { .. } => "SUBCOMMAND_NOT_ALLOWED",
+                    PolicyViolation::TimeoutExceeded { .. }
+                    | PolicyViolation::ConcurrentExecLimitExceeded { .. }
+                    | PolicyViolation::OutputSizeLimitExceeded { .. }
+                    | PolicyViolation::ExecTimeoutCeilingExceeded { .. } => "LIMIT_EXCEEDED",
+                };
+                SealRefusal::policy(403, code, self.to_string())
+            }
+            Self::InvalidArguments(_) => {
+                SealRefusal::caller(422, "INVALID_ARGUMENTS", self.to_string())
+            }
+            Self::NotFound(_) => SealRefusal::caller(404, "NOT_FOUND", self.to_string()),
+            Self::TenantMismatch { .. } => {
+                SealRefusal::caller(403, "TENANT_MISMATCH", self.to_string())
+            }
+            Self::InternalError(_) | Self::JudgeTimeout(_) => {
+                SealRefusal::internal(InternalFailure::Server)
+            }
+            Self::ConfigurationError(_) => SealRefusal::internal(InternalFailure::Unavailable),
+            Self::UpstreamUnavailable(_) => SealRefusal::internal(InternalFailure::Upstream),
+            Self::Answered { answer, .. } => match answer {
+                CallerAnswer::InvalidArguments(m) => {
+                    SealRefusal::caller(422, "INVALID_ARGUMENTS", m.clone())
+                }
+                CallerAnswer::NotFound(m) => SealRefusal::caller(404, "NOT_FOUND", m.clone()),
+                CallerAnswer::Conflict(m) => SealRefusal::caller(409, "CONFLICT", m.clone()),
+                CallerAnswer::QuotaExceeded(m) => {
+                    SealRefusal::caller(422, "QUOTA_EXCEEDED", m.clone())
+                }
+                CallerAnswer::JudgeRejected(m) => {
+                    SealRefusal::policy(403, "JUDGE_REJECTED", m.clone())
+                }
+                CallerAnswer::PathNotAllowed(m) => {
+                    SealRefusal::policy(403, "PATH_NOT_ALLOWED", m.clone())
+                }
+                CallerAnswer::TenantMismatch(m) => {
+                    SealRefusal::caller(403, "TENANT_MISMATCH", m.clone())
+                }
+                CallerAnswer::NotImplemented(m) => {
+                    SealRefusal::caller(501, "NOT_IMPLEMENTED", m.clone())
+                }
+                CallerAnswer::EdgeUnavailable(m) => {
+                    SealRefusal::caller(503, "EDGE_UNAVAILABLE", m.clone())
+                }
+                CallerAnswer::Internal(class) => SealRefusal::internal(*class),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for SealSessionError {
@@ -182,6 +427,7 @@ impl std::fmt::Display for SealSessionError {
                 write!(f, "Upstream service unavailable: {msg}")
             }
             Self::OperatorEscalationExpired => write!(f, "operator_escalation_expired"),
+            Self::Answered { shown, .. } => shown.fmt(f),
         }
     }
 }
@@ -503,5 +749,325 @@ mod tests {
             refusal.to_string(),
             "Policy violation: tool 'aegis.system.info' is not allowed; permitted tools: [zaru.*]"
         );
+    }
+
+    /// AEGIS ADR-035, Update of 2026-10-04, R4: every refusal has one status,
+    /// one stable code and ADR-035's `status` member; an internal failure's
+    /// message is its class's fixed sentence and holds none of its detail.
+    #[test]
+    fn every_refusal_maps_to_its_status_code_and_message() {
+        let policy = |v: PolicyViolation| SealSessionError::PolicyViolation(v);
+        let cases: Vec<(SealSessionError, u16, &str, &str)> = vec![
+            (
+                SealSessionError::SessionInactive(SessionStatus::Revoked {
+                    reason: "Mk7-revocation-reason".into(),
+                }),
+                401,
+                "SESSION_INACTIVE",
+                "error",
+            ),
+            (
+                SealSessionError::SessionExpired,
+                401,
+                "SESSION_EXPIRED",
+                "error",
+            ),
+            (
+                SealSessionError::OperatorEscalationExpired,
+                401,
+                "OPERATOR_ESCALATION_EXPIRED",
+                "error",
+            ),
+            (
+                SealSessionError::SignatureVerificationFailed("Mk7-library-text".into()),
+                401,
+                "SIGNATURE_INVALID",
+                "error",
+            ),
+            (
+                SealSessionError::ReplayProtectionFailed(
+                    "envelope nonce already seen within freshness window".into(),
+                ),
+                401,
+                "ENVELOPE_REPLAYED",
+                "error",
+            ),
+            (
+                SealSessionError::MalformedPayload("missing tool name".into()),
+                400,
+                "MALFORMED_ENVELOPE",
+                "error",
+            ),
+            (
+                policy(PolicyViolation::ToolNotAllowed {
+                    tool_name: "aegis.system.info".into(),
+                    allowed_tools: vec!["zaru.*".into()],
+                }),
+                403,
+                "TOOL_NOT_ALLOWED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::ToolExplicitlyDenied {
+                    tool_name: "cmd.run".into(),
+                }),
+                403,
+                "TOOL_DENIED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::RateLimitExceeded {
+                    resource_type: "tool_call".into(),
+                    bucket: "per_minute".into(),
+                    limit: 60,
+                    current: 61,
+                    retry_after_seconds: 12,
+                }),
+                429,
+                "RATE_LIMIT_EXCEEDED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::PathOutsideBoundary {
+                    path: "/etc/passwd".into(),
+                    allowed_paths: vec!["/workspace".into()],
+                }),
+                403,
+                "PATH_NOT_ALLOWED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::PathTraversalAttempt {
+                    path: "../x".into(),
+                }),
+                403,
+                "PATH_TRAVERSAL",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::DomainNotAllowed {
+                    domain: "evil.example".into(),
+                    allowed_domains: vec![],
+                }),
+                403,
+                "DOMAIN_NOT_ALLOWED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::MissingRequiredArgument("path".into())),
+                403,
+                "POLICY_ARGUMENT_REQUIRED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::CommandNotAllowed {
+                    command: "rm".into(),
+                    allowed_commands: vec![],
+                }),
+                403,
+                "COMMAND_NOT_ALLOWED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::SubcommandNotAllowed {
+                    command: "git".into(),
+                    subcommand: "push".into(),
+                    allowed_subcommands: vec![],
+                }),
+                403,
+                "SUBCOMMAND_NOT_ALLOWED",
+                "policy_violation",
+            ),
+            (
+                policy(PolicyViolation::ConcurrentExecLimitExceeded {
+                    limit: 1,
+                    active: 2,
+                }),
+                403,
+                "LIMIT_EXCEEDED",
+                "policy_violation",
+            ),
+            (
+                SealSessionError::InvalidArguments("required field 'path' is missing".into()),
+                422,
+                "INVALID_ARGUMENTS",
+                "error",
+            ),
+            (
+                SealSessionError::NotFound("approval request 1".into()),
+                404,
+                "NOT_FOUND",
+                "error",
+            ),
+            (
+                SealSessionError::TenantMismatch {
+                    authenticated: "u-1".into(),
+                    requested: "u-2".into(),
+                },
+                403,
+                "TENANT_MISMATCH",
+                "error",
+            ),
+            (
+                SealSessionError::InternalError("Database error: Mk7-db-text".into()),
+                500,
+                "INTERNAL_ERROR",
+                "error",
+            ),
+            (
+                SealSessionError::JudgeTimeout("Mk7-judge-agent".into()),
+                500,
+                "INTERNAL_ERROR",
+                "error",
+            ),
+            (
+                SealSessionError::ConfigurationError("seal_gateway.url is not configured".into()),
+                503,
+                "SERVICE_UNAVAILABLE",
+                "error",
+            ),
+            (
+                SealSessionError::UpstreamUnavailable("Brave API returned 429".into()),
+                502,
+                "UPSTREAM_UNAVAILABLE",
+                "error",
+            ),
+        ];
+        let answered = |a: CallerAnswer| {
+            SealSessionError::InternalError("Mk7-shown-detail".into()).answered(a)
+        };
+        let mut cases = cases;
+        cases.extend([
+            (
+                answered(CallerAnswer::InvalidArguments("bad".into())),
+                422,
+                "INVALID_ARGUMENTS",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::NotFound("x".into())),
+                404,
+                "NOT_FOUND",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::Conflict("x".into())),
+                409,
+                "CONFLICT",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::QuotaExceeded("x".into())),
+                422,
+                "QUOTA_EXCEEDED",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::JudgeRejected("x".into())),
+                403,
+                "JUDGE_REJECTED",
+                "policy_violation",
+            ),
+            (
+                answered(CallerAnswer::PathNotAllowed("x".into())),
+                403,
+                "PATH_NOT_ALLOWED",
+                "policy_violation",
+            ),
+            (
+                answered(CallerAnswer::TenantMismatch("x".into())),
+                403,
+                "TENANT_MISMATCH",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::NotImplemented("x".into())),
+                501,
+                "NOT_IMPLEMENTED",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::EdgeUnavailable("x".into())),
+                503,
+                "EDGE_UNAVAILABLE",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::Internal(InternalFailure::Server)),
+                500,
+                "INTERNAL_ERROR",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::Internal(InternalFailure::Upstream)),
+                502,
+                "UPSTREAM_UNAVAILABLE",
+                "error",
+            ),
+            (
+                answered(CallerAnswer::Internal(InternalFailure::Unavailable)),
+                503,
+                "SERVICE_UNAVAILABLE",
+                "error",
+            ),
+        ]);
+        for (error, http_status, code, status) in cases {
+            let refusal = error.refusal();
+            assert_eq!(refusal.http_status, http_status, "{error:?}");
+            assert_eq!(refusal.code, code, "{error:?}");
+            assert_eq!(refusal.status, status, "{error:?}");
+            let internal = matches!(
+                code,
+                "INTERNAL_ERROR" | "UPSTREAM_UNAVAILABLE" | "SERVICE_UNAVAILABLE"
+            );
+            assert_eq!(refusal.internal, internal, "{error:?}");
+            assert!(
+                !refusal.message.contains("Mk7-"),
+                "a refusal's message carried detail the caller did not send: {error:?} -> {}",
+                refusal.message
+            );
+        }
+    }
+
+    /// R4: the policy refusal keeps 675984dc's words; a 429 carries ADR-072
+    /// §9's numbers.
+    #[test]
+    fn a_policy_refusal_keeps_its_words_and_a_rate_limit_its_numbers() {
+        let refusal = SealSessionError::PolicyViolation(PolicyViolation::ToolNotAllowed {
+            tool_name: "aegis.system.info".to_string(),
+            allowed_tools: vec!["zaru.*".to_string()],
+        })
+        .refusal();
+        assert_eq!(
+            refusal.message,
+            "Policy violation: tool 'aegis.system.info' is not allowed; permitted tools: [zaru.*]"
+        );
+        let limited = SealSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
+            resource_type: "tool_call".into(),
+            bucket: "per_minute".into(),
+            limit: 60,
+            current: 61,
+            retry_after_seconds: 12,
+        })
+        .refusal();
+        assert_eq!(
+            limited.rate_limit,
+            Some(RateLimitHint {
+                limit: 60,
+                remaining: 0,
+                retry_after_seconds: 12
+            })
+        );
+    }
+
+    /// R6: what the inner loop and the log see of an answered refusal is the
+    /// error it was built from, unchanged.
+    #[test]
+    fn an_answered_refusal_shows_the_error_it_was_built_from() {
+        let shown = SealSessionError::InternalError("not found: /aegis/volumes/v/f".into());
+        let answered = shown
+            .clone()
+            .answered(CallerAnswer::NotFound("file 'f' not found".into()));
+        assert_eq!(answered.to_string(), shown.to_string());
     }
 }

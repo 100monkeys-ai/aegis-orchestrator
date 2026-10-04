@@ -948,6 +948,12 @@ enum SealErrorClass {
 fn classify_seal_error(e: &crate::domain::seal_session::SealSessionError) -> SealErrorClass {
     use crate::domain::seal_session::SealSessionError;
     match e {
+        // A refusal whose answer to the HTTP caller was decided where it was
+        // built (AEGIS ADR-035, Update of 2026-10-04, R6): the inner loop
+        // classifies the error it was built from, so an agent sees the class
+        // and the text it saw before.
+        SealSessionError::Answered { shown, .. } => classify_seal_error(shown),
+
         // Truly unrecoverable — crypto, session revocation, misconfiguration.
         SealSessionError::SignatureVerificationFailed(_)
         | SealSessionError::SessionInactive(_)
@@ -1111,6 +1117,32 @@ mod tests {
             class,
             SealErrorClass::PolicyFeedback,
             "PolicyViolation must be PolicyFeedback, not Fatal"
+        );
+    }
+
+    /// AEGIS ADR-035, Update of 2026-10-04, R6: an answered refusal keeps
+    /// the class of the error it was built from, whatever the HTTP caller is
+    /// told.
+    #[test]
+    fn an_answered_refusal_keeps_the_class_of_the_error_it_was_built_from() {
+        use crate::domain::seal_session::{CallerAnswer, InternalFailure};
+        let internal = SealSessionError::InternalError("not found: /x".into());
+        assert_eq!(
+            classify_seal_error(
+                &internal
+                    .clone()
+                    .answered(CallerAnswer::NotFound("file 'x'".into()))
+            ),
+            classify_seal_error(&internal),
+        );
+        let malformed = SealSessionError::MalformedPayload("Failed to load execution".into());
+        assert_eq!(
+            classify_seal_error(
+                &malformed
+                    .clone()
+                    .answered(CallerAnswer::Internal(InternalFailure::Server))
+            ),
+            classify_seal_error(&malformed),
         );
     }
 
