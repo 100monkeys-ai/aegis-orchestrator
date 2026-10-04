@@ -151,16 +151,21 @@ pub async fn invoke_aegis_attachment_read_tool(
             })))
         }
         Err(FileOperationsError::Unauthorized) => {
+            // Answered exactly as a volume that does not exist
+            // (`read_attachment_for_tenant`'s not-found text), so the answer
+            // never tells that another tenant's volume exists (AEGIS ADR-035
+            // R5, NOT_FOUND: "existence is not told"). Only the operator's log
+            // tells them apart.
             warn!(
                 %volume_id,
                 path,
                 caller_tenant = %tenant_id,
-                "aegis.attachment.read: tenant mismatch or non-persistent volume"
+                "aegis.attachment.read: volume of another tenant, or not persistent; answered as not found"
             );
             Ok(ToolInvocationResult::Direct(json!({
                 "status": "error",
-                "error": "forbidden",
-                "message": "volume does not belong to your tenant",
+                "error": "not_found",
+                "message": format!("volume {} not found", volume_id.0),
             })))
         }
         Err(FileOperationsError::InvalidPath(msg)) => {
@@ -228,24 +233,5 @@ mod tests {
         let bytes = b"hello world";
         let mime = sniff_mime(bytes, "text/plain");
         assert_eq!(mime, "text/plain");
-    }
-
-    /// Regression test for ADR-113 tenant isolation: the unauthorized branch
-    /// (mismatched tenant) must surface as `forbidden`, not `not_found`. This
-    /// guards against the failure mode where a leaked volume_id from one
-    /// tenant could be used to fish for "does this exist?" signals from
-    /// another tenant.
-    #[test]
-    fn tenant_mismatch_maps_to_forbidden() {
-        let err = FileOperationsError::Unauthorized;
-        // Mirror the dispatch arm.
-        let resp = match err {
-            FileOperationsError::Unauthorized => json!({
-                "status": "error",
-                "error": "forbidden",
-            }),
-            _ => json!({"status": "error", "error": "other"}),
-        };
-        assert_eq!(resp.get("error").and_then(Value::as_str), Some("forbidden"));
     }
 }

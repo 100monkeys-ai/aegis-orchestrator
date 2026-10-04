@@ -122,12 +122,21 @@ pub async fn invoke_execution_file_tool(
                 "message": msg,
             })))
         }
+        // Another tenant's execution is answered exactly as one with no
+        // workspace volume (`read_file_for_execution`'s not-found text), so the
+        // answer never tells that it exists (AEGIS ADR-035 R5, NOT_FOUND:
+        // "existence is not told"). Only the operator's log tells them apart.
         Err(FileOperationsError::Unauthorized) => {
-            warn!(%execution_id, path, "aegis.execution.file: unauthorized");
+            warn!(
+                %execution_id,
+                path,
+                caller_tenant = %tenant_id,
+                "aegis.execution.file: execution of another tenant; answered as not found"
+            );
             Ok(ToolInvocationResult::Direct(json!({
                 "status": "error",
-                "error": "forbidden",
-                "message": "execution does not belong to your tenant",
+                "error": "not_found",
+                "message": format!("no workspace volume for execution {}", execution_id.0),
             })))
         }
         Err(FileOperationsError::InvalidPath(msg)) => {

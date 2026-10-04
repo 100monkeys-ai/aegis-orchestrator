@@ -405,6 +405,9 @@ struct Mcp {
     key: SigningKey,
     calls: u64,
     volumes: Arc<InMemoryVolumeRepository>,
+    /// The local storage provider's root: a host volume's file `<path>/<f>`
+    /// is the file `<storage_root>/<path>/<f>` on disk.
+    storage_root: std::path::PathBuf,
 }
 
 impl Mcp {
@@ -544,6 +547,7 @@ async fn attest_with(
         key,
         calls: 0,
         volumes,
+        storage_root,
     }
 }
 
@@ -1098,4 +1102,224 @@ async fn a_storage_backend_failure_is_500_and_its_text_is_only_in_the_log() {
         .await;
     a.assert_shape(500, "INTERNAL_ERROR", "error");
     a.assert_detail_only_in_log(&["readdir failed"]);
+}
+
+// ============================================================================
+// Existence is not told across tenants (AEGIS ADR-035 R5's NOT_FOUND row:
+// "including one of another owner or tenant (existence is not told)"):
+// `aegis.execution.file`, `aegis.attachment.read` and `aegis.file.*` answer a
+// resource of another tenant exactly as they answer one that does not exist.
+// The owner's own read is unchanged.
+// ============================================================================
+
+/// A session allowed the three tools, with the file service configured.
+async fn with_file_reads() -> Mcp {
+    attest_with(
+        zaru_pro_allowing(&["aegis.execution.*", "aegis.attachment.*", "aegis.file.*"]),
+        |service, fsal| {
+            service.with_file_operations_service(Arc::new(FileOperationsService::new(fsal)))
+        },
+    )
+    .await
+}
+
+impl Mcp {
+    /// The workspace volume of `execution` in `tenant`, on a host backend at
+    /// `backend_path`.
+    async fn execution_volume(&self, tenant: &TenantId, execution: uuid::Uuid, backend_path: &str) {
+        let mut volume = Volume::new(
+            "workspace".to_string(),
+            tenant.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: backend_path.into(),
+            },
+            1024 * 1024,
+            VolumeOwnership::execution(SharedExecutionId(execution)),
+        )
+        .unwrap();
+        volume.mark_available().unwrap();
+        self.volumes.save(&volume).await.unwrap();
+    }
+
+    /// A persistent volume with this exact id, of `owner` in `tenant`.
+    async fn volume_with_id(&self, id: &str, tenant: &TenantId, owner: &str, backend_path: &str) {
+        let mut volume = Volume::new(
+            "files".to_string(),
+            tenant.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: backend_path.into(),
+            },
+            1024 * 1024,
+            VolumeOwnership::persistent(owner),
+        )
+        .unwrap();
+        volume.id =
+            aegis_orchestrator_core::domain::volume::VolumeId(uuid::Uuid::parse_str(id).unwrap());
+        volume.mark_available().unwrap();
+        self.volumes.save(&volume).await.unwrap();
+    }
+
+    /// Write `content` as the file `name` of the host volume at `backend_path`.
+    fn put_file(&self, backend_path: &str, name: &str, content: &str) {
+        let dir = self.storage_root.join(backend_path.trim_start_matches('/'));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+}
+
+/// The route's answer with its per-call `request_id` (R2: minted for every
+/// refused call, so two calls never share one) set aside; everything else,
+/// status, headers and body, is compared byte for byte.
+fn without_request_id(a: &Answer) -> (u16, Vec<(String, Vec<u8>)>, String) {
+    let mut body = a.body.clone();
+    body["request_id"] = Value::Null;
+    let mut headers: Vec<(String, Vec<u8>)> = a
+        .headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
+        .collect();
+    headers.sort();
+    (a.status, headers, body.to_string())
+}
+
+#[tokio::test]
+async fn an_execution_file_of_another_tenant_answers_byte_for_byte_as_a_missing_one() {
+    let execution = uuid::Uuid::new_v4();
+    let args = json!({"execution_id": execution.to_string(), "path": "output.md"});
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+
+    let mut foreign = with_file_reads().await;
+    foreign
+        .execution_volume(&other, execution, "/aegis-host/other-exec")
+        .await;
+    foreign.put_file("/aegis-host/other-exec", "output.md", "theirs");
+    let theirs = foreign
+        .call("aegis.execution.file", args.clone())
+        .await
+        .expect("answered");
+
+    let mut missing = with_file_reads().await;
+    let none = missing
+        .call("aegis.execution.file", args)
+        .await
+        .expect("answered");
+
+    assert_eq!(
+        serde_json::to_vec(&theirs).unwrap(),
+        serde_json::to_vec(&none).unwrap(),
+        "another tenant's execution: {theirs}\nno such execution: {none}"
+    );
+    assert!(!theirs.to_string().contains("theirs"), "{theirs}");
+}
+
+#[tokio::test]
+async fn an_execution_file_of_the_callers_own_execution_is_read_as_before() {
+    let execution = uuid::Uuid::new_v4();
+    let mut mcp = with_file_reads().await;
+    mcp.execution_volume(&own_tenant(), execution, "/aegis-host/own-exec")
+        .await;
+    mcp.put_file("/aegis-host/own-exec", "output.md", "mine");
+    let read = mcp
+        .call(
+            "aegis.execution.file",
+            json!({"execution_id": execution.to_string(), "path": "output.md"}),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(read["status"], "success", "{read}");
+    assert_eq!(read["content"], "mine", "{read}");
+}
+
+#[tokio::test]
+async fn an_attachment_of_another_tenant_answers_byte_for_byte_as_a_missing_one() {
+    let volume = uuid::Uuid::new_v4().to_string();
+    let args = json!({"volume_id": volume, "path": "upload.txt"});
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+
+    let mut foreign = with_file_reads().await;
+    foreign
+        .volume_with_id(&volume, &other, SOMEONE_ELSE, "/aegis-host/other-files")
+        .await;
+    foreign.put_file("/aegis-host/other-files", "upload.txt", "theirs");
+    let theirs = foreign
+        .call("aegis.attachment.read", args.clone())
+        .await
+        .expect("answered");
+
+    let mut missing = with_file_reads().await;
+    let none = missing
+        .call("aegis.attachment.read", args)
+        .await
+        .expect("answered");
+
+    assert_eq!(
+        serde_json::to_vec(&theirs).unwrap(),
+        serde_json::to_vec(&none).unwrap(),
+        "another tenant's volume: {theirs}\nno such volume: {none}"
+    );
+    assert!(!theirs.to_string().contains("theirs"), "{theirs}");
+}
+
+#[tokio::test]
+async fn an_attachment_in_the_callers_own_volume_is_read_as_before() {
+    let mut mcp = with_file_reads().await;
+    let volume = mcp
+        .volume(&own_tenant(), SUB, "/aegis-host/own-files")
+        .await;
+    mcp.put_file("/aegis-host/own-files", "upload.txt", "mine");
+    let read = mcp
+        .call(
+            "aegis.attachment.read",
+            json!({"volume_id": volume, "path": "upload.txt"}),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(read["status"], "success", "{read}");
+    assert_eq!(read["content"], "mine", "{read}");
+}
+
+#[tokio::test]
+async fn a_file_in_another_tenants_volume_answers_as_one_in_a_missing_volume() {
+    let volume = uuid::Uuid::new_v4().to_string();
+    let args = json!({"volume_id": volume, "path": "a.txt"});
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+
+    let mut foreign = with_file_reads().await;
+    foreign
+        .volume_with_id(&volume, &other, SOMEONE_ELSE, "/aegis-host/other-vol")
+        .await;
+    foreign.put_file("/aegis-host/other-vol", "a.txt", "theirs");
+    let theirs = foreign.refused("aegis.file.read", args.clone()).await;
+
+    let mut missing = with_file_reads().await;
+    let none = missing.refused("aegis.file.read", args).await;
+
+    theirs.assert_shape(404, "NOT_FOUND", "error");
+    assert_eq!(
+        without_request_id(&theirs),
+        without_request_id(&none),
+        "another tenant's volume: {}\nno such volume: {}",
+        theirs.body,
+        none.body
+    );
+    // The operator's log keeps the distinction; no caller-visible text does.
+    assert!(theirs.log.contains("unauthorized"), "{}", theirs.log);
+    assert!(!none.log.contains("unauthorized"), "{}", none.log);
+}
+
+#[tokio::test]
+async fn a_file_in_the_callers_own_volume_is_read_as_before() {
+    let mut mcp = with_file_reads().await;
+    let volume = mcp.volume(&own_tenant(), SUB, "/aegis-host/own-vol").await;
+    mcp.put_file("/aegis-host/own-vol", "a.txt", "mine");
+    let read = mcp
+        .call(
+            "aegis.file.read",
+            json!({"volume_id": volume, "path": "a.txt"}),
+        )
+        .await
+        .expect("answered");
+    assert!(read.to_string().contains("mine"), "{read}");
 }

@@ -86,11 +86,11 @@ fn internal(e: &impl std::fmt::Display) -> SealSessionError {
 /// never the answer.
 fn file_refusal(e: FileOperationsError, volume_id: &str, path: &str) -> SealSessionError {
     let answer = match &e {
-        FileOperationsError::NotFound(_) => {
+        // A volume of another tenant or owner is answered as a missing one:
+        // one message, so existence is not told (R5, NOT_FOUND). The log line
+        // keeps `shown`, which tells them apart for the operator.
+        FileOperationsError::NotFound(_) | FileOperationsError::Unauthorized => {
             CallerAnswer::NotFound(format!("Not found: '{path}' in volume '{volume_id}'."))
-        }
-        FileOperationsError::Unauthorized => {
-            CallerAnswer::NotFound(format!("Not found: volume '{volume_id}'."))
         }
         FileOperationsError::FileTooLarge => {
             CallerAnswer::QuotaExceeded("The file is larger than your tier allows.".to_string())
