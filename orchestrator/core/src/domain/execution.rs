@@ -180,6 +180,15 @@ pub struct Execution {
     /// user-scoped rate limiting (ADR-072) when the agent runtime calls back in.
     #[serde(default)]
     pub initiating_user_sub: Option<String>,
+
+    /// The supervisor's bound on the whole execution, in seconds: the agent's
+    /// `spec.security.resources.timeout`, or the supervisor's default when the
+    /// manifest gives none. Recorded when the execution starts, so the
+    /// container reaper can tell an execution that has outlived its bound
+    /// without reading the agent's manifest again (ADR-040, Update of
+    /// 2026-10-04). `None` until the execution starts.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 fn default_container_uid() -> u32 {
@@ -259,6 +268,31 @@ pub struct AttachmentRef {
 /// its `ExecutionFailed` event, so every reader of the execution sees it.
 pub const ORCHESTRATOR_RESTART_FAILURE_REASON: &str =
     "The orchestrator restarted while this execution was running; no process supervises it any more, so it was ended as failed";
+
+/// How long past an execution's own bound the container reaper waits before
+/// it ends an execution still running (ADR-040, Update of 2026-10-04). The
+/// supervisor records its own ending only after it has terminated the
+/// container, which takes at most four engine calls of 120 s each (480 s);
+/// the rest covers the time between the record's `started_at` and the start
+/// of the supervisor's clock.
+pub const REAPER_MARGIN_SECONDS: u64 = 600;
+
+/// The prefix of the reason an execution carries when the container reaper
+/// ended it ([`Execution::fail_outlived_bound`]).
+pub const REAPER_OUTLIVED_FAILURE_PREFIX: &str =
+    "The orchestrator's container reaper ended this execution";
+
+/// The reason an execution carries when the container reaper ended it: it was
+/// still running `elapsed_seconds` after it started, past its `bound_seconds`
+/// and [`REAPER_MARGIN_SECONDS`]. It is the execution's error, its in-flight
+/// iteration's error and the reason of its `ExecutionFailed` event.
+pub fn reaper_outlived_failure_reason(elapsed_seconds: i64, bound_seconds: u64) -> String {
+    format!(
+        "{REAPER_OUTLIVED_FAILURE_PREFIX}: it was still running {elapsed_seconds} s after it started, \
+         past its execution bound of {bound_seconds} s and the reaper's margin of \
+         {REAPER_MARGIN_SECONDS} s, and no supervisor had ended it"
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionStatus {
@@ -405,6 +439,7 @@ impl Execution {
             hierarchy: ExecutionHierarchy::root(id),
             security_context_name,
             initiating_user_sub: None,
+            timeout_seconds: None,
         }
     }
 
@@ -435,6 +470,7 @@ impl Execution {
             hierarchy,
             security_context_name: parent.security_context_name.clone(),
             initiating_user_sub: parent.initiating_user_sub.clone(),
+            timeout_seconds: None,
         })
     }
 
@@ -584,7 +620,49 @@ impl Execution {
         if self.is_completed() {
             return None;
         }
-        let reason = ORCHESTRATOR_RESTART_FAILURE_REASON.to_string();
+        self.fail_with_iteration_in_flight(ORCHESTRATOR_RESTART_FAILURE_REASON.to_string())
+    }
+
+    /// Whether the container reaper may end this execution at `now`: it is
+    /// still running, its bound is recorded, and `now` is at least its bound
+    /// plus [`REAPER_MARGIN_SECONDS`] after it started. An execution inside
+    /// that time, one already ended, or one whose bound is not recorded is
+    /// never outlived.
+    pub fn outlived_bound(&self, now: DateTime<Utc>) -> bool {
+        let Some(bound) = self.timeout_seconds else {
+            return false;
+        };
+        if self.status != ExecutionStatus::Running {
+            return false;
+        }
+        let allowed = bound.saturating_add(REAPER_MARGIN_SECONDS);
+        let allowed = chrono::Duration::seconds(i64::try_from(allowed).unwrap_or(i64::MAX));
+        match self.started_at.checked_add_signed(allowed) {
+            Some(deadline) => now >= deadline,
+            None => false,
+        }
+    }
+
+    /// End, as failed, an execution the container reaper found still running
+    /// past its bound and [`REAPER_MARGIN_SECONDS`] ([`Self::outlived_bound`]),
+    /// the way [`Self::fail_cut_by_restart`] ends one: the iteration in
+    /// flight, if any, fails with [`reaper_outlived_failure_reason`], and the
+    /// execution fails with the same reason. Returns `Some(failed iteration
+    /// number or None)` when it ended the execution, and `None` (leaving it
+    /// exactly as it is) when the execution has not outlived its bound at
+    /// `now`.
+    pub fn fail_outlived_bound(&mut self, now: DateTime<Utc>) -> Option<Option<u8>> {
+        if !self.outlived_bound(now) {
+            return None;
+        }
+        let bound = self.timeout_seconds.unwrap_or_default();
+        let elapsed = (now - self.started_at).num_seconds();
+        Some(self.fail_with_iteration_in_flight(reaper_outlived_failure_reason(elapsed, bound)))
+    }
+
+    /// Fail the iteration in flight (running or refining), if any, and the
+    /// execution, with one reason; returns the number of the iteration failed.
+    fn fail_with_iteration_in_flight(&mut self, reason: String) -> Option<u8> {
         let failed_iteration = match self.iterations.last() {
             Some(iteration)
                 if matches!(
@@ -965,5 +1043,81 @@ mod tests {
         assert_eq!(info.status, ExecutionStatus::Completed);
         assert!(info.ended_at.is_some());
         assert!(info.error.is_none());
+    }
+
+    // ── The container reaper's ending (ADR-040, Update of 2026-10-04) ───────
+
+    /// A running execution with a 60 s bound and an iteration in flight,
+    /// started `ago` seconds before `now`.
+    fn running_with_bound(now: DateTime<Utc>, ago: i64, bound: Option<u64>) -> Execution {
+        let mut exec = Execution::new(
+            AgentId::new(),
+            make_input("task"),
+            3,
+            "aegis-system-operator".to_string(),
+        );
+        exec.started_at = now - chrono::Duration::seconds(ago);
+        exec.timeout_seconds = bound;
+        exec.start();
+        exec.start_iteration("generate".to_string()).unwrap();
+        exec
+    }
+
+    #[test]
+    fn an_execution_past_its_bound_and_the_margin_is_outlived_and_ended_by_the_reaper() {
+        let now = Utc::now();
+        let mut exec = running_with_bound(now, 60 + 600, Some(60));
+        assert!(exec.outlived_bound(now));
+
+        let ended = exec.fail_outlived_bound(now);
+
+        assert_eq!(ended, Some(Some(1)), "ended, failing iteration 1");
+        assert_eq!(exec.status, ExecutionStatus::Failed);
+        assert!(exec.ended_at.is_some());
+        let error = exec
+            .error
+            .clone()
+            .expect("the execution carries the reason");
+        assert!(error.starts_with(REAPER_OUTLIVED_FAILURE_PREFIX), "{error}");
+        assert!(error.contains("execution bound of 60 s"), "{error}");
+        assert!(error.contains("margin of 600 s"), "{error}");
+        let iteration = exec.iterations().last().unwrap();
+        assert_eq!(iteration.status, IterationStatus::Failed);
+        assert_eq!(iteration.error.as_ref().unwrap().message, error);
+    }
+
+    #[test]
+    fn an_execution_inside_its_bound_and_the_margin_is_never_ended_by_the_reaper() {
+        let now = Utc::now();
+        let mut exec = running_with_bound(now, 60 + 600 - 1, Some(60));
+        assert!(!exec.outlived_bound(now));
+        assert_eq!(exec.fail_outlived_bound(now), None);
+        assert_eq!(exec.status, ExecutionStatus::Running);
+        assert!(exec.error.is_none());
+        assert_eq!(
+            exec.iterations().last().unwrap().status,
+            IterationStatus::Running
+        );
+    }
+
+    #[test]
+    fn an_execution_without_a_recorded_bound_is_never_ended_by_the_reaper() {
+        let now = Utc::now();
+        let mut exec = running_with_bound(now, 100_000, None);
+        assert!(!exec.outlived_bound(now));
+        assert_eq!(exec.fail_outlived_bound(now), None);
+        assert_eq!(exec.status, ExecutionStatus::Running);
+    }
+
+    #[test]
+    fn an_execution_already_ended_is_left_as_it_is_by_the_reaper() {
+        let now = Utc::now();
+        let mut exec = running_with_bound(now, 100_000, Some(60));
+        exec.complete();
+        let before = exec.ended_at;
+        assert_eq!(exec.fail_outlived_bound(now), None);
+        assert_eq!(exec.status, ExecutionStatus::Completed);
+        assert_eq!(exec.ended_at, before);
+        assert!(exec.error.is_none());
     }
 }

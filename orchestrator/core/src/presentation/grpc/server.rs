@@ -2735,6 +2735,7 @@ mod tests {
             container_gid: 1000,
             security_context_name: "aegis-system-operator".to_string(),
             initiating_user_sub: None,
+            timeout_seconds: None,
         };
         let execution_service = Arc::new(TestExecutionService {
             execution_id,

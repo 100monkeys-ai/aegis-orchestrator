@@ -53,7 +53,9 @@ use crate::domain::iam::UserIdentity;
 use crate::domain::node_config::resolve_env_value;
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::RuntimeError;
-use crate::domain::supervisor::{Supervisor, SupervisorObserver};
+use crate::domain::supervisor::{
+    Supervisor, SupervisorObserver, DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+};
 use crate::domain::volume::{
     AccessMode, FilerEndpoint, TenantId, VolumeId, VolumeMount, VolumeOwnership,
 };
@@ -327,26 +329,7 @@ pub async fn fail_executions_cut_by_restart(
             continue;
         }
 
-        let now = Utc::now();
-        if let Some(iteration_number) = failed_iteration {
-            event_bus.publish_execution_event(ExecutionEvent::IterationFailed {
-                execution_id: execution.id,
-                agent_id: execution.agent_id,
-                iteration_number,
-                error: crate::domain::execution::IterationError {
-                    message: reason.clone(),
-                    details: None,
-                },
-                failed_at: now,
-            });
-        }
-        event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
-            execution_id: execution.id,
-            agent_id: execution.agent_id,
-            reason,
-            total_iterations: execution.iterations().len() as u8,
-            failed_at: now,
-        });
+        publish_execution_failure(event_bus, &execution, failed_iteration, reason);
 
         tracing::info!(
             execution_id = %execution.id,
@@ -359,6 +342,125 @@ pub async fn fail_executions_cut_by_restart(
         ended.push(execution.id);
     }
     Ok(ended)
+}
+
+/// Publish the events of an execution ended as failed outside its
+/// supervisor: `IterationFailed` for the iteration it failed, when one was in
+/// flight, then `ExecutionFailed`, both with `reason`.
+fn publish_execution_failure(
+    event_bus: &EventBus,
+    execution: &Execution,
+    failed_iteration: Option<u8>,
+    reason: String,
+) {
+    let now = Utc::now();
+    if let Some(iteration_number) = failed_iteration {
+        event_bus.publish_execution_event(ExecutionEvent::IterationFailed {
+            execution_id: execution.id,
+            agent_id: execution.agent_id,
+            iteration_number,
+            error: crate::domain::execution::IterationError {
+                message: reason.clone(),
+                details: None,
+            },
+            failed_at: now,
+        });
+    }
+    event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
+        execution_id: execution.id,
+        agent_id: execution.agent_id,
+        reason,
+        total_iterations: execution.iterations().len() as u8,
+        failed_at: now,
+    });
+}
+
+/// End, as failed, an execution the container reaper found still running
+/// past its bound and the reaper's margin
+/// ([`crate::domain::execution::REAPER_MARGIN_SECONDS`]; ADR-040, Update of
+/// 2026-10-04), the way [`fail_executions_cut_by_restart`] ends one: its
+/// in-flight iteration and the execution fail with a reason naming the
+/// reaper and the bound, the record is saved under its own tenant, and
+/// `IterationFailed` (when an iteration was in flight) and `ExecutionFailed`
+/// are published.
+///
+/// Returns `Ok(true)` when it ended the execution, `Ok(false)` when the
+/// execution has not outlived its bound at `now` (still inside it, already
+/// ended, or with no recorded bound), which is left exactly as it is, and an
+/// error when the record could not be saved, in which case nothing is
+/// published and the caller keeps the container for the next pass.
+pub async fn fail_execution_outlived_bound(
+    repository: &dyn ExecutionRepository,
+    event_bus: &EventBus,
+    mut execution: Execution,
+    now: chrono::DateTime<Utc>,
+) -> Result<bool> {
+    let Some(failed_iteration) = execution.fail_outlived_bound(now) else {
+        return Ok(false);
+    };
+    let reason = execution.error.clone().unwrap_or_default();
+    let tenant_id = execution.tenant_id.clone();
+    repository
+        .save_for_tenant(&tenant_id, &execution)
+        .await
+        .with_context(|| {
+            format!(
+                "save execution {} ended by the container reaper",
+                execution.id
+            )
+        })?;
+
+    publish_execution_failure(event_bus, &execution, failed_iteration, reason.clone());
+
+    tracing::warn!(
+        execution_id = %execution.id,
+        tenant_id = %tenant_id,
+        agent_id = %execution.agent_id.0,
+        timeout_seconds = execution.timeout_seconds.unwrap_or_default(),
+        margin_seconds = crate::domain::execution::REAPER_MARGIN_SECONDS,
+        reason = %reason,
+        "Container reaper ended an execution that outlived its bound: failed"
+    );
+    Ok(true)
+}
+
+/// The supervisor's bound on an execution of this agent, in seconds: the
+/// manifest's `spec.security.resources.timeout`, or
+/// [`DEFAULT_EXECUTION_TIMEOUT_SECONDS`]; the value `Supervisor::run_loop`
+/// enforces, recorded on the execution when it starts.
+fn execution_timeout_seconds(manifest: &crate::domain::agent::AgentManifest) -> u64 {
+    manifest
+        .spec
+        .security
+        .as_ref()
+        .and_then(|security| security.resources.parse_timeout_seconds())
+        .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS)
+}
+
+/// The execution's record, for the supervisor's task to write its ending on,
+/// or `None` when there is none or it has already ended (the container
+/// reaper, the restart pass or a cancel ended it first): such an execution
+/// keeps its terminal state, reason and events, as the cancel path keeps them.
+async fn unfinished_execution(
+    repository: &dyn ExecutionRepository,
+    tenant_id: &TenantId,
+    execution_id: ExecutionId,
+) -> Option<Execution> {
+    match repository
+        .find_by_id_for_tenant(tenant_id, execution_id)
+        .await
+    {
+        Ok(Some(execution)) if execution.is_completed() => {
+            tracing::info!(
+                execution_id = %execution_id,
+                status = ?execution.status,
+                "The supervisor finished an execution that had already ended; its ending stands"
+            );
+            None
+        }
+        Ok(found) => found,
+        Err(_) => None,
+    }
 }
 
 pub struct StandardExecutionService {
@@ -2825,6 +2927,206 @@ mod tests {
             "no ExecutionCancelled for an execution that had already ended"
         );
     }
+
+    // ── The container reaper's ending (ADR-040, Update of 2026-10-04) ───────
+
+    /// A running execution with a recorded bound and an iteration in flight,
+    /// started `ago` seconds ago; no supervisor runs it.
+    fn running_without_supervisor(
+        tenant_id: &CoreTenantId,
+        ago: i64,
+        bound: Option<u64>,
+    ) -> Execution {
+        let mut execution = execution_left_running(
+            AgentId::new(),
+            tenant_id,
+            Utc::now() - chrono::Duration::seconds(ago),
+        );
+        execution.timeout_seconds = bound;
+        execution
+    }
+
+    /// No supervisor ends the execution; past its 60 s bound and the 600 s
+    /// margin, the reaper's ending fails it and its in-flight iteration with
+    /// the reaper's reason, saves it under its tenant, and publishes
+    /// IterationFailed and ExecutionFailed with that reason.
+    #[tokio::test]
+    async fn the_reaper_ends_an_execution_that_outlived_its_bound_as_the_restart_pass_does() {
+        let repo = InMemoryExecutionRepository::new();
+        let bus = EventBus::with_default_capacity();
+        let tenant = CoreTenantId::for_consumer_user("reaper-owner").unwrap();
+        let execution = running_without_supervisor(&tenant, 60 + 600 + 1, Some(60));
+        repo.save_for_tenant(&tenant, &execution).await.unwrap();
+        let mut receiver = bus.subscribe();
+
+        let ended = fail_execution_outlived_bound(&repo, &bus, execution.clone(), Utc::now())
+            .await
+            .unwrap();
+
+        assert!(ended);
+        let after = repo
+            .find_by_id_for_tenant(&tenant, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, ExecutionStatus::Failed);
+        assert!(after.ended_at.is_some());
+        let reason = after.error.clone().unwrap();
+        assert!(
+            reason.starts_with(crate::domain::execution::REAPER_OUTLIVED_FAILURE_PREFIX),
+            "{reason}"
+        );
+        assert!(reason.contains("execution bound of 60 s"), "{reason}");
+        let last = after.iterations().last().unwrap();
+        assert_eq!(
+            last.status,
+            crate::domain::execution::IterationStatus::Failed
+        );
+        assert_eq!(last.error.as_ref().unwrap().message, reason);
+
+        let events = drain_execution_events(&mut receiver);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ExecutionEvent::IterationFailed { execution_id, iteration_number: 1, error, .. }
+                    if *execution_id == execution.id && error.message == reason
+            )),
+            "IterationFailed with the reaper's reason: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ExecutionEvent::ExecutionFailed { execution_id, reason: r, .. }
+                    if *execution_id == execution.id && *r == reason
+            )),
+            "ExecutionFailed with the reaper's reason: {events:?}"
+        );
+    }
+
+    /// Inside its bound and the margin, or with no recorded bound, the
+    /// reaper's ending leaves the execution exactly as it is and publishes
+    /// nothing.
+    #[tokio::test]
+    async fn the_reaper_never_ends_an_execution_inside_its_bound_or_without_one() {
+        let repo = InMemoryExecutionRepository::new();
+        let bus = EventBus::with_default_capacity();
+        let tenant = CoreTenantId::for_consumer_user("reaper-inside").unwrap();
+        let inside = running_without_supervisor(&tenant, 60 + 600 - 1, Some(60));
+        let unbounded = running_without_supervisor(&tenant, 100_000, None);
+        let mut receiver = bus.subscribe();
+
+        for execution in [&inside, &unbounded] {
+            repo.save_for_tenant(&tenant, execution).await.unwrap();
+            let ended = fail_execution_outlived_bound(&repo, &bus, execution.clone(), Utc::now())
+                .await
+                .unwrap();
+            assert!(!ended);
+            let after = repo
+                .find_by_id_for_tenant(&tenant, execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.status, ExecutionStatus::Running);
+            assert!(after.error.is_none());
+        }
+        assert!(drain_execution_events(&mut receiver).is_empty());
+    }
+
+    /// The supervisor's terminal writes read the record through
+    /// `unfinished_execution`: an execution another path already ended is
+    /// not handed back, so its status, reason and events stand, as the cancel
+    /// path keeps them; a running one is.
+    #[tokio::test]
+    async fn the_supervisors_ending_leaves_an_execution_already_ended_as_it_is() {
+        let repo = InMemoryExecutionRepository::new();
+        let tenant = CoreTenantId::for_consumer_user("reaper-first").unwrap();
+        let mut ended = running_without_supervisor(&tenant, 60 + 600 + 1, Some(60));
+        assert!(ended.fail_outlived_bound(Utc::now()).is_some());
+        let running = running_without_supervisor(&tenant, 1, Some(60));
+        repo.save_for_tenant(&tenant, &ended).await.unwrap();
+        repo.save_for_tenant(&tenant, &running).await.unwrap();
+
+        assert!(unfinished_execution(&repo, &tenant, ended.id)
+            .await
+            .is_none());
+        assert_eq!(
+            unfinished_execution(&repo, &tenant, running.id)
+                .await
+                .map(|e| e.id),
+            Some(running.id)
+        );
+    }
+
+    fn with_timeout(mut agent: Agent, timeout: &str) -> Agent {
+        agent.manifest.spec.security = Some(crate::domain::agent::SecurityConfig {
+            network: Default::default(),
+            filesystem: Default::default(),
+            resources: crate::domain::agent::ResourceLimits {
+                timeout: Some(timeout.to_string()),
+                ..crate::domain::agent::ResourceLimits::default()
+            },
+        });
+        agent
+    }
+
+    /// Both start paths record on the execution the bound the supervisor
+    /// enforces: the manifest's timeout, or the 1800 s default.
+    #[tokio::test]
+    async fn both_start_paths_record_the_supervisors_execution_bound() {
+        let tenant = CoreTenantId::consumer();
+        let bounded = with_timeout(make_agent("bounded-worker", None, None), "90s");
+        let unbounded = make_agent("default-worker", None, None);
+        let parent_execution = make_parent_execution_with_tenant(bounded.id, "zaru-consumer");
+        let (service, execution_repo) =
+            build_child_spawn_service(&tenant, &bounded, &unbounded, &parent_execution).await;
+
+        let input = |intent: &str| ExecutionInput {
+            intent: Some(intent.to_string()),
+            input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+
+        let root_bounded = service
+            .start_execution(bounded.id, input("root"), "test-ctx".to_string(), None)
+            .await
+            .unwrap();
+        let root_default = service
+            .start_execution(unbounded.id, input("root"), "test-ctx".to_string(), None)
+            .await
+            .unwrap();
+        let child_default = service
+            .start_child_execution(unbounded.id, input("child"), parent_execution.id)
+            .await
+            .unwrap();
+        let child_bounded = service
+            .start_child_execution(bounded.id, input("child"), parent_execution.id)
+            .await
+            .unwrap();
+
+        for (id, expected) in [
+            (root_bounded, 90),
+            (
+                root_default,
+                crate::domain::supervisor::DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            ),
+            (
+                child_default,
+                crate::domain::supervisor::DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            ),
+            (child_bounded, 90),
+        ] {
+            let execution = execution_repo
+                .find_by_id_for_tenant(&tenant, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.timeout_seconds, Some(expected), "execution {id}");
+        }
+    }
 }
 
 struct ExecutionMonitor {
@@ -3782,6 +4084,7 @@ impl StandardExecutionService {
         }
 
         // Convert resource limits from domain format to runtime format
+        let execution_timeout_seconds = execution_timeout_seconds(&agent.manifest);
         let resources = if let Some(security) = &agent.manifest.spec.security {
             crate::domain::runtime::ResourceLimits {
                 cpu_millis: Some(security.resources.cpu),
@@ -4101,6 +4404,9 @@ impl StandardExecutionService {
             workflow_execution_id,
         };
 
+        // The supervisor's bound on this execution, recorded so the container
+        // reaper can end it once it has outlived it (ADR-040).
+        execution.timeout_seconds = Some(execution_timeout_seconds);
         execution.start();
         self.repository
             .save_for_tenant(&tenant_id, &execution)
@@ -4194,9 +4500,9 @@ impl StandardExecutionService {
                     )
                     .record(duration_seconds);
                     // Update to completed
-                    if let Ok(Some(mut exec)) = repository
-                        .find_by_id_for_tenant(&tenant_id_for_task, execution_id)
-                        .await
+                    if let Some(mut exec) =
+                        unfinished_execution(repository.as_ref(), &tenant_id_for_task, execution_id)
+                            .await
                     {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
@@ -4280,9 +4586,9 @@ impl StandardExecutionService {
                     )
                     .record(duration_seconds);
                     // Execution timed out — emit specific timeout event
-                    if let Ok(Some(mut exec)) = repository
-                        .find_by_id_for_tenant(&tenant_id_for_task, execution_id)
-                        .await
+                    if let Some(mut exec) =
+                        unfinished_execution(repository.as_ref(), &tenant_id_for_task, execution_id)
+                            .await
                     {
                         exec.fail(format!("Execution timed out after {timeout_secs} seconds"));
                         let total_iterations = exec.iterations().len() as u8;
@@ -4344,9 +4650,9 @@ impl StandardExecutionService {
                     )
                     .record(duration_seconds);
                     // Update to failed (generic failure)
-                    if let Ok(Some(mut exec)) = repository
-                        .find_by_id_for_tenant(&tenant_id_for_task, execution_id)
-                        .await
+                    if let Some(mut exec) =
+                        unfinished_execution(repository.as_ref(), &tenant_id_for_task, execution_id)
+                            .await
                     {
                         exec.fail(e.to_string());
                         let total_iterations = exec.iterations().len() as u8;
@@ -4617,6 +4923,7 @@ impl ExecutionService for StandardExecutionService {
             agent.manifest.spec.runtime.model.clone(),
         );
 
+        let execution_timeout_seconds = execution_timeout_seconds(&agent.manifest);
         let resources = if let Some(security) = &agent.manifest.spec.security {
             crate::domain::runtime::ResourceLimits {
                 cpu_millis: Some(security.resources.cpu),
@@ -4852,6 +5159,9 @@ impl ExecutionService for StandardExecutionService {
             workflow_execution_id: None,
         };
 
+        // The supervisor's bound on this execution, recorded so the container
+        // reaper can end it once it has outlived it (ADR-040).
+        child_execution.timeout_seconds = Some(execution_timeout_seconds);
         child_execution.start();
         self.repository
             .save_for_tenant(&tenant_id, &child_execution)
@@ -4929,9 +5239,12 @@ impl ExecutionService for StandardExecutionService {
 
             match result {
                 Ok(final_output) => {
-                    if let Ok(Some(mut exec)) = repository
-                        .find_by_id_for_tenant(&tenant_id_for_task, child_execution_id)
-                        .await
+                    if let Some(mut exec) = unfinished_execution(
+                        repository.as_ref(),
+                        &tenant_id_for_task,
+                        child_execution_id,
+                    )
+                    .await
                     {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
@@ -4960,9 +5273,12 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
-                    if let Ok(Some(mut exec)) = repository
-                        .find_by_id_for_tenant(&tenant_id_for_task, child_execution_id)
-                        .await
+                    if let Some(mut exec) = unfinished_execution(
+                        repository.as_ref(),
+                        &tenant_id_for_task,
+                        child_execution_id,
+                    )
+                    .await
                     {
                         exec.fail(format!("Execution timed out after {timeout_secs} seconds"));
                         let total_iterations = exec.iterations().len() as u8;
@@ -4995,9 +5311,12 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(e) => {
-                    if let Ok(Some(mut exec)) = repository
-                        .find_by_id_for_tenant(&tenant_id_for_task, child_execution_id)
-                        .await
+                    if let Some(mut exec) = unfinished_execution(
+                        repository.as_ref(),
+                        &tenant_id_for_task,
+                        child_execution_id,
+                    )
+                    .await
                     {
                         exec.fail(e.to_string());
                         let total_iterations = exec.iterations().len() as u8;

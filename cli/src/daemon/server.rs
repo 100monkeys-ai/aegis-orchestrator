@@ -980,6 +980,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let agent_container_reaper_runtime = runtime.clone();
     let agent_container_reaper_execution_repo = execution_repo.clone();
+    // The reaper publishes the failure events of an execution it ends
+    // because it outlived its bound (ADR-040, Update of 2026-10-04).
+    let agent_container_reaper_event_bus = event_bus.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         // First tick fires immediately — clean up any orphans left from a prior crash.
@@ -1000,6 +1003,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             match cleanup_orphaned_agent_containers(
                 agent_container_reaper_runtime.clone(),
                 agent_container_reaper_execution_repo.clone(),
+                &agent_container_reaper_event_bus,
                 &mut attempt_states,
             )
             .await

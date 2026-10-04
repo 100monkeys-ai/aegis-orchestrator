@@ -103,9 +103,9 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 current_iteration, max_iterations, final_output, error_message,
                 container_uid, container_gid,
                 started_at, completed_at, parent_execution_id,
-                security_context_name, initiating_user_sub
+                security_context_name, initiating_user_sub, timeout_seconds
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 status = EXCLUDED.status,
@@ -118,7 +118,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 completed_at = EXCLUDED.completed_at,
                 parent_execution_id = EXCLUDED.parent_execution_id,
                 security_context_name = EXCLUDED.security_context_name,
-                initiating_user_sub = EXCLUDED.initiating_user_sub
+                initiating_user_sub = EXCLUDED.initiating_user_sub,
+                timeout_seconds = EXCLUDED.timeout_seconds
             "#,
         )
         .bind(execution.id.0)
@@ -138,6 +139,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(parent_execution_id)
         .bind(&execution.security_context_name)
         .bind(&execution.initiating_user_sub)
+        .bind(execution.timeout_seconds.map(|s| s as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {e}")))?;
@@ -162,7 +164,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message,
-                parent_execution_id, security_context_name, initiating_user_sub
+                parent_execution_id, security_context_name, initiating_user_sub, timeout_seconds
             FROM executions
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -206,6 +208,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
             let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
+            let timeout_seconds: Option<i64> = row.get("timeout_seconds");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -283,6 +286,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 hierarchy,
                 security_context_name,
                 initiating_user_sub,
+                timeout_seconds: timeout_seconds.and_then(|s| u64::try_from(s).ok()),
             }))
         } else {
             Ok(None)
@@ -301,7 +305,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message, parent_execution_id,
-                security_context_name, initiating_user_sub
+                security_context_name, initiating_user_sub, timeout_seconds
             FROM executions
             WHERE tenant_id = $1 AND agent_id = $2
             ORDER BY started_at DESC
@@ -332,6 +336,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
             let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
+            let timeout_seconds: Option<i64> = row.get("timeout_seconds");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -398,6 +403,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 hierarchy,
                 security_context_name,
                 initiating_user_sub,
+                timeout_seconds: timeout_seconds.and_then(|s| u64::try_from(s).ok()),
             });
         }
 
@@ -416,7 +422,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 e.id, e.agent_id, e.input, e.status, e.iterations, e.max_iterations,
                 e.container_uid, e.container_gid,
                 e.started_at, e.completed_at, e.error_message, e.parent_execution_id,
-                e.security_context_name, e.initiating_user_sub
+                e.security_context_name, e.initiating_user_sub, e.timeout_seconds
             FROM executions e
             INNER JOIN workflow_executions we ON e.workflow_execution_id = we.id
             WHERE e.tenant_id = $1 AND we.workflow_id = $2
@@ -447,6 +453,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
             let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
+            let timeout_seconds: Option<i64> = row.get("timeout_seconds");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -513,6 +520,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 hierarchy,
                 security_context_name,
                 initiating_user_sub,
+                timeout_seconds: timeout_seconds.and_then(|s| u64::try_from(s).ok()),
             });
         }
 
@@ -530,7 +538,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message, parent_execution_id,
-                security_context_name, initiating_user_sub
+                security_context_name, initiating_user_sub, timeout_seconds
             FROM executions
             WHERE tenant_id = $1
             ORDER BY started_at DESC
@@ -559,6 +567,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
             let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
+            let timeout_seconds: Option<i64> = row.get("timeout_seconds");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -625,6 +634,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 hierarchy,
                 security_context_name,
                 initiating_user_sub,
+                timeout_seconds: timeout_seconds.and_then(|s| u64::try_from(s).ok()),
             });
         }
         Ok(executions)
@@ -641,7 +651,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, tenant_id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message, parent_execution_id,
-                security_context_name, initiating_user_sub
+                security_context_name, initiating_user_sub, timeout_seconds
             FROM executions
             ORDER BY started_at DESC
             LIMIT $1 OFFSET $2
@@ -670,6 +680,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
             let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
+            let timeout_seconds: Option<i64> = row.get("timeout_seconds");
 
             let tenant_id = TenantId::from_string(&tenant_id_str).map_err(|e| {
                 RepositoryError::Serialization(format!("Invalid tenant_id in database: {e}"))
@@ -740,6 +751,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 hierarchy,
                 security_context_name,
                 initiating_user_sub,
+                timeout_seconds: timeout_seconds.and_then(|s| u64::try_from(s).ok()),
             });
         }
         Ok(executions)
@@ -790,7 +802,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, tenant_id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message,
-                parent_execution_id, security_context_name, initiating_user_sub
+                parent_execution_id, security_context_name, initiating_user_sub, timeout_seconds
             FROM executions
             WHERE id = $1
             "#,
@@ -816,6 +828,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
             let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
+            let timeout_seconds: Option<i64> = row.get("timeout_seconds");
 
             let tenant_id = TenantId::from_string(&tenant_id_str).map_err(|e| {
                 RepositoryError::Serialization(format!("Invalid tenant_id in database: {e}"))
@@ -885,6 +898,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 hierarchy,
                 security_context_name,
                 initiating_user_sub,
+                timeout_seconds: timeout_seconds.and_then(|s| u64::try_from(s).ok()),
             }))
         } else {
             Ok(None)
