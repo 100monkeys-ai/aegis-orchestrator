@@ -160,7 +160,7 @@ impl std::fmt::Display for SealSessionError {
         match self {
             Self::SessionInactive(status) => write!(f, "Session is inactive: {status:?}"),
             Self::SessionExpired => write!(f, "Session has expired"),
-            Self::PolicyViolation(v) => write!(f, "Policy violation: {v:?}"),
+            Self::PolicyViolation(v) => write!(f, "Policy violation: {v}"),
             Self::MalformedPayload(msg) => write!(f, "Malformed MCP payload: {msg}"),
             Self::ReplayProtectionFailed(msg) => write!(f, "Replay protection failed: {msg}"),
             Self::SignatureVerificationFailed(e) => {
@@ -486,6 +486,22 @@ mod tests {
         assert!(
             printed.contains("SealSession"),
             "Debug lost the type: {printed}"
+        );
+    }
+
+    /// AEGIS operations/known-defects-7: after zaru.operator.release an
+    /// operator-only tool call was answered 400 with the refusal printed in
+    /// Rust's Debug form. The refusal names the tool in words, the form
+    /// `PolicyViolation`'s own Display gives it.
+    #[test]
+    fn a_policy_refusal_names_the_tool_in_words() {
+        let refusal = SealSessionError::PolicyViolation(PolicyViolation::ToolNotAllowed {
+            tool_name: "aegis.system.info".to_string(),
+            allowed_tools: vec!["zaru.*".to_string()],
+        });
+        assert_eq!(
+            refusal.to_string(),
+            "Policy violation: tool 'aegis.system.info' is not allowed; permitted tools: [zaru.*]"
         );
     }
 }
