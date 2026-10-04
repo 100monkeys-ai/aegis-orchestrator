@@ -568,7 +568,12 @@ impl ToolInvocationService {
                 ))
             })?;
 
-        // Extract the caller identity from the parent execution's initiating_user_sub.
+        // Extract the caller identity from the parent execution's initiating_user_sub:
+        // the person the execution acts for, or none. It is never a service
+        // account's subject: a workflow-started agent state records the
+        // workflow's starter, and a service account with no workflow records
+        // none (AEGIS ADR-132's Update, G2; `execution::person_sub`). A row
+        // written before that rule may still hold the worker's subject.
         let caller_identity: Option<crate::domain::iam::UserIdentity> = execution
             .initiating_user_sub
             .as_ref()

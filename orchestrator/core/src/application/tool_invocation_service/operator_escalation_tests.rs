@@ -404,6 +404,7 @@ async fn harness_with(role_lookup: Option<Arc<StubRoleLookup>>) -> Harness {
                 final_output: None,
                 started_at: chrono::Utc::now(),
                 last_transition_at: chrono::Utc::now(),
+                initiating_user_sub: None,
             },
         )
         .await

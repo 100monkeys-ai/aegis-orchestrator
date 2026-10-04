@@ -502,6 +502,10 @@ pub struct StandardExecutionService {
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
     /// Optional quota enforcement service (ADR-056). Checks concurrent execution limits.
     quota_service: Option<Arc<crate::application::tenant_quota::TenantQuotaService>>,
+    /// The workflow executions, read when a service account starts an agent
+    /// state of a workflow, so the agent acts for the person who started the
+    /// workflow (AEGIS ADR-132's Update, G2). `None`: such a run has no user.
+    workflow_executions: Option<Arc<dyn crate::domain::repository::WorkflowExecutionRepository>>,
     /// Where each validation judge alias's room is read (AEGIS ADR-131 U19);
     /// `None` bounds every judge's prompt by the stated default.
     judge_context: Option<Arc<dyn crate::domain::goal::JudgeContextSource>>,
@@ -826,6 +830,7 @@ impl StandardExecutionService {
             output_handler_service: None,
             quota_service: None,
             judge_context: None,
+            workflow_executions: None,
         }
     }
 
@@ -871,6 +876,47 @@ impl StandardExecutionService {
             tenant_id.clone(),
             self.judge_context.clone(),
         )))
+    }
+
+    /// The person an agent execution acts for (AEGIS ADR-132's Update, G2;
+    /// the coordinator's settlement (d)): the caller when the caller is a
+    /// person; when it is a service account (the Temporal worker running an
+    /// agent state), the person who started the workflow execution named by
+    /// `workflow_execution_id` in the same tenant; otherwise none. A service
+    /// account's own subject is never the acting user.
+    async fn acting_user_sub(
+        &self,
+        identity: Option<&UserIdentity>,
+        tenant_id: &TenantId,
+        workflow_execution_id: Option<uuid::Uuid>,
+    ) -> Result<Option<String>> {
+        if let Some(sub) = person_sub(identity) {
+            return Ok(Some(sub));
+        }
+        let (Some(workflow_execution_id), Some(workflow_executions)) =
+            (workflow_execution_id, &self.workflow_executions)
+        else {
+            return Ok(None);
+        };
+        let workflow_execution = workflow_executions
+            .find_by_id_for_tenant(
+                tenant_id,
+                crate::domain::execution::ExecutionId(workflow_execution_id),
+            )
+            .await
+            .context("reading the workflow execution an agent state runs in")?;
+        Ok(workflow_execution.and_then(|w| w.initiating_user_sub))
+    }
+
+    /// Read the workflow executions when a service account starts an agent
+    /// state of a workflow, so the agent acts for the workflow's starter
+    /// (AEGIS ADR-132's Update, G2).
+    pub fn with_workflow_executions(
+        mut self,
+        repository: Arc<dyn crate::domain::repository::WorkflowExecutionRepository>,
+    ) -> Self {
+        self.workflow_executions = Some(repository);
+        self
     }
 
     /// Attach a quota enforcement service for per-tenant concurrent execution limits (ADR-056).
@@ -972,6 +1018,19 @@ impl StandardExecutionService {
         self.output_handler_service = Some(service);
         self
     }
+}
+
+/// The subject of `identity` when it is a person (a consumer, a tenant member
+/// or an operator), and `None` for a service account or no identity: a
+/// service account never becomes the user an execution acts for (AEGIS
+/// ADR-132's Update, G2).
+pub(crate) fn person_sub(identity: Option<&UserIdentity>) -> Option<String> {
+    identity.and_then(|id| match id.identity_kind {
+        crate::domain::iam::IdentityKind::ServiceAccount { .. } => None,
+        crate::domain::iam::IdentityKind::ConsumerUser { .. }
+        | crate::domain::iam::IdentityKind::Operator { .. }
+        | crate::domain::iam::IdentityKind::TenantUser { .. } => Some(id.sub.clone()),
+    })
 }
 
 #[cfg(test)]
@@ -2297,6 +2356,170 @@ mod tests {
             format!("/aegis/volumes/zaru-consumer/{workspace}")
         );
         assert_eq!(spawned.workflow_execution_id, Some(workflow_execution_id));
+    }
+
+    fn caller(sub: &str, identity_kind: crate::domain::iam::IdentityKind) -> UserIdentity {
+        UserIdentity {
+            sub: sub.to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind,
+        }
+    }
+
+    fn temporal_worker() -> UserIdentity {
+        caller(
+            "service-account-aegis-temporal-worker",
+            crate::domain::iam::IdentityKind::ServiceAccount {
+                client_id: "aegis-temporal-worker".to_string(),
+            },
+        )
+    }
+
+    /// A workflow execution of `tenant_id` started by `starter`.
+    async fn workflow_started_by(
+        tenant_id: &CoreTenantId,
+        starter: Option<&str>,
+    ) -> (
+        Arc<crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository>,
+        uuid::Uuid,
+    ) {
+        let id = uuid::Uuid::new_v4();
+        let repository = Arc::new(
+            crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new(),
+        );
+        let now = Utc::now();
+        crate::domain::repository::WorkflowExecutionRepository::save_for_tenant(
+            repository.as_ref(),
+            tenant_id,
+            &crate::domain::workflow::WorkflowExecution {
+                id: crate::domain::execution::ExecutionId(id),
+                workflow_id: crate::domain::workflow::WorkflowId::new(),
+                tenant_id: tenant_id.clone(),
+                status: crate::domain::execution::ExecutionStatus::Running,
+                current_state: crate::domain::workflow::StateName::new("START").unwrap(),
+                blackboard: crate::domain::workflow::Blackboard::new(),
+                input: serde_json::json!({}),
+                state_outputs: HashMap::new(),
+                final_output: None,
+                started_at: now,
+                last_transition_at: now,
+                initiating_user_sub: starter.map(str::to_string),
+            },
+        )
+        .await
+        .unwrap();
+        (repository, id)
+    }
+
+    /// AEGIS ADR-132's Update, G2 (the coordinator's settlement (d)): the
+    /// Temporal worker starts a workflow's agent state with its own service
+    /// account; the agent acts for the person who started the workflow.
+    #[tokio::test]
+    async fn an_agent_state_the_worker_starts_acts_for_the_person_who_started_the_workflow() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("executor", None, None);
+        let (workflows, workflow_execution_id) =
+            workflow_started_by(&tenant_id, Some("u-starter")).await;
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        let service = service.with_workflow_executions(workflows);
+
+        let id = service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), workflow_execution_id),
+                "test-ctx".to_string(),
+                Some(&temporal_worker()),
+            )
+            .await
+            .unwrap();
+
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert_eq!(execution.initiating_user_sub.as_deref(), Some("u-starter"));
+    }
+
+    /// A service account is never the user an execution acts for: with no
+    /// workflow (or one started by no person) the execution has no user, so
+    /// a tool that needs one is refused, never run as the worker.
+    #[tokio::test]
+    async fn a_service_accounts_subject_is_never_the_acting_user() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("executor", None, None);
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        let mut input = workflow_step_input(VolumeId::new(), uuid::Uuid::new_v4());
+        input.workflow_execution_id = None;
+
+        let id = service
+            .start_execution(
+                agent.id,
+                input,
+                "test-ctx".to_string(),
+                Some(&temporal_worker()),
+            )
+            .await
+            .unwrap();
+
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert_eq!(execution.initiating_user_sub, None);
+    }
+
+    /// A workflow execution of another tenant, or one written before
+    /// migration 041 (no starter), gives the agent no user.
+    #[tokio::test]
+    async fn a_workflow_of_another_tenant_or_with_no_starter_gives_no_user() {
+        let tenant_id = CoreTenantId::consumer();
+        let other = CoreTenantId::new("other-tenant".to_string()).unwrap();
+        let agent = make_agent("executor", None, None);
+        for (workflows, workflow_execution_id) in [
+            workflow_started_by(&other, Some("u-elsewhere")).await,
+            workflow_started_by(&tenant_id, None).await,
+        ] {
+            let (service, _runtime, _gw) =
+                workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+            let service = service.with_workflow_executions(workflows);
+            let id = service
+                .start_execution(
+                    agent.id,
+                    workflow_step_input(VolumeId::new(), workflow_execution_id),
+                    "test-ctx".to_string(),
+                    Some(&temporal_worker()),
+                )
+                .await
+                .unwrap();
+            let execution = service.get_execution_unscoped(id).await.unwrap();
+            assert_eq!(execution.initiating_user_sub, None);
+        }
+    }
+
+    /// A person who starts an agent is the user it acts for, as before.
+    #[tokio::test]
+    async fn a_person_who_starts_an_agent_is_its_acting_user() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("executor", None, None);
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        let person = caller(
+            "u-person",
+            crate::domain::iam::IdentityKind::ConsumerUser {
+                zaru_tier: crate::domain::iam::ZaruTier::Free,
+                tenant_id: tenant_id.clone(),
+            },
+        );
+        let id = service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), uuid::Uuid::new_v4()),
+                "test-ctx".to_string(),
+                Some(&person),
+            )
+            .await
+            .unwrap();
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert_eq!(execution.initiating_user_sub.as_deref(), Some("u-person"));
     }
 
     /// T2: a manifest volume at the workflow workspace's mount path is not
@@ -4050,8 +4273,11 @@ impl StandardExecutionService {
         };
         let execution_id = execution.id;
 
-        // Persist the initiating user's sub for later recovery by the dispatch gateway.
-        execution.initiating_user_sub = identity.map(|id| id.sub.clone());
+        // Persist the acting person's sub for later recovery by the dispatch
+        // gateway: never a service account's (AEGIS ADR-132's Update, G2).
+        execution.initiating_user_sub = self
+            .acting_user_sub(identity, &tenant_id, persisted_input.workflow_execution_id)
+            .await?;
 
         // 3. Save initial state
         self.repository

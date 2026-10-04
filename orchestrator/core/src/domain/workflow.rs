@@ -1338,6 +1338,14 @@ pub struct WorkflowExecution {
 
     /// Last state transition at
     pub last_transition_at: DateTime<Utc>,
+
+    /// The subject of the person who started this workflow execution, if a
+    /// person did: never a service account's. The agents its states run act
+    /// for this person (AEGIS ADR-132's Update, G2: a workflow-started run
+    /// carries its owner). `None` for a system-started workflow and for a
+    /// row written before migration 041.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiating_user_sub: Option<String>,
 }
 
 impl WorkflowExecution {
@@ -1357,6 +1365,7 @@ impl WorkflowExecution {
             final_output: None,
             started_at: now,
             last_transition_at: now,
+            initiating_user_sub: None,
         }
     }
 

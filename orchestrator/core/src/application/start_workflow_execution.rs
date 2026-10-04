@@ -369,6 +369,10 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         let execution_id = ExecutionId(uuid::Uuid::new_v4());
         let mut workflow_execution =
             WorkflowExecution::new(&workflow, execution_id, request.input.clone());
+        // The person who started it, never a service account: the agents its
+        // states run act for this person (AEGIS ADR-132's Update, G2).
+        workflow_execution.initiating_user_sub =
+            crate::application::execution::person_sub(identity);
 
         // Step 3: Merge initial blackboard if provided
         if let Some(blackboard_map) = normalized_blackboard.clone() {
@@ -737,6 +741,86 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn identity(sub: &str, identity_kind: crate::domain::iam::IdentityKind) -> UserIdentity {
+        UserIdentity {
+            sub: sub.to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind,
+        }
+    }
+
+    async fn started_by(identity: Option<&UserIdentity>) -> Option<String> {
+        let workflow = build_test_workflow("outreach");
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
+        let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-1"));
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            execution_repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(engine))),
+            Arc::new(EventBus::new(32)),
+        );
+        let started = service
+            .start_execution_for_tenant(
+                &TenantId::consumer(),
+                StartWorkflowExecutionRequest {
+                    workflow_id: workflow.metadata.name.clone(),
+                    input: json!({}),
+                    blackboard: None,
+                    version: None,
+                    tenant_id: Some(TenantId::consumer()),
+                    security_context_name: None,
+                    intent: None,
+                },
+                identity,
+            )
+            .await
+            .unwrap();
+        execution_repo
+            .find_by_id_for_tenant(
+                &TenantId::consumer(),
+                ExecutionId::from_string(&started.execution_id).unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("the workflow execution is stored")
+            .initiating_user_sub
+    }
+
+    /// AEGIS ADR-132's Update, G2: a workflow execution records the person
+    /// who started it, so the agents its states run act for that person; a
+    /// service account or no caller records none.
+    #[tokio::test]
+    async fn a_workflow_execution_records_the_person_who_started_it_and_never_a_service_account() {
+        let person = identity(
+            "u-starter",
+            crate::domain::iam::IdentityKind::ConsumerUser {
+                zaru_tier: crate::domain::iam::ZaruTier::Pro,
+                tenant_id: TenantId::consumer(),
+            },
+        );
+        assert_eq!(
+            started_by(Some(&person)).await.as_deref(),
+            Some("u-starter")
+        );
+
+        let worker = identity(
+            "service-account-aegis-temporal-worker",
+            crate::domain::iam::IdentityKind::ServiceAccount {
+                client_id: "aegis-temporal-worker".to_string(),
+            },
+        );
+        assert_eq!(started_by(Some(&worker)).await, None);
+        assert_eq!(started_by(None).await, None);
     }
 
     #[tokio::test]

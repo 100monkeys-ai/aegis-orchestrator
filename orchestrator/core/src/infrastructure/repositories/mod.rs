@@ -1021,10 +1021,16 @@ impl crate::domain::repository::WorkflowExecutionRepository
         execution: &crate::domain::workflow::WorkflowExecution,
     ) -> Result<(), RepositoryError> {
         let mut executions = self.executions.write().unwrap();
-        executions
-            .entry(tenant_id.clone())
-            .or_default()
-            .insert(execution.id, execution.clone());
+        let tenant_executions = executions.entry(tenant_id.clone()).or_default();
+        let mut stored = execution.clone();
+        // The starter is set once and never cleared, as the Postgres
+        // repository's COALESCE keeps it (migration 041).
+        if let Some(previous) = tenant_executions.get(&execution.id) {
+            if stored.initiating_user_sub.is_none() {
+                stored.initiating_user_sub = previous.initiating_user_sub.clone();
+            }
+        }
+        tenant_executions.insert(execution.id, stored);
         Ok(())
     }
 
@@ -1637,6 +1643,7 @@ mod tests {
             final_output: None,
             started_at: chrono::DateTime::from_timestamp(started_secs, 0).unwrap(),
             last_transition_at: chrono::DateTime::from_timestamp(started_secs, 0).unwrap(),
+            initiating_user_sub: None,
         }
     }
 

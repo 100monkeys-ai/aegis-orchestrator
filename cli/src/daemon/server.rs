@@ -1544,7 +1544,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     .with_nfs_gateway(nfs_gateway.clone())
     .with_runtime_registry(runtime_registry.clone())
     .with_tool_router(tool_router.clone())
-    .with_judge_context(judge_context.clone());
+    .with_judge_context(judge_context.clone())
+    .with_workflow_executions(workflow_execution_repo.clone());
 
     if let Some(c_client) = cortex_client.clone() {
         execution_service_builder = execution_service_builder.with_cortex_client(c_client);

@@ -108,7 +108,8 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 input_params, status,
                 current_state, blackboard, state_outputs, state_history,
                 final_output,
-                started_at, last_transition_at, completed_at
+                started_at, last_transition_at, completed_at,
+                initiating_user_sub
             )
             VALUES (
                 $1, $2, $3, $4, $5,
@@ -116,7 +117,8 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 $8, $9, $10, $11,
                 $12,
                 $13, $14,
-                CASE WHEN $7 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE NULL END
+                CASE WHEN $7 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE NULL END,
+                $15
             )
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
@@ -131,7 +133,11 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 state_history = workflow_executions.state_history || EXCLUDED.state_history,
                 final_output = EXCLUDED.final_output,
                 last_transition_at = EXCLUDED.last_transition_at,
-                completed_at = EXCLUDED.completed_at
+                completed_at = EXCLUDED.completed_at,
+                initiating_user_sub = COALESCE(
+                    workflow_executions.initiating_user_sub,
+                    EXCLUDED.initiating_user_sub
+                )
             "#,
         )
         .bind(execution.id.0)
@@ -148,6 +154,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         .bind(final_output_json)
         .bind(execution.started_at)
         .bind(execution.last_transition_at)
+        .bind(&execution.initiating_user_sub)
         .execute(&self.pool)
         .await
         .map_err(|e| {
@@ -205,7 +212,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
                 final_output,
-                started_at, last_transition_at
+                started_at, last_transition_at, initiating_user_sub
             FROM workflow_executions
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -245,6 +252,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "pending" => ExecutionStatus::Pending,
@@ -285,6 +293,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 final_output,
                 started_at,
                 last_transition_at,
+                initiating_user_sub,
             }))
         } else {
             Ok(None)
@@ -326,7 +335,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
                 final_output,
-                started_at, last_transition_at
+                started_at, last_transition_at, initiating_user_sub
             FROM workflow_executions
             WHERE tenant_id = $1 AND status = 'running'
             "#,
@@ -348,6 +357,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "running" => ExecutionStatus::Running,
@@ -383,6 +393,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 final_output,
                 started_at,
                 last_transition_at,
+                initiating_user_sub,
             });
         }
         Ok(executions)
@@ -401,7 +412,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
                 final_output,
-                started_at, last_transition_at
+                started_at, last_transition_at, initiating_user_sub
             FROM workflow_executions
             WHERE tenant_id = $1 AND workflow_id = $2
             ORDER BY started_at DESC
@@ -428,6 +439,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "pending" => ExecutionStatus::Pending,
@@ -467,6 +479,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 final_output,
                 started_at,
                 last_transition_at,
+                initiating_user_sub,
             });
         }
 
@@ -595,7 +608,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
                 final_output,
-                started_at, last_transition_at
+                started_at, last_transition_at, initiating_user_sub
             FROM workflow_executions
             WHERE tenant_id = $1
             ORDER BY started_at DESC
@@ -621,6 +634,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "pending" => ExecutionStatus::Pending,
@@ -660,6 +674,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 final_output,
                 started_at,
                 last_transition_at,
+                initiating_user_sub,
             });
         }
         Ok(executions)
@@ -676,7 +691,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 id, tenant_id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
                 final_output,
-                started_at, last_transition_at
+                started_at, last_transition_at, initiating_user_sub
             FROM workflow_executions
             ORDER BY started_at DESC
             LIMIT $1 OFFSET $2
@@ -701,6 +716,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let tenant_id = TenantId::from_string(&tenant_id_str).map_err(|e| {
                 RepositoryError::Serialization(format!("Invalid tenant_id in database: {e}"))
@@ -744,6 +760,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 final_output,
                 started_at,
                 last_transition_at,
+                initiating_user_sub,
             });
         }
         Ok(executions)
