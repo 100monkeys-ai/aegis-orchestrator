@@ -64,7 +64,7 @@ use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use crate::domain::repository::WorkflowExecutionRepository;
 use crate::domain::shared_kernel::VolumeId;
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::{ExecutionLanguage, WorkflowId};
+use crate::domain::workflow::{ExecutionLanguage, StateName, WorkflowId};
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -757,6 +757,50 @@ impl TemporalEventListener {
         Ok(())
     }
 
+    /// Move a running workflow execution to the state the worker entered, so
+    /// the row's `current_state` and `last_transition_at` follow the FSM as
+    /// ADR-015's engine saves them on every transition. The worker's terminal
+    /// events name no state, so the row ends at the last state entered. An
+    /// execution already terminal is left alone: a late event changes nothing.
+    async fn record_state_entered(
+        &self,
+        execution_id: ExecutionId,
+        state_name: &str,
+    ) -> Result<()> {
+        let tenant_id = self
+            .execution_repository
+            .find_tenant_id_by_execution(execution_id)
+            .await
+            .context("Failed to resolve workflow execution tenant")?
+            .ok_or_else(|| anyhow!("Workflow execution not found: {}", execution_id.0))?;
+        let mut execution = self
+            .execution_repository
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .context("Failed to load workflow execution")?
+            .ok_or_else(|| anyhow!("Workflow execution not found: {}", execution_id.0))?;
+        if matches!(
+            execution.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+        ) {
+            tracing::info!(
+                execution_id = %execution_id.0,
+                status = ?execution.status,
+                state_name = %state_name,
+                "Workflow execution already terminal; state entered changes nothing"
+            );
+            return Ok(());
+        }
+        let state = StateName::new(state_name)
+            .context("Invalid state_name in WorkflowStateEntered event")?;
+        execution.transition_to(state);
+        self.execution_repository
+            .save_for_tenant(&tenant_id, &execution)
+            .await
+            .context("Failed to persist the state entered")?;
+        Ok(())
+    }
+
     /// Process incoming event from Temporal worker
     ///
     /// # Arguments
@@ -969,6 +1013,11 @@ impl TemporalEventListener {
             | WorkflowEvent::WorkflowExecutionCancelled { .. } => {
                 self.reconcile_terminal_workflow_event(execution_id_obj, &payload, &domain_event)
                     .await?;
+            }
+            WorkflowEvent::WorkflowStateEntered { state_name, .. } => {
+                self.record_state_entered(execution_id_obj, state_name)
+                    .await?;
+                self.event_bus.publish_workflow_event(domain_event.clone());
             }
             _ => self.event_bus.publish_workflow_event(domain_event.clone()),
         }
@@ -1700,5 +1749,176 @@ mod tests {
             receiver.try_recv().is_err(),
             "no second terminal event is published"
         );
+    }
+
+    /// One event as the worker emits it (`aegis-temporal-worker` `ad1ba6c`,
+    /// `src/workflows/aegis-workflow.ts`, `emit`): the common fields and the
+    /// event's own extra fields, nothing else.
+    fn worker_payload(
+        execution_id: ExecutionId,
+        workflow: &Workflow,
+        sequence: i64,
+        event_type: &str,
+        extra: serde_json::Value,
+    ) -> TemporalEventPayload {
+        let mut body = json!({
+            "event_type": event_type,
+            "execution_id": execution_id.to_string(),
+            "temporal_sequence_number": sequence,
+            "workflow_id": workflow.id.to_string(),
+            "timestamp": "2026-10-04T06:00:00.000Z",
+        });
+        for (key, value) in extra.as_object().expect("extra fields are an object") {
+            body[key] = value.clone();
+        }
+        serde_json::from_value(body).expect("the worker's payload deserializes")
+    }
+
+    /// AEGIS operations/known-defects-7: `aegis.execute.wait` answered the
+    /// initial state and `last_transition_at` equal to `started_at` for a
+    /// completed execution, because no state the worker entered reached the
+    /// row. Each WorkflowStateEntered moves the row (ADR-015, the engine's
+    /// step 5), and the terminal event, which names no state, leaves it at the
+    /// last state entered.
+    #[tokio::test]
+    async fn a_completed_execution_reports_the_last_state_the_worker_entered() {
+        let tenant_id = TenantId::from_string("tenant-blue").unwrap();
+        let (workflow, execution_id, repo) = running_execution(&tenant_id).await;
+        let started_at = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let listener = TemporalEventListener::new(Arc::new(EventBus::new(16)), repo.clone());
+
+        for (sequence, event_type, extra) in [
+            (0, "WorkflowExecutionStarted", json!({})),
+            (1, "WorkflowStateEntered", json!({"state_name": "START"})),
+            (
+                2,
+                "WorkflowStateExited",
+                json!({"state_name": "START", "output": {"status": "success"}}),
+            ),
+            (3, "WorkflowStateEntered", json!({"state_name": "END"})),
+            (
+                4,
+                "WorkflowStateExited",
+                json!({"state_name": "END", "output": {"status": "success"}}),
+            ),
+            (
+                5,
+                "WorkflowExecutionCompleted",
+                json!({"final_blackboard": {"END": {"status": "success"}}}),
+            ),
+        ] {
+            listener
+                .handle_event(worker_payload(
+                    execution_id,
+                    &workflow,
+                    sequence,
+                    event_type,
+                    extra,
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("{event_type} is handled: {e}"));
+        }
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status,
+            crate::domain::execution::ExecutionStatus::Completed
+        );
+        assert_eq!(saved.current_state.as_str(), "END");
+        assert!(
+            saved.last_transition_at > started_at,
+            "last_transition_at {} is after started_at {started_at}",
+            saved.last_transition_at
+        );
+    }
+
+    /// A running execution reports the state it is in.
+    #[tokio::test]
+    async fn a_state_entered_moves_a_running_execution() {
+        let tenant_id = TenantId::from_string("tenant-blue").unwrap();
+        let (workflow, execution_id, repo) = running_execution(&tenant_id).await;
+        let listener = TemporalEventListener::new(Arc::new(EventBus::new(16)), repo.clone());
+
+        listener
+            .handle_event(worker_payload(
+                execution_id,
+                &workflow,
+                3,
+                "WorkflowStateEntered",
+                json!({"state_name": "END"}),
+            ))
+            .await
+            .expect("the state entered is handled");
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status,
+            crate::domain::execution::ExecutionStatus::Running
+        );
+        assert_eq!(saved.current_state.as_str(), "END");
+    }
+
+    /// A row already finished is left alone: a WorkflowStateEntered that
+    /// arrives after the terminal event changes neither its state nor its
+    /// time, and is still recorded and published.
+    #[tokio::test]
+    async fn a_state_entered_after_the_end_leaves_a_finished_execution_alone() {
+        let tenant_id = TenantId::from_string("tenant-blue").unwrap();
+        let (workflow, execution_id, repo) = running_execution(&tenant_id).await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let listener = TemporalEventListener::new(event_bus.clone(), repo.clone());
+        listener
+            .handle_event(worker_payload(
+                execution_id,
+                &workflow,
+                5,
+                "WorkflowExecutionCompleted",
+                json!({"final_blackboard": {}}),
+            ))
+            .await
+            .expect("the completion is handled");
+        let finished = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut receiver = event_bus.subscribe();
+
+        listener
+            .handle_event(worker_payload(
+                execution_id,
+                &workflow,
+                6,
+                "WorkflowStateEntered",
+                json!({"state_name": "END"}),
+            ))
+            .await
+            .expect("a late state entered is not an error");
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.current_state, finished.current_state);
+        assert_eq!(saved.last_transition_at, finished.last_transition_at);
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            DomainEvent::Workflow(WorkflowEvent::WorkflowStateEntered { .. })
+        ));
     }
 }
