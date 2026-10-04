@@ -647,7 +647,7 @@ spec:
   # set in extra_authorization_params. client_id and client_secret take the
   # env:VAR_NAME form; an unset variable fails startup.
   # oauth_providers:
-  #   - provider: google_mail
+  #   - provider: google
   #     authorization_url: "https://accounts.google.com/o/oauth2/v2/auth"
   #     token_url: "https://oauth2.googleapis.com/token"
   #     client_id: "env:GOOGLE_MAIL_OAUTH_CLIENT_ID"

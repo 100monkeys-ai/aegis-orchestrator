@@ -1052,13 +1052,16 @@ impl GitRepoService {
     }
 }
 
-fn default_username_for(cb: &UserCredentialBinding) -> String {
-    use crate::domain::credential::CredentialProvider;
-    match &cb.provider {
-        CredentialProvider::GitHub => "x-access-token".to_string(),
-        CredentialProvider::Custom(_) => "x-access-token".to_string(),
-        _ => "x-access-token".to_string(),
-    }
+/// The HTTPS username a git credential uses when its secret stores none (a
+/// `username` field in OpenBao, read first): `x-access-token`, which GitHub
+/// takes for a token and other hosts ignore beside one. It is the same for
+/// every provider, as it was when the providers were matched by name; no
+/// provider name is known here (AEGIS ADR-125, Update of 2026-10-04,
+/// clause 1).
+const DEFAULT_GIT_USERNAME: &str = "x-access-token";
+
+fn default_username_for(_cb: &UserCredentialBinding) -> String {
+    DEFAULT_GIT_USERNAME.to_string()
 }
 
 // ============================================================================
@@ -1430,6 +1433,48 @@ fn blocking_diff(target_dir: &std::path::Path, staged: bool) -> Result<String, G
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An existing GitHub or GitLab binding (a GitLab one was stored as
+    /// `custom:gitlab` and reads as `gitlab`) clones with the username it
+    /// had before the provider arms were removed: `x-access-token`, unless
+    /// its secret stores a `username` (AEGIS ADR-125, Update of 2026-10-04,
+    /// clause 1; the coordinator's correction C1).
+    #[test]
+    fn a_git_binding_keeps_its_default_username_whatever_its_provider() {
+        use crate::domain::credential::{
+            CredentialMetadata, CredentialProvider, CredentialScope, CredentialStatus,
+            CredentialType,
+        };
+        use crate::domain::secrets::SecretPath;
+        for provider in ["github", "gitlab", "bitbucket", "stripe"] {
+            let binding = UserCredentialBinding {
+                id: crate::domain::credential::CredentialBindingId::new(),
+                owner_user_id: "user-1".to_string(),
+                tenant_id: TenantId::consumer(),
+                credential_type: CredentialType::Secret,
+                provider: CredentialProvider::new(provider),
+                secret_path: SecretPath::new("aegis-system", "kv", "users/x/credentials/y"),
+                scope: CredentialScope::Personal,
+                status: CredentialStatus::Active,
+                metadata: CredentialMetadata {
+                    label: "pat".to_string(),
+                    tags: None,
+                    service_url: None,
+                    external_account_id: None,
+                    oauth_scopes: None,
+                    mailbox: None,
+                },
+                grants: Vec::new(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            assert_eq!(
+                default_username_for(&binding),
+                "x-access-token",
+                "{provider}"
+            );
+        }
+    }
 
     #[test]
     fn create_git_repo_command_debug_does_not_print_the_url_credential() {

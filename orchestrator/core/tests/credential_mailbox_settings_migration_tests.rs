@@ -156,7 +156,7 @@ async fn migration_035_keeps_existing_rows_and_stores_mailbox_settings() {
         .unwrap()
         .expect("existing row reads back");
     assert_eq!(read.credential_type, CredentialType::Secret);
-    assert_eq!(read.provider, CredentialProvider::OpenAI);
+    assert_eq!(read.provider, CredentialProvider::new("openai"));
     assert_eq!(read.metadata.label, "My key");
     assert_eq!(read.metadata.external_account_id.as_deref(), Some("acct-1"));
     assert!(read.metadata.mailbox.is_none());
@@ -164,7 +164,7 @@ async fn migration_035_keeps_existing_rows_and_stores_mailbox_settings() {
     // An imap mailbox stores and reads back its settings and its names.
     let imap = binding(
         &tenant,
-        CredentialProvider::Imap,
+        CredentialProvider::imap(),
         CredentialMetadata {
             label: "outreach@example.test".to_string(),
             tags: None,
@@ -184,13 +184,13 @@ async fn migration_035_keeps_existing_rows_and_stores_mailbox_settings() {
     assert_eq!(raw, ("mailbox".to_string(), "imap".to_string()));
     let read = repo.find_by_id(&imap.id).await.unwrap().unwrap();
     assert_eq!(read.credential_type, CredentialType::Mailbox);
-    assert_eq!(read.provider, CredentialProvider::Imap);
+    assert_eq!(read.provider, CredentialProvider::imap());
     assert_eq!(read.metadata.mailbox, Some(imap_settings()));
 
-    // A google_mail mailbox reads back as its own provider, never Custom.
+    // A google_mail row reads back as the string it is.
     let google = binding(
         &tenant,
-        CredentialProvider::GoogleMail,
+        CredentialProvider::new("google_mail"),
         CredentialMetadata {
             label: "jeshua@100monkeys.example".to_string(),
             tags: None,
@@ -208,7 +208,7 @@ async fn migration_035_keeps_existing_rows_and_stores_mailbox_settings() {
         .unwrap();
     assert_eq!(raw, "google_mail");
     let read = repo.find_by_id(&google.id).await.unwrap().unwrap();
-    assert_eq!(read.provider, CredentialProvider::GoogleMail);
+    assert_eq!(read.provider.as_str(), "google_mail");
     assert!(read.metadata.mailbox.is_none());
 
     drop_schema(&pool, &schema).await;

@@ -1895,7 +1895,7 @@ mod tests {
             binding_id,
             owner_user_id: "user-1".to_string(),
             tenant_id: tenant_id.clone(),
-            provider: CredentialProvider::OpenAI,
+            provider: CredentialProvider::new("openai"),
             credential_type: CredentialType::Secret,
         });
 

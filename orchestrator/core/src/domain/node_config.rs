@@ -248,7 +248,7 @@ pub struct NodeConfigSpec {
 /// [`SensitiveString`] so the configuration prints it redacted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthProviderEntry {
-    /// The provider's name as credential bindings carry it, e.g. `google_mail`.
+    /// The provider's name as credential bindings carry it, e.g. `google`.
     pub provider: String,
     /// The provider's authorization endpoint; HTTPS. A URL can carry a
     /// credential, so it prints redacted.

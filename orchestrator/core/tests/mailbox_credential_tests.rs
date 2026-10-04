@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Mailbox connections, AEGIS ADR-125 D1 to D3.
 //!
-//! - D1: the type `mailbox`, the providers `google_mail` and `imap`, and an
-//!   `imap` binding created only after a live IMAP and SMTP check, run here
+//! - D1: the type `mailbox` and the provider `imap`, and an `imap` binding created only after a live IMAP and SMTP check, run here
 //!   against loopback stand-ins (`support/mail_standins.rs`).
 //! - D2: the OAuth provider registry built from the node configuration's
 //!   `oauth_providers` block, and the authorization URL carrying `scope` and
@@ -195,29 +194,21 @@ fn credential_error(err: &anyhow::Error) -> &CredentialError {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mailbox_type_and_both_providers_serialise_by_their_adr_names() {
+fn the_mailbox_type_and_a_provider_serialise_by_their_names() {
     assert_eq!(
         serde_json::to_string(&CredentialType::Mailbox).unwrap(),
         "\"mailbox\""
     );
-    assert_eq!(
-        serde_json::to_string(&CredentialProvider::GoogleMail).unwrap(),
-        "\"google_mail\""
-    );
-    assert_eq!(
-        serde_json::to_string(&CredentialProvider::Imap).unwrap(),
-        "\"imap\""
-    );
-    assert_eq!(CredentialProvider::GoogleMail.to_string(), "google_mail");
-    assert_eq!(CredentialProvider::Imap.to_string(), "imap");
-    assert_eq!(
-        CredentialProvider::from_name("google_mail"),
-        CredentialProvider::GoogleMail
-    );
-    assert_eq!(
-        CredentialProvider::from_name("imap"),
-        CredentialProvider::Imap
-    );
+    // A provider is the registry's string (ADR-125, Update of 2026-10-04,
+    // clause 1); `imap` is the protocol's settings form.
+    for name in ["google", "google_mail", "imap", "slack"] {
+        assert_eq!(
+            serde_json::to_string(&CredentialProvider::new(name)).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(CredentialProvider::new(name).to_string(), name);
+    }
+    assert_eq!(CredentialProvider::imap(), CredentialProvider::new("imap"));
     assert_eq!(
         serde_json::to_string(&MailSecurity::Starttls).unwrap(),
         "\"starttls\""
@@ -250,7 +241,7 @@ async fn imap_mailbox_is_created_after_both_standins_accept_and_its_password_is_
             .expect("both stand-ins accept, so the binding is created");
 
         assert_eq!(binding.credential_type, CredentialType::Mailbox);
-        assert_eq!(binding.provider, CredentialProvider::Imap);
+        assert_eq!(binding.provider, CredentialProvider::imap());
         assert_eq!(binding.status, CredentialStatus::Active);
         let stored_settings = binding.metadata.mailbox.clone().expect("mailbox settings");
         assert_eq!(stored_settings.imap_port, imap.port());
@@ -429,7 +420,7 @@ spec:
     id: "node-1"
     type: orchestrator
   oauth_providers:
-    - provider: google_mail
+    - provider: google
       authorization_url: "https://accounts.example/o/oauth2/v2/auth"
       token_url: "https://oauth2.example/token"
       client_id: "env:MBX_TEST_CLIENT_ID"
@@ -462,7 +453,7 @@ fn the_oauth_providers_block_parses_and_builds_the_registry() {
     std::env::set_var("MBX_TEST_CLIENT_SECRET", "Mk7-google-client-secret");
     let entries = parsed_block();
     assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].provider, "google_mail");
+    assert_eq!(entries[0].provider, "google");
     assert_eq!(entries[0].client_id, "env:MBX_TEST_CLIENT_ID");
     assert_eq!(entries[0].scopes.len(), 3);
     assert_eq!(
@@ -477,15 +468,15 @@ fn the_oauth_providers_block_parses_and_builds_the_registry() {
 
     let registry = oauth_provider_registry_from_config(&entries).expect("registry builds");
     let google = registry
-        .get(&CredentialProvider::GoogleMail)
-        .expect("google_mail registered");
+        .get(&CredentialProvider::new("google"))
+        .expect("google registered");
     assert_eq!(google.client_id, "google-client-id");
     assert_eq!(
         google.client_secret.as_ref().map(|s| s.expose()),
         Some("Mk7-google-client-secret")
     );
     assert!(!format!("{google:?}").contains("Mk7-google-client-secret"));
-    assert!(registry.contains_key(&CredentialProvider::GitHub));
+    assert!(registry.contains_key(&CredentialProvider::new("github")));
 }
 
 #[test]
@@ -534,7 +525,7 @@ async fn a_redirect_uri_outside_the_configured_allowlist_is_refused_at_initiate(
         .initiate_oauth_connection(
             USER,
             &tenant(),
-            CredentialProvider::GoogleMail,
+            CredentialProvider::new("google"),
             "https://attacker.example/vault/connections/callback".to_string(),
         )
         .await
@@ -565,7 +556,7 @@ async fn the_authorization_url_carries_scope_and_every_extra_parameter_for_a_con
         .initiate_oauth_connection(
             USER,
             &tenant(),
-            CredentialProvider::GoogleMail,
+            CredentialProvider::new("google"),
             REDIRECT.to_string(),
         )
         .await
@@ -591,11 +582,12 @@ async fn the_authorization_url_carries_scope_and_every_extra_parameter_for_a_con
         .expose()
         .contains("Mk7-google-client-secret"));
 
-    // The pending binding is a mailbox.
+    // The pending binding is an OAuth binding under the registry's name,
+    // whatever that name is (ADR-125, Update of 2026-10-04, clause 1).
     let pending = h.repo.bindings.read().await;
     let b = pending.values().next().expect("pending binding");
-    assert_eq!(b.credential_type, CredentialType::Mailbox);
-    assert_eq!(b.provider, CredentialProvider::GoogleMail);
+    assert_eq!(b.credential_type, CredentialType::OAuth2);
+    assert_eq!(b.provider, CredentialProvider::new("google"));
 }
 
 #[tokio::test]
@@ -607,7 +599,7 @@ async fn the_authorization_url_carries_neither_for_a_provider_configured_without
         .initiate_oauth_connection(
             USER,
             &tenant(),
-            CredentialProvider::GitHub,
+            CredentialProvider::new("github"),
             REDIRECT.to_string(),
         )
         .await
@@ -636,7 +628,7 @@ async fn the_authorization_url_carries_neither_for_a_provider_configured_without
 fn google_registry(token_url: String) -> OAuthProviderRegistry {
     let mut registry = OAuthProviderRegistry::new();
     registry.insert(
-        CredentialProvider::GoogleMail,
+        CredentialProvider::new("google"),
         OAuthProviderConfig {
             authorization_url: "https://accounts.example/o/oauth2/v2/auth".into(),
             token_url: token_url.into(),
@@ -666,8 +658,8 @@ fn id_token(email: &str) -> String {
     format!("{header}.{claims}.c2lnbmF0dXJl")
 }
 
-/// Connect a google_mail mailbox through initiate and callback, the token
-/// endpoint answering with `expires_in`.
+/// Connect an OAuth binding of the registry entry `google` through initiate
+/// and callback, the token endpoint answering with `expires_in`.
 async fn connected_google_mailbox(
     server: &mut mockito::ServerGuard,
     expires_in: i64,
@@ -699,7 +691,7 @@ async fn connected_google_mailbox(
         .initiate_oauth_connection(
             USER,
             &tenant(),
-            CredentialProvider::GoogleMail,
+            CredentialProvider::new("google"),
             REDIRECT.to_string(),
         )
         .await
@@ -714,12 +706,12 @@ async fn connected_google_mailbox(
 }
 
 #[tokio::test]
-async fn a_google_mail_callback_stores_a_mailbox_binding_with_the_address_and_granted_scopes() {
+async fn an_oauth_callback_stores_an_oauth2_binding_with_the_account_and_granted_scopes() {
     let mut server = mockito::Server::new_async().await;
     let (h, id) = connected_google_mailbox(&mut server, 3600).await;
     let b = h.repo.find_by_id(&id).await.unwrap().unwrap();
-    assert_eq!(b.credential_type, CredentialType::Mailbox);
-    assert_eq!(b.provider, CredentialProvider::GoogleMail);
+    assert_eq!(b.credential_type, CredentialType::OAuth2);
+    assert_eq!(b.provider, CredentialProvider::new("google"));
     assert_eq!(b.status, CredentialStatus::Active);
     assert_eq!(
         b.metadata.external_account_id.as_deref(),

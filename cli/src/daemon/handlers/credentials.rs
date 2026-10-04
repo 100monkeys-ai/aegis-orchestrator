@@ -288,24 +288,17 @@ struct RotateRequest {
 // ============================================================================
 
 #[allow(clippy::result_large_err)]
+/// A provider is the name the request gives, as given (AEGIS ADR-125,
+/// Update of 2026-10-04, clause 1): no provider name is known here.
 fn parse_provider(s: &str) -> Result<CredentialProvider, Response> {
-    let provider = match s {
-        "openai" => CredentialProvider::OpenAI,
-        "anthropic" => CredentialProvider::Anthropic,
-        "github" => CredentialProvider::GitHub,
-        "google" => CredentialProvider::Google,
-        "google_mail" => CredentialProvider::GoogleMail,
-        "imap" => CredentialProvider::Imap,
-        other if !other.is_empty() => CredentialProvider::Custom(other.to_string()),
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Provider name must not be empty"})),
-            )
-                .into_response());
-        }
-    };
-    Ok(provider)
+    if s.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Provider name must not be empty"})),
+        )
+            .into_response());
+    }
+    Ok(CredentialProvider::new(s))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1560,7 +1553,7 @@ mod tests {
             .store_api_key(StoreApiKeyCommand {
                 owner_user_id: OWNER.into(),
                 tenant_id: owner_tenant.clone(),
-                provider: CredentialProvider::OpenAI,
+                provider: CredentialProvider::new("openai"),
                 label: "owner's key".into(),
                 scope,
                 api_key_value: SensitiveString::new("sk-original"),

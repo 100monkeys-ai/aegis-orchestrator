@@ -65,31 +65,22 @@ fn str_to_credential_type(s: &str) -> anyhow::Result<CredentialType> {
     }
 }
 
+/// The prefix the code before AEGIS ADR-125's Update of 2026-10-04 wrote
+/// before a provider it did not enumerate (`custom:stripe`). Such rows exist
+/// and are read, never written again.
+const LEGACY_CUSTOM_PREFIX: &str = "custom:";
+
+/// A provider is stored as its name, as given (ADR-125, Update of
+/// 2026-10-04, clause 1).
 fn provider_to_str(p: &CredentialProvider) -> String {
-    match p {
-        CredentialProvider::OpenAI => "openai".to_string(),
-        CredentialProvider::Anthropic => "anthropic".to_string(),
-        CredentialProvider::GitHub => "github".to_string(),
-        CredentialProvider::Google => "google".to_string(),
-        CredentialProvider::GoogleMail => "google_mail".to_string(),
-        CredentialProvider::Imap => "imap".to_string(),
-        CredentialProvider::Custom(name) => format!("custom:{name}"),
-    }
+    p.as_str().to_string()
 }
 
+/// A stored provider reads back as the string it is, a row of a provider no
+/// registry serves any more included; a row written as `custom:<name>` reads as `<name>`, the name
+/// its user gave.
 fn str_to_provider(s: &str) -> CredentialProvider {
-    match s {
-        "openai" => CredentialProvider::OpenAI,
-        "anthropic" => CredentialProvider::Anthropic,
-        "github" => CredentialProvider::GitHub,
-        "google" => CredentialProvider::Google,
-        "google_mail" => CredentialProvider::GoogleMail,
-        "imap" => CredentialProvider::Imap,
-        other => {
-            let name = other.strip_prefix("custom:").unwrap_or(other);
-            CredentialProvider::Custom(name.to_string())
-        }
-    }
+    CredentialProvider::new(s.strip_prefix(LEGACY_CUSTOM_PREFIX).unwrap_or(s))
 }
 
 fn status_to_str(s: &CredentialStatus) -> &'static str {
@@ -439,6 +430,8 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
         target: &GrantTarget,
     ) -> anyhow::Result<Vec<CredentialGrant>> {
         let (target_type, target_value) = grant_target_to_db(target);
+        // A row written as `custom:<name>` before ADR-125's Update of
+        // 2026-10-04 answers its name too (the query's `'custom:' || $3`).
         let provider_str = provider_to_str(provider);
 
         let rows = sqlx::query(
@@ -448,7 +441,7 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
             JOIN credential_bindings b ON b.id = g.binding_id
             WHERE b.tenant_id    = $1
               AND b.owner_user_id = $2
-              AND b.provider      = $3
+              AND b.provider IN ($3, 'custom:' || $3)
               AND b.status        = 'active'
               AND g.target_type   = $4
               AND g.target_value  = $5
@@ -554,5 +547,160 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to delete expired OAuth pending states: {e}"))?;
         Ok(result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod provider_storage_tests {
+    use super::*;
+
+    /// Test (d), the repository's half: a provider is stored as the
+    /// registry's string, whatever it is, and reads back as it; a stored
+    /// `google_mail` reads back as `google_mail`; an old `custom:` row reads
+    /// as the name its user gave.
+    #[test]
+    fn a_provider_is_stored_and_read_back_as_its_string() {
+        for name in ["google", "slack", "github", "openai", "imap", "google_mail"] {
+            let stored = provider_to_str(&CredentialProvider::new(name));
+            assert_eq!(stored, name);
+            assert_eq!(str_to_provider(&stored).as_str(), name);
+        }
+        assert_eq!(str_to_provider("google_mail").as_str(), "google_mail");
+        assert_eq!(str_to_provider("custom:gitlab").as_str(), "gitlab");
+    }
+
+    /// Test (d) against PostgreSQL (`AEGIS_DATABASE_URL` or `DATABASE_URL`;
+    /// skipped without one), in a schema of its own with migrations 011 and
+    /// 035: an OAuth2 binding of the registry entry `google` round-trips as
+    /// `google`; a row stored as `google_mail` reads back as `google_mail`;
+    /// a row stored as `custom:gitlab` reads as `gitlab` and answers the
+    /// grant query for `gitlab`.
+    #[tokio::test]
+    async fn providers_round_trip_through_postgres_as_their_strings() {
+        use crate::domain::credential::{
+            CredentialBindingId, CredentialBindingRepository, CredentialMetadata, CredentialScope,
+            CredentialStatus, CredentialType, GrantTarget, UserCredentialBinding,
+        };
+        use crate::domain::secrets::SecretPath;
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx::Executor;
+
+        let Ok(url) =
+            std::env::var("AEGIS_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        else {
+            eprintln!("skipped: no AEGIS_DATABASE_URL or DATABASE_URL");
+            return;
+        };
+        let schema = format!("prov_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        admin
+            .execute(format!("CREATE SCHEMA {schema}").as_str())
+            .await
+            .unwrap();
+        let search_path = format!("SET search_path TO {schema}, public");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |conn, _| {
+                let sql = search_path.clone();
+                Box::pin(async move {
+                    conn.execute(sql.as_str()).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        pool.execute(include_str!(
+            "../../../../../cli/migrations/011_credential_bindings.sql"
+        ))
+        .await
+        .unwrap();
+        pool.execute(include_str!(
+            "../../../../../cli/migrations/035_credential_mailbox_settings.sql"
+        ))
+        .await
+        .unwrap();
+        let repo = PostgresCredentialBindingRepository::new(pool.clone());
+        let tenant = TenantId::for_consumer_user("owner-sub").unwrap();
+        let binding = |provider: &str, credential_type: CredentialType| {
+            let id = CredentialBindingId::new();
+            UserCredentialBinding {
+                id,
+                owner_user_id: "owner-sub".to_string(),
+                tenant_id: tenant.clone(),
+                credential_type,
+                provider: CredentialProvider::new(provider),
+                secret_path: SecretPath::for_tenant(tenant.clone(), "kv", format!("c/{}", id.0)),
+                scope: CredentialScope::Personal,
+                status: CredentialStatus::Active,
+                metadata: CredentialMetadata {
+                    label: provider.to_string(),
+                    tags: None,
+                    service_url: None,
+                    external_account_id: None,
+                    oauth_scopes: None,
+                    mailbox: None,
+                },
+                grants: Vec::new(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }
+        };
+        let raw = |id: CredentialBindingId| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT provider FROM credential_bindings WHERE id = $1",
+                )
+                .bind(id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        let google = binding("google", CredentialType::OAuth2);
+        repo.save(&google).await.unwrap();
+        assert_eq!(raw(google.id).await, "google");
+        let read = repo.find_by_id(&google.id).await.unwrap().unwrap();
+        assert_eq!(read.provider.as_str(), "google");
+        assert_eq!(read.credential_type, CredentialType::OAuth2);
+
+        let old = binding("google_mail", CredentialType::Mailbox);
+        repo.save(&old).await.unwrap();
+        assert_eq!(raw(old.id).await, "google_mail");
+        let read = repo.find_by_id(&old.id).await.unwrap().unwrap();
+        assert_eq!(read.provider.as_str(), "google_mail");
+
+        let mut gitlab = binding("gitlab", CredentialType::Secret);
+        gitlab.add_grant(GrantTarget::AllAgents, "owner-sub".to_string());
+        repo.save(&gitlab).await.unwrap();
+        sqlx::query("UPDATE credential_bindings SET provider = 'custom:gitlab' WHERE id = $1")
+            .bind(gitlab.id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let read = repo.find_by_id(&gitlab.id).await.unwrap().unwrap();
+        assert_eq!(read.provider.as_str(), "gitlab");
+        let grants = repo
+            .find_active_grants_for_target(
+                &tenant,
+                "owner-sub",
+                &CredentialProvider::new("gitlab"),
+                &GrantTarget::AllAgents,
+            )
+            .await
+            .unwrap();
+        assert_eq!(grants.len(), 1, "the old custom: row answers its name");
+
+        pool.close().await;
+        admin
+            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+            .await
+            .unwrap();
     }
 }

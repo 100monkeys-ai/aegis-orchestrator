@@ -149,7 +149,7 @@ pub fn oauth_provider_registry_from_config(
                 provider: name.clone(),
                 detail: e.to_string(),
             })?;
-        let provider = CredentialProvider::from_name(&name);
+        let provider = CredentialProvider::new(name.clone());
         if registry.contains_key(&provider) {
             return Err(OAuthRegistryError::DuplicateProvider { provider: name });
         }
@@ -1050,7 +1050,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
             owner_user_id: owner_user_id.clone(),
             tenant_id: tenant_id.clone(),
             credential_type: CredentialType::Mailbox,
-            provider: CredentialProvider::Imap,
+            provider: CredentialProvider::imap(),
             secret_path,
             scope,
             status: CredentialStatus::Active,
@@ -1078,7 +1078,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 binding_id,
                 owner_user_id,
                 tenant_id,
-                provider: CredentialProvider::Imap,
+                provider: CredentialProvider::imap(),
                 credential_type: CredentialType::Mailbox,
             });
 
@@ -1241,12 +1241,9 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
         let binding_id = CredentialBindingId::new();
         let now = Utc::now();
-        // A Google mailbox is a credential of type `mailbox` in its OAuth
-        // form (ADR-125 D1); every other provider's token is `oauth2`.
-        let credential_type = match provider {
-            CredentialProvider::GoogleMail => CredentialType::Mailbox,
-            _ => CredentialType::OAuth2,
-        };
+        // Every OAuth binding is of type `oauth2`, whatever its provider's
+        // name (ADR-125, Update of 2026-10-04, clause 1).
+        let credential_type = CredentialType::OAuth2;
 
         let binding = UserCredentialBinding {
             id: binding_id,
@@ -1368,9 +1365,30 @@ impl CredentialManagementService for StandardCredentialManagementService {
         let secret_path =
             user_credential_path(&binding.tenant_id, &binding.owner_user_id, &binding.id);
 
-        // A Google mailbox records its address and the scopes Google granted
-        // (ADR-125 D1). Without the address the mailbox cannot be used, so
-        // the callback fails before anything is stored.
+        // A `mailbox` binding in its OAuth form, pending since before ADR-125's
+        // Update of 2026-10-04, records its address and the scopes granted
+        // (ADR-125 D1); without the address it cannot be used, so the
+        // callback fails before anything is stored. Any other OAuth binding
+        // records the scopes granted (its scopes are its registry entry's,
+        // the Update's clause 1) and, where the token response carries an
+        // id_token naming an email, that account; no provider is named.
+        if binding.credential_type != CredentialType::Mailbox {
+            binding.metadata.oauth_scopes = Some(match &token_response.scope {
+                Some(scope) => scope.split_whitespace().map(str::to_string).collect(),
+                None => self
+                    .oauth_providers
+                    .get(&binding.provider)
+                    .map(|c| c.scopes.clone())
+                    .unwrap_or_default(),
+            });
+            if let Some(address) = token_response
+                .id_token
+                .as_ref()
+                .and_then(|t| email_from_id_token(t).ok())
+            {
+                binding.metadata.external_account_id = Some(address);
+            }
+        }
         if binding.credential_type == CredentialType::Mailbox {
             let id_token = token_response.id_token.as_ref().ok_or_else(|| {
                 CredentialError::InvalidResponse(

@@ -141,7 +141,7 @@ async fn setup_harness_with(authorization_url: &str, token_url: String) -> Harne
 
     let mut registry: OAuthProviderRegistry = HashMap::new();
     registry.insert(
-        CredentialProvider::GitHub,
+        CredentialProvider::new("github"),
         OAuthProviderConfig {
             authorization_url: authorization_url.into(),
             token_url: token_url.into(),
@@ -162,7 +162,7 @@ async fn setup_harness_with(authorization_url: &str, token_url: String) -> Harne
         owner_user_id: "user-sub-abc".to_string(),
         tenant_id: tenant_id.clone(),
         credential_type: CredentialType::OAuth2,
-        provider: CredentialProvider::GitHub,
+        provider: CredentialProvider::new("github"),
         secret_path: SecretPath::new("PENDING_OAUTH", "PENDING_OAUTH", "PENDING_OAUTH"),
         scope: CredentialScope::Personal,
         status: CredentialStatus::PendingOAuth,
@@ -459,7 +459,7 @@ async fn oauth_exchange_rejects_insecure_non_localhost_token_url() {
 fn registry_validation_rejects_placeholder_authorization_url() {
     let mut registry: OAuthProviderRegistry = HashMap::new();
     registry.insert(
-        CredentialProvider::GitHub,
+        CredentialProvider::new("github"),
         OAuthProviderConfig {
             authorization_url: "https://oauth.placeholder/github/authorize".into(),
             token_url: "https://github.com/token".into(),
@@ -484,7 +484,7 @@ fn registry_validation_rejects_placeholder_authorization_url() {
 fn registry_validation_rejects_insecure_authorization_url() {
     let mut registry: OAuthProviderRegistry = HashMap::new();
     registry.insert(
-        CredentialProvider::GitHub,
+        CredentialProvider::new("github"),
         OAuthProviderConfig {
             authorization_url: "http://github.com/login/oauth/authorize".into(),
             token_url: "https://github.com/token".into(),
@@ -505,7 +505,7 @@ fn registry_validation_rejects_insecure_authorization_url() {
 fn registry_validation_rejects_empty_redirect_allowlist() {
     let mut registry: OAuthProviderRegistry = HashMap::new();
     registry.insert(
-        CredentialProvider::GitHub,
+        CredentialProvider::new("github"),
         OAuthProviderConfig {
             authorization_url: "https://github.com/login/oauth/authorize".into(),
             token_url: "https://github.com/token".into(),
@@ -526,7 +526,7 @@ fn registry_validation_rejects_empty_redirect_allowlist() {
 fn registry_validation_accepts_real_https_authorization_url() {
     let mut registry: OAuthProviderRegistry = HashMap::new();
     registry.insert(
-        CredentialProvider::GitHub,
+        CredentialProvider::new("github"),
         OAuthProviderConfig {
             authorization_url: "https://github.com/login/oauth/authorize".into(),
             token_url: "https://github.com/login/oauth/access_token".into(),
@@ -553,7 +553,7 @@ async fn initiate_oauth_uses_configured_authorization_url_not_placeholder() {
         .initiate_oauth_connection(
             "user-sub-abc",
             &TenantId::consumer(),
-            CredentialProvider::GitHub,
+            CredentialProvider::new("github"),
             "https://app.example/oauth/callback".to_string(),
         )
         .await
@@ -593,7 +593,7 @@ async fn initiate_oauth_rejects_redirect_uri_outside_allowlist() {
         .initiate_oauth_connection(
             "user-sub-abc",
             &TenantId::consumer(),
-            CredentialProvider::GitHub,
+            CredentialProvider::new("github"),
             "https://attacker.example/steal".to_string(),
         )
         .await
@@ -612,7 +612,7 @@ async fn initiate_oauth_accepts_allowlisted_redirect_uri() {
         .initiate_oauth_connection(
             "user-sub-abc",
             &TenantId::consumer(),
-            CredentialProvider::GitHub,
+            CredentialProvider::new("github"),
             "https://app.example/oauth/callback".to_string(),
         )
         .await
@@ -670,7 +670,7 @@ async fn initiate_oauth_builds_the_redirect_from_the_authorization_url_as_config
         .initiate_oauth_connection(
             "user-sub-abc",
             &TenantId::consumer(),
-            CredentialProvider::GitHub,
+            CredentialProvider::new("github"),
             "https://app.example/oauth/callback".to_string(),
         )
         .await

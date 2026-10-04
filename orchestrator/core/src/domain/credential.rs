@@ -117,59 +117,51 @@ pub enum CredentialType {
     OAuth2,
     /// Machine identity / service account credential (JSON blob).
     ServiceAccount,
-    /// A mailbox connection (AEGIS ADR-125 D1), in one of two forms: Google
-    /// OAuth (provider `google_mail`, the OpenBao fields of an OAuth token)
-    /// or SMTP with IMAP (provider `imap`, the settings in
-    /// [`CredentialMetadata::mailbox`] and the field `password` in OpenBao).
+    /// A mailbox connection (AEGIS ADR-125 D1): SMTP with IMAP (provider
+    /// `imap`, the settings in [`CredentialMetadata::mailbox`] and the field
+    /// `password` in OpenBao). A row stored before ADR-125's Update of
+    /// 2026-10-04 may also carry an OAuth token in this type; it reads back
+    /// as it was stored. A new OAuth binding is of type `oauth2`.
     Mailbox,
 }
 
-/// The external service or platform this credential authenticates with.
+/// The external service or platform this credential authenticates with: an
+/// opaque name (AEGIS ADR-125, Update of 2026-10-04, clause 1). An OAuth
+/// binding's provider is the `provider` string of its `spec.oauth_providers`
+/// entry; an API key's is the name its user gave. No provider name is known
+/// to the code, except [`CredentialProvider::imap`], the settings form of a
+/// standard protocol (a `mailbox` binding's SMTP-with-IMAP form).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialProvider {
-    OpenAI,
-    Anthropic,
-    GitHub,
-    Google,
-    /// A Google mailbox reached through the Gmail API by OAuth (ADR-125 D1).
-    GoogleMail,
-    /// A mailbox reached by IMAP and SMTP with the user's own server
-    /// settings and password (ADR-125 D1).
-    Imap,
-    /// Any provider not explicitly enumerated above; the inner string is the
-    /// canonical service identifier chosen by the user (e.g. `"stripe"`).
-    Custom(String),
+#[serde(transparent)]
+pub struct CredentialProvider {
+    /// The provider's name: not a secret.
+    name: String,
+}
+
+impl CredentialProvider {
+    /// The provider of an SMTP-with-IMAP mailbox (ADR-125 D1, kept by its
+    /// Update of 2026-10-04 as a protocol, not a product).
+    pub const IMAP: &'static str = "imap";
+
+    /// The provider of this name, as given.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    /// The provider of an SMTP-with-IMAP mailbox.
+    pub fn imap() -> Self {
+        Self::new(Self::IMAP)
+    }
+
+    /// The provider's name.
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
 }
 
 impl std::fmt::Display for CredentialProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CredentialProvider::OpenAI => write!(f, "openai"),
-            CredentialProvider::Anthropic => write!(f, "anthropic"),
-            CredentialProvider::GitHub => write!(f, "github"),
-            CredentialProvider::Google => write!(f, "google"),
-            CredentialProvider::GoogleMail => write!(f, "google_mail"),
-            CredentialProvider::Imap => write!(f, "imap"),
-            CredentialProvider::Custom(name) => write!(f, "{name}"),
-        }
-    }
-}
-
-impl CredentialProvider {
-    /// The provider a configuration or request names: an enumerated
-    /// provider by its [`Display`](std::fmt::Display) name, anything else
-    /// as [`CredentialProvider::Custom`].
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            "openai" => CredentialProvider::OpenAI,
-            "anthropic" => CredentialProvider::Anthropic,
-            "github" => CredentialProvider::GitHub,
-            "google" => CredentialProvider::Google,
-            "google_mail" => CredentialProvider::GoogleMail,
-            "imap" => CredentialProvider::Imap,
-            other => CredentialProvider::Custom(other.to_string()),
-        }
+        f.write_str(&self.name)
     }
 }
 
@@ -482,7 +474,7 @@ mod tests {
             owner_user_id: "user-sub-123".to_string(),
             tenant_id: TenantId::consumer(),
             credential_type: CredentialType::Secret,
-            provider: CredentialProvider::OpenAI,
+            provider: CredentialProvider::new("openai"),
             secret_path: SecretPath::new("aegis-system", "kv", "openai/key"),
             scope: CredentialScope::Personal,
             status: CredentialStatus::Active,
@@ -567,30 +559,27 @@ mod tests {
     }
 
     #[test]
-    fn credential_provider_display() {
-        assert_eq!(CredentialProvider::OpenAI.to_string(), "openai");
+    fn credential_provider_is_its_name() {
+        assert_eq!(CredentialProvider::new("openai").to_string(), "openai");
+        assert_eq!(CredentialProvider::new("stripe").as_str(), "stripe");
+        assert_eq!(CredentialProvider::imap().as_str(), "imap");
         assert_eq!(
-            CredentialProvider::Custom("stripe".to_string()).to_string(),
-            "stripe"
+            serde_json::to_string(&CredentialProvider::new("google")).unwrap(),
+            "\"google\""
         );
+        let read: CredentialProvider = serde_json::from_str("\"google_mail\"").unwrap();
+        assert_eq!(read.as_str(), "google_mail");
     }
 
     /// Regression: `CredentialProvider` must implement `Hash` so it can be
-    /// used as a `HashMap` key in `OAuthProviderRegistry` (CL5). Prior to
-    /// this test the `Hash` derive was missing and `credential_service.rs`
-    /// failed to compile when looking up OAuth provider configs by provider.
+    /// used as a `HashMap` key in `OAuthProviderRegistry` (CL5).
     #[test]
     fn credential_provider_is_hashable() {
         use std::collections::HashMap;
         let mut map: HashMap<CredentialProvider, &'static str> = HashMap::new();
-        map.insert(CredentialProvider::OpenAI, "openai");
-        map.insert(CredentialProvider::GitHub, "github");
-        map.insert(CredentialProvider::Custom("stripe".to_string()), "stripe");
-        assert_eq!(map.get(&CredentialProvider::OpenAI), Some(&"openai"));
-        assert_eq!(map.get(&CredentialProvider::GitHub), Some(&"github"));
-        assert_eq!(
-            map.get(&CredentialProvider::Custom("stripe".to_string())),
-            Some(&"stripe")
-        );
+        map.insert(CredentialProvider::new("github"), "github");
+        map.insert(CredentialProvider::new("stripe"), "stripe");
+        assert_eq!(map.get(&CredentialProvider::new("github")), Some(&"github"));
+        assert_eq!(map.get(&CredentialProvider::new("stripe")), Some(&"stripe"));
     }
 }
