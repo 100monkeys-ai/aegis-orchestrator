@@ -389,33 +389,24 @@ spec:
   # force_deploy_builtins: "false"
 
   # --------------------------------------------------------------------------
-  # MCP Tool Servers (Optional)
+  # Tool Capabilities (Optional)
   # --------------------------------------------------------------------------
-  # mcp_servers:
-  #   - name: "filesystem"
-  #     enabled: true
-  #     executable: "/usr/local/bin/fs-mcp"
-  #     args: ["--root", "/data"]
-  #     capabilities:
-  #       - name: "fs.read"
-  #         skip_judge: true
-  #       - name: "fs.write"
-  #         # AEGIS ADR-126: an agent's call waits for its user's answer
-  #         # (approve once, always allow, deny) at the approval gate; it
-  #         # returns approval_pending and the tool runs only on approval.
-  #         # Default: false. An agent manifest cannot clear it.
-  #         requires_approval: true
-  #     credentials:
-  #       API_KEY: "env:FILESYSTEM_MCP_API_KEY"
-  #     health_check:
-  #       interval_seconds: 30
-  #       timeout_seconds: 5
-  #       method: "http"
-  #     resource_limits:
-  #       cpu_millicores: 250
-  #       memory_mb: 256
-  #     environment:
-  #       LOG_LEVEL: "info"
+  # The orchestrator runs no MCP server of its own: a tool it does not serve
+  # comes through the SEAL gateway (AEGIS ADR-132). What the approval gate
+  # knows of such a tool is declared here by tool name pattern: an exact
+  # name, "<prefix>.*" for every tool under "<prefix>.", or "*".
+  # tool_capabilities:
+  #   - tool_pattern: "nuclear-notes.pages.*"
+  #     # AEGIS ADR-126: an agent's call waits for its user's answer
+  #     # (approve once, always allow, deny) at the approval gate; it
+  #     # returns approval_pending and the tool runs only on approval.
+  #     # Default: false. An agent manifest cannot clear it.
+  #     requires_approval: true
+  #     # The argument naming the credential binding the call acts through
+  #     # (the gate keys "always allow" on it), and the arguments the gate
+  #     # shows its user.
+  #     # binding_argument: "workspace"
+  #     # approval_summary: ["path"]
 
   # --------------------------------------------------------------------------
   # Built-In Dispatchers (Optional)

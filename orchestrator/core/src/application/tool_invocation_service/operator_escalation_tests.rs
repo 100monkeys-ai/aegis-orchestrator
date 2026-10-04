@@ -31,7 +31,7 @@ use crate::infrastructure::repositories::{
 };
 use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
 use crate::infrastructure::storage::LocalHostStorageProvider;
-use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+use crate::infrastructure::tool_router::ToolRouter;
 use async_trait::async_trait;
 use futures::Stream;
 use serde_json::json;
@@ -416,13 +416,7 @@ async fn harness_with(role_lookup: Option<Arc<StubRoleLookup>>) -> Harness {
         .await
         .unwrap();
 
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        servers,
-        dispatchers_gating("aegis.system.info"),
-    ));
+    let router = Arc::new(ToolRouter::new(dispatchers_gating("aegis.system.info")));
     let storage_root =
         std::env::temp_dir().join(format!("aegis-escalation-tests-{}", uuid::Uuid::new_v4()));
     let fsal = Arc::new(AegisFSAL::new(

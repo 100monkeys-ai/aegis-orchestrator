@@ -19,7 +19,7 @@
 //! | [`VolumeEvent`] | BC-7 Storage Gateway | Volume lifecycle (create/attach/detach/delete/expire) |
 //! | [`PolicyEvent`] | BC-4 Security Policy | Runtime policy violation records |
 //! | [`ViolationType`] | BC-4 / BC-12 | Structured violation classification |
-//! | [`MCPToolEvent`] | BC-12 SEAL / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
+//! | [`MCPToolEvent`] | BC-12 SEAL / Tool Routing | Tool invocation, policy and approval audit (ADR-033) |
 //! | [`ImageManagementEvent`] | BC-2 Execution | Container image pull lifecycle and cache status (ADR-045) |
 //! | [`CommandExecutionEvent`] | BC-2 Execution / Dispatch | In-container command execution via Dispatch Protocol (ADR-040) |
 //! | [`IamEvent`] | BC-13 IAM & Identity Federation | OIDC authentication, realm lifecycle, JWKS cache events (ADR-041) |
@@ -878,49 +878,16 @@ pub enum ViolationType {
     TimeoutExceeded,
 }
 
-/// MCP Tool server lifecycle and invocation audit events (BC-12 SEAL / Tool Routing, ADR-033).
+/// Tool invocation, policy and approval audit events (BC-12 SEAL / Tool Routing, ADR-033).
 ///
-/// Published by [`crate::application::tool_invocation_service::ToolInvocationService`] and
-/// [`crate::infrastructure::tool_router::ToolRouter`]. Consumed by:
+/// Published by [`crate::application::tool_invocation_service::ToolInvocationService`]
+/// and the approval gate. Consumed by:
 /// - The Cortex for tool-usage pattern learning (e.g. "always run `npm install`
 ///   after modifying `package.json`")
 /// - The Zaru client for real-time execution visualization
 /// - Security analytics for anomalous tool usage detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MCPToolEvent {
-    // ========== Server Lifecycle Events ==========
-    ServerRegistered {
-        server_id: crate::domain::mcp::ToolServerId,
-        name: String,
-        capabilities: Vec<String>,
-        registered_at: DateTime<Utc>,
-    },
-
-    ServerStarted {
-        server_id: crate::domain::mcp::ToolServerId,
-        name: String,
-        process_id: u32,
-        started_at: DateTime<Utc>,
-    },
-
-    ServerStopped {
-        server_id: crate::domain::mcp::ToolServerId,
-        name: String,
-        stopped_at: DateTime<Utc>,
-    },
-
-    ServerFailed {
-        server_id: crate::domain::mcp::ToolServerId,
-        name: String,
-        error: String,
-        failed_at: DateTime<Utc>,
-    },
-
-    ServerUnhealthy {
-        server_id: crate::domain::mcp::ToolServerId,
-        last_healthy: Option<DateTime<Utc>>,
-    },
-
     // ========== Tool Invocation Events ==========
     InvocationRequested {
         invocation_id: crate::domain::mcp::ToolInvocationId,
@@ -929,15 +896,6 @@ pub enum MCPToolEvent {
         tool_name: String,
         arguments: serde_json::Value,
         requested_at: DateTime<Utc>,
-    },
-
-    InvocationStarted {
-        invocation_id: crate::domain::mcp::ToolInvocationId,
-        execution_id: ExecutionId,
-        agent_id: AgentId,
-        server_id: crate::domain::mcp::ToolServerId,
-        tool_name: String,
-        started_at: DateTime<Utc>,
     },
 
     InvocationCompleted {

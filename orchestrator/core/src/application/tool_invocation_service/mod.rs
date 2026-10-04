@@ -49,9 +49,7 @@ use crate::domain::dispatch::DispatchAction;
 use crate::domain::events::{MCPToolEvent, ViolationType};
 use crate::domain::execution::{ExecutionInput, TrajectoryStep};
 use crate::domain::fsal::AegisFSAL;
-use crate::domain::mcp::{
-    MCPError, PolicyViolation, ToolInputContract, ToolInvocationId, ToolServerId,
-};
+use crate::domain::mcp::{MCPError, PolicyViolation, ToolInputContract, ToolInvocationId};
 use crate::domain::runtime_registry::StandardRuntimeRegistry;
 use crate::domain::seal_session::{EnvelopeVerifier, SealSessionError};
 use crate::domain::seal_session_repository::SealSessionRepository;

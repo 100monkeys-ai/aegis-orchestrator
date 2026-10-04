@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Tool Router
 //!
-//! Infrastructure layer implementation of MCP tool routing and server lifecycle management.
+//! Infrastructure layer catalogue of the orchestrator's builtin tools and of
+//! what the approval gate and the inner-loop judge know of every tool.
 //!
 //! # Architecture
 //!
 //! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Routes agent tool requests to the correct MCP server process,
-//!   manages server lifecycles (start/stop/health), and enforces agent-level
-//!   tool authorization via the ToolRegistry.
+//! - **Purpose:** Lists the builtin tools with their schemas, and answers
+//!   whether a tool skips the judge or waits at the approval gate. The
+//!   orchestrator runs no MCP server process of its own: a tool it does not
+//!   serve comes through the SEAL gateway (AEGIS ADR-132 G1, G4).
 //!
 //! # Related ADRs
 //!
@@ -22,123 +24,23 @@
 //! Builtin tool names are defined canonically in `BUILTIN_TOOL_DEFINITIONS`.
 //! For filesystem tools, the canonical create-directory name is `fs.create_dir`.
 
-use crate::domain::execution::ExecutionId;
-use crate::domain::mcp::{DomainError, ToolRegistry, ToolServer, ToolServerId, ToolServerStatus};
-use crate::domain::node_config::BuiltinDispatcherConfig;
-use crate::domain::secrets::AccessContext;
+use crate::domain::node_config::{BuiltinDispatcherConfig, ToolCapabilityConfig};
 use crate::domain::tool_approval::ApprovalContract;
-use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::secrets_manager::SecretsManager;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{error, info, trace, warn};
-
-// =============================================================================
-// InMemoryToolRegistry — Concrete ToolRegistry implementation
-// =============================================================================
-
-/// In-memory implementation of the ToolRegistry domain trait.
-/// Tracks which tool servers are available globally and per-execution.
-/// Used by ToolRouter for agent-level authorization and by ToolServerManager
-/// to persist server registrations.
-pub struct InMemoryToolRegistry {
-    servers_by_execution: Arc<RwLock<HashMap<ExecutionId, Vec<ToolServer>>>>,
-    global_servers: Arc<RwLock<Vec<ToolServer>>>,
-}
-
-impl InMemoryToolRegistry {
-    pub fn new() -> Self {
-        Self {
-            servers_by_execution: Arc::new(RwLock::new(HashMap::new())),
-            global_servers: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    pub async fn add_global_server(&self, server: ToolServer) {
-        let mut servers = self.global_servers.write().await;
-        servers.push(server);
-    }
-
-    pub async fn add_agent_server(&self, execution_id: ExecutionId, server: ToolServer) {
-        let mut map = self.servers_by_execution.write().await;
-        map.entry(execution_id)
-            .or_insert_with(Vec::new)
-            .push(server);
-    }
-}
-
-impl Default for InMemoryToolRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl ToolRegistry for InMemoryToolRegistry {
-    async fn get_tools_for_agent(
-        &self,
-        execution_id: ExecutionId,
-    ) -> Result<Vec<ToolServer>, DomainError> {
-        let map = self.servers_by_execution.read().await;
-        let mut tools = map.get(&execution_id).cloned().unwrap_or_default();
-
-        let globals = self.global_servers.read().await;
-        tools.extend(globals.clone());
-
-        Ok(tools)
-    }
-
-    async fn register_tool(&self, server: ToolServer) -> Result<(), DomainError> {
-        self.add_global_server(server).await;
-        Ok(())
-    }
-}
-
-// =============================================================================
-// RoutingError
-// =============================================================================
-
-#[derive(Debug, thiserror::Error)]
-pub enum RoutingError {
-    #[error("Tool not found: {tool_name}. Available: {available_tools:?}")]
-    ToolNotFound {
-        tool_name: String,
-        available_tools: Vec<String>,
-    },
-
-    #[error("Server {0:?} not found in active servers")]
-    ServerNotFound(ToolServerId),
-
-    #[error("Server {server_id:?} not ready. Current status: {status:?}")]
-    ServerNotReady {
-        server_id: ToolServerId,
-        status: ToolServerStatus,
-    },
-
-    #[error("Agent not authorized to use tool '{tool_name}': {reason}")]
-    AgentNotAuthorized { tool_name: String, reason: String },
-}
 
 // =============================================================================
 // ToolRouter — Routes tool requests to the correct MCP server
 // =============================================================================
 
-/// Routes agent tool requests to appropriate MCP servers.
-/// Uses the ToolRegistry to enforce agent-level authorization, and the shared
-/// servers map + capabilities index for fast capability lookups.
+/// The catalogue of builtin tools, and what the approval gate and the
+/// inner-loop judge know of each tool by name.
 pub struct ToolRouter {
-    registry: Arc<dyn ToolRegistry>,
-    servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
-    capabilities_index: Arc<RwLock<HashMap<String, ToolServerId>>>,
     builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
-    /// The capability entries of the enabled `spec.mcp_servers`: which carry
-    /// `requires_approval` (AEGIS ADR-126 D1) and what each declares to the
-    /// gate (its Update of 2026-10-04, clause 1).
-    mcp_capabilities: Vec<crate::domain::node_config::CapabilityConfig>,
+    /// `spec.tool_capabilities`: which tools the orchestrator does not serve
+    /// itself carry `requires_approval` (AEGIS ADR-126 D1) and what each
+    /// declares to the gate (its Update of 2026-10-04, clause 1), by pattern.
+    tool_capabilities: Vec<ToolCapabilityConfig>,
 }
 
 /// Canonical structured definition of one builtin tool dispatcher.
@@ -337,173 +239,23 @@ impl ToolRouter {
         true
     }
 
-    pub fn new(
-        registry: Arc<dyn ToolRegistry>,
-        servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
-        builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
-    ) -> Self {
+    pub fn new(builtin_dispatchers: Vec<BuiltinDispatcherConfig>) -> Self {
         Self {
-            registry,
-            servers,
-            capabilities_index: Arc::new(RwLock::new(HashMap::new())),
             builtin_dispatchers,
-            mcp_capabilities: Vec::new(),
+            tool_capabilities: Vec::new(),
         }
     }
 
-    /// Gate the MCP server tools whose capability entry in `spec.mcp_servers`
-    /// carries `requires_approval` (AEGIS ADR-126 D1).
-    pub fn with_mcp_server_approvals(
-        mut self,
-        configs: &[crate::domain::node_config::McpServerConfig],
-    ) -> Self {
-        self.mcp_capabilities = configs
-            .iter()
-            .filter(|c| c.enabled)
-            .flat_map(|c| c.capabilities.iter().cloned())
-            .collect();
+    /// The entries of `spec.tool_capabilities`, which gate and describe to
+    /// the approval gate the tools they match (AEGIS ADR-126 D1).
+    pub fn with_tool_capabilities(mut self, entries: &[ToolCapabilityConfig]) -> Self {
+        self.tool_capabilities = entries.to_vec();
         self
     }
 
-    /// Find and authorize the server that can handle this tool for the given execution.
-    ///
-    /// 1. Query the registry for this agent's authorized tools
-    /// 2. Verify the requested tool is in the agent's authorized set
-    /// 3. Look up the server that provides this capability
-    /// 4. Verify the server is running and healthy
-    pub async fn route_tool(
-        &self,
-        execution_id: ExecutionId,
-        tool_name: &str,
-    ) -> Result<ToolServerId, RoutingError> {
-        // Step 1: Fetch the agent's authorized tool servers from the registry
-        let agents_tools = self
-            .registry
-            .get_tools_for_agent(execution_id)
-            .await
-            .map_err(|e| RoutingError::AgentNotAuthorized {
-                tool_name: tool_name.to_string(),
-                reason: format!("Could not load agent's tool authorization: {e}"),
-            })?;
-
-        // Step 2: Verify the agent is authorized to use this specific tool.
-        // If the registry returns an empty set, all global tools are implicitly allowed
-        // (this supports the MVP "default unrestricted" security context).
-        // If the registry returns a non-empty set, the tool must appear in it.
-        if !agents_tools.is_empty() {
-            let authorized = agents_tools.iter().any(|srv| srv.can_invoke(tool_name));
-            if !authorized {
-                let available: Vec<String> = agents_tools
-                    .iter()
-                    .flat_map(|s| s.capabilities.clone())
-                    .collect();
-                return Err(RoutingError::AgentNotAuthorized {
-                    tool_name: tool_name.to_string(),
-                    reason: format!(
-                        "Tool not in agent's authorized set. Authorized: {available:?}"
-                    ),
-                });
-            }
-        }
-
-        // Step 3: Look up the server providing this capability from the live index
-        let index = self.capabilities_index.read().await;
-
-        // Try exact match first
-        if let Some(server_id) = index.get(tool_name) {
-            return self.verify_server_ready(*server_id).await;
-        }
-
-        // Try prefix match (e.g., "filesystem.read" matches "filesystem.*")
-        for (capability, server_id) in index.iter() {
-            if capability.ends_with(".*") {
-                let prefix = capability.trim_end_matches(".*");
-                if tool_name.starts_with(prefix) {
-                    return self.verify_server_ready(*server_id).await;
-                }
-            }
-        }
-
-        Err(RoutingError::ToolNotFound {
-            tool_name: tool_name.to_string(),
-            available_tools: index.keys().cloned().collect(),
-        })
-    }
-
-    /// Get server instance by ID
-    pub async fn get_server(&self, server_id: ToolServerId) -> Option<ToolServer> {
-        let servers = self.servers.read().await;
-        servers.get(&server_id).cloned()
-    }
-
-    /// Verify server is running and ready to handle invocations
-    async fn verify_server_ready(
-        &self,
-        server_id: ToolServerId,
-    ) -> Result<ToolServerId, RoutingError> {
-        let servers = self.servers.read().await;
-        let server = servers
-            .get(&server_id)
-            .ok_or(RoutingError::ServerNotFound(server_id))?;
-
-        if server.status != ToolServerStatus::Running {
-            return Err(RoutingError::ServerNotReady {
-                server_id,
-                status: server.status.clone(),
-            });
-        }
-
-        Ok(server_id)
-    }
-
-    /// Rebuild the capability → server_id index from the live servers map.
-    /// Called after server registration or status changes.
-    pub async fn rebuild_index(&self) {
-        let servers = self.servers.read().await;
-        let mut index = self.capabilities_index.write().await;
-        index.clear();
-
-        for (server_id, server) in servers.iter() {
-            if server.status == ToolServerStatus::Running {
-                for capability in &server.capabilities {
-                    index.insert(capability.clone(), *server_id);
-                }
-            }
-        }
-
-        trace!("Rebuilt capabilities index with {} entries", index.len());
-    }
-
-    /// Add a server to the live servers map and rebuild the index
-    pub async fn add_server(&self, server: ToolServer) -> anyhow::Result<()> {
-        let id = server.id;
-        let name = server.name.clone();
-        {
-            let mut servers = self.servers.write().await;
-            servers.insert(id, server);
-        }
-        self.rebuild_index().await;
-        info!("Added server '{}' ({:?}) to router", name, id);
-        Ok(())
-    }
-
-    /// List all tools from running servers with their metadata
+    /// List the builtin tools with their metadata.
     pub async fn list_tools(&self) -> anyhow::Result<Vec<ToolMetadata>> {
-        let servers = self.servers.read().await;
         let mut all_tools = Vec::new();
-
-        for server in servers.values() {
-            if server.status == ToolServerStatus::Running {
-                for cap in &server.capabilities {
-                    all_tools.push(ToolMetadata {
-                        name: cap.clone(),
-                        description: format!("Provided by MCP server '{}'", server.name),
-                        input_schema: json!({ "type": "object" }),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
 
         for dispatcher in &self.builtin_dispatchers {
             for cap in &dispatcher.capabilities {
@@ -1861,12 +1613,11 @@ impl ToolRouter {
     }
 
     /// Returns `true` if the operator has flagged `tool_name` to bypass the inner-loop
-    /// semantic judge.  Checks builtin dispatchers first, then MCP server entries.
+    /// semantic judge in a builtin dispatcher's capability entry.
     ///
     /// Called by `ToolInvocationService::invoke_tool_internal` before running the
     /// `spec.execution.tool_validation` pipeline (see ADR-049 and NODE_CONFIGURATION_SPEC_V1.md).
     pub async fn is_skip_judge(&self, tool_name: &str) -> bool {
-        // 1. Builtin dispatchers — iterate CapabilityConfig entries directly.
         for dispatcher in &self.builtin_dispatchers {
             for cap in &dispatcher.capabilities {
                 if cap.name == tool_name && cap.skip_judge {
@@ -1875,22 +1626,14 @@ impl ToolRouter {
             }
         }
 
-        // 2. MCP server ToolServer entries — ask each server whether this tool is flagged.
-        let servers = self.servers.read().await;
-        for server in servers.values() {
-            if server.is_skip_judge(tool_name) {
-                return true;
-            }
-        }
-
         false
     }
 
     /// Whether a call of `tool_name` waits for its user at the approval gate
     /// (AEGIS ADR-126 D1): the tool catalogue's entry is marked, or a
-    /// capability entry of the node configuration (a builtin dispatcher's or
-    /// an MCP server's) carries `requires_approval: true`. Either mark gates;
-    /// neither can clear the other.
+    /// capability entry of the node configuration (a builtin dispatcher's, or
+    /// a `spec.tool_capabilities` entry whose pattern matches) carries
+    /// `requires_approval: true`. Any mark gates; none can clear another.
     pub fn requires_approval(&self, tool_name: &str) -> bool {
         if BuiltinToolDefinition::lookup(tool_name).is_some_and(|d| d.requires_approval) {
             return true;
@@ -1903,27 +1646,34 @@ impl ToolRouter {
         {
             return true;
         }
-        self.mcp_capabilities
+        self.tool_capabilities
             .iter()
-            .any(|cap| cap.name == tool_name && cap.requires_approval)
+            .any(|entry| entry.requires_approval && entry.matches(tool_name))
     }
 
     /// What `tool_name` declares to the approval gate (AEGIS ADR-126, Update
     /// of 2026-10-04, clause 1): its input contract's declaration where it
-    /// makes one, otherwise its capability entry's in the node configuration
-    /// (a builtin dispatcher's, then an MCP server's), otherwise nothing, and
-    /// the gate's fallback applies.
+    /// makes one, otherwise its builtin dispatcher's capability entry,
+    /// otherwise the first `spec.tool_capabilities` entry, in the order the
+    /// configuration lists them, whose pattern matches; otherwise nothing,
+    /// and the gate's fallback applies.
     pub fn approval_contract(&self, tool_name: &str) -> ApprovalContract {
         let declared = crate::domain::mcp::ToolInputContract::approval_contract(tool_name);
         if !declared.is_empty() {
             return declared;
         }
-        self.builtin_dispatchers
+        if let Some(cap) = self
+            .builtin_dispatchers
             .iter()
             .flat_map(|d| d.capabilities.iter())
-            .chain(self.mcp_capabilities.iter())
             .find(|cap| cap.name == tool_name)
-            .map(|cap| cap.approval_contract())
+        {
+            return cap.approval_contract();
+        }
+        self.tool_capabilities
+            .iter()
+            .find(|entry| entry.matches(tool_name))
+            .map(|entry| entry.approval_contract())
             .unwrap_or_default()
     }
 }
@@ -1953,483 +1703,13 @@ pub struct ToolMetadata {
     pub fleet_capable: bool,
 }
 
-// =============================================================================
-// ManagerError
-// =============================================================================
-
-#[derive(Debug, thiserror::Error)]
-pub enum ManagerError {
-    #[error("Failed to start server '{0}': {1}")]
-    StartFailed(String, String),
-
-    #[error("Health check error for server '{0}': {1}")]
-    HealthCheckError(String, String),
-}
-
-// =============================================================================
-// ToolServerManager — Lifecycle management for MCP server processes
-// =============================================================================
-
-/// Manages the lifecycle of MCP server processes: starting, stopping,
-/// health checking, and registering them into the ToolRegistry.
-pub struct ToolServerManager {
-    registry: Arc<dyn ToolRegistry>,
-    servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
-    event_bus: Arc<EventBus>,
-    secrets_manager: Arc<SecretsManager>,
-}
-
-/// Parse Windows `tasklist /FO CSV /NH` output and determine whether the given
-/// PID is present in the result set.
-///
-/// The CSV format produced by `tasklist /FO CSV /NH` is one row per process:
-///   `"Image Name","PID","Session Name","Session#","Mem Usage"`
-///
-/// We extract the second field (PID), parse it as `u32`, and check for an exact
-/// match against the requested PID. This avoids brittle substring matches against
-/// localized "INFO: No tasks are running" messages or process names that happen
-/// to contain phrases like "No tasks".
-///
-/// Returns `false` for empty stdout (which is what `/NH` produces when no rows
-/// match the filter), for non-CSV lines, and for any input where the requested
-/// PID does not appear in the PID column of any row.
-#[cfg(windows)]
-pub(crate) fn parse_tasklist_csv_for_pid(stdout: &str, pid: u32) -> bool {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            // CSV row format:
-            //   "Image Name","PID","Session Name","Session#","Mem Usage"
-            // We only need the 2nd field (PID).
-            let mut parts = line.split("\",\"");
-            let _image_name = parts.next()?;
-            let pid_field = parts.next()?;
-            let pid_text = pid_field.trim_matches('"');
-            pid_text.parse::<u32>().ok()
-        })
-        .any(|found_pid| found_pid == pid)
-}
-
-impl ToolServerManager {
-    pub fn new(
-        registry: Arc<dyn ToolRegistry>,
-        servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
-        event_bus: Arc<EventBus>,
-        secrets_manager: Arc<SecretsManager>,
-    ) -> Self {
-        Self {
-            registry,
-            servers,
-            event_bus,
-            secrets_manager,
-        }
-    }
-
-    /// Start all configured servers that are currently in Stopped state.
-    /// Each successfully started server is registered into the ToolRegistry
-    /// so that ToolRouter can authorize agent access to them.
-    pub async fn start_all(&self) -> Result<Vec<ToolServerId>, ManagerError> {
-        let mut servers = self.servers.write().await;
-        let mut started = vec![];
-
-        for (server_id, server) in servers.iter_mut() {
-            if server.status == ToolServerStatus::Stopped {
-                match self.start_server(server).await {
-                    Ok(event) => {
-                        // Register server into the ToolRegistry for agent authorization
-                        if let Err(e) = self.registry.register_tool(server.clone()).await {
-                            warn!(
-                                "Failed to register server '{}' in registry: {}",
-                                server.name, e
-                            );
-                        }
-
-                        self.event_bus.publish_mcp_event(event);
-                        info!(
-                            "Started MCP server '{}' (pid: {:?})",
-                            server.name, server.process_id
-                        );
-                        started.push(*server_id);
-                    }
-                    Err(e) => {
-                        error!("Failed to start MCP server '{}': {}", server.name, e);
-                    }
-                }
-            }
-        }
-
-        if started.is_empty() {
-            info!("No MCP servers configured to start");
-        } else {
-            info!("Started {} MCP server(s)", started.len());
-        }
-
-        Ok(started)
-    }
-
-    /// Start a single MCP server process.
-    /// Sets the domain state transitions properly: Stopped → Starting → Running.
-    async fn start_server(
-        &self,
-        server: &mut ToolServer,
-    ) -> Result<crate::domain::events::MCPToolEvent, ManagerError> {
-        info!(
-            "Starting MCP server '{}' from '{}'",
-            server.name,
-            server.executable_path.display()
-        );
-
-        // Transition to Starting state first (domain validation)
-        let start_event = server
-            .start()
-            .map_err(|e| ManagerError::StartFailed(server.name.clone(), e.to_string()))?;
-
-        // Spawn the actual process
-        let mut command = tokio::process::Command::new(&server.executable_path);
-        command.args(&server.args);
-        command.stdin(std::process::Stdio::piped());
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-
-        // Inject credentials as environment variables (ADR-034 Keymaster pattern).
-        // Credentials are resolved from the secret store and injected here;
-        // the subprocess never receives vault tokens or raw secret paths.
-        let cred_context = AccessContext::system("orchestrator");
-        for (env_key, cred_ref) in &server.credentials {
-            match self
-                .secrets_manager
-                .resolve_credential(cred_ref, &cred_context)
-                .await
-            {
-                Ok(sensitive_value) => {
-                    command.env(env_key, sensitive_value.expose());
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to resolve credential '{}' for server '{}': {}",
-                        env_key, server.name, e
-                    );
-                }
-            }
-        }
-
-        let child = command.spawn().map_err(|e| {
-            // Revert domain state on spawn failure
-            server.status = ToolServerStatus::Failed;
-            ManagerError::StartFailed(
-                server.name.clone(),
-                format!(
-                    "Failed to spawn process '{}': {}",
-                    server.executable_path.display(),
-                    e
-                ),
-            )
-        })?;
-
-        let pid = child.id().unwrap_or(0);
-
-        // Update domain object with process details
-        server.process_id = child.id();
-        server.status = ToolServerStatus::Running;
-
-        info!("MCP server '{}' spawned with PID {}", server.name, pid);
-
-        // Return the start event with the actual PID
-        if let crate::domain::events::MCPToolEvent::ServerStarted {
-            server_id,
-            name,
-            process_id: _,
-            started_at,
-        } = start_event
-        {
-            Ok(crate::domain::events::MCPToolEvent::ServerStarted {
-                server_id,
-                name,
-                process_id: pid,
-                started_at,
-            })
-        } else {
-            Ok(start_event)
-        }
-    }
-
-    /// Background health check loop. Runs continuously, checking all Running
-    /// servers at regular intervals. Marks servers as Unhealthy after failures.
-    pub async fn health_check_loop(&self) {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-
-        loop {
-            interval.tick().await;
-
-            let mut servers = self.servers.write().await;
-            for server in servers.values_mut() {
-                if server.status == ToolServerStatus::Running {
-                    match self.check_server_health(server).await {
-                        Ok(true) => {
-                            trace!(
-                                "Server '{}' healthy (pid: {:?})",
-                                server.name,
-                                server.process_id
-                            );
-                            server.record_health_check(true);
-                        }
-                        Ok(false) => {
-                            warn!(
-                                "Server '{}' unhealthy (pid: {:?})",
-                                server.name, server.process_id
-                            );
-                            if let Some(evt) = server.record_health_check(false) {
-                                self.event_bus.publish_mcp_event(evt);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Health check error for server '{}': {}", server.name, e);
-                            if let Some(evt) = server.record_health_check(false) {
-                                self.event_bus.publish_mcp_event(evt);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check if a server's process is still alive by checking PID existence.
-    /// A more sophisticated implementation would send a JSON-RPC `tools/list`
-    /// request via stdio, but checking process liveness is the baseline.
-    async fn check_server_health(&self, server: &ToolServer) -> Result<bool, ManagerError> {
-        match server.process_id {
-            Some(pid) => {
-                // Check if the process is still running by attempting to query it.
-                // On Unix, we'd use kill(pid, 0). On Windows, OpenProcess.
-                // tokio::process doesn't expose this directly, so we use a platform check.
-                let is_alive = Self::is_process_alive(pid);
-                if !is_alive {
-                    warn!(
-                        "MCP server '{}' process (PID {}) is no longer running",
-                        server.name, pid
-                    );
-                }
-                Ok(is_alive)
-            }
-            None => {
-                // No PID means the server was never properly started
-                warn!(
-                    "MCP server '{}' has no PID — treating as unhealthy",
-                    server.name
-                );
-                Ok(false)
-            }
-        }
-    }
-
-    /// Platform-specific process liveness check.
-    fn is_process_alive(pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            // Send signal 0 to check if process exists (no signal actually sent).
-            // Uses `kill -0` via Command to avoid requiring the libc crate.
-            std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        }
-
-        #[cfg(windows)]
-        {
-            // Use tasklist to check if PID exists.
-            // Request CSV output and parse the PID column to avoid brittle substring
-            // matching against localized "No tasks are running" messages or process
-            // names that happen to contain that phrase.
-            match std::process::Command::new("tasklist")
-                .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
-                .output()
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    parse_tasklist_csv_for_pid(&stdout, pid)
-                }
-                Err(_) => {
-                    // If tasklist itself fails, fail closed and report unhealthy.
-                    // This avoids masking real process failures.
-                    warn!(
-                        pid,
-                        "tasklist health check command failed; reporting process as unhealthy"
-                    );
-                    false
-                }
-            }
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = pid;
-            true
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::mcp::*;
     use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    fn make_test_server(name: &str, capabilities: Vec<&str>) -> ToolServer {
-        ToolServer {
-            id: ToolServerId::new(),
-            name: name.to_string(),
-            execution_mode: ExecutionMode::Remote,
-            executable_path: PathBuf::from("/usr/local/bin/mcp-test"),
-            args: vec![],
-            capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
-            skip_judge_tools: std::collections::HashSet::new(),
-            status: ToolServerStatus::Running,
-            process_id: None,
-            health_check_interval: Duration::from_secs(60),
-            last_health_check: None,
-            credentials: HashMap::new(),
-            resource_limits: ResourceLimits {
-                max_memory_mb: Some(512),
-                max_cpu_shares: Some(1000),
-            },
-            started_at: None,
-            stopped_at: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_route_tool_exact_match() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-        let server = make_test_server("filesystem", vec!["filesystem.read", "filesystem.write"]);
-        let server_id = server.id;
-        servers.write().await.insert(server_id, server);
-
-        let router = ToolRouter::new(registry, servers, vec![]);
-        router.rebuild_index().await;
-
-        let exec_id = ExecutionId::new();
-        let result = router.route_tool(exec_id, "filesystem.read").await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), server_id);
-    }
-
-    #[tokio::test]
-    async fn test_route_tool_not_found() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-        let router = ToolRouter::new(registry, servers, vec![]);
-        router.rebuild_index().await;
-
-        let exec_id = ExecutionId::new();
-        let result = router.route_tool(exec_id, "nonexistent.tool").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_route_tool_server_not_ready() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-        let mut server = make_test_server("gmail", vec!["gmail.send"]);
-        server.status = ToolServerStatus::Failed;
-        let server_id = server.id;
-        servers.write().await.insert(server_id, server);
-
-        let router = ToolRouter::new(registry, servers, vec![]);
-        router.rebuild_index().await;
-
-        let exec_id = ExecutionId::new();
-        let result = router.route_tool(exec_id, "gmail.send").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_route_tool_agent_authorization() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let exec_id = ExecutionId::new();
-
-        // Register a specific tool set for this agent
-        let authorized_server = make_test_server("filesystem", vec!["filesystem.read"]);
-        registry.add_agent_server(exec_id, authorized_server).await;
-
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-        let router_server = make_test_server("gmail", vec!["gmail.send"]);
-        let gmail_id = router_server.id;
-        servers.write().await.insert(gmail_id, router_server);
-
-        let router = ToolRouter::new(registry, servers, vec![]);
-        router.rebuild_index().await;
-
-        // Agent is only authorized for filesystem.read, not gmail.send
-        let result = router.route_tool(exec_id, "gmail.send").await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, RoutingError::AgentNotAuthorized { .. }),
-            "Expected AgentNotAuthorized, got {err:?}"
-        );
-        if let RoutingError::AgentNotAuthorized { tool_name, .. } = err {
-            assert_eq!(tool_name, "gmail.send");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_list_tools_only_running() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-
-        let running = make_test_server("filesystem", vec!["filesystem.read"]);
-        let mut stopped = make_test_server("gmail", vec!["gmail.send"]);
-        stopped.status = ToolServerStatus::Stopped;
-
-        servers.write().await.insert(running.id, running);
-        servers.write().await.insert(stopped.id, stopped);
-
-        let router = ToolRouter::new(registry, servers, vec![]);
-        let tools = router.list_tools().await.unwrap();
-        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        // Running MCP server's tool must appear
-        assert!(
-            tool_names.contains(&"filesystem.read"),
-            "Expected running server tool 'filesystem.read' in {tool_names:?}"
-        );
-        // Stopped MCP server's tool must NOT appear
-        assert!(
-            !tool_names.contains(&"gmail.send"),
-            "Stopped server tool 'gmail.send' should not appear in {tool_names:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_registry_global_and_per_execution() {
-        let registry = InMemoryToolRegistry::new();
-        let global_server = make_test_server("filesystem", vec!["filesystem.read"]);
-        registry.add_global_server(global_server).await;
-
-        let exec_id = ExecutionId::new();
-        let agent_server = make_test_server("gmail", vec!["gmail.send"]);
-        registry.add_agent_server(exec_id, agent_server).await;
-
-        let tools = registry.get_tools_for_agent(exec_id).await.unwrap();
-        assert_eq!(tools.len(), 2);
-
-        // Different execution should only see globals
-        let other_exec = ExecutionId::new();
-        let other_tools = registry.get_tools_for_agent(other_exec).await.unwrap();
-        assert_eq!(other_tools.len(), 1);
-    }
 
     #[tokio::test]
     async fn test_list_tools_includes_aegis_authoring_tool_schemas() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-
         let builtins = vec![
             BuiltinDispatcherConfig {
                 name: "aegis.agent.create".to_string(),
@@ -2485,7 +1765,7 @@ mod tests {
             },
         ];
 
-        let router = ToolRouter::new(registry, servers, builtins);
+        let router = ToolRouter::new(builtins);
         let tools = router.list_tools().await.unwrap();
 
         let agent_tool = tools.iter().find(|t| t.name == "aegis.agent.create");
@@ -2545,9 +1825,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_tools_advertises_implemented_workflow_builtins() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-
         let builtins = vec![
             BuiltinDispatcherConfig {
                 name: "aegis.workflow.cancel".to_string(),
@@ -2603,7 +1880,7 @@ mod tests {
             },
         ];
 
-        let router = ToolRouter::new(registry, servers, builtins);
+        let router = ToolRouter::new(builtins);
         let tools = router.list_tools().await.unwrap();
 
         assert!(tools
@@ -2682,9 +1959,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_attachment_capable_tool_schemas_declare_attachments() {
-        let registry = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-
         let builtins = vec![
             BuiltinDispatcherConfig {
                 name: "aegis.task.execute".to_string(),
@@ -2728,7 +2002,7 @@ mod tests {
             },
         ];
 
-        let router = ToolRouter::new(registry, servers, builtins);
+        let router = ToolRouter::new(builtins);
         let tools = router.list_tools().await.unwrap();
 
         for tool_name in [
@@ -2742,61 +2016,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected `{tool_name}` to be advertised"));
             assert_attachments_property_shape(&tool.input_schema, tool_name);
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Regression tests for `parse_tasklist_csv_for_pid`.
-    //
-    // The previous implementation used `!stdout.contains("No tasks")` to detect
-    // process liveness on Windows. This had two failure modes:
-    //   1. False positive when a process Image Name (or other column) happened
-    //      to contain the substring "No tasks".
-    //   2. Locale-dependent — `tasklist` localizes the
-    //      "INFO: No tasks are running" message, breaking the check on any
-    //      non-English Windows host.
-    //
-    // The fix parses CSV output from `tasklist /FO CSV /NH` and matches the
-    // PID column exactly. These tests pin that behavior.
-    // -----------------------------------------------------------------------
-
-    #[cfg(windows)]
-    #[test]
-    fn parse_tasklist_csv_pid_present() {
-        // Typical CSV row produced by `tasklist /FI "PID eq 4242" /FO CSV /NH`.
-        let stdout = "\"my-process.exe\",\"4242\",\"Console\",\"1\",\"12,345 K\"\r\n";
-        assert!(parse_tasklist_csv_for_pid(stdout, 4242));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn parse_tasklist_csv_pid_absent() {
-        // Localized "no match" output from older tasklist versions that print
-        // a banner instead of returning empty stdout. The PID 4242 is nowhere
-        // in this text, so the parser must return false.
-        let stdout = "INFO: No tasks are running which match the specified criteria.\r\n";
-        assert!(!parse_tasklist_csv_for_pid(stdout, 4242));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn parse_tasklist_csv_pid_substring_in_image_name() {
-        // Adversarial input: an image name contains the literal substring
-        // "No tasks". Under the old `!stdout.contains("No tasks")` logic this
-        // would have collapsed both branches to the same answer. The new
-        // parser must treat this row as "PID 99 exists" and therefore return
-        // false when asked about PID 4242.
-        let stdout = "\"No tasks helper.exe\",\"99\",\"Console\",\"1\",\"1,000 K\"\r\n";
-        assert!(!parse_tasklist_csv_for_pid(stdout, 4242));
-        // Sanity: the row's actual PID is correctly recognized.
-        assert!(parse_tasklist_csv_for_pid(stdout, 99));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn parse_tasklist_csv_localized_no_match_text() {
-        // `tasklist /NH` with a non-matching PID filter typically emits empty
-        // stdout. Empty input must yield false (process not alive).
-        assert!(!parse_tasklist_csv_for_pid("", 4242));
     }
 
     // -----------------------------------------------------------------------
@@ -3091,19 +2310,17 @@ mod tests {
         );
     }
 
+    fn tool_capabilities(yaml: &str) -> Vec<ToolCapabilityConfig> {
+        serde_yaml::from_str(yaml).expect("spec.tool_capabilities entries parse")
+    }
+
     /// AEGIS ADR-126 D1: a capability entry of the node configuration gates
-    /// its tool, a builtin dispatcher's or an MCP server's; no catalogue
-    /// entry is marked yet, so with no entry nothing is gated, and an entry
-    /// without the flag does not gate.
+    /// its tool, a builtin dispatcher's or a `spec.tool_capabilities` entry
+    /// whose pattern matches; no catalogue entry is marked yet, so with no
+    /// entry nothing is gated, and an entry without the flag does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
-        let registry: Arc<dyn ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-        let plain = ToolRouter::new(
-            registry.clone(),
-            servers.clone(),
-            ToolRouter::builtin_dispatchers(),
-        );
+        let plain = ToolRouter::new(ToolRouter::builtin_dispatchers());
         for def in BUILTIN_TOOL_DEFINITIONS {
             assert!(
                 !plain.requires_approval(def.name),
@@ -3125,30 +2342,59 @@ mod tests {
             }],
             api_key: None,
         }];
-        let mcp: Vec<crate::domain::node_config::McpServerConfig> = serde_yaml::from_str(
-            "- name: mail\n  executable: /bin/true\n  capabilities:\n    - name: gmail.send\n      requires_approval: true\n    - name: gmail.list\n",
-        )
-        .expect("MCP server entries parse");
-        let gated = ToolRouter::new(registry, servers, dispatchers).with_mcp_server_approvals(&mcp);
+        let gated = ToolRouter::new(dispatchers).with_tool_capabilities(&tool_capabilities(
+            "- tool_pattern: gmail.send\n  requires_approval: true\n- tool_pattern: gmail.list\n",
+        ));
         assert!(gated.requires_approval("aegis.system.info"));
         assert!(gated.requires_approval("gmail.send"));
         assert!(!gated.requires_approval("gmail.list"));
         assert!(!gated.requires_approval("fs.read"));
     }
 
+    /// ADR-132's Update (the coordinator's settlement of C1): a tool the
+    /// orchestrator does not serve, such as a SEAL gateway tool of a remote
+    /// server, is gated by a `spec.tool_capabilities` pattern with no server
+    /// entry; `<prefix>.*` matches the tools under `<prefix>.` and no other.
+    #[test]
+    fn a_gateway_tool_matched_by_a_pattern_is_gated() {
+        let router = ToolRouter::new(ToolRouter::builtin_dispatchers()).with_tool_capabilities(
+            &tool_capabilities(
+                "- tool_pattern: nuclear-notes.pages.*\n  requires_approval: true\n- tool_pattern: nuclear-notes.search.literal\n  requires_approval: true\n",
+            ),
+        );
+        assert!(router.requires_approval("nuclear-notes.pages.create"));
+        assert!(router.requires_approval("nuclear-notes.pages.apply_patch"));
+        assert!(router.requires_approval("nuclear-notes.search.literal"));
+        assert!(!router.requires_approval("nuclear-notes.search.global"));
+        assert!(!router.requires_approval("nuclear-notes.pagesx.create"));
+        assert!(!router.requires_approval("nuclear-notes.pages"));
+
+        let everything = ToolRouter::new(ToolRouter::builtin_dispatchers()).with_tool_capabilities(
+            &tool_capabilities("- tool_pattern: \"*\"\n  requires_approval: true\n"),
+        );
+        assert!(everything.requires_approval("any.tool"));
+    }
+
+    /// `spec.tool_capabilities` refuses a key it does not know, so a key
+    /// that once lived on an MCP server entry is not silently dropped.
+    #[test]
+    fn a_tool_capability_entry_with_an_unknown_key_is_refused() {
+        let parsed: Result<Vec<ToolCapabilityConfig>, _> =
+            serde_yaml::from_str("- tool_pattern: chat.post\n  skip_judge: true\n");
+        assert!(parsed.is_err());
+    }
+
     /// ADR-126, Update of 2026-10-04, clause 1: the gate's keys come from the
-    /// tool's capability entry, a builtin dispatcher's or an MCP server's;
-    /// a tool whose entry declares none gets the empty contract.
+    /// tool's capability entry, a builtin dispatcher's or the first matching
+    /// `spec.tool_capabilities` entry; a tool whose entry declares none gets
+    /// the empty contract.
     #[test]
     fn approval_contract_comes_from_the_capability_entry() {
-        let registry: Arc<dyn ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(RwLock::new(HashMap::new()));
-        let mcp: Vec<crate::domain::node_config::McpServerConfig> = serde_yaml::from_str(
-            "- name: chat\n  executable: /bin/true\n  capabilities:\n    - name: chat.post\n      requires_approval: true\n      binding_argument: workspace\n      approval_summary: [channel, text]\n    - name: chat.list\n",
-        )
-        .expect("MCP server entries parse");
-        let router = ToolRouter::new(registry, servers, ToolRouter::builtin_dispatchers())
-            .with_mcp_server_approvals(&mcp);
+        let router = ToolRouter::new(ToolRouter::builtin_dispatchers()).with_tool_capabilities(
+            &tool_capabilities(
+                "- tool_pattern: chat.post\n  requires_approval: true\n  binding_argument: workspace\n  approval_summary: [channel, text]\n- tool_pattern: chat.*\n  binding_argument: other\n- tool_pattern: chat.list\n",
+            ),
+        );
         assert_eq!(
             router.approval_contract("chat.post"),
             ApprovalContract {
@@ -3156,7 +2402,13 @@ mod tests {
                 approval_summary: Some(vec!["channel".to_string(), "text".to_string()]),
             }
         );
-        assert!(router.approval_contract("chat.list").is_empty());
+        assert_eq!(
+            router.approval_contract("chat.edit"),
+            ApprovalContract {
+                binding_argument: Some("other".to_string()),
+                approval_summary: None,
+            }
+        );
         assert!(router.approval_contract("fs.write").is_empty());
         assert!(router.approval_contract("mail.send").is_empty());
     }

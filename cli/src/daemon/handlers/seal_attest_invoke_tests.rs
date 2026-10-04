@@ -64,7 +64,7 @@ use aegis_orchestrator_core::infrastructure::seal::session_repository::InMemoryS
 use aegis_orchestrator_core::infrastructure::seal::signature::SecurityTokenIssuer;
 use aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository;
 use aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider;
-use aegis_orchestrator_core::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+use aegis_orchestrator_core::infrastructure::tool_router::ToolRouter;
 use aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter;
 
 use super::{attest_binding, AttestCaller, HttpAttestationRequest};
@@ -513,13 +513,7 @@ async fn attest_with(
         .await
         .expect("attestation succeeds");
 
-    let registry: Arc<dyn aegis_orchestrator_core::domain::mcp::ToolRegistry> =
-        Arc::new(InMemoryToolRegistry::new());
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        ToolRouter::builtin_dispatchers(),
-    ));
+    let router = Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers()));
     let storage_root =
         std::env::temp_dir().join(format!("aegis-attest-identity-{}", uuid::Uuid::new_v4()));
     let volumes = Arc::new(InMemoryVolumeRepository::new());
@@ -926,7 +920,11 @@ async fn an_unknown_tool_is_404_and_the_nodes_tools_are_not_listed() {
         a.body
     );
     assert!(!a.body.to_string().contains("Available"), "{}", a.body);
-    assert!(a.log.contains("Available"), "{}", a.log);
+    assert!(
+        a.log.contains("Tool not found: aegis.goal.no-such-tool"),
+        "{}",
+        a.log
+    );
 }
 
 // ---- caller-facing refusals the service cannot be driven to here -----------

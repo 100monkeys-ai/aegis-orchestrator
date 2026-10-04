@@ -27,7 +27,7 @@
 //! | [`storage`] | BC-7 Storage Gateway | `StorageProvider` trait, `OpenMode`, ACL for SeaweedFS |
 //! | [`fsal`] | BC-7 Storage Gateway | `AegisFSAL` transport-agnostic security boundary (ADR-036) |
 //! | [`path_sanitizer`] | BC-7 Storage Gateway | Path canonicalization and traversal-rejection |
-//! | [`mcp`] | BC-12 SEAL / Tool Routing | `ToolServer`, `MCPError`, MCP integration types (ADR-033) |
+//! | [`mcp`] | BC-12 SEAL / Tool Routing | `MCPError`, `ToolInputContract`, MCP integration types (ADR-033) |
 //! | [`secrets`] | BC-11 Secrets & Identity | `SensitiveString`, `SecretPath`, `AccessContext`, `DomainDynamicSecret` (ADR-034) |
 //! | [`shared_kernel`] | Shared Kernel | Cross-context identity types — DDD Shared Kernel pattern |
 //! | [`discovery`] | BC-1/BC-3 Agent & Workflow Discovery | `DiscoveryQuery`, `DiscoveryResult`, `DiscoveryResponse` value objects (ADR-075) |

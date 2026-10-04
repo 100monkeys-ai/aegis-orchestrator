@@ -640,7 +640,6 @@ impl ToolInvocationService {
     /// - Inner-loop semantic judge (ADR-049)
     /// - aegis.* built-in tool dispatch
     /// - try_invoke_builtin fallback (cmd.run, fs.*, web.*, aegis.schema.*)
-    /// - ToolRouter dynamic routing
     /// - SEAL gateway fallback
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_tool_core(
@@ -1180,124 +1179,49 @@ impl ToolInvocationService {
             }
         }
 
-        let server_id = match self.tool_router.route_tool(execution_id, &tool_name).await {
-            Ok(id) => {
-                self.publish_invocation_started(
-                    invocation_id,
+        // No builtin serves the tool: the SEAL gateway is the one path for an
+        // external tool (AEGIS ADR-132 G1, G4). The orchestrator runs no MCP
+        // server of its own, so nothing here answers for a tool it did not run.
+        if self.seal_gateway_url.is_some() {
+            let gateway_result = self
+                .invoke_seal_gateway_internal_grpc(
                     execution_id,
-                    *agent_id,
-                    id,
                     &tool_name,
-                );
-                id
-            }
-            Err(routing_err) => {
-                if self.seal_gateway_url.is_some() {
-                    let gateway_result = self
-                        .invoke_seal_gateway_internal_grpc(
-                            execution_id,
-                            &tool_name,
-                            args.clone(),
-                            Some(tenant_id.as_str()),
-                            None,
-                        )
-                        .await;
-                    if let Ok(value) = gateway_result {
-                        self.publish_invocation_completed(
-                            invocation_id,
-                            execution_id,
-                            *agent_id,
-                            &value,
-                            started_at,
-                        );
-                        return Ok(ToolInvocationResult::Direct(value));
-                    }
-                }
-                self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    format!("Routing error: {routing_err}"),
-                );
-                let shown =
-                    SealSessionError::InternalError(format!("Routing error: {routing_err}"));
-                // The tool name is the caller's; the node's list of tools is not.
-                return Err(match &routing_err {
-                    crate::infrastructure::tool_router::RoutingError::ToolNotFound {
-                        tool_name,
-                        ..
-                    } => shown.answered(crate::domain::seal_session::CallerAnswer::NotFound(
-                        format!("Not found: tool '{tool_name}'."),
-                    )),
-                    _ => shown,
-                });
-            }
-        };
-
-        let server = match self.tool_router.get_server(server_id).await {
-            Some(server) => server,
-            None => {
-                let err =
-                    SealSessionError::InternalError("Server vanished after routing".to_string());
-                self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    err.to_string(),
-                );
-                return Err(err);
-            }
-        };
-
-        match server.execution_mode {
-            crate::domain::mcp::ExecutionMode::Local => {
-                tracing::info!(
-                    "Executing local tool via FSAL: {} for agent {:?}",
-                    tool_name,
-                    agent_id
-                );
-                let result = serde_json::json!({
-                    "status": "success",
-                    "execution_mode": "local_fsal",
-                    "message": format!("Locally executed {} affecting agent volume", tool_name),
-                    "args_executed": args
-                });
+                    args.clone(),
+                    Some(tenant_id.as_str()),
+                    None,
+                )
+                .await;
+            if let Ok(value) = gateway_result {
                 self.publish_invocation_completed(
                     invocation_id,
                     execution_id,
                     *agent_id,
-                    &result,
+                    &value,
                     started_at,
                 );
-                Ok(ToolInvocationResult::Direct(result))
-            }
-            crate::domain::mcp::ExecutionMode::Remote => {
-                tracing::info!(
-                    "Proxying remote tool via JSON-RPC: {} to server {:?}",
-                    tool_name,
-                    server_id
-                );
-                let result = serde_json::json!({
-                    "status": "success",
-                    "execution_mode": "remote_jsonrpc",
-                    "message": format!("Proxied {} to external MCP server {:?}", tool_name, server_id),
-                    "args_proxied": args
-                });
-                self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &result,
-                    started_at,
-                );
-                Ok(ToolInvocationResult::Direct(result))
+                return Ok(ToolInvocationResult::Direct(value));
             }
         }
+        self.publish_invocation_failed(
+            invocation_id,
+            execution_id,
+            *agent_id,
+            format!("Tool not found: {tool_name}"),
+        );
+        // The tool name is the caller's; the node's list of tools is not.
+        Err(
+            SealSessionError::InternalError(format!("Tool not found: {tool_name}")).answered(
+                crate::domain::seal_session::CallerAnswer::NotFound(format!(
+                    "Not found: tool '{tool_name}'."
+                )),
+            ),
+        )
     }
 
     /// Attempt to dispatch an aegis.* tool by name. Returns `Some(result)` if
     /// the tool name matched an aegis.* handler, `None` if it should fall through
-    /// to the builtin / ToolRouter / gateway chain.
+    /// to the builtin / gateway chain.
     #[allow(clippy::too_many_arguments)]
     async fn try_dispatch_aegis_tool(
         &self,

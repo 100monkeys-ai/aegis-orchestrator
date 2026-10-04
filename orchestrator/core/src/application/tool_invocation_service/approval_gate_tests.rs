@@ -24,7 +24,7 @@ use crate::infrastructure::repositories::postgres_tool_approval::InMemoryToolApp
 use crate::infrastructure::repositories::InMemoryVolumeRepository;
 use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
 use crate::infrastructure::storage::LocalHostStorageProvider;
-use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+use crate::infrastructure::tool_router::ToolRouter;
 use async_trait::async_trait;
 use futures::Stream;
 use serde_json::json;
@@ -374,13 +374,7 @@ async fn harness_declaring(
         .await
         .unwrap();
 
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        servers,
-        dispatchers_gating(GATED_TOOL, &contract),
-    ));
+    let router = Arc::new(ToolRouter::new(dispatchers_gating(GATED_TOOL, &contract)));
     let storage_root =
         std::env::temp_dir().join(format!("aegis-gate-tests-{}", uuid::Uuid::new_v4()));
     let fsal = Arc::new(AegisFSAL::new(

@@ -141,9 +141,13 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageConfig>,
 
-    /// MCP tool servers configurations
+    /// What the approval gate knows of tools the orchestrator does not serve
+    /// itself, such as the SEAL gateway's, keyed by tool name pattern (AEGIS
+    /// ADR-126 D1 and its Update of 2026-10-04 clause 1; ADR-132's Update).
+    /// The orchestrator runs no MCP server of its own: an external tool comes
+    /// through the SEAL gateway (ADR-132 G1, G4).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_servers: Option<Vec<McpServerConfig>>,
+    pub tool_capabilities: Option<Vec<ToolCapabilityConfig>>,
 
     /// Built-in dispatchers configurations (e.g. cmd.run) (ADR-040)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1031,8 +1035,7 @@ impl Default for OpenDalConfig {
 
 /// Per-tool capability configuration, including operator-level judge optimization flags.
 ///
-/// Replaces the previous flat `Vec<String>` capabilities list on both
-/// `BuiltinDispatcherConfig` and `McpServerConfig`.
+/// The capabilities of a `BuiltinDispatcherConfig`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityConfig {
     /// Tool name exposed to agents (e.g. `"fs.read"`, `"cmd.run"`, `"gmail.send"`)
@@ -1108,86 +1111,56 @@ pub struct BuiltinDispatcherConfig {
     pub api_key: Option<SensitiveString>,
 }
 
-/// MCP Server configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerConfig {
-    /// Server identifier (unique on this node)
-    pub name: String,
+/// One entry of `spec.tool_capabilities`: what the approval gate knows of a
+/// tool the orchestrator does not serve itself (a SEAL gateway tool), keyed
+/// by a tool name pattern rather than by a server entry (AEGIS ADR-126 D1 and
+/// its Update of 2026-10-04 clause 1; ADR-132's Update).
+///
+/// `tool_pattern` is an exact tool name, `<prefix>.*` for every tool whose
+/// name starts with `<prefix>.`, or `*` for every tool. An unknown key is
+/// refused when the configuration loads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCapabilityConfig {
+    /// The tools this entry speaks for.
+    pub tool_pattern: String,
 
-    /// Whether to start this server
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Path to executable (absolute or relative to /usr/local/bin)
-    pub executable: String,
-
-    /// Command-line arguments
+    /// When `true`, an agent's call of a matching tool waits for its user's
+    /// answer at the approval gate (ADR-126 D1). Defaults to `false`; it
+    /// cannot clear a mark the tool catalogue or another entry sets.
     #[serde(default)]
-    pub args: Vec<String>,
+    pub requires_approval: bool,
 
-    /// Tool capabilities provided by this server.
-    /// Use object form to control per-tool `skip_judge` behaviour.
-    #[serde(default)]
-    pub capabilities: Vec<CapabilityConfig>,
+    /// The argument naming the credential binding a call acts through; the
+    /// gate keys a user's "always allow" on its value. Absent: no binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_argument: Option<String>,
 
-    /// API keys/tokens for external services
-    #[serde(default)]
-    pub credentials: HashMap<String, SensitiveString>,
-
-    /// Health monitoring configuration
-    #[serde(default)]
-    pub health_check: McpHealthCheckConfig,
-
-    /// Process resource constraints
-    #[serde(default)]
-    pub resource_limits: McpResourceLimitsConfig,
-
-    /// Additional environment variables
-    #[serde(default)]
-    pub environment: HashMap<String, SensitiveString>,
+    /// The arguments, in order, the gate shows its user before an answer.
+    /// Absent: the tool's name and its arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_summary: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpHealthCheckConfig {
-    /// Check interval in seconds
-    #[serde(default = "default_health_check_interval_seconds")]
-    pub interval_seconds: u64,
-
-    /// Health check timeout in seconds
-    #[serde(default = "default_health_check_timeout_seconds")]
-    pub timeout_seconds: u64,
-
-    /// Health check method
-    #[serde(default = "default_health_check_method")]
-    pub method: String,
-}
-
-impl Default for McpHealthCheckConfig {
-    fn default() -> Self {
-        Self {
-            interval_seconds: default_health_check_interval_seconds(),
-            timeout_seconds: default_health_check_timeout_seconds(),
-            method: default_health_check_method(),
+impl ToolCapabilityConfig {
+    /// Whether `tool_name` is one of the tools this entry speaks for.
+    pub fn matches(&self, tool_name: &str) -> bool {
+        match self.tool_pattern.as_str() {
+            "*" => true,
+            pattern => match pattern.strip_suffix(".*") {
+                Some(prefix) => tool_name
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('.')),
+                None => tool_name == pattern,
+            },
         }
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpResourceLimitsConfig {
-    /// CPU limit (1000 = 1 core)
-    #[serde(default = "default_cpu_millicores")]
-    pub cpu_millicores: u32,
-
-    /// Memory limit in MB
-    #[serde(default = "default_memory_mb")]
-    pub memory_mb: u32,
-}
-
-impl Default for McpResourceLimitsConfig {
-    fn default() -> Self {
-        Self {
-            cpu_millicores: default_cpu_millicores(),
-            memory_mb: default_memory_mb(),
+    /// What this entry declares to the approval gate.
+    pub fn approval_contract(&self) -> crate::domain::tool_approval::ApprovalContract {
+        crate::domain::tool_approval::ApprovalContract {
+            binding_argument: self.binding_argument.clone(),
+            approval_summary: self.approval_summary.clone(),
         }
     }
 }
@@ -2040,21 +2013,6 @@ fn default_s3_region() -> String {
     "us-east-1".to_string()
 }
 
-fn default_health_check_interval_seconds() -> u64 {
-    60
-}
-fn default_health_check_timeout_seconds() -> u64 {
-    5
-}
-fn default_health_check_method() -> String {
-    "tools/list".to_string()
-}
-fn default_cpu_millicores() -> u32 {
-    1000
-}
-fn default_memory_mb() -> u32 {
-    512
-}
 fn default_seal_issuer() -> String {
     "aegis-orchestrator".to_string()
 }
@@ -2126,7 +2084,7 @@ impl Default for NodeConfigSpec {
             network: None,
             observability: None,
             storage: None,
-            mcp_servers: None,
+            tool_capabilities: None,
             builtin_dispatchers: None,
             registry_credentials: vec![],
             database: None,
@@ -2876,7 +2834,7 @@ mod tests {
                 temporal: None,
                 cortex: None,
                 secrets: None,
-                mcp_servers: None,
+                tool_capabilities: None,
                 builtin_dispatchers: None,
                 seal: None,
                 cluster: None,

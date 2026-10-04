@@ -20,7 +20,7 @@ use crate::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
 use crate::infrastructure::repositories::InMemoryVolumeRepository;
 use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
 use crate::infrastructure::storage::LocalHostStorageProvider;
-use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+use crate::infrastructure::tool_router::ToolRouter;
 use async_trait::async_trait;
 use futures::Stream;
 use serde_json::json;
@@ -250,13 +250,7 @@ struct Harness {
 }
 
 fn harness() -> Harness {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        servers,
-        ToolRouter::builtin_dispatchers(),
-    ));
+    let router = Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers()));
     let storage_root =
         std::env::temp_dir().join(format!("aegis-goal-tests-{}", uuid::Uuid::new_v4()));
     let fsal = Arc::new(AegisFSAL::new(
@@ -457,9 +451,7 @@ async fn a_goal_belongs_to_a_user_so_a_call_without_one_is_refused() {
 /// no model is shown it; the three goal tools are listed.
 #[tokio::test]
 async fn goal_id_is_not_advertised_by_the_four_starting_tools() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let router = ToolRouter::new(registry, servers, ToolRouter::builtin_dispatchers());
+    let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
     let tools = router.list_tools().await.unwrap();
     for name in [
         "aegis.agent.generate",

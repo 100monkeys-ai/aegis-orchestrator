@@ -259,17 +259,11 @@ impl DomainEvent {
             },
             DomainEvent::MCP(event) => match event {
                 MCPToolEvent::InvocationRequested { execution_id, .. }
-                | MCPToolEvent::InvocationStarted { execution_id, .. }
                 | MCPToolEvent::InvocationCompleted { execution_id, .. }
                 | MCPToolEvent::InvocationFailed { execution_id, .. }
                 | MCPToolEvent::PolicyViolation { execution_id, .. }
                 | MCPToolEvent::ApprovalRequested { execution_id, .. }
                 | MCPToolEvent::ApprovalDecided { execution_id, .. } => Some(*execution_id),
-                MCPToolEvent::ServerRegistered { .. }
-                | MCPToolEvent::ServerStarted { .. }
-                | MCPToolEvent::ServerStopped { .. }
-                | MCPToolEvent::ServerFailed { .. }
-                | MCPToolEvent::ServerUnhealthy { .. } => None,
             },
             DomainEvent::Seal(event) => match event {
                 SealEvent::AttestationCompleted { execution_id, .. }
@@ -380,17 +374,11 @@ impl DomainEvent {
             }),
             DomainEvent::MCP(event) => match event {
                 MCPToolEvent::InvocationRequested { agent_id, .. }
-                | MCPToolEvent::InvocationStarted { agent_id, .. }
                 | MCPToolEvent::InvocationCompleted { agent_id, .. }
                 | MCPToolEvent::InvocationFailed { agent_id, .. }
                 | MCPToolEvent::PolicyViolation { agent_id, .. }
                 | MCPToolEvent::ApprovalRequested { agent_id, .. }
                 | MCPToolEvent::ApprovalDecided { agent_id, .. } => Some(*agent_id),
-                MCPToolEvent::ServerRegistered { .. }
-                | MCPToolEvent::ServerStarted { .. }
-                | MCPToolEvent::ServerStopped { .. }
-                | MCPToolEvent::ServerFailed { .. }
-                | MCPToolEvent::ServerUnhealthy { .. } => None,
             },
             DomainEvent::Seal(event) => Some(match event {
                 SealEvent::AttestationCompleted { agent_id, .. }
@@ -520,15 +508,7 @@ impl DomainEvent {
                 StorageEvent::UnauthorizedVolumeAccess { attempted_at, .. } => *attempted_at,
             },
             DomainEvent::MCP(event) => match event {
-                MCPToolEvent::ServerRegistered { registered_at, .. } => *registered_at,
-                MCPToolEvent::ServerStarted { started_at, .. } => *started_at,
-                MCPToolEvent::ServerStopped { stopped_at, .. } => *stopped_at,
-                MCPToolEvent::ServerFailed { failed_at, .. } => *failed_at,
-                MCPToolEvent::ServerUnhealthy { last_healthy, .. } => {
-                    last_healthy.unwrap_or_else(Utc::now)
-                }
                 MCPToolEvent::InvocationRequested { requested_at, .. } => *requested_at,
-                MCPToolEvent::InvocationStarted { started_at, .. } => *started_at,
                 MCPToolEvent::InvocationCompleted { completed_at, .. } => *completed_at,
                 MCPToolEvent::InvocationFailed { failed_at, .. } => *failed_at,
                 MCPToolEvent::PolicyViolation { blocked_at, .. } => *blocked_at,
@@ -783,13 +763,7 @@ impl DomainEvent {
                 StorageEvent::UnauthorizedVolumeAccess { .. } => "unauthorized_volume_access",
             },
             DomainEvent::MCP(event) => match event {
-                MCPToolEvent::ServerRegistered { .. } => "tool_server_registered",
-                MCPToolEvent::ServerStarted { .. } => "tool_server_started",
-                MCPToolEvent::ServerStopped { .. } => "tool_server_stopped",
-                MCPToolEvent::ServerFailed { .. } => "tool_server_failed",
-                MCPToolEvent::ServerUnhealthy { .. } => "tool_server_unhealthy",
                 MCPToolEvent::InvocationRequested { .. } => "tool_invocation_requested",
-                MCPToolEvent::InvocationStarted { .. } => "tool_invocation_started",
                 MCPToolEvent::InvocationCompleted { .. } => "tool_invocation_completed",
                 MCPToolEvent::InvocationFailed { .. } => "tool_invocation_failed",
                 MCPToolEvent::PolicyViolation { .. } => "tool_policy_violation",
@@ -1612,13 +1586,6 @@ impl AgentEventReceiver {
                 MCPToolEvent::PolicyViolation { agent_id, .. } => agent_id == &self.agent_id,
                 MCPToolEvent::ApprovalRequested { agent_id, .. }
                 | MCPToolEvent::ApprovalDecided { agent_id, .. } => agent_id == &self.agent_id,
-                // Server lifecycle and InvocationStarted events are global (no agent_id)
-                MCPToolEvent::ServerRegistered { .. }
-                | MCPToolEvent::ServerStarted { .. }
-                | MCPToolEvent::ServerStopped { .. }
-                | MCPToolEvent::ServerFailed { .. }
-                | MCPToolEvent::ServerUnhealthy { .. }
-                | MCPToolEvent::InvocationStarted { .. } => false,
             },
             DomainEvent::Seal(e) => match e {
                 SealEvent::AttestationCompleted { agent_id, .. } => agent_id == &self.agent_id,

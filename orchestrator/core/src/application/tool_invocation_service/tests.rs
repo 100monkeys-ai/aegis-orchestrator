@@ -12,7 +12,7 @@ use crate::domain::security_context::SecurityContext;
 use crate::infrastructure::repositories::InMemoryVolumeRepository;
 use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
 use crate::infrastructure::storage::LocalHostStorageProvider;
-use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+use crate::infrastructure::tool_router::ToolRouter;
 use async_trait::async_trait;
 
 struct NoOpEventPublisher;
@@ -859,9 +859,7 @@ spec:
 #[tokio::test]
 async fn test_invoke_tool_no_session() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
 
     let security_context_repo =
@@ -916,9 +914,7 @@ async fn test_invoke_tool_bad_signature() {
     );
     let _ = repo.save(session).await;
 
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
 
     let security_context_repo =
@@ -948,9 +944,7 @@ async fn test_invoke_tool_bad_signature() {
 
 #[tokio::test]
 async fn workflow_validate_tool_returns_success_for_valid_manifest() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -990,9 +984,7 @@ async fn workflow_validate_tool_returns_success_for_valid_manifest() {
 
 #[tokio::test]
 async fn workflow_update_tool_returns_failure_with_deterministic_validation_details_for_cycle() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -1092,9 +1084,7 @@ fn thresholded_transition_semantic_guard_rejects_missing_score_below() {
 
 #[tokio::test]
 async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_success_fallback() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -1627,9 +1617,7 @@ fn judge_template_field_list_matches_payload_keys() {
 
 #[tokio::test]
 async fn workflow_run_tool_forwards_blackboard() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -1709,9 +1697,7 @@ async fn workflow_run_tool_forwards_blackboard() {
 
 #[tokio::test]
 async fn workflow_execution_tools_list_and_get() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -1809,9 +1795,7 @@ async fn workflow_execution_tools_list_and_get() {
 
 #[tokio::test]
 async fn task_logs_tool_returns_paginated_execution_events() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -1909,9 +1893,7 @@ async fn task_logs_tool_returns_paginated_execution_events() {
 
 #[tokio::test]
 async fn task_logs_tool_returns_execution_fetch_error() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -1969,12 +1951,11 @@ async fn task_logs_tool_returns_execution_fetch_error() {
 }
 
 #[tokio::test]
-async fn test_invoke_tool_execution_modes() {
-    use crate::domain::mcp::{
-        ExecutionMode, ResourceLimits, ToolServer, ToolServerId, ToolServerStatus,
-    };
-    use std::path::PathBuf;
-
+/// AEGIS ADR-132 G4: a tool no builtin serves, on a node with no SEAL gateway,
+/// answers NOT_FOUND. The orchestrator runs no MCP server of its own, so no
+/// call is answered with a success it did not run (the `local_fsal` and
+/// `remote_jsonrpc` bodies this replaces).
+async fn a_tool_no_builtin_serves_answers_not_found_and_never_a_success() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let agent_id = AgentId::new();
     let exec_id = ExecutionId::new();
@@ -2024,9 +2005,7 @@ async fn test_invoke_tool_execution_modes() {
     );
     let _ = repo.save(session).await;
 
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers.clone(), vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -2045,124 +2024,33 @@ async fn test_invoke_tool_execution_modes() {
         None,
     );
 
-    // 1. Local Tool
-    let local_server = ToolServer {
-        id: ToolServerId::new(),
-        name: "local-fs-tool".to_string(),
-        execution_mode: ExecutionMode::Local,
-        executable_path: PathBuf::from("/bin/true"),
-        args: vec![],
-        capabilities: vec!["test_tool".to_string()],
-        skip_judge_tools: std::collections::HashSet::new(),
-        status: ToolServerStatus::Running,
-        process_id: None,
-        health_check_interval: std::time::Duration::from_secs(30),
-        last_health_check: None,
-        credentials: std::collections::HashMap::new(),
-        resource_limits: ResourceLimits {
-            max_memory_mb: None,
-            max_cpu_shares: None,
-        },
-        started_at: None,
-        stopped_at: None,
-    };
-
-    router.add_server(local_server).await.unwrap();
-
     let envelope = DummyEnvelope::for_agent(true, agent_id); // extracts "test_tool"
-    let result = service.invoke_tool(&envelope).await.unwrap();
-
-    let exec_mode = result
-        .get("execution_mode")
-        .and_then(|v| v.as_str())
-        .unwrap();
-    assert_eq!(exec_mode, "local_fsal");
-
-    // 2. Remote Tool
-    let remote_server = ToolServer {
-        id: ToolServerId::new(),
-        name: "remote-web-tool".to_string(),
-        execution_mode: ExecutionMode::Remote,
-        executable_path: PathBuf::from("/bin/true"),
-        args: vec![],
-        capabilities: vec!["test_tool_remote".to_string()],
-        skip_judge_tools: std::collections::HashSet::new(),
-        status: ToolServerStatus::Running,
-        process_id: None,
-        health_check_interval: std::time::Duration::from_secs(30),
-        last_health_check: None,
-        credentials: std::collections::HashMap::new(),
-        resource_limits: ResourceLimits {
-            max_memory_mb: None,
-            max_cpu_shares: None,
-        },
-        started_at: None,
-        stopped_at: None,
-    };
-    router.add_server(remote_server).await.unwrap();
-
-    struct DummyRemoteEnvelope {
-        valid: bool,
-        token: SensitiveString,
-    }
-    impl EnvelopeVerifier for DummyRemoteEnvelope {
-        fn security_token(&self) -> &SensitiveString {
-            &self.token
-        }
-
-        fn verify_signature(&self, _: &[u8]) -> Result<(), SealSessionError> {
-            if self.valid {
-                Ok(())
-            } else {
-                Err(SealSessionError::SignatureVerificationFailed("".into()))
-            }
-        }
-        fn extract_tool_name(&self) -> Option<String> {
-            Some("test_tool_remote".to_string())
-        }
-        fn extract_arguments(&self) -> Option<Value> {
-            Some(serde_json::json!({}))
-        }
-        fn replay_nonce(&self) -> String {
-            format!("dummy-remote-nonce-{}", self.token.expose())
-        }
-    }
-
-    let remote_envelope = DummyRemoteEnvelope {
-        valid: true,
-        token: make_fake_token(agent_id).into(),
-    };
-    let result = service.invoke_tool(&remote_envelope).await.unwrap();
-
-    let exec_mode = result
-        .get("execution_mode")
-        .and_then(|v| v.as_str())
-        .unwrap();
-    assert_eq!(exec_mode, "remote_jsonrpc");
+    let error = service
+        .invoke_tool(&envelope)
+        .await
+        .expect_err("a tool nothing serves is refused");
+    let refusal = error.refusal();
+    assert_eq!(refusal.http_status, 404);
+    assert_eq!(refusal.code, "NOT_FOUND");
+    assert_eq!(refusal.message, "Not found: tool 'test_tool'.");
 }
 
 #[tokio::test]
 async fn get_available_tools_returns_builtin_dispatcher_metadata() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        servers,
-        vec![BuiltinDispatcherConfig {
+    let router = Arc::new(ToolRouter::new(vec![BuiltinDispatcherConfig {
+        name: "fs.read".to_string(),
+        description: "Read files from the workspace".to_string(),
+        enabled: true,
+        capabilities: vec![CapabilityConfig {
             name: "fs.read".to_string(),
-            description: "Read files from the workspace".to_string(),
-            enabled: true,
-            capabilities: vec![CapabilityConfig {
-                name: "fs.read".to_string(),
-                skip_judge: true,
-                requires_approval: false,
-                binding_argument: None,
-                approval_summary: None,
-            }],
-            api_key: None,
+            skip_judge: true,
+            requires_approval: false,
+            binding_argument: None,
+            approval_summary: None,
         }],
-    ));
+        api_key: None,
+    }]));
     let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -2194,40 +2082,34 @@ async fn get_available_tools_returns_builtin_dispatcher_metadata() {
 #[tokio::test]
 async fn get_available_tools_for_context_filters_disallowed_tools() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        servers,
-        vec![
-            BuiltinDispatcherConfig {
+    let router = Arc::new(ToolRouter::new(vec![
+        BuiltinDispatcherConfig {
+            name: "fs.read".to_string(),
+            description: "Read files".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
                 name: "fs.read".to_string(),
-                description: "Read files".to_string(),
-                enabled: true,
-                capabilities: vec![CapabilityConfig {
-                    name: "fs.read".to_string(),
-                    skip_judge: true,
-                    requires_approval: false,
-                    binding_argument: None,
-                    approval_summary: None,
-                }],
-                api_key: None,
-            },
-            BuiltinDispatcherConfig {
+                skip_judge: true,
+                requires_approval: false,
+                binding_argument: None,
+                approval_summary: None,
+            }],
+            api_key: None,
+        },
+        BuiltinDispatcherConfig {
+            name: "cmd.run".to_string(),
+            description: "Run commands".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
                 name: "cmd.run".to_string(),
-                description: "Run commands".to_string(),
-                enabled: true,
-                capabilities: vec![CapabilityConfig {
-                    name: "cmd.run".to_string(),
-                    skip_judge: false,
-                    requires_approval: false,
-                    binding_argument: None,
-                    approval_summary: None,
-                }],
-                api_key: None,
-            },
-        ],
-    ));
+                skip_judge: false,
+                requires_approval: false,
+                binding_argument: None,
+                approval_summary: None,
+            }],
+            api_key: None,
+        },
+    ]));
     let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -2281,40 +2163,34 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
 #[tokio::test]
 async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_low_trust_tiers() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        servers,
-        vec![
-            BuiltinDispatcherConfig {
+    let router = Arc::new(ToolRouter::new(vec![
+        BuiltinDispatcherConfig {
+            name: "aegis.workflow.status".to_string(),
+            description: "Inspect workflow execution state".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
                 name: "aegis.workflow.status".to_string(),
-                description: "Inspect workflow execution state".to_string(),
-                enabled: true,
-                capabilities: vec![CapabilityConfig {
-                    name: "aegis.workflow.status".to_string(),
-                    skip_judge: true,
-                    requires_approval: false,
-                    binding_argument: None,
-                    approval_summary: None,
-                }],
-                api_key: None,
-            },
-            BuiltinDispatcherConfig {
+                skip_judge: true,
+                requires_approval: false,
+                binding_argument: None,
+                approval_summary: None,
+            }],
+            api_key: None,
+        },
+        BuiltinDispatcherConfig {
+            name: "aegis.workflow.delete".to_string(),
+            description: "Delete workflow definitions".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
                 name: "aegis.workflow.delete".to_string(),
-                description: "Delete workflow definitions".to_string(),
-                enabled: true,
-                capabilities: vec![CapabilityConfig {
-                    name: "aegis.workflow.delete".to_string(),
-                    skip_judge: false,
-                    requires_approval: false,
-                    binding_argument: None,
-                    approval_summary: None,
-                }],
-                api_key: None,
-            },
-        ],
-    ));
+                skip_judge: false,
+                requires_approval: false,
+                binding_argument: None,
+                approval_summary: None,
+            }],
+            api_key: None,
+        },
+    ]));
     let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -2421,9 +2297,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
     );
     let exec_service = LogsTestExecutionService { execution };
 
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let (fsal, volume_registry, _storage_root) = test_fsal_deps();
     let service = ToolInvocationService::new(
@@ -2463,40 +2337,34 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
 #[tokio::test]
 async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
     let repo = Arc::new(InMemorySealSessionRepository::new());
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(
-        registry,
-        servers,
-        vec![
-            BuiltinDispatcherConfig {
+    let router = Arc::new(ToolRouter::new(vec![
+        BuiltinDispatcherConfig {
+            name: "fs.read".to_string(),
+            description: "Read files".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
                 name: "fs.read".to_string(),
-                description: "Read files".to_string(),
-                enabled: true,
-                capabilities: vec![CapabilityConfig {
-                    name: "fs.read".to_string(),
-                    skip_judge: true,
-                    requires_approval: false,
-                    binding_argument: None,
-                    approval_summary: None,
-                }],
-                api_key: None,
-            },
-            BuiltinDispatcherConfig {
+                skip_judge: true,
+                requires_approval: false,
+                binding_argument: None,
+                approval_summary: None,
+            }],
+            api_key: None,
+        },
+        BuiltinDispatcherConfig {
+            name: "cmd.run".to_string(),
+            description: "Run commands".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
                 name: "cmd.run".to_string(),
-                description: "Run commands".to_string(),
-                enabled: true,
-                capabilities: vec![CapabilityConfig {
-                    name: "cmd.run".to_string(),
-                    skip_judge: false,
-                    requires_approval: false,
-                    binding_argument: None,
-                    approval_summary: None,
-                }],
-                api_key: None,
-            },
-        ],
-    ));
+                skip_judge: false,
+                requires_approval: false,
+                binding_argument: None,
+                approval_summary: None,
+            }],
+            api_key: None,
+        },
+    ]));
     let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -2681,9 +2549,7 @@ fn build_version_aware_service(
     agent_version: &str,
     agent_id: AgentId,
 ) -> ToolInvocationService {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -2835,9 +2701,7 @@ fn workflow_start_service(
     start_use_case: Arc<TestStartWorkflowExecutionUseCase>,
 ) -> (ToolInvocationService, SecurityContext) {
     let agent_id = AgentId::new();
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -2937,9 +2801,7 @@ async fn aegis_workflow_generate_answers_the_started_execution_id() {
 #[tokio::test]
 async fn workflow_run_with_version_passes_version_through() {
     let agent_id = AgentId::new();
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -3036,9 +2898,7 @@ fn make_security_context(name: &str) -> SecurityContext {
 }
 
 fn make_execute_intent_service() -> ToolInvocationService {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -3147,9 +3007,7 @@ async fn test_paid_tier_volume_id_allowed() {
 /// were present in the dispatcher vec passed at construction time.
 #[tokio::test]
 async fn list_tools_includes_aegis_workflow_wait() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = ToolRouter::new(registry, servers, vec![]);
+    let router = ToolRouter::new(vec![]);
 
     let tools = router.list_tools().await.expect("list_tools failed");
     let found = tools.iter().find(|t| t.name == "aegis.workflow.wait");
@@ -3169,9 +3027,7 @@ async fn list_tools_includes_aegis_workflow_wait() {
 /// builtin_dispatchers is empty.
 #[tokio::test]
 async fn list_tools_includes_aegis_execute_wait() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = ToolRouter::new(registry, servers, vec![]);
+    let router = ToolRouter::new(vec![]);
 
     let tools = router.list_tools().await.expect("list_tools failed");
     let found = tools.iter().find(|t| t.name == "aegis.execute.wait");
@@ -3192,9 +3048,7 @@ async fn list_tools_includes_aegis_execute_wait() {
 /// is_supported_builtin_workflow_tool() did not include it.
 #[tokio::test]
 async fn list_tools_includes_aegis_workflow_search() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = ToolRouter::new(registry, servers, vec![]);
+    let router = ToolRouter::new(vec![]);
 
     let tools = router.list_tools().await.expect("list_tools failed");
     let found = tools.iter().find(|t| t.name == "aegis.workflow.search");
@@ -3473,9 +3327,7 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
     });
 
     let repo = Arc::new(InMemorySealSessionRepository::new());
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let (fsal, volume_registry, _storage_root) = test_fsal_deps();
 
@@ -3526,9 +3378,6 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
 /// the reconciliation pass must not duplicate it in the output.
 #[tokio::test]
 async fn list_tools_does_not_duplicate_when_dispatchers_present() {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-
     // Provide aegis.workflow.wait as an explicit dispatcher entry
     let dispatchers = vec![BuiltinDispatcherConfig {
         name: "aegis.workflow.wait".to_string(),
@@ -3543,7 +3392,7 @@ async fn list_tools_does_not_duplicate_when_dispatchers_present() {
         }],
         api_key: None,
     }];
-    let router = ToolRouter::new(registry, servers, dispatchers);
+    let router = ToolRouter::new(dispatchers);
 
     let tools = router.list_tools().await.expect("list_tools failed");
     let count = tools
@@ -3707,26 +3556,19 @@ mod gateway_timeout_regression {
 
     fn make_service(seal_gateway_url: Option<String>) -> ToolInvocationService {
         let repo = Arc::new(InMemorySealSessionRepository::new());
-        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
-            Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let router = Arc::new(ToolRouter::new(
-            registry,
-            servers,
-            vec![BuiltinDispatcherConfig {
+        let router = Arc::new(ToolRouter::new(vec![BuiltinDispatcherConfig {
+            name: "fs.read".to_string(),
+            description: "Read files from the workspace".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
                 name: "fs.read".to_string(),
-                description: "Read files from the workspace".to_string(),
-                enabled: true,
-                capabilities: vec![CapabilityConfig {
-                    name: "fs.read".to_string(),
-                    skip_judge: true,
-                    requires_approval: false,
-                    binding_argument: None,
-                    approval_summary: None,
-                }],
-                api_key: None,
+                skip_judge: true,
+                requires_approval: false,
+                binding_argument: None,
+                approval_summary: None,
             }],
-        ));
+            api_key: None,
+        }]));
         let middleware = Arc::new(SealMiddleware::new());
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
@@ -4106,9 +3948,7 @@ fn build_attachments_capturing_service(
     ToolInvocationService,
     Arc<std::sync::Mutex<Option<ExecutionInput>>>,
 ) {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -4291,9 +4131,7 @@ async fn task_execute_seal_invoke_rejects_malformed_attachments() {
 /// empty list — sufficient to exercise the tenant-scope guard before the
 /// repository call fires.
 fn build_minimal_tool_invocation_service() -> ToolInvocationService {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -4704,9 +4542,7 @@ impl ExecutionService for CannedListExecutionService {
 }
 
 fn build_task_list_service_with_executions(executions: Vec<Execution>) -> ToolInvocationService {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -4944,9 +4780,7 @@ async fn aegis_task_list_emits_ended_at_tenant_id_and_iteration_count() {
 async fn build_workflow_list_service_with_input(
     input_params: serde_json::Value,
 ) -> (ToolInvocationService, crate::domain::workflow::WorkflowId) {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -5229,9 +5063,7 @@ fn make_execution_with_tenant(tenant_id: TenantId) -> Execution {
 fn build_task_service_with(
     execution_service: Arc<TenantScopedTaskExecutionService>,
 ) -> ToolInvocationService {
-    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
-    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let router = Arc::new(ToolRouter::new(vec![]));
     let middleware = Arc::new(SealMiddleware::new());
     let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
@@ -5606,13 +5438,6 @@ spec:
       provider: s3
       options:
         secret_access_key: "Mk5-opendal-option"
-  mcp_servers:
-    - name: tools
-      executable: /usr/local/bin/tools
-      credentials:
-        API_TOKEN: "Mk5-mcp-credential"
-      environment:
-        SERVICE_PASSWORD: "Mk5-mcp-environment"
   builtin_dispatchers:
     - name: web.search
       description: search
@@ -5665,10 +5490,7 @@ spec:
 "#;
 
     fn service_reading(path: std::path::PathBuf) -> ToolInvocationService {
-        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
-            Arc::new(InMemoryToolRegistry::new());
-        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let router = Arc::new(ToolRouter::new(vec![]));
         let (fsal, volume_registry, _storage_root) = test_fsal_deps();
         ToolInvocationService::new(
             Arc::new(InMemorySealSessionRepository::new()),
@@ -5725,7 +5547,7 @@ spec:
         let markers = markers();
         assert_eq!(
             markers.len(),
-            37,
+            35,
             "the fixture has {} markers",
             markers.len()
         );
@@ -5777,11 +5599,6 @@ spec:
     type: orchestrator
   database:
     url: "env:AEGIS_DATABASE_URL"
-  mcp_servers:
-    - name: tools
-      executable: /usr/local/bin/tools
-      credentials:
-        API_TOKEN: "secret:aegis-system/kv/tools#token"
   billing:
     stripe_secret_key: "env:STRIPE_SECRET_KEY"
 "#;
@@ -5791,10 +5608,6 @@ spec:
         assert_eq!(
             spec["billing"]["stripe_secret_key"],
             "env:STRIPE_SECRET_KEY"
-        );
-        assert_eq!(
-            spec["mcp_servers"][0]["credentials"]["API_TOKEN"],
-            "secret:aegis-system/kv/tools#token"
         );
     }
 

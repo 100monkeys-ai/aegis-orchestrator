@@ -1348,42 +1348,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             rate_limit_resolver.clone(),
         ),
     );
-    let tool_registry =
-        Arc::new(aegis_orchestrator_core::infrastructure::tool_router::InMemoryToolRegistry::new());
-
-    // Shared tool servers state
-    let tool_servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::<
-        aegis_orchestrator_core::domain::mcp::ToolServerId,
-        aegis_orchestrator_core::domain::mcp::ToolServer,
-    >::new()));
-
-    // Load configured servers from NodeConfig
-    if let Some(mcp_configs) = &config.spec.mcp_servers {
-        let mut servers_lock = tool_servers.write().await;
-        for srv_cfg in mcp_configs {
-            if srv_cfg.enabled {
-                let tool_server =
-                    aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
-
-                // Prevent silent overwrites when multiple MCP servers share the same
-                // logical identity. Use the configured name (stable identifier) rather
-                // than the randomly generated ToolServer ID for duplicate detection.
-                if servers_lock
-                    .values()
-                    .any(|existing| existing.name == srv_cfg.name)
-                {
-                    return Err(anyhow::anyhow!(
-                        "Duplicate MCP server name '{}' detected in configuration. \
-                         MCP server names must be unique.",
-                        srv_cfg.name
-                    ));
-                }
-
-                servers_lock.insert(tool_server.id, tool_server);
-            }
-        }
-    }
-
     // Derive builtin dispatchers from the canonical tool router registry.
     // User-configured dispatchers from aegis-config.yaml take precedence.
     let mut builtin_dispatchers = config.spec.builtin_dispatchers.clone().unwrap_or_default();
@@ -1406,16 +1370,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .and_then(|k| resolve_env_value(k.expose()).ok());
 
     let tool_router = Arc::new(
-        aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
-            tool_registry.clone(),
-            tool_servers.clone(),
-            builtin_dispatchers,
-        )
-        .with_mcp_server_approvals(config.spec.mcp_servers.as_deref().unwrap_or_default()),
+        aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(builtin_dispatchers)
+            .with_tool_capabilities(config.spec.tool_capabilities.as_deref().unwrap_or_default()),
     );
-
-    // Build initial capabilities index
-    tool_router.rebuild_index().await;
 
     // Connect to the standalone Cortex service if configured (ADR-042).
     // Absence of spec.cortex.grpc_url means memoryless mode — no error, no retry.
@@ -1806,24 +1763,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
     info!("Container step runner initialized");
-
-    let tool_manager = Arc::new(
-        aegis_orchestrator_core::infrastructure::tool_router::ToolServerManager::new(
-            tool_registry,
-            tool_servers.clone(),
-            event_bus.clone(),
-            secrets_manager.clone(),
-        ),
-    );
-
-    // Start MCP servers and spawn health check loop
-    let tool_manager_clone = tool_manager.clone();
-    tokio::spawn(async move {
-        if let Err(e) = tool_manager_clone.start_all().await {
-            tracing::error!("Failed to start some MCP servers: {}", e);
-        }
-        tool_manager_clone.health_check_loop().await;
-    });
 
     let tool_catalog =
         Arc::new(aegis_orchestrator_core::application::tool_catalog::StandardToolCatalog::new());
