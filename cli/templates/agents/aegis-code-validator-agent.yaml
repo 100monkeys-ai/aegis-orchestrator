@@ -108,7 +108,7 @@ spec:
   execution:
     mode: iterative
     max_iterations: 1
-    llm_timeout_seconds: 60
+    llm_timeout_seconds: 300
 
     validation:
       - type: json_schema
@@ -144,4 +144,4 @@ spec:
     resources:
       cpu: 500
       memory: 256Mi
-      timeout: 120s
+      timeout: 300s

@@ -696,6 +696,108 @@ mod tests {
         );
     }
 
+    /// Built-in agents known on 2026-10-04 to give one model call a longer
+    /// bound than their whole execution (AEGIS operations/known-defects-5, the
+    /// Low row): the execution bound cuts first, so their larger
+    /// `llm_timeout_seconds` is inert. Their clocks are AEGIS ADR-124's and do
+    /// not move without a measurement; they are listed here so they stay
+    /// visible and a fifth is caught. Remove a name once its template obeys
+    /// the rule.
+    const KNOWN_LLM_TIMEOUT_ABOVE_EXECUTION_TIMEOUT: &[&str] = &[
+        "tool-call-policy-judge",
+        "agent-generator-judge",
+        "workflow-generator-judge",
+        "skill-validator",
+    ];
+
+    /// The production model registry's overall budget for one call, every
+    /// attempt and the fallback alias included (`llm_overall_timeout_secs`,
+    /// `aegis-platform-deployment` `29c8c998`
+    /// `podman/pods/core/aegis-config.yaml` line 106). Production's value, not
+    /// the code's default, because it is what bounds `smart` there.
+    const PRODUCTION_LLM_OVERALL_TIMEOUT_SECS: u64 = 300;
+
+    /// Regression test for `builtin-intent-to-execution` failing in
+    /// VALIDATE_CODE (AEGIS known-defects-5 and -7, the High row): the code
+    /// validator's one model call on `smart` was ended at its
+    /// `llm_timeout_seconds` of 60 by the inner loop with HTTP 502, below the
+    /// model's measured answer (59.06 s when it passed, past 60 s three times
+    /// of four), and before `smart`'s fallback alias could be reached after
+    /// the provider's limit at about 120 s (AEGIS ADR-130 D2). AEGIS ADR-124,
+    /// Update of 2026-10-04: the validator runs with `llm_timeout_seconds:
+    /// 300` and `resources.timeout: 300s`.
+    ///
+    /// Two rules. One model call is not bounded longer than the execution
+    /// that holds it (manifest-spec-v1, "Constraint Rules":
+    /// `llm_timeout_seconds ≤ spec.security.resources.timeout`), for every
+    /// built-in agent outside the known set above. The code validator's one
+    /// call is not bounded below the registry's overall budget, so the
+    /// per-call bound cuts nothing the registry would still answer.
+    #[test]
+    fn builtin_agent_llm_timeout_fits_its_execution_and_code_validator_reaches_the_registry_budget()
+    {
+        use aegis_orchestrator_core::domain::agent::{ExecutionStrategy, ResourceLimits};
+        use aegis_orchestrator_core::domain::supervisor::DEFAULT_EXECUTION_TIMEOUT_SECONDS;
+
+        let mut violations = Vec::new();
+        let mut known_found = Vec::new();
+        let mut code_validator_llm_timeout = None;
+        for (name, yaml) in BUILTIN_AGENTS {
+            let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let spec = &doc["spec"];
+            let execution: ExecutionStrategy = serde_yaml::from_value(spec["execution"].clone())
+                .unwrap_or_else(|e| {
+                    panic!("builtin agent '{name}': execution does not parse: {e}")
+                });
+            let resources: ResourceLimits =
+                serde_yaml::from_value(spec["security"]["resources"].clone()).unwrap_or_else(|e| {
+                    panic!("builtin agent '{name}': resources do not parse: {e}")
+                });
+            let execution_timeout = resources
+                .parse_timeout_seconds()
+                .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
+            let llm_timeout = execution.llm_timeout_seconds;
+
+            if *name == AEGIS_CODE_VALIDATOR_AGENT_NAME {
+                code_validator_llm_timeout = Some(llm_timeout);
+            }
+            if llm_timeout > execution_timeout {
+                let line = format!(
+                    "{name}: llm_timeout_seconds {llm_timeout} s is above its execution timeout {execution_timeout} s"
+                );
+                if KNOWN_LLM_TIMEOUT_ABOVE_EXECUTION_TIMEOUT.contains(name) {
+                    known_found.push((*name, line));
+                } else {
+                    violations.push(line);
+                }
+            }
+        }
+
+        for (_, line) in &known_found {
+            println!("known, not changed here: {line}");
+        }
+        assert!(
+            violations.is_empty(),
+            "built-in agents whose model call is bounded longer than their execution:\n{}",
+            violations.join("\n")
+        );
+        let mut found: Vec<&str> = known_found.iter().map(|(name, _)| *name).collect();
+        let mut known = KNOWN_LLM_TIMEOUT_ABOVE_EXECUTION_TIMEOUT.to_vec();
+        found.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(
+            found, known,
+            "the known set no longer matches the templates: remove a name whose template now obeys the rule"
+        );
+
+        let code_validator_llm_timeout = code_validator_llm_timeout
+            .unwrap_or_else(|| panic!("{AEGIS_CODE_VALIDATOR_AGENT_NAME} is not a built-in agent"));
+        assert!(
+            code_validator_llm_timeout >= PRODUCTION_LLM_OVERALL_TIMEOUT_SECS,
+            "{AEGIS_CODE_VALIDATOR_AGENT_NAME}: llm_timeout_seconds {code_validator_llm_timeout} s is below the registry's overall budget {PRODUCTION_LLM_OVERALL_TIMEOUT_SECS} s, so smart's fallback alias is unreachable"
+        );
+    }
+
     #[test]
     fn all_builtin_workflow_templates_parse_successfully() {
         for (name, yaml) in BUILTIN_WORKFLOWS {
