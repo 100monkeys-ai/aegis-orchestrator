@@ -74,6 +74,10 @@ spec:
           cost_per_1k_tokens: 0.0  # Free
           # max_output_tokens: 8192  # Optional: override default (8192)
           # temperature: 0.4  # Optional: override default (0.4)
+          # fallback_alias: "fast"  # Optional: another alias, tried once after the
+          #   provider's time limit on this model (a Workers AI 408 with code 3046),
+          #   with that alias's own max_output_tokens and temperature. One level:
+          #   not this alias, not an alias that names a fallback_alias itself.
 
         - alias: "fast"
           model: "qwen2.5-coder:7b"
@@ -161,7 +165,8 @@ spec:
     # Default provider name to use
     default_provider: "local"
     
-    # Optional: Fallback provider if default fails
+    # Optional: Fallback provider if default fails, for an alias whose model
+    # entry names no fallback_alias (its first model is used)
     fallback_provider: "openai"
     
     # Retry configuration

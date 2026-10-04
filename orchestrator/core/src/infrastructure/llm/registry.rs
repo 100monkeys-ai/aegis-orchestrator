@@ -4,7 +4,9 @@
 //!
 //! `ProviderRegistry` resolves model aliases (e.g. `"default"`, `"fast"`,
 //! `"smart"`) to real `LLMProvider` adapters at runtime based on node config.
-//! Includes retry-with-exponential-backoff and one-level fallback.
+//! Includes retry-with-exponential-backoff and one-level fallback: an alias's
+//! own `fallback_alias` after the provider's time limit, else the node-wide
+//! `fallback_provider`.
 
 use crate::domain::llm::{
     ChatMessage, ChatResponse, GenerationOptions, GenerationResponse, LLMError, LLMProvider,
@@ -48,6 +50,14 @@ const MAX_BACKOFF_EXPONENT: u32 = 16;
 /// Matches the value produced by `retry_delay_ms = 1000` and `MAX_BACKOFF_EXPONENT = 16`.
 const MAX_BACKOFF_MS: u64 = 65_536_000; // 2^16 * 1000 ms
 
+/// The alias another alias falls back to, resolved at construction from the
+/// alias map: the named alias, its model and its adapter.
+struct AliasFallback {
+    alias: String,
+    model: String,
+    adapter: Arc<dyn LLMProvider>,
+}
+
 /// Registry for managing LLM providers and resolving model aliases.
 ///
 /// Each entry in `alias_map` is an `Arc<dyn LLMProvider>` that was constructed at
@@ -60,8 +70,13 @@ pub struct ProviderRegistry {
     alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)>,
     /// provider_name → adapter used for health checks (built from models.first()).
     providers: HashMap<String, Arc<dyn LLMProvider>>,
-    /// Fallback adapter resolved at construction time; used when primary exhausts retries.
+    /// Fallback adapter resolved at construction time; used when primary exhausts retries,
+    /// for an alias that is not in `alias_fallbacks`.
     fallback_provider: Option<(String, Arc<dyn LLMProvider>)>,
+    /// alias → the alias its model entry names as `fallback_alias`, tried once
+    /// after the provider's time limit on the alias's own model, with the
+    /// named alias's options. An alias here never reaches `fallback_provider`.
+    alias_fallbacks: HashMap<String, AliasFallback>,
     /// alias → raw `api_key` value from the provider config (before env resolution).
     /// Used to determine [`ApiKeySource`] for BYOK exemption (ADR-072).
     raw_api_keys: HashMap<String, Option<SensitiveString>>,
@@ -262,6 +277,8 @@ impl ProviderRegistry {
         let mut raw_api_keys: HashMap<String, Option<SensitiveString>> = HashMap::new();
         let mut alias_max_output_tokens: HashMap<String, u32> = HashMap::new();
         let mut alias_temperatures: HashMap<String, f32> = HashMap::new();
+        // alias → its winning entry's `fallback_alias`, for aliases whose adapter built.
+        let mut fallback_alias_names: Vec<(String, String)> = Vec::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -288,6 +305,9 @@ impl ProviderRegistry {
                                     info!("Alias '{}' temperature override: {}", alias, temp);
                                     alias_temperatures.insert(alias.clone(), temp);
                                 }
+                                if let Some(fallback) = &model_config.fallback_alias {
+                                    fallback_alias_names.push((alias.clone(), fallback.clone()));
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -299,6 +319,31 @@ impl ProviderRegistry {
                     }
                 }
             }
+        }
+
+        // Resolve each alias's own fallback to the named alias's entry in the
+        // alias map. A mapped alias whose named alias has no adapter refuses
+        // the registry: the node never runs with a fallback configured and
+        // silently absent.
+        let mut alias_fallbacks: HashMap<String, AliasFallback> = HashMap::new();
+        for (alias, fallback) in fallback_alias_names {
+            let Some((model, adapter)) = alias_map.get(&fallback) else {
+                anyhow::bail!(
+                    "alias '{alias}' names fallback_alias '{fallback}', which has no adapter: the alias it names was not mapped or its adapter failed to build"
+                );
+            };
+            info!(
+                "Alias '{}' falls back to alias '{}' ({}) after the provider's time limit",
+                alias, fallback, model
+            );
+            alias_fallbacks.insert(
+                alias,
+                AliasFallback {
+                    alias: fallback,
+                    model: model.clone(),
+                    adapter: adapter.clone(),
+                },
+            );
         }
 
         // Resolve fallback to a concrete adapter at construction time.
@@ -319,6 +364,7 @@ impl ProviderRegistry {
             alias_map,
             providers,
             fallback_provider,
+            alias_fallbacks,
             raw_api_keys,
             alias_max_output_tokens,
             alias_temperatures,
@@ -456,6 +502,68 @@ impl ProviderRegistry {
         }
     }
 
+    /// The request sent once to the alias's own fallback alias after the
+    /// provider's time limit on its model, with the named alias's options.
+    /// Its answer is returned; its failure is returned with the time limit,
+    /// naming both models.
+    async fn chat_on_fallback_alias(
+        &self,
+        alias: &str,
+        fallback: &AliasFallback,
+        timeout: LLMError,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        info!(
+            "Trying fallback alias: alias='{}', fallback_alias='{}', model='{}'",
+            alias, fallback.alias, fallback.model
+        );
+        let fallback_options = self.apply_alias_options(&fallback.alias, options);
+        self.bounded_attempt(
+            &fallback.alias,
+            &fallback.model,
+            1,
+            1,
+            fallback
+                .adapter
+                .generate_chat(messages, tools, &fallback_options),
+        )
+        .await
+        .and_then(
+            |r| match empty_generation_fault(&r, &fallback.alias, &fallback.model, 1, 1) {
+                Some(fault) => Err(fault),
+                None => Ok(r),
+            },
+        )
+        .map_err(|fe| with_fallback_failure(timeout, &fallback.model, &fe))
+    }
+
+    /// The single-prompt form of [`Self::chat_on_fallback_alias`].
+    async fn generate_on_fallback_alias(
+        &self,
+        alias: &str,
+        fallback: &AliasFallback,
+        timeout: LLMError,
+        prompt: &str,
+        options: &GenerationOptions,
+    ) -> Result<GenerationResponse, LLMError> {
+        info!(
+            "Trying fallback alias: alias='{}', fallback_alias='{}', model='{}'",
+            alias, fallback.alias, fallback.model
+        );
+        let fallback_options = self.apply_alias_options(&fallback.alias, options);
+        self.bounded_attempt(
+            &fallback.alias,
+            &fallback.model,
+            1,
+            1,
+            fallback.adapter.generate(prompt, &fallback_options),
+        )
+        .await
+        .map_err(|fe| with_fallback_failure(timeout, &fallback.model, &fe))
+    }
+
     /// Generate a chat response for the given model alias.
     ///
     /// Resolves the alias directly to a pre-configured `Arc<dyn LLMProvider>` adapter;
@@ -549,9 +657,20 @@ impl ProviderRegistry {
                         last_error = Some(e);
 
                         // A time limit ends the primary's attempts: the fallback, a
-                        // different model, is tried as after the last retry.
+                        // different model, is tried as after the last retry. An
+                        // alias naming its own fallback alias goes there after the
+                        // time limit only, and never to the node-wide fallback.
                         if time_limit.is_some() || attempt == self.max_retries - 1 {
-                            if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                            if let Some(own) = self.alias_fallbacks.get(alias) {
+                                if let Some(timeout) = time_limit {
+                                    return self
+                                        .chat_on_fallback_alias(
+                                            alias, own, timeout, messages, tools, options,
+                                        )
+                                        .await;
+                                }
+                            } else if let Some((fallback_model, fallback)) = &self.fallback_provider
+                            {
                                 info!("Trying fallback provider (model='{}')", fallback_model);
                                 let outcome = self
                                     .bounded_attempt(
@@ -687,9 +806,19 @@ impl ProviderRegistry {
                     last_error = Some(e);
 
                     // A time limit ends the primary's attempts: the fallback, a
-                    // different model, is tried as after the last retry.
+                    // different model, is tried as after the last retry. An
+                    // alias naming its own fallback alias goes there after the
+                    // time limit only, and never to the node-wide fallback.
                     if time_limit.is_some() || attempt == self.max_retries - 1 {
-                        if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                        if let Some(own) = self.alias_fallbacks.get(alias) {
+                            if let Some(timeout) = time_limit {
+                                return self
+                                    .generate_on_fallback_alias(
+                                        alias, own, timeout, prompt, options,
+                                    )
+                                    .await;
+                            }
+                        } else if let Some((fallback_model, fallback)) = &self.fallback_provider {
                             info!("Trying fallback provider (model='{}')", fallback_model);
                             let outcome = self
                                 .bounded_attempt(
@@ -833,6 +962,7 @@ impl ProviderRegistry {
             alias_map,
             providers,
             fallback_provider,
+            alias_fallbacks: HashMap::new(),
             raw_api_keys: HashMap::new(),
             alias_max_output_tokens: HashMap::new(),
             alias_temperatures: HashMap::new(),
@@ -1262,6 +1392,7 @@ mod tests {
                         cost_per_1k_tokens: 0.0,
                         max_output_tokens: None,
                         temperature: None,
+                        fallback_alias: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),
@@ -1616,6 +1747,461 @@ mod tests {
         assert!(
             matches!(&res, Err(LLMError::Provider(msg)) if msg.starts_with("HTTP 408")),
             "got {res:?}"
+        );
+    }
+
+    // ── Per-alias fallback (`fallback_alias`) ──────────────────────────────
+    //
+    // `smart` on nemotron-3-120b-a12b is ended by Workers AI at about 120 s
+    // with a 408 and code 3046 (execution 18d8e0ca; the planning arc
+    // `smart-fallback-update`, m6 at 120.60 s), and the identical request
+    // meets the same limit again. A model entry may name another alias as its
+    // fallback: after the provider's time limit, and only then, the request
+    // goes once to the named alias's model with the named alias's own options.
+    // Every other failure behaves as it does today for that alias.
+    //
+    // Each registry here is built by `from_config` from the configuration an
+    // operator writes: `smart` (model `m-smart`) on one stand-in, `coder`
+    // (model `m-coder`, max_output_tokens 4321, temperature 0.5) on another.
+
+    /// The configuration under test: the providers block and the
+    /// `llm_selection` block as written in `aegis-config.yaml`.
+    fn alias_fallback_manifest(providers_yaml: &str, selection_yaml: &str) -> NodeConfigManifest {
+        let providers: Vec<LLMProviderConfig> =
+            serde_yaml::from_str(providers_yaml).expect("the providers block parses");
+        let selection: LLMSelection =
+            serde_yaml::from_str(selection_yaml).expect("the llm_selection block parses");
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.llm_providers = providers;
+        manifest.spec.llm_selection = selection;
+        manifest
+    }
+
+    /// `smart` on `smart_url`, `coder` on `coder_url`, and an optional third
+    /// provider `node-fallback` on `node_url` (model `m-node`, alias `spare`).
+    /// `smart_fallback` is the `fallback_alias` line of `smart`'s entry, or
+    /// empty for none.
+    fn alias_fallback_providers(
+        smart_url: &str,
+        coder_url: &str,
+        node_url: Option<&str>,
+        smart_fallback: &str,
+    ) -> String {
+        let mut yaml = format!(
+            r#"- name: p-smart
+  type: openai-compatible
+  endpoint: "{smart_url}"
+  api_key: "test-key"
+  models:
+    - alias: "smart"
+      model: "m-smart"
+      capabilities: ["chat"]
+      context_window: 8192
+      max_output_tokens: 16384
+      temperature: 0.25
+      {smart_fallback}
+- name: p-coder
+  type: openai-compatible
+  endpoint: "{coder_url}"
+  api_key: "test-key"
+  models:
+    - alias: "coder"
+      model: "m-coder"
+      capabilities: ["chat"]
+      context_window: 8192
+      max_output_tokens: 4321
+      temperature: 0.5
+"#
+        );
+        if let Some(node_url) = node_url {
+            yaml.push_str(&format!(
+                r#"- name: node-fallback
+  type: openai-compatible
+  endpoint: "{node_url}"
+  api_key: "test-key"
+  models:
+    - alias: "spare"
+      model: "m-node"
+      capabilities: ["chat"]
+      context_window: 8192
+"#
+            ));
+        }
+        yaml
+    }
+
+    const ALIAS_FALLBACK_SELECTION: &str =
+        "max_retries: 3\nretry_delay_ms: 1\nllm_overall_timeout_secs: 60\n";
+
+    fn alias_fallback_registry(manifest: &NodeConfigManifest) -> ProviderRegistry {
+        manifest
+            .validate()
+            .expect("the configuration under test is valid");
+        ProviderRegistry::from_config(manifest).expect("registry builds")
+    }
+
+    /// A request at `model` carrying exactly these `max_tokens` and
+    /// `temperature` (both exact in binary, so the JSON compares equal).
+    fn body_of(model: &str, max_tokens: u32, temperature: f64) -> mockito::Matcher {
+        mockito::Matcher::PartialJson(serde_json::json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }))
+    }
+
+    /// After a 3046 on `smart`, exactly one request goes to `coder`'s model
+    /// with `coder`'s max_output_tokens and temperature (not the caller's 8192
+    /// and 0.4, not `smart`'s), and its answer is returned.
+    #[tokio::test]
+    async fn fallback_alias_after_3046_sends_one_request_at_the_named_alias_with_its_options() {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .match_body(body_of("m-coder", 4321, 0.5))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FALLBACK_ANSWER_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(
+                &smart.url(),
+                &coder.url(),
+                None,
+                r#"fallback_alias: "coder""#,
+            ),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let res = registry
+            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .await;
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        match res {
+            Ok(ChatResponse::FinalText(r)) => assert_eq!(r.text, "fallback answer"),
+            other => panic!("the fallback alias's answer must be returned, got {other:?}"),
+        }
+    }
+
+    /// The single-prompt path takes the same rule.
+    #[tokio::test]
+    async fn fallback_alias_after_3046_sends_one_request_at_the_named_alias_on_generate() {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .match_body(body_of("m-coder", 4321, 0.5))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FALLBACK_ANSWER_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(
+                &smart.url(),
+                &coder.url(),
+                None,
+                r#"fallback_alias: "coder""#,
+            ),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let res = registry
+            .generate("smart", "hello", &GenerationOptions::default())
+            .await;
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        assert!(
+            matches!(&res, Ok(r) if r.text == "fallback answer"),
+            "got {res:?}"
+        );
+    }
+
+    /// The fallback alias is used only after the provider's time limit: the
+    /// last failed retry of another retryable error sends nothing to it, and
+    /// the error is today's. A node-wide `fallback_provider` is not reached
+    /// either, since the alias names its own fallback.
+    #[tokio::test]
+    async fn fallback_alias_is_not_used_after_the_last_failed_retry_of_another_error() {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let mut node = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(503)
+            .with_body(r#"{"error":"busy"}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let node_mock = node
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(
+                &smart.url(),
+                &coder.url(),
+                Some(&node.url()),
+                r#"fallback_alias: "coder""#,
+            ),
+            &format!("{ALIAS_FALLBACK_SELECTION}fallback_provider: node-fallback\n"),
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let res = registry
+            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .await;
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        node_mock.assert_async().await;
+        assert!(
+            matches!(&res, Err(LLMError::ServiceUnavailable(_))),
+            "the primary's own error must be returned, got {res:?}"
+        );
+    }
+
+    /// An alias that names a fallback alias never reaches the node-wide
+    /// `fallback_provider`, after its time limit either.
+    #[tokio::test]
+    async fn fallback_alias_after_3046_takes_precedence_over_fallback_provider() {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let mut node = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FALLBACK_ANSWER_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let node_mock = node
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(
+                &smart.url(),
+                &coder.url(),
+                Some(&node.url()),
+                r#"fallback_alias: "coder""#,
+            ),
+            &format!("{ALIAS_FALLBACK_SELECTION}fallback_provider: node-fallback\n"),
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let res = registry
+            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .await;
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        node_mock.assert_async().await;
+        assert!(res.is_ok(), "got {res:?}");
+    }
+
+    /// A fallback alias that also meets its limit is not retried, and the
+    /// error names both models.
+    #[tokio::test]
+    async fn fallback_alias_3046_on_both_names_both_models() {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(
+                &smart.url(),
+                &coder.url(),
+                None,
+                r#"fallback_alias: "coder""#,
+            ),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let res = registry
+            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .await;
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        match res {
+            Err(LLMError::Provider(msg)) => {
+                assert!(
+                    msg.starts_with("provider timeout: alias 'smart'"),
+                    "got: {msg}"
+                );
+                assert!(msg.contains("model 'm-smart'"), "got: {msg}");
+                assert!(msg.contains("model 'm-coder'"), "got: {msg}");
+            }
+            other => panic!("both 3046 answers must end as a provider timeout, got {other:?}"),
+        }
+    }
+
+    /// No `fallback_alias` and no `fallback_provider`: the 3046 is returned
+    /// with no further request, though another alias exists.
+    #[tokio::test]
+    async fn no_fallback_alias_and_no_fallback_provider_returns_the_error_with_no_further_request()
+    {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(&smart.url(), &coder.url(), None, ""),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let res = registry
+            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .await;
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        assert!(
+            matches!(&res, Err(LLMError::Provider(msg)) if msg.starts_with("provider timeout: alias 'smart'")),
+            "got {res:?}"
+        );
+    }
+
+    /// No `fallback_alias` under a configured `fallback_provider`: today's
+    /// behaviour, the node-wide fallback tried once with the caller's options.
+    #[tokio::test]
+    async fn no_fallback_alias_under_fallback_provider_behaves_as_today() {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let mut node = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let node_mock = node
+            .mock("POST", "/chat/completions")
+            .match_body(body_of("m-node", 8192, 0.4))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FALLBACK_ANSWER_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(&smart.url(), &coder.url(), Some(&node.url()), ""),
+            &format!("{ALIAS_FALLBACK_SELECTION}fallback_provider: node-fallback\n"),
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let res = registry
+            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .await;
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        node_mock.assert_async().await;
+        assert!(
+            matches!(&res, Ok(ChatResponse::FinalText(r)) if r.text == "fallback answer"),
+            "got {res:?}"
+        );
+    }
+
+    /// A node never runs with a fallback configured and silently absent: when
+    /// the alias is mapped and the alias it names has no adapter, the registry
+    /// refuses to build, naming both.
+    #[test]
+    fn fallback_alias_without_an_adapter_refuses_the_registry() {
+        let mut manifest = alias_fallback_manifest(
+            &alias_fallback_providers(
+                "http://127.0.0.1:9",
+                "http://127.0.0.1:9",
+                None,
+                r#"fallback_alias: "coder""#,
+            ),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        // The coder provider's key names an environment variable that is not
+        // set, so its adapters fail to build.
+        manifest.spec.llm_providers[1].api_key = Some(SensitiveString::new(
+            "env:AEGIS_TEST_UNSET_FALLBACK_ALIAS_KEY_7c1e".to_string(),
+        ));
+        manifest
+            .validate()
+            .expect("the configuration is valid as written");
+
+        let err = match ProviderRegistry::from_config(&manifest) {
+            Ok(_) => panic!("a fallback alias with no adapter must refuse the registry"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("'smart'") && err.contains("'coder'"),
+            "the error must name both aliases, got: {err}"
         );
     }
 }

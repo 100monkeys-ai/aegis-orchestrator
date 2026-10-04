@@ -481,6 +481,18 @@ pub struct ModelConfig {
     /// Optional temperature override for this model alias.
     #[serde(default)]
     pub temperature: Option<f32>,
+
+    /// Another alias this alias falls back to, tried once after the
+    /// provider's time limit on this alias's own model (a Workers AI 408 with
+    /// code 3046), with the named alias's own `max_output_tokens` and
+    /// `temperature`. Every other failure behaves as it does without it, and
+    /// an alias that names one never reaches `llm_selection.fallback_provider`.
+    /// The per-alias fallback decision of 2026-10-04, after AEGIS ADR-124's
+    /// measured 120 s limit of `smart`. One level only: `validate` refuses a
+    /// name no enabled provider maps, the alias itself, and an alias that
+    /// itself names a fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,7 +505,8 @@ pub struct LLMSelection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
 
-    /// Fallback provider if primary fails
+    /// Fallback provider if primary fails, for an alias whose model entry
+    /// names no `fallback_alias`; resolved to that provider's first model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_provider: Option<String>,
 
@@ -2412,6 +2425,46 @@ impl NodeConfigManifest {
             }
         }
 
+        // A model entry's fallback_alias names another alias an enabled
+        // provider maps, never the entry's own alias, and never an alias that
+        // itself names a fallback: the registry's fallback is one level.
+        let enabled_models = || {
+            self.spec
+                .llm_providers
+                .iter()
+                .filter(|p| p.enabled)
+                .flat_map(|p| p.models.iter())
+        };
+        let mapped: std::collections::HashSet<&str> =
+            enabled_models().map(|m| m.alias.as_str()).collect();
+        let naming_a_fallback: std::collections::HashSet<&str> = enabled_models()
+            .filter(|m| m.fallback_alias.is_some())
+            .map(|m| m.alias.as_str())
+            .collect();
+        for model in enabled_models() {
+            let Some(fallback) = model.fallback_alias.as_deref() else {
+                continue;
+            };
+            if fallback == model.alias {
+                anyhow::bail!(
+                    "model alias '{}' names itself as its fallback_alias",
+                    model.alias
+                );
+            }
+            if !mapped.contains(fallback) {
+                anyhow::bail!(
+                    "model alias '{}' names fallback_alias '{fallback}', which is not mapped by any enabled provider",
+                    model.alias
+                );
+            }
+            if naming_a_fallback.contains(fallback) {
+                anyhow::bail!(
+                    "model alias '{}' names fallback_alias '{fallback}', which itself names a fallback_alias: a fallback is one level only",
+                    model.alias
+                );
+            }
+        }
+
         // Validate default/fallback providers exist
         if let Some(default_provider) = &self.spec.llm_selection.default_provider {
             if !self
@@ -2653,6 +2706,7 @@ mod tests {
                         cost_per_1k_tokens: 0.0,
                         max_output_tokens: None,
                         temperature: None,
+                        fallback_alias: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),
@@ -3121,6 +3175,7 @@ path: "/metrics"
                 cost_per_1k_tokens: 0.0,
                 max_output_tokens: None,
                 temperature: None,
+                fallback_alias: None,
             }],
         }];
         manifest
@@ -3408,5 +3463,127 @@ grpc_port: 50051
         assert!(capabilities[0].requires_approval);
         assert!(capabilities[0].skip_judge);
         assert!(!capabilities[1].requires_approval);
+    }
+
+    // ── fallback_alias: one other alias, one level ────────────────────────
+    //
+    // A model entry may name another alias as its fallback, used after the
+    // provider's time limit on its own model. The node refuses to start when
+    // the name is not mapped by an enabled provider, names the entry's own
+    // alias, or names an alias that itself names a fallback (one level only).
+
+    /// A manifest whose providers are the block an operator writes.
+    fn manifest_with_providers(providers_yaml: &str) -> NodeConfigManifest {
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.node.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        manifest.spec.llm_providers =
+            serde_yaml::from_str(providers_yaml).expect("the providers block parses");
+        manifest
+    }
+
+    /// `smart` and `coder` on one enabled provider, with `smart_extra` and
+    /// `coder_extra` as extra lines of each entry; a disabled provider maps
+    /// `spare`.
+    fn fallback_alias_providers(smart_extra: &str, coder_extra: &str) -> String {
+        format!(
+            r#"- name: workers-ai
+  type: openai-compatible
+  endpoint: "https://inference.example/v1"
+  api_key: "env:TEST_KEY"
+  models:
+    - alias: "smart"
+      model: "m-smart"
+      capabilities: ["chat"]
+      context_window: 8192
+      {smart_extra}
+    - alias: "coder"
+      model: "m-coder"
+      capabilities: ["chat"]
+      context_window: 8192
+      {coder_extra}
+- name: off
+  type: openai-compatible
+  endpoint: "https://inference.example/v1"
+  enabled: false
+  models:
+    - alias: "spare"
+      model: "m-spare"
+      capabilities: ["chat"]
+      context_window: 8192
+"#
+        )
+    }
+
+    fn refusal(manifest: &NodeConfigManifest) -> String {
+        manifest
+            .validate()
+            .expect_err("the configuration must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn fallback_alias_to_a_mapped_alias_validates() {
+        let manifest =
+            manifest_with_providers(&fallback_alias_providers(r#"fallback_alias: "coder""#, ""));
+        manifest
+            .validate()
+            .expect("smart falling back to coder is valid");
+    }
+
+    #[test]
+    fn fallback_alias_unmapped_is_refused() {
+        let manifest =
+            manifest_with_providers(&fallback_alias_providers(r#"fallback_alias: "nobody""#, ""));
+        let msg = refusal(&manifest);
+        assert!(
+            msg.contains("'smart'") && msg.contains("'nobody'") && msg.contains("not mapped"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fallback_alias_empty_is_refused() {
+        let manifest =
+            manifest_with_providers(&fallback_alias_providers(r#"fallback_alias: """#, ""));
+        let msg = refusal(&manifest);
+        assert!(
+            msg.contains("'smart'") && msg.contains("not mapped"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fallback_alias_on_a_disabled_provider_is_refused() {
+        let manifest =
+            manifest_with_providers(&fallback_alias_providers(r#"fallback_alias: "spare""#, ""));
+        let msg = refusal(&manifest);
+        assert!(
+            msg.contains("'spare'") && msg.contains("not mapped"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fallback_alias_naming_itself_is_refused() {
+        let manifest =
+            manifest_with_providers(&fallback_alias_providers(r#"fallback_alias: "smart""#, ""));
+        let msg = refusal(&manifest);
+        assert!(
+            msg.contains("'smart'") && msg.contains("itself"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fallback_alias_chain_is_refused() {
+        let manifest = manifest_with_providers(&fallback_alias_providers(
+            r#"fallback_alias: "coder""#,
+            r#"fallback_alias: "smart""#,
+        ));
+        let msg = refusal(&manifest);
+        assert!(
+            msg.contains("one level"),
+            "a chain of two must be refused as more than one level, got: {msg}"
+        );
     }
 }
