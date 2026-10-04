@@ -65,9 +65,9 @@ use crate::domain::agent::AgentId;
 use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
     AgentLifecycleEvent, CanvasEvent, ContainerRunEvent, CredentialEvent, DriftEvent,
-    ExecutionEvent, GitRepoEvent, IamEvent, ImageManagementEvent, LearningEvent, MCPToolEvent,
-    PolicyEvent, RateLimitEvent, ScriptEvent, SealEvent, SecretEvent, StimulusEvent, StorageEvent,
-    SwarmEvent, TeamEvent, TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
+    ExecutionEvent, GitRepoEvent, GoalEvent, IamEvent, ImageManagementEvent, LearningEvent,
+    MCPToolEvent, PolicyEvent, RateLimitEvent, ScriptEvent, SealEvent, SecretEvent, StimulusEvent,
+    StorageEvent, SwarmEvent, TeamEvent, TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -102,6 +102,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Script(_) => "script",
         DomainEvent::Team(_) => "team",
         DomainEvent::Drift(_) => "drift",
+        DomainEvent::Goal(_) => "goal",
     }
 }
 
@@ -150,6 +151,8 @@ pub enum DomainEvent {
     /// Cross-context drift events — cached external IDs discovered to be
     /// missing or stale at point of use (self-healing sweep).
     Drift(DriftEvent),
+    /// A goal's evaluations and closing (AEGIS ADR-131 D8)
+    Goal(GoalEvent),
 }
 
 impl DomainEvent {
@@ -165,7 +168,8 @@ impl DomainEvent {
             | DomainEvent::Canvas(_)
             | DomainEvent::Script(_)
             | DomainEvent::Team(_)
-            | DomainEvent::Drift(_) => None,
+            | DomainEvent::Drift(_)
+            | DomainEvent::Goal(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -414,7 +418,8 @@ impl DomainEvent {
             | DomainEvent::Canvas(_)
             | DomainEvent::Script(_)
             | DomainEvent::Team(_)
-            | DomainEvent::Drift(_) => None,
+            | DomainEvent::Drift(_)
+            | DomainEvent::Goal(_) => None,
         }
     }
 
@@ -669,6 +674,10 @@ impl DomainEvent {
                 | DriftEvent::StripeSubscriptionMissing { detected_at, .. }
                 | DriftEvent::OrphanSubscription { detected_at, .. }
                 | DriftEvent::DuplicateStripeCustomer { detected_at, .. } => *detected_at,
+            },
+            DomainEvent::Goal(event) => match event {
+                GoalEvent::GoalEvaluated { evaluated_at, .. } => *evaluated_at,
+                GoalEvent::GoalClosed { closed_at, .. } => *closed_at,
             },
         }
     }
@@ -927,6 +936,10 @@ impl DomainEvent {
                 DriftEvent::OrphanSubscription { .. } => "drift_orphan_subscription",
                 DriftEvent::DuplicateStripeCustomer { .. } => "drift_duplicate_stripe_customer",
             },
+            DomainEvent::Goal(event) => match event {
+                GoalEvent::GoalEvaluated { .. } => "goal_evaluated",
+                GoalEvent::GoalClosed { .. } => "goal_closed",
+            },
         }
     }
 
@@ -956,6 +969,7 @@ impl DomainEvent {
             DomainEvent::Script(_) => "script",
             DomainEvent::Team(_) => "team",
             DomainEvent::Drift(_) => "drift",
+            DomainEvent::Goal(_) => "goal",
         }
     }
 
@@ -1069,6 +1083,7 @@ impl DomainEvent {
             DomainEvent::Script(_) => Some("script"),
             DomainEvent::Team(_) => Some("team"),
             DomainEvent::Drift(_) => Some("drift"),
+            DomainEvent::Goal(_) => Some("goal"),
         }
     }
 }
@@ -1221,6 +1236,11 @@ impl EventBus {
     /// or stale at point of use (anti-fragility sweep).
     pub fn publish_drift_event(&self, event: DriftEvent) {
         self.publish(DomainEvent::Drift(event));
+    }
+
+    /// Publish a goal event (AEGIS ADR-131 D8).
+    pub fn publish_goal_event(&self, event: GoalEvent) {
+        self.publish(DomainEvent::Goal(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1631,6 +1651,7 @@ impl AgentEventReceiver {
             DomainEvent::Script(_) => false, // Script persistence events are tenant-scoped, not per-agent
             DomainEvent::Team(_) => false,   // Team tenancy events are tenant-scoped, not per-agent
             DomainEvent::Drift(_) => false,  // Drift events are system-wide, not per-agent
+            DomainEvent::Goal(_) => false,   // Goal events are per-user, not per-agent
         }
     }
 }

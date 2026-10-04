@@ -612,6 +612,22 @@ spec:
       # Failed redemptions that invalidate the user's live codes (D8).
       code_max_failed_attempts: 5
 
+  # Goals (AEGIS ADR-131): a user's request held by the orchestrator, judged
+  # after every execution turn by the built-in judge agent goal-judge. These
+  # bounds are node configuration, never a manifest or a prompt (D7). Omit
+  # the block for these defaults.
+  goals:
+    # Continuations granted at most per goal (D7).
+    max_continuations: 3
+    # Seconds a goal stays open from its creation (D7).
+    lifetime_seconds: 1800
+    # A verdict meets the goal at this score and confidence or above (D5).
+    met_min_score: 0.85
+    met_min_confidence: 0.75
+    # A verdict not met whose feasibility signal scores at or below this
+    # cannot be met (D5).
+    cannot_be_met_max_feasibility: 0.2
+
   grpc_auth:
     enabled: true
     exempt_methods:

@@ -1610,6 +1610,37 @@ pub enum CredentialEvent {
     },
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Goal events (AEGIS ADR-131 D8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A goal's evaluations and its closing, published beside the execution
+/// events so that a goal is visible wherever executions are (ADR-131 D8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GoalEvent {
+    /// One evaluation of a goal ended: the round it judged, the verdict's
+    /// score and confidence, the outcome read from it, and whether a
+    /// continuation was granted.
+    GoalEvaluated {
+        goal_id: crate::domain::goal::GoalId,
+        tenant_id: TenantId,
+        round: u32,
+        score: f64,
+        confidence: f64,
+        outcome: crate::domain::goal::GoalOutcome,
+        r#continue: bool,
+        evaluated_at: DateTime<Utc>,
+    },
+    /// A goal closed: `met`, `cannot_be_met`, `exhausted`, `expired` or
+    /// `superseded`.
+    GoalClosed {
+        goal_id: crate::domain::goal::GoalId,
+        tenant_id: TenantId,
+        state: crate::domain::goal::GoalState,
+        closed_at: DateTime<Utc>,
+    },
+}
+
 #[cfg(test)]
 mod tests_iam {
     use super::*;

@@ -234,6 +234,11 @@ pub struct NodeConfigSpec {
     /// every initiate answers that the provider is not configured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oauth_providers: Vec<OAuthProviderEntry>,
+
+    /// `spec.goals` (AEGIS ADR-131 D7): the bounds of a goal and the
+    /// thresholds its verdicts are read by. Absent, the record's values.
+    #[serde(default)]
+    pub goals: GoalsConfig,
 }
 
 /// One entry of `spec.oauth_providers` (AEGIS ADR-125 D2).
@@ -1676,6 +1681,85 @@ fn default_operator_escalation_max_failed_attempts() -> u32 {
     5
 }
 
+/// `spec.goals` (AEGIS ADR-131 D7, D5): how many continuations a goal may be
+/// granted, how long it stays open, and the thresholds its judge's verdict
+/// is read by. Node configuration, never a manifest or a prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalsConfig {
+    /// Continuations granted at most per goal. Default 3 (D7).
+    #[serde(default = "default_goals_max_continuations")]
+    pub max_continuations: u32,
+    /// Seconds a goal stays open from its creation. Default 1800 (D7).
+    #[serde(default = "default_goals_lifetime_seconds")]
+    pub lifetime_seconds: u64,
+    /// A verdict meets the goal at this score or above... Default 0.85 (D5).
+    #[serde(default = "default_goals_met_min_score")]
+    pub met_min_score: f64,
+    /// ...and at this confidence or above. Default 0.75 (D5).
+    #[serde(default = "default_goals_met_min_confidence")]
+    pub met_min_confidence: f64,
+    /// A verdict not met whose `feasibility` signal scores at or below this
+    /// cannot be met. Default 0.2 (D5).
+    #[serde(default = "default_goals_cannot_be_met_max_feasibility")]
+    pub cannot_be_met_max_feasibility: f64,
+}
+
+impl Default for GoalsConfig {
+    fn default() -> Self {
+        Self {
+            max_continuations: default_goals_max_continuations(),
+            lifetime_seconds: default_goals_lifetime_seconds(),
+            met_min_score: default_goals_met_min_score(),
+            met_min_confidence: default_goals_met_min_confidence(),
+            cannot_be_met_max_feasibility: default_goals_cannot_be_met_max_feasibility(),
+        }
+    }
+}
+
+impl GoalsConfig {
+    /// Refuse bounds no goal could be judged by: a lifetime of zero, or a
+    /// threshold outside 0.0 to 1.0.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.lifetime_seconds == 0 {
+            anyhow::bail!("spec.goals.lifetime_seconds must be above 0");
+        }
+        for (name, value) in [
+            ("met_min_score", self.met_min_score),
+            ("met_min_confidence", self.met_min_confidence),
+            (
+                "cannot_be_met_max_feasibility",
+                self.cannot_be_met_max_feasibility,
+            ),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                anyhow::bail!("spec.goals.{name} must be between 0.0 and 1.0, got {value}");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_goals_max_continuations() -> u32 {
+    3
+}
+
+fn default_goals_lifetime_seconds() -> u64 {
+    1800
+}
+
+fn default_goals_met_min_score() -> f64 {
+    0.85
+}
+
+fn default_goals_met_min_confidence() -> f64 {
+    0.75
+}
+
+fn default_goals_cannot_be_met_max_feasibility() -> f64 {
+    0.2
+}
+
 /// Individual realm configuration entry within `spec.iam.realms`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IamRealmConfig {
@@ -2035,6 +2119,7 @@ impl Default for NodeConfigSpec {
             billing: None,
             zaru: None,
             oauth_providers: Vec::new(),
+            goals: GoalsConfig::default(),
         }
     }
 }
@@ -2409,6 +2494,8 @@ impl NodeConfigManifest {
             anyhow::bail!("spec.node.id cannot be empty");
         }
 
+        self.spec.goals.validate()?;
+
         // Validate OAuth providers (AEGIS ADR-125 D2)
         let mut seen_oauth_providers = std::collections::HashSet::new();
         for entry in &self.spec.oauth_providers {
@@ -2778,6 +2865,7 @@ mod tests {
                 billing: None,
                 zaru: None,
                 oauth_providers: Vec::new(),
+                goals: GoalsConfig::default(),
             },
         };
 
@@ -3660,5 +3748,66 @@ grpc_port: 50051
             "realms: []\noperator_escalation:\n  ttl_secs: 900\n",
         );
         assert!(misspelt.is_err(), "a misspelt key was accepted");
+    }
+
+    /// AEGIS ADR-131 D7: without the block, the record's values.
+    #[test]
+    fn goals_default_to_3_1800_085_075_02() {
+        let spec: GoalsConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(spec, GoalsConfig::default());
+        assert_eq!(spec.max_continuations, 3);
+        assert_eq!(spec.lifetime_seconds, 1800);
+        assert_eq!(spec.met_min_score, 0.85);
+        assert_eq!(spec.met_min_confidence, 0.75);
+        assert_eq!(spec.cannot_be_met_max_feasibility, 0.2);
+    }
+
+    /// AEGIS ADR-131 D7 and U8: the block exactly as the deployment writes it
+    /// under `spec` of `podman/pods/core/aegis-config.yaml`
+    /// (`aegis-platform-deployment` 5ee35855, lines 623-628) parses to its
+    /// five values, and a misspelt key is refused rather than ignored.
+    #[test]
+    fn goals_block_as_the_deployment_writes_it_parses() {
+        let block = "\
+goals:
+  max_continuations: 3
+  lifetime_seconds: 1800
+  met_min_score: 0.85
+  met_min_confidence: 0.75
+  cannot_be_met_max_feasibility: 0.2
+";
+        #[derive(Deserialize)]
+        struct Spec {
+            goals: GoalsConfig,
+        }
+        let spec: Spec = serde_yaml::from_str(block).unwrap();
+        assert_eq!(
+            spec.goals,
+            GoalsConfig {
+                max_continuations: 3,
+                lifetime_seconds: 1800,
+                met_min_score: 0.85,
+                met_min_confidence: 0.75,
+                cannot_be_met_max_feasibility: 0.2,
+            }
+        );
+        spec.goals.validate().unwrap();
+        let misspelt = serde_yaml::from_str::<GoalsConfig>("max_rounds: 3\n");
+        assert!(misspelt.is_err(), "a misspelt key was accepted");
+    }
+
+    /// A threshold outside 0.0 to 1.0, or a lifetime of zero, is refused.
+    #[test]
+    fn goals_out_of_range_are_refused() {
+        let goals = GoalsConfig {
+            met_min_score: 1.5,
+            ..Default::default()
+        };
+        assert!(goals.validate().is_err());
+        let goals = GoalsConfig {
+            lifetime_seconds: 0,
+            ..Default::default()
+        };
+        assert!(goals.validate().is_err());
     }
 }

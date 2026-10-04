@@ -1420,6 +1420,7 @@ mod tests {
                 billing: None,
                 zaru: None,
                 oauth_providers: Vec::new(),
+                goals: crate::domain::node_config::GoalsConfig::default(),
             },
         };
 

@@ -64,6 +64,7 @@ pub mod fsal;
 pub mod git_host_keys;
 pub mod git_repo;
 pub mod git_repo_tier_limits;
+pub mod goal;
 pub mod iam;
 pub mod llm;
 pub mod mcp;
