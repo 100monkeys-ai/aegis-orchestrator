@@ -376,6 +376,51 @@ pub(crate) async fn connect_postgres(config: &NodeConfigManifest) -> Result<Opti
     Ok(db_pool)
 }
 
+/// The judges' room, read from the node configuration's alias table
+/// (`spec.llm_providers[].models[]`: `context_window` and
+/// `max_output_tokens`), handed to every service the daemon builds that runs
+/// a judge: goal-judge (AEGIS ADR-131 U16) and the validation judges (U19).
+/// A service not given it bounds its judges by the stated default
+/// (`JudgeContext::UNCONFIGURED`), which would stop as too large an input
+/// production's judge model holds.
+fn judge_context_source(
+    config: &NodeConfigManifest,
+) -> Arc<dyn aegis_orchestrator_core::domain::goal::JudgeContextSource> {
+    Arc::new(
+        aegis_orchestrator_core::domain::goal::AliasTableJudgeContext::from_providers(
+            &config.spec.llm_providers,
+        ),
+    )
+}
+
+/// The goal service the daemon runs (AEGIS ADR-131): its bounds from
+/// `spec.goals` (D7), goal-judge's room from the alias table (U16).
+fn daemon_goal_service(
+    repo: Arc<dyn aegis_orchestrator_core::domain::goal::GoalRepository>,
+    event_bus: Arc<EventBus>,
+    config: &NodeConfigManifest,
+    judge_context: Arc<dyn aegis_orchestrator_core::domain::goal::JudgeContextSource>,
+) -> aegis_orchestrator_core::application::goal_service::GoalService {
+    aegis_orchestrator_core::application::goal_service::GoalService::new(
+        repo,
+        event_bus,
+        config.spec.goals.clone(),
+    )
+    .with_judge_context(judge_context)
+}
+
+/// The validation service the daemon and its gRPC server run, its judges'
+/// room from the alias table (AEGIS ADR-131 U19).
+fn daemon_validation_service(
+    event_bus: Arc<EventBus>,
+    execution_service: Arc<dyn ExecutionService>,
+    agent_service: Arc<dyn AgentLifecycleService>,
+    judge_context: Arc<dyn aegis_orchestrator_core::domain::goal::JudgeContextSource>,
+) -> ValidationService {
+    ValidationService::new(event_bus, execution_service, agent_service)
+        .with_judge_context(judge_context)
+}
+
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     // Write PID file
     let pid = std::process::id();
@@ -1526,6 +1571,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )
     };
 
+    // Every judge the daemon runs is bounded by its alias's room in the
+    // alias table (AEGIS ADR-131 U16, U19).
+    let judge_context = judge_context_source(&config);
+
     // Finally initialize ExecutionService now that ToolRouter is ready
     let mut execution_service_builder = StandardExecutionService::new(
         agent_service.clone(),
@@ -1537,7 +1586,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     )
     .with_nfs_gateway(nfs_gateway.clone())
     .with_runtime_registry(runtime_registry.clone())
-    .with_tool_router(tool_router.clone());
+    .with_tool_router(tool_router.clone())
+    .with_judge_context(judge_context.clone());
 
     if let Some(c_client) = cortex_client.clone() {
         execution_service_builder = execution_service_builder.with_cortex_client(c_client);
@@ -1563,10 +1613,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
     execution_service.set_child_execution_service(execution_service.clone());
 
-    let validation_service = Arc::new(ValidationService::new(
+    let validation_service = Arc::new(daemon_validation_service(
         event_bus.clone(),
         execution_service.clone(),
         agent_service.clone(),
+        judge_context.clone(),
     ));
 
     // Create human input service
@@ -2047,13 +2098,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 aegis_orchestrator_core::infrastructure::repositories::postgres_goal::InMemoryGoalRepository::new(),
             ),
         };
-    let goal_service = Arc::new(
-        aegis_orchestrator_core::application::goal_service::GoalService::new(
-            goal_repo,
-            event_bus.clone(),
-            config.spec.goals.clone(),
-        ),
-    );
+    let goal_service = Arc::new(daemon_goal_service(
+        goal_repo,
+        event_bus.clone(),
+        &config,
+        judge_context.clone(),
+    ));
     goal_service.clone().spawn_expiry_sweep(
         aegis_orchestrator_core::application::goal_service::EXPIRY_SWEEP_INTERVAL,
     );
@@ -3607,6 +3657,316 @@ mod tests {
         dir.push(format!("aegis-server-test-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// The node configuration with `judge` at production's entry
+    /// (`aegis-platform-deployment` d27c51d `podman/pods/core/aegis-config.yaml`
+    /// 40-45: `context_window: 256000`, `max_output_tokens: 16384`).
+    fn production_judge_config() -> aegis_orchestrator_core::domain::node_config::NodeConfigManifest
+    {
+        let mut config =
+            aegis_orchestrator_core::domain::node_config::NodeConfigManifest::default();
+        config.spec.llm_providers = serde_yaml::from_str(
+            r#"- name: workers-ai
+  type: openai-compatible
+  endpoint: "https://api.example.invalid/v1"
+  enabled: true
+  models:
+    - alias: judge
+      model: "@cf/google/gemma-4-26b-a4b-it"
+      capabilities: ["chat"]
+      context_window: 256000
+      max_output_tokens: 16384
+"#,
+        )
+        .expect("provider block parses");
+        config
+    }
+
+    /// The rest of the orchestrator as a goal evaluation sees it: no bound
+    /// executions, and a judge that stays running; each judge start's input
+    /// is recorded.
+    #[derive(Default)]
+    struct RecordingGoalWorld {
+        judge_inputs: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl aegis_orchestrator_core::application::goal_service::GoalWorld for RecordingGoalWorld {
+        async fn read_execution(
+            &self,
+            _goal: &aegis_orchestrator_core::domain::goal::Goal,
+            _bound: &aegis_orchestrator_core::domain::goal::BoundExecution,
+        ) -> Option<aegis_orchestrator_core::application::goal_service::ExecutionView> {
+            None
+        }
+
+        async fn pending_approvals(
+            &self,
+            _goal: &aegis_orchestrator_core::domain::goal::Goal,
+            _execution_ids: &[aegis_orchestrator_core::domain::execution::ExecutionId],
+        ) -> Vec<(
+            aegis_orchestrator_core::domain::execution::ExecutionId,
+            String,
+        )> {
+            Vec::new()
+        }
+
+        async fn start_judge(
+            &self,
+            _goal: &aegis_orchestrator_core::domain::goal::Goal,
+            input: serde_json::Value,
+        ) -> Result<aegis_orchestrator_core::domain::execution::ExecutionId, String> {
+            self.judge_inputs.lock().unwrap().push(input);
+            Ok(aegis_orchestrator_core::domain::execution::ExecutionId::new())
+        }
+
+        async fn judge_progress(
+            &self,
+            _goal: &aegis_orchestrator_core::domain::goal::Goal,
+            _judge_execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> aegis_orchestrator_core::application::goal_service::JudgeProgress {
+            aegis_orchestrator_core::application::goal_service::JudgeProgress::Running
+        }
+    }
+
+    /// An execution service that is never called: the validation service is
+    /// built here only to read what the daemon gave it.
+    struct NoExecutions;
+
+    #[async_trait::async_trait]
+    impl aegis_orchestrator_core::application::execution::ExecutionService for NoExecutions {
+        async fn start_execution(
+            &self,
+            _agent_id: aegis_orchestrator_core::domain::agent::AgentId,
+            _input: aegis_orchestrator_core::domain::execution::ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+        ) -> anyhow::Result<aegis_orchestrator_core::domain::execution::ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn start_execution_with_id(
+            &self,
+            _execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+            _agent_id: aegis_orchestrator_core::domain::agent::AgentId,
+            _input: aegis_orchestrator_core::domain::execution::ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+        ) -> anyhow::Result<aegis_orchestrator_core::domain::execution::ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn start_child_execution(
+            &self,
+            _agent_id: aegis_orchestrator_core::domain::agent::AgentId,
+            _input: aegis_orchestrator_core::domain::execution::ExecutionInput,
+            _parent_execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> anyhow::Result<aegis_orchestrator_core::domain::execution::ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn get_execution_for_tenant(
+            &self,
+            _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+            _id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> anyhow::Result<aegis_orchestrator_core::domain::execution::Execution> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn get_execution_unscoped(
+            &self,
+            _id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> anyhow::Result<aegis_orchestrator_core::domain::execution::Execution> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn get_iterations_for_tenant(
+            &self,
+            _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+            _exec_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> anyhow::Result<Vec<aegis_orchestrator_core::domain::execution::Iteration>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn cancel_execution_for_tenant(
+            &self,
+            _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+            _id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn stream_execution(
+            &self,
+            _id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> anyhow::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = anyhow::Result<
+                                aegis_orchestrator_core::domain::events::ExecutionEvent,
+                            >,
+                        > + Send,
+                >,
+            >,
+        > {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _id: aegis_orchestrator_core::domain::agent::AgentId,
+        ) -> anyhow::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = anyhow::Result<
+                                aegis_orchestrator_core::infrastructure::event_bus::DomainEvent,
+                            >,
+                        > + Send,
+                >,
+            >,
+        > {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn list_executions_for_tenant(
+            &self,
+            _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+            _agent_id: Option<aegis_orchestrator_core::domain::agent::AgentId>,
+            _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<aegis_orchestrator_core::domain::execution::Execution>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn delete_execution_for_tenant(
+            &self,
+            _tenant_id: &aegis_orchestrator_core::domain::tenant::TenantId,
+            _id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+            _iteration: u8,
+            _interaction: aegis_orchestrator_core::domain::execution::LlmInteraction,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+            _iteration: u8,
+            _trajectory: Vec<aegis_orchestrator_core::domain::execution::TrajectoryStep>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+    }
+
+    /// AEGIS ADR-131 U16, U19: the daemon gives the goal service and the
+    /// validation service the alias table. The failure this prevents: a
+    /// limit right in tests and wrong in production, where a service not
+    /// given the table bounds its judge by the stated default (24,576 bytes)
+    /// and stops as too large what production's judge holds (239,616 bytes).
+    #[tokio::test]
+    async fn the_daemon_gives_the_goal_service_and_the_validation_service_the_alias_table() {
+        use aegis_orchestrator_core::application::goal_service::GoalCaller;
+        use aegis_orchestrator_core::domain::goal::{GoalChannel, JudgeContext};
+        use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+        use aegis_orchestrator_core::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = production_judge_config();
+        let judge_context = super::judge_context_source(&config);
+        let production = JudgeContext {
+            context_window: 256_000,
+            max_output_tokens: 16_384,
+        };
+        assert_eq!(production.prompt_limit_bytes(), 239_616);
+
+        let goals = super::daemon_goal_service(
+            Arc::new(InMemoryGoalRepository::new()),
+            Arc::new(EventBus::new(16)),
+            &config,
+            judge_context.clone(),
+        )
+        .with_wait(Duration::from_millis(30), Duration::from_millis(10));
+        let caller = GoalCaller {
+            tenant_id: aegis_orchestrator_core::domain::tenant::TenantId::consumer(),
+            user_sub: "user-1".to_string(),
+        };
+
+        // 13,010 characters, the size of the answer of 2026-10-04, and
+        // 100,000, above the stated default's room: each judged whole.
+        for (n, size) in [13_010usize, 100_000].into_iter().enumerate() {
+            let world = RecordingGoalWorld::default();
+            let goal = goals
+                .create(
+                    &caller,
+                    "write the report",
+                    &format!("conv-{n}"),
+                    GoalChannel::Web,
+                )
+                .await
+                .expect("goal created");
+            let answer = "r".repeat(size);
+            let reply = goals
+                .evaluate(&world, &caller, goal.id, &answer, None)
+                .await
+                .expect("evaluated");
+            assert_eq!(
+                reply["state"], "judging",
+                "a {size}-character answer is judged, not stopped: {reply}"
+            );
+            let inputs = world.judge_inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 1, "goal-judge started once");
+            assert_eq!(
+                inputs[0]["companion_answer"].as_str().map(str::len),
+                Some(size),
+                "goal-judge is given the answer whole"
+            );
+        }
+
+        // Above production's limit: no judge runs; the goal stops and says why.
+        let world = RecordingGoalWorld::default();
+        let goal = goals
+            .create(&caller, "write the report", "conv-over", GoalChannel::Web)
+            .await
+            .expect("goal created");
+        let reply = goals
+            .evaluate(&world, &caller, goal.id, &"r".repeat(300_000), None)
+            .await
+            .expect("evaluated");
+        assert_eq!(reply["state"], "stopped", "{reply}");
+        let reasoning = reply["verdict"]["reasoning"].as_str().unwrap_or_default();
+        assert!(
+            reasoning.starts_with("The input is too large to judge: ")
+                && reasoning.ends_with("against a limit of 239616 bytes."),
+            "{reasoning}"
+        );
+        assert!(world.judge_inputs.lock().unwrap().is_empty());
+
+        // The validation service the daemon and its gRPC server run reads the
+        // same table.
+        let validation = super::daemon_validation_service(
+            Arc::new(EventBus::new(16)),
+            Arc::new(NoExecutions),
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository::new(
+                ),
+            ),
+            judge_context,
+        );
+        let source = validation
+            .judge_context()
+            .expect("the daemon gives the validation service the alias table");
+        assert_eq!(source.judge_context("judge"), Some(production));
     }
 
     /// AEGIS ADR-124 D3, as the coordinator ruled it (correction C1): the
