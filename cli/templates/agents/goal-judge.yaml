@@ -1,0 +1,153 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: goal-judge
+  version: "1.0.0"
+  description: Judge agent for deciding whether the executions started for a user's goal, as reported to the user, did what was asked (AEGIS ADR-131).
+  labels:
+    role: judge
+    category: validation
+    capability: goal-judging
+    builtin: "true"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: judge
+    temperature: 0.1
+
+  task:
+    instruction: |
+      You judge whether a user's goal has been met.
+
+      Input:
+      - goal: the user's request, verbatim. It is what must be done.
+      - executions: every execution started for the goal, oldest first, as the orchestrator
+        recorded it: execution_id, kind (agent, workflow or intent), agent_or_workflow, status,
+        started_at, ended_at, iterations, last_output, last_error, and approval_pending (the ids
+        of tool calls waiting for the user's approval).
+      - companion_answer: the text the user was shown at the end of the turn just ended.
+      - round and rounds_left: how many continuations were granted and how many remain.
+
+      The executions are the orchestrator's own records and are the source of truth for what
+      ran. The companion_answer is the only evidence of what reached the user. Never take the
+      companion_answer's word that something ran: check it against the executions.
+
+      Score five signals, each from 0.0 to 1.0:
+      - delivered: the result reached the user. An execution that completed but whose result is
+        not in the companion_answer is NOT delivered. "Dispatching it now", "working on it" or an
+        answer that only promises a result scores low.
+      - evidence: the executions' outputs bear out what the companion_answer says.
+      - chain: every step the goal needs has run. A goal that asks to create an agent and then
+        run it needs both an agent-creation execution and an execution of the new agent, each
+        completed.
+      - feasibility: the goal can still be met with the tools of this mode. Score at most 0.2
+        only when it plainly cannot (the request is impossible, forbidden, or every route has
+        failed for a reason a further attempt cannot change). A failed or unfinished execution
+        alone is not infeasibility. A pending approval is not infeasibility: the user can answer it.
+      - alignment: the result is what was asked, not a different or partial task.
+
+      Then give the overall score (0.0 to 1.0) and your confidence (0.0 to 1.0). Score 0.85 or
+      above only when the goal is met and delivered. In reasoning, name what is missing in one
+      to four sentences, concretely enough that the companion can continue from it (for example
+      "Execution 4a9396f8 completed with the answer but it was never shown to the user"). When
+      nothing is missing, say so.
+
+      Return JSON only:
+      {
+        "score": 0.0-1.0,
+        "confidence": 0.0-1.0,
+        "reasoning": "1-4 sentences naming what is missing",
+        "signals": [
+          {"category": "delivered", "score": 0.0-1.0, "message": "short note"},
+          {"category": "evidence", "score": 0.0-1.0, "message": "short note"},
+          {"category": "chain", "score": 0.0-1.0, "message": "short note"},
+          {"category": "feasibility", "score": 0.0-1.0, "message": "short note"},
+          {"category": "alignment", "score": 0.0-1.0, "message": "short note"}
+        ]
+      }
+    prompt_template: |
+      {{instruction}}
+
+      Input to evaluate:
+      {{input}}
+
+      Judge:
+
+  execution:
+    mode: iterative
+    max_iterations: 3
+    llm_timeout_seconds: 300
+    validation:
+      - type: json_schema
+        schema:
+          type: object
+          required: [score, confidence, reasoning, signals]
+          properties:
+            score:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            confidence:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            reasoning:
+              type: string
+              minLength: 20
+            signals:
+              type: array
+              minItems: 5
+              maxItems: 5
+              items:
+                type: object
+                required: [category, score, message]
+                properties:
+                  category:
+                    type: string
+                  score:
+                    type: number
+                    minimum: 0.0
+                    maximum: 1.0
+                  message:
+                    type: string
+                    minLength: 5
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write: []
+    resources:
+      cpu: 1000
+      memory: 512Mi
+      disk: 1Gi
+      timeout: 300s
+
+  tools:
+    - aegis.task.status
+    - aegis.execution.file
+
+  input_schema:
+    type: object
+    properties:
+      goal:
+        type: string
+        description: The user's request, verbatim
+      executions:
+        type: array
+        description: Every execution bound to the goal, oldest first, from the orchestrator's records
+      companion_answer:
+        type: string
+        description: The text the user was shown in the turn just ended
+      round:
+        type: integer
+        description: The continuations granted so far
+      rounds_left:
+        type: integer
+        description: The continuations still allowed
+    required:
+      - goal
+      - executions

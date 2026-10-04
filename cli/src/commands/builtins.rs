@@ -37,6 +37,10 @@ pub const WORKFLOW_GENERATOR_JUDGE_NAME: &str = "workflow-generator-judge";
 pub const WORKFLOW_GENERATOR_JUDGE_TEMPLATE: &str =
     include_str!("../../templates/agents/workflow-generator-judge.yaml");
 
+/// The built-in judge of every goal (AEGIS ADR-131 D3).
+pub const GOAL_JUDGE_NAME: &str = "goal-judge";
+pub const GOAL_JUDGE_TEMPLATE: &str = include_str!("../../templates/agents/goal-judge.yaml");
+
 pub const WORKFLOW_CREATOR_AGENT_NAME: &str = "workflow-creator-validator-agent";
 pub const WORKFLOW_CREATOR_AGENT_TEMPLATE: &str =
     include_str!("../../templates/agents/workflow-creator-validator-agent.yaml");
@@ -94,6 +98,7 @@ pub const BUILTIN_AGENTS: &[(&str, &str)] = &[
         WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
     ),
     (WORKFLOW_CREATOR_AGENT_NAME, WORKFLOW_CREATOR_AGENT_TEMPLATE),
+    (GOAL_JUDGE_NAME, GOAL_JUDGE_TEMPLATE),
     ("skill-validator", SKILL_VALIDATOR_AGENT_TEMPLATE),
     (
         AEGIS_OUTPUT_FORMATTER_AGENT_NAME,
@@ -171,6 +176,11 @@ const BUILTIN_TEMPLATES: &[BuiltinTemplateSpec] = &[
         category: "agents",
         file_name: "workflow-creator-validator-agent.yaml",
         content: WORKFLOW_CREATOR_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "goal-judge.yaml",
+        content: GOAL_JUDGE_TEMPLATE,
     },
     BuiltinTemplateSpec {
         category: "agents",
@@ -605,6 +615,53 @@ mod tests {
         assert!(states.contains_key(serde_yaml::Value::from("PLAN")));
         assert!(states.contains_key(serde_yaml::Value::from("GENERATE_MISSING_AGENTS")));
         assert!(states.contains_key(serde_yaml::Value::from("GENERATE_AND_REGISTER_WORKFLOW")));
+    }
+
+    /// AEGIS ADR-131 D3: `goal-judge` is a built-in judge on the alias
+    /// `judge`, its model call and its execution both bounded at 300 s, so it
+    /// keeps manifest-spec-v1's `llm_timeout_seconds ≤ resources.timeout`
+    /// without joining the known exceptions.
+    #[test]
+    fn goal_judge_is_a_builtin_judge_on_the_alias_judge_bounded_at_300_s() {
+        let (_, yaml) = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == GOAL_JUDGE_NAME)
+            .expect("goal-judge is a built-in agent");
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(doc["metadata"]["name"].as_str(), Some("goal-judge"));
+        assert_eq!(doc["metadata"]["labels"]["role"].as_str(), Some("judge"));
+        assert_eq!(doc["metadata"]["labels"]["builtin"].as_str(), Some("true"));
+        assert_eq!(doc["spec"]["runtime"]["model"].as_str(), Some("judge"));
+        assert_eq!(
+            doc["spec"]["execution"]["llm_timeout_seconds"].as_u64(),
+            Some(300)
+        );
+        assert_eq!(
+            doc["spec"]["security"]["resources"]["timeout"].as_str(),
+            Some("300s")
+        );
+        assert_eq!(
+            doc["spec"]["security"]["network"]["mode"].as_str(),
+            Some("none")
+        );
+        let tools: Vec<&str> = doc["spec"]["tools"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert_eq!(tools, ["aegis.task.status", "aegis.execution.file"]);
+        assert!(
+            !KNOWN_LLM_TIMEOUT_ABOVE_EXECUTION_TIMEOUT.contains(&GOAL_JUDGE_NAME),
+            "goal-judge obeys the rule; it is no known exception"
+        );
+        let required: Vec<&str> = doc["spec"]["input_schema"]["required"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert_eq!(required, ["goal", "executions"]);
     }
 
     #[test]
