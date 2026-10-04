@@ -3,7 +3,8 @@
 //! SEAL session attested under an escalation (as `/v1/seal/attest` binds
 //! it), a real `OperatorEscalationService` over the in-memory store, and an
 //! execution service and store holding one execution in the operator's home
-//! tenant and one in another tenant.
+//! tenant and one in another tenant. The operator's federated record is a
+//! stub [`OperatorRoleLookup`] (ADR-129 — Updates, V9).
 
 use super::*;
 use crate::application::operator_escalation_service::{OperatorEscalationService, RedeemingKey};
@@ -13,7 +14,10 @@ use crate::domain::events::{ExecutionEvent, TenantEvent};
 use crate::domain::execution::{Execution, ExecutionId, ExecutionInput, Iteration};
 use crate::domain::iam::AegisRole;
 use crate::domain::node_config::OperatorEscalationConfig;
-use crate::domain::operator_escalation::{audit_action, EscalationEndReason, OperatorEscalation};
+use crate::domain::operator_escalation::{
+    audit_action, EscalationEndReason, OperatorEscalation, OperatorEscalationRepository,
+    OperatorRecord, OperatorRoleLookup, RoleLookupError,
+};
 use crate::domain::repository::{AgentVersion, ExecutionRepository, WorkflowExecutionRepository};
 use crate::domain::seal_session::{SealOperatorEscalation, SealSession};
 use crate::domain::secrets::SensitiveString;
@@ -33,6 +37,7 @@ use futures::Stream;
 use serde_json::json;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 
 const CONSUMER_SUB: &str = "8d4e0000-operator";
@@ -311,8 +316,53 @@ fn dispatchers_gating(tool: &str) -> Vec<crate::domain::node_config::BuiltinDisp
         .collect()
 }
 
+/// The operator's federated record in the system realm, as a stub answer
+/// (ADR-129 — Updates, V9: "the trigger's tests need a stub").
+struct StubRoleLookup {
+    answer: StdMutex<Result<OperatorRecord, RoleLookupError>>,
+    calls: AtomicUsize,
+}
+
+impl StubRoleLookup {
+    fn new() -> Self {
+        Self {
+            answer: StdMutex::new(Ok(OperatorRecord::Found {
+                aegis_role: Some("aegis:operator".to_string()),
+            })),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn answer(&self, answer: Result<OperatorRecord, RoleLookupError>) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    fn holds(&self, role: &AegisRole) {
+        self.answer(Ok(OperatorRecord::Found {
+            aegis_role: Some(role.as_claim_str().to_string()),
+        }));
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl OperatorRoleLookup for StubRoleLookup {
+    async fn lookup(&self, system_sub: &str) -> Result<OperatorRecord, RoleLookupError> {
+        assert_eq!(
+            system_sub, SYSTEM_SUB,
+            "the lookup reads the escalation's system sub"
+        );
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.answer.lock().unwrap().clone()
+    }
+}
+
 struct Harness {
     service: ToolInvocationService,
+    role_lookup: Option<Arc<StubRoleLookup>>,
     sessions: Arc<InMemorySealSessionRepository>,
     escalations: Arc<OperatorEscalationService>,
     escalation_repo: Arc<InMemoryOperatorEscalationRepository>,
@@ -324,6 +374,11 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(Some(Arc::new(StubRoleLookup::new()))).await
+}
+
+/// `role_lookup: None` is a node with no Keycloak admin client (V5).
+async fn harness_with(role_lookup: Option<Arc<StubRoleLookup>>) -> Harness {
     let home_exec = execution_in(&home());
     let other_exec = execution_in(&other());
     let other_execution = other_exec.id;
@@ -380,13 +435,15 @@ async fn harness() -> Harness {
     let now = Arc::new(StdMutex::new(chrono::Utc::now()));
     let clock = now.clone();
     let escalation_repo = Arc::new(InMemoryOperatorEscalationRepository::new());
-    let escalations = Arc::new(
-        OperatorEscalationService::new(
-            escalation_repo.clone(),
-            OperatorEscalationConfig::default(),
-        )
-        .with_clock(move || *clock.lock().unwrap()),
-    );
+    let mut escalations = OperatorEscalationService::new(
+        escalation_repo.clone(),
+        OperatorEscalationConfig::default(),
+    )
+    .with_clock(move || *clock.lock().unwrap());
+    if let Some(lookup) = &role_lookup {
+        escalations = escalations.with_role_lookup(lookup.clone());
+    }
+    let escalations = Arc::new(escalations);
     let event_bus = Arc::new(EventBus::new(1024));
     let approvals_repo = Arc::new(InMemoryToolApprovalRepository::new());
     let sessions = Arc::new(InMemorySealSessionRepository::new());
@@ -417,6 +474,7 @@ async fn harness() -> Harness {
     .with_execution_repository(store);
     Harness {
         service,
+        role_lookup,
         sessions,
         escalations,
         escalation_repo,
@@ -429,8 +487,12 @@ async fn harness() -> Harness {
 }
 
 impl Harness {
-    /// Mint and redeem a code for a new key, as the operator with `role`.
+    /// Mint and redeem a code for a new key, as the operator with `role`,
+    /// whose federated record holds that role.
     async fn escalate(&self, role: AegisRole) -> OperatorEscalation {
+        if let Some(lookup) = &self.role_lookup {
+            lookup.holds(&role);
+        }
         let minted = self
             .escalations
             .mint(SYSTEM_SUB, CONSUMER_SUB, role)
@@ -752,4 +814,168 @@ async fn unbound_session_is_unaffected_by_the_check() {
     // A session bound to no escalation is not checked against one.
     assert!(h.call(&plain, "aegis.task.list", json!({})).await.is_ok());
     assert!(h.escalation_repo.audit_entries().await.is_empty());
+}
+
+// ── ADR-129 — Updates, V1, V5, V6: a demotion ends an escalation ────────
+
+fn lookup(h: &Harness) -> &StubRoleLookup {
+    h.role_lookup.as_deref().expect("a node with a role lookup")
+}
+
+/// The `ended` rows written, as (escalation id, end_reason, role_found,
+/// whether `checked_at` is present).
+async fn ended_rows(h: &Harness) -> Vec<(String, Value, Value, bool)> {
+    h.escalation_repo
+        .audit_entries()
+        .await
+        .into_iter()
+        .filter(|a| a.action == audit_action::ENDED)
+        .map(|a| {
+            let state = a.after_state.unwrap();
+            (
+                state["escalation_id"].as_str().unwrap().to_string(),
+                state["end_reason"].clone(),
+                state["role_found"].clone(),
+                state.get("checked_at").is_some_and(|v| v.is_string()),
+            )
+        })
+        .collect()
+}
+
+/// V1: when the record answers absent, disabled, no role, or a role other
+/// than the escalation's, the escalated call is refused
+/// `operator_escalation_expired` and every active escalation of that
+/// `system_sub` is ended `operator_demoted`; V6: each `ended` row carries
+/// `role_found` and `checked_at`.
+#[tokio::test]
+async fn demoted_operator_call_refused_and_every_escalation_ended() {
+    let cases = [
+        (Ok(OperatorRecord::Absent), json!("user_absent")),
+        (Ok(OperatorRecord::Disabled), json!("user_disabled")),
+        (Ok(OperatorRecord::Found { aegis_role: None }), Value::Null),
+        (
+            Ok(OperatorRecord::Found {
+                aegis_role: Some("aegis:admin".to_string()),
+            }),
+            json!("aegis:admin"),
+        ),
+    ];
+    for (answer, role_found) in cases {
+        let h = harness().await;
+        let first = h.escalate(AegisRole::Operator).await;
+        let second = h.escalate(AegisRole::Operator).await;
+        let first_token = h.escalated_session(&first).await;
+        let second_token = h.escalated_session(&second).await;
+        assert!(h
+            .call(&first_token, "aegis.task.list", json!({}))
+            .await
+            .is_ok());
+
+        lookup(&h).answer(answer.clone());
+        let refused = h.call(&first_token, "aegis.task.list", json!({})).await;
+        assert_eq!(
+            refused,
+            Err(SealSessionError::OperatorEscalationExpired),
+            "{answer:?}"
+        );
+        for e in [&first, &second] {
+            let row = h
+                .escalation_repo
+                .find_escalation(e.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.end_reason,
+                Some(EscalationEndReason::OperatorDemoted),
+                "{answer:?}"
+            );
+        }
+        let mut ended = ended_rows(&h).await;
+        ended.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = vec![
+            (
+                first.id.to_string(),
+                json!("operator_demoted"),
+                role_found.clone(),
+                true,
+            ),
+            (
+                second.id.to_string(),
+                json!("operator_demoted"),
+                role_found.clone(),
+                true,
+            ),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(ended, expected, "{answer:?}");
+        // The other escalation's session is refused too.
+        assert_eq!(
+            h.call(&second_token, "aegis.task.list", json!({})).await,
+            Err(SealSessionError::OperatorEscalationExpired),
+            "{answer:?}"
+        );
+    }
+}
+
+/// V1: the record is read on every escalated call, and a record holding the
+/// escalation's role answers the call and ends nothing.
+#[tokio::test]
+async fn escalated_call_answered_while_the_record_grants_its_role() {
+    let h = harness().await;
+    let e = h.escalate(AegisRole::Admin).await;
+    let token = h.escalated_session(&e).await;
+    let before = lookup(&h).calls();
+    for _ in 0..3 {
+        assert!(h.call(&token, "aegis.task.list", json!({})).await.is_ok());
+    }
+    assert_eq!(
+        lookup(&h).calls() - before,
+        3,
+        "one read per escalated call"
+    );
+    assert!(h.escalations.check_active(e.id).await.is_ok());
+    assert!(ended_rows(&h).await.is_empty());
+}
+
+/// V5: a lookup that fails refuses the call as the existing check's failure
+/// does, leaves the escalation active and writes no `ended` row.
+#[tokio::test]
+async fn lookup_error_refuses_the_call_and_leaves_the_escalation_active() {
+    let h = harness().await;
+    let e = h.escalate(AegisRole::Operator).await;
+    let token = h.escalated_session(&e).await;
+    lookup(&h).answer(Err(RoleLookupError(
+        "realm operation failed: 503 unavailable".to_string(),
+    )));
+    let refused = h.call(&token, "aegis.task.list", json!({})).await;
+    assert_eq!(
+        refused,
+        Err(SealSessionError::InternalError(
+            "operator escalation check failed: realm operation failed: 503 unavailable".to_string()
+        ))
+    );
+    assert!(h.escalations.check_active(e.id).await.is_ok());
+    assert!(ended_rows(&h).await.is_empty());
+    // When Keycloak answers again, the escalation grants again.
+    lookup(&h).holds(&AegisRole::Operator);
+    assert!(h.call(&token, "aegis.task.list", json!({})).await.is_ok());
+}
+
+/// V5: a node with no `spec.iam.keycloak_admin` cannot make the check and
+/// refuses every escalated call; an unescalated session is unaffected.
+#[tokio::test]
+async fn node_without_keycloak_admin_refuses_every_escalated_call() {
+    let h = harness_with(None).await;
+    let e = h.escalate(AegisRole::Operator).await;
+    let token = h.escalated_session(&e).await;
+    let refused = h.call(&token, "aegis.task.list", json!({})).await;
+    assert!(
+        matches!(&refused, Err(SealSessionError::InternalError(m)) if m.starts_with("operator escalation check failed: ") && m.contains("spec.iam.keycloak_admin")),
+        "{refused:?}"
+    );
+    assert!(h.escalations.check_active(e.id).await.is_ok());
+    assert!(ended_rows(&h).await.is_empty());
+    let plain = h.plain_session().await;
+    assert!(h.call(&plain, "aegis.task.list", json!({})).await.is_ok());
 }

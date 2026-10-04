@@ -8,6 +8,11 @@
 //! the Update's U5 and U6), and writes every act to `admin_audit_log` (D18).
 //! The routes that call it are `cli/src/daemon/handlers/operator_escalations.rs`;
 //! the dispatch-time check is `ToolInvocationService::invoke_tool`.
+//!
+//! A demotion ends an escalation (ADR-129 — Updates, V1 to V9): through the
+//! [`OperatorRoleLookup`] port the service re-reads the operator's federated
+//! record in the system realm at dispatch, and ends every active escalation
+//! of a person whose record no longer grants the escalation's role.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +25,8 @@ use crate::domain::iam::AegisRole;
 use crate::domain::node_config::OperatorEscalationConfig;
 use crate::domain::operator_escalation::{
     audit_action, generate_code, hash_code, is_code_shaped, AdminAuditEntry, EscalationEndReason,
-    OperatorEscalation, OperatorEscalationCode, OperatorEscalationRepository,
+    OperatorEscalation, OperatorEscalationCode, OperatorEscalationRepository, OperatorRecord,
+    OperatorRoleLookup,
 };
 use crate::domain::repository::RepositoryError;
 
@@ -46,6 +52,18 @@ pub enum OperatorEscalationError {
     /// The escalation a SEAL session was attested under has ended (D19).
     #[error("operator_escalation_expired")]
     Expired,
+    /// The node cannot re-read an operator's role: it has no Keycloak admin
+    /// client (`spec.iam.keycloak_admin` absent, or a value that did not
+    /// resolve). Every escalated call is refused (ADR-129 — Updates, V5).
+    #[error(
+        "the operator role check is unavailable: this node has no Keycloak admin client \
+         (spec.iam.keycloak_admin)"
+    )]
+    RoleCheckUnavailable,
+    /// The role lookup could not read the record (V5). The call is refused
+    /// and the escalation is left active: an outage is not a demotion.
+    #[error("{0}")]
+    RoleLookupFailed(String),
     #[error("repository: {0}")]
     Repository(String),
 }
@@ -82,6 +100,10 @@ pub struct OperatorEscalationService {
     repo: Arc<dyn OperatorEscalationRepository>,
     config: OperatorEscalationConfig,
     clock: Clock,
+    /// The operator's federated record, re-read at dispatch (V1). `None` on
+    /// a node without a Keycloak admin client, which refuses every
+    /// escalated call and every redemption (V5).
+    role_lookup: Option<Arc<dyn OperatorRoleLookup>>,
 }
 
 impl OperatorEscalationService {
@@ -93,7 +115,21 @@ impl OperatorEscalationService {
             repo,
             config,
             clock: Arc::new(Utc::now),
+            role_lookup: None,
         }
+    }
+
+    /// Attach the role lookup the daemon builds from the Keycloak admin
+    /// client (ADR-129 — Updates, V9).
+    pub fn with_role_lookup(mut self, lookup: Arc<dyn OperatorRoleLookup>) -> Self {
+        self.role_lookup = Some(lookup);
+        self
+    }
+
+    /// Whether this node can re-read an operator's role (V5). Without it the
+    /// redemption route answers 503 and every escalated call is refused.
+    pub fn can_check_roles(&self) -> bool {
+        self.role_lookup.is_some()
     }
 
     /// Replace the clock (tests move time past a bound without sleeping).
@@ -299,6 +335,72 @@ impl OperatorEscalationService {
         }
     }
 
+    /// The dispatch-time role check (ADR-129 — Updates, V1, V5, V6), made
+    /// after [`Self::check_active`] finds the escalation active.
+    ///
+    /// - A node with no lookup cannot make the check: refused, nothing ended
+    ///   (V5).
+    /// - A lookup that fails: refused, the escalation left active, a warning
+    ///   logged naming the escalation and the error, no audit row (V5, V6).
+    /// - A record that is absent, disabled, or holds no role or another role:
+    ///   every active escalation of that `system_sub` is ended
+    ///   `operator_demoted`, and the call is refused
+    ///   [`OperatorEscalationError::Expired`] (V1).
+    pub async fn confirm_role(
+        &self,
+        escalation: &OperatorEscalation,
+    ) -> Result<(), OperatorEscalationError> {
+        let Some(lookup) = &self.role_lookup else {
+            return Err(OperatorEscalationError::RoleCheckUnavailable);
+        };
+        let record = match lookup.lookup(&escalation.system_sub).await {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::warn!(
+                    escalation_id = %escalation.id,
+                    error = %e,
+                    "Operator role lookup failed; the escalated call is refused and the escalation left active"
+                );
+                return Err(OperatorEscalationError::RoleLookupFailed(e.0));
+            }
+        };
+        if record.grants(&escalation.aegis_role) {
+            return Ok(());
+        }
+        self.end_demoted(&escalation.system_sub, &record).await?;
+        Err(OperatorEscalationError::Expired)
+    }
+
+    /// End every active escalation of `system_sub` because its record no
+    /// longer grants the role (V1, V2), each `ended` row carrying what was
+    /// found and when it was read (V6).
+    async fn end_demoted(
+        &self,
+        system_sub: &str,
+        record: &OperatorRecord,
+    ) -> Result<Vec<OperatorEscalation>, OperatorEscalationError> {
+        let checked_at = self.now();
+        let ended = self
+            .repo
+            .end_active_for_system_sub(system_sub, checked_at, EscalationEndReason::OperatorDemoted)
+            .await?;
+        for e in &ended {
+            self.audit_ended_with(
+                e,
+                json!({ "role_found": record.role_found(), "checked_at": checked_at }),
+            )
+            .await?;
+        }
+        if !ended.is_empty() {
+            tracing::info!(
+                ended = ended.len(),
+                role_found = %record.role_found(),
+                "Ended the operator escalations of a demoted operator"
+            );
+        }
+        Ok(ended)
+    }
+
     /// The operator's own active escalations (the Update's U5).
     pub async fn list_active_for_operator(
         &self,
@@ -372,15 +474,28 @@ impl OperatorEscalationService {
     }
 
     async fn audit_ended(&self, e: &OperatorEscalation) -> Result<(), OperatorEscalationError> {
+        self.audit_ended_with(e, json!({})).await
+    }
+
+    /// The `ended` row, with `extra`'s fields added to its `after_state`.
+    async fn audit_ended_with(
+        &self,
+        e: &OperatorEscalation,
+        extra: serde_json::Value,
+    ) -> Result<(), OperatorEscalationError> {
+        let mut state = json!({
+            "escalation_id": e.id,
+            "end_reason": e.end_reason.map(|r| r.as_str()),
+            "ended_at": e.ended_at,
+        });
+        if let (Some(state), serde_json::Value::Object(extra)) = (state.as_object_mut(), extra) {
+            state.extend(extra);
+        }
         self.audit(
             &e.system_sub,
             audit_action::ENDED,
             &e.api_key_id.to_string(),
-            json!({
-                "escalation_id": e.id,
-                "end_reason": e.end_reason.map(|r| r.as_str()),
-                "ended_at": e.ended_at,
-            }),
+            state,
         )
         .await
     }

@@ -20,6 +20,10 @@
 //! take an `aegis_*` key only; any other bearer is
 //! `escalation_requires_api_key` (D11).
 //!
+//! A node that cannot re-read an operator's role (no Keycloak admin client,
+//! ADR-129 — Updates, V5) answers every redemption 503 `unavailable`, as a
+//! node without the service does.
+//!
 //! Errors carry `{"error": <code>, "message": <text>}`; the codes are the
 //! ones Zaru ADR-0050 D3 relays: `invalid_code`, `code_expired`,
 //! `escalation_requires_api_key`.
@@ -388,6 +392,13 @@ async fn redeem_handler(
         Ok(s) => s,
         Err(r) => return *r,
     };
+    if !service.can_check_roles() {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "this node cannot check an operator's role (no Keycloak admin client)",
+        );
+    }
     let code = body
         .as_ref()
         .and_then(|b| b.0.get("code"))
@@ -459,7 +470,9 @@ mod tests {
         consumer, identity_provider_with_claims, operator, send, serve,
     };
     use aegis_orchestrator_core::domain::node_config::OperatorEscalationConfig;
-    use aegis_orchestrator_core::domain::operator_escalation::audit_action;
+    use aegis_orchestrator_core::domain::operator_escalation::{
+        audit_action, OperatorRecord, OperatorRoleLookup, RoleLookupError,
+    };
     use aegis_orchestrator_core::domain::tenant::TenantId;
     use aegis_orchestrator_core::infrastructure::repositories::postgres_operator_escalation::InMemoryOperatorEscalationRepository;
     use reqwest::Method;
@@ -479,6 +492,19 @@ mod tests {
     const OTHER_KEY: &str = "aegis_other-user-key";
     const ROLE_KEY: &str = "aegis_role-bearing-key";
 
+    /// The operator's federated record holds `aegis:operator` (ADR-129 —
+    /// Updates, V9's stub).
+    struct HoldsOperator;
+
+    #[async_trait::async_trait]
+    impl OperatorRoleLookup for HoldsOperator {
+        async fn lookup(&self, _: &str) -> Result<OperatorRecord, RoleLookupError> {
+            Ok(OperatorRecord::Found {
+                aegis_role: Some("aegis:operator".to_string()),
+            })
+        }
+    }
+
     struct Harness {
         base: String,
         repo: Arc<InMemoryOperatorEscalationRepository>,
@@ -493,11 +519,18 @@ mod tests {
     }
 
     async fn harness() -> Harness {
+        harness_with(true).await
+    }
+
+    /// `role_lookup: false` is a node with no Keycloak admin client (V5).
+    async fn harness_with(role_lookup: bool) -> Harness {
         let repo = Arc::new(InMemoryOperatorEscalationRepository::new());
-        let service = Arc::new(OperatorEscalationService::new(
-            repo.clone(),
-            OperatorEscalationConfig::default(),
-        ));
+        let mut service =
+            OperatorEscalationService::new(repo.clone(), OperatorEscalationConfig::default());
+        if role_lookup {
+            service = service.with_role_lookup(Arc::new(HoldsOperator));
+        }
+        let service = Arc::new(service);
         let operator_key = key_row(OPERATOR_KEY, CONSUMER_SUB, &tenant_of(CONSUMER_SUB), None);
         let operator_key_id = operator_key.id;
         let table = KeyTable {
@@ -839,5 +872,28 @@ mod tests {
         )
         .await;
         assert_eq!(status, 404, "nothing left to release");
+    }
+
+    /// ADR-129 — Updates, V5: a node with no `spec.iam.keycloak_admin`
+    /// answers a redemption 503 `unavailable`, and the code is neither
+    /// consumed nor counted as a failure.
+    #[tokio::test]
+    async fn redemption_503_on_a_node_without_keycloak_admin() {
+        let h = harness_with(false).await;
+        let code = minted_code(&h).await;
+        let (status, body) = redeem(&h, OPERATOR_KEY, &code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (503, Some("unavailable")),
+            "{body}"
+        );
+        let actions: Vec<String> = h
+            .repo
+            .audit_entries()
+            .await
+            .into_iter()
+            .map(|a| a.action)
+            .collect();
+        assert_eq!(actions, vec![audit_action::CODE_ISSUED.to_string()]);
     }
 }

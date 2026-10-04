@@ -7,5 +7,6 @@
 
 pub mod keycloak_admin_client;
 pub mod keycloak_iam_service;
+pub mod keycloak_operator_role_lookup;
 
 pub use keycloak_iam_service::StandardIamService;

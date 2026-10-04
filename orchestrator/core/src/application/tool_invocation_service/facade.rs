@@ -442,6 +442,13 @@ impl ToolInvocationService {
     /// The active operator escalation `session` was attested under, if any
     /// (AEGIS ADR-129 D19). A session bound to an escalation that has ended,
     /// or on a node without the escalation service, is refused.
+    ///
+    /// Once the escalation is found active, the operator's federated record
+    /// is re-read on every escalated call (ADR-129 — Updates, V1): a record
+    /// that no longer grants the escalation's role ends every active
+    /// escalation of that person (`operator_demoted`) and refuses the call
+    /// `operator_escalation_expired`; a record that cannot be read, or a
+    /// node that cannot read it, refuses the call and ends nothing (V5).
     async fn active_session_escalation(
         &self,
         session: &crate::domain::seal_session::SealSession,
@@ -455,7 +462,11 @@ impl ToolInvocationService {
             .operator_escalations
             .as_ref()
             .ok_or(SealSessionError::OperatorEscalationExpired)?;
-        match service.check_active(binding.escalation_id).await {
+        let checked = match service.check_active(binding.escalation_id).await {
+            Ok(escalation) => service.confirm_role(&escalation).await.map(|()| escalation),
+            Err(e) => Err(e),
+        };
+        match checked {
             Ok(escalation) => Ok(Some(escalation)),
             Err(OperatorEscalationError::Expired) => {
                 Err(SealSessionError::OperatorEscalationExpired)

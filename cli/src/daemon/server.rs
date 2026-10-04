@@ -1921,6 +1921,51 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tool_invocation_service_builder =
         tool_invocation_service_builder.with_tool_approvals(tool_approval_service);
 
+    // Keycloak Admin client — shared between TenantProvisioningService, the
+    // colony handlers and the operator escalation's role lookup. Built before
+    // the escalation service, which re-reads an escalated operator's role
+    // through it (AEGIS ADR-129 — Updates, V9).
+    let colony_keycloak_admin: Option<Arc<aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient>> = config
+        .spec
+        .iam
+        .as_ref()
+        .and_then(|iam| iam.keycloak_admin.as_ref())
+        .and_then(|admin_cfg| {
+            let host = match resolve_env_value(admin_cfg.host.expose()) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("Keycloak admin host not resolvable: {e} — admin client disabled");
+                    return None;
+                }
+            };
+            let username = match resolve_env_value(&admin_cfg.admin_username) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!("Keycloak admin username not resolvable: {e} — admin client disabled");
+                    return None;
+                }
+            };
+            let password = match resolve_env_value(admin_cfg.admin_password.expose()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Keycloak admin password not resolvable: {e} — admin client disabled");
+                    return None;
+                }
+            };
+            Some(Arc::new(
+                aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient::new(
+                    aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminConfig {
+                        host,
+                        admin_username: username,
+                        // Audit 002 §4.37.10 — wrap at the construction
+                        // boundary so the admin password is redacted in
+                        // any subsequent Debug output.
+                        admin_password: aegis_orchestrator_core::domain::secrets::SensitiveString::new(password),
+                    },
+                ),
+            ))
+        });
+
     // ─── Operator escalation (AEGIS ADR-129) ────────────────────────────────
     // Codes and escalations live in PostgreSQL (migration 037) and every act
     // is appended to admin_audit_log; a node without a database keeps them in
@@ -1936,7 +1981,38 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             aegis_orchestrator_core::infrastructure::repositories::postgres_operator_escalation::InMemoryOperatorEscalationRepository::new(),
         ),
     };
-    let operator_escalations = Arc::new(
+    // A demotion ends an escalation (ADR-129 — Updates, V1 to V9): the
+    // service re-reads an escalated operator's federated record in the
+    // system realm through the Keycloak admin client. A node without that
+    // client, or without a realm of kind `system`, cannot make the check: it
+    // refuses every redemption 503 and every escalated call (V5).
+    let operator_role_lookup: Option<
+        Arc<dyn aegis_orchestrator_core::domain::operator_escalation::OperatorRoleLookup>,
+    > = {
+        let system_realm = config.spec.iam.as_ref().and_then(|iam| {
+            iam.realms
+                .iter()
+                .find(|realm| realm.kind == "system")
+                .map(|realm| realm.slug.clone())
+        });
+        match (colony_keycloak_admin.clone(), system_realm) {
+            (Some(admin), Some(realm)) => {
+                info!(realm = %realm, "Operator escalation role lookup enabled");
+                Some(Arc::new(
+                    aegis_orchestrator_core::infrastructure::iam::keycloak_operator_role_lookup::KeycloakOperatorRoleLookup::new(admin, realm),
+                ))
+            }
+            (admin, realm) => {
+                warn!(
+                    keycloak_admin = admin.is_some(),
+                    system_realm = realm.is_some(),
+                    "Operator escalation role lookup disabled (requires spec.iam.keycloak_admin and a realm of kind system): every redemption answers 503 and every escalated call is refused"
+                );
+                None
+            }
+        }
+    };
+    let mut operator_escalation_service =
         aegis_orchestrator_core::application::operator_escalation_service::OperatorEscalationService::new(
             operator_escalation_repo,
             config
@@ -1945,8 +2021,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .as_ref()
                 .map(|iam| iam.operator_escalation.clone())
                 .unwrap_or_default(),
-        ),
-    );
+        );
+    if let Some(lookup) = operator_role_lookup {
+        operator_escalation_service = operator_escalation_service.with_role_lookup(lookup);
+    }
+    let operator_escalations = Arc::new(operator_escalation_service);
     operator_escalations.clone().spawn_expiry_sweep(
         aegis_orchestrator_core::application::operator_escalation_service::EXPIRY_SWEEP_INTERVAL,
     );
@@ -2040,48 +2119,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Arc::new(
                 aegis_orchestrator_core::infrastructure::repositories::postgres_tenant::PostgresTenantRepository::new(pool.clone()),
             ) as Arc<dyn aegis_orchestrator_core::domain::repository::TenantRepository>
-        });
-
-    // Keycloak Admin client — shared between TenantProvisioningService and colony handlers.
-    let colony_keycloak_admin: Option<Arc<aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient>> = config
-        .spec
-        .iam
-        .as_ref()
-        .and_then(|iam| iam.keycloak_admin.as_ref())
-        .and_then(|admin_cfg| {
-            let host = match resolve_env_value(admin_cfg.host.expose()) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!("Keycloak admin host not resolvable: {e} — admin client disabled");
-                    return None;
-                }
-            };
-            let username = match resolve_env_value(&admin_cfg.admin_username) {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!("Keycloak admin username not resolvable: {e} — admin client disabled");
-                    return None;
-                }
-            };
-            let password = match resolve_env_value(admin_cfg.admin_password.expose()) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Keycloak admin password not resolvable: {e} — admin client disabled");
-                    return None;
-                }
-            };
-            Some(Arc::new(
-                aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient::new(
-                    aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminConfig {
-                        host,
-                        admin_username: username,
-                        // Audit 002 §4.37.10 — wrap at the construction
-                        // boundary so the admin password is redacted in
-                        // any subsequent Debug output.
-                        admin_password: aegis_orchestrator_core::domain::secrets::SensitiveString::new(password),
-                    },
-                ),
-            ))
         });
 
     // Tenant Provisioning Service (ADR-097) is constructed AFTER the

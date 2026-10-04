@@ -162,6 +162,68 @@ pub struct AdminAuditEntry {
     pub after_state: Option<Value>,
 }
 
+/// The attribute of an operator's federated record in the system realm that
+/// holds their role: `make operator-promote` sets it, `make operator-demote`
+/// clears it, and the step-up token's role claim is mapped from it (ADR-073
+/// "Operator promotion lifecycle"; ADR-129 — Updates, V1).
+pub const AEGIS_ROLE_ATTRIBUTE: &str = "aegis_role";
+
+/// What the operator's federated record in the system realm holds, read by
+/// its `sub` (ADR-129 — Updates, V1 and V9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorRecord {
+    /// The record exists and is not disabled; `aegis_role` is the
+    /// attribute's value, `None` when the attribute is absent.
+    Found { aegis_role: Option<String> },
+    /// The realm has no such user.
+    Absent,
+    /// The record exists and its `enabled` is `false`.
+    Disabled,
+}
+
+impl OperatorRecord {
+    /// Whether the record still grants `role`: it exists, is not disabled,
+    /// and its attribute parses to exactly that role (V1). A role changed
+    /// rather than cleared does not grant the old one.
+    pub fn grants(&self, role: &AegisRole) -> bool {
+        match self {
+            Self::Found {
+                aegis_role: Some(value),
+            } => AegisRole::from_claim(value).as_ref() == Some(role),
+            _ => false,
+        }
+    }
+
+    /// The `role_found` an `ended` row carries (V6): the attribute's value,
+    /// `null` when absent, `"user_absent"` on 404, `"user_disabled"` when
+    /// `enabled` is `false`.
+    pub fn role_found(&self) -> Value {
+        match self {
+            Self::Found { aegis_role } => aegis_role
+                .as_ref()
+                .map_or(Value::Null, |v| Value::String(v.clone())),
+            Self::Absent => Value::String("user_absent".to_string()),
+            Self::Disabled => Value::String("user_disabled".to_string()),
+        }
+    }
+}
+
+/// A role lookup that could not read the record (V5): no connection, the
+/// admin client's bound, the admin token refused, or any status other than
+/// success and 404. An outage is not a demotion.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct RoleLookupError(pub String);
+
+/// The role-lookup port (ADR-129 — Updates, V9): for an escalation's
+/// `system_sub`, what the operator's federated record holds now. Implemented
+/// over the Keycloak admin client in
+/// `infrastructure::iam::keycloak_operator_role_lookup`.
+#[async_trait]
+pub trait OperatorRoleLookup: Send + Sync {
+    async fn lookup(&self, system_sub: &str) -> Result<OperatorRecord, RoleLookupError>;
+}
+
 /// Durable store of codes and escalations, and the append-only audit log.
 #[async_trait]
 pub trait OperatorEscalationRepository: Send + Sync {
@@ -280,6 +342,37 @@ mod tests {
         assert_eq!(
             h,
             "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92"
+        );
+    }
+
+    /// ADR-129 — Updates, V1: only the escalation's own role, on an enabled
+    /// record, grants; V6: what `role_found` records for each answer.
+    #[test]
+    fn operator_record_grants_only_its_own_role_and_names_what_it_found() {
+        let found = |v: Option<&str>| OperatorRecord::Found {
+            aegis_role: v.map(str::to_string),
+        };
+        assert!(found(Some("aegis:operator")).grants(&AegisRole::Operator));
+        assert!(found(Some("aegis:admin")).grants(&AegisRole::Admin));
+        assert!(!found(Some("aegis:operator")).grants(&AegisRole::Admin));
+        assert!(!found(Some("aegis:admin")).grants(&AegisRole::Operator));
+        assert!(!found(Some("operator")).grants(&AegisRole::Operator));
+        assert!(!found(None).grants(&AegisRole::Operator));
+        assert!(!OperatorRecord::Absent.grants(&AegisRole::Operator));
+        assert!(!OperatorRecord::Disabled.grants(&AegisRole::Operator));
+
+        assert_eq!(
+            found(Some("aegis:operator")).role_found(),
+            Value::String("aegis:operator".into())
+        );
+        assert_eq!(found(None).role_found(), Value::Null);
+        assert_eq!(
+            OperatorRecord::Absent.role_found(),
+            Value::String("user_absent".into())
+        );
+        assert_eq!(
+            OperatorRecord::Disabled.role_found(),
+            Value::String("user_disabled".into())
         );
     }
 
