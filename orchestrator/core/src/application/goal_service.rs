@@ -745,6 +745,10 @@ impl GoalService {
                         .unwrap_or(Value::Null),
                     "continue": e.r#continue,
                     "waiting_on": e.waiting_on,
+                    // When this attempt's goal-judge execution was started,
+                    // and when its outcome was stored (null while judging).
+                    "judge_started_at": e.created_at,
+                    "decided_at": e.decided_at,
                 }))
             })
             .collect();
@@ -1408,6 +1412,24 @@ mod tests {
                 "closed met"
             ]
         );
+    }
+
+    /// AEGIS operations/known-defects-7: aegis.goal.status verdicts carried
+    /// no time, so the time to a verdict was measurable only to the polling
+    /// interval. Each verdict carries the two stored times: when its
+    /// goal-judge execution was started and when its outcome was stored.
+    #[tokio::test]
+    async fn status_lists_each_verdicts_judge_start_and_decision_times() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let judged_at = Utc::now() + chrono::Duration::seconds(42);
+        *h.now.lock().unwrap() = judged_at;
+        let world = World::scripted(vec![says(0.4, 0.9, 0.9)]);
+        h.evaluate(&world, &goal, None).await;
+        let status = h.service.status(&world, &h.caller, goal.id).await.unwrap();
+        let verdict = &status["verdicts"][0];
+        assert_eq!(verdict["judge_started_at"], json!(judged_at));
+        assert_eq!(verdict["decided_at"], json!(judged_at));
     }
 
     #[tokio::test]
