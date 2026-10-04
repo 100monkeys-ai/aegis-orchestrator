@@ -4,7 +4,9 @@
 //! in-memory store, and an execution service that records every execution
 //! the gated tool (`aegis.task.execute`) starts, with the identity it was
 //! started as. The tool is gated the way production's first check gates
-//! one: by `requires_approval` on its capability entry.
+//! one: by `requires_approval` on its capability entry, which also declares
+//! the gate's keys (ADR-126, Update of 2026-10-04, clause 1): the binding
+//! argument `account` and the summary's arguments, unless a test says not.
 
 use super::*;
 use crate::application::tool_approval_service::{ToolApprovalError, ToolApprovalService};
@@ -14,8 +16,8 @@ use crate::domain::execution::{Execution, ExecutionId, ExecutionInput, Iteration
 use crate::domain::repository::AgentVersion;
 use crate::domain::security_context::SecurityContext;
 use crate::domain::tool_approval::{
-    ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository, ToolApprovalRequest,
-    ToolApprovalStatus,
+    ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository,
+    ToolApprovalRequest, ToolApprovalStatus,
 };
 use crate::infrastructure::event_bus::DomainEvent;
 use crate::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository;
@@ -272,15 +274,30 @@ fn security_context(tool_pattern: &str) -> SecurityContext {
     }
 }
 
-/// The canonical dispatchers, with `requires_approval: true` on the gated
-/// tool's capability entry, as a node configuration sets it.
-fn dispatchers_gating(tool: &str) -> Vec<crate::domain::node_config::BuiltinDispatcherConfig> {
+/// The contract the gated tool's capability entry declares in most tests:
+/// a binding argument no gate knows by name, and two arguments to show.
+fn declared_contract() -> ApprovalContract {
+    ApprovalContract {
+        binding_argument: Some("account".to_string()),
+        approval_summary: Some(vec!["agent_id".to_string(), "input".to_string()]),
+    }
+}
+
+/// The canonical dispatchers, with `requires_approval: true` and `contract`'s
+/// keys on the gated tool's capability entry, as a node configuration sets
+/// them.
+fn dispatchers_gating(
+    tool: &str,
+    contract: &ApprovalContract,
+) -> Vec<crate::domain::node_config::BuiltinDispatcherConfig> {
     ToolRouter::builtin_dispatchers()
         .into_iter()
         .map(|mut d| {
             for cap in &mut d.capabilities {
                 if cap.name == tool {
                     cap.requires_approval = true;
+                    cap.binding_argument = contract.binding_argument.clone();
+                    cap.approval_summary = contract.approval_summary.clone();
                 }
             }
             d
@@ -306,6 +323,14 @@ struct Harness {
 }
 
 async fn harness_with(tool_pattern: &str, repo: Arc<InMemoryToolApprovalRepository>) -> Harness {
+    harness_declaring(tool_pattern, repo, declared_contract()).await
+}
+
+async fn harness_declaring(
+    tool_pattern: &str,
+    repo: Arc<InMemoryToolApprovalRepository>,
+    contract: ApprovalContract,
+) -> Harness {
     let tenant = TenantId::for_consumer_user(USER).unwrap();
     let agent = agent();
     let agent_id = agent.id;
@@ -354,7 +379,7 @@ async fn harness_with(tool_pattern: &str, repo: Arc<InMemoryToolApprovalReposito
     let router = Arc::new(ToolRouter::new(
         registry,
         servers,
-        dispatchers_gating(GATED_TOOL),
+        dispatchers_gating(GATED_TOOL, &contract),
     ));
     let storage_root =
         std::env::temp_dir().join(format!("aegis-gate-tests-{}", uuid::Uuid::new_v4()));
@@ -400,8 +425,8 @@ async fn harness() -> Harness {
 }
 
 impl Harness {
-    fn args(&self, mailbox: &str) -> Value {
-        json!({ "agent_id": self.target_agent, "mailbox": mailbox, "input": { "note": "the stored arguments" } })
+    fn args(&self, account: &str) -> Value {
+        json!({ "agent_id": self.target_agent, "account": account, "input": { "note": "the stored arguments" } })
     }
 
     async fn call_as(
@@ -753,4 +778,63 @@ async fn an_ungated_tool_is_not_stopped_by_the_gate() {
         h.rows().await.is_empty(),
         "an ungated call wrote a row: {result:?}"
     );
+}
+
+/// Test (a): the policy is keyed on the argument the capability entry
+/// declares (`account`); a `mailbox` argument means nothing to the gate.
+#[tokio::test]
+async fn a_policy_is_keyed_on_the_contract_declared_argument_only() {
+    let h = harness().await;
+    let id = pending_id(h.call(h.args("b-1")).await);
+    h.decide(id, ToolApprovalDecision::Always).await.unwrap();
+    let policies = h.approvals.list_policies(&h.tenant, USER).await.unwrap();
+    assert_eq!(policies[0].binding_id.as_deref(), Some("b-1"));
+
+    let mut same_account = h.args("b-1");
+    same_account["mailbox"] = json!("m-9");
+    assert_ne!(
+        direct(h.call(same_account).await)["status"],
+        "approval_pending"
+    );
+
+    let mut other_account = h.args("b-2");
+    other_account["mailbox"] = json!("b-1");
+    pending_id(h.call(other_account).await);
+}
+
+/// Test (b) through the dispatch path: the pending answer's summary lists
+/// exactly the declared arguments, each cut at 2,000 characters.
+#[tokio::test]
+async fn the_pending_summary_lists_exactly_the_declared_arguments() {
+    let h = harness().await;
+    let mut args = h.args("b-1");
+    args["input"] = json!("q".repeat(2_500));
+    let value = direct(h.call(args).await);
+    assert_eq!(
+        value["summary"],
+        format!(
+            "{GATED_TOOL}\nagent_id: {}\ninput: {}",
+            h.target_agent,
+            "q".repeat(2_000)
+        )
+    );
+}
+
+/// Test (c) through the dispatch path: a capability entry declaring neither
+/// key gives today's fallback, and no binding.
+#[tokio::test]
+async fn a_tool_declaring_neither_key_keeps_the_fallback_summary() {
+    let h = harness_declaring(
+        "aegis.*",
+        Arc::new(InMemoryToolApprovalRepository::new()),
+        ApprovalContract::default(),
+    )
+    .await;
+    let args = h.args("b-1");
+    let value = direct(h.call(args.clone()).await);
+    assert_eq!(
+        value["summary"],
+        format!("{GATED_TOOL} with arguments {args}")
+    );
+    assert_eq!(h.rows().await[0].binding_id, None);
 }

@@ -32,7 +32,7 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
 use crate::domain::tool_approval::{
-    binding_of, summarize, ToolApprovalDecision, ToolApprovalId, ToolApprovalPolicy,
+    ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalPolicy,
     ToolApprovalPolicyId, ToolApprovalRepository, ToolApprovalRequest, ToolApprovalStatus,
     PENDING_APPROVAL_TTL_HOURS,
 };
@@ -75,6 +75,9 @@ pub struct GatedCall<'a> {
     pub tool_name: &'a str,
     pub arguments: &'a Value,
     pub security_context_name: &'a str,
+    /// What the tool declares to the gate: its binding argument and its
+    /// summary's arguments (ADR-126, Update of 2026-10-04, clause 1).
+    pub contract: ApprovalContract,
 }
 
 /// What the dispatch path does with a gated call.
@@ -111,7 +114,7 @@ impl ToolApprovalService {
             .user_sub
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ToolApprovalError::RequiresUser(call.tool_name.to_string()))?;
-        let binding_id = binding_of(call.arguments);
+        let binding_id = call.contract.binding_of(call.arguments);
         let now = Utc::now();
         let policy = self
             .repo
@@ -130,7 +133,7 @@ impl ToolApprovalService {
             agent_id: call.agent_id,
             tool_name: call.tool_name.to_string(),
             arguments: call.arguments.clone(),
-            summary: summarize(call.tool_name, call.arguments),
+            summary: call.contract.summarize(call.tool_name, call.arguments),
             binding_id,
             security_context_name: call.security_context_name.to_string(),
             policy_id: None,

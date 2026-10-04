@@ -293,7 +293,9 @@ mod tests {
     use aegis_orchestrator_core::domain::execution::ExecutionId;
     use aegis_orchestrator_core::domain::iam::{AegisRole, UserIdentity};
     use aegis_orchestrator_core::domain::shared_kernel::TenantId;
-    use aegis_orchestrator_core::domain::tool_approval::{ToolApprovalId, ToolApprovalRequest};
+    use aegis_orchestrator_core::domain::tool_approval::{
+        ApprovalContract, ToolApprovalId, ToolApprovalRequest,
+    };
     use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
     use aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository;
     use reqwest::Method;
@@ -361,6 +363,15 @@ mod tests {
                 tool_name: "mail.send",
                 arguments: &args,
                 security_context_name: "zaru-pro",
+                contract: ApprovalContract {
+                    binding_argument: Some("mailbox".into()),
+                    approval_summary: Some(vec![
+                        "mailbox".into(),
+                        "to".into(),
+                        "subject".into(),
+                        "body".into(),
+                    ]),
+                },
             })
             .await
             .expect("gate");
@@ -404,7 +415,7 @@ mod tests {
         assert!(body["requests"][0]["summary"]
             .as_str()
             .unwrap()
-            .contains("Subject: Hi"));
+            .contains("subject: Hi"));
 
         let (status, body) = decide(&f, "owner", id, "once").await;
         assert_eq!(status, 200, "{body}");

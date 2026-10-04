@@ -6,7 +6,7 @@
 //! allow, or deny. The gate in the tool dispatch path writes a
 //! [`ToolApprovalRequest`] for every call of a gated tool, and a
 //! [`ToolApprovalPolicy`] holds a user's "always allow" for one tool on one
-//! binding (the call's `mailbox` argument, or none).
+//! binding (the argument the tool's [`ApprovalContract`] names, or none).
 //!
 //! Both are stored durably by a [`ToolApprovalRepository`]: a pending request
 //! outlives the agent that made the call and the process that stored it.
@@ -26,12 +26,9 @@ use crate::domain::tenant::TenantId;
 /// (ADR-126 D3).
 pub const PENDING_APPROVAL_TTL_HOURS: i64 = 72;
 
-/// The argument whose value names the binding a gated call acts through
-/// (ADR-126 D2: "the `mailbox` argument's binding id").
-pub const BINDING_ARGUMENT: &str = "mailbox";
-
-/// The number of body characters a mail tool's summary carries (ADR-126 D3).
-pub const SUMMARY_BODY_CHARS: usize = 2_000;
+/// The number of characters of each argument a summary carries (ADR-126
+/// D3, as its Update of 2026-10-04 clause 1 reads it).
+pub const SUMMARY_ARGUMENT_CHARS: usize = 2_000;
 
 /// Identifier of one approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -208,54 +205,88 @@ pub struct ToolApprovalPolicy {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-/// The binding a call acts through: its `mailbox` argument, when a string.
-pub fn binding_of(arguments: &Value) -> Option<String> {
-    arguments
-        .get(BINDING_ARGUMENT)
-        .and_then(Value::as_str)
-        .map(str::to_string)
+/// What a tool declares to the approval gate (AEGIS ADR-126, Update of
+/// 2026-10-04, clause 1), from its input contract
+/// ([`ToolInputContract`](crate::domain::mcp::ToolInputContract)) or from its
+/// capability entry in the node configuration. The gate knows no tool name
+/// and no argument name of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalContract {
+    /// The argument naming the credential binding the call acts through; a
+    /// policy is keyed on its value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_argument: Option<String>,
+    /// The arguments a user reads before answering, in this order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_summary: Option<Vec<String>>,
 }
 
-/// The text a user reads before answering.
-///
-/// For `mail.send` and `mail.reply`: the mailbox, recipients, subject and the
-/// first [`SUMMARY_BODY_CHARS`] characters of the body (ADR-126 D3). For any
-/// other tool: its name and its arguments, cut at the same length.
-pub fn summarize(tool_name: &str, arguments: &Value) -> String {
-    match tool_name {
-        "mail.send" | "mail.reply" => {
-            let field = |key: &str| -> String {
-                match arguments.get(key) {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Array(items)) => items
-                        .iter()
-                        .map(|v| {
-                            v.as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| v.to_string())
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    Some(Value::Null) | None => String::new(),
-                    Some(other) => other.to_string(),
+impl ApprovalContract {
+    /// Whether the tool declares neither key.
+    pub fn is_empty(&self) -> bool {
+        self.binding_argument.is_none() && self.approval_summary.is_none()
+    }
+
+    /// The binding a call acts through: the value of the declared binding
+    /// argument, when a string; none when the tool declares no binding.
+    pub fn binding_of(&self, arguments: &Value) -> Option<String> {
+        let name = self.binding_argument.as_deref()?;
+        arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// The text a user reads before answering.
+    ///
+    /// With `approval_summary` declared: the tool's name, then one line
+    /// `<argument>: <value>` for each listed argument, in its order, each
+    /// value cut at [`SUMMARY_ARGUMENT_CHARS`] characters. Otherwise the
+    /// fallback: the tool's name and its arguments, cut at the same length.
+    pub fn summarize(&self, tool_name: &str, arguments: &Value) -> String {
+        match &self.approval_summary {
+            Some(names) => {
+                let mut summary = tool_name.to_string();
+                for name in names {
+                    let value: String = argument_text(arguments.get(name))
+                        .chars()
+                        .take(SUMMARY_ARGUMENT_CHARS)
+                        .collect();
+                    summary.push('\n');
+                    summary.push_str(name);
+                    summary.push_str(": ");
+                    summary.push_str(&value);
                 }
-            };
-            let body: String = field("body").chars().take(SUMMARY_BODY_CHARS).collect();
-            format!(
-                "{tool_name} from mailbox {}\nTo: {}\nSubject: {}\n\n{body}",
-                field(BINDING_ARGUMENT),
-                field("to"),
-                field("subject"),
-            )
+                summary
+            }
+            None => {
+                let args: String = arguments
+                    .to_string()
+                    .chars()
+                    .take(SUMMARY_ARGUMENT_CHARS)
+                    .collect();
+                format!("{tool_name} with arguments {args}")
+            }
         }
-        _ => {
-            let args: String = arguments
-                .to_string()
-                .chars()
-                .take(SUMMARY_BODY_CHARS)
-                .collect();
-            format!("{tool_name} with arguments {args}")
-        }
+    }
+}
+
+/// An argument's value as a user reads it: a string as itself, a list of
+/// strings joined by `, `, anything else as JSON, absent as nothing.
+fn argument_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
     }
 }
 
@@ -359,25 +390,74 @@ mod tests {
         assert_eq!(ToolApprovalStatus::parse("approved"), None);
     }
 
+    /// Test (a)'s domain half: the binding is the argument the contract
+    /// declares, whatever its name, and no argument without a declaration.
     #[test]
-    fn a_mail_summary_names_the_mailbox_recipients_subject_and_cut_body() {
-        let body = "z".repeat(SUMMARY_BODY_CHARS + 500);
-        let summary = summarize(
-            "mail.send",
-            &json!({"mailbox": "b-1", "to": ["a@example.com", "b@example.com"], "subject": "Hi", "body": body}),
+    fn the_binding_is_the_argument_the_contract_declares() {
+        let contract = ApprovalContract {
+            binding_argument: Some("account".into()),
+            approval_summary: None,
+        };
+        assert_eq!(
+            contract.binding_of(&json!({"account": "b-1", "mailbox": "m-1"})),
+            Some("b-1".into())
         );
-        assert!(summary.contains("mailbox b-1"), "{summary}");
-        assert!(
-            summary.contains("To: a@example.com, b@example.com"),
-            "{summary}"
+        assert_eq!(contract.binding_of(&json!({"mailbox": "m-1"})), None);
+        assert_eq!(
+            ApprovalContract::default().binding_of(&json!({"mailbox": "m-1"})),
+            None,
+            "no tool name and no argument name is known to the gate"
         );
-        assert!(summary.contains("Subject: Hi"), "{summary}");
-        assert_eq!(summary.matches('z').count(), SUMMARY_BODY_CHARS);
     }
 
+    /// Test (b): a summary lists exactly the declared arguments, in order,
+    /// each cut at 2,000 characters.
     #[test]
-    fn the_binding_is_the_mailbox_argument() {
-        assert_eq!(binding_of(&json!({"mailbox": "b-1"})), Some("b-1".into()));
-        assert_eq!(binding_of(&json!({"to": "x"})), None);
+    fn a_declared_summary_lists_exactly_those_arguments_each_cut() {
+        let contract = ApprovalContract {
+            binding_argument: Some("account".into()),
+            approval_summary: Some(vec!["recipients".into(), "text".into(), "title".into()]),
+        };
+        let long = "z".repeat(SUMMARY_ARGUMENT_CHARS + 500);
+        let summary = contract.summarize(
+            "chat.post",
+            &json!({
+                "account": "b-1",
+                "recipients": ["a@example.com", "b@example.com"],
+                "text": long,
+                "title": "y".repeat(SUMMARY_ARGUMENT_CHARS + 1),
+                "secret_extra": "not listed"
+            }),
+        );
+        let lines: Vec<&str> = summary.lines().collect();
+        assert_eq!(lines[0], "chat.post");
+        assert_eq!(lines[1], "recipients: a@example.com, b@example.com");
+        assert_eq!(
+            lines[2],
+            format!("text: {}", "z".repeat(SUMMARY_ARGUMENT_CHARS))
+        );
+        assert_eq!(
+            lines[3],
+            format!("title: {}", "y".repeat(SUMMARY_ARGUMENT_CHARS))
+        );
+        assert_eq!(lines.len(), 4, "{summary}");
+        assert!(!summary.contains("not listed"), "{summary}");
+        assert!(!summary.contains("b-1"), "{summary}");
+    }
+
+    /// Test (c): a tool declaring neither key keeps today's fallback text,
+    /// whatever its name (a former mail tool included).
+    #[test]
+    fn a_tool_declaring_neither_key_keeps_the_fallback() {
+        let args = json!({"mailbox": "b-1", "to": "x@example.com", "body": "w".repeat(3_000)});
+        for tool in ["mail.send", "anything.else"] {
+            let summary = ApprovalContract::default().summarize(tool, &args);
+            let expected: String = args
+                .to_string()
+                .chars()
+                .take(SUMMARY_ARGUMENT_CHARS)
+                .collect();
+            assert_eq!(summary, format!("{tool} with arguments {expected}"));
+        }
     }
 }

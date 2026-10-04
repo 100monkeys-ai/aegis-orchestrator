@@ -1056,6 +1056,29 @@ pub struct CapabilityConfig {
     /// clear a tool catalogue entry's own mark.
     #[serde(default)]
     pub requires_approval: bool,
+
+    /// The argument naming the credential binding a call of this tool acts
+    /// through; the approval gate keys a user's "always allow" on its value
+    /// (AEGIS ADR-126, Update of 2026-10-04, clause 1). For a gateway or MCP
+    /// tool, which has no input contract of its own. Absent: no binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_argument: Option<String>,
+
+    /// The arguments, in order, the approval gate shows its user before an
+    /// answer, each cut at 2,000 characters (the same clause). Absent: the
+    /// tool's name and its arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_summary: Option<Vec<String>>,
+}
+
+impl CapabilityConfig {
+    /// What this entry declares to the approval gate.
+    pub fn approval_contract(&self) -> crate::domain::tool_approval::ApprovalContract {
+        crate::domain::tool_approval::ApprovalContract {
+            binding_argument: self.binding_argument.clone(),
+            approval_summary: self.approval_summary.clone(),
+        }
+    }
 }
 
 /// Built-in tools configured directly inside the Orchestrator via Dispatch Protocol (ADR-040)

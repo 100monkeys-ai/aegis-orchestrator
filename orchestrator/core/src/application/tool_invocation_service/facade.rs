@@ -752,6 +752,7 @@ impl ToolInvocationService {
                         tool_name: &tool_name,
                         arguments: &args,
                         security_context_name: &security_context.name,
+                        contract: self.tool_router.approval_contract(&tool_name),
                     })
                     .await;
                 match gated {

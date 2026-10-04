@@ -631,6 +631,19 @@ impl ToolPolicy {
 /// ```
 pub struct ToolInputContract;
 
+/// One tool's declaration to the approval gate, part of its input contract
+/// (AEGIS ADR-126, Update of 2026-10-04, clause 1).
+pub struct ApprovalDeclaration {
+    pub tool: &'static str,
+    pub binding_argument: Option<&'static str>,
+    pub approval_summary: Option<&'static [&'static str]>,
+}
+
+/// The built-in tools' declarations to the approval gate. No built-in tool
+/// acts through a credential binding today; a gateway or MCP tool declares
+/// the same keys on its capability entry in the node configuration.
+pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[];
+
 impl ToolInputContract {
     /// Returns the required parameter names for `tool_name`, or an empty slice
     /// for tools with no required parameters or unknown tool names.
@@ -668,6 +681,24 @@ impl ToolInputContract {
             "aegis.tools.list" | "aegis.tools.search" => &[],
             _ => &[],
         }
+    }
+
+    /// What `tool_name`'s input contract declares to the approval gate: the
+    /// argument naming the binding the call acts through, and the arguments
+    /// its summary lists (AEGIS ADR-126, Update of 2026-10-04, clause 1).
+    /// A tool declares them in [`APPROVAL_DECLARATIONS`]; none does today,
+    /// and an undeclared tool gets the empty contract (the gate's fallback).
+    pub fn approval_contract(tool_name: &str) -> crate::domain::tool_approval::ApprovalContract {
+        APPROVAL_DECLARATIONS
+            .iter()
+            .find(|d| d.tool == tool_name)
+            .map(|d| crate::domain::tool_approval::ApprovalContract {
+                binding_argument: d.binding_argument.map(str::to_string),
+                approval_summary: d
+                    .approval_summary
+                    .map(|names| names.iter().map(|n| n.to_string()).collect()),
+            })
+            .unwrap_or_default()
     }
 
     /// Validates that `args` satisfies the input contract for `tool_name`.

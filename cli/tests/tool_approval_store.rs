@@ -11,7 +11,8 @@
 //! They cover: a pending request is still there, and can be answered, after
 //! the service is rebuilt on the same database (the redeploy case); one
 //! answer wins when two race; a policy matches only its own user, tool and
-//! binding, and stops matching once revoked; the sweep expires only what has
+//! binding (the argument the tool's contract declares, ADR-126 Update of
+//! 2026-10-04 clause 1), and stops matching once revoked; the sweep expires only what has
 //! waited 72 hours; and migration 036 run again changes nothing.
 
 use std::sync::{Arc, Mutex};
@@ -23,8 +24,8 @@ use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::tool_approval::{
-    ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository, ToolApprovalRequest,
-    ToolApprovalStatus,
+    ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository,
+    ToolApprovalRequest, ToolApprovalStatus,
 };
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::PostgresToolApprovalRepository;
@@ -122,7 +123,30 @@ fn tenant() -> TenantId {
     TenantId::for_consumer_user(USER).unwrap()
 }
 
+/// The contract the gated tools declare: a binding argument the gate knows
+/// by no name of its own, and the arguments a user reads.
+fn contract() -> ApprovalContract {
+    ApprovalContract {
+        binding_argument: Some("account".to_string()),
+        approval_summary: Some(vec![
+            "to".to_string(),
+            "subject".to_string(),
+            "body".to_string(),
+        ]),
+    }
+}
+
 async fn gate(svc: &ToolApprovalService, user: &str, tool: &str, args: &Value) -> GateOutcome {
+    gate_declaring(svc, user, tool, args, contract()).await
+}
+
+async fn gate_declaring(
+    svc: &ToolApprovalService,
+    user: &str,
+    tool: &str,
+    args: &Value,
+    contract: ApprovalContract,
+) -> GateOutcome {
     svc.gate(GatedCall {
         tenant_id: &tenant(),
         user_sub: Some(user),
@@ -131,6 +155,7 @@ async fn gate(svc: &ToolApprovalService, user: &str, tool: &str, args: &Value) -
         tool_name: tool,
         arguments: args,
         security_context_name: "zaru-pro",
+        contract,
     })
     .await
     .expect("gate")
@@ -153,10 +178,10 @@ async fn a_pending_request_survives_a_rebuild_of_the_service_on_the_same_databas
     let Some(db) = TestDb::create().await else {
         return;
     };
-    let args = json!({"mailbox": "b-1", "to": "x@example.com", "subject": "Hi", "body": "Hello"});
+    let args = json!({"account": "b-1", "to": "x@example.com", "subject": "Hi", "body": "Hello"});
     let id = {
         let before = service(&db.pool);
-        pending_id(gate(&before, USER, "mail.send", &args).await)
+        pending_id(gate(&before, USER, "outbound.send", &args).await)
     };
 
     let pool = TestDb::connect(&db.options).await;
@@ -169,7 +194,7 @@ async fn a_pending_request_survives_a_rebuild_of_the_service_on_the_same_databas
     assert_eq!(listed[0].id, id);
     assert_eq!(listed[0].arguments, args, "the exact arguments are stored");
     assert!(
-        listed[0].summary.contains("Subject: Hi"),
+        listed[0].summary.contains("subject: Hi"),
         "{}",
         listed[0].summary
     );
@@ -201,7 +226,7 @@ async fn one_of_two_racing_answers_wins() {
         return;
     };
     let svc = Arc::new(service(&db.pool));
-    let id = pending_id(gate(&svc, USER, "mail.send", &json!({"mailbox": "b-1"})).await);
+    let id = pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-1"})).await);
     let runner = Arc::new(RecordingRunner::default());
     let mut handles = Vec::new();
     for _ in 0..4 {
@@ -238,22 +263,30 @@ async fn a_policy_matches_only_its_own_user_tool_and_binding_until_revoked() {
     };
     let svc = service(&db.pool);
     let runner = RecordingRunner::default();
-    for args in [json!({"mailbox": "b-1"}), json!({})] {
-        let id = pending_id(gate(&svc, USER, "mail.send", &args).await);
+    for args in [json!({"account": "b-1"}), json!({})] {
+        let id = pending_id(gate(&svc, USER, "outbound.send", &args).await);
         svc.decide(id, &tenant(), USER, ToolApprovalDecision::Always, &runner)
             .await
             .unwrap();
         assert!(
             matches!(
-                gate(&svc, USER, "mail.send", &args).await,
+                gate(&svc, USER, "outbound.send", &args).await,
                 GateOutcome::Proceed { .. }
             ),
             "the policy for {args} did not apply"
         );
     }
-    pending_id(gate(&svc, USER, "mail.send", &json!({"mailbox": "b-2"})).await);
-    pending_id(gate(&svc, USER, "mail.reply", &json!({"mailbox": "b-1"})).await);
-    pending_id(gate(&svc, "other-sub", "mail.send", &json!({"mailbox": "b-1"})).await);
+    pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-2"})).await);
+    pending_id(gate(&svc, USER, "outbound.reply", &json!({"account": "b-1"})).await);
+    pending_id(
+        gate(
+            &svc,
+            "other-sub",
+            "outbound.send",
+            &json!({"account": "b-1"}),
+        )
+        .await,
+    );
 
     let auto = svc
         .list_for_user(&tenant(), USER, Some(ToolApprovalStatus::AutoAllowed))
@@ -265,8 +298,8 @@ async fn a_policy_matches_only_its_own_user_tool_and_binding_until_revoked() {
     for policy in svc.list_policies(&tenant(), USER).await.unwrap() {
         svc.revoke_policy(policy.id, &tenant(), USER).await.unwrap();
     }
-    pending_id(gate(&svc, USER, "mail.send", &json!({"mailbox": "b-1"})).await);
-    pending_id(gate(&svc, USER, "mail.send", &json!({})).await);
+    pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-1"})).await);
+    pending_id(gate(&svc, USER, "outbound.send", &json!({})).await);
     db.remove().await;
 }
 
@@ -277,8 +310,8 @@ async fn the_sweep_expires_only_requests_pending_72_hours() {
         return;
     };
     let svc = service(&db.pool);
-    let old = pending_id(gate(&svc, USER, "mail.send", &json!({"mailbox": "b-1"})).await);
-    let young = pending_id(gate(&svc, USER, "mail.send", &json!({"mailbox": "b-2"})).await);
+    let old = pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-1"})).await);
+    let young = pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-2"})).await);
     sqlx::query(
         "UPDATE tool_approval_requests SET created_at = now() - interval '73 hours' WHERE id = $1",
     )
@@ -308,7 +341,7 @@ async fn migration_036_run_again_changes_nothing() {
         return;
     };
     let svc = service(&db.pool);
-    pending_id(gate(&svc, USER, "mail.send", &json!({"mailbox": "b-1"})).await);
+    pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-1"})).await);
     let snapshot = || async {
         sqlx::query(
             "SELECT (SELECT count(*) FROM tool_approval_requests) AS requests, \
@@ -329,5 +362,55 @@ async fn migration_036_run_again_changes_nothing() {
         .await
         .expect("migration 036 run again");
     assert_eq!(snapshot().await, before);
+    db.remove().await;
+}
+
+/// Test (a) against PostgreSQL: a policy keyed on the contract-declared
+/// argument `account` matches only its own tool and binding; where the tool
+/// declares no binding argument, `account` is no key and the call waits.
+#[tokio::test]
+async fn a_policy_keyed_on_a_contract_declared_argument_matches_only_its_own_tool_and_binding() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let svc = service(&db.pool);
+    let runner = RecordingRunner::default();
+    let id = pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-1"})).await);
+    let decided = svc
+        .decide(id, &tenant(), USER, ToolApprovalDecision::Always, &runner)
+        .await
+        .unwrap();
+    assert_eq!(decided.binding_id.as_deref(), Some("b-1"));
+    assert!(matches!(
+        gate(
+            &svc,
+            USER,
+            "outbound.send",
+            &json!({"account": "b-1", "to": "x"})
+        )
+        .await,
+        GateOutcome::Proceed { .. }
+    ));
+    pending_id(gate(&svc, USER, "outbound.send", &json!({"account": "b-2"})).await);
+    pending_id(gate(&svc, USER, "outbound.reply", &json!({"account": "b-1"})).await);
+    pending_id(
+        gate_declaring(
+            &svc,
+            USER,
+            "outbound.send",
+            &json!({"account": "b-1"}),
+            ApprovalContract::default(),
+        )
+        .await,
+    );
+    let stored = PostgresToolApprovalRepository::new(db.pool.clone())
+        .list_requests_for_user(&tenant(), USER, Some(ToolApprovalStatus::Pending))
+        .await
+        .unwrap();
+    let summaries: Vec<&str> = stored.iter().map(|r| r.summary.as_str()).collect();
+    assert!(
+        summaries.contains(&"outbound.reply\nto: \nsubject: \nbody: "),
+        "{summaries:?}"
+    );
     db.remove().await;
 }

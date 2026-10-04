@@ -26,6 +26,7 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::{DomainError, ToolRegistry, ToolServer, ToolServerId, ToolServerStatus};
 use crate::domain::node_config::BuiltinDispatcherConfig;
 use crate::domain::secrets::AccessContext;
+use crate::domain::tool_approval::ApprovalContract;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::secrets_manager::SecretsManager;
 use async_trait::async_trait;
@@ -134,9 +135,10 @@ pub struct ToolRouter {
     servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
     capabilities_index: Arc<RwLock<HashMap<String, ToolServerId>>>,
     builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
-    /// MCP server tools whose capability entry carries `requires_approval`
-    /// (AEGIS ADR-126 D1), from `spec.mcp_servers`.
-    mcp_approval_tools: std::collections::HashSet<String>,
+    /// The capability entries of the enabled `spec.mcp_servers`: which carry
+    /// `requires_approval` (AEGIS ADR-126 D1) and what each declares to the
+    /// gate (its Update of 2026-10-04, clause 1).
+    mcp_capabilities: Vec<crate::domain::node_config::CapabilityConfig>,
 }
 
 /// Canonical structured definition of one builtin tool dispatcher.
@@ -169,7 +171,7 @@ pub struct ToolRouter {
 /// `requires_approval`: AEGIS ADR-126 D1 outbound tools: an agent's call
 /// waits for its user's answer at the approval gate. A node configuration's
 /// capability entry may gate further tools; it cannot clear this mark.
-/// No tool carries it yet: `mail.send` and `mail.reply` (ADR-125 D4) will.
+/// No tool carries it yet.
 struct BuiltinToolDefinition {
     name: &'static str,
     description: &'static str,
@@ -207,7 +209,7 @@ impl BuiltinToolDefinition {
     }
 
     /// Mark an outbound tool for the approval gate (AEGIS ADR-126 D1).
-    #[allow(dead_code)] // the mail tools (ADR-125 D4) are the first to carry it
+    #[allow(dead_code)] // no built-in tool carries it yet
     const fn requires_approval(mut self) -> Self {
         self.requires_approval = true;
         self
@@ -306,6 +308,8 @@ impl ToolRouter {
                     name: def.name.to_string(),
                     skip_judge: def.skip_judge,
                     requires_approval: def.requires_approval,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             })
@@ -343,7 +347,7 @@ impl ToolRouter {
             servers,
             capabilities_index: Arc::new(RwLock::new(HashMap::new())),
             builtin_dispatchers,
-            mcp_approval_tools: std::collections::HashSet::new(),
+            mcp_capabilities: Vec::new(),
         }
     }
 
@@ -353,12 +357,10 @@ impl ToolRouter {
         mut self,
         configs: &[crate::domain::node_config::McpServerConfig],
     ) -> Self {
-        self.mcp_approval_tools = configs
+        self.mcp_capabilities = configs
             .iter()
             .filter(|c| c.enabled)
-            .flat_map(|c| c.capabilities.iter())
-            .filter(|cap| cap.requires_approval)
-            .map(|cap| cap.name.clone())
+            .flat_map(|c| c.capabilities.iter().cloned())
             .collect();
         self
     }
@@ -1901,7 +1903,28 @@ impl ToolRouter {
         {
             return true;
         }
-        self.mcp_approval_tools.contains(tool_name)
+        self.mcp_capabilities
+            .iter()
+            .any(|cap| cap.name == tool_name && cap.requires_approval)
+    }
+
+    /// What `tool_name` declares to the approval gate (AEGIS ADR-126, Update
+    /// of 2026-10-04, clause 1): its input contract's declaration where it
+    /// makes one, otherwise its capability entry's in the node configuration
+    /// (a builtin dispatcher's, then an MCP server's), otherwise nothing, and
+    /// the gate's fallback applies.
+    pub fn approval_contract(&self, tool_name: &str) -> ApprovalContract {
+        let declared = crate::domain::mcp::ToolInputContract::approval_contract(tool_name);
+        if !declared.is_empty() {
+            return declared;
+        }
+        self.builtin_dispatchers
+            .iter()
+            .flat_map(|d| d.capabilities.iter())
+            .chain(self.mcp_capabilities.iter())
+            .find(|cap| cap.name == tool_name)
+            .map(|cap| cap.approval_contract())
+            .unwrap_or_default()
     }
 }
 
@@ -2416,6 +2439,8 @@ mod tests {
                     name: "aegis.agent.create".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2427,6 +2452,8 @@ mod tests {
                     name: "aegis.workflow.create".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2438,6 +2465,8 @@ mod tests {
                     name: "aegis.task.logs".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2449,6 +2478,8 @@ mod tests {
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2526,6 +2557,8 @@ mod tests {
                     name: "aegis.workflow.cancel".to_string(),
                     skip_judge: false,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2537,6 +2570,8 @@ mod tests {
                     name: "aegis.workflow.signal".to_string(),
                     skip_judge: false,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2548,6 +2583,8 @@ mod tests {
                     name: "aegis.workflow.remove".to_string(),
                     skip_judge: false,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2559,6 +2596,8 @@ mod tests {
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2655,6 +2694,8 @@ mod tests {
                     name: "aegis.task.execute".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2667,6 +2708,8 @@ mod tests {
                     name: "aegis.agent.generate".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -2678,6 +2721,8 @@ mod tests {
                     name: "aegis.execute.intent".to_string(),
                     skip_judge: true,
                     requires_approval: false,
+                    binding_argument: None,
+                    approval_summary: None,
                 }],
                 api_key: None,
             },
@@ -3075,6 +3120,8 @@ mod tests {
                 name: "aegis.system.info".to_string(),
                 skip_judge: true,
                 requires_approval: true,
+                binding_argument: None,
+                approval_summary: None,
             }],
             api_key: None,
         }];
@@ -3087,5 +3134,30 @@ mod tests {
         assert!(gated.requires_approval("gmail.send"));
         assert!(!gated.requires_approval("gmail.list"));
         assert!(!gated.requires_approval("fs.read"));
+    }
+
+    /// ADR-126, Update of 2026-10-04, clause 1: the gate's keys come from the
+    /// tool's capability entry, a builtin dispatcher's or an MCP server's;
+    /// a tool whose entry declares none gets the empty contract.
+    #[test]
+    fn approval_contract_comes_from_the_capability_entry() {
+        let registry: Arc<dyn ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(RwLock::new(HashMap::new()));
+        let mcp: Vec<crate::domain::node_config::McpServerConfig> = serde_yaml::from_str(
+            "- name: chat\n  executable: /bin/true\n  capabilities:\n    - name: chat.post\n      requires_approval: true\n      binding_argument: workspace\n      approval_summary: [channel, text]\n    - name: chat.list\n",
+        )
+        .expect("MCP server entries parse");
+        let router = ToolRouter::new(registry, servers, ToolRouter::builtin_dispatchers())
+            .with_mcp_server_approvals(&mcp);
+        assert_eq!(
+            router.approval_contract("chat.post"),
+            ApprovalContract {
+                binding_argument: Some("workspace".to_string()),
+                approval_summary: Some(vec!["channel".to_string(), "text".to_string()]),
+            }
+        );
+        assert!(router.approval_contract("chat.list").is_empty());
+        assert!(router.approval_contract("fs.write").is_empty());
+        assert!(router.approval_contract("mail.send").is_empty());
     }
 }
