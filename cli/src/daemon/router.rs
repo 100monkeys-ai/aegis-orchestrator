@@ -49,10 +49,11 @@ use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
 use crate::daemon::handlers::credentials::{
-    credentials_by_id_router, credentials_mailboxes_router, delete_secret_handler,
-    device_poll_handler, get_secret_handler, list_credentials_handler, list_secrets_handler,
-    oauth_callback_handler, oauth_initiate_handler, store_api_key_handler, write_secret_handler,
-    CredentialsByIdState, CredentialsMailboxesState,
+    credentials_by_id_router, credentials_mailboxes_router, credentials_oauth_providers_router,
+    delete_secret_handler, device_poll_handler, get_secret_handler, list_credentials_handler,
+    list_secrets_handler, oauth_callback_handler, oauth_initiate_handler, store_api_key_handler,
+    write_secret_handler, CredentialsByIdState, CredentialsMailboxesState,
+    CredentialsOAuthProvidersState,
 };
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
@@ -412,6 +413,15 @@ pub(crate) fn create_router(
     let router = router.merge(credentials_mailboxes_router(CredentialsMailboxesState {
         credential_service: app_state.credential_service.clone(),
     }));
+
+    // The OAuth providers the registry serves, by name and display name
+    // (AEGIS ADR-125, Update of 2026-10-04, clause 2), beneath the same
+    // authentication layers as `GET /v1/credentials`.
+    let router = router.merge(credentials_oauth_providers_router(
+        CredentialsOAuthProvidersState {
+            credential_service: app_state.credential_service.clone(),
+        },
+    ));
 
     // Model alias lookup (AEGIS ADR-124 D3): the model an alias resolves to,
     // read from the daemon's one provider registry, the instance the inner

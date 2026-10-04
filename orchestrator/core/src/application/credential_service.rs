@@ -88,6 +88,34 @@ pub struct OAuthProviderConfig {
     /// Further authorization-request parameters, appended in key order
     /// (e.g. `access_type=offline`, `prompt=consent`).
     pub extra_authorization_params: BTreeMap<String, String>,
+    /// The name a client shows for the provider; `None` shows the provider
+    /// string (AEGIS ADR-125, Update of 2026-10-04, clause 2).
+    pub display_name: Option<String>,
+}
+
+/// One provider the registry serves, as `GET /v1/credentials/oauth/providers`
+/// answers it (AEGIS ADR-125, Update of 2026-10-04, clause 2): its name and
+/// its display name, never a client id, a client secret or an endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OAuthProviderListing {
+    pub provider: String,
+    pub display_name: String,
+}
+
+/// The providers `registry` serves, by provider name.
+pub fn oauth_provider_listing(registry: &OAuthProviderRegistry) -> Vec<OAuthProviderListing> {
+    let mut listing: Vec<OAuthProviderListing> = registry
+        .iter()
+        .map(|(provider, cfg)| OAuthProviderListing {
+            provider: provider.to_string(),
+            display_name: cfg
+                .display_name
+                .clone()
+                .unwrap_or_else(|| provider.to_string()),
+        })
+        .collect();
+    listing.sort_by(|a, b| a.provider.cmp(&b.provider));
+    listing
 }
 
 /// Registry mapping `CredentialProvider` → `OAuthProviderConfig`.
@@ -192,6 +220,12 @@ pub fn oauth_provider_registry_from_config(
                 redirect_uri_allowlist: entry.redirect_uri_allowlist.clone(),
                 scopes: entry.scopes.clone(),
                 extra_authorization_params: entry.extra_authorization_params.clone(),
+                display_name: entry
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string),
             },
         );
     }
@@ -546,6 +580,11 @@ pub trait CredentialManagementService: Send + Sync {
         actor: &CredentialActor,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<()>;
+
+    /// The OAuth providers this node's registry serves, by name and display
+    /// name, never a client id or secret (AEGIS ADR-125, Update of
+    /// 2026-10-04, clause 2).
+    fn oauth_providers(&self) -> Vec<OAuthProviderListing>;
 
     /// List all bindings owned by `owner_user_id` within `tenant_id`.
     async fn list_bindings(
@@ -1592,6 +1631,10 @@ impl CredentialManagementService for StandardCredentialManagementService {
     // list_bindings
     // -----------------------------------------------------------------------
 
+    fn oauth_providers(&self) -> Vec<OAuthProviderListing> {
+        oauth_provider_listing(&self.oauth_providers)
+    }
+
     async fn list_bindings(
         &self,
         tenant_id: &TenantId,
@@ -1638,6 +1681,7 @@ mod debug_tests {
             redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
             scopes: Vec::new(),
             extra_authorization_params: BTreeMap::new(),
+            display_name: None,
         };
         let printed = format!("{cfg:?}");
         for marker in [

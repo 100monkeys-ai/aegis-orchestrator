@@ -19,6 +19,7 @@
 //! | `DELETE /v1/credentials/{id}/grants/{grant_id}` | ConsumerUser \| TenantUser \| Operator | `CredentialGrant` |
 //! | `POST /v1/credentials/oauth/initiate` | ConsumerUser \| TenantUser | `CredentialCreate` |
 //! | `GET /v1/credentials/oauth/callback` | — (state token) | — |
+//! | `GET /v1/credentials/oauth/providers` | ConsumerUser \| TenantUser | `CredentialList` |
 //! | `POST /v1/credentials/oauth/device/poll` | ConsumerUser \| TenantUser | `CredentialCreate` |
 //! | `/v1/secrets/*` | Operator \| Admin | — |
 //!
@@ -181,6 +182,51 @@ pub(crate) fn credentials_mailboxes_router(state: CredentialsMailboxesState) -> 
     Router::new()
         .route("/v1/credentials/mailboxes", post(create_mailbox_handler))
         .with_state(state)
+}
+
+/// State of `GET /v1/credentials/oauth/providers`.
+#[derive(Clone)]
+pub(crate) struct CredentialsOAuthProvidersState {
+    pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+}
+
+/// `GET /v1/credentials/oauth/providers`, over its own narrow state. Merged
+/// into the daemon router by `router::create_router`, beneath the same
+/// authentication layers as `GET /v1/credentials`.
+pub(crate) fn credentials_oauth_providers_router(state: CredentialsOAuthProvidersState) -> Router {
+    Router::new()
+        .route(
+            "/v1/credentials/oauth/providers",
+            get(list_oauth_providers_handler),
+        )
+        .with_state(state)
+}
+
+/// `GET /v1/credentials/oauth/providers` — the OAuth providers the node's
+/// registry serves, each by its `provider` and display name, never a client
+/// id or secret (AEGIS ADR-125, Update of 2026-10-04, clause 2), so that a
+/// client lists what the registry serves.
+async fn list_oauth_providers_handler(
+    State(state): State<CredentialsOAuthProvidersState>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(r) = require_credential_scope(request.extensions(), ApiScope::CredentialList) {
+        return r;
+    }
+    let Some(svc) = state.credential_service else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Credential service not configured"})),
+        )
+            .into_response();
+    };
+    let providers = svc.oauth_providers();
+    let count = providers.len();
+    (
+        StatusCode::OK,
+        Json(json!({ "providers": providers, "count": count })),
+    )
+        .into_response()
 }
 
 /// Require that the caller holds `Operator` or `Admin` role.
@@ -2199,5 +2245,148 @@ mod mailbox_route_tests {
         .await;
         assert_eq!(status, 400, "{answer}");
         assert!(!answer.to_string().contains(PASSWORD), "{answer}");
+    }
+}
+
+#[cfg(test)]
+mod oauth_providers_route_tests {
+    //! `GET /v1/credentials/oauth/providers` (AEGIS ADR-125, Update of
+    //! 2026-10-04, clause 2), driven through the daemon's real
+    //! authentication stack against the real
+    //! `StandardCredentialManagementService` over a registry built from a
+    //! node configuration's `spec.oauth_providers`. Test (f): the body
+    //! holds each provider and its display name and never a client id, a
+    //! client secret or an endpoint.
+
+    use super::{credentials_oauth_providers_router, CredentialsOAuthProvidersState};
+    use crate::daemon::handlers::test_support::{consumer, identity_provider, send, serve};
+    use aegis_orchestrator_core::application::credential_service::{
+        oauth_provider_registry_from_config, CredentialManagementService,
+        StandardCredentialManagementService,
+    };
+    use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::repositories::PostgresCredentialBindingRepository;
+    use aegis_orchestrator_core::infrastructure::secrets_manager::{
+        SecretsManager, TestSecretStore,
+    };
+    use std::sync::Arc;
+
+    const CLIENT_ID: &str = "Mk7-listing-client-id";
+    const CLIENT_SECRET: &str = "Mk7-listing-client-secret";
+
+    const BLOCK: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+metadata:
+  name: listing-route-test
+spec:
+  node:
+    id: "node-1"
+    type: orchestrator
+  oauth_providers:
+    - provider: google
+      display_name: "Google"
+      authorization_url: "https://accounts.example/o/oauth2/v2/auth"
+      token_url: "https://oauth2.example/token"
+      client_id: "env:LISTING_ROUTE_CLIENT_ID"
+      client_secret: "env:LISTING_ROUTE_CLIENT_SECRET"
+      redirect_uri_allowlist:
+        - "https://ask.example/vault/connections/callback"
+    - provider: slack
+      authorization_url: "https://slack.example/oauth/v2/authorize"
+      token_url: "https://slack.example/api/oauth.v2.access"
+      client_id: "plain-slack-client"
+      redirect_uri_allowlist:
+        - "https://ask.example/vault/connections/callback"
+"#;
+
+    async fn route() -> String {
+        std::env::set_var("LISTING_ROUTE_CLIENT_ID", CLIENT_ID);
+        std::env::set_var("LISTING_ROUTE_CLIENT_SECRET", CLIENT_SECRET);
+        let entries = NodeConfigManifest::from_yaml_str(BLOCK)
+            .expect("the block parses")
+            .spec
+            .oauth_providers;
+        let registry = oauth_provider_registry_from_config(&entries).expect("registry builds");
+        let event_bus = Arc::new(EventBus::new(16));
+        // The listing reads the registry only; the repository is never
+        // reached, so its pool never connects.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("a lazy pool");
+        let service = StandardCredentialManagementService::new(
+            Arc::new(PostgresCredentialBindingRepository::new(pool)),
+            Arc::new(SecretsManager::from_store(
+                Arc::new(TestSecretStore::new()),
+                event_bus.clone(),
+            )),
+            event_bus,
+            Arc::new(registry),
+        );
+        serve(
+            credentials_oauth_providers_router(CredentialsOAuthProvidersState {
+                credential_service: Some(Arc::new(service) as Arc<dyn CredentialManagementService>),
+            }),
+            Some(identity_provider(&[(
+                "owner-token",
+                consumer("listing-owner"),
+                "credential:list",
+            )])),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_listing_answers_providers_and_display_names_and_never_a_client_credential() {
+        let base = route().await;
+        let (status, body) = send(
+            &base,
+            &reqwest::Method::GET,
+            "/v1/credentials/oauth/providers",
+            &None,
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "providers": [
+                    {"provider": "google", "display_name": "Google"},
+                    {"provider": "slack", "display_name": "slack"},
+                ],
+                "count": 2,
+            })
+        );
+        let text = body.to_string();
+        for absent in [
+            CLIENT_ID,
+            CLIENT_SECRET,
+            "plain-slack-client",
+            "client_id",
+            "client_secret",
+            "oauth2.example",
+            "accounts.example",
+            "redirect_uri",
+        ] {
+            assert!(!text.contains(absent), "the listing holds {absent}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_listing_refuses_an_unauthenticated_caller() {
+        let base = route().await;
+        let (status, body) = send(
+            &base,
+            &reqwest::Method::GET,
+            "/v1/credentials/oauth/providers",
+            &None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 401, "{body}");
+        assert!(!body.to_string().contains(CLIENT_SECRET));
     }
 }

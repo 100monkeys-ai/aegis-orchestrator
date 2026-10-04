@@ -644,6 +644,7 @@ fn google_registry(token_url: String) -> OAuthProviderRegistry {
                 "access_type".to_string(),
                 "offline".to_string(),
             )]),
+            display_name: None,
         },
     );
     registry

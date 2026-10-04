@@ -150,6 +150,7 @@ async fn setup_harness_with(authorization_url: &str, token_url: String) -> Harne
             redirect_uri_allowlist: vec!["https://app.example/oauth/callback".to_string()],
             scopes: Vec::new(),
             extra_authorization_params: Default::default(),
+            display_name: None,
         },
     );
     let oauth_providers = Arc::new(registry);
@@ -468,6 +469,7 @@ fn registry_validation_rejects_placeholder_authorization_url() {
             redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
             scopes: Vec::new(),
             extra_authorization_params: Default::default(),
+            display_name: None,
         },
     );
     let err = validate_oauth_provider_registry(&registry).expect_err("must reject");
@@ -493,6 +495,7 @@ fn registry_validation_rejects_insecure_authorization_url() {
             redirect_uri_allowlist: vec!["https://app.example/cb".to_string()],
             scopes: Vec::new(),
             extra_authorization_params: Default::default(),
+            display_name: None,
         },
     );
     assert!(matches!(
@@ -514,6 +517,7 @@ fn registry_validation_rejects_empty_redirect_allowlist() {
             redirect_uri_allowlist: vec![],
             scopes: Vec::new(),
             extra_authorization_params: Default::default(),
+            display_name: None,
         },
     );
     assert!(matches!(
@@ -535,6 +539,7 @@ fn registry_validation_accepts_real_https_authorization_url() {
             redirect_uri_allowlist: vec!["https://app.example/oauth/callback".to_string()],
             scopes: Vec::new(),
             extra_authorization_params: Default::default(),
+            display_name: None,
         },
     );
     assert!(validate_oauth_provider_registry(&registry).is_ok());

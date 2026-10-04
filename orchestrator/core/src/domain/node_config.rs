@@ -250,6 +250,10 @@ pub struct NodeConfigSpec {
 pub struct OAuthProviderEntry {
     /// The provider's name as credential bindings carry it, e.g. `google`.
     pub provider: String,
+    /// The name a client shows for this provider, e.g. `Google`; absent,
+    /// the provider string (AEGIS ADR-125, Update of 2026-10-04, clause 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// The provider's authorization endpoint; HTTPS. A URL can carry a
     /// credential, so it prints redacted.
     pub authorization_url: SensitiveUrl,
