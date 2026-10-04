@@ -29,7 +29,9 @@ pub struct HttpAttestationRequest {
     pub public_key: String,
     pub security_context: Option<String>,
     pub principal_subject: Option<String>,
-    pub user_id: Option<String>,
+    // No `user_id`: the session's user is the authenticated caller's own
+    // subject, never a value the body names (AEGIS ADR-035 — Updates, S1). A
+    // body that still sends one is ignored.
     pub workload_id: Option<String>,
     pub zaru_tier: Option<String>,
     pub tenant_id: Option<String>,
@@ -406,6 +408,11 @@ pub(crate) struct AttestBinding {
 /// resolves as [`resolve_attest_tenant`] says, in its own realm: a key with
 /// no stored role and no escalation stays a consumer and is refused the
 /// operator context; a role-bearing key is unchanged (D15).
+///
+/// The session's user is the authenticated caller's own subject, for every
+/// caller (AEGIS ADR-035 — Updates, S1): the escalation's `consumer_sub`,
+/// which equals the key's `user_id` (ADR-129 D10), or the identity's `sub`.
+/// The body never names it.
 pub(crate) async fn attest_binding<F, Fut>(
     lookup_execution_tenant: F,
     caller: Option<&AttestCaller>,
@@ -440,12 +447,13 @@ where
     }
     let identity = caller.map(|c| &c.identity);
     let tenant_id = resolve_attest_tenant(lookup_execution_tenant, identity, request).await?;
+    // `resolve_attest_tenant` refuses a caller with no identity, so one is
+    // present here.
+    let identity = identity.ok_or(AttestTenantError::Unauthenticated)?;
     Ok(AttestBinding {
         tenant_id,
-        realm: identity
-            .map(|id| id.realm_kind())
-            .unwrap_or(RealmKind::Consumer),
-        user_id: request.user_id.clone(),
+        realm: identity.realm_kind(),
+        user_id: Some(identity.sub.clone()),
         escalation: None,
     })
 }
@@ -672,7 +680,6 @@ mod attest_tenant_resolution_tests {
             public_key: "k".to_string(),
             security_context: None,
             principal_subject: None,
-            user_id: None,
             workload_id: None,
             zaru_tier: None,
             tenant_id: None,
@@ -926,7 +933,6 @@ mod operator_escalation_attest_tests {
             public_key: "k".to_string(),
             security_context: Some(security_context.to_string()),
             principal_subject: None,
-            user_id: None,
             workload_id: Some("zaru:u:s".to_string()),
             zaru_tier: None,
             // The body naming another tenant changes nothing for an
@@ -1039,6 +1045,10 @@ mod operator_escalation_attest_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "seal_attest_invoke_tests.rs"]
+mod attest_invoke_tests;
 
 #[cfg(test)]
 mod envelope_wire_tests {
