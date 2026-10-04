@@ -12,6 +12,8 @@ mod discovery;
 mod execute;
 mod facade;
 mod gateway;
+#[cfg(test)]
+mod operator_escalation_tests;
 mod runtime;
 mod storage;
 mod summary;

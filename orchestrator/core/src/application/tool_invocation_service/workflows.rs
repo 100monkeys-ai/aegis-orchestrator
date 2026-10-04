@@ -576,8 +576,20 @@ impl ToolInvocationService {
             }
         };
 
+        let all_tenants = Self::reads_every_tenant(args, _scope);
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
-        let execution = match repo.find_by_id_for_tenant(&tenant_id, exec_id).await {
+        let fetched = if all_tenants {
+            // AEGIS ADR-129 D17: under an active escalation, any tenant's
+            // workflow execution by its id: its own tenant, then the read.
+            match repo.find_tenant_id_by_execution(exec_id).await {
+                Ok(Some(own_tenant)) => repo.find_by_id_for_tenant(&own_tenant, exec_id).await,
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            }
+        } else {
+            repo.find_by_id_for_tenant(&tenant_id, exec_id).await
+        };
+        let execution = match fetched {
             Ok(Some(e)) => e,
             Ok(None) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({

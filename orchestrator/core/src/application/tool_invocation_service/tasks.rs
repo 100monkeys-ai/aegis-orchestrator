@@ -2,6 +2,16 @@ use super::attachment_args::parse_attachments;
 use super::*;
 
 impl ToolInvocationService {
+    /// Whether this read reaches every tenant: an active operator
+    /// escalation and no `tenant_id` named (AEGIS ADR-129 D17). A named
+    /// tenant is read as that tenant, through `enforce_tenant_arg`.
+    pub(super) fn reads_every_tenant(
+        args: &Value,
+        scope: &crate::domain::iam::TenantScope,
+    ) -> bool {
+        scope.is_escalated() && args.get("tenant_id").is_none() && args.get("tenant").is_none()
+    }
+
     pub(super) async fn invoke_aegis_task_execute_tool(
         &self,
         args: &mut Value,
@@ -124,6 +134,7 @@ impl ToolInvocationService {
         // ADR-097: bind/verify the requested tenant against the authenticated
         // scope before any execution data is touched. Without this gate any
         // caller could read any tenant's execution by guessing its UUID.
+        let all_tenants = Self::reads_every_tenant(args, scope);
         let tenant_id = Self::enforce_tenant_arg(args, scope)?;
 
         let exec_id_str = args
@@ -140,17 +151,23 @@ impl ToolInvocationService {
                 .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
         );
 
-        match self
-            .execution_service
-            .get_execution_for_tenant(&tenant_id, exec_id)
-            .await
-        {
+        let fetched = if all_tenants {
+            // AEGIS ADR-129 D17: under an active escalation, any tenant's
+            // execution by its id, as the REST route reads it for an operator.
+            self.execution_service.get_execution_unscoped(exec_id).await
+        } else {
+            self.execution_service
+                .get_execution_for_tenant(&tenant_id, exec_id)
+                .await
+        };
+        match fetched {
             Ok(exec) => {
                 let last_iter = exec.iterations().last();
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.task.status",
                     "execution_id": exec_id_str,
                     "agent_id": exec.agent_id.0.to_string(),
+                    "tenant_id": exec.tenant_id.as_str(),
                     "status": format!("{:?}", exec.status).to_lowercase(),
                     "started_at": exec.started_at,
                     "ended_at": exec.ended_at,
@@ -267,6 +284,7 @@ impl ToolInvocationService {
         // ADR-097: bind/verify the requested tenant against the authenticated
         // scope before any execution data is touched. Without this gate any
         // caller could read any tenant's execution events by guessing its UUID.
+        let all_tenants = Self::reads_every_tenant(args, scope);
         let tenant_id = Self::enforce_tenant_arg(args, scope)?;
 
         let exec_id_str = args
@@ -300,11 +318,15 @@ impl ToolInvocationService {
         // The tenant gate is enforced here: get_execution_for_tenant returns
         // an error when the execution doesn't belong to `tenant_id`, so a
         // foreign-tenant UUID cannot reach the unscoped events query below.
-        let execution = match self
-            .execution_service
-            .get_execution_for_tenant(&tenant_id, exec_id)
-            .await
-        {
+        let fetched = if all_tenants {
+            // AEGIS ADR-129 D17: under an active escalation, any tenant's.
+            self.execution_service.get_execution_unscoped(exec_id).await
+        } else {
+            self.execution_service
+                .get_execution_for_tenant(&tenant_id, exec_id)
+                .await
+        };
+        let execution = match fetched {
             Ok(execution) => execution,
             Err(error) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -357,6 +379,7 @@ impl ToolInvocationService {
         // unscoped `list_executions`, which routed to the global
         // `TenantId::consumer()` singleton — leaking every consumer-tier
         // execution across all callers.
+        let all_tenants = Self::reads_every_tenant(args, scope);
         let tenant_id = Self::enforce_tenant_arg(args, scope)?;
 
         let agent_id = args
@@ -367,11 +390,26 @@ impl ToolInvocationService {
 
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-        match self
-            .execution_service
-            .list_executions_for_tenant(&tenant_id, agent_id, None, limit)
-            .await
-        {
+        let listed = if all_tenants && agent_id.is_none() {
+            // AEGIS ADR-129 D17: under an active escalation and without an
+            // `agent_id`, the most recent executions of every tenant, each
+            // carrying its `tenant_id`, as the REST route lists them for an
+            // operator (`list_recent_all_paginated`).
+            match &self.execution_repository {
+                Some(repo) => repo
+                    .list_recent_all_paginated(limit, 0)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+                None => Err(anyhow::anyhow!(
+                    "the execution store is not configured for the all-tenant list"
+                )),
+            }
+        } else {
+            self.execution_service
+                .list_executions_for_tenant(&tenant_id, agent_id, None, limit)
+                .await
+        };
+        match listed {
             Ok(executions) => {
                 let entries: Vec<serde_json::Value> = executions
                     .iter()
