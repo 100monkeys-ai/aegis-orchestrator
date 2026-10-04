@@ -30,11 +30,11 @@ use aegis_orchestrator_core::application::canvas_service::{
 use aegis_orchestrator_core::domain::canvas::{
     CanvasEvent, CanvasSession, CanvasSessionId, ConversationId, WorkspaceMode,
 };
-use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{owner_of, require_identity, tenant_id_from_identity, zaru_tier_of};
 use crate::daemon::state::AppState;
 
 // ============================================================================
@@ -117,22 +117,6 @@ impl From<CanvasSession> for CanvasSessionResponse {
 // Helpers
 // ============================================================================
 
-fn user_sub(identity: Option<&UserIdentity>) -> String {
-    identity
-        .map(|i| i.sub.clone())
-        .unwrap_or_else(|| "anonymous".to_string())
-}
-
-fn user_tier(identity: Option<&UserIdentity>) -> ZaruTier {
-    match identity.map(|i| &i.identity_kind) {
-        Some(IdentityKind::ConsumerUser { zaru_tier, .. }) => zaru_tier.clone(),
-        // Non-consumer identities (operator / service account / tenant user)
-        // default to Enterprise so that admin tooling is not artificially
-        // blocked by Zaru-tier gating.
-        _ => ZaruTier::Enterprise,
-    }
-}
-
 /// Map a [`CanvasError`] to an HTTP response. Ownership and tenant-boundary
 /// violations are deliberately collapsed to `404 NotFound` so the endpoint
 /// does not leak the existence of other tenants' sessions.
@@ -170,10 +154,10 @@ pub(crate) async fn create_session_handler(
         )
     })?;
 
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
-    let tier = user_tier(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
+    let tier = zaru_tier_of(identity);
 
     // Enforce the invariant up front so `WorkspaceMode::GitLinked { binding_id: X }`
     // and a top-level `git_binding_id: Y` can never contradict.
@@ -309,9 +293,9 @@ pub(crate) async fn update_session_handler(
         )
     })?;
 
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
 
     let cmd = UpdateCanvasSessionCommand {
         session_id: CanvasSessionId(id),

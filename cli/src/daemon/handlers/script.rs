@@ -28,11 +28,11 @@ use uuid::Uuid;
 use aegis_orchestrator_core::application::script_service::{
     CreateScriptCommand, ScriptService, ScriptServiceError, UpdateScriptCommand,
 };
-use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::domain::script::{Script, ScriptId};
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{owner_of, require_identity, tenant_id_from_identity, zaru_tier_of};
 use crate::daemon::state::AppState;
 
 // ============================================================================
@@ -105,19 +105,6 @@ fn visibility_error(raw: &str) -> (StatusCode, Json<serde_json::Value>) {
 // Identity helpers
 // ============================================================================
 
-fn user_tier(identity: Option<&UserIdentity>) -> ZaruTier {
-    match identity.map(|i| &i.identity_kind) {
-        Some(IdentityKind::ConsumerUser { zaru_tier, .. }) => zaru_tier.clone(),
-        _ => ZaruTier::Enterprise,
-    }
-}
-
-fn user_sub(identity: Option<&UserIdentity>) -> String {
-    identity
-        .map(|i| i.sub.clone())
-        .unwrap_or_else(|| "anonymous".to_string())
-}
-
 // ============================================================================
 // Serialization — clean DTO without `deleted_at` / `domain_events`.
 // ============================================================================
@@ -175,10 +162,10 @@ pub(crate) async fn create_script(
     scope_guard.require("script:write")?;
     require_private_visibility(body.visibility.as_deref())?;
 
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let created_by = user_sub(identity_ref);
-    let tier = user_tier(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let created_by = owner_of(identity);
+    let tier = zaru_tier_of(identity);
     let svc = script_service(&state)?;
 
     let cmd = CreateScriptCommand {
@@ -204,9 +191,9 @@ pub(crate) async fn list_scripts(
     Query(query): Query<ListScriptsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("script:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let created_by = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let created_by = owner_of(identity);
     let svc = script_service(&state)?;
 
     let mut scripts = svc
@@ -239,9 +226,9 @@ pub(crate) async fn get_script(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("script:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let created_by = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let created_by = owner_of(identity);
     let svc = script_service(&state)?;
 
     let script_id = ScriptId(id);
@@ -284,9 +271,9 @@ pub(crate) async fn update_script(
     scope_guard.require("script:write")?;
     require_private_visibility(body.visibility.as_deref())?;
 
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let created_by = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let created_by = owner_of(identity);
     let svc = script_service(&state)?;
 
     let cmd = UpdateScriptCommand {
@@ -312,9 +299,9 @@ pub(crate) async fn delete_script(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("script:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let created_by = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let created_by = owner_of(identity);
     let svc = script_service(&state)?;
 
     svc.delete(&ScriptId(id), &tenant_id, &created_by)

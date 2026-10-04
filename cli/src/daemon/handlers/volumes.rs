@@ -15,11 +15,11 @@ use uuid::Uuid;
 use aegis_orchestrator_core::application::file_operations_service::FileOperationsError;
 use aegis_orchestrator_core::application::user_volume_service::UserVolumeError;
 use aegis_orchestrator_core::application::volume_manager::CreateUserVolumeCommand;
-use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+use aegis_orchestrator_core::domain::iam::{UserIdentity, ZaruTier};
 use aegis_orchestrator_core::domain::volume::VolumeId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{owner_of, require_identity, tenant_id_from_identity, zaru_tier_of};
 use crate::daemon::state::AppState;
 
 // ============================================================================
@@ -77,19 +77,6 @@ fn file_ops_error_response(e: FileOperationsError) -> (StatusCode, Json<serde_js
     (status, Json(serde_json::json!({"error": message})))
 }
 
-fn user_tier(identity: Option<&UserIdentity>) -> ZaruTier {
-    match identity.map(|i| &i.identity_kind) {
-        Some(IdentityKind::ConsumerUser { zaru_tier, .. }) => zaru_tier.clone(),
-        _ => ZaruTier::Enterprise,
-    }
-}
-
-fn user_sub(identity: Option<&UserIdentity>) -> String {
-    identity
-        .map(|i| i.sub.clone())
-        .unwrap_or_else(|| "anonymous".to_string())
-}
-
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -102,10 +89,10 @@ pub(crate) async fn create_volume(
     Json(body): Json<CreateVolumeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
-    let tier = user_tier(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
+    let tier = zaru_tier_of(identity);
 
     let cmd = CreateUserVolumeCommand {
         tenant_id,
@@ -141,9 +128,9 @@ pub(crate) async fn list_volumes(
     identity: Option<Extension<UserIdentity>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
 
     state
         .user_volume_service
@@ -176,10 +163,10 @@ pub(crate) async fn get_quota(
     identity: Option<Extension<UserIdentity>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
-    let tier = user_tier(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
+    let tier = zaru_tier_of(identity);
 
     state
         .user_volume_service
@@ -205,9 +192,9 @@ pub(crate) async fn get_volume(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
 
     let vols = state
         .user_volume_service
@@ -244,8 +231,8 @@ pub(crate) async fn rename_volume(
     Json(body): Json<RenameVolumeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     state
@@ -264,8 +251,8 @@ pub(crate) async fn delete_volume(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     state
@@ -285,9 +272,9 @@ pub(crate) async fn list_files(
     Query(params): Query<FilePathQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     state
@@ -314,9 +301,9 @@ pub(crate) async fn stat_file(
     Query(params): Query<FilePathQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     state
@@ -336,9 +323,9 @@ pub(crate) async fn download_file(
     Query(params): Query<FilePathQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     let content = state
@@ -636,10 +623,10 @@ pub(crate) async fn upload_file(
     request: Request,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
-    let tier = user_tier(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
+    let tier = zaru_tier_of(identity);
 
     validate_dest_path(&params.path)?;
 
@@ -819,9 +806,9 @@ pub(crate) async fn delete_path(
     Query(params): Query<FilePathQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     state
@@ -841,9 +828,9 @@ pub(crate) async fn mkdir(
     Query(params): Query<FilePathQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     state
@@ -863,9 +850,9 @@ pub(crate) async fn move_path(
     Json(body): Json<MovePathRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let vol_id = VolumeId(id);
 
     state

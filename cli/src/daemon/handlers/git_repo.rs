@@ -39,10 +39,10 @@ use aegis_orchestrator_core::application::git_repo_service::{
 };
 use aegis_orchestrator_core::domain::credential::CredentialBindingId;
 use aegis_orchestrator_core::domain::git_repo::{GitRef, GitRepoBinding, GitRepoBindingId};
-use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{owner_of, require_identity, tenant_id_from_identity, zaru_tier_of};
 use crate::daemon::state::AppState;
 
 // ============================================================================
@@ -156,19 +156,6 @@ fn git_repo_error_response(e: GitRepoError) -> (StatusCode, Json<serde_json::Val
 // Identity helpers
 // ============================================================================
 
-fn user_tier(identity: Option<&UserIdentity>) -> ZaruTier {
-    match identity.map(|i| &i.identity_kind) {
-        Some(IdentityKind::ConsumerUser { zaru_tier, .. }) => zaru_tier.clone(),
-        _ => ZaruTier::Enterprise,
-    }
-}
-
-fn user_sub(identity: Option<&UserIdentity>) -> String {
-    identity
-        .map(|i| i.sub.clone())
-        .unwrap_or_else(|| "anonymous".to_string())
-}
-
 /// Resolve `(author_name, author_email)` for a canvas commit.
 ///
 /// [`UserIdentity`] exposes only `sub` and `email` (no display name).
@@ -250,10 +237,10 @@ pub(crate) async fn create_git_repo(
     Json(body): Json<CreateGitRepoRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
-    let tier = user_tier(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
+    let tier = zaru_tier_of(identity);
     let svc = git_repo_service(&state)?;
 
     let cmd = CreateGitRepoCommand {
@@ -296,9 +283,9 @@ pub(crate) async fn list_git_repos(
     identity: Option<Extension<UserIdentity>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let svc = git_repo_service(&state)?;
 
     let bindings = svc
@@ -323,9 +310,9 @@ pub(crate) async fn get_git_repo(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let svc = git_repo_service(&state)?;
 
     let binding = svc
@@ -344,9 +331,9 @@ pub(crate) async fn delete_git_repo(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let svc = git_repo_service(&state)?;
 
     svc.delete_binding(&GitRepoBindingId(id), &tenant_id, &owner)
@@ -365,9 +352,9 @@ pub(crate) async fn refresh_git_repo(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let svc = git_repo_service(&state)?;
 
     svc.refresh_repo(&GitRepoBindingId(id), &tenant_id, &owner)
@@ -474,10 +461,10 @@ pub(crate) async fn commit_git_repo(
     Json(body): Json<CommitGitRepoRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
-    let (author_name, author_email) = commit_author(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
+    let (author_name, author_email) = commit_author(Some(identity));
     let svc = git_repo_service(&state)?;
 
     let commit_sha = svc
@@ -507,9 +494,9 @@ pub(crate) async fn push_git_repo(
     body: Option<Json<PushGitRepoRequest>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:write")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let svc = git_repo_service(&state)?;
 
     let (remote, ref_name) = match body {
@@ -544,9 +531,9 @@ pub(crate) async fn diff_git_repo(
     Query(query): Query<DiffGitRepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scope_guard.require("volume:read")?;
-    let identity_ref = identity.as_ref().map(|e| &e.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
-    let owner = user_sub(identity_ref);
+    let identity = require_identity(identity.as_ref().map(|e| &e.0))?;
+    let tenant_id = tenant_id_from_identity(Some(identity));
+    let owner = owner_of(identity);
     let svc = git_repo_service(&state)?;
 
     let diff_text = svc

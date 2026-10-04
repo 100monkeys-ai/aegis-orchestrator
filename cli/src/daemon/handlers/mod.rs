@@ -3,9 +3,10 @@
 //! HTTP handler modules for the daemon server.
 
 use aegis_orchestrator_core::domain::{
-    iam::{resolve_effective_tenant, IdentityKind, UserIdentity},
+    iam::{resolve_effective_tenant, IdentityKind, UserIdentity, ZaruTier},
     tenant::TenantId,
 };
+use axum::{http::StatusCode, Json};
 
 pub(crate) mod admin;
 pub(crate) mod agents;
@@ -56,6 +57,40 @@ pub(crate) struct CortexQueryParams {
 }
 
 pub(crate) const TENANT_DELEGATION_HEADER: &str = "x-tenant-id";
+
+/// The caller's identity, or the refusal of a call that has none.
+///
+/// A handler that stores or reads by owner calls this after its scope check.
+/// No caller without an identity reaches it today: with `spec.iam` the IAM
+/// layer answers 401 first, and without it the empty `ScopeGuard` answers
+/// 403 (`router.rs`, `apply_request_auth_layers`). It refuses rather than
+/// inventing an owner, as AEGIS ADR-035's Update S3 refuses a call with no
+/// authenticated identity.
+pub(crate) fn require_identity(
+    identity: Option<&UserIdentity>,
+) -> Result<&UserIdentity, (StatusCode, Json<serde_json::Value>)> {
+    identity.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "authentication_required" })),
+        )
+    })
+}
+
+/// The owner a handler stores and reads by: the caller's own subject.
+pub(crate) fn owner_of(identity: &UserIdentity) -> String {
+    identity.sub.clone()
+}
+
+/// The Zaru tier a handler applies: a consumer's own tier; every other
+/// identity kind (operator, service account, tenant user) is not gated by a
+/// Zaru tier, so it is `Enterprise`.
+pub(crate) fn zaru_tier_of(identity: &UserIdentity) -> ZaruTier {
+    match &identity.identity_kind {
+        IdentityKind::ConsumerUser { zaru_tier, .. } => zaru_tier.clone(),
+        _ => ZaruTier::Enterprise,
+    }
+}
 
 pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
     match identity {
@@ -321,5 +356,27 @@ mod tests {
     fn is_operator_false_for_missing_identity() {
         // Fail-closed: unauthenticated callers are never operators.
         assert!(!is_operator(None));
+    }
+
+    /// AEGIS operations/known-defects-7: the volume, git, script and canvas
+    /// handlers wrote the literal owner "anonymous" for a caller with no
+    /// identity. They refuse such a call 401 and own by the caller's subject.
+    #[test]
+    fn a_call_with_no_identity_is_refused_and_never_given_an_owner() {
+        let (status, Json(body)) = require_identity(None).expect_err("no identity is refused");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "authentication_required" })
+        );
+
+        let consumer = consumer_user_identity();
+        let caller = require_identity(Some(&consumer)).expect("an identity is admitted");
+        assert_eq!(owner_of(caller), "user-1");
+        assert_eq!(zaru_tier_of(caller), ZaruTier::Free);
+        assert_eq!(
+            zaru_tier_of(&operator_identity(AegisRole::Operator)),
+            ZaruTier::Enterprise
+        );
     }
 }
