@@ -117,7 +117,18 @@ pub trait AttestationService: Send + Sync {
     /// - `container_id` is not a currently-running container for `execution_id`
     /// - `public_key_pem` is not a valid Ed25519 public key
     /// - JWT signing fails
-    async fn attest(&self, request: AttestationRequest) -> Result<AttestationResponse>;
+    async fn attest(&self, request: AttestationRequest) -> Result<AttestationResponse> {
+        self.attest_with_escalation(request, None).await
+    }
+
+    /// [`Self::attest`], with the session bound to the operator escalation
+    /// the caller's API key holds, when it holds one (AEGIS ADR-129 D14):
+    /// every call on such a session re-checks the escalation (D19).
+    async fn attest_with_escalation(
+        &self,
+        request: AttestationRequest,
+        operator_escalation: Option<crate::domain::seal_session::SealOperatorEscalation>,
+    ) -> Result<AttestationResponse>;
 }
 
 #[cfg(test)]

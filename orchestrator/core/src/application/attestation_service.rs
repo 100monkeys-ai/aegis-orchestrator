@@ -170,8 +170,12 @@ impl AttestationServiceImpl {
 
 #[async_trait]
 impl AttestationService for AttestationServiceImpl {
-    async fn attest(&self, request: AttestationRequest) -> Result<AttestationResponse> {
-        let result = self.attest_inner(request).await;
+    async fn attest_with_escalation(
+        &self,
+        request: AttestationRequest,
+        operator_escalation: Option<crate::domain::seal_session::SealOperatorEscalation>,
+    ) -> Result<AttestationResponse> {
+        let result = self.attest_inner(request, operator_escalation).await;
         if result.is_err() {
             metrics::counter!("aegis_seal_attestations_total", "result" => "failure").increment(1);
         }
@@ -180,7 +184,11 @@ impl AttestationService for AttestationServiceImpl {
 }
 
 impl AttestationServiceImpl {
-    async fn attest_inner(&self, request: AttestationRequest) -> Result<AttestationResponse> {
+    async fn attest_inner(
+        &self,
+        request: AttestationRequest,
+        operator_escalation: Option<crate::domain::seal_session::SealOperatorEscalation>,
+    ) -> Result<AttestationResponse> {
         let (agent_id, execution_id) = self.resolve_ids(&request)?;
 
         // 1. Verify the requesting container is running (ADR-035 §4.1).
@@ -338,7 +346,7 @@ impl AttestationServiceImpl {
         };
         let session_security_context_name = security_context.name.clone();
         let principal_subject = self.resolve_principal_subject(&request);
-        let session = SealSession::new(
+        let mut session = SealSession::new(
             agent_id,
             execution_id,
             public_key_bytes,
@@ -352,6 +360,9 @@ impl AttestationServiceImpl {
             request.workload_id.clone(),
             request.zaru_tier.clone(),
         );
+        if let Some(escalation) = operator_escalation {
+            session = session.with_operator_escalation(escalation);
+        }
         self.seal_session_repo.save(session).await?;
 
         // 4b. Pre-register session at the SEAL gateway (ADR-088 §A8).

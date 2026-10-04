@@ -346,6 +346,16 @@ models:
                 })
                 .cloned())
         }
+
+        async fn active_escalation(
+            &self,
+            _api_key_id: uuid::Uuid,
+        ) -> Result<
+            Option<aegis_orchestrator_core::domain::operator_escalation::OperatorEscalation>,
+            String,
+        > {
+            Ok(None)
+        }
     }
 
     fn key_row(key: &str, status: &str, user: &str) -> ApiKeyRow {

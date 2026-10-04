@@ -15,7 +15,7 @@
 //! by supplying the value in `args.tenant_id`; all other identity kinds
 //! must match the authenticated tenant exactly.
 
-use super::IdentityKind;
+use super::{AegisRole, IdentityKind};
 use crate::domain::tenant::TenantId;
 
 /// Authoritative tenant scope for a single tool dispatch.
@@ -33,6 +33,18 @@ pub struct TenantScope {
     /// ADR-100 service-account delegation when a tool argument supplies a
     /// `tenant_id` different from `authenticated_tenant`.
     pub identity_kind: IdentityKind,
+    /// The operator escalation the dispatch runs under, when its SEAL
+    /// session was attested by an escalated API key (AEGIS ADR-129 D14,
+    /// D17). `authenticated_tenant` is then the key's home tenant.
+    pub operator_escalation: Option<EscalationScope>,
+}
+
+/// What an active operator escalation adds to a dispatch (AEGIS ADR-129
+/// D17): reads of every tenant's executions, and, for `aegis:admin` alone,
+/// naming one other tenant in `tenant_id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EscalationScope {
+    pub aegis_role: AegisRole,
 }
 
 impl TenantScope {
@@ -42,7 +54,33 @@ impl TenantScope {
         Self {
             authenticated_tenant,
             identity_kind,
+            operator_escalation: None,
         }
+    }
+
+    /// The same scope, running under an active operator escalation.
+    pub fn with_operator_escalation(mut self, escalation: EscalationScope) -> Self {
+        self.operator_escalation = Some(escalation);
+        self
+    }
+
+    /// Whether the dispatch runs under an active operator escalation
+    /// (AEGIS ADR-129 D17: reads of any tenant's execution by its id, and
+    /// the all-tenant list).
+    pub fn is_escalated(&self) -> bool {
+        self.operator_escalation.is_some()
+    }
+
+    /// Whether the caller may name another tenant in `tenant_id` as an
+    /// escalated operator: `aegis:admin` only, the tool-path equivalent of
+    /// `X-Aegis-Tenant` (AEGIS ADR-129 D17; ADR-056).
+    pub fn may_name_tenant_as_admin(&self) -> bool {
+        matches!(
+            self.operator_escalation,
+            Some(EscalationScope {
+                aegis_role: AegisRole::Admin
+            })
+        )
     }
 
     /// Returns `true` when the caller is a service account permitted to

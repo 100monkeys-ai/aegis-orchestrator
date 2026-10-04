@@ -234,11 +234,29 @@ pub(crate) async fn revoke_api_key_handler(
     };
 
     match repo.revoke(id, &identity.sub).await {
-        Ok(true) => Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({"message": "API key revoked"})),
-        )
-            .into_response()),
+        Ok(true) => {
+            // AEGIS ADR-129 D19: revoking the key ends its escalation.
+            if let Some(escalations) = &state.operator_escalations {
+                if let Err(e) = escalations
+                    .end_for_api_key(
+                        id,
+                        aegis_orchestrator_core::domain::operator_escalation::EscalationEndReason::ApiKeyRevoked,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        api_key_id = %id,
+                        error = %e,
+                        "revoked API key's operator escalation could not be ended"
+                    );
+                }
+            }
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({"message": "API key revoked"})),
+            )
+                .into_response())
+        }
         Ok(false) => Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "API key not found or already revoked"})),
@@ -280,42 +298,69 @@ pub(crate) async fn validate_api_key_handler(
         }
     };
 
-    let repo = match &state.api_key_repo {
-        Some(r) => r.clone(),
-        None => {
+    let lookup = crate::daemon::api_key_identity::lookup_from_repo(
+        state.api_key_repo.as_ref(),
+        state.operator_escalations.as_ref(),
+    );
+    let (status, body) = validate_answer(lookup.as_deref(), token).await;
+    (status, Json(body)).into_response()
+}
+
+/// The validate route's answer for `token` (AEGIS ADR-093; ADR-129 D14 and
+/// the Update's U7): the key's owner, tenant, scopes and tier; its stored
+/// `aegis_role`; and, while a key with no stored role holds an active
+/// operator escalation, the escalation's `aegis_role` and
+/// `operator_escalation: { expires_at }`.
+pub(crate) async fn validate_answer(
+    lookup: Option<&dyn crate::daemon::api_key_identity::ApiKeyLookup>,
+    token: &str,
+) -> (StatusCode, serde_json::Value) {
+    let Some(lookup) = lookup else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "API key repository not configured"}),
+        );
+    };
+    let row = match lookup.find_active_by_hash(&hash_key(token)).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "API key repository not configured"})),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({"error": "Invalid or expired API key"}),
             )
-                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": e}),
+            )
         }
     };
-
-    let key_hash = hash_key(token);
-
-    match repo.find_by_key_hash(&key_hash).await {
-        Ok(Some(row)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "user_id": row.user_id,
-                "tenant_id": row.tenant_id,
-                "aegis_role": row.aegis_role,
-                "scopes": row.scopes,
-                "zaru_tier": row.zaru_tier,
-            })),
-        )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid or expired API key"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    let escalation = if row.aegis_role.is_none() {
+        match lookup.active_escalation(row.id).await {
+            Ok(escalation) => escalation,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"error": e}),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let mut body = serde_json::json!({
+        "user_id": row.user_id,
+        "tenant_id": row.tenant_id,
+        "aegis_role": row.aegis_role,
+        "scopes": row.scopes,
+        "zaru_tier": row.zaru_tier,
+    });
+    if let Some(escalation) = escalation {
+        body["aegis_role"] = serde_json::json!(escalation.aegis_role.as_claim_str());
+        body["operator_escalation"] = serde_json::json!({ "expires_at": escalation.expires_at });
     }
+    (StatusCode::OK, body)
 }
 
 #[cfg(test)]
@@ -442,5 +487,78 @@ mod tests {
             },
         };
         assert_eq!(identity_claim_columns(&tenant_user), (None, None));
+    }
+
+    /// AEGIS ADR-129 D14 and the Update's U7: `validate` answers
+    /// `operator_escalation` and the escalation's role only while the key
+    /// holds an active escalation; before it, after its end, and for a
+    /// second key of the same user, neither.
+    #[tokio::test]
+    async fn validate_answers_operator_escalation_only_while_active() {
+        use crate::daemon::api_key_identity::test_keys::{key_row, KeyTable};
+        use aegis_orchestrator_core::application::operator_escalation_service::{
+            OperatorEscalationService, RedeemingKey,
+        };
+        use aegis_orchestrator_core::domain::node_config::OperatorEscalationConfig;
+        use aegis_orchestrator_core::domain::operator_escalation::EscalationEndReason;
+        use aegis_orchestrator_core::infrastructure::repositories::postgres_operator_escalation::InMemoryOperatorEscalationRepository;
+
+        let escalations = Arc::new(OperatorEscalationService::new(
+            Arc::new(InMemoryOperatorEscalationRepository::new()),
+            OperatorEscalationConfig::default(),
+        ));
+        let sub = "c0ffee00-consumer";
+        let tenant = TenantId::for_consumer_user(sub)
+            .unwrap()
+            .as_str()
+            .to_string();
+        let first = key_row("aegis_first", sub, &tenant, None);
+        let second = key_row("aegis_second", sub, &tenant, None);
+        let table = KeyTable {
+            rows: vec![first.clone(), second.clone()],
+            escalations: Some(escalations.clone()),
+        };
+
+        let (status, body) = validate_answer(Some(&table), "aegis_first").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("operator_escalation").is_none(), "{body}");
+        assert!(body["aegis_role"].is_null(), "{body}");
+
+        let minted = escalations
+            .mint("system-sub", sub, AegisRole::Operator)
+            .await
+            .unwrap();
+        let escalation = escalations
+            .redeem(
+                &RedeemingKey {
+                    api_key_id: first.id,
+                    user_id: sub.to_string(),
+                    has_stored_role: false,
+                },
+                &minted.code,
+            )
+            .await
+            .unwrap();
+
+        let (_, body) = validate_answer(Some(&table), "aegis_first").await;
+        assert_eq!(body["aegis_role"], "aegis:operator", "{body}");
+        assert_eq!(
+            body["operator_escalation"]["expires_at"],
+            serde_json::json!(escalation.expires_at),
+            "{body}"
+        );
+        let (_, other) = validate_answer(Some(&table), "aegis_second").await;
+        assert!(
+            other.get("operator_escalation").is_none(),
+            "a second key of the same user holds nothing: {other}"
+        );
+
+        escalations
+            .end_for_api_key(first.id, EscalationEndReason::AgentRelease)
+            .await
+            .unwrap();
+        let (_, body) = validate_answer(Some(&table), "aegis_first").await;
+        assert!(body.get("operator_escalation").is_none(), "{body}");
+        assert!(body["aegis_role"].is_null(), "{body}");
     }
 }

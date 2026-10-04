@@ -13,7 +13,9 @@ impl ToolInvocationService {
     ///    the value and return it.
     /// 3. If present and **different**, reject with
     ///    [`SealSessionError::TenantMismatch`] — **except** when the
-    ///    caller is a `ServiceAccount`, which may delegate per ADR-100.
+    ///    caller is a `ServiceAccount`, which may delegate per ADR-100, or an
+    ///    `aegis:admin` under an active operator escalation (AEGIS ADR-129
+    ///    D17, the tool-path equivalent of `X-Aegis-Tenant`).
     ///
     /// On acceptance, the canonical `tenant_id` is also written back into
     /// `args` (overwriting any legacy `tenant` key normalization) so that
@@ -36,7 +38,10 @@ impl ToolInvocationService {
                         "invalid tenant identifier '{raw}': {e}"
                     ))
                 })?;
-                if parsed == scope.authenticated_tenant || scope.may_delegate() {
+                if parsed == scope.authenticated_tenant
+                    || scope.may_delegate()
+                    || scope.may_name_tenant_as_admin()
+                {
                     parsed
                 } else {
                     return Err(SealSessionError::TenantMismatch {
@@ -105,7 +110,29 @@ impl ToolInvocationService {
             edge_fleet_dispatcher: None,
             edge_fleet_cancel: None,
             tool_approval_service: None,
+            operator_escalations: None,
+            execution_repository: None,
         }
+    }
+
+    /// AEGIS ADR-129: re-check and audit the operator escalation of every
+    /// session attested under one.
+    pub fn with_operator_escalations(
+        mut self,
+        service: Arc<crate::application::operator_escalation_service::OperatorEscalationService>,
+    ) -> Self {
+        self.operator_escalations = Some(service);
+        self
+    }
+
+    /// AEGIS ADR-129 D17: the execution store the escalated all-tenant
+    /// `aegis.task.list` reads.
+    pub fn with_execution_repository(
+        mut self,
+        repository: Arc<dyn crate::domain::repository::ExecutionRepository>,
+    ) -> Self {
+        self.execution_repository = Some(repository);
+        self
     }
 
     /// AEGIS ADR-126: enable the approval gate. A call of a tool the router
@@ -331,6 +358,13 @@ impl ToolInvocationService {
         ToolInputContract::validate(&tool_name, &args)
             .map_err(SealSessionError::InvalidArguments)?;
 
+        // 2c. AEGIS ADR-129 D19: a session attested under an operator
+        // escalation runs a call only while that escalation is active,
+        // checked here at dispatch beside the session's policy evaluation.
+        // A call dispatched before the end runs to its own completion; one
+        // arriving after it is refused `operator_escalation_expired`.
+        let escalation = self.active_session_escalation(&session).await?;
+
         // 3. Get security context and tenant_id from the session.
         let security_context = session.security_context;
 
@@ -368,7 +402,16 @@ impl ToolInvocationService {
                 .unwrap_or(crate::domain::iam::ZaruTier::Free),
                 tenant_id: tenant_id.clone(),
             });
-        let tenant_scope = TenantScope::new(tenant_id.clone(), scope_identity_kind);
+        let mut tenant_scope = TenantScope::new(tenant_id.clone(), scope_identity_kind);
+        if let Some(escalation) = &escalation {
+            tenant_scope = tenant_scope.with_operator_escalation(
+                crate::domain::iam::tenant_scope::EscalationScope {
+                    aegis_role: escalation.aegis_role.clone(),
+                },
+            );
+            self.audit_escalated_call(escalation, &tool_name, &args, &tenant_scope)
+                .await?;
+        }
 
         // 7. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
         let result = self
@@ -392,6 +435,91 @@ impl ToolInvocationService {
                 "status": "dispatch_required",
                 "action": format!("{:?}", action)
             })),
+        }
+    }
+
+    /// The active operator escalation `session` was attested under, if any
+    /// (AEGIS ADR-129 D19). A session bound to an escalation that has ended,
+    /// or on a node without the escalation service, is refused.
+    async fn active_session_escalation(
+        &self,
+        session: &crate::domain::seal_session::SealSession,
+    ) -> Result<Option<crate::domain::operator_escalation::OperatorEscalation>, SealSessionError>
+    {
+        use crate::application::operator_escalation_service::OperatorEscalationError;
+        let Some(binding) = &session.operator_escalation else {
+            return Ok(None);
+        };
+        let service = self
+            .operator_escalations
+            .as_ref()
+            .ok_or(SealSessionError::OperatorEscalationExpired)?;
+        match service.check_active(binding.escalation_id).await {
+            Ok(escalation) => Ok(Some(escalation)),
+            Err(OperatorEscalationError::Expired) => {
+                Err(SealSessionError::OperatorEscalationExpired)
+            }
+            Err(e) => Err(SealSessionError::InternalError(format!(
+                "operator escalation check failed: {e}"
+            ))),
+        }
+    }
+
+    /// Audit a call made under an operator escalation (AEGIS ADR-129 D18):
+    /// the tool and the tenant it acts on, `*` when an escalated read can
+    /// reach every tenant (D17). A call naming another tenant also emits
+    /// `TenantEvent::AdminCrossTenantAccess` (ADR-056: non-optional). An
+    /// audit row that cannot be written refuses the call.
+    async fn audit_escalated_call(
+        &self,
+        escalation: &crate::domain::operator_escalation::OperatorEscalation,
+        tool_name: &str,
+        args: &Value,
+        scope: &TenantScope,
+    ) -> Result<(), SealSessionError> {
+        let named = args
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("tenant").and_then(|v| v.as_str()));
+        let target = match named {
+            Some(tenant) => tenant.to_string(),
+            None if Self::escalated_read_reaches_every_tenant(tool_name, args) => "*".to_string(),
+            None => scope.authenticated_tenant.as_str().to_string(),
+        };
+        if let Some(named) = named {
+            if let Ok(target_tenant) = TenantId::from_string(named) {
+                if target_tenant != scope.authenticated_tenant && scope.may_name_tenant_as_admin() {
+                    self.event_bus.publish_tenant_event(
+                        crate::domain::events::TenantEvent::AdminCrossTenantAccess {
+                            admin_identity: escalation.system_sub.clone(),
+                            target_tenant_id: target_tenant,
+                            accessed_at: Utc::now(),
+                        },
+                    );
+                }
+            }
+        }
+        let service = self
+            .operator_escalations
+            .as_ref()
+            .ok_or(SealSessionError::OperatorEscalationExpired)?;
+        service
+            .audit_tool_call(escalation, tool_name, &target)
+            .await
+            .map_err(|e| {
+                SealSessionError::InternalError(format!("operator escalation audit failed: {e}"))
+            })
+    }
+
+    /// The reads an active escalation widens to every tenant when no
+    /// `tenant_id` is named (AEGIS ADR-129 D17): `aegis.task.list` without
+    /// an `agent_id`, and `aegis.task.status`, `aegis.task.logs` and
+    /// `aegis.workflow.logs` by execution id.
+    pub(super) fn escalated_read_reaches_every_tenant(tool_name: &str, args: &Value) -> bool {
+        match tool_name {
+            "aegis.task.list" => args.get("agent_id").is_none(),
+            "aegis.task.status" | "aegis.task.logs" | "aegis.workflow.logs" => true,
+            _ => false,
         }
     }
 

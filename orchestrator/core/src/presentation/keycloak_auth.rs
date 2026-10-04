@@ -77,6 +77,19 @@ where
     }
 }
 
+/// The validated JWT's full claims, inserted beside the identity wherever
+/// the middleware attaches one. The operator escalation's routes read the
+/// token's `azp` and `consumer_sub` from it (AEGIS ADR-129 D10, D13).
+#[derive(Clone, Debug, Default)]
+pub struct TokenClaims(pub serde_json::Value);
+
+impl TokenClaims {
+    /// A string claim, if present.
+    pub fn str_claim(&self, name: &str) -> Option<&str> {
+        self.0.get(name).and_then(|v| v.as_str())
+    }
+}
+
 /// Paths exempt from IAM/OIDC JWT auth.
 /// These endpoints use other auth mechanisms (SEAL attestation, HMAC, or are unauthenticated).
 const EXEMPT_PATH_PREFIXES: &[&str] = &[
@@ -90,6 +103,15 @@ const EXEMPT_PATH_PREFIXES: &[&str] = &[
     // the lookup `/v1/seal/attest` uses; anything else is 401 (Zaru ADR-0049
     // D4, AEGIS ADR-124's Update of 2026-10-01).
     "/v1/llm/aliases",
+    // Authenticated by their own handlers
+    // (`cli/src/daemon/handlers/operator_escalations.rs`, AEGIS ADR-129):
+    // the operator web interface's routes take a JWT, whose identity and
+    // claims this middleware still attaches, and answer 403 to anything
+    // else, an `aegis_*` key included (D13); the redemption routes take an
+    // `aegis_*` key and refuse everything else `escalation_requires_api_key`
+    // (D11).
+    "/v1/admin/operator-escalation",
+    "/v1/operator-escalations",
     "/v1/seal/attest",
     "/v1/seal/invoke",
     "/v1/seal/tools",
@@ -100,7 +122,8 @@ const EXEMPT_PATH_PREFIXES: &[&str] = &[
 /// scopes) of a valid JWT, but refuses nothing: a request with no token, an
 /// `aegis_*` key or an invalid token passes with no identity, and the
 /// path's handler decides.
-const JWT_IDENTITY_ON_EXEMPT_PATH_PREFIXES: &[&str] = &["/v1/llm/aliases"];
+const JWT_IDENTITY_ON_EXEMPT_PATH_PREFIXES: &[&str] =
+    &["/v1/llm/aliases", "/v1/admin/operator-escalation"];
 
 /// Whether an exempt path still receives a valid JWT's identity.
 fn attaches_jwt_identity_when_exempt(path: &str) -> bool {
@@ -147,6 +170,9 @@ async fn attach_jwt_identity_if_valid(
                 .unwrap_or("");
             let scopes: Vec<String> = scope_str.split_whitespace().map(String::from).collect();
             request.extensions_mut().insert(ScopeGuard(scopes));
+            request
+                .extensions_mut()
+                .insert(TokenClaims(validated.raw_claims));
         }
         Err(e) => {
             warn!(route = %route, error = %e, "HTTP JWT validation failed");
@@ -225,6 +251,9 @@ pub async fn iam_auth_middleware(
                 .unwrap_or("");
             let scopes: Vec<String> = scope_str.split_whitespace().map(String::from).collect();
             request.extensions_mut().insert(ScopeGuard(scopes));
+            request
+                .extensions_mut()
+                .insert(TokenClaims(validated.raw_claims));
             next.run(request).await
         }
         Err(e) => {
@@ -285,6 +314,31 @@ mod tests {
                 "{path} keeps the exempt behaviour it had"
             );
         }
+    }
+
+    /// AEGIS ADR-129: the operator web interface's escalation routes are
+    /// exempt and still receive a JWT's identity (their handler answers 403
+    /// to an API key, D13); the redemption routes are exempt and receive no
+    /// JWT identity (their handler takes an API key only, D11).
+    #[test]
+    fn operator_escalation_routes_authenticate_themselves() {
+        for path in [
+            "/v1/admin/operator-escalation-codes",
+            "/v1/admin/operator-escalations",
+            "/v1/admin/operator-escalations/some-id",
+            "/v1/admin/operator-escalations/end-for-operator",
+        ] {
+            assert!(is_exempt(path), "{path}");
+            assert!(attaches_jwt_identity_when_exempt(path), "{path}");
+        }
+        for path in [
+            "/v1/operator-escalations",
+            "/v1/operator-escalations/current",
+        ] {
+            assert!(is_exempt(path), "{path}");
+            assert!(!attaches_jwt_identity_when_exempt(path), "{path}");
+        }
+        assert!(!is_exempt("/v1/admin/rate-limits/overrides"));
     }
 
     /// Regression: the broad `/v1/executions` prefix was previously exempt,

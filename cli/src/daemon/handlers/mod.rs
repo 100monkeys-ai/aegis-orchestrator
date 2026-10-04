@@ -24,6 +24,7 @@ pub(crate) mod git_repo;
 pub(crate) mod health;
 pub(crate) mod llm;
 pub(crate) mod observability;
+pub(crate) mod operator_escalations;
 pub(crate) mod script;
 pub(crate) mod seal;
 pub(crate) mod stimulus;

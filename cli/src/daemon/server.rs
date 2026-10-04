@@ -1917,6 +1917,39 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tool_invocation_service_builder =
         tool_invocation_service_builder.with_tool_approvals(tool_approval_service);
 
+    // ─── Operator escalation (AEGIS ADR-129) ────────────────────────────────
+    // Codes and escalations live in PostgreSQL (migration 037) and every act
+    // is appended to admin_audit_log; a node without a database keeps them in
+    // process. The bounds are spec.iam.operator_escalation (D12). The sweep
+    // ends and audits escalations past their expires_at every minute (D19).
+    let operator_escalation_repo: Arc<
+        dyn aegis_orchestrator_core::domain::operator_escalation::OperatorEscalationRepository,
+    > = match db_pool.as_ref() {
+        Some(pool) => Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::postgres_operator_escalation::PostgresOperatorEscalationRepository::new(pool.clone()),
+        ),
+        None => Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::postgres_operator_escalation::InMemoryOperatorEscalationRepository::new(),
+        ),
+    };
+    let operator_escalations = Arc::new(
+        aegis_orchestrator_core::application::operator_escalation_service::OperatorEscalationService::new(
+            operator_escalation_repo,
+            config
+                .spec
+                .iam
+                .as_ref()
+                .map(|iam| iam.operator_escalation.clone())
+                .unwrap_or_default(),
+        ),
+    );
+    operator_escalations.clone().spawn_expiry_sweep(
+        aegis_orchestrator_core::application::operator_escalation_service::EXPIRY_SWEEP_INTERVAL,
+    );
+    tool_invocation_service_builder = tool_invocation_service_builder
+        .with_operator_escalations(operator_escalations.clone())
+        .with_execution_repository(execution_repo.clone());
+
     let tool_invocation_service = Arc::new(tool_invocation_service_builder);
 
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
@@ -2474,6 +2507,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Arc::new(aegis_orchestrator_core::infrastructure::repositories::PostgresApiKeyRepository::new(pool.clone()))
         }),
         iam_service: iam_service.clone(),
+        operator_escalations: Some(operator_escalations.clone()),
         tenant_provisioning_service,
         realm_repo: db_pool.as_ref().map(|pool| {
             Arc::new(

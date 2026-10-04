@@ -69,6 +69,9 @@ use crate::daemon::handlers::observability::{
     dashboard_summary_handler, get_stimulus_handler, list_security_incidents_handler,
     list_stimuli_handler, list_storage_violations_handler,
 };
+use crate::daemon::handlers::operator_escalations::{
+    operator_escalations_router, OperatorEscalationsState,
+};
 use crate::daemon::handlers::script::{
     create_script, delete_script, get_script, list_scripts, update_script,
 };
@@ -421,8 +424,24 @@ pub(crate) fn create_router(
         llm_aliases_router(LlmAliasesState {
             registry: app_state.llm_registry.clone(),
         }),
-        lookup_from_repo(app_state.api_key_repo.as_ref()),
+        lookup_from_repo(
+            app_state.api_key_repo.as_ref(),
+            app_state.operator_escalations.as_ref(),
+        ),
     ));
+
+    // Operator escalation (AEGIS ADR-129): the operator web interface mints
+    // a code, an API key redeems it, and either ends it. Exempt from the
+    // JWT-only IAM layer, which still attaches a valid JWT's identity and
+    // claims on the web interface's routes; the handlers admit exactly D13's
+    // token there and an `aegis_*` key on the redemption routes.
+    let router = router.merge(operator_escalations_router(OperatorEscalationsState {
+        service: app_state.operator_escalations.clone(),
+        api_keys: lookup_from_repo(
+            app_state.api_key_repo.as_ref(),
+            app_state.operator_escalations.as_ref(),
+        ),
+    }));
 
     // ADR-117 §F: mount `/v1/edge/*` whenever the edge bundle was constructed
     // (i.e. a Postgres pool is available). Pure-worker deployments without a

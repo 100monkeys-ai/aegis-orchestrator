@@ -75,6 +75,11 @@ pub(crate) struct AppState {
         Arc<aegis_orchestrator_core::infrastructure::repositories::PostgresApiKeyRepository>,
     >,
     pub(crate) iam_service: Option<Arc<dyn IdentityProvider>>,
+    /// The operator escalation (AEGIS ADR-129): its routes, the validate
+    /// answer, the API-key lookup and the key revocation read it.
+    pub(crate) operator_escalations: Option<
+        Arc<aegis_orchestrator_core::application::operator_escalation_service::OperatorEscalationService>,
+    >,
     pub(crate) tenant_provisioning_service: Option<
         Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
     >,

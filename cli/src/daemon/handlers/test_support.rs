@@ -21,28 +21,34 @@ use axum::Router;
 
 use crate::daemon::router::apply_request_auth_layers;
 
-/// Resolves a bearer token to a fixed identity and `scope` claim, the way
-/// `StandardIamService` resolves a validated JWT. Unknown tokens fail
-/// validation.
+/// Resolves a bearer token to a fixed identity, `scope` claim and any further
+/// raw claims (`azp`, `consumer_sub`), the way `StandardIamService` resolves
+/// a validated JWT. Unknown tokens fail validation.
 pub(crate) struct TokenTableIdentityProvider {
-    entries: HashMap<String, (UserIdentity, String)>,
+    entries: HashMap<String, (UserIdentity, String, serde_json::Value)>,
 }
 
 #[async_trait::async_trait]
 impl IdentityProvider for TokenTableIdentityProvider {
     async fn validate_token(&self, raw_jwt: &str) -> Result<ValidatedIdentityToken, IamError> {
-        let (identity, scopes) =
+        let (identity, scopes, extra) =
             self.entries
                 .get(raw_jwt)
                 .cloned()
                 .ok_or_else(|| IamError::MissingClaim {
                     claim: "sub".to_string(),
                 })?;
+        let mut raw_claims = serde_json::json!({ "scope": scopes });
+        if let (Some(raw), Some(extra)) = (raw_claims.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                raw.insert(k.clone(), v.clone());
+            }
+        }
         Ok(ValidatedIdentityToken {
             identity,
             issued_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
-            raw_claims: serde_json::json!({ "scope": scopes }),
+            raw_claims,
         })
     }
     fn resolve_tier(&self, _token: &ValidatedIdentityToken) -> Result<ZaruTier, IamError> {
@@ -65,7 +71,31 @@ pub(crate) fn identity_provider(
     Arc::new(TokenTableIdentityProvider {
         entries: entries
             .iter()
-            .map(|(token, id, scopes)| (token.to_string(), (id.clone(), scopes.to_string())))
+            .map(|(token, id, scopes)| {
+                (
+                    token.to_string(),
+                    (id.clone(), scopes.to_string(), serde_json::Value::Null),
+                )
+            })
+            .collect(),
+    })
+}
+
+/// A provider for `(bearer token, identity, space-separated scopes, further
+/// raw claims)` rows: the claims a real token carries beside its identity,
+/// such as `azp` and `consumer_sub` (AEGIS ADR-129 D13).
+pub(crate) fn identity_provider_with_claims(
+    entries: &[(&str, UserIdentity, &str, serde_json::Value)],
+) -> Arc<dyn IdentityProvider> {
+    Arc::new(TokenTableIdentityProvider {
+        entries: entries
+            .iter()
+            .map(|(token, id, scopes, extra)| {
+                (
+                    token.to_string(),
+                    (id.clone(), scopes.to_string(), extra.clone()),
+                )
+            })
             .collect(),
     })
 }

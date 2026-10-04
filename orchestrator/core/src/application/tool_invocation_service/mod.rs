@@ -166,4 +166,12 @@ pub struct ToolInvocationService {
     /// ADR-126: the approval gate; `None` leaves every tool ungated.
     tool_approval_service:
         Option<Arc<crate::application::tool_approval_service::ToolApprovalService>>,
+    /// AEGIS ADR-129: the operator escalation, re-checked at every call on a
+    /// session attested under one (D19) and audited (D18). A session bound
+    /// to an escalation is refused when this is `None`.
+    operator_escalations:
+        Option<Arc<crate::application::operator_escalation_service::OperatorEscalationService>>,
+    /// AEGIS ADR-129 D17: the execution store, for the all-tenant list an
+    /// escalated `aegis.task.list` reads.
+    execution_repository: Option<Arc<dyn repository::ExecutionRepository>>,
 }

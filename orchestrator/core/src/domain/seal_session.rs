@@ -92,6 +92,16 @@ pub enum SessionStatus {
     Revoked { reason: String },
 }
 
+/// The operator escalation a SEAL session was attested under (AEGIS ADR-129
+/// D14): which escalation to re-check at every call (D19) and the role it
+/// grants. The session's own `tenant_id` is the holding key's home tenant
+/// (the Update's U1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SealOperatorEscalation {
+    pub escalation_id: uuid::Uuid,
+    pub aegis_role: crate::domain::iam::AegisRole,
+}
+
 /// Errors that can occur when evaluating an SEAL envelope against a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SealSessionError {
@@ -139,6 +149,10 @@ pub enum SealSessionError {
     /// the LLM receives the error as a normal tool-call failure and can
     /// adapt (per ADR-005 iterative refinement).
     UpstreamUnavailable(String),
+    /// The session was attested under an operator escalation that has since
+    /// ended (AEGIS ADR-129 D19): a call arriving after the end is refused.
+    /// Displayed as the record's error code, `operator_escalation_expired`.
+    OperatorEscalationExpired,
 }
 
 impl std::fmt::Display for SealSessionError {
@@ -167,6 +181,7 @@ impl std::fmt::Display for SealSessionError {
             Self::UpstreamUnavailable(msg) => {
                 write!(f, "Upstream service unavailable: {msg}")
             }
+            Self::OperatorEscalationExpired => write!(f, "operator_escalation_expired"),
         }
     }
 }
@@ -263,6 +278,11 @@ pub struct SealSession {
     /// Tenant that owns this session, extracted from the JWT claims at attestation time.
     pub tenant_id: TenantId,
 
+    /// The operator escalation this session was attested under, when its API
+    /// key held one (AEGIS ADR-129 D14). Every call on the session re-checks
+    /// that the escalation is still active (D19).
+    pub operator_escalation: Option<SealOperatorEscalation>,
+
     /// Session status
     pub status: SessionStatus,
 
@@ -296,10 +316,18 @@ impl SealSession {
             workload_id: None,
             zaru_tier: None,
             tenant_id,
+            operator_escalation: None,
             status: SessionStatus::Active,
             created_at: now,
             expires_at: now + chrono::Duration::hours(SESSION_TTL_HOURS),
         }
+    }
+
+    /// Bind the session to the operator escalation its API key held at
+    /// attestation (AEGIS ADR-129 D14).
+    pub fn with_operator_escalation(mut self, escalation: SealOperatorEscalation) -> Self {
+        self.operator_escalation = Some(escalation);
+        self
     }
 
     /// Attach optional upstream identity metadata captured during attestation.

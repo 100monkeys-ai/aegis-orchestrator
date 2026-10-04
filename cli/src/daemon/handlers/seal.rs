@@ -14,7 +14,10 @@ use aegis_orchestrator_core::domain::iam::{IdentityKind, RealmKind, UserIdentity
 use aegis_orchestrator_core::domain::shared_kernel::ExecutionId;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 
-use crate::daemon::api_key_identity::{identity_from_api_key, key_hash_prefix, lookup_from_repo};
+use aegis_orchestrator_core::domain::operator_escalation::OperatorEscalation;
+use aegis_orchestrator_core::domain::seal_session::SealOperatorEscalation;
+
+use crate::daemon::api_key_identity::{key_hash_prefix, lookup_from_repo, resolve_api_key};
 use crate::daemon::state::AppState;
 
 #[derive(serde::Deserialize)]
@@ -289,7 +292,7 @@ where
 async fn authenticate_attest_request(
     state: &AppState,
     headers: &HeaderMap,
-) -> Option<UserIdentity> {
+) -> Option<AttestCaller> {
     let raw_header = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         Some(v) => v,
         None => {
@@ -324,11 +327,21 @@ async fn authenticate_attest_request(
             key_prefix = %key_hash_prefix(raw),
             "attempting API key validation"
         );
-        return identity_from_api_key(
-            lookup_from_repo(state.api_key_repo.as_ref()).as_deref(),
+        let resolved = resolve_api_key(
+            lookup_from_repo(
+                state.api_key_repo.as_ref(),
+                state.operator_escalations.as_ref(),
+            )
+            .as_deref(),
             raw,
         )
-        .await;
+        .await?;
+        return Some(AttestCaller {
+            identity: resolved.identity,
+            escalation: resolved
+                .escalation
+                .map(|escalation| (escalation, resolved.home_tenant)),
+        });
     }
     tracing::info!(
         target: "aegis::seal::attest",
@@ -362,7 +375,79 @@ async fn authenticate_attest_request(
         realm = %validated.identity.realm_slug,
         "JWT validated successfully"
     );
-    Some(validated.identity)
+    Some(AttestCaller {
+        identity: validated.identity,
+        escalation: None,
+    })
+}
+
+/// The authenticated caller of `/v1/seal/attest`: its identity and, for an
+/// `aegis_*` key holding an active operator escalation, the escalation with
+/// the key's home tenant (AEGIS ADR-129 D14; the Update's U1).
+pub(crate) struct AttestCaller {
+    pub(crate) identity: UserIdentity,
+    pub(crate) escalation: Option<(OperatorEscalation, String)>,
+}
+
+/// What a session is attested as: its tenant, realm and user, and the
+/// escalation it is bound to.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AttestBinding {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) realm: RealmKind,
+    pub(crate) user_id: Option<String>,
+    pub(crate) escalation: Option<SealOperatorEscalation>,
+}
+
+/// Resolve what the session is attested as (AEGIS ADR-129 D14). An escalated
+/// key attests on its home tenant, as its consumer `sub`, in the system realm
+/// (so `aegis-system-operator` is admitted by the context ownership check),
+/// bound to the escalation, whatever the body names. Every other caller
+/// resolves as [`resolve_attest_tenant`] says, in its own realm: a key with
+/// no stored role and no escalation stays a consumer and is refused the
+/// operator context; a role-bearing key is unchanged (D15).
+pub(crate) async fn attest_binding<F, Fut>(
+    lookup_execution_tenant: F,
+    caller: Option<&AttestCaller>,
+    request: &HttpAttestationRequest,
+) -> Result<AttestBinding, AttestTenantError>
+where
+    F: FnOnce(ExecutionId) -> Fut,
+    Fut: std::future::Future<Output = Result<TenantId, ()>>,
+{
+    if let Some(AttestCaller {
+        escalation: Some((escalation, home_tenant)),
+        ..
+    }) = caller
+    {
+        let tenant_id = TenantId::from_realm_slug(home_tenant).map_err(|_| {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                stored_tenant_id = %home_tenant,
+                "escalated key's home tenant is not a valid realm slug"
+            );
+            AttestTenantError::Unauthenticated
+        })?;
+        return Ok(AttestBinding {
+            tenant_id,
+            realm: RealmKind::System,
+            user_id: Some(escalation.consumer_sub.clone()),
+            escalation: Some(SealOperatorEscalation {
+                escalation_id: escalation.id,
+                aegis_role: escalation.aegis_role.clone(),
+            }),
+        });
+    }
+    let identity = caller.map(|c| &c.identity);
+    let tenant_id = resolve_attest_tenant(lookup_execution_tenant, identity, request).await?;
+    Ok(AttestBinding {
+        tenant_id,
+        realm: identity
+            .map(|id| id.realm_kind())
+            .unwrap_or(RealmKind::Consumer),
+        user_id: request.user_id.clone(),
+        escalation: None,
+    })
 }
 
 pub(crate) async fn attest_seal_handler(
@@ -383,7 +468,7 @@ pub(crate) async fn attest_seal_handler(
     // JWTs (Zaru consumer flow) and `aegis_*` API keys (SDK flow). The
     // global middleware only knows JWTs, so we authenticate in-handler
     // and derive a `UserIdentity` from whichever credential was supplied.
-    let identity = authenticate_attest_request(&state, &headers).await;
+    let caller = authenticate_attest_request(&state, &headers).await;
 
     let lookup = |exec_id: ExecutionId| {
         let svc = state.execution_service.clone();
@@ -394,8 +479,8 @@ pub(crate) async fn attest_seal_handler(
                 .map_err(|_| ())
         }
     };
-    let tenant_id = match resolve_attest_tenant(lookup, identity.as_ref(), &request).await {
-        Ok(t) => t,
+    let binding = match attest_binding(lookup, caller.as_ref(), &request).await {
+        Ok(b) => b,
         Err(err) => {
             return (
                 err.http_status(),
@@ -405,14 +490,11 @@ pub(crate) async fn attest_seal_handler(
         }
     };
 
-    // Derive realm from the authenticated identity rather than defaulting
-    // to Consumer; this preserves the strongly-typed classification per
-    // ADR-097 and ensures `aegis-system-*` SecurityContext ownership
-    // checks see the right realm for operator-issued attestations.
-    let realm = identity
-        .as_ref()
-        .map(|id| id.realm_kind())
-        .unwrap_or(RealmKind::Consumer);
+    // The realm is derived from the authenticated identity rather than
+    // defaulting to Consumer (`attest_binding`); this preserves the
+    // strongly-typed classification per ADR-097 and ensures
+    // `aegis-system-*` SecurityContext ownership checks see the right realm
+    // for operator-issued attestations.
 
     let internal_req =
         aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {
@@ -422,16 +504,20 @@ pub(crate) async fn attest_seal_handler(
             public_key_pem: request.public_key.clone(),
             security_context: request.security_context.clone(),
             principal_subject: request.principal_subject.clone(),
-            user_id: request.user_id.clone(),
+            user_id: binding.user_id.clone(),
             workload_id: request.workload_id.clone(),
             zaru_tier: request.zaru_tier.clone(),
-            tenant_id,
-            realm,
+            tenant_id: binding.tenant_id.clone(),
+            realm: binding.realm.clone(),
             task_summary: request.task_summary.clone(),
         };
 
     let tenant_for_log = internal_req.tenant_id.as_str().to_string();
-    match state.attestation_service.attest(internal_req).await {
+    match state
+        .attestation_service
+        .attest_with_escalation(internal_req, binding.escalation)
+        .await
+    {
         Ok(res) => {
             tracing::info!(
                 target: "aegis::seal::attest",
@@ -496,6 +582,18 @@ pub(crate) async fn invoke_seal_handler(
     // and extracting any required claims (such as agent_id) from it as appropriate.
     match state.tool_invocation_service.invoke_tool(&envelope).await {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+        // AEGIS ADR-129 D19: the escalation the session was attested under
+        // has ended; answered as ADR-073 line 934 answers an expired system
+        // layer, 401.
+        Err(
+            e @ aegis_orchestrator_core::domain::seal_session::SealSessionError::OperatorEscalationExpired,
+        ) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -808,6 +906,137 @@ mod attest_tenant_resolution_tests {
         assert!(may_delegate(&operator_identity()));
         assert!(may_delegate(&service_account_identity()));
         assert!(!may_delegate(&consumer_identity("user-1")));
+    }
+}
+
+#[cfg(test)]
+mod operator_escalation_attest_tests {
+    //! AEGIS ADR-129 D14: what a session is attested as when its key holds
+    //! an operator escalation, and when it does not.
+    use super::*;
+    use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, ZaruTier};
+
+    const CONSUMER_SUB: &str = "7c3d0000-consumer";
+
+    fn req(security_context: &str) -> HttpAttestationRequest {
+        HttpAttestationRequest {
+            agent_id: None,
+            execution_id: None,
+            container_id: None,
+            public_key: "k".to_string(),
+            security_context: Some(security_context.to_string()),
+            principal_subject: None,
+            user_id: None,
+            workload_id: Some("zaru:u:s".to_string()),
+            zaru_tier: None,
+            // The body naming another tenant changes nothing for an
+            // escalated key.
+            tenant_id: Some("u-someoneelse".to_string()),
+            task_summary: None,
+        }
+    }
+
+    fn home() -> TenantId {
+        TenantId::for_consumer_user(CONSUMER_SUB).unwrap()
+    }
+
+    fn no_lookup() -> impl FnOnce(
+        ExecutionId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TenantId, ()>> + Send>,
+    > {
+        |_| Box::pin(async { Err(()) })
+    }
+
+    fn escalation(role: AegisRole) -> OperatorEscalation {
+        let now = chrono::Utc::now();
+        OperatorEscalation {
+            id: uuid::Uuid::new_v4(),
+            api_key_id: uuid::Uuid::new_v4(),
+            consumer_sub: CONSUMER_SUB.to_string(),
+            system_sub: "system-sub".to_string(),
+            aegis_role: role,
+            code_id: uuid::Uuid::new_v4(),
+            started_at: now,
+            expires_at: now + chrono::Duration::seconds(1800),
+            ended_at: None,
+            end_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn escalated_key_attests_operator_context_on_home_tenant() {
+        let e = escalation(AegisRole::Operator);
+        let caller = AttestCaller {
+            identity: UserIdentity {
+                sub: CONSUMER_SUB.to_string(),
+                realm_slug: "aegis-system".to_string(),
+                email: None,
+                email_verified: false,
+                name: None,
+                identity_kind: IdentityKind::Operator {
+                    aegis_role: AegisRole::Operator,
+                },
+            },
+            escalation: Some((e.clone(), home().as_str().to_string())),
+        };
+        let binding = attest_binding(no_lookup(), Some(&caller), &req("aegis-system-operator"))
+            .await
+            .expect("an escalated key attests; no OperatorMissingTarget");
+        assert_eq!(
+            binding,
+            AttestBinding {
+                tenant_id: home(),
+                realm: RealmKind::System,
+                user_id: Some(CONSUMER_SUB.to_string()),
+                escalation: Some(SealOperatorEscalation {
+                    escalation_id: e.id,
+                    aegis_role: AegisRole::Operator,
+                }),
+            }
+        );
+        assert!(
+            aegis_orchestrator_core::domain::security_context::validate_context_ownership(
+                "aegis-system-operator",
+                &binding.tenant_id,
+                &binding.realm,
+            )
+            .is_ok(),
+            "the operator context is admitted to the escalated session"
+        );
+    }
+
+    #[tokio::test]
+    async fn unescalated_consumer_key_refused_operator_context() {
+        let caller = AttestCaller {
+            identity: UserIdentity {
+                sub: CONSUMER_SUB.to_string(),
+                realm_slug: "zaru-consumer".to_string(),
+                email: None,
+                email_verified: false,
+                name: None,
+                identity_kind: IdentityKind::ConsumerUser {
+                    zaru_tier: ZaruTier::Pro,
+                    tenant_id: home(),
+                },
+            },
+            escalation: None,
+        };
+        let binding = attest_binding(no_lookup(), Some(&caller), &req("aegis-system-operator"))
+            .await
+            .unwrap();
+        assert_eq!(binding.realm, RealmKind::Consumer);
+        assert_eq!(binding.tenant_id, home());
+        assert!(binding.escalation.is_none());
+        assert!(
+            aegis_orchestrator_core::domain::security_context::validate_context_ownership(
+                "aegis-system-operator",
+                &binding.tenant_id,
+                &binding.realm,
+            )
+            .is_err(),
+            "whatever the body claims, a consumer key gets no operator context"
+        );
     }
 }
 
