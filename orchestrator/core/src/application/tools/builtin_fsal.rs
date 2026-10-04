@@ -1,11 +1,43 @@
 use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
+use crate::domain::fsal::FsalError;
 use crate::domain::fsal::{AegisFSAL, AegisFileHandle, CreateFsalFileRequest};
-use crate::domain::seal_session::SealSessionError;
+use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
+use crate::domain::storage::StorageError;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
+
+/// An FSAL error of a `fs.*` tool, answered by its variant and the caller's
+/// own `path` (AEGIS ADR-035, Update of 2026-10-04, R5). What the inner loop
+/// and the log see is the text it always had, `"<context>: <error>"`.
+fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
+    let answer = match &e {
+        FsalError::VolumeNotFound(_)
+        | FsalError::Storage(StorageError::FileNotFound(_))
+        | FsalError::Storage(StorageError::NotFound(_)) => {
+            CallerAnswer::NotFound(format!("Not found: '{path_arg}'."))
+        }
+        FsalError::Storage(StorageError::AlreadyExists(_)) => {
+            CallerAnswer::Conflict(format!("Conflict: '{path_arg}' already exists."))
+        }
+        FsalError::PathSanitization(_) | FsalError::Storage(StorageError::InvalidPath(_)) => {
+            CallerAnswer::InvalidArguments(format!(
+                "Invalid tool arguments: '{path_arg}' is not a valid path in a volume."
+            ))
+        }
+        FsalError::QuotaExceeded { .. }
+        | FsalError::Storage(StorageError::QuotaExceeded { .. }) => {
+            CallerAnswer::QuotaExceeded("Quota exceeded: the volume is full.".to_string())
+        }
+        FsalError::PolicyViolation(_) => CallerAnswer::PathNotAllowed(format!(
+            "Policy violation: '{path_arg}' is not permitted by your filesystem policy."
+        )),
+        _ => CallerAnswer::Internal(InternalFailure::Server),
+    };
+    SealSessionError::InternalError(format!("{context}: {e}")).answered(answer)
+}
 
 /// Strips the volume mount-point prefix from a container-absolute path.
 ///
@@ -44,7 +76,10 @@ pub async fn invoke_fs_tool(
         .find_by_execution_and_path(execution_id, path_arg)
         .or_else(|| volume_registry.find_primary_workspace_by_execution(execution_id))
         .ok_or_else(|| {
+            // Platform state, not the caller's: the execution's volume is the
+            // orchestrator's to register (AEGIS ADR-035, Update of 2026-10-04, R5).
             SealSessionError::NotFound(format!("No volume registered for execution {execution_id}"))
+                .answered(CallerAnswer::Internal(InternalFailure::Server))
         })?;
 
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
@@ -66,14 +101,12 @@ pub async fn invoke_fs_tool(
                     workflow_execution_id: None,
                 })
                 .await
-                .map_err(|e| {
-                    SealSessionError::InternalError(format!("FSAL create_file error: {e}"))
-                })?;
+                .map_err(|e| fsal_refusal("FSAL create_file error", path_arg, e))?;
 
             let bytes_written = fsal
                 .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
                 .await
-                .map_err(|e| SealSessionError::InternalError(format!("FSAL write error: {e}")))?;
+                .map_err(|e| fsal_refusal("FSAL write error", path_arg, e))?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
@@ -87,7 +120,7 @@ pub async fn invoke_fs_tool(
             let data = fsal
                 .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
                 .await
-                .map_err(|e| SealSessionError::InternalError(format!("FSAL read error: {e}")))?;
+                .map_err(|e| fsal_refusal("FSAL read error", path_arg, e))?;
 
             let content = String::from_utf8_lossy(&data).to_string();
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -111,7 +144,7 @@ pub async fn invoke_fs_tool(
                     None,
                 )
                 .await
-                .map_err(|e| SealSessionError::InternalError(format!("FSAL readdir error: {e}")))?;
+                .map_err(|e| fsal_refusal("FSAL readdir error", path_arg, e))?;
 
             let entries_json: Vec<serde_json::Value> = entries
                 .iter()
@@ -142,7 +175,7 @@ pub async fn invoke_fs_tool(
                 None,
             )
             .await
-            .map_err(|e| SealSessionError::InternalError(format!("FSAL create_dir error: {e}")))?;
+            .map_err(|e| fsal_refusal("FSAL create_dir error", path_arg, e))?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
@@ -167,9 +200,7 @@ pub async fn invoke_fs_tool(
                     None,
                 )
                 .await
-                .map_err(|e| {
-                    SealSessionError::InternalError(format!("FSAL delete_directory error: {e}"))
-                })?;
+                .map_err(|e| fsal_refusal("FSAL delete_directory error", path_arg, e))?;
             } else {
                 fsal.delete_file(
                     vol_ctx.execution_id,
@@ -181,9 +212,7 @@ pub async fn invoke_fs_tool(
                     None,
                 )
                 .await
-                .map_err(|e| {
-                    SealSessionError::InternalError(format!("FSAL delete_file error: {e}"))
-                })?;
+                .map_err(|e| fsal_refusal("FSAL delete_file error", path_arg, e))?;
             }
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -224,7 +253,7 @@ async fn invoke_edit(
     let data = fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
-        .map_err(|e| SealSessionError::InternalError(format!("Edit error (read): {e}")))?;
+        .map_err(|e| fsal_refusal("Edit error (read)", path_arg, e))?;
 
     let content = String::from_utf8_lossy(&data).to_string();
 
@@ -248,7 +277,7 @@ async fn invoke_edit(
     let _ = fsal
         .write(&handle, &path, &vol_ctx.policy, 0, new_content.as_bytes())
         .await
-        .map_err(|e| SealSessionError::InternalError(format!("Edit error (write): {e}")))?;
+        .map_err(|e| fsal_refusal("Edit error (write)", path_arg, e))?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",
@@ -270,7 +299,7 @@ async fn invoke_multi_edit(
     let data = fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
-        .map_err(|e| SealSessionError::InternalError(format!("Multi-edit error (read): {e}")))?;
+        .map_err(|e| fsal_refusal("Multi-edit error (read)", path_arg, e))?;
 
     let mut content = String::from_utf8(data)
         .map_err(|_| SealSessionError::InvalidArguments("File is not valid UTF-8".to_string()))?;
@@ -328,14 +357,12 @@ async fn invoke_multi_edit(
             workflow_execution_id: None,
         })
         .await
-        .map_err(|e| {
-            SealSessionError::InternalError(format!("Multi-edit error (truncate): {e}"))
-        })?;
+        .map_err(|e| fsal_refusal("Multi-edit error (truncate)", path_arg, e))?;
 
     let _ = fsal
         .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
         .await
-        .map_err(|e| SealSessionError::InternalError(format!("Multi-edit error (write): {e}")))?;
+        .map_err(|e| fsal_refusal("Multi-edit error (write)", path_arg, e))?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",

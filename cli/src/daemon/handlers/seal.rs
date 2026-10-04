@@ -15,7 +15,7 @@ use aegis_orchestrator_core::domain::shared_kernel::ExecutionId;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 
 use aegis_orchestrator_core::domain::operator_escalation::OperatorEscalation;
-use aegis_orchestrator_core::domain::seal_session::SealOperatorEscalation;
+use aegis_orchestrator_core::domain::seal_session::{SealOperatorEscalation, SealSessionError};
 
 use crate::daemon::api_key_identity::{key_hash_prefix, lookup_from_repo, resolve_api_key};
 use crate::daemon::state::AppState;
@@ -568,13 +568,12 @@ pub(crate) async fn invoke_seal_handler(
     let (protocol, timestamp) = match (request.protocol, request.timestamp) {
         (Some(p), Some(t)) => (p, t),
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "SEAL envelope requires both 'protocol' and 'timestamp' fields"
-                })),
-            )
-                .into_response();
+            return invoke_refusal_response(
+                &SealSessionError::MalformedPayload(
+                    "SEAL envelope requires both 'protocol' and 'timestamp' fields".to_string(),
+                ),
+                &request.payload,
+            );
         }
     };
 
@@ -590,26 +589,81 @@ pub(crate) async fn invoke_seal_handler(
     // and extracting any required claims (such as agent_id) from it as appropriate.
     match state.tool_invocation_service.invoke_tool(&envelope).await {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-        // AEGIS ADR-129 D19: the escalation the session was attested under
-        // has ended; answered as ADR-073 line 934 answers an expired system
-        // layer, 401.
-        Err(
-            e @ aegis_orchestrator_core::domain::seal_session::SealSessionError::OperatorEscalationExpired,
-        ) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": e.to_string()
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": e.to_string()
-            })),
-        )
-            .into_response(),
+        Err(e) => invoke_refusal_response(&e, &envelope.payload),
     }
+}
+
+/// The answer of `POST /v1/seal/invoke` to a refusal (AEGIS ADR-035, Update
+/// of 2026-10-04, R1 to R4): ADR-035's own error shape,
+/// `{"protocol","request_id","status","error":{"code","message","context","tool"}}`,
+/// with the status and stable code of [`SealSessionError::refusal`]. The
+/// route has no request id for a call, so one is minted here and is the
+/// correlation id: the log line carries it. An internal failure's detail is
+/// written only to the log, at error level; a caller-facing refusal is logged
+/// at info with its code and the refusal as the service built it. `tool` is the name the caller sent; `context` is
+/// null, because the answer is built from the error, which does not carry
+/// the session's context name.
+pub(crate) fn invoke_refusal_response(
+    e: &SealSessionError,
+    payload: &serde_json::Value,
+) -> axum::response::Response {
+    let refusal = e.refusal();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let tool = payload
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str());
+    let rpc_id = payload.get("id").map(|id| id.to_string());
+    if refusal.internal {
+        tracing::error!(
+            target: "aegis::seal::invoke",
+            request_id = %request_id,
+            code = refusal.code,
+            tool = tool.unwrap_or(""),
+            rpc_id = rpc_id.as_deref().unwrap_or(""),
+            error = %e,
+            "tool invocation failed"
+        );
+    } else {
+        tracing::info!(
+            target: "aegis::seal::invoke",
+            request_id = %request_id,
+            code = refusal.code,
+            tool = tool.unwrap_or(""),
+            rpc_id = rpc_id.as_deref().unwrap_or(""),
+            error = %e,
+            "tool invocation refused"
+        );
+    }
+    let status =
+        StatusCode::from_u16(refusal.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = Json(serde_json::json!({
+        "protocol": "seal/v1",
+        "request_id": request_id,
+        "status": refusal.status,
+        "error": {
+            "code": refusal.code,
+            "message": refusal.message,
+            "context": serde_json::Value::Null,
+            "tool": tool,
+        },
+    }));
+    let mut headers = HeaderMap::new();
+    if let Some(limit) = refusal.rate_limit {
+        // AEGIS ADR-072 §9: a 429 carries Retry-After and the X-RateLimit-* headers.
+        let reset = chrono::Utc::now().timestamp() + limit.retry_after_seconds as i64;
+        for (name, value) in [
+            ("retry-after", limit.retry_after_seconds.to_string()),
+            ("x-ratelimit-limit", limit.limit.to_string()),
+            ("x-ratelimit-remaining", limit.remaining.to_string()),
+            ("x-ratelimit-reset", reset.to_string()),
+        ] {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+                headers.insert(name, value);
+            }
+        }
+    }
+    (status, headers, body).into_response()
 }
 
 pub(crate) async fn list_seal_tools_handler(

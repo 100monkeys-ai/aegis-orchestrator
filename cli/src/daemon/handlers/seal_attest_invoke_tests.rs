@@ -184,19 +184,26 @@ async fn attest_binding_binds_the_authenticated_subject_whatever_the_body() {
 // ── The attest-then-invoke harness ──────────────────────────────────────────
 
 fn zaru_pro() -> SecurityContext {
+    zaru_pro_allowing(&["aegis.goal.*"])
+}
+
+fn zaru_pro_allowing(patterns: &[&str]) -> SecurityContext {
     SecurityContext {
         name: "zaru-pro".to_string(),
         description: "consumer".to_string(),
-        capabilities: vec![Capability {
-            tool_pattern: "aegis.goal.*".to_string(),
-            path_allowlist: None,
-            command_allowlist: None,
-            subcommand_allowlist: None,
-            domain_allowlist: None,
-            max_response_size: None,
-            rate_limit: None,
-            max_concurrent: None,
-        }],
+        capabilities: patterns
+            .iter()
+            .map(|pattern| Capability {
+                tool_pattern: pattern.to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                max_response_size: None,
+                rate_limit: None,
+                max_concurrent: None,
+            })
+            .collect(),
         deny_list: vec![],
         metadata: SecurityContextMetadata {
             created_at: chrono::Utc::now(),
@@ -397,11 +404,21 @@ struct Mcp {
     token: String,
     key: SigningKey,
     calls: u64,
+    volumes: Arc<InMemoryVolumeRepository>,
 }
 
 impl Mcp {
     /// One `tools/call`, signed as the MCP server signs it.
     async fn call(&mut self, tool: &str, arguments: Value) -> Result<Value, String> {
+        let envelope = self.envelope(tool, arguments);
+        self.service
+            .invoke_tool(&envelope)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The envelope of one `tools/call`, signed as the MCP server signs it.
+    fn envelope(&mut self, tool: &str, arguments: Value) -> SealEnvelope {
         self.calls += 1;
         let payload = json!({
             "jsonrpc": "2.0",
@@ -409,32 +426,50 @@ impl Mcp {
             "method": "tools/call",
             "params": {"name": tool, "arguments": arguments},
         });
-        let now = chrono::Utc::now();
+        self.sign(payload, &self.key.clone(), &self.token.clone())
+    }
+
+    fn sign(&self, payload: Value, key: &SigningKey, token: &str) -> SealEnvelope {
+        self.sign_at(payload, key, token, chrono::Utc::now())
+    }
+
+    fn sign_at(
+        &self,
+        payload: Value,
+        key: &SigningKey,
+        token: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> SealEnvelope {
         let canonical = serde_json::to_vec(&json!({
             "payload": payload,
-            "security_token": self.token,
+            "security_token": token,
             "timestamp": now.timestamp(),
         }))
         .unwrap();
-        let envelope = SealEnvelope {
+        SealEnvelope {
             protocol: "seal/v1".to_string(),
-            security_token: self.token.as_str().into(),
-            signature: STANDARD.encode(self.key.sign(&canonical).to_bytes()),
+            security_token: token.into(),
+            signature: STANDARD.encode(key.sign(&canonical).to_bytes()),
             payload,
             timestamp: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        };
-        self.service
-            .invoke_tool(&envelope)
-            .await
-            .map_err(|e| e.to_string())
+        }
     }
 }
 
 /// Attest as the Zaru MCP server attests for an `aegis_*` key: no `user_id`
 /// in the body, the key the only identity.
 async fn attest_as_the_mcp_server() -> Mcp {
+    attest_with(zaru_pro(), |service, _| service).await
+}
+
+/// As [`attest_as_the_mcp_server`], with the session's context and the
+/// service as the test configures them; `configure` receives the FSAL.
+async fn attest_with(
+    context: SecurityContext,
+    configure: impl FnOnce(ToolInvocationService, Arc<AegisFSAL>) -> ToolInvocationService,
+) -> Mcp {
     let contexts = Arc::new(InMemorySecurityContextRepository::new());
-    contexts.save(zaru_pro()).await.unwrap();
+    contexts.save(context).await.unwrap();
     let sessions = Arc::new(InMemorySealSessionRepository::new());
     let issuer =
         Arc::new(SecurityTokenIssuer::new(&seal_signing_pem(), "aegis-orchestrator").unwrap());
@@ -476,9 +511,10 @@ async fn attest_as_the_mcp_server() -> Mcp {
     ));
     let storage_root =
         std::env::temp_dir().join(format!("aegis-attest-identity-{}", uuid::Uuid::new_v4()));
+    let volumes = Arc::new(InMemoryVolumeRepository::new());
     let fsal = Arc::new(AegisFSAL::new(
         Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
-        Arc::new(InMemoryVolumeRepository::new()),
+        volumes.clone(),
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         Arc::new(NoOpPublisher),
     ));
@@ -488,7 +524,7 @@ async fn attest_as_the_mcp_server() -> Mcp {
         contexts,
         Arc::new(SealMiddleware::new()),
         router,
-        fsal,
+        fsal.clone(),
         NfsVolumeRegistry::new(),
         Arc::new(OneAgent(AgentId::new())),
         Arc::new(Executions::default()),
@@ -501,11 +537,13 @@ async fn attest_as_the_mcp_server() -> Mcp {
         event_bus,
         GoalsConfig::default(),
     )));
+    let service = configure(service, fsal);
     Mcp {
         service,
         token: attested.security_token.expose().to_string(),
         key,
         calls: 0,
+        volumes,
     }
 }
 
@@ -554,4 +592,510 @@ async fn an_api_key_attested_as_the_mcp_server_does_creates_evaluates_and_reads_
         "{status}"
     );
     assert_eq!(status["channel"], "api", "{status}");
+}
+
+// ============================================================================
+// What the tool invoke route tells its caller (AEGIS ADR-035, Update of
+// 2026-10-04, R1 to R5): ADR-035's error shape, a 4xx with a stable code and
+// the caller's own business for a refusal, a 5xx with a fixed message for an
+// internal failure whose detail is only in the log under the body's
+// request_id.
+// ============================================================================
+
+use aegis_orchestrator_core::application::file_operations_service::FileOperationsService;
+use aegis_orchestrator_core::domain::repository::VolumeRepository;
+use aegis_orchestrator_core::domain::seal_session::{
+    CallerAnswer, InternalFailure, SealSessionError,
+};
+use aegis_orchestrator_core::domain::security_context::PolicyViolation;
+use aegis_orchestrator_core::domain::volume::{
+    StorageClass, Volume, VolumeBackend, VolumeOwnership,
+};
+
+#[derive(Clone, Default)]
+struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The route's answer to one refusal, and the log lines it wrote.
+struct Answer {
+    status: u16,
+    headers: axum::http::HeaderMap,
+    body: Value,
+    log: String,
+}
+
+impl Answer {
+    fn request_id(&self) -> String {
+        self.body["request_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a request_id in {}", self.body))
+            .to_string()
+    }
+
+    /// ADR-035's members, the status and the code.
+    fn assert_shape(&self, status: u16, code: &str, body_status: &str) {
+        assert_eq!(self.status, status, "{}", self.body);
+        assert_eq!(self.body["protocol"], "seal/v1", "{}", self.body);
+        assert_eq!(self.body["status"], body_status, "{}", self.body);
+        assert_eq!(self.body["error"]["code"], code, "{}", self.body);
+        assert!(self.body["error"].get("context").is_some(), "{}", self.body);
+        assert!(self.body["error"].get("tool").is_some(), "{}", self.body);
+        assert!(
+            uuid::Uuid::parse_str(&self.request_id()).is_ok(),
+            "{}",
+            self.body
+        );
+        assert!(
+            self.log.contains(&self.request_id()),
+            "the log line does not carry the body's request_id {}:\n{}",
+            self.request_id(),
+            self.log
+        );
+    }
+
+    fn message(&self) -> String {
+        self.body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// None of `detail` reaches the body; all of it reaches the log.
+    fn assert_detail_only_in_log(&self, detail: &[&str]) {
+        let body = self.body.to_string();
+        for d in detail {
+            assert!(!body.contains(d), "the body carried {d:?}: {body}");
+            assert!(
+                self.log.contains(d),
+                "the log does not carry {d:?}:\n{}",
+                self.log
+            );
+        }
+    }
+}
+
+/// The route's answer to `error` for a call to `tool`, with the log the
+/// answer wrote captured.
+async fn answer(error: &SealSessionError, tool: &str) -> Answer {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": {}},
+    });
+    let response = tracing::subscriber::with_default(subscriber, || {
+        super::invoke_refusal_response(error, &payload)
+    });
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("a JSON body: {}", String::from_utf8_lossy(&bytes)));
+    let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+    Answer {
+        status,
+        headers,
+        body,
+        log,
+    }
+}
+
+impl Mcp {
+    /// One call through the service, refused, and the route's answer to it.
+    async fn refused(&mut self, tool: &str, arguments: Value) -> Answer {
+        let envelope = self.envelope(tool, arguments);
+        let error = self
+            .service
+            .invoke_tool(&envelope)
+            .await
+            .expect_err("the call is refused");
+        answer(&error, tool).await
+    }
+
+    /// A persistent volume of `owner` in `tenant`, on the host backend whose
+    /// path names `backend_path`.
+    async fn volume(&self, tenant: &TenantId, owner: &str, backend_path: &str) -> String {
+        let mut volume = Volume::new(
+            "files".to_string(),
+            tenant.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: backend_path.into(),
+            },
+            1024 * 1024,
+            VolumeOwnership::persistent(owner),
+        )
+        .unwrap();
+        volume.mark_available().unwrap();
+        self.volumes.save(&volume).await.unwrap();
+        volume.id.to_string()
+    }
+}
+
+fn own_tenant() -> TenantId {
+    TenantId::for_consumer_user(SUB).unwrap()
+}
+
+/// A storage backend path, as `fsal.rs` 372-380 routes a host volume's file.
+const BACKEND: &str = "/aegis-host/Mk7-backend-volume";
+
+async fn with_files() -> Mcp {
+    attest_with(
+        zaru_pro_allowing(&["aegis.goal.*", "aegis.file.*"]),
+        |service, fsal| {
+            service.with_file_operations_service(Arc::new(FileOperationsService::new(fsal)))
+        },
+    )
+    .await
+}
+
+// ---- caller-facing refusals, through the service ---------------------------
+
+#[tokio::test]
+async fn a_tool_the_context_does_not_permit_is_403_tool_not_allowed_in_675984dc_words() {
+    let mut mcp = attest_as_the_mcp_server().await;
+    let a = mcp.refused("aegis.system.info", json!({})).await;
+    a.assert_shape(403, "TOOL_NOT_ALLOWED", "policy_violation");
+    assert_eq!(
+        a.message(),
+        "Policy violation: tool 'aegis.system.info' is not allowed; permitted tools: [aegis.goal.*]"
+    );
+    assert_eq!(a.body["error"]["tool"], "aegis.system.info");
+}
+
+#[tokio::test]
+async fn missing_arguments_are_422_invalid_arguments_saying_which() {
+    let mut mcp = attest_as_the_mcp_server().await;
+    let a = mcp.refused("aegis.goal.status", json!({})).await;
+    a.assert_shape(422, "INVALID_ARGUMENTS", "error");
+    assert!(a.message().contains("goal_id"), "{}", a.body);
+}
+
+#[tokio::test]
+async fn an_unknown_session_is_401_session_inactive() {
+    let mut mcp = attest_as_the_mcp_server().await;
+    mcp.token = "not-a-session-token".to_string();
+    let a = mcp
+        .refused("aegis.goal.status", json!({"goal_id": "x"}))
+        .await;
+    a.assert_shape(401, "SESSION_INACTIVE", "error");
+}
+
+#[tokio::test]
+async fn a_signature_by_another_key_is_401_signature_invalid() {
+    let mut mcp = attest_as_the_mcp_server().await;
+    mcp.key = SigningKey::from_bytes(&[7u8; 32]);
+    let a = mcp
+        .refused("aegis.goal.status", json!({"goal_id": "x"}))
+        .await;
+    a.assert_shape(401, "SIGNATURE_INVALID", "error");
+}
+
+#[tokio::test]
+async fn an_envelope_outside_the_freshness_window_is_401_envelope_replayed() {
+    let mut mcp = attest_as_the_mcp_server().await;
+    let (key, token) = (mcp.key.clone(), mcp.token.clone());
+    let envelope = mcp.sign_at(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "aegis.goal.status", "arguments": {}}}),
+        &key,
+        &token,
+        chrono::Utc::now() - chrono::Duration::seconds(120),
+    );
+    let error = mcp
+        .service
+        .invoke_tool(&envelope)
+        .await
+        .expect_err("a stale envelope is refused");
+    let a = answer(&error, "aegis.goal.status").await;
+    a.assert_shape(401, "ENVELOPE_REPLAYED", "error");
+    assert!(a.message().contains("freshness window"), "{}", a.body);
+}
+
+#[tokio::test]
+async fn a_call_with_no_tool_name_is_400_malformed_envelope() {
+    let mut mcp = attest_as_the_mcp_server().await;
+    let (key, token) = (mcp.key.clone(), mcp.token.clone());
+    let envelope = mcp.sign(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}}),
+        &key,
+        &token,
+    );
+    let error = mcp
+        .service
+        .invoke_tool(&envelope)
+        .await
+        .expect_err("refused");
+    let a = answer(&error, "").await;
+    a.assert_shape(400, "MALFORMED_ENVELOPE", "error");
+}
+
+#[tokio::test]
+async fn another_tenant_named_in_the_arguments_is_403_tenant_mismatch() {
+    let mut mcp = with_files().await;
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+    let a = mcp
+        .refused(
+            "aegis.file.read",
+            json!({"tenant_id": other.as_str(), "volume_id": uuid::Uuid::new_v4().to_string(), "path": "a.txt"}),
+        )
+        .await;
+    a.assert_shape(403, "TENANT_MISMATCH", "error");
+}
+
+/// I5: a file of the caller's that does not exist is named by the caller's
+/// own path, never by the storage backend's.
+#[tokio::test]
+async fn a_missing_file_is_404_named_by_the_callers_path_not_the_backend_path() {
+    let mut mcp = with_files().await;
+    let volume = mcp.volume(&own_tenant(), SUB, BACKEND).await;
+    let a = mcp
+        .refused(
+            "aegis.file.read",
+            json!({"volume_id": volume, "path": "notes/missing.txt"}),
+        )
+        .await;
+    a.assert_shape(404, "NOT_FOUND", "error");
+    assert!(a.message().contains("notes/missing.txt"), "{}", a.body);
+    a.assert_detail_only_in_log(&["Mk7-backend-volume"]);
+}
+
+/// I5 and "another tenant's identifier": a volume of another tenant is not
+/// found, named by the id the caller sent.
+#[tokio::test]
+async fn another_tenants_volume_is_404_and_names_nothing_of_that_tenant() {
+    let mut mcp = with_files().await;
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+    let volume = mcp.volume(&other, SOMEONE_ELSE, BACKEND).await;
+    let a = mcp
+        .refused(
+            "aegis.file.read",
+            json!({"volume_id": volume, "path": "a.txt"}),
+        )
+        .await;
+    a.assert_shape(404, "NOT_FOUND", "error");
+    assert!(a.message().contains(&volume), "{}", a.body);
+    let body = a.body.to_string();
+    assert!(!body.contains(SOMEONE_ELSE), "{body}");
+    assert!(!body.contains(other.as_str()), "{body}");
+    assert!(!body.contains("Mk7-backend-volume"), "{body}");
+}
+
+/// I6: a tool the node does not have is named as the caller named it; the
+/// node's list of tools is not in the answer.
+#[tokio::test]
+async fn an_unknown_tool_is_404_and_the_nodes_tools_are_not_listed() {
+    let mut mcp = attest_as_the_mcp_server().await;
+    let a = mcp.refused("aegis.goal.no-such-tool", json!({})).await;
+    a.assert_shape(404, "NOT_FOUND", "error");
+    assert!(
+        a.message().contains("aegis.goal.no-such-tool"),
+        "{}",
+        a.body
+    );
+    assert!(!a.body.to_string().contains("Available"), "{}", a.body);
+    assert!(a.log.contains("Available"), "{}", a.log);
+}
+
+// ---- caller-facing refusals the service cannot be driven to here -----------
+
+#[tokio::test]
+async fn every_other_caller_facing_row_has_its_status_code_and_message() {
+    let rows: Vec<(SealSessionError, u16, &str, &str, &str)> = vec![
+        (
+            SealSessionError::SessionExpired,
+            401,
+            "SESSION_EXPIRED",
+            "error",
+            "expired",
+        ),
+        (
+            SealSessionError::OperatorEscalationExpired,
+            401,
+            "OPERATOR_ESCALATION_EXPIRED",
+            "error",
+            "escalation has ended",
+        ),
+        (
+            SealSessionError::NotFound("approval request 9".into()),
+            404,
+            "NOT_FOUND",
+            "error",
+            "approval request 9",
+        ),
+        (
+            SealSessionError::InternalError("x".into()).answered(CallerAnswer::Conflict(
+                "a volume named 'files' already exists".into(),
+            )),
+            409,
+            "CONFLICT",
+            "error",
+            "already exists",
+        ),
+        (
+            SealSessionError::InternalError("x".into()).answered(CallerAnswer::QuotaExceeded(
+                "storage quota exceeded for tier".into(),
+            )),
+            422,
+            "QUOTA_EXCEEDED",
+            "error",
+            "quota",
+        ),
+        (
+            SealSessionError::InternalError("x".into()).answered(CallerAnswer::JudgeRejected(
+                "rejected by the semantic judge".into(),
+            )),
+            403,
+            "JUDGE_REJECTED",
+            "policy_violation",
+            "semantic judge",
+        ),
+        (
+            SealSessionError::InternalError("x".into()).answered(CallerAnswer::NotImplemented(
+                "not yet implemented: push".into(),
+            )),
+            501,
+            "NOT_IMPLEMENTED",
+            "error",
+            "push",
+        ),
+        (
+            SealSessionError::InternalError("x".into())
+                .answered(CallerAnswer::EdgeUnavailable("edge n-1 unavailable".into())),
+            503,
+            "EDGE_UNAVAILABLE",
+            "error",
+            "edge n-1",
+        ),
+    ];
+    for (error, status, code, body_status, words) in rows {
+        let a = answer(&error, "aegis.some.tool").await;
+        a.assert_shape(status, code, body_status);
+        assert!(a.message().contains(words), "{error:?}: {}", a.body);
+    }
+}
+
+/// ADR-072 §9: a rate-limit refusal is 429 with Retry-After and the
+/// X-RateLimit-* headers.
+#[tokio::test]
+async fn a_rate_limit_is_429_with_adr_072s_headers() {
+    let error = SealSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
+        resource_type: "tool_call".into(),
+        bucket: "per_minute".into(),
+        limit: 60,
+        current: 61,
+        retry_after_seconds: 12,
+    });
+    let a = answer(&error, "aegis.goal.create").await;
+    a.assert_shape(429, "RATE_LIMIT_EXCEEDED", "policy_violation");
+    assert_eq!(a.headers["retry-after"], "12");
+    assert_eq!(a.headers["x-ratelimit-limit"], "60");
+    assert_eq!(a.headers["x-ratelimit-remaining"], "0");
+    assert!(a.headers.contains_key("x-ratelimit-reset"));
+}
+
+// ---- internal failures: a fixed message, the detail only in the log --------
+
+/// I1: database and repository text (`facade.rs` 336-339, `repository.rs` 581).
+#[tokio::test]
+async fn a_database_failure_is_500_and_its_text_is_only_in_the_log() {
+    let error = SealSessionError::InternalError(
+        "session repository lookup failed: Database error: Mk7-db-relation \"seal_sessions\" does not exist"
+            .into(),
+    );
+    let a = answer(&error, "aegis.goal.create").await;
+    a.assert_shape(500, "INTERNAL_ERROR", "error");
+    a.assert_detail_only_in_log(&["Database error", "Mk7-db-relation"]);
+}
+
+/// I2: a configuration key (`discovery.rs` 25), driven through the service.
+#[tokio::test]
+async fn an_unconfigured_tool_is_503_and_its_configuration_key_is_only_in_the_log() {
+    let mut mcp = attest_with(
+        zaru_pro_allowing(&["aegis.goal.*", "aegis.agent.search"]),
+        |service, _| service,
+    )
+    .await;
+    let a = mcp
+        .refused("aegis.agent.search", json!({"query": "summarise"}))
+        .await;
+    a.assert_shape(503, "SERVICE_UNAVAILABLE", "error");
+    a.assert_detail_only_in_log(&["spec.discovery", "aegis-config.yaml"]);
+}
+
+/// I2: the operator escalation's V5 refusal (`facade.rs` 474-476) names a
+/// node configuration key.
+#[tokio::test]
+async fn the_escalation_check_failure_is_500_and_its_key_is_only_in_the_log() {
+    let error = SealSessionError::InternalError(
+        "operator escalation check failed: spec.iam.keycloak_admin is not configured on this node"
+            .into(),
+    );
+    let a = answer(&error, "aegis.task.list").await;
+    a.assert_shape(500, "INTERNAL_ERROR", "error");
+    a.assert_detail_only_in_log(&["spec.iam.keycloak_admin"]);
+}
+
+/// I3: upstream and gateway transport text (`web_tools.rs`, `gateway.rs`).
+#[tokio::test]
+async fn an_upstream_failure_is_502_and_its_text_is_only_in_the_log() {
+    let error = SealSessionError::UpstreamUnavailable(
+        "web.search Brave API returned 429: Mk7-upstream-body".into(),
+    );
+    let a = answer(&error, "web.search").await;
+    a.assert_shape(502, "UPSTREAM_UNAVAILABLE", "error");
+    a.assert_detail_only_in_log(&["Brave", "Mk7-upstream-body"]);
+    let gateway = SealSessionError::InternalError(
+        "seal tooling gateway connect failed (http://10.9.8.7:50055): Mk7-transport".into(),
+    );
+    let a = answer(&gateway, "some.tool").await;
+    a.assert_shape(500, "INTERNAL_ERROR", "error");
+    a.assert_detail_only_in_log(&["10.9.8.7", "Mk7-transport"]);
+}
+
+/// I4: platform state and internal ids (`audit.rs` 381, `facade.rs` 563).
+#[tokio::test]
+async fn a_platform_state_failure_is_500_and_its_ids_are_only_in_the_log() {
+    let execution = uuid::Uuid::new_v4().to_string();
+    let error = SealSessionError::MalformedPayload(format!(
+        "Failed to load execution {execution}: Database error: Mk7-row"
+    ))
+    .answered(CallerAnswer::Internal(InternalFailure::Server));
+    let a = answer(&error, "aegis.task.status").await;
+    a.assert_shape(500, "INTERNAL_ERROR", "error");
+    a.assert_detail_only_in_log(&[execution.as_str(), "Mk7-row"]);
+}
+
+/// I5: a storage failure the file service reports as `FileOperationsError::Fsal`
+/// is 500 and its text is only in the log.
+#[tokio::test]
+async fn a_storage_backend_failure_is_500_and_its_text_is_only_in_the_log() {
+    let mut mcp = with_files().await;
+    let volume = mcp.volume(&own_tenant(), SUB, BACKEND).await;
+    let a = mcp
+        .refused(
+            "aegis.file.list",
+            json!({"volume_id": volume, "path": "no-such-directory"}),
+        )
+        .await;
+    a.assert_shape(500, "INTERNAL_ERROR", "error");
+    a.assert_detail_only_in_log(&["readdir failed"]);
 }

@@ -4,9 +4,13 @@
 
 use serde_json::{json, Value};
 
+use crate::application::file_operations_service::FileOperationsError;
+use crate::application::git_repo_service::GitRepoError;
+use crate::application::script_service::ScriptServiceError;
 use crate::application::tool_invocation_service::ToolInvocationResult;
+use crate::application::user_volume_service::UserVolumeError;
 use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
-use crate::domain::seal_session::SealSessionError;
+use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
 
 use super::ToolInvocationService;
 
@@ -59,14 +63,131 @@ fn ok_direct(value: Value) -> ToolResult {
     Ok(ToolInvocationResult::Direct(value))
 }
 
-fn internal_err(msg: impl std::fmt::Display) -> SealSessionError {
-    SealSessionError::InternalError(msg.to_string())
+// ============================================================================
+// Refusals (AEGIS ADR-035, Update of 2026-10-04, R5, R6)
+// ============================================================================
+//
+// A storage service's typed error is answered by its variant, where it is
+// mapped: the caller is told their own business (not found, quota, conflict,
+// invalid input), named as they named it; anything else is an internal
+// failure. What the inner loop and the operator's log see is the error's
+// text, as before (`shown`).
+
+fn shown(e: &impl std::fmt::Display) -> SealSessionError {
+    SealSessionError::InternalError(e.to_string())
+}
+
+fn internal(e: &impl std::fmt::Display) -> SealSessionError {
+    shown(e).answered(CallerAnswer::Internal(InternalFailure::Server))
+}
+
+/// A file operation's error, answered by the caller's own `volume_id` and
+/// `path`. A not-found's own text names the storage backend's path, so it is
+/// never the answer.
+fn file_refusal(e: FileOperationsError, volume_id: &str, path: &str) -> SealSessionError {
+    let answer = match &e {
+        FileOperationsError::NotFound(_) => {
+            CallerAnswer::NotFound(format!("Not found: '{path}' in volume '{volume_id}'."))
+        }
+        FileOperationsError::Unauthorized => {
+            CallerAnswer::NotFound(format!("Not found: volume '{volume_id}'."))
+        }
+        FileOperationsError::FileTooLarge => {
+            CallerAnswer::QuotaExceeded("The file is larger than your tier allows.".to_string())
+        }
+        FileOperationsError::InvalidPath(_) => CallerAnswer::InvalidArguments(format!(
+            "Invalid tool arguments: '{path}' is not a valid path in a volume."
+        )),
+        FileOperationsError::Fsal(_) | FileOperationsError::Repository(_) => {
+            CallerAnswer::Internal(InternalFailure::Server)
+        }
+    };
+    shown(&e).answered(answer)
+}
+
+/// A storage service's typed error, answered by its variant.
+trait IntoRefusal {
+    fn into_refusal(self) -> SealSessionError;
+}
+
+impl IntoRefusal for UserVolumeError {
+    fn into_refusal(self) -> SealSessionError {
+        let answer = match &self {
+            UserVolumeError::NotFound(_) => CallerAnswer::NotFound(format!("Not found: {self}.")),
+            UserVolumeError::Unauthorized => {
+                CallerAnswer::NotFound("Not found: the volume you named.".to_string())
+            }
+            UserVolumeError::VolumeCountQuotaExceeded | UserVolumeError::StorageQuotaExceeded => {
+                CallerAnswer::QuotaExceeded(format!("Quota exceeded: {self}."))
+            }
+            UserVolumeError::DuplicateName(_) | UserVolumeError::VolumeAttached => {
+                CallerAnswer::Conflict(format!("Conflict: {self}."))
+            }
+            UserVolumeError::UnknownTier
+            | UserVolumeError::Repository(_)
+            | UserVolumeError::VolumeService(_) => return internal(&self),
+        };
+        shown(&self).answered(answer)
+    }
+}
+
+impl IntoRefusal for GitRepoError {
+    fn into_refusal(self) -> SealSessionError {
+        let answer = match &self {
+            GitRepoError::TierLimitExceeded { .. } => {
+                CallerAnswer::QuotaExceeded(format!("Quota exceeded: {self}."))
+            }
+            GitRepoError::BindingNotFound | GitRepoError::NotOwned => CallerAnswer::NotFound(
+                "Not found: the git repository binding you named.".to_string(),
+            ),
+            GitRepoError::UrlValidationFailed(_) | GitRepoError::SshHostKeys(_) => {
+                CallerAnswer::InvalidArguments(format!("Invalid tool arguments: {self}"))
+            }
+            GitRepoError::NothingToCommit
+            | GitRepoError::BindingBusy(_)
+            | GitRepoError::NoHeadBranch => CallerAnswer::Conflict(format!("Conflict: {self}.")),
+            GitRepoError::NotYetImplemented(_) => CallerAnswer::NotImplemented(self.to_string()),
+            // The git library's text can carry the clone's local path: no
+            // caller-facing message is built from the caller's own inputs at
+            // this site, so it is answered as an upstream failure.
+            GitRepoError::CloneFailed(_) | GitRepoError::GitFailed(_) => {
+                CallerAnswer::Internal(InternalFailure::Upstream)
+            }
+            GitRepoError::Repository(_)
+            | GitRepoError::SecretResolutionFailed(_)
+            | GitRepoError::VolumeProvisioningFailed(_)
+            | GitRepoError::WebhookRejected(_) => return internal(&self),
+        };
+        shown(&self).answered(answer)
+    }
+}
+
+impl IntoRefusal for ScriptServiceError {
+    fn into_refusal(self) -> SealSessionError {
+        let answer = match &self {
+            ScriptServiceError::NotFound => {
+                CallerAnswer::NotFound("Not found: the script you named.".to_string())
+            }
+            ScriptServiceError::DuplicateName => {
+                CallerAnswer::Conflict(format!("Conflict: {self}."))
+            }
+            ScriptServiceError::TierLimitExceeded { .. } => {
+                CallerAnswer::QuotaExceeded(format!("Quota exceeded: {self}."))
+            }
+            ScriptServiceError::Domain(_) => {
+                CallerAnswer::InvalidArguments(format!("Invalid tool arguments: {self}"))
+            }
+            ScriptServiceError::Repository(_) => return internal(&self),
+        };
+        shown(&self).answered(answer)
+    }
 }
 
 fn not_configured(tool: &str, service: &str) -> ToolResult {
-    Err(SealSessionError::InternalError(format!(
-        "{tool}: {service} not configured"
-    )))
+    Err(
+        SealSessionError::InternalError(format!("{tool}: {service} not configured"))
+            .answered(CallerAnswer::Internal(InternalFailure::Unavailable)),
+    )
 }
 
 // ============================================================================
@@ -93,7 +214,7 @@ impl ToolInvocationService {
         let entries = svc
             .list_directory(&vid, &tenant_id, &owner, path)
             .await
-            .map_err(internal_err)?;
+            .map_err(|e| file_refusal(e, volume_id, path))?;
 
         ok_direct(serde_json::to_value(entries).unwrap_or(json!([])))
     }
@@ -117,7 +238,7 @@ impl ToolInvocationService {
         let content = svc
             .read_file(&vid, &tenant_id, &owner, path)
             .await
-            .map_err(internal_err)?;
+            .map_err(|e| file_refusal(e, volume_id, path))?;
 
         // Return text content as JSON string; binary as base64
         let text = String::from_utf8(content.data.clone())
@@ -150,7 +271,7 @@ impl ToolInvocationService {
 
         svc.write_file_for_tier(&vid, &tenant_id, &owner, path, content.as_bytes(), &tier)
             .await
-            .map_err(internal_err)?;
+            .map_err(|e| file_refusal(e, volume_id, path))?;
 
         ok_direct(json!({"success": true}))
     }
@@ -173,7 +294,7 @@ impl ToolInvocationService {
 
         svc.delete_path(&vid, &tenant_id, &owner, path)
             .await
-            .map_err(internal_err)?;
+            .map_err(|e| file_refusal(e, volume_id, path))?;
 
         ok_direct(json!({"success": true}))
     }
@@ -196,7 +317,7 @@ impl ToolInvocationService {
 
         svc.create_directory(&vid, &tenant_id, &owner, path)
             .await
-            .map_err(internal_err)?;
+            .map_err(|e| file_refusal(e, volume_id, path))?;
 
         ok_direct(json!({"success": true}))
     }
@@ -229,7 +350,10 @@ impl ToolInvocationService {
             zaru_tier: tier,
         };
 
-        let vol = svc.create_volume(cmd).await.map_err(internal_err)?;
+        let vol = svc
+            .create_volume(cmd)
+            .await
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({
             "id": vol.id.to_string(),
@@ -256,7 +380,7 @@ impl ToolInvocationService {
         let vols = svc
             .list_volumes(&tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         let items: Vec<Value> = vols
             .into_iter()
@@ -289,7 +413,7 @@ impl ToolInvocationService {
 
         svc.delete_volume(&vid, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -311,7 +435,7 @@ impl ToolInvocationService {
         let usage = svc
             .get_quota_usage(&tenant_id, &owner, &tier)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({
             "volume_count": usage.volume_count,
@@ -402,7 +526,10 @@ impl ToolInvocationService {
             ssh_host_keys,
         };
 
-        let binding = svc.create_binding(cmd).await.map_err(internal_err)?;
+        let binding = svc
+            .create_binding(cmd)
+            .await
+            .map_err(IntoRefusal::into_refusal)?;
 
         // Spawn background clone
         let svc_bg = svc.clone();
@@ -432,7 +559,7 @@ impl ToolInvocationService {
         let bindings = svc
             .list_bindings(&tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         let items: Vec<Value> = bindings.iter().map(redacted_binding).collect();
         ok_direct(json!(items))
@@ -456,7 +583,7 @@ impl ToolInvocationService {
         let binding = svc
             .get_binding(&bid, &tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(redacted_binding(&binding))
     }
@@ -478,7 +605,7 @@ impl ToolInvocationService {
 
         svc.refresh_repo(&bid, &tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -500,7 +627,7 @@ impl ToolInvocationService {
 
         svc.delete_binding(&bid, &tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -532,7 +659,7 @@ impl ToolInvocationService {
                 &author_email,
             )
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"commit_sha": commit_sha}))
     }
@@ -557,7 +684,7 @@ impl ToolInvocationService {
 
         svc.push(&bid, &tenant_id, &owner, remote, ref_name)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"success": true}))
     }
@@ -585,7 +712,7 @@ impl ToolInvocationService {
         let diff_text = svc
             .diff(&bid, &tenant_id, &owner, staged)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"diff": diff_text}))
     }
@@ -634,7 +761,7 @@ impl ToolInvocationService {
             tags,
         };
 
-        let script = svc.create(cmd).await.map_err(internal_err)?;
+        let script = svc.create(cmd).await.map_err(IntoRefusal::into_refusal)?;
         ok_direct(script_dto(&script))
     }
 
@@ -657,7 +784,7 @@ impl ToolInvocationService {
         let scripts = svc
             .list_filtered(&tenant_id, &owner, tag, query)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         let items: Vec<Value> = scripts.iter().map(script_dto).collect();
         ok_direct(json!(items))
@@ -681,12 +808,12 @@ impl ToolInvocationService {
         let script = svc
             .get(&script_id, &tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         let versions = svc
             .list_versions(&script_id, &tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         let mut body = script_dto(&script);
         if let Some(obj) = body.as_object_mut() {
@@ -747,7 +874,7 @@ impl ToolInvocationService {
         let script = svc
             .update(&script_id, &tenant_id, &owner, cmd)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(script_dto(&script))
     }
@@ -769,7 +896,7 @@ impl ToolInvocationService {
 
         svc.delete(&script_id, &tenant_id, &owner)
             .await
-            .map_err(internal_err)?;
+            .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"success": true}))
     }

@@ -563,6 +563,9 @@ impl ToolInvocationService {
                 SealSessionError::MalformedPayload(format!(
                     "Failed to load execution {execution_id}: {e}"
                 ))
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Server,
+                ))
             })?;
 
         // Extract the caller identity from the parent execution's initiating_user_sub.
@@ -590,11 +593,17 @@ impl ToolInvocationService {
                     "Failed to load security context '{}': {e}",
                     execution.security_context_name
                 ))
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Server,
+                ))
             })?
             .ok_or_else(|| {
                 SealSessionError::MalformedPayload(format!(
                     "Security context '{}' not found for execution {execution_id}",
                     execution.security_context_name
+                ))
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Server,
                 ))
             })?;
 
@@ -875,9 +884,15 @@ impl ToolInvocationService {
                                     ))
                                 })?
                                 .ok_or_else(|| {
+                                    // The node's configured judge, not the caller's.
                                     SealSessionError::NotFound(format!(
                                         "Judge agent '{judge_agent}' not found"
                                     ))
+                                    .answered(
+                                        crate::domain::seal_session::CallerAnswer::Internal(
+                                            crate::domain::seal_session::InternalFailure::Server,
+                                        ),
+                                    )
                                 })?;
 
                             let worker_execution = self
@@ -1014,7 +1029,14 @@ impl ToolInvocationService {
                                                 "Inner-loop tool execution rejected by semantic judge \
                                                  (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
                                                 result.score, min_score, result.reasoning,
-                                            )));
+                                            ))
+                                            .answered(
+                                                crate::domain::seal_session::CallerAnswer::JudgeRejected(format!(
+                                                    "The semantic judge rejected this tool call \
+                                                     (score {:.2}, minimum {:.2}): {}",
+                                                    result.score, min_score, result.reasoning,
+                                                )),
+                                            ));
                                         }
                                         break;
                                     }
@@ -1196,9 +1218,18 @@ impl ToolInvocationService {
                     *agent_id,
                     format!("Routing error: {routing_err}"),
                 );
-                return Err(SealSessionError::InternalError(format!(
-                    "Routing error: {routing_err}"
-                )));
+                let shown =
+                    SealSessionError::InternalError(format!("Routing error: {routing_err}"));
+                // The tool name is the caller's; the node's list of tools is not.
+                return Err(match &routing_err {
+                    crate::infrastructure::tool_router::RoutingError::ToolNotFound {
+                        tool_name,
+                        ..
+                    } => shown.answered(crate::domain::seal_session::CallerAnswer::NotFound(
+                        format!("Not found: tool '{tool_name}'."),
+                    )),
+                    _ => shown,
+                });
             }
         };
 
@@ -1595,7 +1626,8 @@ impl ToolInvocationService {
                     ),
                     None => Some(Err(SealSessionError::InternalError(
                         "aegis.execution.file: file operations service not configured".to_string(),
-                    ))),
+                    )
+                    .answered(crate::domain::seal_session::CallerAnswer::Internal(crate::domain::seal_session::InternalFailure::Unavailable)))),
                 }
             }
             "aegis.attachment.read" => {
@@ -1612,6 +1644,11 @@ impl ToolInvocationService {
                     ),
                     None => Some(Err(SealSessionError::InternalError(
                         "aegis.attachment.read: file operations service not configured".to_string(),
+                    )
+                    .answered(
+                        crate::domain::seal_session::CallerAnswer::Internal(
+                            crate::domain::seal_session::InternalFailure::Unavailable,
+                        ),
                     ))),
                 }
             }
@@ -1673,17 +1710,18 @@ impl ToolInvocationService {
             {
                 Ok(nodes) if nodes.len() == 1 => Some(nodes[0]),
                 Ok(_) => {
-                    return Some(Err(SealSessionError::InternalError(
-                        "edge_selector matched multiple nodes; use \
+                    let message = "edge_selector matched multiple nodes; use \
                          aegis.edge.fleet.invoke for fan-out (\
-                         MultiTargetRequiresFleetTool)"
-                            .to_string(),
-                    )));
+                         MultiTargetRequiresFleetTool)";
+                    return Some(Err(SealSessionError::InternalError(message.to_string())
+                        .answered(
+                            crate::domain::seal_session::CallerAnswer::InvalidArguments(format!(
+                                "Invalid tool arguments: {message}"
+                            )),
+                        )));
                 }
                 Err(e) => {
-                    return Some(Err(SealSessionError::InternalError(format!(
-                        "edge resolve: {e}"
-                    ))));
+                    return Some(Err(edge_refusal("edge resolve", e)));
                 }
             }
         } else {
@@ -1741,9 +1779,7 @@ impl ToolInvocationService {
                 "error_kind": result.error_kind,
                 "error_message": result.error_message,
             })))),
-            Err(e) => Some(Err(SealSessionError::InternalError(format!(
-                "edge dispatch: {e}"
-            )))),
+            Err(e) => Some(Err(edge_refusal("edge dispatch", e))),
         }
     }
 
@@ -1758,6 +1794,9 @@ impl ToolInvocationService {
             SealSessionError::InternalError(
                 "edge fleet not configured on this orchestrator".to_string(),
             )
+            .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                crate::domain::seal_session::InternalFailure::Unavailable,
+            ))
         })?;
         let target_value = args
             .get("target")
@@ -1767,7 +1806,7 @@ impl ToolInvocationService {
         let resolved = resolver
             .resolve(&tenant_scope.authenticated_tenant, &target)
             .await
-            .map_err(|e| SealSessionError::InternalError(format!("resolve: {e}")))?;
+            .map_err(|e| edge_refusal("resolve", e))?;
         Ok(ToolInvocationResult::Direct(serde_json::json!({
             "resolved": resolved.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
             "skipped": Vec::<serde_json::Value>::new(),
@@ -1788,9 +1827,15 @@ impl ToolInvocationService {
             SealSessionError::InternalError(
                 "edge fleet not configured on this orchestrator".to_string(),
             )
+            .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                crate::domain::seal_session::InternalFailure::Unavailable,
+            ))
         })?;
         let dispatcher = self.edge_fleet_dispatcher.as_ref().ok_or_else(|| {
             SealSessionError::InternalError("edge fleet dispatcher not configured".to_string())
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Unavailable,
+                ))
         })?;
 
         let target_value = args
@@ -1811,7 +1856,7 @@ impl ToolInvocationService {
         let resolved = resolver
             .resolve(&tenant_scope.authenticated_tenant, &target)
             .await
-            .map_err(|e| SealSessionError::InternalError(format!("resolve: {e}")))?;
+            .map_err(|e| edge_refusal("resolve", e))?;
 
         let policy = crate::domain::cluster::FleetDispatchPolicy {
             mode: crate::domain::cluster::FleetMode::Parallel,
@@ -1862,6 +1907,9 @@ impl ToolInvocationService {
             SealSessionError::InternalError(
                 "edge fleet cancel not configured on this orchestrator".to_string(),
             )
+            .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                crate::domain::seal_session::InternalFailure::Unavailable,
+            ))
         })?;
         let id_str = args
             .get("fleet_command_id")
@@ -1906,4 +1954,30 @@ impl ToolInvocationService {
             .map(|entry| entry.executor.as_deref() == Some("edge"))
             .unwrap_or(false)
     }
+}
+
+/// An edge routing error, answered by its variant (AEGIS ADR-035, Update of
+/// 2026-10-04, R5): each names only the caller's own edges, groups and
+/// selectors. What the inner loop and the log see is `"<context>: <error>"`,
+/// as before.
+fn edge_refusal(context: &str, e: crate::domain::edge::EdgeRouterError) -> SealSessionError {
+    use crate::domain::edge::EdgeRouterError;
+    use crate::domain::seal_session::CallerAnswer;
+    let answer = match &e {
+        EdgeRouterError::NoMatchingEdges | EdgeRouterError::GroupNotFound(_) => {
+            CallerAnswer::NotFound(format!("Not found: {e}."))
+        }
+        EdgeRouterError::CrossTenantAccessDenied { node_id, .. } => {
+            CallerAnswer::TenantMismatch(format!("Edge {node_id} is not in your tenant."))
+        }
+        EdgeRouterError::InsufficientTargets { .. } => {
+            CallerAnswer::InvalidArguments(format!("Invalid tool arguments: {e}"))
+        }
+        EdgeRouterError::EdgeUnavailable { .. }
+        | EdgeRouterError::Timeout(_)
+        | EdgeRouterError::EdgeDisconnected => {
+            CallerAnswer::EdgeUnavailable(format!("Your edge did not answer: {e}."))
+        }
+    };
+    SealSessionError::InternalError(format!("{context}: {e}")).answered(answer)
 }

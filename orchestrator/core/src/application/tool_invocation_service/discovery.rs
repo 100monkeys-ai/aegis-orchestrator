@@ -27,6 +27,9 @@ impl ToolInvocationService {
                  Configure spec.discovery in aegis-config.yaml to enable semantic search."
                     .into(),
             )
+            .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                crate::domain::seal_session::InternalFailure::Unavailable,
+            ))
         })?;
 
         let query_text = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -126,6 +129,9 @@ impl ToolInvocationService {
                  Configure spec.discovery in aegis-config.yaml to enable semantic search."
                     .into(),
             )
+            .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                crate::domain::seal_session::InternalFailure::Unavailable,
+            ))
         })?;
 
         let query_text = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {

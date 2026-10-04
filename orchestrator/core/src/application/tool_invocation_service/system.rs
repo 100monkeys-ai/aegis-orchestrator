@@ -24,6 +24,9 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let catalog = self.tool_catalog.as_ref().ok_or_else(|| {
             SealSessionError::InternalError("Tool catalog not configured on this node".to_string())
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Unavailable,
+                ))
         })?;
 
         let permitted_tools: Vec<String> = security_context
@@ -64,6 +67,9 @@ impl ToolInvocationService {
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let catalog = self.tool_catalog.as_ref().ok_or_else(|| {
             SealSessionError::InternalError("Tool catalog not configured on this node".to_string())
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Unavailable,
+                ))
         })?;
 
         let permitted_tools: Vec<String> = security_context
