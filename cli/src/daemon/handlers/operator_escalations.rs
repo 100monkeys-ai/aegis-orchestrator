@@ -505,6 +505,16 @@ mod tests {
         }
     }
 
+    /// The record answers one fixed thing (V3, V5).
+    struct Answers(Result<OperatorRecord, RoleLookupError>);
+
+    #[async_trait::async_trait]
+    impl OperatorRoleLookup for Answers {
+        async fn lookup(&self, _: &str) -> Result<OperatorRecord, RoleLookupError> {
+            self.0.clone()
+        }
+    }
+
     struct Harness {
         base: String,
         repo: Arc<InMemoryOperatorEscalationRepository>,
@@ -519,16 +529,16 @@ mod tests {
     }
 
     async fn harness() -> Harness {
-        harness_with(true).await
+        harness_with(Some(Arc::new(HoldsOperator))).await
     }
 
-    /// `role_lookup: false` is a node with no Keycloak admin client (V5).
-    async fn harness_with(role_lookup: bool) -> Harness {
+    /// `role_lookup: None` is a node with no Keycloak admin client (V5).
+    async fn harness_with(role_lookup: Option<Arc<dyn OperatorRoleLookup>>) -> Harness {
         let repo = Arc::new(InMemoryOperatorEscalationRepository::new());
         let mut service =
             OperatorEscalationService::new(repo.clone(), OperatorEscalationConfig::default());
-        if role_lookup {
-            service = service.with_role_lookup(Arc::new(HoldsOperator));
+        if let Some(lookup) = role_lookup {
+            service = service.with_role_lookup(lookup);
         }
         let service = Arc::new(service);
         let operator_key = key_row(OPERATOR_KEY, CONSUMER_SUB, &tenant_of(CONSUMER_SUB), None);
@@ -879,7 +889,7 @@ mod tests {
     /// consumed nor counted as a failure.
     #[tokio::test]
     async fn redemption_503_on_a_node_without_keycloak_admin() {
-        let h = harness_with(false).await;
+        let h = harness_with(None).await;
         let code = minted_code(&h).await;
         let (status, body) = redeem(&h, OPERATOR_KEY, &code).await;
         assert_eq!(
@@ -895,5 +905,41 @@ mod tests {
             .map(|a| a.action)
             .collect();
         assert_eq!(actions, vec![audit_action::CODE_ISSUED.to_string()]);
+    }
+
+    /// ADR-129 — Updates, V3 with the coordinator's V10: a redemption whose
+    /// operator's record no longer grants the role is answered exactly as a
+    /// wrong code is, 400 `invalid_code`.
+    #[tokio::test]
+    async fn redemption_by_a_demoted_operator_answers_invalid_code() {
+        let h = harness_with(Some(Arc::new(Answers(Ok(OperatorRecord::Absent))))).await;
+        let code = minted_code(&h).await;
+        let (status, body) = redeem(&h, OPERATOR_KEY, &code).await;
+        assert_eq!(
+            (status, body["error"].as_str(), body["message"].as_str()),
+            (
+                400,
+                Some("invalid_code"),
+                Some("the code is not valid for this key")
+            ),
+            "{body}"
+        );
+    }
+
+    /// V3 with V5: a read that fails at redemption answers 500
+    /// `internal_error`.
+    #[tokio::test]
+    async fn redemption_with_keycloak_unreadable_answers_500() {
+        let h = harness_with(Some(Arc::new(Answers(Err(RoleLookupError(
+            "connection refused".to_string(),
+        ))))))
+        .await;
+        let code = minted_code(&h).await;
+        let (status, body) = redeem(&h, OPERATOR_KEY, &code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (500, Some("internal_error")),
+            "{body}"
+        );
     }
 }

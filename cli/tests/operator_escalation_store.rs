@@ -11,8 +11,11 @@
 //! They cover: the code row holds the hash and never the code (D9); a code is
 //! consumed once when two redemptions race (D8); the fifth failure
 //! invalidates (D8); an escalation outlives a rebuilt service and ends (D19);
-//! every audit action lands in `admin_audit_log` (D18); and migration 037 run
-//! again changes nothing.
+//! every audit action lands in `admin_audit_log` (D18); migration 037 run
+//! again changes nothing; and the two reads of the Update V1 to V9:
+//! `invalidate_code` invalidates that one live code only (V3) and
+//! `active_system_subs` names each operator holding an active escalation
+//! once (V2).
 
 use std::sync::Arc;
 
@@ -21,7 +24,9 @@ use aegis_orchestrator_core::application::operator_escalation_service::{
 };
 use aegis_orchestrator_core::domain::iam::AegisRole;
 use aegis_orchestrator_core::domain::node_config::OperatorEscalationConfig;
-use aegis_orchestrator_core::domain::operator_escalation::{audit_action, EscalationEndReason};
+use aegis_orchestrator_core::domain::operator_escalation::{
+    audit_action, hash_code, EscalationEndReason, OperatorEscalationRepository,
+};
 use aegis_orchestrator_core::infrastructure::repositories::postgres_operator_escalation::PostgresOperatorEscalationRepository;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -283,5 +288,85 @@ async fn migration_037_run_again_changes_nothing() {
         .await
         .expect("migration 037 run again");
     assert_eq!(snapshot().await, before);
+    db.remove().await;
+}
+
+/// ADR-129 — Updates, V3: `invalidate_code` sets `invalidated_at` on that one
+/// live code, leaves the user's other live code redeemable, and answers
+/// `false` for a code no longer live.
+#[tokio::test]
+async fn invalidate_code_invalidates_that_code_only() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = PostgresOperatorEscalationRepository::new(db.pool.clone());
+    let svc = service(&db.pool);
+    let first = svc
+        .mint(SYSTEM, CONSUMER, AegisRole::Operator)
+        .await
+        .unwrap();
+    let second = svc
+        .mint(SYSTEM, CONSUMER, AegisRole::Operator)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    assert!(repo.invalidate_code(first.code_id, now).await.unwrap());
+    assert!(
+        !repo.invalidate_code(first.code_id, now).await.unwrap(),
+        "an invalidated code is no longer live"
+    );
+    let stored = repo
+        .find_code(CONSUMER, &hash_code(&first.code))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.invalidated_at.is_some());
+    assert!(stored.consumed_at.is_none(), "invalidated, not consumed");
+    assert_eq!(stored.failed_attempts, 0, "no failure counted");
+    let other = repo
+        .find_code(CONSUMER, &hash_code(&second.code))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(other.invalidated_at.is_none());
+    assert_eq!(
+        svc.redeem(&consumer_key(), &first.code).await,
+        Err(OperatorEscalationError::InvalidCode)
+    );
+    assert!(svc.redeem(&consumer_key(), &second.code).await.is_ok());
+    db.remove().await;
+}
+
+/// ADR-129 — Updates, V2: `active_system_subs` names each operator holding
+/// an active escalation once, and no operator whose escalations ended.
+#[tokio::test]
+async fn active_system_subs_names_each_active_operator_once() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = PostgresOperatorEscalationRepository::new(db.pool.clone());
+    let svc = service(&db.pool);
+    for (system, consumer) in [
+        ("system-b", "consumer-b"),
+        ("system-a", "consumer-a"),
+        ("system-a", "consumer-a"),
+        ("system-c", "consumer-c"),
+    ] {
+        let minted = svc
+            .mint(system, consumer, AegisRole::Operator)
+            .await
+            .unwrap();
+        let key = RedeemingKey {
+            api_key_id: Uuid::new_v4(),
+            user_id: consumer.to_string(),
+            has_stored_role: false,
+        };
+        svc.redeem(&key, &minted.code).await.unwrap();
+    }
+    svc.end_for_operator("system-c").await.unwrap();
+    assert_eq!(
+        repo.active_system_subs(chrono::Utc::now()).await.unwrap(),
+        vec!["system-a".to_string(), "system-b".to_string()]
+    );
     db.remove().await;
 }

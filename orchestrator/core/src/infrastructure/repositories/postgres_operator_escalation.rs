@@ -141,6 +141,18 @@ impl OperatorEscalationRepository for PostgresOperatorEscalationRepository {
         Ok(done.rows_affected() == 1)
     }
 
+    async fn invalidate_code(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, RepositoryError> {
+        let done = sqlx::query(
+            "UPDATE operator_escalation_codes SET invalidated_at = $2 \
+             WHERE id = $1 AND consumed_at IS NULL AND invalidated_at IS NULL AND expires_at > $2",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     async fn record_failure(
         &self,
         consumer_sub: &str,
@@ -229,6 +241,17 @@ impl OperatorEscalationRepository for PostgresOperatorEscalationRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(hydrate_escalation).collect()
+    }
+
+    async fn active_system_subs(&self, now: DateTime<Utc>) -> Result<Vec<String>, RepositoryError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT system_sub FROM operator_escalations \
+             WHERE ended_at IS NULL AND expires_at > $1 ORDER BY system_sub",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 
     async fn end_escalation(
@@ -395,6 +418,17 @@ impl OperatorEscalationRepository for InMemoryOperatorEscalationRepository {
         }
     }
 
+    async fn invalidate_code(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, RepositoryError> {
+        let mut codes = self.codes.write().await;
+        match codes.get_mut(&id) {
+            Some(c) if c.is_live(now) => {
+                c.invalidated_at = Some(now);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn record_failure(
         &self,
         consumer_sub: &str,
@@ -467,6 +501,20 @@ impl OperatorEscalationRepository for InMemoryOperatorEscalationRepository {
             .collect();
         active.sort_by_key(|e| std::cmp::Reverse(e.started_at));
         Ok(active)
+    }
+
+    async fn active_system_subs(&self, now: DateTime<Utc>) -> Result<Vec<String>, RepositoryError> {
+        let mut subs: Vec<String> = self
+            .escalations
+            .read()
+            .await
+            .values()
+            .filter(|e| e.is_active(now))
+            .map(|e| e.system_sub.clone())
+            .collect();
+        subs.sort();
+        subs.dedup();
+        Ok(subs)
     }
 
     async fn end_escalation(

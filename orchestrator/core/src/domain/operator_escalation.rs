@@ -241,6 +241,11 @@ pub trait OperatorEscalationRepository: Send + Sync {
     /// or a race lost to another redemption).
     async fn consume_code(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, RepositoryError>;
 
+    /// Invalidate one live code (ADR-129 — Updates, V3: a redemption whose
+    /// operator's record no longer grants the code's role invalidates that
+    /// code); `false` when it was no longer live.
+    async fn invalidate_code(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, RepositoryError>;
+
     /// Count one failure against every live code of `consumer_sub`; a code
     /// reaching `max_failed_attempts` is invalidated. Returns the codes
     /// counted, as they stand after the update (the Update's U3).
@@ -273,6 +278,10 @@ pub trait OperatorEscalationRepository: Send + Sync {
         system_sub: &str,
         now: DateTime<Utc>,
     ) -> Result<Vec<OperatorEscalation>, RepositoryError>;
+
+    /// The distinct `system_sub` of every active escalation, sorted (ADR-129
+    /// — Updates, V2: the sweep reads each operator's record once).
+    async fn active_system_subs(&self, now: DateTime<Utc>) -> Result<Vec<String>, RepositoryError>;
 
     /// End one active escalation; `None` when it was not active.
     async fn end_escalation(
