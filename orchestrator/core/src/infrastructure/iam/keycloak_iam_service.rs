@@ -699,6 +699,12 @@ impl IdentityProvider for StandardIamService {
                 "exp".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(claims.exp)),
             );
+            // The authorized party: the client the token was issued to. The
+            // operator escalation's mint route admits only the web
+            // interface's step-up client (AEGIS ADR-129 D13).
+            if let Some(azp) = &claims.azp {
+                obj.insert("azp".to_string(), serde_json::Value::String(azp.clone()));
+            }
         }
 
         Ok(ValidatedIdentityToken {
@@ -879,6 +885,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -902,6 +909,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -934,6 +942,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -978,6 +987,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -1017,6 +1027,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -1050,6 +1061,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -1091,6 +1103,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -1124,6 +1137,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -1163,6 +1177,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         StandardIamService::new(&config, event_bus).expect("test config must build")
@@ -1312,6 +1327,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let result = StandardIamService::new(&config, event_bus);
@@ -1355,6 +1371,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         StandardIamService::new(&config, event_bus).expect("test config must build")
@@ -1487,6 +1504,37 @@ mod tests {
         );
     }
 
+    /// AEGIS ADR-129 D13: the mint route reads the token's `azp`, so the
+    /// validated token's raw claims carry it. Before this, `azp` was parsed
+    /// into a named field and left out of the raw claims.
+    #[tokio::test]
+    async fn raw_claims_carry_azp() {
+        let service = test_service_with_consumer_realm();
+        populate_jwks_cache(&service).await;
+
+        let now = now_secs();
+        let token = sign_test_jwt(serde_json::json!({
+            "sub": "abc-def-123",
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "iat": now,
+            "exp": now + 3600,
+            "azp": "zaru-client-system",
+            "zaru_tier": "free",
+            "tenant_id": "u-abcdef123",
+        }));
+        let validated = service
+            .validate_token(&token)
+            .await
+            .expect("token should validate");
+        assert_eq!(
+            validated.raw_claims.get("azp").and_then(|v| v.as_str()),
+            Some("zaru-client-system"),
+            "raw_claims must carry azp: {}",
+            validated.raw_claims
+        );
+    }
+
     /// The identity says the email is verified only when the token's
     /// `email_verified` claim is the JSON value `true`. Absent, `false`, or
     /// any other value (a string, a number) is not verified.
@@ -1552,6 +1600,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -1735,6 +1784,7 @@ mod tests {
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         StandardIamService::new(&config, event_bus).expect("test config must build")
@@ -1878,6 +1928,7 @@ mod tests {
             jwks_cache_ttl_seconds: 1,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");
@@ -1939,6 +1990,7 @@ mod tests {
             jwks_cache_ttl_seconds: 1,
             claims: IamClaimsConfig::default(),
             keycloak_admin: None,
+            operator_escalation: Default::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus).expect("test config must build");

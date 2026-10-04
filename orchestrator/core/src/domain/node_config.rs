@@ -1630,6 +1630,50 @@ pub struct IamConfig {
     /// If omitted, automatic tenant provisioning on user signup is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keycloak_admin: Option<KeycloakAdminConfig>,
+
+    /// The operator escalation's bounds (AEGIS ADR-129 D12):
+    /// `spec.iam.operator_escalation`.
+    #[serde(default)]
+    pub operator_escalation: OperatorEscalationConfig,
+}
+
+/// `spec.iam.operator_escalation` (AEGIS ADR-129 D5, D7, D8, D12): how long
+/// an escalation lasts after redemption, how long a minted code stays
+/// redeemable, and how many failed redemptions invalidate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorEscalationConfig {
+    /// Seconds an escalation lasts from its redemption. Default 1800 (D5).
+    #[serde(default = "default_operator_escalation_ttl")]
+    pub ttl_seconds: u64,
+    /// Seconds a minted code stays redeemable. Default 300 (D7).
+    #[serde(default = "default_operator_escalation_code_validity")]
+    pub code_validity_seconds: u64,
+    /// Failed redemptions that invalidate a code. Default 5 (D8).
+    #[serde(default = "default_operator_escalation_max_failed_attempts")]
+    pub code_max_failed_attempts: u32,
+}
+
+impl Default for OperatorEscalationConfig {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: default_operator_escalation_ttl(),
+            code_validity_seconds: default_operator_escalation_code_validity(),
+            code_max_failed_attempts: default_operator_escalation_max_failed_attempts(),
+        }
+    }
+}
+
+fn default_operator_escalation_ttl() -> u64 {
+    1800
+}
+
+fn default_operator_escalation_code_validity() -> u64 {
+    300
+}
+
+fn default_operator_escalation_max_failed_attempts() -> u32 {
+    5
 }
 
 /// Individual realm configuration entry within `spec.iam.realms`.
@@ -3585,5 +3629,36 @@ grpc_port: 50051
             msg.contains("one level"),
             "a chain of two must be refused as more than one level, got: {msg}"
         );
+    }
+
+    /// AEGIS ADR-129 D12: without the block, the record's defaults.
+    #[test]
+    fn operator_escalation_defaults_1800_300_5() {
+        let iam: IamConfig = serde_yaml::from_str("realms: []\n").unwrap();
+        assert_eq!(iam.operator_escalation.ttl_seconds, 1800);
+        assert_eq!(iam.operator_escalation.code_validity_seconds, 300);
+        assert_eq!(iam.operator_escalation.code_max_failed_attempts, 5);
+    }
+
+    /// AEGIS ADR-129 D12: `spec.iam.operator_escalation` sets each bound,
+    /// and a misspelt key is refused rather than ignored.
+    #[test]
+    fn operator_escalation_block_parses() {
+        let iam: IamConfig = serde_yaml::from_str(
+            "realms: []\noperator_escalation:\n  ttl_seconds: 900\n  code_validity_seconds: 120\n  code_max_failed_attempts: 3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            iam.operator_escalation,
+            OperatorEscalationConfig {
+                ttl_seconds: 900,
+                code_validity_seconds: 120,
+                code_max_failed_attempts: 3,
+            }
+        );
+        let misspelt = serde_yaml::from_str::<IamConfig>(
+            "realms: []\noperator_escalation:\n  ttl_secs: 900\n",
+        );
+        assert!(misspelt.is_err(), "a misspelt key was accepted");
     }
 }

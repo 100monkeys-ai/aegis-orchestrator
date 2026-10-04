@@ -50,6 +50,7 @@ pub mod edge;
 pub mod effective_tier_service;
 pub mod execution;
 pub mod lifecycle;
+pub mod operator_escalation_service;
 pub mod schema_registry;
 pub mod scope_requester;
 pub mod tool_approval_service;

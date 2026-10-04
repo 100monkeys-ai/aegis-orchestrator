@@ -600,6 +600,17 @@ spec:
       zaru_tier: "zaru_tier"
       aegis_role: "aegis_role"
       tenant_id: "tenant_id"
+    # Operator escalation over MCP (AEGIS ADR-129): an operator's stepped-up
+    # web session mints a six-digit, single-use code; the operator's own
+    # consumer API key redeems it and holds the operator tool surface until
+    # the escalation ends. Omit the block for these defaults.
+    operator_escalation:
+      # Seconds an escalation lasts from its redemption (D5).
+      ttl_seconds: 1800
+      # Seconds a minted code stays redeemable (D7).
+      code_validity_seconds: 300
+      # Failed redemptions that invalidate the user's live codes (D8).
+      code_max_failed_attempts: 5
 
   grpc_auth:
     enabled: true

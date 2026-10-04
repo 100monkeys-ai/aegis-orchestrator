@@ -564,6 +564,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 jwks_cache_ttl_seconds: iam.jwks_cache_ttl_seconds,
                 claims: iam.claims.clone(),
                 keycloak_admin: iam.keycloak_admin.clone(),
+                operator_escalation: iam.operator_escalation.clone(),
             };
             // `StandardIamService::new` returns `IamError::Configuration` for
             // malformed realms (unknown kind, malformed tenant slug). Surface
