@@ -21,7 +21,6 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE):
 import base64
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -187,18 +186,18 @@ def _candidate_urls() -> list:
     return result
 
 
-def post_json(payload: dict, timeout: int = 0) -> dict:
+def post_json(payload: dict) -> dict:
     """POST JSON to /v1/dispatch-gateway, trying all candidate URLs in order.
 
-    ``timeout`` is the iteration's bound (AEGIS_ITERATION_TIMEOUT_SECONDS):
-    the orchestrator runs the whole inner tool loop, many model calls and
-    tool rounds, inside one request, so the wait is bounded by the iteration
-    and not by the bound of one model call, which the orchestrator enforces
-    itself (llm_timeout_seconds). timeout=0 means no timeout.
-    Only a failure to reach a candidate (refused, unresolvable, unreachable)
-    tries the next one. A request that was delivered and not answered within
-    ``timeout`` is not re-sent anywhere: the process exits with status 1
-    naming the URL and the seconds. Exits with status 1 if all candidates fail.
+    The request carries no timeout (ADR-040, "bootstrap.py — Dispatch Loop":
+    no timeout is required for long-running dispatch loops): the orchestrator
+    runs the whole inner tool loop, many model calls and tool rounds, inside
+    one request. The orchestrator bounds the wait, not this script: the inner
+    loop bounds each model call (llm_timeout_seconds), and the supervisor
+    bounds the iteration and the execution by terminating this container.
+    An HTTP error answer exits with status 1. A failure to reach or hear from
+    a candidate (refused, unresolvable, unreachable, reset) tries the next
+    one. Exits with status 1 if all candidates fail.
     """
     data = json.dumps(payload).encode("utf-8")
     errors = []
@@ -212,7 +211,7 @@ def post_json(payload: dict, timeout: int = 0) -> dict:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout or None) as resp:
+            with urllib.request.urlopen(req, timeout=None) as resp:
                 body = resp.read().decode("utf-8")
                 debug_print(f"← {resp.status} ({len(body)} bytes)")
                 return json.loads(body)
@@ -233,15 +232,6 @@ def post_json(payload: dict, timeout: int = 0) -> dict:
             err = f"{base_url}: {e}"
             errors.append(err)
             debug_print(f"Connection error: {err}")
-        except (socket.timeout, TimeoutError):
-            # The request was delivered and no answer came within the
-            # timeout. Re-sending it elsewhere would only repeat the work.
-            print(
-                f"Error: no answer from {url} within {timeout} s "
-                "(AEGIS_ITERATION_TIMEOUT_SECONDS)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
         except Exception as e:
             err = f"{base_url}: {e}"
             errors.append(err)
@@ -427,28 +417,6 @@ def read_prompt(argv, stdin) -> str:
     return stdin.buffer.read().decode("utf-8")
 
 
-# The supervisor's default bound on one iteration
-# (orchestrator/core/src/domain/supervisor.rs, DEFAULT_ITERATION_TIMEOUT_SECONDS),
-# used only when the orchestrator did not set AEGIS_ITERATION_TIMEOUT_SECONDS.
-DEFAULT_ITERATION_TIMEOUT_SECONDS = 600
-
-
-def _parse_iteration_timeout() -> int:
-    """Parse AEGIS_ITERATION_TIMEOUT_SECONDS, the iteration's bound, which
-    bounds every wait on the dispatch gateway; the default on invalid input."""
-    raw = os.environ.get(
-        "AEGIS_ITERATION_TIMEOUT_SECONDS", str(DEFAULT_ITERATION_TIMEOUT_SECONDS)
-    )
-    try:
-        return int(raw)
-    except ValueError:
-        debug_print(
-            f"Warning: Invalid AEGIS_ITERATION_TIMEOUT_SECONDS value {raw!r}, "
-            f"using default {DEFAULT_ITERATION_TIMEOUT_SECONDS}s"
-        )
-        return DEFAULT_ITERATION_TIMEOUT_SECONDS
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -459,7 +427,6 @@ def main():
     execution_id = os.environ.get("AEGIS_EXECUTION_ID")
     agent_id = os.environ.get("AEGIS_AGENT_ID", "")
     iteration_number = int(os.environ.get("AEGIS_ITERATION", "1"))
-    iteration_timeout_seconds = _parse_iteration_timeout()
 
     # AEGIS_MODEL_ALIAS is injected by the orchestrator from spec.runtime.model.
     # It routes this execution to the correct provider alias (e.g. "judge",
@@ -476,8 +443,7 @@ def main():
 
     debug_print(
         f"execution_id={execution_id} agent_id={agent_id} "
-        f"iteration={iteration_number} model_alias={model_alias} "
-        f"iteration_timeout={iteration_timeout_seconds}s"
+        f"iteration={iteration_number} model_alias={model_alias}"
     )
 
     # -- Prompt ---------------------------------------------------------------
@@ -528,8 +494,7 @@ def main():
             "model_alias": model_alias,
             "prompt": final_prompt,
             "messages": [],
-        },
-        timeout=iteration_timeout_seconds,
+        }
     )
 
     # Execute dispatch commands until the orchestrator issues type="final".
@@ -541,7 +506,7 @@ def main():
         result = run_dispatch(msg, execution_id)
         # Re-POST the result; the orchestrator will continue the LLM conversation
         # and may dispatch another command or issue the final response.
-        msg = post_json(result, timeout=iteration_timeout_seconds)
+        msg = post_json(result)
 
     # type="final" — print the LLM response to stdout and exit cleanly.
     print(msg.get("content", ""))

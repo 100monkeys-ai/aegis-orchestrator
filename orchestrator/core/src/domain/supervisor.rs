@@ -194,8 +194,10 @@ impl Supervisor {
     ///
     /// The overall execution is bounded by `runtime_config.resources.timeout_seconds`
     /// (falling back to [`DEFAULT_EXECUTION_TIMEOUT_SECONDS`] when unset). Each
-    /// individual iteration is bounded by `timeout / max_retries` to ensure the
-    /// loop cannot monopolise the full deadline on a single hanging iteration.
+    /// individual iteration is bounded by [`iteration_timeout`] (the manifest's
+    /// `iteration_timeout`, or [`DEFAULT_ITERATION_TIMEOUT_SECONDS`]). On either
+    /// bound the iteration's container is terminated; the agent's bootstrap
+    /// holds no clock of its own (ADR-040).
     ///
     /// ## Cancellation
     ///
@@ -1102,6 +1104,57 @@ mod tests {
         let terminate_calls = runtime.terminate_calls.lock().await;
         assert_eq!(terminate_calls.len(), 1);
         assert_eq!(terminate_calls[0].as_str(), "instance-0");
+    }
+
+    /// An iteration whose bootstrap never returns (it waits on the dispatch
+    /// gateway with no timeout, AEGIS ADR-040) is ended at the iteration's
+    /// bound by the supervisor, which terminates its container; the next
+    /// iteration gets a fresh container and the same bound.
+    #[tokio::test]
+    async fn iteration_whose_bootstrap_never_returns_is_ended_at_the_iteration_bound() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(2)
+                .with_execute_success(vec!["never".to_string(), "never".to_string()])
+                .with_execute_delay(Duration::from_secs(3600)),
+        );
+        let supervisor = Supervisor::new(runtime.clone());
+        let observer = Arc::new(TestObserver::default());
+
+        let mut config = create_test_config();
+        config.execution.iteration_timeout = Some("1s".to_string());
+        config.resources.timeout_seconds = Some(60);
+
+        let started = std::time::Instant::now();
+        let result = supervisor
+            .run_loop(
+                config,
+                create_test_input(),
+                2,
+                observer.clone(),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(RuntimeError::ExecutionFailed(_))),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "each iteration ends at its 1 s bound, not the execution's 60 s: {elapsed:?}"
+        );
+        assert_eq!(*observer.iteration_fails.lock().await, vec![1, 2]);
+        let terminated: Vec<String> = runtime
+            .terminate_calls
+            .lock()
+            .await
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect();
+        assert_eq!(terminated, vec!["instance-0", "instance-1"]);
     }
 
     #[tokio::test]

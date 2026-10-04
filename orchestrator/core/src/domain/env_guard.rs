@@ -76,7 +76,6 @@ const ALLOWED_AEGIS_VARS: &[&str] = &[
     "AEGIS_MODEL_ALIAS",
     "AEGIS_AGENT_INSTRUCTION",
     "AEGIS_PROMPT_TEMPLATE",
-    "AEGIS_ITERATION_TIMEOUT_SECONDS",
 ];
 
 /// Validates whether an environment variable name is safe to pass to

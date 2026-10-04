@@ -1179,13 +1179,10 @@ mod tests {
             .unwrap();
 
         let spawned = wait_for_spawn(runtime.as_ref()).await;
-        // A child's container waits the iteration's bound too.
-        assert_eq!(
-            spawned
-                .env
-                .get("AEGIS_ITERATION_TIMEOUT_SECONDS")
-                .map(String::as_str),
-            Some("600"),
+        // A child's container is given no bound for the bootstrap's wait
+        // either (AEGIS ADR-040); the supervisor bounds its iterations.
+        assert!(
+            !spawned.env.contains_key("AEGIS_ITERATION_TIMEOUT_SECONDS"),
             "env: {:?}",
             spawned.env
         );
@@ -2082,13 +2079,14 @@ mod tests {
         assert_eq!(spawned.volumes[0].mount_point, PathBuf::from("/workspace"));
     }
 
-    /// The bootstrap's wait on the dispatch gateway spans the iteration's whole
-    /// inner tool loop, so the container is given the supervisor's bound on an
-    /// iteration and not the bound of one model call (f6209dbc, 2026-10-03:
-    /// three working iterations cut at llm_timeout_seconds' 300 s, below the
-    /// iteration's 600 s).
+    /// The bootstrap's wait on the dispatch gateway carries no timeout (AEGIS
+    /// ADR-040, "bootstrap.py — Dispatch Loop": "timeout=0 → no timeout
+    /// (required for long-running dispatch loops)"), so the container is given
+    /// no bound for it: not the iteration's, which the supervisor enforces by
+    /// terminating the container, and not one model call's, which the inner
+    /// loop enforces.
     #[tokio::test]
-    async fn container_waits_the_iteration_bound_not_one_model_calls() {
+    async fn container_env_carries_no_bound_for_the_bootstraps_wait() {
         let tenant_id = CoreTenantId::consumer();
         let agent = make_agent("executor", None, None);
         let (service, runtime, _gw) =
@@ -2104,24 +2102,22 @@ mod tests {
             .unwrap();
 
         let spawned = wait_for_spawn(runtime.as_ref()).await;
-        assert_eq!(
-            spawned
-                .env
-                .get("AEGIS_ITERATION_TIMEOUT_SECONDS")
-                .map(String::as_str),
-            Some("600"),
-            "env: {:?}",
+        assert!(
+            !spawned.env.contains_key("AEGIS_ITERATION_TIMEOUT_SECONDS"),
+            "the bootstrap's wait is unbounded (ADR-040): {:?}",
             spawned.env
         );
         assert!(
             !spawned.env.contains_key("AEGIS_LLM_TIMEOUT_SECONDS"),
-            "the bootstrap no longer waits one model call's bound: {:?}",
+            "one model call is bounded by the inner loop, not the bootstrap: {:?}",
             spawned.env
         );
     }
 
+    /// A manifest's own iteration bound and model-call bound reach the
+    /// supervisor and the inner loop, not the container's environment.
     #[tokio::test]
-    async fn container_waits_the_manifests_own_iteration_bound() {
+    async fn manifest_bounds_do_not_reach_the_container_env() {
         let tenant_id = CoreTenantId::consumer();
         let mut agent = make_agent("executor", None, None);
         agent.manifest.spec.execution = Some(crate::domain::agent::ExecutionStrategy {
@@ -2142,12 +2138,13 @@ mod tests {
             .unwrap();
 
         let spawned = wait_for_spawn(runtime.as_ref()).await;
-        assert_eq!(
-            spawned
-                .env
-                .get("AEGIS_ITERATION_TIMEOUT_SECONDS")
-                .map(String::as_str),
-            Some("900"),
+        assert!(
+            !spawned.env.contains_key("AEGIS_ITERATION_TIMEOUT_SECONDS"),
+            "env: {:?}",
+            spawned.env
+        );
+        assert!(
+            !spawned.env.contains_key("AEGIS_LLM_TIMEOUT_SECONDS"),
             "env: {:?}",
             spawned.env
         );
@@ -3765,18 +3762,10 @@ impl StandardExecutionService {
                 });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
 
-        // bootstrap.py waits on the dispatch gateway for the iteration's whole
-        // inner tool loop, so it is given the supervisor's bound on an
-        // iteration; one model call is bounded by llm_timeout_seconds on the
-        // orchestrator's side (inner_loop_service).
-        env.insert(
-            "AEGIS_ITERATION_TIMEOUT_SECONDS".to_string(),
-            crate::domain::supervisor::iteration_timeout(
-                &agent.manifest.spec.execution.clone().unwrap_or_default(),
-            )
-            .as_secs()
-            .to_string(),
-        );
+        // bootstrap.py waits on the dispatch gateway with no timeout (ADR-040),
+        // so no bound is passed to it: the supervisor bounds the iteration and
+        // the execution by terminating the container, and the inner loop
+        // bounds each model call by llm_timeout_seconds (inner_loop_service).
 
         // Inject model alias so bootstrap.py routes this agent's LLM calls to the
         // model the node configuration maps that alias to (`spec.llm_providers`).
@@ -4619,14 +4608,6 @@ impl ExecutionService for StandardExecutionService {
                     format!("http://host.docker.internal:{port}")
                 });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
-        env.insert(
-            "AEGIS_ITERATION_TIMEOUT_SECONDS".to_string(),
-            crate::domain::supervisor::iteration_timeout(
-                &agent.manifest.spec.execution.clone().unwrap_or_default(),
-            )
-            .as_secs()
-            .to_string(),
-        );
 
         // Inject model alias so bootstrap.py routes this child agent's LLM calls to the
         // model the node configuration maps that alias to (`spec.llm_providers`).

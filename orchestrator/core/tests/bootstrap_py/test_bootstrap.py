@@ -14,12 +14,15 @@ import io
 import json
 import os
 import pathlib
+import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import threading
 import time
 import unittest
+import unittest.mock
 
 # Loading the bootstrap must not leave a __pycache__ beside it in assets/,
 # which the images copy whole.
@@ -33,33 +36,6 @@ def load_bootstrap():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-class SilentServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """An orchestrator stand-in that reads each request and never answers."""
-
-    daemon_threads = True
-
-    def __init__(self):
-        self.requests_seen = 0
-        self.release = threading.Event()
-        server = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", 0))
-                self.rfile.read(length)
-                server.requests_seen += 1
-                server.release.wait(10)
-
-            def log_message(self, *args):
-                pass
-
-        super().__init__(("127.0.0.1", 0), Handler)
-
-    @property
-    def url(self):
-        return f"http://127.0.0.1:{self.server_address[1]}"
 
 
 class RunDispatchTests(unittest.TestCase):
@@ -104,55 +80,89 @@ class RunDispatchTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 3)
 
 
-class PostJsonTimeoutTests(unittest.TestCase):
-    """T5: a request that was delivered and not answered in time is not re-sent."""
+class ResettingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """An orchestrator stand-in whose process goes away mid-request: it reads
+    each request and resets the connection without answering."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self):
+        self.requests_seen = 0
+        server = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                length = 0
+                while True:
+                    line = self.rfile.readline()
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+                    name, _, value = line.decode("latin-1").partition(":")
+                    if name.strip().lower() == "content-length":
+                        length = int(value.strip())
+                self.rfile.read(length)
+                server.requests_seen += 1
+                # SO_LINGER with a zero timeout: close() sends a reset.
+                self.connection.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+                self.connection.close()
+
+            def finish(self):
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+
+class PostJsonCandidateTests(unittest.TestCase):
+    """Which failures move the request on to the next candidate URL, and that a
+    reset connection ends the bootstrap with status 1."""
 
     def setUp(self):
         self.bootstrap = load_bootstrap()
-        self.servers = [SilentServer(), SilentServer()]
-        for server in self.servers:
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-        urls = [server.url for server in self.servers]
-        self.bootstrap._candidate_urls = lambda: list(urls)
 
-    def tearDown(self):
-        for server in self.servers:
-            server.release.set()
-            server.shutdown()
-            server.server_close()
-
-    def test_read_timeout_is_not_retried_on_other_candidates(self):
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            with self.assertRaises(SystemExit) as raised:
-                self.bootstrap.post_json({"type": "generate"}, timeout=1)
-
-        self.assertEqual(raised.exception.code, 1)
-        self.assertEqual(
-            [server.requests_seen for server in self.servers],
-            [1, 0],
-            "the generate request must be sent once, to the first candidate",
-        )
-        first = f"{self.servers[0].url}/v1/dispatch-gateway"
-        self.assertIn(
-            f"Error: no answer from {first} within 1 s (AEGIS_ITERATION_TIMEOUT_SECONDS)",
-            stderr.getvalue(),
-        )
+    def start(self, server):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
 
     def test_unreachable_candidate_falls_through_to_the_next(self):
         # A port nothing listens on: the connection is refused before any
         # request is sent, so the next candidate is tried.
         with socketserver.TCPServer(("127.0.0.1", 0), None) as probe:
             dead = f"http://127.0.0.1:{probe.server_address[1]}"
-        live = self.servers[0].url
-        self.bootstrap._candidate_urls = lambda: [dead, live]
+        live = self.start(ScriptedServer([(0, {"type": "final", "content": "ok"})]))
+        self.bootstrap._candidate_urls = lambda: [dead, live.url]
+
+        msg = self.bootstrap.post_json({"type": "generate"})
+
+        self.assertEqual(msg, {"type": "final", "content": "ok"})
+        self.assertEqual([r["type"] for r in live.requests], ["generate"])
+
+    def test_reset_connection_exits_with_status_1(self):
+        # The orchestrator's process is gone: the kernel resets the connection
+        # the bootstrap is waiting on. With no clock of its own, this is what
+        # ends the bootstrap when nothing will ever answer.
+        server = self.start(ResettingServer())
+        self.bootstrap._candidate_urls = lambda: [server.url]
 
         stderr = io.StringIO()
+        started = time.monotonic()
         with contextlib.redirect_stderr(stderr):
-            with self.assertRaises(SystemExit):
-                self.bootstrap.post_json({"type": "generate"}, timeout=1)
+            with self.assertRaises(SystemExit) as raised:
+                self.bootstrap.post_json({"type": "generate"})
 
-        self.assertEqual(self.servers[0].requests_seen, 1, stderr.getvalue())
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(server.requests_seen, 1)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("Error: Failed to reach orchestrator.", stderr.getvalue())
+        self.assertIn(server.url, stderr.getvalue())
 
 
 class ScriptedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -193,12 +203,13 @@ class ScriptedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         return f"http://127.0.0.1:{self.server_address[1]}"
 
 
-class IterationBoundTests(unittest.TestCase):
-    """The bootstrap's wait on the dispatch gateway spans the whole inner tool
-    loop of an iteration (many model calls and tool rounds), so it is bounded
-    by the iteration's own bound, AEGIS_ITERATION_TIMEOUT_SECONDS, and not by
-    a timeout meant for one model call (f6209dbc, 2026-10-03: three working
-    iterations cut at 300 s, below the supervisor's 600 s)."""
+class UnboundedWaitTests(unittest.TestCase):
+    """The bootstrap's wait on the dispatch gateway carries no timeout (AEGIS
+    ADR-040, "bootstrap.py — Dispatch Loop": "timeout=0 → no timeout (required
+    for long-running dispatch loops)"; Gap 040-9: the wait after a dispatch
+    result "should be unbounded"). The orchestrator bounds one model call
+    (llm_timeout_seconds), and its supervisor bounds the iteration and the
+    execution by terminating the container."""
 
     def start(self, script):
         server = ScriptedServer(script)
@@ -227,37 +238,75 @@ class IterationBoundTests(unittest.TestCase):
             timeout=wall,
         )
 
-    def test_answer_after_llm_timeout_and_before_iteration_bound_is_received(self):
-        # The loop's answer comes 2 s after the generate POST: past the 1 s a
-        # model call is given, inside the iteration's 6 s.
+    def test_answer_after_llm_timeout_is_received(self):
+        # The loop's answer comes 2 s after the generate POST, past the 1 s a
+        # model call is given.
         server = self.start([(2, {"type": "final", "content": "the answer"})])
+        done = self.run_main(server, {"AEGIS_LLM_TIMEOUT_SECONDS": "1"})
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(done.stdout.decode().strip(), "the answer")
+
+    def test_answers_after_any_earlier_bound_are_received_on_both_posts(self):
+        # The generate POST is answered with a dispatch after 2 s, and the
+        # dispatch_result re-POST with the final answer after 2 s more: each
+        # past the 1 s that 265469e7's bootstrap would have read from
+        # AEGIS_ITERATION_TIMEOUT_SECONDS and given up at.
+        server = self.start(
+            [
+                (2, {"type": "dispatch", "action": "exec", "dispatch_id": "d",
+                     "command": "true", "cwd": "/"}),
+                (2, {"type": "final", "content": "the answer"}),
+            ]
+        )
         done = self.run_main(
             server,
-            {"AEGIS_LLM_TIMEOUT_SECONDS": "1", "AEGIS_ITERATION_TIMEOUT_SECONDS": "6"},
+            {"AEGIS_LLM_TIMEOUT_SECONDS": "1", "AEGIS_ITERATION_TIMEOUT_SECONDS": "1"},
         )
         self.assertEqual(done.returncode, 0, done.stderr.decode())
         self.assertEqual(done.stdout.decode().strip(), "the answer")
-        self.assertNotIn(b"no answer from", done.stderr)
+        self.assertEqual(
+            [r["type"] for r in server.requests], ["generate", "dispatch_result"]
+        )
 
-    def test_repeat_post_after_a_dispatch_is_bounded_by_the_iteration(self):
-        # The first answer is a dispatch; the repeat POST carrying its result
-        # is never answered, so the bootstrap gives up at the iteration's bound
-        # and says so, rather than waiting without end.
+    def test_both_posts_are_made_with_no_timeout(self):
+        # In process: every urlopen the dispatch loop makes is given
+        # timeout=None, whatever the environment says.
         server = self.start(
             [
                 (0, {"type": "dispatch", "action": "exec", "dispatch_id": "d",
                      "command": "true", "cwd": "/"}),
-                (0, None),
+                (0, {"type": "final", "content": "the answer"}),
             ]
         )
-        done = self.run_main(server, {"AEGIS_ITERATION_TIMEOUT_SECONDS": "2"}, wall=15)
-        self.assertEqual(done.returncode, 1, done.stderr.decode())
-        self.assertEqual([r["type"] for r in server.requests], ["generate", "dispatch_result"])
-        self.assertIn(
-            f"Error: no answer from {server.url}/v1/dispatch-gateway within 2 s "
-            "(AEGIS_ITERATION_TIMEOUT_SECONDS)",
-            done.stderr.decode(),
+        bootstrap = load_bootstrap()
+        bootstrap._candidate_urls = lambda: [server.url]
+        timeouts = []
+        real_urlopen = bootstrap.urllib.request.urlopen
+
+        def recording_urlopen(req, *args, **kwargs):
+            timeouts.append(kwargs["timeout"] if "timeout" in kwargs else args[1])
+            return real_urlopen(req, *args, **kwargs)
+
+        env = {
+            "AEGIS_MODEL_ALIAS": "default",
+            "AEGIS_EXECUTION_ID": "e",
+            "AEGIS_AGENT_ID": "a",
+            "AEGIS_LLM_TIMEOUT_SECONDS": "1",
+            "AEGIS_ITERATION_TIMEOUT_SECONDS": "1",
+        }
+        stdout = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(
+            bootstrap.urllib.request, "urlopen", recording_urlopen
+        ), unittest.mock.patch.object(
+            sys, "argv", ["bootstrap.py", "do the work"]
+        ), contextlib.redirect_stdout(stdout):
+            bootstrap.main()
+
+        self.assertEqual(stdout.getvalue().strip(), "the answer")
+        self.assertEqual(
+            [r["type"] for r in server.requests], ["generate", "dispatch_result"]
         )
+        self.assertEqual(timeouts, [None, None])
 
 
 class ReadPromptTests(unittest.TestCase):
