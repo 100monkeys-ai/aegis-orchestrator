@@ -120,10 +120,9 @@ pub const DEFAULT_EXECUTION_TIMEOUT_SECONDS: u64 = 1800;
 pub const DEFAULT_ITERATION_TIMEOUT_SECONDS: u64 = 600;
 
 /// The bound on one iteration of an agent with this execution strategy: its
-/// `iteration_timeout`, or [`DEFAULT_ITERATION_TIMEOUT_SECONDS`]. The one
-/// source of the bound: the supervisor enforces it on each iteration, and the
-/// agent container's bootstrap waits that long on the dispatch gateway
-/// (`AEGIS_ITERATION_TIMEOUT_SECONDS`).
+/// `iteration_timeout`, or [`DEFAULT_ITERATION_TIMEOUT_SECONDS`]. The supervisor
+/// enforces it on each iteration by terminating the container; the agent's
+/// bootstrap holds no clock of its own (ADR-040).
 pub fn iteration_timeout(execution: &crate::domain::agent::ExecutionStrategy) -> Duration {
     execution
         .iteration_timeout
