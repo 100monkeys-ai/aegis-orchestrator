@@ -733,6 +733,10 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
 struct TestStartWorkflowExecutionUseCase {
     last_request:
         Mutex<Option<crate::application::start_workflow_execution::StartWorkflowExecutionRequest>>,
+    /// The started execution this use case answered last, so a test can
+    /// compare a tool's answer with the run it started.
+    last_started:
+        Mutex<Option<crate::application::start_workflow_execution::StartedWorkflowExecution>>,
 }
 
 #[async_trait]
@@ -746,15 +750,15 @@ impl StartWorkflowExecutionUseCase for TestStartWorkflowExecutionUseCase {
         request.tenant_id = Some(tenant_id.clone());
         *self.last_request.lock().await = Some(request.clone());
 
-        Ok(
-            crate::application::start_workflow_execution::StartedWorkflowExecution {
-                execution_id: ExecutionId::new().to_string(),
-                workflow_id: request.workflow_id,
-                temporal_run_id: "temporal-run-id".to_string(),
-                status: "started".to_string(),
-                started_at: chrono::Utc::now(),
-            },
-        )
+        let started = crate::application::start_workflow_execution::StartedWorkflowExecution {
+            execution_id: ExecutionId::new().to_string(),
+            workflow_id: request.workflow_id,
+            temporal_run_id: "temporal-run-id".to_string(),
+            status: "started".to_string(),
+            started_at: chrono::Utc::now(),
+        };
+        *self.last_started.lock().await = Some(started.clone());
+        Ok(started)
     }
 }
 
@@ -2809,6 +2813,111 @@ async fn task_execute_with_version_on_uuid_returns_error() {
         error.contains("only supported when identifying agents by name"),
         "error should explain version is only for name lookups: {error}"
     );
+}
+
+/// A service whose workflow starts are answered by `start_use_case`, and an
+/// operator context that admits every tool.
+fn workflow_start_service(
+    start_use_case: Arc<TestStartWorkflowExecutionUseCase>,
+) -> (ToolInvocationService, SecurityContext) {
+    let agent_id = AgentId::new();
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(VersionAwareAgentLifecycleService {
+            agent_name: "unused".to_string(),
+            agent_version: "unused".to_string(),
+            agent_id,
+        }),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution(start_use_case);
+    let operator_context = SecurityContext {
+        name: "aegis-system-operator".to_string(),
+        description: "Operator".to_string(),
+        capabilities: vec![crate::domain::security_context::Capability {
+            tool_pattern: "*".to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        }],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+    (service, operator_context)
+}
+
+/// AEGIS operations/known-defects-7: `aegis.workflow.run` answered the
+/// workflow definition's id as `execution_id`, so `aegis.workflow.wait` on
+/// it found no execution. It answers the workflow execution it started.
+#[tokio::test]
+async fn aegis_workflow_run_answers_the_started_execution_id() {
+    let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+    let (service, operator_context) = workflow_start_service(start_use_case.clone());
+    let mut args = serde_json::json!({ "name": "my-workflow", "input": {} });
+    let ToolInvocationResult::Direct(payload) = service
+        .invoke_aegis_workflow_run_tool(&mut args, &operator_context, None, &test_tenant_scope())
+        .await
+        .expect("workflow run should return a result")
+    else {
+        panic!("expected direct payload");
+    };
+    let started = start_use_case
+        .last_started
+        .lock()
+        .await
+        .clone()
+        .expect("the run was started");
+    assert_eq!(payload["execution_id"], started.execution_id);
+    assert_ne!(payload["execution_id"], started.workflow_id);
+}
+
+/// AEGIS operations/known-defects-7: `aegis.workflow.generate` answered the
+/// generator workflow's id as `execution_id`. It answers the workflow
+/// execution it started, the one `aegis.workflow.wait` reads.
+#[tokio::test]
+async fn aegis_workflow_generate_answers_the_started_execution_id() {
+    let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+    let (service, _operator_context) = workflow_start_service(start_use_case.clone());
+    let mut args = serde_json::json!({ "input": "a workflow that greets" });
+    let ToolInvocationResult::Direct(payload) = service
+        .invoke_aegis_workflow_generate_tool(&mut args, None, &test_tenant_scope())
+        .await
+        .expect("workflow generate should return a result")
+    else {
+        panic!("expected direct payload");
+    };
+    let started = start_use_case
+        .last_started
+        .lock()
+        .await
+        .clone()
+        .expect("the generation was started");
+    assert_eq!(payload["execution_id"], started.execution_id);
+    assert_ne!(payload["execution_id"], started.workflow_id);
 }
 
 #[tokio::test]

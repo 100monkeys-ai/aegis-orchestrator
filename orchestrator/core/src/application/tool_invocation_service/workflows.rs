@@ -192,7 +192,7 @@ impl ToolInvocationService {
         {
             Ok(started) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.run",
-                "execution_id": started.workflow_id,
+                "execution_id": started.execution_id,
                 "status": "started"
             }))),
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -539,7 +539,7 @@ impl ToolInvocationService {
                 .await;
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.generate",
-                    "execution_id": started.workflow_id,
+                    "execution_id": started.execution_id,
                     "status": "started"
                 })))
             }
