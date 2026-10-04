@@ -36,7 +36,7 @@ use crate::domain::events::GoalEvent;
 use crate::domain::execution::ExecutionId;
 use crate::domain::goal::{
     outcome_of, truncate_chars, BoundExecution, BoundKind, Goal, GoalChannel, GoalEvaluation,
-    GoalId, GoalOutcome, GoalRepository, GoalState, MAX_JUDGED_TEXT_CHARS, MAX_STATEMENT_CHARS,
+    GoalId, GoalOutcome, GoalRepository, GoalState, FAULT_OUTPUT_SHOWN_CHARS, MAX_STATEMENT_CHARS,
 };
 use crate::domain::node_config::GoalsConfig;
 use crate::domain::repository::RepositoryError;
@@ -341,8 +341,9 @@ impl GoalService {
                 asked,
             });
         }
-        let answer = truncate_chars(companion_answer, MAX_JUDGED_TEXT_CHARS);
-        self.judge_round(world, goal, &answer, evaluations).await
+        // U14: the answer is judged and stored as the person received it.
+        self.judge_round(world, goal, companion_answer, evaluations)
+            .await
     }
 
     async fn judge_round(
@@ -451,8 +452,9 @@ impl GoalService {
     }
 
     /// D4: the goal verbatim, every bound execution oldest first as the
-    /// orchestrator's rows hold it, the companion's answer, the round and
-    /// the rounds left. `approval_pending` covers executions bound directly
+    /// orchestrator's rows hold it, its last output whole, the companion's
+    /// answer whole (U14: nothing a judge is given is cut), the round and the
+    /// rounds left. `approval_pending` covers executions bound directly
     /// to the goal only (U5).
     pub async fn judge_input(
         &self,
@@ -480,10 +482,7 @@ impl GoalService {
                 "started_at": view.started_at,
                 "ended_at": view.ended_at,
                 "iterations": view.iterations,
-                "last_output": view
-                    .last_output
-                    .as_deref()
-                    .map(|o| truncate_chars(o, MAX_JUDGED_TEXT_CHARS)),
+                "last_output": view.last_output,
                 "last_error": view.last_error,
                 "approval_pending": approvals,
             }));
@@ -491,7 +490,7 @@ impl GoalService {
         Ok(json!({
             "goal": goal.statement,
             "executions": executions,
-            "companion_answer": truncate_chars(companion_answer, MAX_JUDGED_TEXT_CHARS),
+            "companion_answer": companion_answer,
             "round": goal.rounds,
             "rounds_left": self.config.max_continuations.saturating_sub(goal.rounds),
         }))
@@ -872,7 +871,7 @@ fn fault_json(fault: &JudgeFault) -> Value {
         "fault": {
             "judge_agent": fault.judge_agent,
             "reason": fault.reason,
-            "output": truncate_chars(&fault.output, MAX_JUDGED_TEXT_CHARS),
+            "output": truncate_chars(&fault.output, FAULT_OUTPUT_SHOWN_CHARS),
         }
     })
 }
@@ -919,6 +918,8 @@ mod tests {
         script: Mutex<VecDeque<Judge>>,
         judges: Mutex<Vec<(ExecutionId, Judge, Value)>>,
         pending: Mutex<Vec<(ExecutionId, String)>>,
+        /// Every bound execution's last output; 10,000 characters when unset.
+        output: Mutex<Option<String>>,
     }
 
     impl World {
@@ -955,7 +956,13 @@ mod tests {
                 started_at: b.started_at,
                 ended_at: Some(b.started_at),
                 iterations: Some(1),
-                last_output: Some("x".repeat(10_000)),
+                last_output: Some(
+                    self.output
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "x".repeat(10_000)),
+                ),
                 last_error: None,
             })
         }
@@ -1364,17 +1371,108 @@ mod tests {
         assert_eq!(input["round"], 0);
         assert_eq!(input["rounds_left"], 3);
         assert_eq!(
-            input["companion_answer"].as_str().unwrap().chars().count(),
-            MAX_JUDGED_TEXT_CHARS
+            input["companion_answer"], long_answer,
+            "U14: the answer reaches the judge whole"
         );
         let execution = &input["executions"][0];
         assert_eq!(execution["kind"], "agent");
         assert_eq!(execution["status"], "completed");
         assert_eq!(
-            execution["last_output"].as_str().unwrap().chars().count(),
-            MAX_JUDGED_TEXT_CHARS
+            execution["last_output"],
+            "x".repeat(10_000),
+            "U14: the output reaches the judge whole"
         );
         assert_eq!(execution["approval_pending"], json!([]));
+    }
+
+    /// A long, complete report (synthetic text, 13,010 characters, the size
+    /// of the answer judged on 2026-10-04 19:20-19:28 UTC) ending on its own
+    /// closing sentence.
+    fn complete_report_of_13010_chars() -> String {
+        let closing = " End of the report: every section above is complete.";
+        let paragraph = "Section: the parts, their ratings and why each was chosen. ";
+        let mut report = String::new();
+        while report.chars().count() + paragraph.len() <= 13_010 - closing.len() {
+            report.push_str(paragraph);
+        }
+        while report.chars().count() < 13_010 - closing.len() {
+            report.push('.');
+        }
+        report.push_str(closing);
+        assert_eq!(report.chars().count(), 13_010);
+        report
+    }
+
+    /// U14 (AEGIS ADR-131, Update of 2026-10-04 (5)): on 2026-10-04 goal-judge
+    /// was given an answer and an output cut to 8,192 characters and judged
+    /// the cut as the answer's own defect four rounds running. The judge is
+    /// given both whole, ending on their closing sentence, and the stored
+    /// evaluation holds the answer whole.
+    #[tokio::test]
+    async fn a_long_complete_answer_and_output_reach_the_judge_whole_and_are_stored_whole() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let report = complete_report_of_13010_chars();
+        let world = World::scripted(vec![says(0.95, 0.9, 0.9)]);
+        *world.output.lock().unwrap() = Some(report.clone());
+        let answer = h
+            .service
+            .evaluate(&world, &h.caller, goal.id, &report, None)
+            .await
+            .unwrap();
+        assert_eq!(answer["outcome"], "met");
+        let input = world.last_input();
+        let judged_answer = input["companion_answer"].as_str().unwrap();
+        assert_eq!(judged_answer, report);
+        assert!(judged_answer.ends_with("every section above is complete."));
+        let judged_output = input["executions"][0]["last_output"].as_str().unwrap();
+        assert_eq!(judged_output, report);
+        let stored = h.repo.list_evaluations(goal.id).await.unwrap();
+        assert_eq!(stored[0].companion_answer, report, "stored whole");
+    }
+
+    /// An evaluation stored before U14, its answer cut to 8,192 characters,
+    /// reads as stored: a repeated evaluation of its decided round answers the
+    /// stored answer and starts no judge, and the stored text is not
+    /// presented as whole.
+    #[tokio::test]
+    async fn an_evaluation_stored_cut_before_u14_reads_as_stored() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let cut = "a".repeat(8_192);
+        let stored_answer = json!({"goal_id": goal.id.to_string(), "state": "open",
+            "round": 1, "continue": true, "outcome": "not_met"});
+        let old = GoalEvaluation {
+            id: Uuid::new_v4(),
+            goal_id: goal.id,
+            round: 0,
+            attempt: 1,
+            judge_execution_id: Some(ExecutionId::new()),
+            companion_answer: cut.clone(),
+            verdict: Some(json!({"score": 0.0, "confidence": 1.0,
+                "reasoning": "The answer is truncated.", "signals": []})),
+            outcome: Some(GoalOutcome::NotMet),
+            r#continue: true,
+            waiting_on: None,
+            answer: Some(stored_answer.clone()),
+            created_at: h.now(),
+            decided_at: Some(h.now()),
+        };
+        h.repo.insert_evaluation(&old).await.unwrap();
+        let world = World::scripted(vec![]);
+        let again = h
+            .service
+            .evaluate(&world, &h.caller, goal.id, &"a".repeat(13_010), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(again, stored_answer);
+        assert_eq!(world.judges_started(), 0);
+        let stored = h.repo.list_evaluations(goal.id).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].companion_answer, cut,
+            "kept as stored, not rewritten"
+        );
     }
 
     #[tokio::test]

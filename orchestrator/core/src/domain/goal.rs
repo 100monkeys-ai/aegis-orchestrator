@@ -28,9 +28,11 @@ use crate::domain::validation::GradientResult;
 /// The longest statement a goal holds, in characters (D1).
 pub const MAX_STATEMENT_CHARS: usize = 32_768;
 
-/// The longest companion answer and execution output the judge receives, in
-/// characters (D4; Zaru ADR-0049 D1's per-result limit).
-pub const MAX_JUDGED_TEXT_CHARS: usize = 8_192;
+/// The longest part of a faulted judge's own output an answer shows a reader,
+/// in characters. A judge's input is never cut: the judge is given the goal,
+/// each output and the answer whole (U14); this bounds only the text quoted
+/// back from a judge whose verdict could not be read.
+pub const FAULT_OUTPUT_SHOWN_CHARS: usize = 8_192;
 
 /// The signal category whose score decides "cannot be met" (D5).
 pub const FEASIBILITY_SIGNAL: &str = "feasibility";
