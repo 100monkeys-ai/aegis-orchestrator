@@ -114,6 +114,24 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 /// 30 minutes is generous enough for complex tasks while preventing indefinite runs.
 pub const DEFAULT_EXECUTION_TIMEOUT_SECONDS: u64 = 1800;
 
+/// Default bound on one iteration when the manifest's
+/// `spec.execution.iteration_timeout` is absent or unparseable: time for the
+/// iteration's whole inner tool loop, many model calls and tool rounds.
+pub const DEFAULT_ITERATION_TIMEOUT_SECONDS: u64 = 600;
+
+/// The bound on one iteration of an agent with this execution strategy: its
+/// `iteration_timeout`, or [`DEFAULT_ITERATION_TIMEOUT_SECONDS`]. The one
+/// source of the bound: the supervisor enforces it on each iteration, and the
+/// agent container's bootstrap waits that long on the dispatch gateway
+/// (`AEGIS_ITERATION_TIMEOUT_SECONDS`).
+pub fn iteration_timeout(execution: &crate::domain::agent::ExecutionStrategy) -> Duration {
+    execution
+        .iteration_timeout
+        .as_deref()
+        .and_then(|s| parse_duration(s).ok())
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_ITERATION_TIMEOUT_SECONDS))
+}
+
 #[async_trait]
 pub trait SupervisorObserver: Send + Sync {
     async fn on_iteration_start(&self, iteration: u8, prompt: &str);
@@ -207,14 +225,10 @@ impl Supervisor {
             .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
         let overall_timeout = Duration::from_secs(overall_timeout_secs);
 
-        // Per-iteration timeout: explicitly configured in manifest, or 600 seconds default.
-        // This ensures each iteration has sufficient time for LLM calls + tool invocations.
-        let per_iteration_timeout = runtime_config
-            .execution
-            .iteration_timeout
-            .as_deref()
-            .and_then(|s| parse_duration(s).ok())
-            .unwrap_or_else(|| Duration::from_secs(600));
+        // Per-iteration timeout: explicitly configured in manifest, or
+        // DEFAULT_ITERATION_TIMEOUT_SECONDS. This ensures each iteration has
+        // sufficient time for LLM calls + tool invocations.
+        let per_iteration_timeout = iteration_timeout(&runtime_config.execution);
 
         info!(
             overall_timeout_secs = overall_timeout_secs,
@@ -656,6 +670,26 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn iteration_timeout_defaults_to_600_seconds() {
+        let strategy = crate::domain::agent::ExecutionStrategy::default();
+        assert_eq!(iteration_timeout(&strategy), Duration::from_secs(600));
+        assert_eq!(DEFAULT_ITERATION_TIMEOUT_SECONDS, 600);
+    }
+
+    #[test]
+    fn iteration_timeout_reads_the_manifest_and_falls_back_on_garbage() {
+        let mut strategy = crate::domain::agent::ExecutionStrategy {
+            iteration_timeout: Some("15m".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(iteration_timeout(&strategy), Duration::from_secs(900));
+        strategy.iteration_timeout = Some("120s".to_string());
+        assert_eq!(iteration_timeout(&strategy), Duration::from_secs(120));
+        strategy.iteration_timeout = Some("soon".to_string());
+        assert_eq!(iteration_timeout(&strategy), Duration::from_secs(600));
+    }
 
     // Test runtime for exercising supervisor behavior.
     struct TestRuntime {

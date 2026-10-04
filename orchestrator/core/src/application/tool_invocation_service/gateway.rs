@@ -96,6 +96,21 @@ impl ToolInvocationService {
             .collect())
     }
 
+    /// The agent's `spec.execution.llm_timeout_seconds`: the bound on one of
+    /// its model calls, which the inner loop enforces (the default when the
+    /// manifest has no execution block).
+    pub(crate) async fn agent_llm_timeout_seconds(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> anyhow::Result<u64> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent_visible(tenant_id, agent_id)
+            .await?;
+        Ok(llm_timeout_seconds_of(&agent))
+    }
+
     pub async fn get_available_tools_for_agent_in_context(
         &self,
         tenant_id: &TenantId,
@@ -443,5 +458,61 @@ impl ToolInvocationService {
 
         serde_json::from_str(&response.result_json)
             .map_err(|e| SealSessionError::InternalError(e.to_string()))
+    }
+}
+
+fn llm_timeout_seconds_of(agent: &crate::domain::agent::Agent) -> u64 {
+    agent
+        .manifest
+        .spec
+        .execution
+        .clone()
+        .unwrap_or_default()
+        .llm_timeout_seconds
+}
+
+#[cfg(test)]
+mod llm_timeout_tests {
+    use super::llm_timeout_seconds_of;
+    use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
+
+    fn agent(execution: &str) -> Agent {
+        let manifest: AgentManifest = serde_yaml::from_str(&format!(
+            r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: timeout-test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+{execution}
+"#
+        ))
+        .unwrap();
+        Agent {
+            id: AgentId::new(),
+            tenant_id: crate::domain::tenant::TenantId::default(),
+            scope: crate::domain::agent::AgentScope::default(),
+            name: manifest.metadata.name.clone(),
+            manifest,
+            status: AgentStatus::Active,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn the_manifests_llm_timeout_seconds_is_read() {
+        let agent = agent("  execution:\n    llm_timeout_seconds: 45\n");
+        assert_eq!(llm_timeout_seconds_of(&agent), 45);
+    }
+
+    #[test]
+    fn without_an_execution_block_the_default_300_is_read() {
+        assert_eq!(llm_timeout_seconds_of(&agent("")), 300);
     }
 }

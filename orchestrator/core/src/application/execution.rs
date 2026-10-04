@@ -1179,6 +1179,17 @@ mod tests {
             .unwrap();
 
         let spawned = wait_for_spawn(runtime.as_ref()).await;
+        // A child's container waits the iteration's bound too.
+        assert_eq!(
+            spawned
+                .env
+                .get("AEGIS_ITERATION_TIMEOUT_SECONDS")
+                .map(String::as_str),
+            Some("600"),
+            "env: {:?}",
+            spawned.env
+        );
+        assert!(!spawned.env.contains_key("AEGIS_LLM_TIMEOUT_SECONDS"));
         assert_eq!(spawned.volumes.len(), 1);
         assert_eq!(
             spawned.volumes[0].mount_point,
@@ -2069,6 +2080,77 @@ mod tests {
         assert_eq!(spawned.volumes.len(), 1, "volumes: {:?}", spawned.volumes);
         assert_eq!(spawned.volumes[0].volume_id, workspace);
         assert_eq!(spawned.volumes[0].mount_point, PathBuf::from("/workspace"));
+    }
+
+    /// The bootstrap's wait on the dispatch gateway spans the iteration's whole
+    /// inner tool loop, so the container is given the supervisor's bound on an
+    /// iteration and not the bound of one model call (f6209dbc, 2026-10-03:
+    /// three working iterations cut at llm_timeout_seconds' 300 s, below the
+    /// iteration's 600 s).
+    #[tokio::test]
+    async fn container_waits_the_iteration_bound_not_one_model_calls() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("executor", None, None);
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), uuid::Uuid::new_v4()),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        assert_eq!(
+            spawned
+                .env
+                .get("AEGIS_ITERATION_TIMEOUT_SECONDS")
+                .map(String::as_str),
+            Some("600"),
+            "env: {:?}",
+            spawned.env
+        );
+        assert!(
+            !spawned.env.contains_key("AEGIS_LLM_TIMEOUT_SECONDS"),
+            "the bootstrap no longer waits one model call's bound: {:?}",
+            spawned.env
+        );
+    }
+
+    #[tokio::test]
+    async fn container_waits_the_manifests_own_iteration_bound() {
+        let tenant_id = CoreTenantId::consumer();
+        let mut agent = make_agent("executor", None, None);
+        agent.manifest.spec.execution = Some(crate::domain::agent::ExecutionStrategy {
+            iteration_timeout: Some("15m".to_string()),
+            llm_timeout_seconds: 120,
+            ..Default::default()
+        });
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), uuid::Uuid::new_v4()),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        assert_eq!(
+            spawned
+                .env
+                .get("AEGIS_ITERATION_TIMEOUT_SECONDS")
+                .map(String::as_str),
+            Some("900"),
+            "env: {:?}",
+            spawned.env
+        );
     }
 
     /// A judge of a workflow's Agent state reads the workspace its worker wrote
@@ -3683,15 +3765,17 @@ impl StandardExecutionService {
                 });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
 
-        // Inject LLM timeout for bootstrap.py (default 300 seconds)
-        let llm_timeout_seconds = if let Some(exec_strategy) = &agent.manifest.spec.execution {
-            exec_strategy.llm_timeout_seconds
-        } else {
-            300
-        };
+        // bootstrap.py waits on the dispatch gateway for the iteration's whole
+        // inner tool loop, so it is given the supervisor's bound on an
+        // iteration; one model call is bounded by llm_timeout_seconds on the
+        // orchestrator's side (inner_loop_service).
         env.insert(
-            "AEGIS_LLM_TIMEOUT_SECONDS".to_string(),
-            llm_timeout_seconds.to_string(),
+            "AEGIS_ITERATION_TIMEOUT_SECONDS".to_string(),
+            crate::domain::supervisor::iteration_timeout(
+                &agent.manifest.spec.execution.clone().unwrap_or_default(),
+            )
+            .as_secs()
+            .to_string(),
         );
 
         // Inject model alias so bootstrap.py routes this agent's LLM calls to the
@@ -4535,16 +4619,13 @@ impl ExecutionService for StandardExecutionService {
                     format!("http://host.docker.internal:{port}")
                 });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
-        let llm_timeout_seconds = agent
-            .manifest
-            .spec
-            .execution
-            .as_ref()
-            .map(|e| e.llm_timeout_seconds)
-            .unwrap_or(300);
         env.insert(
-            "AEGIS_LLM_TIMEOUT_SECONDS".to_string(),
-            llm_timeout_seconds.to_string(),
+            "AEGIS_ITERATION_TIMEOUT_SECONDS".to_string(),
+            crate::domain::supervisor::iteration_timeout(
+                &agent.manifest.spec.execution.clone().unwrap_or_default(),
+            )
+            .as_secs()
+            .to_string(),
         );
 
         // Inject model alias so bootstrap.py routes this child agent's LLM calls to the

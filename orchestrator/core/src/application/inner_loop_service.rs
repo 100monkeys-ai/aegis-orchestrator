@@ -79,6 +79,9 @@ struct ExecutionContext {
     tenant_id: TenantId,
     /// Security context name bound to this execution, used to scope available tools.
     security_context_name: String,
+    /// The agent's `llm_timeout_seconds`, read once at Generate: the bound on
+    /// each model call of this loop.
+    llm_timeout_seconds: u64,
     /// Count of in-flight `cmd.run` dispatches for this execution.
     /// Used to enforce `Capability.max_concurrent`.
     active_dispatch_count: u32,
@@ -193,6 +196,17 @@ impl InnerLoopService {
                     ),
                 };
 
+                let llm_timeout_seconds = self
+                    .tool_invocation_service
+                    .agent_llm_timeout_seconds(&tenant_id, parsed_agent_id)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "loading agent {} for its llm_timeout_seconds: {e}",
+                            parsed_agent_id.0
+                        )
+                    })?;
+
                 self.active_executions.write().await.insert(
                     execution_id.clone(),
                     ExecutionContext {
@@ -207,6 +221,7 @@ impl InnerLoopService {
                         user_identity: user_identity.clone(),
                         tenant_id,
                         security_context_name,
+                        llm_timeout_seconds,
                         active_dispatch_count: 0,
                     },
                 );
@@ -329,6 +344,7 @@ impl InnerLoopService {
                     &tool_schemas,
                     ctx.user_identity.as_ref(),
                     &ctx.tenant_id,
+                    ctx.llm_timeout_seconds,
                 )
                 .await?;
 
@@ -609,6 +625,7 @@ impl InnerLoopService {
         // caller has no tenant, that's an upstream bug and we want a
         // type error rather than a silent footgun.
         tenant_id: &TenantId,
+        llm_timeout_seconds: u64,
     ) -> anyhow::Result<LlmOutput> {
         let chat_messages: Vec<ChatMessage> = conversation
             .iter()
@@ -748,10 +765,15 @@ impl InnerLoopService {
         );
         let llm_started_at = std::time::Instant::now();
 
-        let llm_result = self
-            .provider_registry
-            .generate_chat(model_alias, &chat_messages, &schemas, &options)
-            .await;
+        let llm_result = generate_within_llm_timeout(
+            &self.provider_registry,
+            model_alias,
+            &chat_messages,
+            &schemas,
+            &options,
+            llm_timeout_seconds,
+        )
+        .await;
 
         let llm_elapsed_ms = llm_started_at.elapsed().as_millis() as u64;
         match &llm_result {
@@ -877,6 +899,34 @@ impl InnerLoopService {
     }
 }
 
+/// One model call of the inner loop, bounded by the agent's
+/// `llm_timeout_seconds` (manifest spec v1: the bound on one LLM call, not on
+/// the iteration, whose bound the supervisor enforces). A call that has not
+/// answered by then is ended with an error naming the field and the seconds,
+/// typed as a network error so the gateway answers 502 as for the registry's
+/// own budget.
+async fn generate_within_llm_timeout(
+    registry: &ProviderRegistry,
+    model_alias: &str,
+    messages: &[ChatMessage],
+    schemas: &[ToolSchema],
+    options: &GenerationOptions,
+    llm_timeout_seconds: u64,
+) -> Result<crate::domain::llm::ChatResponse, crate::domain::llm::LLMError> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(llm_timeout_seconds),
+        registry.generate_chat(model_alias, messages, schemas, options),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(crate::domain::llm::LLMError::Network(format!(
+            "model call on alias '{model_alias}' gave no answer within the agent's \
+             llm_timeout_seconds ({llm_timeout_seconds} s)"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error classification helper (extracted for testability)
 // ---------------------------------------------------------------------------
@@ -949,6 +999,99 @@ mod tests {
     use super::*;
     use crate::domain::seal_session::SealSessionError;
     use crate::domain::security_context::PolicyViolation;
+
+    /// A stand-in provider whose every answer takes `delay`.
+    struct SlowProvider {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::domain::llm::LLMProvider for SlowProvider {
+        async fn generate(
+            &self,
+            _prompt: &str,
+            _options: &GenerationOptions,
+        ) -> Result<crate::domain::llm::GenerationResponse, crate::domain::llm::LLMError> {
+            unimplemented!("not used by the inner loop")
+        }
+
+        async fn generate_chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolSchema],
+            _options: &GenerationOptions,
+        ) -> Result<crate::domain::llm::ChatResponse, crate::domain::llm::LLMError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(crate::domain::llm::ChatResponse::ToolCalls(Vec::new()))
+        }
+
+        async fn health_check(&self) -> Result<(), crate::domain::llm::LLMError> {
+            Ok(())
+        }
+    }
+
+    fn slow_registry(delay_secs: u64) -> ProviderRegistry {
+        // One attempt and an overall budget far above the delay, so only the
+        // agent's llm_timeout_seconds can end the call.
+        ProviderRegistry::new_for_test(
+            Arc::new(SlowProvider {
+                delay: std::time::Duration::from_secs(delay_secs),
+            }),
+            None,
+            1,
+            0,
+            3600,
+        )
+    }
+
+    /// llm_timeout_seconds bounds one model call on the orchestrator's side:
+    /// a call longer than the agent's bound is ended with an error naming the
+    /// field and the seconds.
+    #[tokio::test(start_paused = true)]
+    async fn model_call_longer_than_llm_timeout_seconds_is_ended_naming_it() {
+        let registry = slow_registry(500);
+        let started = tokio::time::Instant::now();
+        let result = generate_within_llm_timeout(
+            &registry,
+            "default",
+            &[],
+            &[],
+            &GenerationOptions::default(),
+            120,
+        )
+        .await;
+        let waited = started.elapsed();
+        let err = result.expect_err("a 500 s call must not outlive a 120 s llm_timeout_seconds");
+        assert_eq!(
+            waited,
+            std::time::Duration::from_secs(120),
+            "waited {waited:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("llm_timeout_seconds") && text.contains("120 s"),
+            "the error must name llm_timeout_seconds and the seconds: {text}"
+        );
+        assert!(
+            matches!(err, crate::domain::llm::LLMError::Network(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_call_inside_llm_timeout_seconds_answers() {
+        let registry = slow_registry(119);
+        let result = generate_within_llm_timeout(
+            &registry,
+            "default",
+            &[],
+            &[],
+            &GenerationOptions::default(),
+            120,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+    }
 
     // -----------------------------------------------------------------------
     // Regression: PolicyViolation must NOT be classified as fatal (was bail!).

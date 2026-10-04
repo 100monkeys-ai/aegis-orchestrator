@@ -11,12 +11,14 @@ import contextlib
 import http.server
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import socketserver
 import subprocess
 import sys
 import threading
+import time
 import unittest
 
 # Loading the bootstrap must not leave a __pycache__ beside it in assets/,
@@ -133,7 +135,7 @@ class PostJsonTimeoutTests(unittest.TestCase):
         )
         first = f"{self.servers[0].url}/v1/dispatch-gateway"
         self.assertIn(
-            f"Error: no answer from {first} within 1 s (AEGIS_LLM_TIMEOUT_SECONDS)",
+            f"Error: no answer from {first} within 1 s (AEGIS_ITERATION_TIMEOUT_SECONDS)",
             stderr.getvalue(),
         )
 
@@ -151,6 +153,111 @@ class PostJsonTimeoutTests(unittest.TestCase):
                 self.bootstrap.post_json({"type": "generate"}, timeout=1)
 
         self.assertEqual(self.servers[0].requests_seen, 1, stderr.getvalue())
+
+
+class ScriptedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """An orchestrator stand-in that answers the n-th POST after the n-th
+    delay with the n-th body; a body of None is never answered."""
+
+    daemon_threads = True
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests = []
+        self.release = threading.Event()
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                server.requests.append(json.loads(self.rfile.read(length)))
+                delay, body = server.script[len(server.requests) - 1]
+                if body is None:
+                    server.release.wait(30)
+                    return
+                time.sleep(delay)
+                data = json.dumps(body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+
+class IterationBoundTests(unittest.TestCase):
+    """The bootstrap's wait on the dispatch gateway spans the whole inner tool
+    loop of an iteration (many model calls and tool rounds), so it is bounded
+    by the iteration's own bound, AEGIS_ITERATION_TIMEOUT_SECONDS, and not by
+    a timeout meant for one model call (f6209dbc, 2026-10-03: three working
+    iterations cut at 300 s, below the supervisor's 600 s)."""
+
+    def start(self, script):
+        server = ScriptedServer(script)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.release.set)
+        return server
+
+    def run_main(self, server, env_overrides, wall=20):
+        env = dict(os.environ)
+        env.pop("AEGIS_LLM_TIMEOUT_SECONDS", None)
+        env.pop("AEGIS_ITERATION_TIMEOUT_SECONDS", None)
+        env.update(
+            AEGIS_MODEL_ALIAS="default",
+            AEGIS_EXECUTION_ID="e",
+            AEGIS_AGENT_ID="a",
+            AEGIS_ORCHESTRATOR_URL=server.url,
+        )
+        env.update(env_overrides)
+        return subprocess.run(
+            [sys.executable, "-B", str(BOOTSTRAP)],
+            input=b"do the work",
+            capture_output=True,
+            env=env,
+            timeout=wall,
+        )
+
+    def test_answer_after_llm_timeout_and_before_iteration_bound_is_received(self):
+        # The loop's answer comes 2 s after the generate POST: past the 1 s a
+        # model call is given, inside the iteration's 6 s.
+        server = self.start([(2, {"type": "final", "content": "the answer"})])
+        done = self.run_main(
+            server,
+            {"AEGIS_LLM_TIMEOUT_SECONDS": "1", "AEGIS_ITERATION_TIMEOUT_SECONDS": "6"},
+        )
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertEqual(done.stdout.decode().strip(), "the answer")
+        self.assertNotIn(b"no answer from", done.stderr)
+
+    def test_repeat_post_after_a_dispatch_is_bounded_by_the_iteration(self):
+        # The first answer is a dispatch; the repeat POST carrying its result
+        # is never answered, so the bootstrap gives up at the iteration's bound
+        # and says so, rather than waiting without end.
+        server = self.start(
+            [
+                (0, {"type": "dispatch", "action": "exec", "dispatch_id": "d",
+                     "command": "true", "cwd": "/"}),
+                (0, None),
+            ]
+        )
+        done = self.run_main(server, {"AEGIS_ITERATION_TIMEOUT_SECONDS": "2"}, wall=15)
+        self.assertEqual(done.returncode, 1, done.stderr.decode())
+        self.assertEqual([r["type"] for r in server.requests], ["generate", "dispatch_result"])
+        self.assertIn(
+            f"Error: no answer from {server.url}/v1/dispatch-gateway within 2 s "
+            "(AEGIS_ITERATION_TIMEOUT_SECONDS)",
+            done.stderr.decode(),
+        )
 
 
 class ReadPromptTests(unittest.TestCase):
