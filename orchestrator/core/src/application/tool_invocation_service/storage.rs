@@ -87,8 +87,7 @@ fn internal(e: &impl std::fmt::Display) -> SealSessionError {
 fn file_refusal(e: FileOperationsError, volume_id: &str, path: &str) -> SealSessionError {
     let answer = match &e {
         // A volume of another tenant or owner is answered as a missing one:
-        // one message, so existence is not told (R5, NOT_FOUND). The log line
-        // keeps `shown`, which tells them apart for the operator.
+        // one message, so existence is not told (R5, NOT_FOUND).
         FileOperationsError::NotFound(_) | FileOperationsError::Unauthorized => {
             CallerAnswer::NotFound(format!("Not found: '{path}' in volume '{volume_id}'."))
         }
@@ -102,7 +101,23 @@ fn file_refusal(e: FileOperationsError, volume_id: &str, path: &str) -> SealSess
             CallerAnswer::Internal(InternalFailure::Server)
         }
     };
-    shown(&e).answered(answer)
+    // What the inner loop shows an agent for another tenant's or owner's
+    // volume is the text it shows for a volume that does not exist (AEGIS
+    // ADR-035, Update T1: R7 yields for this one text). Only this warn line
+    // tells the two apart, for the operator.
+    let foreign = matches!(e, FileOperationsError::Unauthorized);
+    let shown_error = match crate::domain::shared_kernel::VolumeId::from_string(volume_id) {
+        Ok(id) if foreign => {
+            tracing::warn!(
+                volume_id,
+                path,
+                "aegis.file: volume of another tenant or owner; answered as not found"
+            );
+            FileOperationsError::from(crate::domain::fsal::FsalError::VolumeNotFound(id))
+        }
+        _ => e,
+    };
+    shown(&shown_error).answered(answer)
 }
 
 /// A storage service's typed error, answered by its variant.

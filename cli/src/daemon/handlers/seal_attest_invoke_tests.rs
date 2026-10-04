@@ -273,8 +273,13 @@ impl ExecutionService for Executions {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Execution not found"))
     }
-    async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
-        anyhow::bail!("not exercised")
+    async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
+        self.started
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("not exercised"))
     }
     async fn get_iterations_for_tenant(
         &self,
@@ -408,6 +413,9 @@ struct Mcp {
     /// The local storage provider's root: a host volume's file `<path>/<f>`
     /// is the file `<storage_root>/<path>/<f>` on disk.
     storage_root: std::path::PathBuf,
+    /// The execution store the service reads, so a test can hold the
+    /// execution an agent's tool call runs in (the inner loop's path).
+    executions: Arc<Executions>,
 }
 
 impl Mcp {
@@ -522,6 +530,7 @@ async fn attest_with(
         Arc::new(NoOpPublisher),
     ));
     let event_bus = Arc::new(EventBus::new(256));
+    let executions = Arc::new(Executions::default());
     let service = ToolInvocationService::new(
         sessions,
         contexts,
@@ -530,7 +539,7 @@ async fn attest_with(
         fsal.clone(),
         NfsVolumeRegistry::new(),
         Arc::new(OneAgent(AgentId::new())),
-        Arc::new(Executions::default()),
+        executions.clone(),
         Arc::new(ReqwestWebToolAdapter::unconfigured()),
         event_bus.clone(),
         None,
@@ -548,6 +557,7 @@ async fn attest_with(
         calls: 0,
         volumes,
         storage_root,
+        executions,
     }
 }
 
@@ -1291,10 +1301,10 @@ async fn a_file_in_another_tenants_volume_answers_as_one_in_a_missing_volume() {
         .volume_with_id(&volume, &other, SOMEONE_ELSE, "/aegis-host/other-vol")
         .await;
     foreign.put_file("/aegis-host/other-vol", "a.txt", "theirs");
-    let theirs = foreign.refused("aegis.file.read", args.clone()).await;
+    let (theirs, theirs_call_log) = logged(foreign.refused("aegis.file.read", args.clone())).await;
 
     let mut missing = with_file_reads().await;
-    let none = missing.refused("aegis.file.read", args).await;
+    let (none, none_call_log) = logged(missing.refused("aegis.file.read", args)).await;
 
     theirs.assert_shape(404, "NOT_FOUND", "error");
     assert_eq!(
@@ -1305,8 +1315,9 @@ async fn a_file_in_another_tenants_volume_answers_as_one_in_a_missing_volume() {
         none.body
     );
     // The operator's log keeps the distinction; no caller-visible text does.
-    assert!(theirs.log.contains("unauthorized"), "{}", theirs.log);
-    assert!(!none.log.contains("unauthorized"), "{}", none.log);
+    let foreign_line = "volume of another tenant or owner; answered as not found";
+    assert!(theirs_call_log.contains(foreign_line), "{theirs_call_log}");
+    assert!(!none_call_log.contains(foreign_line), "{none_call_log}");
 }
 
 #[tokio::test]
@@ -1322,4 +1333,198 @@ async fn a_file_in_the_callers_own_volume_is_read_as_before() {
         .await
         .expect("answered");
     assert!(read.to_string().contains("mine"), "{read}");
+}
+
+/// The log lines written while `call` runs, with its result.
+async fn logged<T>(call: impl std::future::Future<Output = T>) -> (T, String) {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let out = call.await;
+    drop(guard);
+    let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+    (out, log)
+}
+
+impl Mcp {
+    /// One tool call as an agent's iteration makes it: through
+    /// `invoke_tool_internal`, the inner loop's path, in an execution of the
+    /// caller's own tenant run under the session's security context.
+    async fn as_agent(
+        &self,
+        tool: &str,
+        arguments: Value,
+    ) -> std::result::Result<
+        aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationResult,
+        SealSessionError,
+    > {
+        let agent = AgentId::new();
+        let id = ExecutionId::new();
+        let mut execution = Execution::new_with_id(
+            id,
+            agent,
+            ExecutionInput {
+                intent: None,
+                input: json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: vec![],
+            },
+            5,
+            "zaru-pro".to_string(),
+        );
+        execution.tenant_id = own_tenant();
+        execution.initiating_user_sub = Some(SUB.to_string());
+        self.executions
+            .started
+            .lock()
+            .unwrap()
+            .insert(id, execution);
+        self.service
+            .invoke_tool_internal(
+                &agent,
+                id,
+                own_tenant(),
+                1,
+                Vec::new(),
+                tool.to_string(),
+                arguments,
+            )
+            .await
+    }
+}
+
+/// The body of a direct answer.
+fn direct(
+    result: std::result::Result<
+        aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationResult,
+        SealSessionError,
+    >,
+) -> Value {
+    match result {
+        Ok(aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationResult::Direct(v)) => v,
+        other => panic!("a direct answer, got {other:?}"),
+    }
+}
+
+/// Through the inner loop's path an agent reading another tenant's volume
+/// gets the very error it gets for a volume that does not exist: the same
+/// text ("Tool execution error: <it>") and the same class, since the class
+/// is the error's variant (AEGIS ADR-035 Update T1).
+#[tokio::test]
+async fn through_the_inner_loop_a_file_in_another_tenants_volume_reads_as_one_in_a_missing_volume()
+{
+    let volume = uuid::Uuid::new_v4().to_string();
+    let args = json!({"volume_id": volume, "path": "a.txt"});
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+
+    let foreign = with_file_reads().await;
+    foreign
+        .volume_with_id(&volume, &other, SOMEONE_ELSE, "/aegis-host/other-vol")
+        .await;
+    foreign.put_file("/aegis-host/other-vol", "a.txt", "theirs");
+    let theirs = foreign
+        .as_agent("aegis.file.read", args.clone())
+        .await
+        .expect_err("refused");
+
+    let missing = with_file_reads().await;
+    let none = missing
+        .as_agent("aegis.file.read", args)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(theirs.to_string(), none.to_string());
+    assert_eq!(theirs, none);
+}
+
+#[tokio::test]
+async fn through_the_inner_loop_an_execution_file_of_another_tenant_reads_as_a_missing_one() {
+    let execution = uuid::Uuid::new_v4();
+    let args = json!({"execution_id": execution.to_string(), "path": "output.md"});
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+
+    let foreign = with_file_reads().await;
+    foreign
+        .execution_volume(&other, execution, "/aegis-host/other-exec")
+        .await;
+    foreign.put_file("/aegis-host/other-exec", "output.md", "theirs");
+    let theirs = direct(foreign.as_agent("aegis.execution.file", args.clone()).await);
+
+    let missing = with_file_reads().await;
+    let none = direct(missing.as_agent("aegis.execution.file", args).await);
+
+    assert_eq!(
+        serde_json::to_vec(&theirs).unwrap(),
+        serde_json::to_vec(&none).unwrap(),
+        "{theirs}\n{none}"
+    );
+}
+
+#[tokio::test]
+async fn through_the_inner_loop_an_attachment_of_another_tenant_reads_as_a_missing_one() {
+    let volume = uuid::Uuid::new_v4().to_string();
+    let args = json!({"volume_id": volume, "path": "upload.txt"});
+    let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
+
+    let foreign = with_file_reads().await;
+    foreign
+        .volume_with_id(&volume, &other, SOMEONE_ELSE, "/aegis-host/other-files")
+        .await;
+    foreign.put_file("/aegis-host/other-files", "upload.txt", "theirs");
+    let theirs = direct(
+        foreign
+            .as_agent("aegis.attachment.read", args.clone())
+            .await,
+    );
+
+    let missing = with_file_reads().await;
+    let none = direct(missing.as_agent("aegis.attachment.read", args).await);
+
+    assert_eq!(
+        serde_json::to_vec(&theirs).unwrap(),
+        serde_json::to_vec(&none).unwrap(),
+        "{theirs}\n{none}"
+    );
+}
+
+/// The owner-side change of `255f4737`, pinned: a volume of the caller's own
+/// tenant that is not persistent holds no attachment, and is answered as a
+/// volume that does not exist (`read_attachment_for_tenant`'s own comment).
+#[tokio::test]
+async fn an_attachment_in_the_callers_own_non_persistent_volume_answers_not_found() {
+    let mut mcp = with_file_reads().await;
+    let mut volume = Volume::new(
+        "workspace".to_string(),
+        own_tenant(),
+        StorageClass::persistent(),
+        VolumeBackend::HostPath {
+            path: "/aegis-host/own-ephemeral".into(),
+        },
+        1024 * 1024,
+        VolumeOwnership::execution(SharedExecutionId(uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    volume.mark_available().unwrap();
+    mcp.volumes.save(&volume).await.unwrap();
+    mcp.put_file("/aegis-host/own-ephemeral", "upload.txt", "mine");
+    let id = volume.id.to_string();
+    let read = mcp
+        .call(
+            "aegis.attachment.read",
+            json!({"volume_id": id, "path": "upload.txt"}),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(
+        read,
+        json!({"status": "error", "error": "not_found", "message": format!("volume {id} not found")}),
+    );
 }
