@@ -231,7 +231,7 @@ jobs:
 
   # ── Stage 2: Build + Publish (only after ALL checks pass) ──────────────────
   build-deploy:
-    name: Build, Deploy & Publish
+    name: Build & Publish
     needs: [fmt, clippy, test, doc]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
@@ -306,3 +306,55 @@ jobs:
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MINOR
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MAJOR
+
+  # Redeploy the core pod on nuclear-vm-1 with the aegis-runtime image just
+  # pushed (deploy-pod also replaces the relay-coordinator pod, which runs
+  # the same image, and the FUSE daemon's binary): dispatch
+  # aegis-platform-deployment's deploy-pod.yml (a reusable call is
+  # impossible from this public repository to that internal one),
+  # find that run by its run-name "deploy-pod core <sha>", and watch
+  # it to its end, so this run goes red when the deploy does. Without the
+  # organisation secret AEGIS_DEPLOY_DISPATCH_TOKEN this job fails, naming
+  # it: a merge that does not deploy is visible.
+  deploy:
+    name: Deploy core (nuclear-vm-1)
+    needs: [build-deploy]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 45
+    concurrency:
+      group: deploy-core
+      cancel-in-progress: false
+    steps:
+      - name: Dispatch deploy-pod and watch it
+        env:
+          GH_TOKEN: ${{ secrets.AEGIS_DEPLOY_DISPATCH_TOKEN }}
+          DEPLOY_REPO: 100monkeys-ai/aegis-platform-deployment
+          POD: core
+          IMAGE: aegis-runtime
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::the organisation secret AEGIS_DEPLOY_DISPATCH_TOKEN is not available to this repository, so ${SOURCE_SHA} was published but not deployed"
+            exit 1
+          fi
+          title="deploy-pod ${POD} ${SOURCE_SHA}"
+          started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          gh workflow run deploy-pod.yml --repo "$DEPLOY_REPO" --ref main \
+            -f pod="$POD" -f image="$IMAGE" -f sha="$SOURCE_SHA"
+          id=""
+          for _ in $(seq 1 30); do
+            id="$(gh run list --repo "$DEPLOY_REPO" --workflow deploy-pod.yml \
+              --event workflow_dispatch --created ">=${started}" --limit 50 \
+              --json databaseId,displayTitle \
+              --jq "map(select(.displayTitle == \"${title}\")) | max_by(.databaseId) | .databaseId // empty")"
+            [ -n "$id" ] && break
+            sleep 10
+          done
+          if [ -z "$id" ]; then
+            echo "::error::no deploy-pod run named '${title}' appeared in ${DEPLOY_REPO} within 300 s"
+            exit 1
+          fi
+          echo "deploy-pod run ${id}: https://github.com/${DEPLOY_REPO}/actions/runs/${id}"
+          gh run watch "$id" --repo "$DEPLOY_REPO" --exit-status --interval 15
