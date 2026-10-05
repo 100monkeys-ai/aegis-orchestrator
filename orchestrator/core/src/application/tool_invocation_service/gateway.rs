@@ -183,6 +183,143 @@ impl ToolInvocationService {
             .collect())
     }
 
+    /// The tools an agent's run sees (AEGIS ADR-132 G5, H4): the built-ins
+    /// and the gateway's tools for the tenant, with the `<server>.<tool>`
+    /// tools of each remote server the run's person holds a binding to that
+    /// is granted to the agent or its workflow, listed by the gateway with
+    /// that person's credential; then only the agent's declared tools that
+    /// its security context permits. It is served to the agent's own run,
+    /// never on the unauthenticated `GET /v1/seal/tools`, which answers the
+    /// node-wide list ([`Self::get_available_tools_for_context`]). A gateway
+    /// that fails to list leaves the built-ins.
+    pub async fn get_available_tools_for_agent_run(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+        execution_id: crate::domain::execution::ExecutionId,
+        security_context_name: &str,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent_visible(tenant_id, agent_id)
+            .await
+            .map_err(|e| {
+                SealSessionError::InternalError(format!(
+                    "Failed to load agent for tool scoping: {e}"
+                ))
+            })?;
+        let declared_tools = agent.manifest.spec.tools;
+        if declared_tools.is_empty() {
+            return Ok(Vec::new());
+        }
+        let security_context = self
+            .security_context_repo
+            .find_by_name(security_context_name)
+            .await
+            .map_err(|e| SealSessionError::ConfigurationError(e.to_string()))?
+            .ok_or_else(|| {
+                SealSessionError::ConfigurationError(format!(
+                    "Security context '{security_context_name}' not found"
+                ))
+            })?;
+
+        let mut tools =
+            self.tool_router.list_tools().await.map_err(|e| {
+                SealSessionError::InternalError(format!("Failed to list tools: {e}"))
+            })?;
+        if self.seal_gateway_url.is_some() {
+            // The run's person, as the execution recorded it: never a
+            // service account (G2, `execution::person_sub`).
+            let user_id = self
+                .execution_service
+                .get_execution_unscoped(execution_id)
+                .await
+                .ok()
+                .and_then(|execution| execution.initiating_user_sub);
+            let acting = GatewayActing {
+                user_id,
+                agent_id,
+                workflow_id: self.workflow_of(execution_id, tenant_id).await,
+            };
+            let listing = ListToolsRequest {
+                tenant_id: tenant_id.as_str().to_string(),
+                acting: Some(acting.to_proto()),
+                bound_servers: self.bound_servers(tenant_id, &acting).await,
+            };
+            match self
+                .list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
+                .await
+            {
+                Ok(listed) => tools.extend(listed.into_iter().map(Self::gateway_tool_metadata)),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "SEAL gateway tool enumeration for an agent's run failed; proceeding with built-in tools only"
+                ),
+            }
+        }
+        Ok(tools
+            .into_iter()
+            .filter(|tool| {
+                declared_tools.iter().any(|name| name == &tool.name)
+                    && security_context.permits_tool_name(&tool.name)
+            })
+            .collect())
+    }
+
+    /// Each remote server the acting person holds a binding to granted to
+    /// the acting agent or its workflow, with that person's credential, for
+    /// the gateway to list its tools (AEGIS ADR-132 H4). None for a run with
+    /// no person, and none over a plaintext channel (H8): a credential is
+    /// never sent there, and the reason is logged.
+    async fn bound_servers(
+        &self,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+    ) -> Vec<crate::infrastructure::seal_gateway_proto::BoundServer> {
+        let (Some(user_id), Some(source)) = (acting.user_id.as_deref(), &self.tool_credentials)
+        else {
+            return Vec::new();
+        };
+        if self.remote_tool_servers.is_empty() {
+            return Vec::new();
+        }
+        if !self.gateway_channel_is_confidential() {
+            tracing::error!(
+                "an agent's tool list would carry the acting user's credentials to the SEAL \
+                 gateway over a plaintext channel; none was sent and no remote server's tools \
+                 are listed. Configure seal_gateway.url as an https address"
+            );
+            return Vec::new();
+        }
+        let actor = ToolCallActor {
+            tenant_id,
+            user_id,
+            agent_id: acting.agent_id,
+            workflow_id: acting.workflow_id,
+        };
+        let mut bound = Vec::new();
+        for server in &self.remote_tool_servers {
+            match source.tool_server_credential(&actor, server).await {
+                Ok(Some(credential)) => {
+                    bound.push(crate::infrastructure::seal_gateway_proto::BoundServer {
+                        server: server.clone(),
+                        credential: Some(ResolvedCredential {
+                            kind: CredentialKind::BearerToken as i32,
+                            value: credential.expose().to_string(),
+                        }),
+                    })
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    server = %server,
+                    error = %e,
+                    "the acting user's credential for a remote tool server could not be resolved; its tools are not listed"
+                ),
+            }
+        }
+        bound
+    }
+
     pub async fn get_available_tools_for_context(
         &self,
         security_context_name: &str,

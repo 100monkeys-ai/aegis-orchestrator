@@ -466,6 +466,8 @@ struct Harness {
     execution: ExecutionId,
     /// An execution of the same tenant with no person recorded.
     personless_execution: ExecutionId,
+    /// An execution of the same tenant whose person is `user-2`.
+    other_users_execution: ExecutionId,
 }
 
 /// What a harness is built with.
@@ -555,8 +557,13 @@ async fn harness(setup: Setup) -> Harness {
         e.initiating_user_sub = user.map(str::to_string);
         e
     };
-    let executions = vec![execution_for(Some(USER)), execution_for(None)];
-    let (execution, personless_execution) = (executions[0].id, executions[1].id);
+    let executions = vec![
+        execution_for(Some(USER)),
+        execution_for(None),
+        execution_for(Some("user-2")),
+    ];
+    let (execution, personless_execution, other_users_execution) =
+        (executions[0].id, executions[1].id, executions[2].id);
 
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -610,6 +617,7 @@ async fn harness(setup: Setup) -> Harness {
         agent_id,
         execution,
         personless_execution,
+        other_users_execution,
     }
 }
 
@@ -1528,4 +1536,179 @@ fn the_credential_is_in_no_log_line_and_no_error() {
     }
     assert!(!logs.is_empty(), "the capture saw the calls' log lines");
     assert!(!logs.contains("Mk9-"), "a log line carries the credential");
+}
+
+// ---------------------------------------------------------------------------
+// G5, H4: the tools a user's agent sees
+// ---------------------------------------------------------------------------
+
+/// The names in a tool list.
+fn names(tools: &[crate::infrastructure::tool_router::ToolMetadata]) -> Vec<String> {
+    let mut names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    names.sort();
+    names
+}
+
+/// A run's agent sees the `<server>.<tool>` tools of a server its person
+/// holds a granted binding to, listed by the gateway with that person's
+/// credential; a run of another person, or of no person, does not, and
+/// nothing of the first person's reaches the gateway for it; the agent's
+/// security context still filters the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_users_agent_lists_the_tools_of_the_servers_its_person_granted_it() {
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let declared = vec!["ext.lookup", "notes-1.lookup"];
+    let h = harness(Setup {
+        agent_tools: declared.clone(),
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        ..Setup::gateway(&url)
+    })
+    .await;
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::Agent {
+                agent_id: h.agent_id,
+            }],
+        )
+        .await;
+
+    let mine = h
+        .service
+        .get_available_tools_for_agent_run(&h.tenant, h.agent_id, h.execution, CONTEXT)
+        .await
+        .unwrap();
+    assert_eq!(names(&mine), vec!["ext.lookup", "notes-1.lookup"]);
+    {
+        let received = stub.received.lock().unwrap();
+        let listing = received.lists.last().unwrap();
+        assert_eq!(listing.tenant_id, h.tenant.as_str());
+        assert_eq!(listing.acting.as_ref().unwrap().user_id, USER);
+        assert_eq!(listing.bound_servers.len(), 1);
+        assert_eq!(listing.bound_servers[0].server, SERVER);
+        assert_eq!(
+            listing.bound_servers[0].credential.as_ref().unwrap().value,
+            MARKER
+        );
+    }
+
+    for (execution, who) in [
+        (h.other_users_execution, "user-2"),
+        (h.personless_execution, ""),
+    ] {
+        let theirs = h
+            .service
+            .get_available_tools_for_agent_run(&h.tenant, h.agent_id, execution, CONTEXT)
+            .await
+            .unwrap();
+        assert_eq!(names(&theirs), vec!["ext.lookup"], "{who:?}");
+        let received = stub.received.lock().unwrap();
+        let listing = received.lists.last().unwrap();
+        assert_eq!(listing.acting.as_ref().unwrap().user_id, who);
+        assert!(listing.bound_servers.is_empty(), "{who:?}");
+    }
+
+    let narrow = harness(Setup {
+        agent_tools: declared,
+        context_patterns: vec!["ext.*"],
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        ..Setup::gateway(&url)
+    })
+    .await;
+    vault
+        .bind(
+            &narrow.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let filtered = narrow
+        .service
+        .get_available_tools_for_agent_run(
+            &narrow.tenant,
+            narrow.agent_id,
+            narrow.execution,
+            CONTEXT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&filtered), vec!["ext.lookup"]);
+}
+
+/// The node-wide list, the one the unauthenticated `GET /v1/seal/tools`
+/// answers, names no user and carries no credential, so no person's remote
+/// tool is ever in it; and over a plaintext channel an agent's run lists no
+/// remote server's tools and sends no credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_persons_remote_tools_are_in_the_node_wide_list_or_listed_over_plaintext() {
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup {
+        agent_tools: vec!["ext.lookup", "notes-1.lookup"],
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        ..Setup::gateway(&url)
+    })
+    .await;
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+
+    let node_wide = h.service.get_available_tools().await.unwrap();
+    assert!(node_wide.iter().all(|t| t.name != "notes-1.lookup"));
+    {
+        let received = stub.received.lock().unwrap();
+        let listing = received.lists.last().unwrap();
+        assert!(listing.acting.is_none() && listing.bound_servers.is_empty());
+    }
+
+    let plain_stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
+    let (plain_url, _plain_shutdown) = serve_plaintext(plain_stub.clone()).await;
+    let plain = harness(Setup {
+        agent_tools: vec!["ext.lookup", "notes-1.lookup"],
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        ..Setup::gateway(&plain_url)
+    })
+    .await;
+    vault
+        .bind(
+            &plain.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let listed_plain = plain
+        .service
+        .get_available_tools_for_agent_run(&plain.tenant, plain.agent_id, plain.execution, CONTEXT)
+        .await
+        .unwrap();
+    assert_eq!(names(&listed_plain), vec!["ext.lookup"]);
+    let received = plain_stub.received.lock().unwrap();
+    assert!(received.lists.last().unwrap().bound_servers.is_empty());
 }
