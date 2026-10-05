@@ -21,6 +21,7 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE):
 import base64
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -251,6 +252,68 @@ def post_json(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _end_command(proc) -> tuple:
+    """End a timed-out command and everything in its session; return the
+    stdout and stderr it wrote until then."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        return proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        # A process that left the session still holds the pipes: keep what
+        # was read and stop reading.
+        return exc.stdout or b"", exc.stderr or b""
+
+
+def _keep_head_and_tail(data: bytes, budget: int, label: str, max_bytes: int) -> str:
+    """`data` whole when it fits `budget`, else its first and last bytes with
+    a line stating what was omitted, cut on character boundaries."""
+    if len(data) <= budget:
+        return data.decode("utf-8", errors="replace")
+    head = budget // 2
+    while head > 0 and (data[head] & 0xC0) == 0x80:
+        head -= 1
+    tail_start = len(data) - (budget - budget // 2)
+    while tail_start < len(data) and (data[tail_start] & 0xC0) == 0x80:
+        tail_start += 1
+    tail = len(data) - tail_start
+    omitted = len(data) - head - tail
+    marker = (
+        f"\n[AEGIS] max_output_bytes ({max_bytes}) cut this {label}: it was {len(data)} bytes; "
+        f"the first {head} and the last {tail} are kept and the {omitted} between them "
+        "are omitted here.\n"
+    )
+    return (
+        data[:head].decode("utf-8", errors="replace")
+        + marker
+        + data[tail_start:].decode("utf-8", errors="replace")
+    )
+
+
+def cap_output(stdout_b: bytes, stderr_b: bytes, max_bytes: int) -> tuple:
+    """Cap stdout and stderr together at `max_bytes`, keeping the head and
+    the tail of each stream that does not fit and stating its true size.
+    Returns (stdout, stderr, truncated)."""
+    if len(stdout_b) + len(stderr_b) <= max_bytes:
+        return (
+            stdout_b.decode("utf-8", errors="replace"),
+            stderr_b.decode("utf-8", errors="replace"),
+            False,
+        )
+    stderr_budget = min(len(stderr_b), max_bytes // 2)
+    stdout_budget = max_bytes - stderr_budget
+    if len(stdout_b) < stdout_budget:
+        stdout_budget = len(stdout_b)
+        stderr_budget = max_bytes - stdout_budget
+    return (
+        _keep_head_and_tail(stdout_b, stdout_budget, "stdout", max_bytes),
+        _keep_head_and_tail(stderr_b, stderr_budget, "stderr", max_bytes),
+        True,
+    )
+
+
 def run_dispatch(msg: dict, execution_id: str) -> dict:
     """Execute a dispatch action and return the dispatch_result payload.
 
@@ -268,7 +331,7 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
         command = " ".join(parts)
         cwd = msg.get("cwd", "/workspace")
         timeout_secs = msg.get("timeout_secs", 60)
-        max_bytes = msg.get("max_output_bytes", 524288)  # 512 KB default
+        max_bytes = msg.get("max_output_bytes", 1048576)  # the orchestrator's default
 
         # Inherit full container env then overlay orchestrator-supplied additions.
         # The orchestrator already scrubbed sensitive vars before building this message.
@@ -278,52 +341,17 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
         debug_print(f"exec: {command!r} cwd={cwd!r} timeout={timeout_secs}s")
         started_at = time.monotonic()
         try:
-            result = subprocess.run(
+            # Its own session, so a timeout ends the command and everything
+            # it started, not only the shell.
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=cwd,
                 env=env,
-                capture_output=True,
-                timeout=timeout_secs,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
-            duration_ms = int((time.monotonic() - started_at) * 1000)
-            stdout_raw = result.stdout.decode("utf-8", errors="replace")
-            stderr_raw = result.stderr.decode("utf-8", errors="replace")
-            combined_size = len((stdout_raw + stderr_raw).encode("utf-8"))
-            truncated = combined_size > max_bytes
-            if truncated:
-                # Keep the tail — most diagnostic for the LLM
-                half = max_bytes // 2
-                stdout_raw = stdout_raw[-half:]
-                stderr_raw = stderr_raw[-half:]
-            debug_print(
-                f"exec done: exit={result.returncode} "
-                f"stdout={len(stdout_raw)}B stderr={len(stderr_raw)}B "
-                f"duration={duration_ms}ms truncated={truncated}"
-            )
-            return {
-                "type": "dispatch_result",
-                "execution_id": execution_id,
-                "dispatch_id": dispatch_id,
-                "exit_code": result.returncode,
-                "stdout": stdout_raw,
-                "stderr": stderr_raw,
-                "duration_ms": duration_ms,
-                "truncated": truncated,
-            }
-        except subprocess.TimeoutExpired:
-            duration_ms = int((time.monotonic() - started_at) * 1000)
-            debug_print(f"exec timed out after {timeout_secs}s")
-            return {
-                "type": "dispatch_result",
-                "execution_id": execution_id,
-                "dispatch_id": dispatch_id,
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"[AEGIS] Command timed out after {timeout_secs}s",
-                "duration_ms": duration_ms,
-                "truncated": False,
-            }
         except OSError as e:
             # The command could not be started at all: a missing cwd or
             # shell (FileNotFoundError), a cwd that is not a directory or
@@ -343,6 +371,37 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
                 "duration_ms": duration_ms,
                 "truncated": False,
             }
+
+        timed_out = False
+        try:
+            stdout_b, stderr_b = proc.communicate(timeout=timeout_secs)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            stdout_b, stderr_b = _end_command(proc)
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        stdout_raw, stderr_raw, truncated = cap_output(stdout_b, stderr_b, max_bytes)
+        if timed_out:
+            debug_print(f"exec timed out after {timeout_secs}s")
+            notice = (
+                f"[AEGIS] Command timed out after {timeout_secs}s and was ended; "
+                "its output until then is above."
+            )
+            stderr_raw = f"{stderr_raw}\n{notice}" if stderr_raw else notice
+        debug_print(
+            f"exec done: exit={-1 if timed_out else proc.returncode} "
+            f"stdout={len(stdout_b)}B stderr={len(stderr_b)}B "
+            f"duration={duration_ms}ms truncated={truncated}"
+        )
+        return {
+            "type": "dispatch_result",
+            "execution_id": execution_id,
+            "dispatch_id": dispatch_id,
+            "exit_code": -1 if timed_out else proc.returncode,
+            "stdout": stdout_raw,
+            "stderr": stderr_raw,
+            "duration_ms": duration_ms,
+            "truncated": truncated,
+        }
     else:
         # Unknown action — report gracefully (ADR-040 §Dispatch DSL Action Vocabulary)
         debug_print(f"unknown dispatch action: {action!r}")

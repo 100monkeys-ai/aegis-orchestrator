@@ -80,6 +80,107 @@ class RunDispatchTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 3)
 
 
+class CommandTimeoutTests(unittest.TestCase):
+    """AEGIS ADR-005 / ADR-040 (retry-knows-what-failed): a command that runs
+    past its timeout ends, with everything it started, and the model is given
+    its output until then with the command's own timeout result."""
+
+    def setUp(self):
+        self.bootstrap = load_bootstrap()
+
+    def test_a_timed_out_command_returns_its_output_so_far(self):
+        started = time.monotonic()
+        result = self.bootstrap.run_dispatch(
+            {
+                "action": "exec",
+                "dispatch_id": "d",
+                "command": "echo tick 1; echo warn 1 >&2; sleep 30; echo never",
+                "cwd": "/",
+                "timeout_secs": 1,
+            },
+            "e",
+        )
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(result["exit_code"], -1)
+        self.assertIn("tick 1", result["stdout"])
+        self.assertNotIn("never", result["stdout"])
+        self.assertIn("warn 1", result["stderr"])
+        self.assertIn("[AEGIS] Command timed out after 1s", result["stderr"])
+
+    def test_a_timed_out_command_ends_what_it_started(self):
+        with contextlib.ExitStack() as stack:
+            import tempfile
+
+            workdir = stack.enter_context(tempfile.TemporaryDirectory())
+            marker = os.path.join(workdir, "late")
+            self.bootstrap.run_dispatch(
+                {
+                    "action": "exec",
+                    "dispatch_id": "d",
+                    "command": f"(sleep 3; touch {marker}) & sleep 30",
+                    "cwd": "/",
+                    "timeout_secs": 1,
+                },
+                "e",
+            )
+            time.sleep(4)
+            self.assertFalse(
+                os.path.exists(marker),
+                "a child of the timed-out command kept running after its result",
+            )
+
+
+class OutputCapTests(unittest.TestCase):
+    """The max_output_bytes cap keeps the head and the tail and states the
+    output's true size in words (ADR-040's cap; AEGIS ADR-131 U19 keeps it as
+    the output as produced)."""
+
+    def setUp(self):
+        self.bootstrap = load_bootstrap()
+
+    def run_command(self, command, max_output_bytes):
+        return self.bootstrap.run_dispatch(
+            {
+                "action": "exec",
+                "dispatch_id": "d",
+                "command": command,
+                "cwd": "/",
+                "max_output_bytes": max_output_bytes,
+            },
+            "e",
+        )
+
+    def test_output_over_the_cap_keeps_head_and_tail_and_states_its_true_size(self):
+        result = self.run_command(
+            "python3 -c \"import sys; sys.stdout.write('HEAD' + 'x' * 10000 + 'TAIL')\"",
+            1000,
+        )
+        self.assertTrue(result["truncated"])
+        out = result["stdout"]
+        self.assertTrue(out.startswith("HEAD"), out[:80])
+        self.assertTrue(out.endswith("TAIL"), out[-80:])
+        self.assertIn("max_output_bytes (1000)", out)
+        self.assertIn("it was 10008 bytes", out)
+        kept = len(out.encode("utf-8")) - len(
+            out[out.index("\n[AEGIS]") : out.index("\n", out.index("\n[AEGIS]") + 1) + 1].encode(
+                "utf-8"
+            )
+        )
+        self.assertLessEqual(kept, 1000)
+
+    def test_output_under_the_cap_is_whole_and_unmarked(self):
+        result = self.run_command("printf 'abc'", 1000)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["stdout"], "abc")
+
+    def test_the_cut_never_splits_a_character(self):
+        result = self.run_command(
+            "python3 -c \"import sys; sys.stdout.write('\\u00e9' * 5000)\"", 1001
+        )
+        self.assertTrue(result["truncated"])
+        self.assertNotIn("�", result["stdout"])
+
+
 class ResettingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     """An orchestrator stand-in whose process goes away mid-request: it reads
     each request and resets the connection without answering."""
