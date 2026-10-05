@@ -480,6 +480,8 @@ impl InnerLoopService {
                     ctx.user_identity.as_ref(),
                     &ctx.tenant_id,
                     ctx.llm_timeout_seconds,
+                    ctx.deadline,
+                    ctx.command_margin_secs,
                 )
                 .await?;
 
@@ -767,6 +769,7 @@ impl InnerLoopService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn call_llm(
         &self,
         model_alias: &str,
@@ -783,6 +786,8 @@ impl InnerLoopService {
         // type error rather than a silent footgun.
         tenant_id: &TenantId,
         llm_timeout_seconds: u64,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        command_margin_secs: u64,
     ) -> anyhow::Result<LlmOutput> {
         let chat_messages: Vec<ChatMessage> = conversation
             .iter()
@@ -929,6 +934,7 @@ impl InnerLoopService {
             &schemas,
             &options,
             llm_timeout_seconds,
+            try_left_after_margin(deadline, command_margin_secs, chrono::Utc::now()),
         )
         .await;
 
@@ -1056,12 +1062,27 @@ impl InnerLoopService {
     }
 }
 
+/// The try's time left less the margin it keeps after a command for the
+/// model to act ([`command_margin_secs`]), the rule [`fit_command_to_try`]
+/// applies to a command, here applied to an alias's fallback (AEGIS ADR-130,
+/// Update of 2026-10-05, D2a). `None` when the try has no deadline.
+fn try_left_after_margin(
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    margin_secs: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    deadline.map(|deadline| {
+        let room = (deadline - now).num_seconds() - margin_secs as i64;
+        std::time::Duration::from_secs(room.max(0) as u64)
+    })
+}
+
 /// One model call of the inner loop, bounded by the agent's
 /// `llm_timeout_seconds` (manifest spec v1: the bound on one LLM call, not on
-/// the iteration, whose bound the supervisor enforces). The registry is given
-/// the bound, so an alias's fallback is tried inside it (AEGIS ADR-130,
-/// Update of 2026-10-05, D2a); a call that has not answered by then is ended
-/// with an error naming the field and the seconds.
+/// the iteration, whose bound the supervisor enforces). A call that has not
+/// answered by then is ended with an error naming the field and the seconds;
+/// on an alias that names a fallback, the fallback is then tried once where
+/// `try_left` holds its bound (AEGIS ADR-130, Update of 2026-10-05, D2a).
 async fn generate_within_llm_timeout(
     registry: &ProviderRegistry,
     model_alias: &str,
@@ -1069,6 +1090,7 @@ async fn generate_within_llm_timeout(
     schemas: &[ToolSchema],
     options: &GenerationOptions,
     llm_timeout_seconds: u64,
+    try_left: Option<std::time::Duration>,
 ) -> Result<crate::domain::llm::ChatResponse, crate::infrastructure::llm::registry::ModelCallFailure>
 {
     registry
@@ -1078,6 +1100,7 @@ async fn generate_within_llm_timeout(
             schemas,
             options,
             std::time::Duration::from_secs(llm_timeout_seconds),
+            try_left,
         )
         .await
 }
@@ -1564,6 +1587,7 @@ mod tests {
             &[],
             &GenerationOptions::default(),
             120,
+            None,
         )
         .await;
         let waited = started.elapsed();
@@ -1594,6 +1618,7 @@ mod tests {
             &[],
             &GenerationOptions::default(),
             120,
+            None,
         )
         .await;
         assert!(result.is_ok(), "{result:?}");

@@ -469,7 +469,7 @@ mod tests {
                 model: "m-smart".to_string(),
                 attempts: 2,
                 elapsed_ms: 120_000,
-                primary: PrimaryFailure::Silent { secs: 42 },
+                primary: PrimaryFailure::Silent { secs: 120 },
                 fallback: Some(FallbackReport {
                     alias: "coder".to_string(),
                     model: "m-coder".to_string(),
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(parts.error.to_string(), "Network error: raw detail");
         assert_eq!(
             parts.sentence,
-            "The model on alias 'smart' (m-smart) gave no answer within 42 s; its fallback 'coder' (m-coder) was tried and gave no answer within 78 s."
+            "The model on alias 'smart' (m-smart) gave no answer within 120 s; its fallback 'coder' (m-coder) was tried and gave no answer within 78 s."
         );
     }
 
