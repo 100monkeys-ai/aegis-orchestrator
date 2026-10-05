@@ -421,6 +421,25 @@ fn daemon_validation_service(
         .with_judge_context(judge_context)
 }
 
+/// The inner loop the daemon runs: a command's output enters the model's
+/// conversation bounded by its alias's room in the alias table the judges
+/// read (AEGIS ADR-131 U16a's measure; retry-knows-what-failed).
+fn daemon_inner_loop_service(
+    tool_invocation_service: Arc<
+        aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService,
+    >,
+    execution_service: Arc<dyn ExecutionService>,
+    registry: Arc<aegis_orchestrator_core::infrastructure::llm::ProviderRegistry>,
+    judge_context: Arc<dyn aegis_orchestrator_core::domain::goal::JudgeContextSource>,
+) -> aegis_orchestrator_core::application::inner_loop_service::InnerLoopService {
+    aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
+        tool_invocation_service,
+        execution_service,
+        registry,
+    )
+    .with_context_source(judge_context)
+}
+
 /// The SEAL middleware the daemon runs for every `POST /v1/seal/invoke`:
 /// ADR-072's rate limits when configured, and always the replay-nonce store
 /// AEGIS ADR-035's Amendment "SEAL Replay-Nonce Store" decides: one
@@ -2138,12 +2157,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
 
     let (inner_loop_service, llm_registry) = share_llm_registry(llm_registry, |registry| {
-        let mut ils =
-            aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
-                tool_invocation_service.clone(),
-                execution_service.clone(),
-                registry,
-            );
+        let mut ils = daemon_inner_loop_service(
+            tool_invocation_service.clone(),
+            execution_service.clone(),
+            registry,
+            judge_context.clone(),
+        );
         if let (Some(ref enforcer), Some(ref resolver)) =
             (&rate_limit_enforcer, &rate_limit_resolver)
         {
@@ -3970,6 +3989,84 @@ mod tests {
             .judge_context()
             .expect("the daemon gives the validation service the alias table");
         assert_eq!(source.judge_context("judge"), Some(production));
+    }
+
+    /// retry-knows-what-failed: the inner loop the daemon builds is given the
+    /// alias table, so a command's output enters the model's conversation
+    /// bounded by an eighth of the alias's prompt limit (production's
+    /// `smart`: 256,000 and 16,384, 239,616 bytes, 29,952 per output). The
+    /// failure this prevents: the bound right in the inner loop's tests and,
+    /// in production, the stated default's (24,576 bytes, 3,072 per output).
+    #[tokio::test]
+    async fn the_daemon_gives_the_inner_loop_the_alias_table() {
+        use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+        use aegis_orchestrator_core::infrastructure::llm::ProviderRegistry;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut config = production_judge_config();
+        config.spec.llm_providers[0].models.push(
+            serde_yaml::from_str(
+                r#"alias: smart
+model: "@cf/nvidia/nemotron-3-120b-a12b"
+capabilities: ["chat", "code", "reasoning"]
+context_window: 256000
+max_output_tokens: 16384
+"#,
+            )
+            .expect("model entry parses"),
+        );
+        let judge_context = super::judge_context_source(&config);
+
+        let storage_root =
+            std::env::temp_dir().join(format!("aegis-daemon-inner-loop-{}", uuid::Uuid::new_v4()));
+        let fsal = Arc::new(aegis_orchestrator_core::domain::fsal::AegisFSAL::new(
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider::new(
+                    &storage_root,
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::InMemoryVolumeRepository::new(),
+            ),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoStorageEvents),
+        ));
+        let tools = aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
+            Arc::new(aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository::new()),
+            Arc::new(aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository::new()),
+            super::daemon_seal_middleware(None, None),
+            Arc::new(aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
+                aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::builtin_dispatchers(),
+            )),
+            fsal,
+            aegis_orchestrator_core::application::nfs_gateway::NfsVolumeRegistry::new(),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository::new()),
+            Arc::new(NoExecutions),
+            Arc::new(aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+            Arc::new(EventBus::new(16)),
+            None,
+        );
+        let inner_loop = super::daemon_inner_loop_service(
+            Arc::new(tools),
+            Arc::new(NoExecutions),
+            Arc::new(ProviderRegistry::from_config(&config).expect("registry builds")),
+            judge_context,
+        );
+        assert_eq!(inner_loop.conversation_output_bound("smart"), 29_952);
+        assert_eq!(inner_loop.conversation_output_bound("judge"), 29_952);
+    }
+
+    struct NoStorageEvents;
+
+    #[async_trait::async_trait]
+    impl aegis_orchestrator_core::domain::fsal::EventPublisher for NoStorageEvents {
+        async fn publish_storage_event(
+            &self,
+            _event: aegis_orchestrator_core::domain::events::StorageEvent,
+        ) {
+        }
     }
 
     /// AEGIS ADR-124 D3, as the coordinator ruled it (correction C1): the

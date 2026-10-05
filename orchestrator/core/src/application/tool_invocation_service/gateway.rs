@@ -141,6 +141,21 @@ impl ToolInvocationService {
         Ok(llm_timeout_seconds_of(&agent))
     }
 
+    /// The agent's iteration bound as the supervisor reads it.
+    pub(crate) async fn agent_iteration_timeout(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> anyhow::Result<std::time::Duration> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent_visible(tenant_id, agent_id)
+            .await?;
+        Ok(crate::domain::supervisor::iteration_timeout(
+            &agent.manifest.spec.execution.clone().unwrap_or_default(),
+        ))
+    }
+
     pub async fn get_available_tools_for_agent_in_context(
         &self,
         tenant_id: &TenantId,

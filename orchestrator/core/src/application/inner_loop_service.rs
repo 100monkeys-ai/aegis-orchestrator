@@ -15,13 +15,18 @@ use crate::application::execution::ExecutionService;
 use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::{
-    AgentMessage, ConversationMessage, DispatchId, OrchestratorMessage, ToolCall,
+    AgentMessage, ConversationMessage, DispatchAction, DispatchId, OrchestratorMessage, ToolCall,
 };
-use crate::domain::execution::{ExecutionId, TrajectoryStep};
+use crate::domain::execution::{ExecutionId, Iteration, TrajectoryStep};
+use crate::domain::goal::{judge_context_or_default, JudgeContextSource};
 use crate::domain::iam::UserIdentity;
 use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::llm::registry::{ApiKeySource, ProviderRegistry};
+
+/// The share of the alias's prompt limit one command's output may take in
+/// the conversation: an eighth.
+const COMMAND_OUTPUT_SHARE_OF_PROMPT_LIMIT: usize = 8;
 
 /// Maximum number of tool-call iterations before the inner loop is forcibly terminated.
 const MAX_INNER_LOOP_ITERATIONS: usize = 50;
@@ -85,6 +90,23 @@ struct ExecutionContext {
     /// Count of in-flight `cmd.run` dispatches for this execution.
     /// Used to enforce `Capability.max_concurrent`.
     active_dispatch_count: u32,
+    /// When this try's time runs out: its iteration's bound counted from the
+    /// iteration's start, or the execution's bound when that comes first.
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// The seconds of the try kept after a command for the model to read its
+    /// result and act on it ([`command_margin_secs`]).
+    command_margin_secs: u64,
+    /// The command in flight, as asked for and as dispatched.
+    pending_command: Option<PendingCommand>,
+}
+
+/// A dispatched command: the timeout the model asked for, the one it was
+/// given, and its output cap.
+#[derive(Debug, Clone)]
+struct PendingCommand {
+    requested_timeout_secs: u32,
+    timeout_secs: u32,
+    max_output_bytes: u64,
 }
 
 pub struct InnerLoopService {
@@ -96,6 +118,8 @@ pub struct InnerLoopService {
     rate_limit_enforcer: Option<Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>>,
     /// Optional rate limit policy resolver (ADR-072).
     rate_limit_resolver: Option<Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>>,
+    /// The alias table's room per alias (AEGIS ADR-131 U16a's measure).
+    context_source: Option<Arc<dyn JudgeContextSource>>,
 }
 
 impl InnerLoopService {
@@ -111,6 +135,48 @@ impl InnerLoopService {
             active_executions: RwLock::new(HashMap::new()),
             rate_limit_enforcer: None,
             rate_limit_resolver: None,
+            context_source: None,
+        }
+    }
+
+    /// The alias table the daemon hands its judges (AEGIS ADR-131 U16a).
+    pub fn with_context_source(mut self, source: Arc<dyn JudgeContextSource>) -> Self {
+        self.context_source = Some(source);
+        self
+    }
+
+    /// The bytes of one command's output the model's conversation is given:
+    /// an eighth of the alias's prompt limit (`context_window -
+    /// max_output_tokens`, U16a's measure, read from the alias table), so one
+    /// output never takes more than an eighth of what the model always holds
+    /// and a try's prompt, its history and several outputs still fit.
+    pub fn conversation_output_bound(&self, alias: &str) -> usize {
+        judge_context_or_default(self.context_source.as_deref(), alias).prompt_limit_bytes()
+            / COMMAND_OUTPUT_SHARE_OF_PROMPT_LIMIT
+    }
+
+    /// Store the try's trajectory as it stands, so a try that fails or is
+    /// cut off leaves on its iteration what it did (retry-knows-what-failed,
+    /// (a)); before this the trajectory was stored only on a final answer.
+    async fn persist_trajectory(&self, execution_id_str: &str, ctx: &ExecutionContext) {
+        let Ok(uuid) = uuid::Uuid::parse_str(execution_id_str) else {
+            return;
+        };
+        if let Err(e) = self
+            .execution_service
+            .store_iteration_trajectory(
+                ExecutionId(uuid),
+                ctx.iteration_number,
+                ctx.trajectory.clone(),
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution_id_str,
+                iteration = ctx.iteration_number,
+                error = %e,
+                "Failed to persist inner-loop trajectory"
+            );
         }
     }
 
@@ -151,6 +217,7 @@ impl InnerLoopService {
             } => {
                 let parsed_agent_id = AgentId::from_string(&agent_id)?;
                 let mut conversation = messages.clone();
+                let prompt_is_ours = conversation.is_empty();
                 if conversation.is_empty() {
                     // Prepend tool-use policy guidance as a system message so the agent
                     // knows to use purpose-built tools rather than routing through cmd.run.
@@ -207,6 +274,59 @@ impl InnerLoopService {
                         )
                     })?;
 
+                // The try's clock (retry-knows-what-failed, (b)): the supervisor
+                // ends the iteration at its bound, counted from the iteration's
+                // start as the record holds it, and the execution at its own.
+                let iteration_bound = self
+                    .tool_invocation_service
+                    .agent_iteration_timeout(&tenant_id, parsed_agent_id)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "loading agent {} for its iteration_timeout: {e}",
+                            parsed_agent_id.0
+                        )
+                    })?;
+                let now = chrono::Utc::now();
+                let iteration_bound_delta =
+                    chrono::Duration::seconds(iteration_bound.as_secs() as i64);
+                let deadline = match exec_record {
+                    Ok(ref e) => {
+                        let started = e
+                            .iterations
+                            .iter()
+                            .find(|i| i.number == iteration_number)
+                            .map(|i| i.started_at)
+                            .unwrap_or(now);
+                        let mut deadline = started + iteration_bound_delta;
+                        if let Some(bound) = e.timeout_seconds {
+                            deadline = deadline
+                                .min(e.started_at + chrono::Duration::seconds(bound as i64));
+                        }
+                        deadline
+                    }
+                    Err(_) => now + iteration_bound_delta,
+                };
+
+                // What the earlier tries did (retry-knows-what-failed, (a)),
+                // from the trajectory the record keeps of each.
+                if prompt_is_ours {
+                    if let Ok(ref e) = exec_record {
+                        let section = previous_tries_section(
+                            &e.iterations,
+                            iteration_number,
+                            self.conversation_output_bound(&model_alias),
+                        );
+                        if let (false, Some(user)) = (
+                            section.is_empty(),
+                            conversation.iter_mut().find(|m| m.role == "user"),
+                        ) {
+                            user.content.push_str("\n\n");
+                            user.content.push_str(&section);
+                        }
+                    }
+                }
+
                 self.active_executions.write().await.insert(
                     execution_id.clone(),
                     ExecutionContext {
@@ -223,6 +343,12 @@ impl InnerLoopService {
                         security_context_name,
                         llm_timeout_seconds,
                         active_dispatch_count: 0,
+                        deadline: Some(deadline),
+                        command_margin_secs: command_margin_secs(
+                            llm_timeout_seconds,
+                            iteration_bound,
+                        ),
+                        pending_command: None,
                     },
                 );
 
@@ -250,17 +376,21 @@ impl InnerLoopService {
 
                 let tool_call_id = ctx.pending_tool_call_id.clone().unwrap_or_default();
 
-                let mut result_json = serde_json::json!({
-                    "exit_code": exit_code,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                });
-                if truncated {
-                    result_json["truncated"] = serde_json::json!(true);
-                    result_json["notice"] = serde_json::json!(
-                        "[AEGIS] Output truncated at 512 KB. Full output available in execution logs."
-                    );
-                }
+                // The result as produced, kept whole in the trajectory for the
+                // person and the judges (AEGIS ADR-131 U19); the model's
+                // conversation is given a copy bounded by its alias's room.
+                let pending = ctx.pending_command.take();
+                let result_json = command_result_as_produced(
+                    exit_code,
+                    &stdout,
+                    &stderr,
+                    truncated,
+                    pending.as_ref(),
+                );
+                let seen = conversation_copy(
+                    &result_json,
+                    self.conversation_output_bound(&ctx.model_alias),
+                );
                 let _ = duration_ms; // used by future CommandExecutionCompleted event emission
 
                 if let Some(step) = ctx.trajectory.last_mut() {
@@ -277,10 +407,11 @@ impl InnerLoopService {
 
                 ctx.conversation.push(ConversationMessage {
                     role: "tool".to_string(),
-                    content: result_json.to_string(),
+                    content: seen.to_string(),
                     tool_call_id: Some(tool_call_id),
                     tool_calls: None,
                 });
+                self.persist_trajectory(&execution_id, &ctx).await;
 
                 ctx.pending_dispatch_id = None;
                 ctx.pending_tool_call_id = None;
@@ -374,23 +505,7 @@ impl InnerLoopService {
                         trajectory: ctx.trajectory.clone(),
                     };
 
-                    let execution_id = ExecutionId(uuid::Uuid::parse_str(execution_id_str)?);
-                    if let Err(e) = self
-                        .execution_service
-                        .store_iteration_trajectory(
-                            execution_id,
-                            ctx.iteration_number,
-                            ctx.trajectory.clone(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            execution_id = %execution_id_str,
-                            iteration = ctx.iteration_number,
-                            error = %e,
-                            "Failed to persist inner-loop trajectory"
-                        );
-                    }
+                    self.persist_trajectory(execution_id_str, &ctx).await;
 
                     self.active_executions
                         .write()
@@ -490,13 +605,48 @@ impl InnerLoopService {
                                     }
                                 }
 
+                                // The command ends inside the try (retry-knows-what-failed, (b)).
+                                let now = chrono::Utc::now();
+                                let (action, pending) = match fit_command_to_try(
+                                    action,
+                                    next_ctx.deadline,
+                                    next_ctx.command_margin_secs,
+                                    now,
+                                ) {
+                                    Ok(fitted) => fitted,
+                                    Err(refusal) => {
+                                        let mut step = step;
+                                        step.status = "refused".to_string();
+                                        step.error = Some(refusal.clone());
+                                        next_ctx.trajectory.push(step);
+                                        next_ctx.conversation.push(ConversationMessage {
+                                            role: "tool".to_string(),
+                                            content: refusal,
+                                            tool_call_id: Some(tool_call.id.clone()),
+                                            tool_calls: None,
+                                        });
+                                        self.persist_trajectory(execution_id_str, &next_ctx).await;
+                                        self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
+                                        continue;
+                                    }
+                                };
+
                                 next_ctx.active_dispatch_count =
                                     next_ctx.active_dispatch_count.saturating_add(1);
                                 let mut step = step;
                                 step.status = "dispatched".to_string();
+                                step.result_json = Some(
+                                    serde_json::json!({
+                                        "running_since": now.to_rfc3339(),
+                                        "timeout_secs": pending.timeout_secs,
+                                    })
+                                    .to_string(),
+                                );
                                 next_ctx.trajectory.push(step);
                                 next_ctx.pending_dispatch_id = Some(dispatch_id);
                                 next_ctx.pending_tool_call_id = Some(tool_call.id.clone());
+                                next_ctx.pending_command = Some(pending);
+                                self.persist_trajectory(execution_id_str, &next_ctx).await;
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
 
                                 return Ok(OrchestratorMessage::Dispatch {
@@ -532,6 +682,7 @@ impl InnerLoopService {
                                     tool_call_id: Some(tool_call.id.clone()),
                                     tool_calls: None,
                                 });
+                                self.persist_trajectory(execution_id_str, &next_ctx).await;
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
                             }
                             Err(e) => {
@@ -554,6 +705,7 @@ impl InnerLoopService {
                                         step.status = "fatal".to_string();
                                         step.error = Some(e.to_string());
                                         failed_ctx.trajectory.push(step);
+                                        self.persist_trajectory(execution_id_str, &failed_ctx).await;
                                     }
                                     anyhow::bail!(
                                         "Tool '{}' terminated with fatal error: {}",
@@ -605,6 +757,7 @@ impl InnerLoopService {
                                     tool_call_id: Some(tool_call.id.clone()),
                                     tool_calls: None,
                                 });
+                                self.persist_trajectory(execution_id_str, &next_ctx).await;
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
                             }
                         }
@@ -1003,6 +1156,351 @@ fn classify_seal_error(e: &crate::domain::seal_session::SealSessionError) -> Sea
 fn policy_feedback_message(tool_name: &str) -> String {
     format!("Tool '{tool_name}' is not available. Do not retry this tool.")
 }
+
+// ---------------------------------------------------------------------------
+// A try's clock, a command's result, and what earlier tries did
+// (retry-knows-what-failed: AEGIS ADR-005 "Context Injection", ADR-040)
+// ---------------------------------------------------------------------------
+
+/// Seconds a try's command result needs to come back to the orchestrator.
+const COMMAND_RESULT_TRANSPORT_SECS: u64 = 10;
+
+/// The line the bootstrap ends a timed-out command's stderr with.
+const COMMAND_TIMED_OUT: &str = "[AEGIS] Command timed out after";
+
+/// Seconds of a try kept after a command for the model to read its result and
+/// act on it: one model call's bound (`llm_timeout_seconds`) and the result's
+/// way back, at most half the try, so that a try can always run a command.
+fn command_margin_secs(llm_timeout_seconds: u64, iteration_bound: std::time::Duration) -> u64 {
+    llm_timeout_seconds
+        .saturating_add(COMMAND_RESULT_TRANSPORT_SECS)
+        .min(iteration_bound.as_secs() / 2)
+}
+
+/// The command with its timeout lowered so that it ends `margin_secs` before
+/// the try's `deadline`, and what was asked for; or, when less than a second
+/// would be left to it, the text the model is given instead of running it.
+fn fit_command_to_try(
+    action: DispatchAction,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    margin_secs: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(DispatchAction, PendingCommand), String> {
+    let DispatchAction::Exec {
+        command,
+        args,
+        cwd,
+        env_additions,
+        timeout_secs,
+        max_output_bytes,
+    } = action;
+    let mut fitted = timeout_secs;
+    if let Some(deadline) = deadline {
+        let left = (deadline - now).num_seconds();
+        let room = left - margin_secs as i64;
+        if room < 1 {
+            return Err(format!(
+                "[AEGIS] cmd.run was not run: this try has {} s left, and the last {margin_secs} s \
+                 of a try are kept after a command for you to read its result and act on it. \
+                 Answer with what you have.",
+                left.max(0)
+            ));
+        }
+        fitted = fitted.min(u32::try_from(room).unwrap_or(u32::MAX));
+    }
+    Ok((
+        DispatchAction::Exec {
+            command,
+            args,
+            cwd,
+            env_additions,
+            timeout_secs: fitted,
+            max_output_bytes,
+        },
+        PendingCommand {
+            requested_timeout_secs: timeout_secs,
+            timeout_secs: fitted,
+            max_output_bytes,
+        },
+    ))
+}
+
+/// A command's result as it was produced, as the trajectory keeps it.
+fn command_result_as_produced(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+    pending: Option<&PendingCommand>,
+) -> Value {
+    let mut result = serde_json::json!({
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    });
+    if truncated {
+        result["truncated"] = serde_json::json!(true);
+        let cap = pending
+            .map(|p| format!(" ({} bytes)", p.max_output_bytes))
+            .unwrap_or_default();
+        result["notice"] = serde_json::json!(format!(
+            "[AEGIS] The command's output was larger than its max_output_bytes{cap} and was cut \
+             where it was produced; the line inside stdout or stderr states its true size and \
+             what was kept."
+        ));
+    }
+    if let Some(p) = pending {
+        if p.timeout_secs < p.requested_timeout_secs
+            && exit_code == -1
+            && stderr.contains(COMMAND_TIMED_OUT)
+        {
+            result["timeout_notice"] = serde_json::json!(format!(
+                "[AEGIS] This command's timeout was lowered from {} s to {} s so that it ends \
+                 inside this try's time limit, with time left for you to read this result and \
+                 act on it; the try itself ends at its limit whatever is running.",
+                p.requested_timeout_secs, p.timeout_secs
+            ));
+        }
+    }
+    result
+}
+
+/// The largest index at most `at` that is a character boundary of `text`.
+fn floor_boundary(text: &str, mut at: usize) -> usize {
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The smallest index at least `at` that is a character boundary of `text`.
+fn ceil_boundary(text: &str, mut at: usize) -> usize {
+    while at < text.len() && !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// `text` whole when it fits `budget` bytes, else its head and its tail with
+/// a line stating its true size and what is omitted.
+fn keep_head_and_tail(text: &str, budget: usize, label: &str) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let head = floor_boundary(text, budget / 2);
+    let tail_start = ceil_boundary(text, text.len() - (budget - budget / 2));
+    let tail = text.len() - tail_start;
+    format!(
+        "{}\n[AEGIS] This copy of the {label} is cut to fit the context: it is {} bytes; the \
+         first {head} and the last {tail} are shown and the {} between them are omitted here.\n{}",
+        &text[..head],
+        text.len(),
+        text.len() - head - tail,
+        &text[tail_start..],
+    )
+}
+
+/// The copy of a command's result the model's conversation is given: whole
+/// when its stdout and stderr fit `bound` bytes together, else each stream's
+/// head and tail within it, with the cut stated and where the whole is.
+fn conversation_copy(produced: &Value, bound: usize) -> Value {
+    let stdout = produced["stdout"].as_str().unwrap_or_default();
+    let stderr = produced["stderr"].as_str().unwrap_or_default();
+    if stdout.len() + stderr.len() <= bound {
+        return produced.clone();
+    }
+    let mut stderr_budget = stderr.len().min(bound / 2);
+    let mut stdout_budget = bound - stderr_budget;
+    if stdout.len() < stdout_budget {
+        stdout_budget = stdout.len();
+        stderr_budget = bound - stdout_budget;
+    }
+    let mut seen = produced.clone();
+    seen["stdout"] = Value::String(keep_head_and_tail(stdout, stdout_budget, "stdout"));
+    seen["stderr"] = Value::String(keep_head_and_tail(stderr, stderr_budget, "stderr"));
+    seen["context_notice"] = serde_json::json!(format!(
+        "[AEGIS] This result is cut to fit your context: a command's output may take {bound} \
+         bytes of it, an eighth of what this model always holds. The whole output is kept as it \
+         was produced in this step of the execution's trajectory, for the person and the \
+         judges. To read more of it, run the command again writing its output to a file under \
+         /workspace and read that file in parts."
+    ));
+    seen
+}
+
+/// The tools whose successful call writes or changes the file at `path`.
+const FILE_WRITING_TOOLS: &[&str] = &[
+    "fs.write",
+    "fs.edit",
+    "fs.multi_edit",
+    "fs.create_dir",
+    "fs.delete",
+];
+
+/// One step of an earlier try, as the next try is told it.
+fn render_step(
+    n: usize,
+    step: &TrajectoryStep,
+    try_ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    bound: usize,
+) -> String {
+    let arguments = keep_head_and_tail(&step.arguments_json, bound, "arguments");
+    let mut out = format!("{n}. {} {arguments}\n", step.tool_name);
+    let result: Option<Value> = step
+        .result_json
+        .as_deref()
+        .and_then(|r| serde_json::from_str(r).ok());
+    match step.status.as_str() {
+        "dispatched" => {
+            let since = result
+                .as_ref()
+                .and_then(|r| r["running_since"].as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            let ran = since
+                .map(|since| {
+                    let ended = try_ended_at.unwrap_or_else(chrono::Utc::now);
+                    format!(": it had run {} s", (ended - since).num_seconds().max(0))
+                })
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "   It was still running when the try's time ran out{ran}. Its output so far did \
+                 not reach the orchestrator: the try's container was ended with it.\n"
+            ));
+        }
+        "refused" | "fatal" => {
+            let error = step.error.as_deref().unwrap_or_default();
+            out.push_str(&format!(
+                "   {}: {}\n",
+                step.status,
+                keep_head_and_tail(error, bound, "error")
+            ));
+        }
+        _ => match result {
+            Some(r) if r.get("stdout").is_some() => {
+                let seen = conversation_copy(&r, bound);
+                out.push_str(&format!("   exit code: {}\n", seen["exit_code"]));
+                for stream in ["stdout", "stderr"] {
+                    let text = seen[stream].as_str().unwrap_or_default();
+                    if !text.is_empty() {
+                        out.push_str(&format!("   {stream}:\n{text}\n"));
+                    }
+                }
+                for notice in ["notice", "timeout_notice", "context_notice"] {
+                    if let Some(text) = seen[notice].as_str() {
+                        out.push_str(&format!("   {text}\n"));
+                    }
+                }
+            }
+            _ => {
+                let text = step
+                    .result_json
+                    .as_deref()
+                    .or(step.error.as_deref())
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "   {}: {}\n",
+                    step.status,
+                    keep_head_and_tail(text, bound, "result")
+                ));
+            }
+        },
+    }
+    out
+}
+
+/// How an earlier try ended, in words.
+fn how_the_try_ended(iteration: &Iteration) -> String {
+    use crate::domain::execution::IterationStatus;
+    match (&iteration.error, &iteration.status) {
+        (Some(error), _) => error.message.clone(),
+        (None, IterationStatus::Running) => "it was cut off".to_string(),
+        (None, IterationStatus::Failed) => "it failed".to_string(),
+        (None, IterationStatus::Success | IterationStatus::Refining) => {
+            "it gave an answer, which was not accepted".to_string()
+        }
+    }
+}
+
+/// What the tries of this execution before try `current` did, from the
+/// trajectory each left on its iteration: each step with its result as the
+/// model saw it (bounded by `bound`, as a command's output is in the
+/// conversation), a command still running when its try was cut off named as
+/// such with how long it had run, and the files each try wrote. Kept within
+/// twice `bound`, the latest steps first. Empty when there is no earlier try.
+pub(crate) fn previous_tries_section(
+    iterations: &[Iteration],
+    current: u8,
+    bound: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for iteration in iterations.iter().filter(|i| i.number < current) {
+        parts.push(format!(
+            "## Try {}\nIt ended: {}\n",
+            iteration.number,
+            how_the_try_ended(iteration)
+        ));
+        let steps = iteration.trajectory.as_deref().unwrap_or_default();
+        if steps.is_empty() {
+            parts.push("It ran no tool.\n".to_string());
+        }
+        for (n, step) in steps.iter().enumerate() {
+            parts.push(render_step(n + 1, step, iteration.ended_at, bound));
+        }
+        let mut written: Vec<String> = Vec::new();
+        for step in steps.iter().filter(|s| {
+            s.status == "succeeded" && FILE_WRITING_TOOLS.contains(&s.tool_name.as_str())
+        }) {
+            if let Some(path) = serde_json::from_str::<Value>(&step.arguments_json)
+                .ok()
+                .and_then(|a| a["path"].as_str().map(str::to_string))
+            {
+                if !written.contains(&path) {
+                    written.push(path);
+                }
+            }
+        }
+        if !written.is_empty() {
+            parts.push(format!(
+                "Files it wrote or changed: {}\n",
+                written.join(", ")
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    let limit = bound.saturating_mul(2);
+    let mut kept: Vec<String> = Vec::new();
+    let mut size = 0;
+    for part in parts.iter().rev() {
+        if size + part.len() > limit && !kept.is_empty() {
+            break;
+        }
+        size += part.len();
+        kept.push(keep_head_and_tail(part, limit, "step"));
+    }
+    kept.reverse();
+    let left_out = parts.len() - kept.len();
+    let mut section = String::from(
+        "# What the previous tries did\n\nThe orchestrator kept each step of the earlier tries \
+         of this task. Each result is shown as the model saw it then. Build on what worked and \
+         do not repeat what failed in the same way.\n\n",
+    );
+    if left_out > 0 {
+        section.push_str(&format!(
+            "({left_out} earlier parts of this account are not shown: they are kept in the \
+             execution's trajectory.)\n\n"
+        ));
+    }
+    section.push_str(&kept.join("\n"));
+    section
+}
+
+#[cfg(test)]
+#[path = "inner_loop_service_tests.rs"]
+mod daemon_path_tests;
 
 #[cfg(test)]
 mod tests {
