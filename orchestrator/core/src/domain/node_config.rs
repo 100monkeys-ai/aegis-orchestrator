@@ -1857,6 +1857,46 @@ pub struct SealGatewayConfig {
     /// against (AEGIS ADR-132 H8). Absent: the system's root certificates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_path: Option<std::path::PathBuf>,
+
+    /// The remote MCP servers the gateway serves, each by the name the
+    /// gateway registers it under (its `spec.mcp_servers[].name`): a tool
+    /// `<name>.<tool>` is called with the acting user's credential for their
+    /// binding whose provider is `<name>`, granted to the calling agent, its
+    /// workflow or all their agents (AEGIS ADR-132 H1, H4). A name is checked
+    /// by the gateway's own rule ([`Self::remote_server_names`]). Empty: no
+    /// remote server, and no person's credential is ever resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_servers: Vec<String>,
+}
+
+impl SealGatewayConfig {
+    /// `remote_servers`, each checked by the rule the SEAL gateway applies
+    /// to its own `spec.mcp_servers[].name` (`aegis-seal-gateway` `cc0db0f`,
+    /// `src/domain/remote_mcp.rs` 18-27 and `src/infrastructure/config.rs`
+    /// 55-60): lowercase letters, digits and hyphens, not empty, named once.
+    /// A name the gateway could not register is refused here with the
+    /// reason, so the daemon does not start with it, rather than answering
+    /// its tools as missing at the first call.
+    pub fn remote_server_names(&self) -> anyhow::Result<Vec<String>> {
+        let mut names: Vec<String> = Vec::with_capacity(self.remote_servers.len());
+        for name in &self.remote_servers {
+            let valid = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !valid {
+                anyhow::bail!(
+                    "seal_gateway.remote_servers: '{name}' must be lowercase letters, digits and \
+                     hyphens, the rule of the gateway's spec.mcp_servers[].name"
+                );
+            }
+            if names.contains(name) {
+                anyhow::bail!("seal_gateway.remote_servers: '{name}' is named twice");
+            }
+            names.push(name.clone());
+        }
+        Ok(names)
+    }
 }
 
 /// Configuration for the Zaru consumer product service.
@@ -3802,5 +3842,58 @@ goals:
             ..Default::default()
         };
         assert!(goals.validate().is_err());
+    }
+
+    /// `seal_gateway.remote_servers` (AEGIS ADR-132 H4) names each remote
+    /// server as the gateway registers it; absent, it reads as none, and a
+    /// configuration without it (production's today) parses unchanged.
+    #[test]
+    fn seal_gateway_remote_servers_are_read_and_default_to_none() {
+        let with: SealGatewayConfig = serde_yaml::from_str(
+            "url: https://aegis-seal-gateway:50055\nremote_servers: [nuclear-notes, notes-2]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            with.remote_server_names().unwrap(),
+            vec!["nuclear-notes".to_string(), "notes-2".to_string()]
+        );
+        let without: SealGatewayConfig =
+            serde_yaml::from_str("url: https://aegis-seal-gateway:50055\n").unwrap();
+        assert!(without.remote_servers.is_empty());
+        assert!(without.remote_server_names().unwrap().is_empty());
+    }
+
+    /// A name the gateway could not register (its rule: lowercase letters,
+    /// digits and hyphens, once each) is refused with the reason, never
+    /// carried to the first call to be answered as a missing tool. A dot
+    /// matters most: a tool's server is the part before its first dot.
+    #[test]
+    fn a_remote_server_name_the_gateway_could_not_register_is_refused() {
+        for (names, reason) in [
+            (
+                vec!["nuclear.notes"],
+                "lowercase letters, digits and hyphens",
+            ),
+            (
+                vec!["Nuclear-Notes"],
+                "lowercase letters, digits and hyphens",
+            ),
+            (vec![""], "lowercase letters, digits and hyphens"),
+            (vec!["notes", "notes"], "named twice"),
+        ] {
+            let config = SealGatewayConfig {
+                url: SensitiveUrl::new("https://aegis-seal-gateway:50055"),
+                ca_cert_path: None,
+                remote_servers: names.iter().map(|n| n.to_string()).collect(),
+            };
+            let error = config
+                .remote_server_names()
+                .expect_err("the name is refused")
+                .to_string();
+            assert!(
+                error.contains("seal_gateway.remote_servers") && error.contains(reason),
+                "{names:?}: {error}"
+            );
+        }
     }
 }

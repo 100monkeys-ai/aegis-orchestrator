@@ -460,6 +460,11 @@ fn security_context(patterns: &[&str]) -> SecurityContext {
 /// The orchestrator, an agent and its executions.
 struct Harness {
     service: ToolInvocationService,
+    /// The SEAL sessions `invoke_tool` (the invoke route) looks a call's
+    /// token up in.
+    sessions: Arc<InMemorySealSessionRepository>,
+    /// The executions the service and an inner loop read.
+    executions: Arc<Executions>,
     tenant: TenantId,
     agent_id: AgentId,
     /// An execution whose initiating user is `USER`.
@@ -579,17 +584,19 @@ async fn harness(setup: Setup) -> Harness {
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         Arc::new(NoOpPublisher),
     ));
+    let sessions = Arc::new(InMemorySealSessionRepository::new());
+    let executions = Arc::new(Executions(
+        executions.into_iter().map(|e| (e.id, e)).collect(),
+    ));
     let service = ToolInvocationService::new(
-        Arc::new(InMemorySealSessionRepository::new()),
+        sessions.clone(),
         security_context_repo,
         Arc::new(SealMiddleware::new()),
         Arc::new(setup.router),
         fsal,
         NfsVolumeRegistry::new(),
         Arc::new(OneAgent(agent)),
-        Arc::new(Executions(
-            executions.into_iter().map(|e| (e.id, e)).collect(),
-        )),
+        executions.clone(),
         Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(EventBus::new(1024)),
         setup.gateway_url,
@@ -613,6 +620,8 @@ async fn harness(setup: Setup) -> Harness {
     };
     Harness {
         service,
+        sessions,
+        executions,
         tenant,
         agent_id,
         execution,
@@ -1711,4 +1720,344 @@ async fn no_persons_remote_tools_are_in_the_node_wide_list_or_listed_over_plaint
     assert_eq!(names(&listed_plain), vec!["ext.lookup"]);
     let received = plain_stub.received.lock().unwrap();
     assert!(received.lists.last().unwrap().bound_servers.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The wiring: `seal_gateway` as the daemon configures it, through the route
+// ---------------------------------------------------------------------------
+
+/// A SEAL envelope as `POST /v1/seal/invoke` hands it to `invoke_tool`; the
+/// signature is not what these tests are about.
+struct RouteEnvelope {
+    token: SensitiveString,
+    tool: String,
+    args: Value,
+    nonce: String,
+}
+
+impl EnvelopeVerifier for RouteEnvelope {
+    fn security_token(&self) -> &SensitiveString {
+        &self.token
+    }
+    fn verify_signature(&self, _: &[u8]) -> Result<(), SealSessionError> {
+        Ok(())
+    }
+    fn extract_tool_name(&self) -> Option<String> {
+        Some(self.tool.clone())
+    }
+    fn extract_arguments(&self) -> Option<Value> {
+        Some(self.args.clone())
+    }
+    fn replay_nonce(&self) -> String {
+        self.nonce.clone()
+    }
+}
+
+/// Counts every credential lookup, answering none.
+#[derive(Default)]
+struct CountedCredentials(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl crate::application::credential_service::ToolCredentialSource for CountedCredentials {
+    async fn tool_server_credential(
+        &self,
+        _: &crate::application::credential_service::ToolCallActor<'_>,
+        _: &str,
+    ) -> anyhow::Result<Option<SensitiveString>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }
+}
+
+/// `seal_gateway` as a node configures it.
+fn gateway_config(
+    url: &str,
+    ca: Option<&std::path::Path>,
+    servers: &[&str],
+) -> crate::domain::node_config::SealGatewayConfig {
+    crate::domain::node_config::SealGatewayConfig {
+        url: SensitiveUrl::new(url),
+        ca_cert_path: ca.map(std::path::Path::to_path_buf),
+        remote_servers: servers.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+impl Harness {
+    /// The gateway part of the service wired from `config`, the one way the
+    /// daemon wires it.
+    fn configured(
+        mut self,
+        config: Option<&crate::domain::node_config::SealGatewayConfig>,
+        credentials: Option<Arc<dyn crate::application::credential_service::ToolCredentialSource>>,
+    ) -> Self {
+        self.service = self
+            .service
+            .with_seal_gateway_config(config, credentials)
+            .expect("the configuration wires");
+        self
+    }
+
+    /// A session as `/v1/seal/attest` binds it for `USER` through the Zaru
+    /// MCP server: the user's tenant and subject, a random agent id (a
+    /// chat session has no agent of its own), the test's context.
+    async fn session(&self) -> String {
+        let token = format!("token-{}", uuid::Uuid::new_v4());
+        let session = crate::domain::seal_session::SealSession::new(
+            AgentId::new(),
+            ExecutionId::new(),
+            vec![],
+            token.clone(),
+            security_context(&["*"]),
+            self.tenant.clone(),
+        )
+        .with_principal_metadata(
+            Some(USER.to_string()),
+            Some(USER.to_string()),
+            None,
+            None,
+        );
+        self.sessions.save(session).await.unwrap();
+        token
+    }
+
+    /// One `tools/call` through `invoke_tool`, what the invoke route calls.
+    async fn route(&self, token: &str, tool: &str) -> Result<Value, SealSessionError> {
+        self.service
+            .invoke_tool(&RouteEnvelope {
+                token: token.to_string().into(),
+                tool: tool.to_string(),
+                args: json!({"query": "q"}),
+                nonce: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+    }
+}
+
+/// The wiring, configured: `seal_gateway` with an `https` gateway, its CA
+/// and `remote_servers: [SERVER]` reaches the gateway through the invoke
+/// route with the user's credential over TLS, and answers the server's
+/// result unchanged. Nothing but the configuration wires the CA, the
+/// servers and the credential source here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_configured_gateway_takes_a_granted_users_call_through_the_route() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup::gateway(&url)).await.configured(
+        Some(&gateway_config(&url, Some(&tls.ca_path), &[SERVER])),
+        Some(vault.service.clone()),
+    );
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+
+    let token = h.session().await;
+    let value = h
+        .route(&token, &format!("{SERVER}.pages.read"))
+        .await
+        .expect("the call is made");
+    assert_eq!(
+        value,
+        json!({"content":[{"type":"text","text":"page"}],"isError":false})
+    );
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.tools.len(), 1, "one InvokeTool");
+    let call = &received.tools[0];
+    assert_eq!(
+        (call.server.as_str(), call.tool.as_str()),
+        (SERVER, "pages.read")
+    );
+    assert_eq!(call.acting.as_ref().unwrap().user_id, USER);
+    assert_eq!(call.credential.as_ref().unwrap().value, MARKER);
+}
+
+/// The wiring refuses before any dial: a user with no binding to the server
+/// granted to the session's agent is answered 403
+/// `CREDENTIAL_BINDING_REQUIRED`, and the gateway receives nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_configured_gateway_refuses_an_ungranted_call_before_any_dial() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup::gateway(&url)).await.configured(
+        Some(&gateway_config(&url, Some(&tls.ca_path), &[SERVER])),
+        Some(vault.service.clone()),
+    );
+    // Granted to one named agent, not to the session's.
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::Agent {
+                agent_id: AgentId::new(),
+            }],
+        )
+        .await;
+
+    let token = h.session().await;
+    let error = h
+        .route(&token, &format!("{SERVER}.pages.read"))
+        .await
+        .expect_err("refused");
+    let refusal = error.refusal();
+    assert_eq!(
+        (refusal.http_status, refusal.code),
+        (403, "CREDENTIAL_BINDING_REQUIRED"),
+        "{error:?}"
+    );
+    assert_eq!(
+        refusal.message,
+        format!("This tool needs your own credential for '{SERVER}', granted to this agent.")
+    );
+    let received = stub.received.lock().unwrap();
+    assert!(
+        received.tools.is_empty() && received.lists.is_empty(),
+        "nothing reached the gateway"
+    );
+}
+
+/// The two components name a server once each, and the names must match:
+/// the orchestrator's `seal_gateway.remote_servers` and the gateway's
+/// `spec.mcp_servers[].name`. A server the orchestrator names and the
+/// gateway does not register is answered by the gateway's own refusal
+/// (`aegis-seal-gateway` `cc0db0f` `remote_mcp/mod.rs` 173-180: NOT_FOUND,
+/// "Not found: server '<name>'."), relayed as 404 with that reason. A server
+/// the gateway registers and the orchestrator does not name is never sent a
+/// credential: its tool is looked up in the gateway's tenant list, which
+/// lists a remote server only for a user who holds a binding, and answered
+/// 404 "Not found: tool '<name>'.", nothing invoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mismatched_server_names_are_refused_with_the_reason() {
+    let stub = StubGateway::new(
+        vec![],
+        Answer::Refuse(
+            tonic::Code::NotFound,
+            Some("NOT_FOUND"),
+            format!("Not found: server '{SERVER}'."),
+        ),
+    );
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup::gateway(&url)).await.configured(
+        Some(&gateway_config(&url, Some(&tls.ca_path), &[SERVER])),
+        Some(vault.service.clone()),
+    );
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let token = h.session().await;
+
+    // Named here, not registered there.
+    let error = h
+        .route(&token, &format!("{SERVER}.pages.read"))
+        .await
+        .expect_err("refused");
+    let refusal = error.refusal();
+    assert_eq!((refusal.http_status, refusal.code), (404, "NOT_FOUND"));
+    assert_eq!(refusal.message, format!("Not found: server '{SERVER}'."));
+
+    // Registered there, not named here.
+    let error = h
+        .route(&token, "unnamed-server.pages.read")
+        .await
+        .expect_err("refused");
+    let refusal = error.refusal();
+    assert_eq!((refusal.http_status, refusal.code), (404, "NOT_FOUND"));
+    assert_eq!(
+        refusal.message,
+        "Not found: tool 'unnamed-server.pages.read'."
+    );
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.tools.len(), 1, "only the named server was called");
+    assert_eq!(received.lists.len(), 1, "the unnamed one was looked up");
+    assert!(
+        received.lists[0].bound_servers.is_empty(),
+        "no credential rode the lookup"
+    );
+}
+
+/// With no `seal_gateway` (production today) the wiring changes nothing:
+/// a tool no builtin serves is answered 404 as before, no credential is
+/// looked up, nothing dials.
+#[tokio::test]
+async fn without_a_gateway_the_wiring_changes_nothing() {
+    let credentials = Arc::new(CountedCredentials::default());
+    let mut setup = Setup::gateway("unused");
+    setup.gateway_url = None;
+    let h = harness(setup)
+        .await
+        .configured(None, Some(credentials.clone()));
+    let token = h.session().await;
+    let error = h
+        .route(&token, &format!("{SERVER}.pages.read"))
+        .await
+        .expect_err("not found");
+    let refusal = error.refusal();
+    assert_eq!((refusal.http_status, refusal.code), (404, "NOT_FOUND"));
+    assert_eq!(
+        refusal.message,
+        format!("Not found: tool '{SERVER}.pages.read'.")
+    );
+    assert_eq!(
+        credentials.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no credential was looked up"
+    );
+}
+
+/// What the daemon does not start with, each with its reason: a CA file it
+/// cannot read, a server name the gateway could not register, and remote
+/// servers on a node with no credential store.
+#[tokio::test]
+async fn a_gateway_configuration_that_cannot_work_is_refused_with_the_reason() {
+    let url = "https://aegis-seal-gateway:50055";
+    let credentials: Arc<dyn crate::application::credential_service::ToolCredentialSource> =
+        Arc::new(CountedCredentials::default());
+    for (config, credentials, reason) in [
+        (
+            gateway_config(
+                url,
+                Some(std::path::Path::new("/nonexistent/aegis-wiring-ca.crt")),
+                &[SERVER],
+            ),
+            Some(credentials.clone()),
+            "seal_gateway.ca_cert_path",
+        ),
+        (
+            gateway_config(url, None, &["nuclear.notes"]),
+            Some(credentials.clone()),
+            "seal_gateway.remote_servers",
+        ),
+        (
+            gateway_config(url, None, &[SERVER]),
+            None,
+            "no credential store",
+        ),
+    ] {
+        let error = harness(Setup::gateway(url))
+            .await
+            .service
+            .with_seal_gateway_config(Some(&config), credentials)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains(reason), "{reason}: {error}");
+    }
 }

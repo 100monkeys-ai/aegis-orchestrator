@@ -209,6 +209,54 @@ impl ToolInvocationService {
         self
     }
 
+    /// The SEAL gateway's part of the service as the node configures it
+    /// (AEGIS ADR-132 H1, H4, H8), the one way the daemon wires it:
+    /// `seal_gateway.ca_cert_path`'s CA, `seal_gateway.remote_servers`'
+    /// names, and `credentials`, the source each remote tool call resolves
+    /// the acting user's credential through. The gateway's address is the
+    /// one [`Self::new`] was given.
+    ///
+    /// With no `seal_gateway` (`None`) nothing changes: no CA, no remote
+    /// server, no credential source, so a tool no builtin serves is
+    /// answered as not found and nothing dials. A CA file that cannot be
+    /// read, a server name the gateway could not register, or remote
+    /// servers on a node with no credential store are refused with the
+    /// reason, so the daemon does not start with them.
+    pub fn with_seal_gateway_config(
+        self,
+        gateway: Option<&crate::domain::node_config::SealGatewayConfig>,
+        credentials: Option<Arc<dyn crate::application::credential_service::ToolCredentialSource>>,
+    ) -> anyhow::Result<Self> {
+        let Some(gateway) = gateway else {
+            return Ok(self);
+        };
+        let names = gateway.remote_server_names()?;
+        let mut service = match &gateway.ca_cert_path {
+            Some(ca) => self.with_seal_gateway_ca_cert(ca)?,
+            None => self,
+        };
+        if names.is_empty() {
+            return Ok(service);
+        }
+        let Some(credentials) = credentials else {
+            anyhow::bail!(
+                "seal_gateway.remote_servers names {names:?}, but this node has no credential \
+                 store (no database) to resolve a person's credential from"
+            );
+        };
+        if !service.gateway_channel_is_confidential() {
+            tracing::warn!(
+                remote_servers = ?names,
+                "seal_gateway.url is not an https address: every call of a remote server's tool \
+                 is refused CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL and none of their tools is listed"
+            );
+        }
+        service = service
+            .with_remote_tool_servers(names)
+            .with_tool_credentials(credentials);
+        Ok(service)
+    }
+
     /// ADR-117: enable the four-step edge dispatch pre-routing hook.
     pub fn with_edge_router(
         mut self,

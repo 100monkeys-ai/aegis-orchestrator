@@ -632,6 +632,14 @@ spec:
   #   # The CA the gateway's certificate is verified against; omit it for the
   #   # system's root certificates.
   #   ca_cert_path: "/etc/aegis/tls/seal-gateway-ca.crt"
+  #   # The remote MCP servers the gateway serves, each by the name the
+  #   # gateway registers it under (its spec.mcp_servers[].name; the two
+  #   # lists must name the same servers). A tool <name>.<tool> is called with
+  #   # the acting user's own credential: their binding whose provider is
+  #   # <name>, granted to the agent, its workflow or all their agents (AEGIS
+  #   # ADR-132 H1, H4). Lowercase letters, digits and hyphens. Omit for none.
+  #   remote_servers:
+  #     - nuclear-notes
 
   # --------------------------------------------------------------------------
   # OAuth Providers (Optional, ADR-078, AEGIS ADR-125 D2)
