@@ -18,7 +18,7 @@
 
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
-use crate::domain::shared_kernel::TenantId;
+use crate::domain::shared_kernel::{TenantId, CONSUMER_SLUG};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -577,7 +577,7 @@ impl SecretPath {
         let namespace = if tenant_id.is_system() {
             "aegis-system".to_string()
         } else {
-            format!("tenant-{}", tenant_id.as_str())
+            tenant_namespace(&tenant_id)
         };
         Self {
             namespace: namespace.clone(),
@@ -590,14 +590,15 @@ impl SecretPath {
     /// Returns the engine mount string to pass to the secret store.
     ///
     /// When the path carries a non-system tenant, the mount is prefixed with
-    /// `tenant-{slug}/` so that the OpenBao path-based namespace routing
-    /// directs the operation into the tenant's isolated namespace.
+    /// the tenant's namespace (see `tenant_namespace`): `tenant-{slug}/`
+    /// for an organisation or a team, and the realm's `tenant-zaru-consumer/`
+    /// for a person's tenant (`u-<hex>`).
     ///
     /// System or unscoped paths return the bare `mount_point`.
     pub fn effective_mount(&self) -> String {
         match &self.tenant_id {
             Some(tid) if !tid.is_system() => {
-                format!("tenant-{}/{}", tid.as_str(), self.mount_point)
+                format!("{}/{}", tenant_namespace(tid), self.mount_point)
             }
             _ => self.mount_point.clone(),
         }
@@ -606,6 +607,21 @@ impl SecretPath {
     /// Returns the fully-qualified canonical path: `namespace/mount_point/path`.
     pub fn full_path(&self) -> String {
         format!("{}/{}/{}", self.namespace, self.mount_point, self.path)
+    }
+}
+
+/// The secret-store namespace a non-system tenant's secrets live in.
+///
+/// A person's tenant (`u-<hex>`, ADR-097) keeps its secrets in its realm's
+/// mount, `tenant-zaru-consumer` (ADR-056: "Consumer user secrets reside in
+/// `tenant-zaru-consumer/`."; ADR-125 Update): no mount is made per person,
+/// and the path inside it carries the tenant and the user
+/// (`users/<tenant>/<user>/...`). Every other tenant uses `tenant-{slug}`.
+fn tenant_namespace(tenant_id: &TenantId) -> String {
+    if tenant_id.as_str().starts_with("u-") {
+        format!("tenant-{CONSUMER_SLUG}")
+    } else {
+        format!("tenant-{}", tenant_id.as_str())
     }
 }
 
@@ -1198,3 +1214,7 @@ mod tests {
         assert!(secret.remaining_ttl() > Duration::ZERO);
     }
 }
+
+#[cfg(test)]
+#[path = "secrets_policy_tests.rs"]
+mod policy_tests;
