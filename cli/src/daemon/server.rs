@@ -145,7 +145,7 @@ use aegis_orchestrator_core::{
 
 use aegis_orchestrator_core::application::credential_service::{
     oauth_provider_registry_from_config, CredentialManagementService,
-    StandardCredentialManagementService,
+    StandardCredentialManagementService, ToolCredentialSource,
 };
 use aegis_orchestrator_core::domain::credential::CredentialBindingRepository;
 use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
@@ -444,6 +444,41 @@ pub(crate) fn daemon_seal_middleware(
             aegis_orchestrator_core::infrastructure::seal::nonce_store::InMemoryNonceStore::new(),
         )),
     )
+}
+
+/// The SEAL gateway's address as the daemon dials it: `seal_gateway.url`,
+/// an `env:` value resolved; `None` with no `seal_gateway`.
+pub(crate) fn daemon_seal_gateway_url(
+    gateway: Option<&aegis_orchestrator_core::domain::node_config::SealGatewayConfig>,
+) -> Option<String> {
+    gateway.map(|gateway| {
+        resolve_env_value(gateway.url.expose()).unwrap_or_else(|_| gateway.url.expose().to_string())
+    })
+}
+
+/// The SEAL gateway's part of the daemon's tool invocation service (AEGIS
+/// ADR-132 H1, H4, H8): the CA its certificate is verified against, the
+/// remote MCP servers it serves by name, and the credential store each
+/// remote tool call resolves the acting user's credential through. With no
+/// `seal_gateway` (production today) the service is unchanged: a tool no
+/// builtin serves answers 404 and nothing dials. A configuration that cannot
+/// work stops the daemon with its reason.
+pub(crate) fn daemon_seal_gateway_wiring(
+    service: aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService,
+    gateway: Option<&aegis_orchestrator_core::domain::node_config::SealGatewayConfig>,
+    credentials: Option<Arc<dyn ToolCredentialSource>>,
+) -> Result<aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService> {
+    if let Some(gateway) = gateway {
+        info!(
+            remote_servers = ?gateway.remote_servers,
+            ca_cert_path = ?gateway.ca_cert_path,
+            "SEAL gateway remote servers the orchestrator resolves credentials for; each must be \
+             a name in the gateway's spec.mcp_servers"
+        );
+    }
+    service
+        .with_seal_gateway_config(gateway, credentials)
+        .context("seal_gateway configuration")
 }
 
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
@@ -1698,6 +1733,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         };
 
     // ─── Credential Management Service (BC-11, ADR-078) ────────────────────────
+    // The same store answers a remote tool call's credential (AEGIS ADR-132
+    // H1), wired into the tool invocation service with `seal_gateway`.
+    let mut tool_credentials: Option<Arc<dyn ToolCredentialSource>> = None;
     let credential_service: Option<Arc<dyn CredentialManagementService>> = match db_pool.as_ref() {
         None => None,
         Some(pool) => {
@@ -1726,7 +1764,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
             )
                 as Arc<dyn aegis_orchestrator_core::domain::team::MembershipRepository>;
-            Some(Arc::new(
+            let service = Arc::new(
                 StandardCredentialManagementService::new(
                     repo,
                     secrets_manager.clone(),
@@ -1734,7 +1772,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     oauth_providers,
                 )
                 .with_membership_repo(memberships),
-            ) as Arc<dyn CredentialManagementService>)
+            );
+            tool_credentials = Some(service.clone() as Arc<dyn ToolCredentialSource>);
+            Some(service as Arc<dyn CredentialManagementService>)
         }
     };
 
@@ -1811,10 +1851,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
             ),
             event_bus.clone(),
-            config.spec.seal_gateway.as_ref().map(|gateway| {
-                resolve_env_value(gateway.url.expose())
-                    .unwrap_or_else(|_| gateway.url.expose().to_string())
-            }),
+            daemon_seal_gateway_url(config.spec.seal_gateway.as_ref()),
         )
         .with_workflow_authoring(
             register_workflow_use_case.clone(),
@@ -1841,6 +1878,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tool_invocation_service_builder =
             tool_invocation_service_builder.with_seal_gateway_operator_token(source.clone());
     }
+    tool_invocation_service_builder = daemon_seal_gateway_wiring(
+        tool_invocation_service_builder,
+        config.spec.seal_gateway.as_ref(),
+        tool_credentials,
+    )?;
 
     // Wire discovery service into ToolInvocationService if available (ADR-075)
     if let Some(ref disc_svc) = discovery_service {
@@ -4453,3 +4495,7 @@ models:
         }
     }
 }
+
+#[cfg(test)]
+#[path = "server_gateway_wiring_tests.rs"]
+mod gateway_wiring_tests;
