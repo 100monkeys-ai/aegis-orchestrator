@@ -28,17 +28,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::domain::events::GoalEvent;
 use crate::domain::execution::ExecutionId;
 use crate::domain::goal::{
-    judge_context_or_default, judge_input_digest, outcome_of, truncate_chars, BoundExecution,
-    BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome, GoalRepository, GoalState,
-    JudgeContextSource, OverLimit, StopReason, FAULT_OUTPUT_SHOWN_CHARS,
-    JUDGE_PROMPT_RESERVE_BYTES, MAX_STATEMENT_CHARS,
+    judge_context_or_default, judge_input_digest, outcome_of, truncate_chars, wait_time_text,
+    BoundExecution, BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome,
+    GoalRepository, GoalState, JudgeContextSource, OverLimit, StopReason, FAULT_OUTPUT_SHOWN_CHARS,
+    JUDGE_PROMPT_RESERVE_BYTES, MAX_STATEMENT_CHARS, WAITING_ON_EXECUTION,
 };
 use crate::domain::node_config::GoalsConfig;
 use crate::domain::repository::RepositoryError;
@@ -60,6 +60,10 @@ pub const EVALUATE_WAIT_BOUND: Duration = Duration::from_secs(45);
 
 /// How often a waiting evaluation reads the judge's execution.
 pub const JUDGE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often an evaluation holding for bound work still running reads the
+/// executions' rows (U22): coarse beside an iteration's minutes.
+pub const EXECUTION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the daemon closes goals open past their lifetime (D7: ADR-126
 /// D3's sweep interval).
@@ -127,6 +131,19 @@ pub struct ExecutionView {
     pub iterations: Option<usize>,
     pub last_output: Option<String>,
     pub last_error: Option<String>,
+    /// The latest a round waits for this execution (U23):
+    /// [`crate::domain::goal::execution_wait_bound`] of its start and its
+    /// recorded time limit.
+    pub bound_until: DateTime<Utc>,
+}
+
+impl ExecutionView {
+    /// The execution has not ended and is inside its bound at `now` (U21,
+    /// U23): a round waits for it. Past its bound it is judged as it stands,
+    /// whatever its row still says.
+    pub fn runs_at(&self, now: DateTime<Utc>) -> bool {
+        matches!(self.status.as_str(), "pending" | "running") && now < self.bound_until
+    }
 }
 
 /// Where the judge's execution stands.
@@ -169,6 +186,7 @@ pub struct GoalService {
     clock: Clock,
     wait_bound: Duration,
     poll_interval: Duration,
+    execution_poll_interval: Duration,
     /// The alias table's room for `goal-judge`'s alias (U16); `None` bounds
     /// its prompt by [`crate::domain::goal::JudgeContext::UNCONFIGURED`].
     judge_context: Option<Arc<dyn JudgeContextSource>>,
@@ -187,6 +205,7 @@ impl GoalService {
             clock: Arc::new(Utc::now),
             wait_bound: EVALUATE_WAIT_BOUND,
             poll_interval: JUDGE_POLL_INTERVAL,
+            execution_poll_interval: EXECUTION_POLL_INTERVAL,
             judge_context: None,
         }
     }
@@ -205,11 +224,13 @@ impl GoalService {
         self
     }
 
-    /// Wait at most `bound` per evaluation, reading the judge every
-    /// `poll_interval` (tests shorten the 45 s of U7).
+    /// Wait at most `bound` per evaluation, reading the judge, and the bound
+    /// executions while they run, every `poll_interval` (tests shorten the
+    /// 45 s of U7 and U22, and the 500 ms and 5 s reads).
     pub fn with_wait(mut self, bound: Duration, poll_interval: Duration) -> Self {
         self.wait_bound = bound;
         self.poll_interval = poll_interval;
+        self.execution_poll_interval = poll_interval;
         self
     }
 
@@ -361,9 +382,141 @@ impl GoalService {
                 asked,
             });
         }
+        // U7, U22: one call holds at most `wait_bound`, for the work and
+        // then for the judge.
+        let deadline = tokio::time::Instant::now() + self.wait_bound;
+        if let Some(waiting) = self
+            .wait_for_work(world, &goal, companion_answer, &evaluations, deadline)
+            .await?
+        {
+            return Ok(waiting);
+        }
         // U14: the answer is judged and stored as the person received it.
-        self.judge_round(world, goal, companion_answer, evaluations)
+        self.judge_round(world, goal, companion_answer, evaluations, deadline)
             .await
+    }
+
+    /// U21 to U24, U26: before a round's judge starts, hold while a bound
+    /// execution has not ended and is inside its bound (U23), reading the
+    /// executions every `execution_poll_interval`, up to `deadline`. `None`
+    /// when the round is to be judged now: nothing runs (any more), a judge
+    /// is already in flight for the round, or a bound execution holds a
+    /// pending approval, which keeps its precedence (D6, U3, U10). Otherwise
+    /// the not-decided answer with `waiting_on: "execution"` (U22); the wait
+    /// is one `goal_evaluations` row per round, reused by later calls and
+    /// closed when the wait ends (U24). No judge starts, no verdict is
+    /// stored, no round is decided and nothing is published while it waits.
+    async fn wait_for_work(
+        &self,
+        world: &dyn GoalWorld,
+        goal: &Goal,
+        companion_answer: &str,
+        evaluations: &[GoalEvaluation],
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Value>, GoalError> {
+        let round = goal.rounds;
+        if evaluations
+            .iter()
+            .any(|e| e.round == round && e.is_running())
+        {
+            return Ok(None);
+        }
+        let mut open = evaluations
+            .iter()
+            .find(|e| e.round == round && e.is_open_wait())
+            .cloned();
+        loop {
+            let now = (self.clock)();
+            let bound = self.repo.list_bound(goal.id).await?;
+            let approval_pending = !world
+                .pending_approvals(goal, &directly_bound(&bound))
+                .await
+                .is_empty();
+            let mut running = Vec::new();
+            if !approval_pending {
+                for b in &bound {
+                    if let Some(view) = world.read_execution(goal, b).await {
+                        if view.runs_at(now) {
+                            running.push(view);
+                        }
+                    }
+                }
+            }
+            let Some(wait_until) = running.iter().map(|v| v.bound_until).max() else {
+                if let Some(mut wait) = open.take() {
+                    wait.decided_at = Some(now);
+                    self.repo.finish_evaluation(&wait).await?;
+                    tracing::info!(
+                        goal_id = %goal.id,
+                        round,
+                        approval_pending,
+                        "The goal's wait for its running work ended"
+                    );
+                }
+                return Ok(None);
+            };
+            let execution_ids: Vec<String> =
+                running.iter().map(|v| v.execution_id.to_string()).collect();
+            let waiting_on = json!({
+                "kind": WAITING_ON_EXECUTION,
+                "execution_ids": execution_ids,
+                "wait_until": wait_time_text(wait_until),
+            });
+            match open.as_mut() {
+                None => {
+                    // Stored to the millisecond, so `waiting_since` reads the
+                    // same from every store and every later call.
+                    let began = now.trunc_subsecs(3);
+                    let wait = GoalEvaluation {
+                        id: Uuid::new_v4(),
+                        goal_id: goal.id,
+                        round,
+                        attempt: 1,
+                        judge_execution_id: None,
+                        companion_answer: companion_answer.to_string(),
+                        verdict: None,
+                        outcome: None,
+                        r#continue: false,
+                        waiting_on: Some(waiting_on),
+                        answer: None,
+                        created_at: began,
+                        decided_at: None,
+                        stop_reason: None,
+                        input_digest: None,
+                    };
+                    self.repo.insert_evaluation(&wait).await?;
+                    tracing::info!(
+                        goal_id = %goal.id,
+                        round,
+                        wait_until = %wait_time_text(wait_until),
+                        "The goal waits for its running work before its round is judged"
+                    );
+                    open = Some(wait);
+                }
+                Some(wait) if wait.waiting_on.as_ref() != Some(&waiting_on) => {
+                    wait.waiting_on = Some(waiting_on);
+                    self.repo.finish_evaluation(wait).await?;
+                }
+                Some(_) => {}
+            }
+            let held = tokio::time::Instant::now();
+            if held >= deadline {
+                let since = open
+                    .as_ref()
+                    .map(|w| wait_time_text(w.created_at))
+                    .unwrap_or_default();
+                return Ok(Some(json!({
+                    "state": "judging",
+                    "goal_id": goal.id.to_string(),
+                    "round": round,
+                    "waiting_on": WAITING_ON_EXECUTION,
+                    "execution_ids": execution_ids,
+                    "waiting_since": since,
+                    "wait_until": wait_time_text(wait_until),
+                })));
+            }
+            tokio::time::sleep(self.execution_poll_interval.min(deadline - held)).await;
+        }
     }
 
     async fn judge_round(
@@ -372,10 +525,15 @@ impl GoalService {
         goal: Goal,
         companion_answer: &str,
         evaluations: Vec<GoalEvaluation>,
+        deadline: tokio::time::Instant,
     ) -> Result<Value, GoalError> {
         let round = goal.rounds;
-        let deadline = tokio::time::Instant::now() + self.wait_bound;
-        let attempt = match evaluations.iter().rev().find(|e| e.round == round) {
+        // A wait (U24) is no attempt of the judge's.
+        let attempt = match evaluations
+            .iter()
+            .rev()
+            .find(|e| e.round == round && !e.is_wait())
+        {
             Some(e) if e.is_running() => Attempt::Started(e.clone()),
             Some(e) if e.is_fault() && e.attempt == 1 => {
                 let answer = e.companion_answer.clone();
@@ -1059,7 +1217,7 @@ mod tests {
     use crate::domain::goal::{AliasTableJudgeContext, JudgeContext};
     use crate::infrastructure::event_bus::DomainEvent;
     use crate::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     /// What one judge execution does.
@@ -1098,6 +1256,14 @@ mod tests {
         pending: Mutex<Vec<(ExecutionId, String)>>,
         /// Every bound execution's last output; 10,000 characters when unset.
         output: Mutex<Option<String>>,
+        /// A bound execution's status; `completed` when unset.
+        states: Mutex<HashMap<ExecutionId, String>>,
+        /// A bound execution's recorded time limit; none when unset.
+        timeouts: Mutex<HashMap<ExecutionId, u64>>,
+        /// After this many reads of a bound execution, every execution still
+        /// `running` takes this status (the work ends inside a call).
+        end_after_reads: Mutex<Option<(usize, &'static str)>>,
+        reads: Mutex<usize>,
     }
 
     impl World {
@@ -1117,11 +1283,37 @@ mod tests {
         fn finish_running(&self, judge: Judge) {
             self.judges.lock().unwrap().last_mut().unwrap().1 = judge;
         }
+        /// The bound execution `id` stands at `status`.
+        fn set_status(&self, id: ExecutionId, status: &str) {
+            self.states.lock().unwrap().insert(id, status.to_string());
+        }
     }
 
     #[async_trait]
     impl GoalWorld for World {
         async fn read_execution(&self, _: &Goal, b: &BoundExecution) -> Option<ExecutionView> {
+            {
+                let mut reads = self.reads.lock().unwrap();
+                *reads += 1;
+                if let Some((after, status)) = *self.end_after_reads.lock().unwrap() {
+                    if *reads >= after {
+                        for state in self.states.lock().unwrap().values_mut() {
+                            if state == "running" {
+                                *state = status.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            let status = self
+                .states
+                .lock()
+                .unwrap()
+                .get(&b.execution_id)
+                .cloned()
+                .unwrap_or_else(|| "completed".to_string());
+            let timeout = self.timeouts.lock().unwrap().get(&b.execution_id).copied();
+            let ended = !matches!(status.as_str(), "pending" | "running");
             Some(ExecutionView {
                 execution_id: b.execution_id,
                 kind: if b.kind == BoundKind::Agent {
@@ -1130,9 +1322,10 @@ mod tests {
                     "workflow"
                 },
                 agent_or_workflow: "palindrome-checker".to_string(),
-                status: "completed".to_string(),
+                status,
                 started_at: b.started_at,
-                ended_at: Some(b.started_at),
+                ended_at: ended.then_some(b.started_at),
+                bound_until: crate::domain::goal::execution_wait_bound(b.started_at, timeout),
                 iterations: Some(1),
                 last_output: Some(
                     self.output
@@ -1263,6 +1456,26 @@ mod tests {
 
         async fn stored(&self, goal: &Goal) -> Goal {
             self.repo.find_goal(goal.id).await.unwrap().unwrap()
+        }
+
+        async fn bound(&self, goal: &Goal) -> Vec<ExecutionId> {
+            self.repo
+                .list_bound(goal.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|b| b.execution_id)
+                .collect()
+        }
+
+        async fn waits(&self, goal: &Goal) -> Vec<GoalEvaluation> {
+            self.repo
+                .list_evaluations(goal.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(GoalEvaluation::is_wait)
+                .collect()
         }
     }
 
@@ -1950,5 +2163,238 @@ mod tests {
         assert_eq!(answer["stopped"]["reason"], "too_large");
         assert_eq!(answer["stopped"]["limit_bytes"], 24_576);
         assert_eq!(world.judges_started(), 0);
+    }
+
+    // ── U21 to U23, U26: work still running is waited for, never judged ──
+
+    /// The answer a deployed runner reads as "not decided, ask again with the
+    /// same round" (U7): `state: "judging"`, and U22's fields beside it.
+    fn assert_waiting_answer(answer: &Value, goal: &Goal, round: u32, ids: &[ExecutionId]) {
+        assert_eq!(answer["state"], "judging", "{answer}");
+        assert_eq!(answer["goal_id"], goal.id.to_string());
+        assert_eq!(answer["round"], round);
+        assert_eq!(answer["waiting_on"], WAITING_ON_EXECUTION);
+        let listed: Vec<String> = ids.iter().map(ToString::to_string).collect();
+        assert_eq!(answer["execution_ids"], json!(listed));
+        for field in ["waiting_since", "wait_until"] {
+            let text = answer[field].as_str().unwrap_or_default();
+            assert!(
+                DateTime::parse_from_rfc3339(text).is_ok(),
+                "{field} is an RFC 3339 time: {answer}"
+            );
+        }
+        for absent in ["verdict", "outcome", "continue", "rounds_left"] {
+            assert!(answer.get(absent).is_none(), "no {absent}: {answer}");
+        }
+    }
+
+    /// The reproduction (AEGIS ADR-131 U21, agentic-solver-watch, execution
+    /// b912e29a): the goal was judged four times while its execution still
+    /// ran, each answer "still running" spent a round, and the goal closed
+    /// exhausted while the work ran on. An execution running across four
+    /// evaluations starts no judge and decides no round, and one wait row
+    /// holds the wait; when it ends, the round is judged once on it as it
+    /// ended, and that not_met is one real round.
+    #[tokio::test]
+    async fn the_reproduction_work_running_across_four_evaluations_is_waited_for_and_then_judged_once(
+    ) {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.0, 1.0, 0.9)]);
+        world.set_status(solver, "running");
+
+        let mut since = None;
+        for call in 1..=4 {
+            let answer = h.evaluate(&world, &goal, Some(0)).await;
+            assert_waiting_answer(&answer, &goal, 0, &[solver]);
+            let this = answer["waiting_since"].clone();
+            assert_eq!(
+                since.get_or_insert(this.clone()),
+                &this,
+                "call {call}: one wait"
+            );
+        }
+        assert_eq!(world.judges_started(), 0, "no judge while the work runs");
+        let stored = h.stored(&goal).await;
+        assert_eq!((stored.state, stored.rounds), (GoalState::Open, 0));
+        let evaluations = h.repo.list_evaluations(goal.id).await.unwrap();
+        assert_eq!(evaluations.len(), 1, "one wait row, no verdict");
+        assert!(evaluations[0].is_open_wait());
+        assert_eq!(
+            json!(wait_time_text(evaluations[0].created_at)),
+            since.clone().unwrap()
+        );
+
+        world.set_status(solver, "failed");
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(world.judges_started(), 1, "judged once when it ended");
+        assert_eq!(world.last_input()["executions"][0]["status"], "failed");
+        assert_eq!(answer["outcome"], "not_met");
+        assert_eq!(answer["continue"], true);
+        assert_eq!(h.stored(&goal).await.rounds, 1, "one real round");
+        let waits = h.waits(&goal).await;
+        assert_eq!(waits.len(), 1);
+        assert!(waits[0].decided_at.is_some(), "the wait row is closed");
+    }
+
+    /// U21: an execution that failed before the evaluation is judged at once
+    /// as failed; its not_met is a real round, and no wait is stored.
+    #[tokio::test]
+    async fn an_execution_already_failed_is_judged_at_once_and_its_not_met_costs_one_round() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        world_failed_then_judged(&h, &goal, solver).await;
+    }
+
+    async fn world_failed_then_judged(h: &Harness, goal: &Goal, solver: ExecutionId) {
+        let world = World::scripted(vec![says(0.0, 1.0, 0.9)]);
+        world.set_status(solver, "failed");
+        let answer = h.evaluate(&world, goal, None).await;
+        assert_eq!(world.judges_started(), 1);
+        assert_eq!(world.last_input()["executions"][0]["status"], "failed");
+        assert_eq!(answer["outcome"], "not_met");
+        assert_eq!(answer["continue"], true);
+        assert_eq!(h.stored(goal).await.rounds, 1);
+        assert!(h.waits(goal).await.is_empty(), "no wait");
+    }
+
+    /// U23: past its start plus its recorded time limit plus the reaper's
+    /// 600 s, a row still `running` is judged as it stands; with no recorded
+    /// limit, the node's 1,800 s plus 600 s. No wait outlasts its bound.
+    #[tokio::test]
+    async fn past_its_bound_a_running_execution_is_judged_on_what_exists() {
+        for (timeout, bound) in [(Some(300u64), 900i64), (None, 2_400)] {
+            let h = Harness::new();
+            let goal = h.goal().await;
+            let solver = h.bound(&goal).await[0];
+            let world = World::scripted(vec![says(0.0, 1.0, 0.9)]);
+            world.set_status(solver, "running");
+            if let Some(t) = timeout {
+                world.timeouts.lock().unwrap().insert(solver, t);
+            }
+            let answer = h.evaluate(&world, &goal, None).await;
+            assert_eq!(answer["state"], "judging");
+            let wait_until = answer["wait_until"].as_str().unwrap().to_string();
+            let started = h.repo.list_bound(goal.id).await.unwrap()[0].started_at;
+            assert_eq!(
+                wait_until,
+                wait_time_text(started + chrono::Duration::seconds(bound)),
+                "wait_until is the execution's bound"
+            );
+            assert_eq!(world.judges_started(), 0);
+            if timeout.is_none() {
+                // 2,400 s is past the goal's lifetime: U25's test.
+                continue;
+            }
+
+            // Past the bound (the clock runs from before the binding).
+            h.advance(bound + 1);
+            let answer = h.evaluate(&world, &goal, Some(0)).await;
+            assert_eq!(world.judges_started(), 1, "{timeout:?}: judged");
+            assert_eq!(world.last_input()["executions"][0]["status"], "running");
+            assert_eq!(answer["outcome"], "not_met");
+            assert!(h.waits(&goal).await[0].decided_at.is_some());
+        }
+    }
+
+    /// U21: a pending approval keeps its precedence. A running execution
+    /// holding one is judged and answered as D6, U3 and U10 say, with no
+    /// wait; and an approval asked during a wait ends the wait the same way.
+    #[tokio::test]
+    async fn a_pending_approval_on_running_work_is_answered_as_before_with_no_wait() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.4, 0.9, 0.9)]);
+        world.set_status(solver, "running");
+        world
+            .pending
+            .lock()
+            .unwrap()
+            .push((solver, "approval-1".to_string()));
+        let answer = h.evaluate(&world, &goal, None).await;
+        assert_eq!(answer["waiting_on"], "approval");
+        assert_eq!(answer["approval_ids"], json!(["approval-1"]));
+        assert_eq!(answer["continue"], false);
+        assert_eq!(answer["round"], 0);
+        assert_eq!(world.judges_started(), 1);
+        assert!(h.waits(&goal).await.is_empty(), "no wait");
+
+        // The work runs with no approval: it waits; then an approval is
+        // asked: the wait ends and the approval is answered as before.
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.4, 0.9, 0.9)]);
+        world.set_status(solver, "running");
+        let answer = h.evaluate(&world, &goal, None).await;
+        assert_eq!(answer["waiting_on"], WAITING_ON_EXECUTION);
+        world
+            .pending
+            .lock()
+            .unwrap()
+            .push((solver, "approval-2".to_string()));
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(answer["waiting_on"], "approval");
+        assert_eq!(answer["approval_ids"], json!(["approval-2"]));
+        assert_eq!(world.judges_started(), 1);
+        let waits = h.waits(&goal).await;
+        assert_eq!(waits.len(), 1);
+        assert!(waits[0].decided_at.is_some(), "the wait ended");
+        assert_eq!(h.stored(&goal).await.rounds, 0, "no round is decided");
+    }
+
+    /// U26: several bound executions give one verdict after all have ended;
+    /// one that ended early is not judged alone meanwhile.
+    #[tokio::test]
+    async fn several_executions_are_judged_once_after_every_one_has_ended() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        h.service
+            .bind(goal.id, ExecutionId::new(), BoundKind::Agent)
+            .await
+            .unwrap();
+        let [creator, solver] = h.bound(&goal).await[..] else {
+            panic!("two bound executions");
+        };
+        let world = World::scripted(vec![says(0.95, 0.9, 0.9)]);
+        world.set_status(creator, "completed");
+        world.set_status(solver, "running");
+        let answer = h.evaluate(&world, &goal, None).await;
+        assert_waiting_answer(&answer, &goal, 0, &[solver]);
+        assert_eq!(
+            world.judges_started(),
+            0,
+            "the ended one is not judged alone"
+        );
+
+        world.set_status(solver, "completed");
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(answer["outcome"], "met");
+        assert_eq!(world.judges_started(), 1, "one verdict");
+        assert_eq!(
+            world.last_input()["executions"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    /// U22: one call holds while the work runs, reading the executions, and
+    /// judges in the same call when they end inside its hold.
+    #[tokio::test]
+    async fn work_that_ends_inside_the_hold_is_judged_in_the_same_call() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.95, 0.9, 0.9)]);
+        world.set_status(solver, "running");
+        *world.end_after_reads.lock().unwrap() = Some((3, "completed"));
+        let answer = h.evaluate(&world, &goal, None).await;
+        assert_eq!(answer["outcome"], "met", "{answer}");
+        assert_eq!(world.judges_started(), 1);
+        let waits = h.waits(&goal).await;
+        assert_eq!(waits.len(), 1, "the wait is recorded");
+        assert!(waits[0].decided_at.is_some(), "and ended");
     }
 }

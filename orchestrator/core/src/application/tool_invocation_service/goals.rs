@@ -13,7 +13,9 @@ use crate::application::goal_service::{
     GOAL_JUDGE_AGENT_NAME,
 };
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
-use crate::domain::goal::{BoundExecution, BoundKind, Goal, GoalChannel, GoalId};
+use crate::domain::goal::{
+    execution_wait_bound, BoundExecution, BoundKind, Goal, GoalChannel, GoalId,
+};
 use crate::domain::iam::{TenantScope, UserIdentity};
 use crate::domain::tool_approval::ToolApprovalStatus;
 
@@ -313,6 +315,8 @@ impl GoalWorld for GoalCallWorld<'_> {
                     last_error: last
                         .and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
                         .or_else(|| exec.error.clone()),
+                    // U23: its recorded time limit, or the node's default.
+                    bound_until: execution_wait_bound(exec.started_at, exec.timeout_seconds),
                 })
             }
             BoundKind::Workflow => {
@@ -355,6 +359,9 @@ impl GoalWorld for GoalCallWorld<'_> {
                     iterations: None,
                     last_output: output,
                     last_error: error,
+                    // U23: a workflow or intent execution records no time
+                    // limit of its own; it takes the node's default.
+                    bound_until: execution_wait_bound(wf.started_at, None),
                 })
             }
         }

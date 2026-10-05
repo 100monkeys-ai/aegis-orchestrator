@@ -21,14 +21,45 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::domain::execution::ExecutionId;
+use crate::domain::execution::{ExecutionId, REAPER_MARGIN_SECONDS};
 use crate::domain::node_config::{GoalsConfig, LLMProviderConfig};
 use crate::domain::repository::RepositoryError;
+use crate::domain::supervisor::DEFAULT_EXECUTION_TIMEOUT_SECONDS;
 use crate::domain::tenant::TenantId;
 use crate::domain::validation::GradientResult;
 
 /// The longest statement a goal holds, in characters (D1).
 pub const MAX_STATEMENT_CHARS: usize = 32_768;
+
+/// The `kind` of a [`GoalEvaluation`]'s `waiting_on` while its round waits
+/// for bound work still running (U21, U24), and the `waiting_on` of the
+/// answer that says so (U22).
+pub const WAITING_ON_EXECUTION: &str = "execution";
+
+/// The latest a round waits for one bound execution (U23): its `started_at`
+/// plus its recorded `timeout_seconds` (the supervisor's bound, migration
+/// 038) plus the container reaper's [`REAPER_MARGIN_SECONDS`], by when the
+/// supervisor or the reaper has ended it. An execution with no recorded
+/// bound, and a workflow or intent execution, takes the node's
+/// [`DEFAULT_EXECUTION_TIMEOUT_SECONDS`] plus the same margin.
+pub fn execution_wait_bound(
+    started_at: DateTime<Utc>,
+    timeout_seconds: Option<u64>,
+) -> DateTime<Utc> {
+    let seconds = timeout_seconds
+        .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS)
+        .saturating_add(REAPER_MARGIN_SECONDS);
+    chrono::Duration::try_seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
+        .and_then(|bound| started_at.checked_add_signed(bound))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+/// A time as a wait's record and answer carry it (U22, U24): RFC 3339 in UTC
+/// to the millisecond, so the same instant reads as the same text whichever
+/// store it came back from.
+pub fn wait_time_text(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
 
 /// The longest part of a faulted judge's own output an answer shows a reader,
 /// in characters. A judge's input is never cut: the judge is given the goal,
@@ -423,6 +454,13 @@ pub struct BoundExecution {
 /// One evaluation of a goal: one `goal-judge` execution and what came of it
 /// (U1). A round is decided by the one evaluation with an outcome and no
 /// `waiting_on` (U2, U3).
+///
+/// A **wait** is an evaluation with no judge execution whose `waiting_on` is
+/// `{"kind": "execution", "execution_ids", "wait_until"}` (U24): the round
+/// waited for bound work still running. Its `created_at` is when the wait
+/// began, its `decided_at` when it ended (null while it waits); it has no
+/// verdict and no outcome, never decides a round, and is never a judge in
+/// flight or a judge fault.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoalEvaluation {
     pub id: Uuid,
@@ -438,7 +476,8 @@ pub struct GoalEvaluation {
     pub outcome: Option<GoalOutcome>,
     pub r#continue: bool,
     /// `{"kind": "approval", "approval_ids": [...]}` when the evaluation
-    /// waited on an approval (U3).
+    /// waited on an approval (U3); `{"kind": "execution", "execution_ids":
+    /// [...], "wait_until": ...}` on a wait (U24).
     pub waiting_on: Option<Value>,
     /// The answer `aegis.goal.evaluate` returned (D6).
     pub answer: Option<Value>,
@@ -453,9 +492,39 @@ pub struct GoalEvaluation {
 }
 
 impl GoalEvaluation {
-    /// The judge has not finished.
+    /// A wait for bound work still running (U24), open or ended.
+    pub fn is_wait(&self) -> bool {
+        self.judge_execution_id.is_none()
+            && self
+                .waiting_on
+                .as_ref()
+                .and_then(|w| w.get("kind"))
+                .and_then(Value::as_str)
+                == Some(WAITING_ON_EXECUTION)
+    }
+
+    /// A wait that has not ended (U24).
+    pub fn is_open_wait(&self) -> bool {
+        self.is_wait() && self.decided_at.is_none()
+    }
+
+    /// A wait's `wait_until` (U23, U24); `None` on any other evaluation.
+    pub fn wait_until(&self) -> Option<DateTime<Utc>> {
+        if !self.is_wait() {
+            return None;
+        }
+        self.waiting_on
+            .as_ref()?
+            .get("wait_until")?
+            .as_str()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc))
+    }
+
+    /// The judge has not finished. A wait names no judge and is never one
+    /// (U24).
     pub fn is_running(&self) -> bool {
-        self.decided_at.is_none()
+        self.judge_execution_id.is_some() && self.decided_at.is_none()
     }
 
     /// This evaluation decided its round: by an outcome with no
@@ -467,8 +536,13 @@ impl GoalEvaluation {
     }
 
     /// The judge's verdict could not be read (ADR-017's Update of 2026-10-01).
+    /// Only an evaluation that names its judge execution can be one; an
+    /// ended wait is not (U24).
     pub fn is_fault(&self) -> bool {
-        self.decided_at.is_some() && self.outcome.is_none() && self.stop_reason.is_none()
+        self.judge_execution_id.is_some()
+            && self.decided_at.is_some()
+            && self.outcome.is_none()
+            && self.stop_reason.is_none()
     }
 }
 
@@ -616,6 +690,87 @@ mod tests {
         };
         assert!(!goal.has_outlived(1800, created + chrono::Duration::seconds(1799)));
         assert!(goal.has_outlived(1800, created + chrono::Duration::seconds(1800)));
+    }
+
+    /// U23: an execution's wait ends at its start plus its recorded bound
+    /// plus the reaper's 600 s; with no recorded bound (and for a workflow
+    /// or intent execution), at its start plus the node's 1,800 s plus 600 s.
+    #[test]
+    fn an_executions_wait_bound_is_its_time_limit_plus_the_reapers_margin() {
+        let started = DateTime::parse_from_rfc3339("2026-10-05T02:48:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            wait_time_text(execution_wait_bound(started, Some(600))),
+            "2026-10-05T03:08:01.000Z"
+        );
+        assert_eq!(
+            wait_time_text(execution_wait_bound(started, None)),
+            "2026-10-05T03:28:01.000Z"
+        );
+        assert_eq!(
+            execution_wait_bound(started, Some(u64::MAX)),
+            DateTime::<Utc>::MAX_UTC,
+            "a bound past the calendar is the latest time, never a panic"
+        );
+    }
+
+    fn wait_row(decided: bool) -> GoalEvaluation {
+        let began = Utc::now();
+        GoalEvaluation {
+            id: Uuid::new_v4(),
+            goal_id: GoalId::new(),
+            round: 0,
+            attempt: 1,
+            judge_execution_id: None,
+            companion_answer: "Dispatching it now.".to_string(),
+            verdict: None,
+            outcome: None,
+            r#continue: false,
+            waiting_on: Some(serde_json::json!({
+                "kind": WAITING_ON_EXECUTION,
+                "execution_ids": [ExecutionId::new().to_string()],
+                "wait_until": "2026-10-05T03:28:01.000Z",
+            })),
+            answer: None,
+            created_at: began,
+            decided_at: decided.then_some(began),
+            stop_reason: None,
+            input_digest: None,
+        }
+    }
+
+    /// U24: a wait, open or ended, is never a judge in flight, never a judge
+    /// fault and never decides its round.
+    #[test]
+    fn a_wait_is_neither_a_judge_in_flight_nor_a_fault_nor_a_decision() {
+        let open = wait_row(false);
+        assert!(open.is_wait() && open.is_open_wait());
+        assert!(!open.is_running(), "an open wait is no judge in flight");
+        assert!(!open.is_fault());
+        assert!(!open.decides_round());
+        assert_eq!(
+            open.wait_until().map(wait_time_text).as_deref(),
+            Some("2026-10-05T03:28:01.000Z")
+        );
+
+        let ended = wait_row(true);
+        assert!(ended.is_wait() && !ended.is_open_wait());
+        assert!(!ended.is_running());
+        assert!(!ended.is_fault(), "an ended wait is no judge fault");
+        assert!(!ended.decides_round());
+
+        // A judge's evaluation is not a wait, and reads as before.
+        let mut judged = wait_row(false);
+        judged.judge_execution_id = Some(ExecutionId::new());
+        judged.waiting_on = None;
+        assert!(!judged.is_wait() && judged.is_running());
+        judged.decided_at = Some(Utc::now());
+        assert!(
+            judged.is_fault(),
+            "a judge ended with no outcome is a fault"
+        );
+        assert_eq!(judged.wait_until(), None);
     }
 
     fn providers(yaml: &str) -> Vec<LLMProviderConfig> {
