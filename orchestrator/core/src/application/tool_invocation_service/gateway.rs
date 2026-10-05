@@ -1,7 +1,36 @@
 use super::*;
-use crate::domain::secrets::SensitiveUrl;
-use crate::infrastructure::seal_gateway_proto::ToolSummary;
+use crate::application::credential_service::ToolCallActor;
+use crate::domain::seal_session::{CallerAnswer, InternalFailure};
+use crate::domain::secrets::{SensitiveString, SensitiveUrl};
+use crate::infrastructure::seal_gateway_proto::{
+    ActingIdentity, CredentialKind, InvokeToolRequest, ResolvedCredential, ToolSummary,
+};
 use std::time::Duration;
+
+/// Who a call to the SEAL gateway acts for (AEGIS ADR-132 H4, H6): the
+/// person the run acts for (`None` for a run with no recorded person), the
+/// calling agent, and the workflow the run belongs to, if any. Taken from
+/// the execution's identity, never from a token a caller supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayActing {
+    pub(crate) user_id: Option<String>,
+    pub(crate) agent_id: AgentId,
+    pub(crate) workflow_id: Option<uuid::Uuid>,
+}
+
+impl GatewayActing {
+    /// The wire's form: an absent person or workflow is the empty string.
+    fn to_proto(&self) -> ActingIdentity {
+        ActingIdentity {
+            user_id: self.user_id.clone().unwrap_or_default(),
+            agent_id: self.agent_id.to_string(),
+            workflow_id: self
+                .workflow_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
 
 /// Connect timeout for SEAL Tooling Gateway gRPC connections.
 ///
@@ -339,6 +368,168 @@ impl ToolInvocationService {
         }
     }
 
+    /// Who a call of `agent_id` in `execution_id` acts for (AEGIS ADR-132
+    /// H4, H6): the caller when the caller is a person, never a service
+    /// account; the workflow the execution's workflow run belongs to, read in
+    /// the same tenant. A workflow that cannot be read is named as none.
+    pub(super) async fn gateway_acting(
+        &self,
+        agent_id: AgentId,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &TenantId,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+    ) -> GatewayActing {
+        GatewayActing {
+            user_id: crate::application::execution::person_sub(caller_identity),
+            agent_id,
+            workflow_id: self.workflow_of(execution_id, tenant_id).await,
+        }
+    }
+
+    /// The workflow whose run `execution_id` is a state of, if any.
+    async fn workflow_of(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &TenantId,
+    ) -> Option<uuid::Uuid> {
+        let workflow_executions = self.workflow_execution_repo.as_ref()?;
+        let execution = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .ok()?;
+        let workflow_execution_id = execution.input.workflow_execution_id?;
+        workflow_executions
+            .find_by_id_for_tenant(
+                tenant_id,
+                crate::domain::execution::ExecutionId(workflow_execution_id),
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|run| run.workflow_id.as_uuid())
+    }
+
+    /// The registered remote server `tool_name` belongs to, and the tool's
+    /// own name on it (`<server>.<tool>`; a server's name has no dot).
+    fn remote_tool_of<'a>(&self, tool_name: &'a str) -> Option<(&'a str, &'a str)> {
+        let (server, tool) = tool_name.split_once('.')?;
+        (!tool.is_empty() && self.remote_tool_servers.iter().any(|name| name == server))
+            .then_some((server, tool))
+    }
+
+    /// The acting user's credential for `server` (AEGIS ADR-132 H1, H3,
+    /// H6), or the refusal `CREDENTIAL_BINDING_REQUIRED`: for a run with no
+    /// recorded person, saying so; for a user with no binding to the server
+    /// granted to this agent or its workflow. No other credential path is
+    /// tried.
+    async fn credential_for(
+        &self,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+        server: &str,
+    ) -> Result<SensitiveString, SealSessionError> {
+        let binding_required = |message: String| {
+            SealSessionError::NotFound(message.clone())
+                .answered(CallerAnswer::CredentialBindingRequired { message })
+        };
+        let Some(user_id) = acting.user_id.as_deref() else {
+            return Err(binding_required(format!(
+                "This tool needs your own credential for '{server}', and no person is recorded for this run."
+            )));
+        };
+        let source = self.tool_credentials.as_ref().ok_or_else(|| {
+            SealSessionError::InternalError(format!(
+                "no credential source is configured for the remote tool server '{server}'"
+            ))
+            .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
+        })?;
+        let actor = ToolCallActor {
+            tenant_id,
+            user_id,
+            agent_id: acting.agent_id,
+            workflow_id: acting.workflow_id,
+        };
+        match source.tool_server_credential(&actor, server).await {
+            Ok(Some(credential)) => Ok(credential),
+            Ok(None) => Err(binding_required(format!(
+                "This tool needs your own credential for '{server}', granted to this agent."
+            ))),
+            Err(e) => Err(SealSessionError::InternalError(format!(
+                "resolving the credential for the remote tool server '{server}' failed: {e}"
+            ))),
+        }
+    }
+
+    /// Whether the configured gateway address is a TLS one: a person's
+    /// credential rides only such a channel (AEGIS ADR-132 H8).
+    pub(super) fn gateway_channel_is_confidential(&self) -> bool {
+        self.seal_gateway_url
+            .as_deref()
+            .is_some_and(gateway_url_is_tls)
+    }
+
+    /// Call `tool` of the remote MCP server `server` through the gateway's
+    /// `InvokeTool` (AEGIS ADR-132 H1, H2, H4): the tenant, the acting
+    /// identity, the server, the tool, the arguments as given and the acting
+    /// user's resolved credential, which the gateway presents to the server
+    /// for this call only. The server's `tools/call` result passes back
+    /// unchanged. Nothing is sent when there is no credential to send, or
+    /// when the gateway's address is plaintext.
+    async fn invoke_remote_tool(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SealSessionError> {
+        let tool_name = format!("{server}.{tool}");
+        let credential = self.credential_for(tenant_id, acting, server).await?;
+        if !self.gateway_channel_is_confidential() {
+            tracing::error!(
+                server = %server,
+                tool = %tool_name,
+                "a remote tool call would carry the acting user's credential to the SEAL gateway \
+                 over a plaintext channel; nothing was sent. Configure seal_gateway.url as an \
+                 https address (and seal_gateway.ca_cert_path for a private CA)"
+            );
+            return Err(SealSessionError::InternalError(format!(
+                "the SEAL gateway channel is not confidential; the call of '{tool_name}' was not sent"
+            ))
+            .answered(CallerAnswer::CredentialChannelNotConfidential));
+        }
+
+        let mut client = self.connect_gateway().await?;
+        let mut request = tonic::Request::new(InvokeToolRequest {
+            execution_id: execution_id.to_string(),
+            tenant_id: tenant_id.as_str().to_string(),
+            acting: Some(acting.to_proto()),
+            server: server.to_string(),
+            tool: tool.to_string(),
+            arguments_json: args.to_string(),
+            credential: Some(ResolvedCredential {
+                kind: CredentialKind::BearerToken as i32,
+                value: credential.expose().to_string(),
+            }),
+        });
+        drop(credential);
+        self.authorize_gateway_request(&mut request).await?;
+        let response =
+            match tokio::time::timeout(GATEWAY_INVOKE_TIMEOUT, client.invoke_tool(request)).await {
+                Ok(Ok(resp)) => resp.into_inner(),
+                Ok(Err(status)) => return Err(gateway_refusal("invoke_tool", &tool_name, &status)),
+                Err(_) => {
+                    return Err(SealSessionError::InternalError(format!(
+                        "seal tooling gateway invoke_tool timeout after {}s",
+                        GATEWAY_INVOKE_TIMEOUT.as_secs()
+                    )));
+                }
+            };
+        parse_gateway_result(&response.result_json)
+    }
+
     /// Call `tool_name` on the SEAL gateway. The tool goes by the kind the
     /// gateway lists it under for this tenant: a CLI tool to `InvokeCli`
     /// (it needs the execution's FSAL mounts), any other to
@@ -351,10 +542,17 @@ impl ToolInvocationService {
         tool_name: &str,
         args: serde_json::Value,
         tenant_id: &TenantId,
+        acting: &GatewayActing,
     ) -> Result<serde_json::Value, SealSessionError> {
+        if let Some((server, tool)) = self.remote_tool_of(tool_name) {
+            return self
+                .invoke_remote_tool(execution_id, tenant_id, acting, server, tool, args)
+                .await;
+        }
         let listing = ListToolsRequest {
             tenant_id: tenant_id.as_str().to_string(),
-            ..Default::default()
+            acting: Some(acting.to_proto()),
+            bound_servers: Vec::new(),
         };
         let listed = self
             .list_gateway_tools(listing, GATEWAY_INVOKE_TIMEOUT)
@@ -411,7 +609,7 @@ impl ToolInvocationService {
                 args: cli_args,
                 fsal_mounts,
                 tenant_id: tenant_id.as_str().to_string(),
-                acting: None,
+                acting: Some(acting.to_proto()),
             });
             self.authorize_gateway_request(&mut request).await?;
             let response = match tokio::time::timeout(
@@ -443,7 +641,7 @@ impl ToolInvocationService {
             input_json: args.to_string(),
             zaru_user_token: String::new(),
             tenant_id: tenant_id.as_str().to_string(),
-            acting: None,
+            acting: Some(acting.to_proto()),
         });
         self.authorize_gateway_request(&mut request).await?;
         let response =
@@ -509,7 +707,6 @@ pub(super) fn gateway_refusal(
     tool_name: &str,
     status: &tonic::Status,
 ) -> SealSessionError {
-    use crate::domain::seal_session::{CallerAnswer, InternalFailure};
     let code = status
         .metadata()
         .get(REFUSAL_CODE_METADATA)

@@ -24,6 +24,7 @@
 //!
 //! BC-11 Secrets & Identity Management (ADR-078).
 
+use crate::domain::agent::AgentId;
 use crate::domain::credential::{
     CredentialBindingId, CredentialBindingRepository, CredentialGrantId, CredentialMetadata,
     CredentialProvider, CredentialScope, CredentialStatus, CredentialType, GrantTarget,
@@ -600,6 +601,132 @@ pub trait CredentialManagementService: Send + Sync {
         actor: &CredentialActor,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<Option<UserCredentialBinding>>;
+}
+
+// ============================================================================
+// A tool call's credential (AEGIS ADR-132's Update (3), H1)
+// ============================================================================
+
+/// Who a tool call acts for, as its credential's grant is checked: the
+/// acting user in their tenant, the calling agent, and the workflow the
+/// call runs in, if any (AEGIS ADR-132 H4's acting identity).
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCallActor<'a> {
+    pub tenant_id: &'a TenantId,
+    /// The person the run acts for: the Keycloak subject that owns bindings.
+    pub user_id: &'a str,
+    pub agent_id: AgentId,
+    pub workflow_id: Option<uuid::Uuid>,
+}
+
+/// The credential a remote tool server's call carries (AEGIS ADR-132 H1):
+/// resolved by the orchestrator, which owns the bindings and the vault, and
+/// checked against the binding's grants where the secret is read.
+#[async_trait]
+pub trait ToolCredentialSource: Send + Sync {
+    /// The acting user's credential for the tool server `server`: the secret
+    /// of their active binding whose provider is the server's name, granted
+    /// to the calling agent, to its workflow, or to all their agents (the
+    /// grant model of ADR-078 and ADR-125). `Ok(None)` when no such binding
+    /// is granted, or when its OAuth token can no longer be refreshed: the
+    /// call is then refused, and no other credential path is tried. An
+    /// `OAuth2` binding answers its access token, refreshed when it is
+    /// within 60 seconds of `expires_at` (`access_token_for`); any other
+    /// answers its `token` or `value` field.
+    async fn tool_server_credential(
+        &self,
+        actor: &ToolCallActor<'_>,
+        server: &str,
+    ) -> anyhow::Result<Option<SensitiveString>>;
+}
+
+/// Whether `binding` is granted to `actor`'s agent, its workflow, or all the
+/// owner's agents. `active_grants_for` answers nothing for a binding that is
+/// not active.
+fn granted_to(binding: &UserCredentialBinding, actor: &ToolCallActor<'_>) -> bool {
+    let agent = GrantTarget::Agent {
+        agent_id: actor.agent_id,
+    };
+    !binding.active_grants_for(&agent).is_empty()
+        || actor.workflow_id.is_some_and(|workflow_id| {
+            !binding
+                .active_grants_for(&GrantTarget::Workflow { workflow_id })
+                .is_empty()
+        })
+        || !binding
+            .active_grants_for(&GrantTarget::AllAgents)
+            .is_empty()
+}
+
+#[async_trait]
+impl ToolCredentialSource for StandardCredentialManagementService {
+    async fn tool_server_credential(
+        &self,
+        actor: &ToolCallActor<'_>,
+        server: &str,
+    ) -> anyhow::Result<Option<SensitiveString>> {
+        let provider = CredentialProvider::new(server);
+        // The newest granted binding, when a user holds several.
+        let mut granted: Vec<UserCredentialBinding> = self
+            .repo
+            .find_by_owner(actor.tenant_id, actor.user_id)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                binding.provider == provider
+                    && binding.owner_user_id == actor.user_id
+                    && &binding.tenant_id == actor.tenant_id
+                    && granted_to(binding, actor)
+            })
+            .collect();
+        granted.sort_by_key(|binding| std::cmp::Reverse(binding.created_at));
+        let Some(binding) = granted.into_iter().next() else {
+            return Ok(None);
+        };
+
+        if binding.credential_type == CredentialType::OAuth2 {
+            return match self.access_token_for(&binding.id).await {
+                Ok(token) => Ok(Some(token)),
+                // The token can no longer be refreshed; the binding is now
+                // `Expired` and its user must connect it again.
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<CredentialError>(),
+                        Some(CredentialError::OAuthExchangeFailed { error, .. })
+                            if error == "invalid_grant"
+                    ) =>
+                {
+                    tracing::info!(
+                        binding_id = %binding.id,
+                        provider = %binding.provider,
+                        "a tool server's OAuth binding can no longer be refreshed; the call carries none"
+                    );
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            };
+        }
+
+        let stored = self
+            .secrets
+            .read_secret(
+                &binding.secret_path.effective_mount(),
+                &binding.secret_path.path,
+                &AccessContext::system("aegis-credential-service"),
+            )
+            .await?;
+        stored
+            .get("token")
+            .or_else(|| stored.get("value"))
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow!(
+                    "credential binding {} holds no token or value field",
+                    binding.id
+                )
+            })
+    }
 }
 
 // ============================================================================

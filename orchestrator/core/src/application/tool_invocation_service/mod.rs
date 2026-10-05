@@ -136,6 +136,14 @@ pub struct ToolInvocationService {
     /// (`seal_gateway.ca_cert_path`, AEGIS ADR-132 H8); `None`: the system's
     /// root certificates.
     seal_gateway_ca: Option<tonic::transport::Certificate>,
+    /// Resolves and grant-checks the acting user's credential for a remote
+    /// tool server's call (AEGIS ADR-132 H1). `None`: no remote tool can be
+    /// called.
+    tool_credentials: Option<Arc<dyn crate::application::credential_service::ToolCredentialSource>>,
+    /// The remote MCP servers registered with the SEAL gateway, by name: a
+    /// tool named `<server>.<tool>` of one of them is called with
+    /// `InvokeTool` and the acting user's credential (AEGIS ADR-132 H4).
+    remote_tool_servers: Vec<String>,
     /// Schema registry for builtin schema.get / schema.validate tools.
     schema_registry: Arc<SchemaRegistry>,
     /// Optional port for workflow execution control (cancel, signal, remove).

@@ -96,6 +96,8 @@ impl ToolInvocationService {
             seal_gateway_url,
             seal_gateway_operator_token: None,
             seal_gateway_ca: None,
+            tool_credentials: None,
+            remote_tool_servers: Vec::new(),
             schema_registry: Arc::new(SchemaRegistry::build()),
             workflow_execution_control: None,
             agent_activity: None,
@@ -184,6 +186,27 @@ impl ToolInvocationService {
         }
         self.seal_gateway_ca = Some(tonic::transport::Certificate::from_pem(pem));
         Ok(self)
+    }
+
+    /// Resolve the acting user's credential for a remote tool server's call,
+    /// checking the binding's grant to the calling agent or its workflow
+    /// where the secret is read (AEGIS ADR-132 H1).
+    pub fn with_tool_credentials(
+        mut self,
+        source: Arc<dyn crate::application::credential_service::ToolCredentialSource>,
+    ) -> Self {
+        self.tool_credentials = Some(source);
+        self
+    }
+
+    /// The remote MCP servers registered with the SEAL gateway, by name (the
+    /// gateway's `spec.mcp_servers[].name`). A tool named `<server>.<tool>`
+    /// of one of them is called with `InvokeTool`, carrying the acting
+    /// user's credential for the binding whose provider is the server's
+    /// name (AEGIS ADR-132 H1, H4).
+    pub fn with_remote_tool_servers(mut self, names: Vec<String>) -> Self {
+        self.remote_tool_servers = names;
+        self
     }
 
     /// ADR-117: enable the four-step edge dispatch pre-routing hook.
@@ -1212,8 +1235,17 @@ impl ToolInvocationService {
         // What the gateway answers reaches the caller: its result, or its
         // refusal by code (H5), never a not-found in place of a refusal.
         let outcome = if self.seal_gateway_url.is_some() {
-            self.invoke_seal_gateway_internal_grpc(execution_id, &tool_name, args, tenant_id)
-                .await
+            let acting = self
+                .gateway_acting(*agent_id, execution_id, tenant_id, caller_identity)
+                .await;
+            self.invoke_seal_gateway_internal_grpc(
+                execution_id,
+                &tool_name,
+                args,
+                tenant_id,
+                &acting,
+            )
+            .await
         } else {
             Err(super::gateway::tool_not_found(&tool_name))
         };

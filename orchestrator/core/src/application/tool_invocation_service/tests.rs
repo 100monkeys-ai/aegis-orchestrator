@@ -3681,6 +3681,11 @@ mod gateway_timeout_regression {
                     "gateway.tool",
                     serde_json::json!({}),
                     &TenantId::default(),
+                    &super::super::gateway::GatewayActing {
+                        user_id: None,
+                        agent_id: AgentId::new(),
+                        workflow_id: None,
+                    },
                 )
                 .await
                 .expect_err("the gateway call fails");
@@ -3761,6 +3766,11 @@ mod gateway_timeout_regression {
                 "some.tool",
                 serde_json::json!({}),
                 &TenantId::default(),
+                &super::super::gateway::GatewayActing {
+                    user_id: None,
+                    agent_id: AgentId::new(),
+                    workflow_id: None,
+                },
             ),
         )
         .await
