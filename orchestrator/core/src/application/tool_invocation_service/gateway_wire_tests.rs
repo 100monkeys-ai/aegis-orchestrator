@@ -2061,3 +2061,269 @@ async fn a_gateway_configuration_that_cannot_work_is_refused_with_the_reason() {
         assert!(error.contains(reason), "{reason}: {error}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The inner loop: an agent's run sees and calls its person's remote tools
+// ---------------------------------------------------------------------------
+
+/// A model that records the tools each turn offers it, calls `call` once,
+/// then answers.
+struct ScriptedModel {
+    call: String,
+    offered: StdMutex<Vec<Vec<crate::domain::llm::ToolSchema>>>,
+}
+
+#[async_trait]
+impl crate::domain::llm::LLMProvider for ScriptedModel {
+    async fn generate(
+        &self,
+        _: &str,
+        _: &crate::domain::llm::GenerationOptions,
+    ) -> Result<crate::domain::llm::GenerationResponse, crate::domain::llm::LLMError> {
+        unimplemented!("not used by the inner loop")
+    }
+    async fn generate_chat(
+        &self,
+        messages: &[crate::domain::llm::ChatMessage],
+        tools: &[crate::domain::llm::ToolSchema],
+        _: &crate::domain::llm::GenerationOptions,
+    ) -> Result<crate::domain::llm::ChatResponse, crate::domain::llm::LLMError> {
+        self.offered.lock().unwrap().push(tools.to_vec());
+        if messages.iter().any(|m| m.role == "tool") {
+            return Ok(crate::domain::llm::ChatResponse::FinalText(
+                crate::domain::llm::GenerationResponse {
+                    text: "done".to_string(),
+                    usage: Default::default(),
+                    provider: "scripted".to_string(),
+                    model: "scripted".to_string(),
+                    finish_reason: crate::domain::llm::FinishReason::Stop,
+                },
+            ));
+        }
+        Ok(crate::domain::llm::ChatResponse::ToolCalls(vec![
+            crate::domain::llm::ChatToolCall {
+                id: "call-1".to_string(),
+                name: self.call.clone(),
+                arguments: json!({"query": "q"}),
+            },
+        ]))
+    }
+    async fn health_check(&self) -> Result<(), crate::domain::llm::LLMError> {
+        Ok(())
+    }
+}
+
+/// One run of `h`'s agent in `h.execution` through the inner loop, its
+/// model calling `call`: the tools each turn offered, and the conversation.
+async fn run_inner_loop(
+    h: Harness,
+    call: &str,
+) -> (
+    Vec<Vec<crate::domain::llm::ToolSchema>>,
+    Vec<crate::domain::dispatch::ConversationMessage>,
+) {
+    let model = Arc::new(ScriptedModel {
+        call: call.to_string(),
+        offered: StdMutex::new(Vec::new()),
+    });
+    let registry = crate::infrastructure::llm::registry::ProviderRegistry::new_for_test(
+        model.clone(),
+        None,
+        1,
+        0,
+        60,
+    );
+    let inner_loop = crate::application::inner_loop_service::InnerLoopService::new(
+        Arc::new(h.service),
+        h.executions.clone(),
+        Arc::new(registry),
+    );
+    let answer = inner_loop
+        .handle_agent_message(crate::domain::dispatch::AgentMessage::Generate {
+            agent_id: h.agent_id.to_string(),
+            execution_id: h.execution.to_string(),
+            iteration_number: 1,
+            prompt: "look it up".to_string(),
+            messages: Vec::new(),
+            model_alias: "default".to_string(),
+        })
+        .await
+        .expect("the run ends");
+    let crate::domain::dispatch::OrchestratorMessage::Final { conversation, .. } = answer else {
+        panic!("the run ends with its answer: {answer:?}");
+    };
+    let offered = model.offered.lock().unwrap().clone();
+    (offered, conversation)
+}
+
+fn schema_names(tools: &[crate::domain::llm::ToolSchema]) -> Vec<String> {
+    let mut names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    names.sort();
+    names
+}
+
+/// AEGIS ADR-132 G5, H4 end to end: an agent's run is offered the
+/// `<server>.<tool>` tools of the servers its person bound and granted it,
+/// calls one, and the call reaches the gateway with the person's credential;
+/// the result is the tool message the model reads next. Every tool it was
+/// offered before (a builtin, a gateway workflow) is offered unchanged
+/// (ADR-035 R7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agents_run_lists_and_calls_its_persons_granted_remote_tool() {
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup {
+        agent_tools: vec!["aegis.schema.get", "ext.lookup", "notes-1.lookup"],
+        ..Setup::gateway(&url)
+    })
+    .await
+    .configured(
+        Some(&gateway_config(&url, Some(&tls.ca_path), &[SERVER])),
+        Some(vault.service.clone()),
+    );
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::Agent {
+                agent_id: h.agent_id,
+            }],
+        )
+        .await;
+    let before = h
+        .service
+        .get_available_tools_for_agent_in_context(&h.tenant, h.agent_id, CONTEXT)
+        .await
+        .unwrap();
+    assert_eq!(names(&before), vec!["aegis.schema.get", "ext.lookup"]);
+
+    let (offered, conversation) = run_inner_loop(h, "notes-1.lookup").await;
+    assert_eq!(
+        schema_names(&offered[0]),
+        vec!["aegis.schema.get", "ext.lookup", "notes-1.lookup"]
+    );
+    for tool in &before {
+        let shown = offered[0]
+            .iter()
+            .find(|t| t.name == tool.name)
+            .expect("offered");
+        assert_eq!(
+            (&shown.description, &shown.parameters),
+            (&tool.description, &tool.input_schema),
+            "{} is offered as before",
+            tool.name
+        );
+    }
+    {
+        let received = stub.received.lock().unwrap();
+        assert_eq!(received.tools.len(), 1, "one InvokeTool");
+        let call = &received.tools[0];
+        assert_eq!(
+            (call.server.as_str(), call.tool.as_str()),
+            (SERVER, "lookup")
+        );
+        assert_eq!(call.acting.as_ref().unwrap().user_id, USER);
+        assert_eq!(call.credential.as_ref().unwrap().value, MARKER);
+    }
+    let result = conversation
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("the tool's result is in the conversation");
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap(),
+        json!({"content":[{"type":"text","text":"page"}],"isError":false})
+    );
+}
+
+/// An agent its person did not grant the binding to is not offered the
+/// server's tools, and a call of one anyway is refused before any dial:
+/// the gateway receives no InvokeTool, and the model reads that the tool
+/// is not available.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ungranted_agents_run_is_not_offered_the_remote_tool_and_its_call_is_refused_before_any_dial(
+) {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup {
+        agent_tools: vec!["aegis.schema.get", "notes-1.lookup"],
+        ..Setup::gateway(&url)
+    })
+    .await
+    .configured(
+        Some(&gateway_config(&url, Some(&tls.ca_path), &[SERVER])),
+        Some(vault.service.clone()),
+    );
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[GrantTarget::Agent {
+                agent_id: AgentId::new(),
+            }],
+        )
+        .await;
+
+    let (offered, conversation) = run_inner_loop(h, "notes-1.lookup").await;
+    assert_eq!(schema_names(&offered[0]), vec!["aegis.schema.get"]);
+    let received = stub.received.lock().unwrap();
+    assert!(received.tools.is_empty(), "nothing was invoked");
+    assert!(
+        received.lists.iter().all(|l| l.bound_servers.is_empty()),
+        "no credential rode a listing"
+    );
+    let result = conversation
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("the refusal is in the conversation");
+    assert!(
+        result
+            .content
+            .contains("Tool 'notes-1.lookup' is not available. Do not retry this tool."),
+        "{}",
+        result.content
+    );
+}
+
+/// With no `seal_gateway` an agent's run is offered exactly what its
+/// context list offered before the inner loop asked for the run's own list
+/// (ADR-035 R7), each tool with its description and schema.
+#[tokio::test]
+async fn without_a_gateway_an_agents_run_is_offered_what_it_was_offered_before() {
+    let mut setup = Setup::gateway("unused");
+    setup.gateway_url = None;
+    setup.agent_tools = vec!["aegis.schema.get", "fs.read", "notes-1.lookup"];
+    let h = harness(setup).await.configured(None, None);
+    let before = h
+        .service
+        .get_available_tools_for_agent_in_context(&h.tenant, h.agent_id, CONTEXT)
+        .await
+        .unwrap();
+    assert_eq!(names(&before), vec!["aegis.schema.get", "fs.read"]);
+    let (offered, _) = run_inner_loop(h, "aegis.schema.get").await;
+    let as_offered: Vec<(String, String, Value)> = before
+        .iter()
+        .map(|t| {
+            (
+                t.name.clone(),
+                t.description.clone(),
+                t.input_schema.clone(),
+            )
+        })
+        .collect();
+    let mut shown: Vec<(String, String, Value)> = offered[0]
+        .iter()
+        .map(|t| (t.name.clone(), t.description.clone(), t.parameters.clone()))
+        .collect();
+    shown.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected = as_offered;
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(shown, expected);
+}

@@ -313,11 +313,15 @@ impl InnerLoopService {
                 anyhow::bail!("Inner loop exceeded max iterations ({MAX_INNER_LOOP_ITERATIONS})");
             }
 
+            // The run's own list (AEGIS ADR-132 G5, H4): with the remote
+            // servers' tools its person bound and granted this agent; every
+            // other tool as the agent's context list gives it.
             let available_tools = self
                 .tool_invocation_service
-                .get_available_tools_for_agent_in_context(
+                .get_available_tools_for_agent_run(
                     &ctx.tenant_id,
                     ctx.agent_id,
+                    ExecutionId(uuid::Uuid::parse_str(execution_id_str)?),
                     &ctx.security_context_name,
                 )
                 .await
