@@ -19,6 +19,13 @@
 //! fault decides the round `not_met` with the fault as its verdict (D5,
 //! ADR-017's Update of 2026-10-01; U4).
 //!
+//! Running work (U21 to U26): while a bound execution has not ended and is
+//! inside its bound (its time limit plus the reaper's margin), no judge
+//! starts and no round is decided; the call holds, then answers `judging`
+//! with `waiting_on: "execution"`, and the wait is a row of its own. Past
+//! its lifetime, a goal whose round waited is judged once when the wait
+//! ends, and its not_met closes it `expired`.
+//!
 //! What the service needs from the rest of the orchestrator (the bound
 //! executions' records, their pending approvals, and the judge's execution)
 //! comes through [`GoalWorld`], which the tool invocation service implements
@@ -306,7 +313,12 @@ impl GoalService {
         };
         let now = (self.clock)();
         if goal.has_outlived(self.config.lifetime_seconds, now) {
-            self.close(&goal, GoalState::Expired, now).await?;
+            // U25: a goal whose round waited stays open for its one late
+            // verdict, and binds no new work past its lifetime.
+            let evaluations = self.repo.list_evaluations(goal.id).await?;
+            if !round_waited(&evaluations, goal.rounds) {
+                self.close(&goal, GoalState::Expired, now).await?;
+            }
             return Err(GoalError::NotOpen);
         }
         if !goal.is_open() {
@@ -369,7 +381,12 @@ impl GoalService {
         }
 
         let now = (self.clock)();
-        if goal.has_outlived(self.config.lifetime_seconds, now) {
+        // D7, U25: past its lifetime a goal closes expired, unless its
+        // current round waited for its running work: that round is judged
+        // once when the wait ends (and its not_met closes it expired).
+        if goal.has_outlived(self.config.lifetime_seconds, now)
+            && !round_waited(&evaluations, goal.rounds)
+        {
             self.close(&goal, GoalState::Expired, now).await?;
             goal = self.reload(goal_id).await?;
         }
@@ -816,7 +833,9 @@ impl GoalService {
     ) -> Result<Value, GoalError> {
         let outcome = outcome_of(verdict, &self.config);
         let verdict_json = verdict_json(verdict);
-        if outcome == GoalOutcome::NotMet {
+        // U25: past the lifetime no round is granted, so no approval holds
+        // one; the late round's not_met closes the goal expired.
+        if outcome == GoalOutcome::NotMet && !self.is_late_round(goal).await? {
             let bound = self.repo.list_bound(goal.id).await?;
             let pending = world.pending_approvals(goal, &directly_bound(&bound)).await;
             if !pending.is_empty() {
@@ -904,9 +923,12 @@ impl GoalService {
         confidence: f64,
         outcome: GoalOutcome,
     ) -> Result<Value, GoalError> {
+        let late = outcome == GoalOutcome::NotMet && self.is_late_round(goal).await?;
         let (granted, closes) = match outcome {
             GoalOutcome::Met => (false, Some(GoalState::Met)),
             GoalOutcome::CannotBeMet => (false, Some(GoalState::CannotBeMet)),
+            // U25: a round that waited past the lifetime grants nothing.
+            GoalOutcome::NotMet if late => (false, Some(GoalState::Expired)),
             GoalOutcome::NotMet if goal.rounds < self.config.max_continuations => (true, None),
             GoalOutcome::NotMet => (false, Some(GoalState::Exhausted)),
         };
@@ -1100,7 +1122,7 @@ impl GoalService {
     pub async fn close_expired(&self, now: DateTime<Utc>) -> Result<usize, GoalError> {
         let cutoff = now - chrono::Duration::seconds(self.config.lifetime_seconds as i64);
         let mut closed = 0;
-        for goal in self.repo.list_open_created_before(cutoff).await? {
+        for goal in self.repo.list_open_created_before(cutoff, now).await? {
             if self.close(&goal, GoalState::Expired, now).await? {
                 closed += 1;
             }
@@ -1142,6 +1164,16 @@ impl GoalService {
             });
         }
         Ok(closed)
+    }
+
+    /// U25: the goal is past its lifetime and its current round waited for
+    /// its running work, so the round is judged once and grants nothing.
+    async fn is_late_round(&self, goal: &Goal) -> Result<bool, GoalError> {
+        if !goal.has_outlived(self.config.lifetime_seconds, (self.clock)()) {
+            return Ok(false);
+        }
+        let evaluations = self.repo.list_evaluations(goal.id).await?;
+        Ok(round_waited(&evaluations, goal.rounds))
     }
 
     async fn reload(&self, goal_id: GoalId) -> Result<Goal, GoalError> {
@@ -1193,6 +1225,13 @@ fn repeats_the_last_round(goal: &Goal, evaluations: &[GoalEvaluation], digest: &
             && e.stop_reason.is_none()
             && e.input_digest.as_deref() == Some(digest)
     })
+}
+
+/// U25: the round waited for bound work still running (a wait row of that
+/// round, open or ended). Bounded: a wait ends by U23, work binds only to an
+/// open goal inside its lifetime, and rounds stay at most D7's.
+fn round_waited(evaluations: &[GoalEvaluation], round: u32) -> bool {
+    evaluations.iter().any(|e| e.round == round && e.is_wait())
 }
 
 /// The executions bound directly to the goal, whose own pending approvals
@@ -2460,5 +2499,119 @@ mod tests {
         h.evaluate(&world, &goal, None).await;
         let status = h.service.status(&world, &h.caller, goal.id).await.unwrap();
         assert_eq!(status["waits"], json!([]));
+    }
+
+    // ── U25: the lifetime and a wait ──────────────────────────────────────
+
+    /// U25: a goal whose round waits inside its bound is not closed expired
+    /// past its 1,800 s, by an evaluation or by the sweep, and binds no new
+    /// work; when the wait ends after the lifetime the round is judged once,
+    /// and not_met closes it expired with that verdict, granting no round.
+    #[tokio::test]
+    async fn a_goal_waiting_past_its_lifetime_stays_open_and_its_late_not_met_closes_it_expired() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.0, 1.0, 0.9)]);
+        world.set_status(solver, "running");
+        h.evaluate(&world, &goal, None).await;
+
+        h.advance(1_801);
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_waiting_answer(&answer, &goal, 0, &[solver]);
+        assert_eq!(h.service.close_expired(h.now()).await.unwrap(), 0);
+        assert_eq!(h.stored(&goal).await.state, GoalState::Open);
+        let err = h
+            .service
+            .open_goal_for(&h.caller, goal.id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), GOAL_NOT_OPEN, "no new work past the lifetime");
+        assert_eq!(
+            h.stored(&goal).await.state,
+            GoalState::Open,
+            "and not closed"
+        );
+
+        world.set_status(solver, "failed");
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(world.judges_started(), 1, "judged once");
+        assert_eq!(answer["outcome"], "not_met");
+        assert_eq!(answer["state"], "expired");
+        assert_eq!(answer["continue"], false);
+        assert_eq!(answer["verdict"]["score"], 0.0);
+        let stored = h.stored(&goal).await;
+        assert_eq!((stored.state, stored.rounds), (GoalState::Expired, 0));
+    }
+
+    /// U25 with U23: a wait whose bound (the node's 1,800 s plus 600 s) ends
+    /// after the lifetime is judged once on what exists; met closes met; and
+    /// a pending approval past the lifetime grants nothing.
+    #[tokio::test]
+    async fn a_wait_ending_after_the_lifetime_is_judged_once_on_what_exists() {
+        // The bound passes with the row still running: not_met, expired.
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.0, 1.0, 0.9)]);
+        world.set_status(solver, "running");
+        h.evaluate(&world, &goal, None).await;
+        h.advance(2_401);
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(world.judges_started(), 1);
+        assert_eq!(world.last_input()["executions"][0]["status"], "running");
+        assert_eq!(answer["state"], "expired");
+        assert_eq!(h.stored(&goal).await.rounds, 0);
+
+        // The work completes after the lifetime: met closes met.
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.95, 0.9, 0.9)]);
+        world.set_status(solver, "running");
+        h.evaluate(&world, &goal, None).await;
+        h.advance(1_900);
+        world.set_status(solver, "completed");
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(answer["outcome"], "met");
+        assert_eq!(h.stored(&goal).await.state, GoalState::Met);
+
+        // An approval pending when the late round is judged holds nothing:
+        // no round is granted past the lifetime.
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.4, 0.9, 0.9)]);
+        world.set_status(solver, "running");
+        h.evaluate(&world, &goal, None).await;
+        h.advance(1_900);
+        world
+            .pending
+            .lock()
+            .unwrap()
+            .push((solver, "approval-late".to_string()));
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(answer["state"], "expired", "{answer}");
+        assert_eq!(answer["continue"], false);
+        assert!(answer.get("waiting_on").is_none());
+    }
+
+    /// U25: a goal past its lifetime whose current round did not wait closes
+    /// expired as D7 says, even when its earlier round waited.
+    #[tokio::test]
+    async fn a_goal_past_its_lifetime_whose_round_did_not_wait_closes_expired() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.0, 1.0, 0.9)]);
+        world.set_status(solver, "running");
+        h.evaluate(&world, &goal, None).await;
+        world.set_status(solver, "failed");
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(answer["continue"], true, "round 0 waited, then was judged");
+        h.advance(1_801);
+        let answer = h.evaluate(&world, &goal, Some(1)).await;
+        assert_eq!(answer["state"], "expired");
+        assert_eq!(world.judges_started(), 1, "round 1 is not judged");
     }
 }

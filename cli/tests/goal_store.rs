@@ -424,10 +424,62 @@ async fn the_sweep_finds_only_goals_open_past_the_cutoff() {
         repo.insert_goal(g).await.unwrap();
     }
     let found = repo
-        .list_open_created_before(now() - Duration::seconds(1800))
+        .list_open_created_before(now() - Duration::seconds(1800), now())
         .await
         .unwrap();
     assert_eq!(found.iter().map(|g| g.id).collect::<Vec<_>>(), vec![old.id]);
+    db.remove().await;
+}
+
+/// U25: the sweep skips a goal open past its lifetime whose current round
+/// holds an open wait with its `wait_until` ahead; a wait already ended, an
+/// open wait past its `wait_until`, or a wait of an earlier round leaves the
+/// goal to the sweep as D7 says.
+#[tokio::test]
+async fn the_sweep_skips_a_goal_whose_round_waits_inside_its_bound() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = PostgresGoalRepository::new(db.pool.clone());
+    let at = now();
+    let mut goals = Vec::new();
+    for client_ref in ["waiting", "wait-ended", "wait-past-bound", "earlier-round"] {
+        let mut g = goal(client_ref);
+        g.created_at = at - Duration::seconds(1_801);
+        repo.insert_goal(&g).await.unwrap();
+        goals.push(g);
+    }
+    let [waiting, ended, past, earlier] = &goals[..] else {
+        unreachable!()
+    };
+    repo.insert_evaluation(&wait(waiting.id, 0, at + Duration::seconds(600)))
+        .await
+        .unwrap();
+    let mut done = wait(ended.id, 0, at + Duration::seconds(600));
+    done.decided_at = Some(at);
+    repo.insert_evaluation(&done).await.unwrap();
+    repo.insert_evaluation(&wait(past.id, 0, at - Duration::seconds(1)))
+        .await
+        .unwrap();
+    repo.insert_evaluation(&wait(earlier.id, 0, at + Duration::seconds(600)))
+        .await
+        .unwrap();
+    assert!(repo.grant_round(earlier.id, 0).await.unwrap());
+
+    let found: Vec<GoalId> = repo
+        .list_open_created_before(at - Duration::seconds(1_800), at)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|g| g.id)
+        .collect();
+    assert!(
+        !found.contains(&waiting.id),
+        "an open wait ahead is skipped"
+    );
+    for g in [ended, past, earlier] {
+        assert!(found.contains(&g.id), "{} is swept", g.client_ref);
+    }
     db.remove().await;
 }
 

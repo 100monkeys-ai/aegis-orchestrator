@@ -605,10 +605,13 @@ pub trait GoalRepository: Send + Sync {
         goal_id: GoalId,
     ) -> Result<Vec<GoalEvaluation>, RepositoryError>;
 
-    /// The open goals created before `cutoff` (the expiry sweep, D7).
+    /// The open goals created before `cutoff` (the expiry sweep, D7), less
+    /// those whose current round holds an open wait whose `wait_until` is
+    /// after `now` (U25).
     async fn list_open_created_before(
         &self,
         cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<Vec<Goal>, RepositoryError>;
 }
 

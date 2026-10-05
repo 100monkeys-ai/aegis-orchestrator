@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::domain::execution::ExecutionId;
 use crate::domain::goal::{
     BoundExecution, BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome,
-    GoalRepository, GoalState, StopReason,
+    GoalRepository, GoalState, StopReason, WAITING_ON_EXECUTION,
 };
 use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
@@ -315,12 +315,21 @@ impl GoalRepository for PostgresGoalRepository {
     async fn list_open_created_before(
         &self,
         cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<Vec<Goal>, RepositoryError> {
+        // U25: a goal whose current round holds an open wait (no judge,
+        // waiting_on kind `execution`, not ended) with its wait_until after
+        // `now` is not swept.
         let rows = sqlx::query(&format!(
-            "SELECT {GOAL_COLUMNS} FROM goals WHERE state = 'open' AND created_at <= $1 \
-             ORDER BY created_at"
+            "SELECT {GOAL_COLUMNS} FROM goals g WHERE g.state = 'open' AND g.created_at <= $1 \
+             AND NOT EXISTS (SELECT 1 FROM goal_evaluations e WHERE e.goal_id = g.id \
+             AND e.round = g.rounds AND e.judge_execution_id IS NULL \
+             AND e.waiting_on->>'kind' = '{WAITING_ON_EXECUTION}' AND e.decided_at IS NULL \
+             AND (e.waiting_on->>'wait_until')::timestamptz > $2) \
+             ORDER BY g.created_at"
         ))
         .bind(cutoff)
+        .bind(now)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(hydrate_goal).collect()
@@ -499,13 +508,23 @@ impl GoalRepository for InMemoryGoalRepository {
     async fn list_open_created_before(
         &self,
         cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<Vec<Goal>, RepositoryError> {
+        let evaluations = self.evaluations.read().await;
+        let waits_ahead = |g: &Goal| {
+            evaluations.iter().any(|e| {
+                e.goal_id == g.id
+                    && e.round == g.rounds
+                    && e.is_open_wait()
+                    && e.wait_until().is_some_and(|until| until > now)
+            })
+        };
         let mut found: Vec<Goal> = self
             .goals
             .read()
             .await
             .values()
-            .filter(|g| g.is_open() && g.created_at <= cutoff)
+            .filter(|g| g.is_open() && g.created_at <= cutoff && !waits_ahead(g))
             .cloned()
             .collect();
         found.sort_by_key(|g| g.created_at);
