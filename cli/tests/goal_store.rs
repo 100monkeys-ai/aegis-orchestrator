@@ -16,12 +16,14 @@
 //! migration 039 run again changes nothing; and migration 040 (U16, U17),
 //! applied to a database holding goals and evaluations from before it,
 //! leaves them reading as they did, stores the `stopped` state and a stop
-//! reason, decides a stopped round once, and run again changes nothing.
+//! reason, decides a stopped round once, and run again changes nothing; and
+//! a wait for running work (U24) is stored in those columns with no
+//! migration and decides no round.
 
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::goal::{
-    BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome, GoalRepository, GoalState,
-    StopReason,
+    wait_time_text, BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId, GoalOutcome,
+    GoalRepository, GoalState, StopReason, WAITING_ON_EXECUTION,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_goal::PostgresGoalRepository;
@@ -166,6 +168,58 @@ fn decided(mut e: GoalEvaluation, outcome: GoalOutcome, r#continue: bool) -> Goa
     e.answer = Some(json!({"continue": r#continue}));
     e.decided_at = Some(now());
     e
+}
+
+/// A wait for bound work still running (U24): no judge, no verdict, no
+/// outcome, `waiting_on` naming the executions and the wait's bound.
+fn wait(goal_id: GoalId, round: u32, wait_until: chrono::DateTime<Utc>) -> GoalEvaluation {
+    GoalEvaluation {
+        judge_execution_id: None,
+        waiting_on: Some(json!({
+            "kind": WAITING_ON_EXECUTION,
+            "execution_ids": [ExecutionId::new().to_string()],
+            "wait_until": wait_time_text(wait_until),
+        })),
+        input_digest: None,
+        ..evaluation(goal_id, round, 1)
+    }
+}
+
+/// U24 with no migration: a wait row is stored and read back in 039's and
+/// 040's columns; it decides no round, so the round's verdict is stored
+/// beside it under `uq_goal_evaluations_decided_round`; its end is written
+/// by `finish_evaluation`.
+#[tokio::test]
+async fn a_wait_row_round_trips_and_decides_no_round() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = PostgresGoalRepository::new(db.pool.clone());
+    let g = goal("conversation-wait");
+    repo.insert_goal(&g).await.unwrap();
+
+    let open = wait(g.id, 0, now() + Duration::seconds(2_400));
+    repo.insert_evaluation(&open).await.unwrap();
+    let stored = repo.list_evaluations(g.id).await.unwrap();
+    assert_eq!(stored, vec![open.clone()]);
+    assert!(stored[0].is_open_wait());
+    assert!(!stored[0].is_running() && !stored[0].is_fault() && !stored[0].decides_round());
+
+    let mut ended = open.clone();
+    ended.decided_at = Some(now());
+    assert!(repo.finish_evaluation(&ended).await.unwrap());
+    let judged = decided(evaluation(g.id, 0, 1), GoalOutcome::NotMet, true);
+    repo.insert_evaluation(&judged).await.unwrap();
+    let stored = repo.list_evaluations(g.id).await.unwrap();
+    let waits: Vec<_> = stored.iter().filter(|e| e.is_wait()).collect();
+    assert_eq!(waits, vec![&ended]);
+    assert!(!waits[0].is_fault(), "an ended wait is no judge fault");
+    assert_eq!(
+        stored.iter().filter(|e| e.decides_round()).count(),
+        1,
+        "the round's verdict decides it, the wait does not"
+    );
+    db.remove().await;
 }
 
 #[tokio::test]

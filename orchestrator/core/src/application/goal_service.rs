@@ -1009,8 +1009,9 @@ impl GoalService {
 
     // ── aegis.goal.status (D2, U8) ─────────────────────────────────────────
 
-    /// The goal, its bound executions and every verdict, read-only. Another
-    /// user's goal is answered as not found.
+    /// The goal, its bound executions, every verdict and every wait for
+    /// running work (U24), read-only. Another user's goal is answered as not
+    /// found.
     pub async fn status(
         &self,
         world: &dyn GoalWorld,
@@ -1034,10 +1035,25 @@ impl GoalService {
                 }));
             }
         }
-        let verdicts: Vec<Value> = self
-            .repo
-            .list_evaluations(goal.id)
-            .await?
+        let evaluations = self.repo.list_evaluations(goal.id).await?;
+        // U24: each wait for bound work still running, beside the verdicts.
+        let waits: Vec<Value> = evaluations
+            .iter()
+            .filter(|e| e.is_wait())
+            .map(|e| {
+                let waiting_on = e.waiting_on.as_ref();
+                json!({
+                    "round": e.round,
+                    "execution_ids": waiting_on
+                        .and_then(|w| w.get("execution_ids").cloned())
+                        .unwrap_or_else(|| json!([])),
+                    "began_at": wait_time_text(e.created_at),
+                    "ended_at": e.decided_at.map(wait_time_text),
+                    "wait_until": e.wait_until().map(wait_time_text),
+                })
+            })
+            .collect();
+        let verdicts: Vec<Value> = evaluations
             .into_iter()
             .filter_map(|e| {
                 let verdict = e.verdict?;
@@ -1074,6 +1090,7 @@ impl GoalService {
             "closed_at": goal.closed_at,
             "executions": executions,
             "verdicts": verdicts,
+            "waits": waits,
         }))
     }
 
@@ -2396,5 +2413,52 @@ mod tests {
         let waits = h.waits(&goal).await;
         assert_eq!(waits.len(), 1, "the wait is recorded");
         assert!(waits[0].decided_at.is_some(), "and ended");
+    }
+
+    /// U24: aegis.goal.status lists each wait as `waits: [{round,
+    /// execution_ids, began_at, ended_at, wait_until}]` beside `verdicts`,
+    /// which keep their form and never list a wait. `began_at` is the
+    /// answer's `waiting_since`; `ended_at` is null while it waits.
+    #[tokio::test]
+    async fn status_lists_each_wait_beside_the_verdicts() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let solver = h.bound(&goal).await[0];
+        let world = World::scripted(vec![says(0.4, 0.9, 0.9)]);
+        world.set_status(solver, "running");
+        let waiting = h.evaluate(&world, &goal, None).await;
+
+        let status = h.service.status(&world, &h.caller, goal.id).await.unwrap();
+        assert_eq!(status["verdicts"], json!([]), "a wait is no verdict");
+        assert_eq!(
+            status["waits"],
+            json!([{
+                "round": 0,
+                "execution_ids": [solver.to_string()],
+                "began_at": waiting["waiting_since"],
+                "ended_at": Value::Null,
+                "wait_until": waiting["wait_until"],
+            }])
+        );
+
+        world.set_status(solver, "completed");
+        h.evaluate(&world, &goal, Some(0)).await;
+        let status = h.service.status(&world, &h.caller, goal.id).await.unwrap();
+        let waits = status["waits"].as_array().unwrap();
+        assert_eq!(waits.len(), 1);
+        let ended = waits[0]["ended_at"].as_str().unwrap();
+        assert!(DateTime::parse_from_rfc3339(ended).is_ok(), "{ended}");
+        let verdicts = status["verdicts"].as_array().unwrap();
+        assert_eq!(verdicts.len(), 1, "the round's one verdict");
+        assert_eq!(verdicts[0]["outcome"], "not_met");
+        assert_eq!(verdicts[0]["waiting_on"], Value::Null);
+
+        // A goal that never waited lists no wait.
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![says(0.4, 0.9, 0.9)]);
+        h.evaluate(&world, &goal, None).await;
+        let status = h.service.status(&world, &h.caller, goal.id).await.unwrap();
+        assert_eq!(status["waits"], json!([]));
     }
 }
