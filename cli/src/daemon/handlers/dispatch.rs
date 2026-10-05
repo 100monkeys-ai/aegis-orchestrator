@@ -214,9 +214,8 @@ pub(crate) async fn dispatch_gateway_handler(
             // can react) and a structured `LlmCallFailed` execution event
             // (so parent agents reading the execution stream see the
             // upstream failure class without parsing strings).
-            if let Some(llm_err) =
-                e.downcast_ref::<aegis_orchestrator_core::domain::llm::LLMError>()
-            {
+            if let Some(failure) = llm_call_failure_parts(&e) {
+                let llm_err = failure.error;
                 if agent_id.0 != Uuid::nil() {
                     if let (Some(exec_id), Some(model_alias)) = (exec_id_opt, model_opt.as_ref()) {
                         let error_class =
@@ -231,12 +230,12 @@ pub(crate) async fn dispatch_gateway_handler(
                             model: model_alias.clone(),
                             error_class,
                             message: llm_err.to_string(),
-                            // The registry owns retry/fallback bookkeeping and
-                            // does not surface counts back here. Encode "unknown"
-                            // as 0 — downstream consumers should treat 0 as N/A.
-                            attempts: 0,
-                            elapsed_ms: 0,
-                            fallback_attempted: false,
+                            // The registry's own report where it gave one
+                            // (AEGIS ADR-130, Update of 2026-10-05, D10);
+                            // otherwise 0, which consumers treat as N/A.
+                            attempts: failure.attempts,
+                            elapsed_ms: failure.elapsed_ms,
+                            fallback_attempted: failure.fallback_attempted,
                             timestamp: chrono::Utc::now(),
                         };
                         state.event_bus.publish_execution_event(event);
@@ -247,7 +246,7 @@ pub(crate) async fn dispatch_gateway_handler(
                 return (
                     status,
                     Json(serde_json::json!({
-                        "error": format!("{tag}: {llm_err}")
+                        "error": format!("{tag}: {}", failure.sentence)
                     })),
                 );
             }
@@ -262,6 +261,39 @@ pub(crate) async fn dispatch_gateway_handler(
     }
     .instrument(span)
     .await
+}
+
+/// What the gateway reports of a failed model call: the typed error (its raw
+/// text goes into the event), the registry's attempts, elapsed time and
+/// whether the fallback was sent, and the sentence the client receives
+/// (AEGIS ADR-130, Update of 2026-10-05, D10).
+struct LlmCallFailureParts<'a> {
+    error: &'a aegis_orchestrator_core::domain::llm::LLMError,
+    attempts: u32,
+    elapsed_ms: u64,
+    fallback_attempted: bool,
+    sentence: String,
+}
+
+fn llm_call_failure_parts(e: &anyhow::Error) -> Option<LlmCallFailureParts<'_>> {
+    use aegis_orchestrator_core::infrastructure::llm::registry::ModelCallFailure;
+    if let Some(f) = e.downcast_ref::<ModelCallFailure>() {
+        return Some(LlmCallFailureParts {
+            error: &f.error,
+            attempts: f.attempts(),
+            elapsed_ms: f.elapsed_ms(),
+            fallback_attempted: f.fallback_attempted(),
+            sentence: f.client_sentence(),
+        });
+    }
+    e.downcast_ref::<aegis_orchestrator_core::domain::llm::LLMError>()
+        .map(|error| LlmCallFailureParts {
+            error,
+            attempts: 0,
+            elapsed_ms: 0,
+            fallback_attempted: false,
+            sentence: error.to_string(),
+        })
 }
 
 /// Map an `LLMError` variant to a precise HTTP status + a short tag suitable
@@ -418,5 +450,63 @@ mod tests {
         let (status, tag) = llm_error_to_status(&LLMError::Provider("x".into()));
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(tag, "upstream_provider");
+    }
+
+    /// The inner loop's failure reaches the gateway as a `ModelCallFailure`:
+    /// its report goes into the event and its one sentence to the client,
+    /// the raw error into the event's message (AEGIS ADR-130, Update of
+    /// 2026-10-05, D10).
+    #[test]
+    fn llm_call_failure_parts_carry_the_registrys_report_and_sentence() {
+        use aegis_orchestrator_core::domain::llm::LLMError;
+        use aegis_orchestrator_core::infrastructure::llm::registry::{
+            CallReport, FallbackOutcome, FallbackReport, ModelCallFailure, PrimaryFailure,
+        };
+        let failure = ModelCallFailure {
+            error: LLMError::Network("raw detail".to_string()),
+            report: Some(Box::new(CallReport {
+                alias: "smart".to_string(),
+                model: "m-smart".to_string(),
+                attempts: 2,
+                elapsed_ms: 120_000,
+                primary: PrimaryFailure::Silent { secs: 42 },
+                fallback: Some(FallbackReport {
+                    alias: "coder".to_string(),
+                    model: "m-coder".to_string(),
+                    outcome: FallbackOutcome::Silent { secs: 78 },
+                }),
+            })),
+        };
+        let e = anyhow::Error::new(failure);
+        let parts = llm_call_failure_parts(&e).expect("a model call failure");
+        assert_eq!(parts.attempts, 2);
+        assert_eq!(parts.elapsed_ms, 120_000);
+        assert!(parts.fallback_attempted);
+        assert_eq!(parts.error.to_string(), "Network error: raw detail");
+        assert_eq!(
+            parts.sentence,
+            "The model on alias 'smart' (m-smart) gave no answer within 42 s; its fallback 'coder' (m-coder) was tried and gave no answer within 78 s."
+        );
+    }
+
+    /// With no fallback configured the inner loop's failure carries no
+    /// report: the event and the client's error read as before.
+    #[test]
+    fn llm_call_failure_parts_without_a_report_read_as_before() {
+        use aegis_orchestrator_core::domain::llm::LLMError;
+        use aegis_orchestrator_core::infrastructure::llm::registry::ModelCallFailure;
+        let e = anyhow::Error::new(ModelCallFailure {
+            error: LLMError::Network("model call on alias 'smart' gave no answer within the agent's llm_timeout_seconds (120 s)".to_string()),
+            report: None,
+        });
+        let parts = llm_call_failure_parts(&e).expect("a model call failure");
+        assert_eq!(
+            (parts.attempts, parts.elapsed_ms, parts.fallback_attempted),
+            (0, 0, false)
+        );
+        assert_eq!(
+            parts.sentence,
+            "Network error: model call on alias 'smart' gave no answer within the agent's llm_timeout_seconds (120 s)"
+        );
     }
 }

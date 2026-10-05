@@ -1058,10 +1058,10 @@ impl InnerLoopService {
 
 /// One model call of the inner loop, bounded by the agent's
 /// `llm_timeout_seconds` (manifest spec v1: the bound on one LLM call, not on
-/// the iteration, whose bound the supervisor enforces). A call that has not
-/// answered by then is ended with an error naming the field and the seconds,
-/// typed as a network error so the gateway answers 502 as for the registry's
-/// own budget.
+/// the iteration, whose bound the supervisor enforces). The registry is given
+/// the bound, so an alias's fallback is tried inside it (AEGIS ADR-130,
+/// Update of 2026-10-05, D2a); a call that has not answered by then is ended
+/// with an error naming the field and the seconds.
 async fn generate_within_llm_timeout(
     registry: &ProviderRegistry,
     model_alias: &str,
@@ -1069,19 +1069,17 @@ async fn generate_within_llm_timeout(
     schemas: &[ToolSchema],
     options: &GenerationOptions,
     llm_timeout_seconds: u64,
-) -> Result<crate::domain::llm::ChatResponse, crate::domain::llm::LLMError> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(llm_timeout_seconds),
-        registry.generate_chat(model_alias, messages, schemas, options),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_elapsed) => Err(crate::domain::llm::LLMError::Network(format!(
-            "model call on alias '{model_alias}' gave no answer within the agent's \
-             llm_timeout_seconds ({llm_timeout_seconds} s)"
-        ))),
-    }
+) -> Result<crate::domain::llm::ChatResponse, crate::infrastructure::llm::registry::ModelCallFailure>
+{
+    registry
+        .generate_chat_within(
+            model_alias,
+            messages,
+            schemas,
+            options,
+            std::time::Duration::from_secs(llm_timeout_seconds),
+        )
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1581,7 +1579,7 @@ mod tests {
             "the error must name llm_timeout_seconds and the seconds: {text}"
         );
         assert!(
-            matches!(err, crate::domain::llm::LLMError::Network(_)),
+            matches!(err.error, crate::domain::llm::LLMError::Network(_)),
             "{err:?}"
         );
     }

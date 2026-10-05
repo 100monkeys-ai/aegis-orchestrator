@@ -56,6 +56,11 @@ struct AliasFallback {
     alias: String,
     model: String,
     adapter: Arc<dyn LLMProvider>,
+    /// The named alias's window for a request, in bytes: its entry's
+    /// `context_window - max_output_tokens` (8,192 where it sets none), the
+    /// measure of ADR-131 U16a. A larger request is not sent to it (ADR-130,
+    /// Update of 2026-10-05, D2b).
+    window_bytes: u64,
 }
 
 /// Registry for managing LLM providers and resolving model aliases.
@@ -140,13 +145,226 @@ fn provider_timeout_for_alias(e: &LLMError, alias: &str) -> Option<LLMError> {
 /// The primary's time-limit error, with the failure of the fallback tried
 /// after it, so the error names both models.
 fn with_fallback_failure(timeout: LLMError, fallback_model: &str, fallback: &LLMError) -> LLMError {
-    LLMError::Provider(format!(
-        "{}; the fallback model '{fallback_model}' was tried once and failed: {fallback}",
-        match timeout {
-            LLMError::Provider(msg) => msg,
-            other => other.to_string(),
+    with_fallback_note(
+        timeout,
+        &format!("the fallback model '{fallback_model}' was tried once and failed: {fallback}"),
+    )
+}
+
+/// The primary's error with a sentence about its fallback appended, keeping
+/// the primary's class where it is a network or provider error.
+fn with_fallback_note(primary: LLMError, note: &str) -> LLMError {
+    match primary {
+        LLMError::Network(msg) => LLMError::Network(format!("{msg}; {note}")),
+        LLMError::Provider(msg) => LLMError::Provider(format!("{msg}; {note}")),
+        other => LLMError::Provider(format!("{other}; {note}")),
+    }
+}
+
+/// The time ADR-130 measured the fallback model to need: gpt-oss-20b
+/// (`coder`) answered the request `smart` lost in 34.64 to 77.45 s; 78 s is
+/// the longest, rounded up (AEGIS ADR-130, Update of 2026-10-05, D2a).
+const FALLBACK_RESERVE: std::time::Duration = std::time::Duration::from_secs(78);
+
+/// The bound on the primary's attempts, together, when a call on an alias
+/// that names a `fallback_alias` is bounded by the agent's
+/// `llm_timeout_seconds` (AEGIS ADR-130, Update of 2026-10-05, D2a): the
+/// fallback keeps [`FALLBACK_RESERVE`]; where the timeout is no longer than
+/// that, each takes half (an assumption, to be measured).
+pub(crate) fn primary_bound(llm_timeout: std::time::Duration) -> std::time::Duration {
+    if llm_timeout > FALLBACK_RESERVE {
+        llm_timeout - FALLBACK_RESERVE
+    } else {
+        llm_timeout / 2
+    }
+}
+
+/// The UTF-8 byte length of a chat request's messages and tool definitions
+/// as JSON, the measure ADR-131 U16a sets against an alias's window.
+fn chat_request_bytes(messages: &[ChatMessage], tools: &[ToolSchema]) -> u64 {
+    let bytes = |v: Result<Vec<u8>, serde_json::Error>| v.map(|b| b.len() as u64).unwrap_or(0);
+    bytes(serde_json::to_vec(messages)) + bytes(serde_json::to_vec(tools))
+}
+
+/// How the primary model of a reported call failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrimaryFailure {
+    /// No answer within the primary's share of the agent's timeout.
+    Silent { secs: u64 },
+    /// Ended by the provider at its time limit (Workers AI 408, code 3046).
+    TimeLimit,
+    /// Any other error, which never reaches the fallback alias (ADR-130 D2).
+    Error,
+}
+
+/// What became of the fallback alias on a failed call.
+#[derive(Debug)]
+pub enum FallbackOutcome {
+    /// Not sent: the request is larger than the fallback's window
+    /// (ADR-130, Update of 2026-10-05, D2b).
+    Skipped {
+        request_bytes: u64,
+        limit_bytes: u64,
+    },
+    /// No answer within the time left of the agent's timeout.
+    Silent { secs: u64 },
+    /// Sent once and failed with this error.
+    Failed(LLMError),
+}
+
+/// The fallback alias of a failed call and its outcome.
+#[derive(Debug)]
+pub struct FallbackReport {
+    pub alias: String,
+    pub model: String,
+    pub outcome: FallbackOutcome,
+}
+
+/// What the registry did on a failed call it was asked to report on.
+#[derive(Debug)]
+pub struct CallReport {
+    pub alias: String,
+    pub model: String,
+    /// Requests sent, to the primary and to the fallback together.
+    pub attempts: u32,
+    pub elapsed_ms: u64,
+    pub primary: PrimaryFailure,
+    pub fallback: Option<FallbackReport>,
+}
+
+/// A failed model call bounded by the agent's `llm_timeout_seconds`: the
+/// error, and where the alias names a fallback, the registry's report of it
+/// (ADR-130, Update of 2026-10-05, D10). With no report the call took
+/// today's path and its attempts are not known here.
+#[derive(Debug)]
+pub struct ModelCallFailure {
+    pub error: LLMError,
+    pub report: Option<Box<CallReport>>,
+}
+
+impl std::fmt::Display for ModelCallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ModelCallFailure {}
+
+/// The failure of a fallback in plain words, without the provider's detail.
+fn plain_failure(e: &LLMError) -> &'static str {
+    match e {
+        LLMError::Network(_) => "could not be reached or gave no answer",
+        LLMError::Authentication(_) => "refused the platform's credentials",
+        LLMError::RateLimit => "was over its rate limit",
+        LLMError::ModelNotFound(_) => "is not available",
+        LLMError::Provider(_) => "returned an error",
+        LLMError::InvalidInput(_) => "refused the request as sent",
+        LLMError::ServiceUnavailable(_) => "was unavailable",
+    }
+}
+
+impl ModelCallFailure {
+    fn unreported(error: LLMError) -> Self {
+        Self {
+            error,
+            report: None,
         }
+    }
+
+    /// Requests the registry sent; 0 when it did not report.
+    pub fn attempts(&self) -> u32 {
+        self.report.as_ref().map_or(0, |r| r.attempts)
+    }
+
+    /// Milliseconds the call took; 0 when the registry did not report.
+    pub fn elapsed_ms(&self) -> u64 {
+        self.report.as_ref().map_or(0, |r| r.elapsed_ms)
+    }
+
+    /// True only when a request was sent to the fallback alias.
+    pub fn fallback_attempted(&self) -> bool {
+        matches!(
+            self.report.as_ref().and_then(|r| r.fallback.as_ref()),
+            Some(FallbackReport {
+                outcome: FallbackOutcome::Silent { .. } | FallbackOutcome::Failed(_),
+                ..
+            })
+        )
+    }
+
+    /// The one sentence a person reads when the fallback was in play: which
+    /// model failed and how, and what became of the fallback. Otherwise the
+    /// error as it reads today.
+    pub fn client_sentence(&self) -> String {
+        let Some(report) = &self.report else {
+            return self.error.to_string();
+        };
+        let Some(fallback) = &report.fallback else {
+            return self.error.to_string();
+        };
+        let primary = match report.primary {
+            PrimaryFailure::Silent { secs } => format!("gave no answer within {secs} s"),
+            PrimaryFailure::TimeLimit => "was ended by the provider at its time limit".to_string(),
+            PrimaryFailure::Error => "failed".to_string(),
+        };
+        let outcome = match &fallback.outcome {
+            FallbackOutcome::Skipped {
+                request_bytes,
+                limit_bytes,
+            } => format!(
+                "was not tried: the request is {request_bytes} bytes and its window holds {limit_bytes}"
+            ),
+            FallbackOutcome::Silent { secs } => {
+                format!("was tried and gave no answer within {secs} s")
+            }
+            FallbackOutcome::Failed(e) => format!("was tried and {}", plain_failure(e)),
+        };
+        format!(
+            "The model on alias '{}' ({}) {primary}; its fallback '{}' ({}) {outcome}.",
+            report.alias, report.model, fallback.alias, fallback.model
+        )
+    }
+}
+
+/// The reason a request of `request_bytes` is not sent to `fallback`, when
+/// its window cannot hold it (ADR-130, Update of 2026-10-05, D2b). The
+/// request is never cut to fit.
+fn fallback_window_refusal(
+    alias: &str,
+    fallback: &AliasFallback,
+    request_bytes: u64,
+) -> Option<String> {
+    if request_bytes <= fallback.window_bytes {
+        return None;
+    }
+    warn!(
+        "Fallback alias skipped, request larger than its window: alias='{}', fallback_alias='{}', request_bytes={}, window_bytes={}",
+        alias, fallback.alias, request_bytes, fallback.window_bytes
+    );
+    Some(format!(
+        "the fallback model '{}' was not sent the request: it is {request_bytes} bytes and the window of alias '{}' holds {} (context_window - max_output_tokens)",
+        fallback.model, fallback.alias, fallback.window_bytes
     ))
+}
+
+/// The error of a call the agent's `llm_timeout_seconds` ended.
+fn llm_timeout_error(alias: &str, llm_timeout: std::time::Duration) -> LLMError {
+    LLMError::Network(format!(
+        "model call on alias '{alias}' gave no answer within the agent's \
+         llm_timeout_seconds ({} s)",
+        llm_timeout.as_secs()
+    ))
+}
+
+/// How the primary's attempts of a chat call ended.
+enum PrimaryEnd {
+    Answer(ChatResponse),
+    /// A non-retryable error: returned at once, no fallback.
+    NonRetryable(LLMError),
+    /// The provider's time limit, with the alias put in.
+    TimeLimit(LLMError),
+    /// The last failed retry of another retryable error.
+    Exhausted(LLMError),
 }
 
 fn is_non_retryable(e: &LLMError) -> bool {
@@ -279,6 +497,8 @@ impl ProviderRegistry {
         let mut alias_temperatures: HashMap<String, f32> = HashMap::new();
         // alias → its winning entry's `fallback_alias`, for aliases whose adapter built.
         let mut fallback_alias_names: Vec<(String, String)> = Vec::new();
+        // alias → its winning entry's window for a request in bytes (ADR-131 U16a).
+        let mut alias_window_bytes: HashMap<String, u64> = HashMap::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -293,6 +513,12 @@ impl ProviderRegistry {
                         match Self::create_adapter(provider_config, winner_model) {
                             Ok(adapter) => {
                                 alias_map.insert(alias.clone(), (winner_model.clone(), adapter));
+                                alias_window_bytes.insert(
+                                    alias.clone(),
+                                    u64::from(model_config.context_window).saturating_sub(
+                                        u64::from(model_config.max_output_tokens.unwrap_or(8192)),
+                                    ),
+                                );
                                 raw_api_keys.insert(alias.clone(), provider_config.api_key.clone());
                                 if let Some(max_tokens) = model_config.max_output_tokens {
                                     info!(
@@ -339,6 +565,7 @@ impl ProviderRegistry {
             alias_fallbacks.insert(
                 alias,
                 AliasFallback {
+                    window_bytes: alias_window_bytes.get(&fallback).copied().unwrap_or(0),
                     alias: fallback,
                     model: model.clone(),
                     adapter: adapter.clone(),
@@ -505,12 +732,33 @@ impl ProviderRegistry {
     /// The request sent once to the alias's own fallback alias after the
     /// provider's time limit on its model, with the named alias's options.
     /// Its answer is returned; its failure is returned with the time limit,
-    /// naming both models.
+    /// naming both models. A request larger than the fallback's window is not
+    /// sent (ADR-130, Update of 2026-10-05, D2b).
     async fn chat_on_fallback_alias(
         &self,
         alias: &str,
         fallback: &AliasFallback,
         timeout: LLMError,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        if let Some(reason) =
+            fallback_window_refusal(alias, fallback, chat_request_bytes(messages, tools))
+        {
+            return Err(with_fallback_note(timeout, &reason));
+        }
+        self.send_chat_to_fallback_alias(alias, fallback, messages, tools, options)
+            .await
+            .map_err(|fe| with_fallback_failure(timeout, &fallback.model, &fe))
+    }
+
+    /// One request to the fallback alias with its own options, bounded by
+    /// `llm_attempt_timeout_secs`; an empty generation is a fault.
+    async fn send_chat_to_fallback_alias(
+        &self,
+        alias: &str,
+        fallback: &AliasFallback,
         messages: &[ChatMessage],
         tools: &[ToolSchema],
         options: &GenerationOptions,
@@ -530,13 +778,12 @@ impl ProviderRegistry {
                 .generate_chat(messages, tools, &fallback_options),
         )
         .await
-        .and_then(
-            |r| match empty_generation_fault(&r, &fallback.alias, &fallback.model, 1, 1) {
+        .and_then(|r| {
+            match empty_generation_fault(&r, &fallback.alias, &fallback.model, 1, 1) {
                 Some(fault) => Err(fault),
                 None => Ok(r),
-            },
-        )
-        .map_err(|fe| with_fallback_failure(timeout, &fallback.model, &fe))
+            }
+        })
     }
 
     /// The single-prompt form of [`Self::chat_on_fallback_alias`].
@@ -548,6 +795,9 @@ impl ProviderRegistry {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<GenerationResponse, LLMError> {
+        if let Some(reason) = fallback_window_refusal(alias, fallback, prompt.len() as u64) {
+            return Err(with_fallback_note(timeout, &reason));
+        }
         info!(
             "Trying fallback alias: alias='{}', fallback_alias='{}', model='{}'",
             alias, fallback.alias, fallback.model
@@ -562,6 +812,113 @@ impl ProviderRegistry {
         )
         .await
         .map_err(|fe| with_fallback_failure(timeout, &fallback.model, &fe))
+    }
+
+    /// The primary model's attempts of a chat call: retries with backoff,
+    /// each attempt bounded by `llm_attempt_timeout_secs`, ended at once by
+    /// a non-retryable error or the provider's time limit. `sent` counts the
+    /// requests sent.
+    #[allow(clippy::too_many_arguments)]
+    async fn primary_attempts(
+        &self,
+        alias: &str,
+        model_name: &str,
+        provider: &Arc<dyn LLMProvider>,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        effective_options: &GenerationOptions,
+        sent: &std::sync::atomic::AtomicU32,
+    ) -> PrimaryEnd {
+        let mut last_error: Option<LLMError> = None;
+        for attempt in 0..self.max_retries {
+            sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let outcome = self
+                .bounded_attempt(
+                    alias,
+                    model_name,
+                    attempt + 1,
+                    self.max_retries,
+                    provider.generate_chat(messages, tools, effective_options),
+                )
+                .await
+                .and_then(|response| {
+                    match empty_generation_fault(
+                        &response,
+                        alias,
+                        model_name,
+                        attempt + 1,
+                        self.max_retries,
+                    ) {
+                        Some(fault) => Err(fault),
+                        None => Ok(response),
+                    }
+                });
+            match outcome {
+                Ok(response) => {
+                    info!(
+                        "generate_chat successful: alias='{}', model='{}', attempt={}",
+                        alias,
+                        model_name,
+                        attempt + 1
+                    );
+                    return PrimaryEnd::Answer(response);
+                }
+                Err(e) => {
+                    warn!(
+                        "generate_chat failed: alias='{}', attempt={}/{}: {:?}",
+                        alias,
+                        attempt + 1,
+                        self.max_retries,
+                        e
+                    );
+
+                    if let Some(timeout) = provider_timeout_for_alias(&e, alias) {
+                        warn!(
+                            "LLM provider time limit; not sent again to this model: alias='{}', model='{}', attempt={}/{}",
+                            alias,
+                            model_name,
+                            attempt + 1,
+                            self.max_retries
+                        );
+                        return PrimaryEnd::TimeLimit(timeout);
+                    }
+
+                    // Short-circuit on deterministic upstream rejections — retrying with
+                    // the same credentials (or with the fallback that shares them) is futile.
+                    if is_non_retryable(&e) {
+                        info!(
+                            "LLM call non-retryable; short-circuiting: alias='{}', attempts={}, error={:?}",
+                            alias,
+                            attempt + 1,
+                            e
+                        );
+                        return PrimaryEnd::NonRetryable(e);
+                    }
+
+                    if attempt == self.max_retries - 1 {
+                        return PrimaryEnd::Exhausted(e);
+                    }
+                    last_error = Some(e);
+
+                    let backoff_ms = {
+                        let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
+                        self.retry_delay_ms
+                            .saturating_mul(2_u64.saturating_pow(capped_attempt))
+                            .min(MAX_BACKOFF_MS)
+                    };
+                    debug!(
+                        "LLM retry backoff: alias='{}', duration_ms={}, attempt={}",
+                        alias,
+                        backoff_ms,
+                        attempt + 1
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+        PrimaryEnd::Exhausted(
+            last_error.unwrap_or_else(|| LLMError::Provider("Unknown error".into())),
+        )
     }
 
     /// Generate a chat response for the given model alias.
@@ -588,146 +945,71 @@ impl ProviderRegistry {
         let overall_budget = tokio::time::Duration::from_secs(self.llm_overall_timeout_secs.max(1));
 
         let inner = async {
-            let mut last_error: Option<LLMError> = None;
-
-            for attempt in 0..self.max_retries {
+            let sent = std::sync::atomic::AtomicU32::new(0);
+            let end = self
+                .primary_attempts(
+                    alias,
+                    model_name,
+                    provider,
+                    messages,
+                    tools,
+                    &effective_options,
+                    &sent,
+                )
+                .await;
+            // A time limit ends the primary's attempts: the fallback, a
+            // different model, is tried as after the last retry. An alias
+            // naming its own fallback alias goes there after the time limit
+            // only, and never to the node-wide fallback.
+            let (time_limit, last_error) = match end {
+                PrimaryEnd::Answer(r) => return Ok(r),
+                PrimaryEnd::NonRetryable(e) => return Err(e),
+                PrimaryEnd::TimeLimit(t) => (Some(t), None),
+                PrimaryEnd::Exhausted(e) if sent.load(std::sync::atomic::Ordering::Relaxed) > 0 => {
+                    (None, Some(e))
+                }
+                PrimaryEnd::Exhausted(e) => return Err(e),
+            };
+            if let Some(own) = self.alias_fallbacks.get(alias) {
+                return match time_limit {
+                    Some(timeout) => {
+                        self.chat_on_fallback_alias(alias, own, timeout, messages, tools, options)
+                            .await
+                    }
+                    None => {
+                        Err(last_error
+                            .unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
+                    }
+                };
+            }
+            if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                info!("Trying fallback provider (model='{}')", fallback_model);
                 let outcome = self
                     .bounded_attempt(
                         alias,
-                        model_name,
-                        attempt + 1,
-                        self.max_retries,
-                        provider.generate_chat(messages, tools, &effective_options),
+                        fallback_model,
+                        1,
+                        1,
+                        fallback.generate_chat(messages, tools, options),
                     )
                     .await
-                    .and_then(|response| {
-                        match empty_generation_fault(
-                            &response,
-                            alias,
-                            model_name,
-                            attempt + 1,
-                            self.max_retries,
-                        ) {
+                    .and_then(
+                        |r| match empty_generation_fault(&r, alias, fallback_model, 1, 1) {
                             Some(fault) => Err(fault),
-                            None => Ok(response),
-                        }
-                    });
-                match outcome {
-                    Ok(response) => {
-                        info!(
-                            "generate_chat successful: alias='{}', model='{}', attempt={}",
-                            alias,
-                            model_name,
-                            attempt + 1
-                        );
-                        return Ok(response);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "generate_chat failed: alias='{}', attempt={}/{}: {:?}",
-                            alias,
-                            attempt + 1,
-                            self.max_retries,
-                            e
-                        );
-
-                        let time_limit = provider_timeout_for_alias(&e, alias);
-                        if time_limit.is_some() {
-                            warn!(
-                                "LLM provider time limit; not sent again to this model: alias='{}', model='{}', attempt={}/{}",
-                                alias,
-                                model_name,
-                                attempt + 1,
-                                self.max_retries
-                            );
-                        }
-
-                        // Short-circuit on deterministic upstream rejections — retrying with
-                        // the same credentials (or with the fallback that shares them) is futile.
-                        if is_non_retryable(&e) {
-                            info!(
-                                "LLM call non-retryable; short-circuiting: alias='{}', attempts={}, error={:?}",
-                                alias,
-                                attempt + 1,
-                                e
-                            );
-                            return Err(e);
-                        }
-
-                        last_error = Some(e);
-
-                        // A time limit ends the primary's attempts: the fallback, a
-                        // different model, is tried as after the last retry. An
-                        // alias naming its own fallback alias goes there after the
-                        // time limit only, and never to the node-wide fallback.
-                        if time_limit.is_some() || attempt == self.max_retries - 1 {
-                            if let Some(own) = self.alias_fallbacks.get(alias) {
-                                if let Some(timeout) = time_limit {
-                                    return self
-                                        .chat_on_fallback_alias(
-                                            alias, own, timeout, messages, tools, options,
-                                        )
-                                        .await;
-                                }
-                            } else if let Some((fallback_model, fallback)) = &self.fallback_provider
-                            {
-                                info!("Trying fallback provider (model='{}')", fallback_model);
-                                let outcome = self
-                                    .bounded_attempt(
-                                        alias,
-                                        fallback_model,
-                                        1,
-                                        1,
-                                        fallback.generate_chat(messages, tools, options),
-                                    )
-                                    .await
-                                    .and_then(|r| {
-                                        match empty_generation_fault(
-                                            &r,
-                                            alias,
-                                            fallback_model,
-                                            1,
-                                            1,
-                                        ) {
-                                            Some(fault) => Err(fault),
-                                            None => Ok(r),
-                                        }
-                                    });
-                                match outcome {
-                                    Ok(r) => return Ok(r),
-                                    Err(fe) => {
-                                        return Err(match time_limit {
-                                            Some(timeout) => {
-                                                with_fallback_failure(timeout, fallback_model, &fe)
-                                            }
-                                            None => fe,
-                                        });
-                                    }
-                                }
-                            }
-                            if let Some(timeout) = time_limit {
-                                return Err(timeout);
-                            }
-                        }
-
-                        let backoff_ms = {
-                            let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
-                            self.retry_delay_ms
-                                .saturating_mul(2_u64.saturating_pow(capped_attempt))
-                                .min(MAX_BACKOFF_MS)
-                        };
-                        debug!(
-                            "LLM retry backoff: alias='{}', duration_ms={}, attempt={}",
-                            alias,
-                            backoff_ms,
-                            attempt + 1
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-                    }
-                }
+                            None => Ok(r),
+                        },
+                    );
+                return match outcome {
+                    Ok(r) => Ok(r),
+                    Err(fe) => Err(match time_limit {
+                        Some(timeout) => with_fallback_failure(timeout, fallback_model, &fe),
+                        None => fe,
+                    }),
+                };
             }
-
-            Err(last_error.unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
+            Err(time_limit
+                .or(last_error)
+                .unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
         };
 
         match tokio::time::timeout(overall_budget, inner).await {
@@ -741,6 +1023,174 @@ impl ProviderRegistry {
                 Err(LLMError::Network(format!("upstream timeout after {secs}s")))
             }
         }
+    }
+
+    /// A chat call bounded by the agent's `llm_timeout_seconds`. A call not
+    /// answered by then is ended with an error naming the field and the
+    /// seconds, typed as a network error so the gateway answers 502 as for
+    /// the registry's own budget.
+    ///
+    /// On an alias that names a `fallback_alias` (AEGIS ADR-130, Update of
+    /// 2026-10-05): the primary's attempts together are bounded by
+    /// `primary_bound`; a primary silent until then, or ended by the
+    /// provider's time limit, goes once to the fallback alias inside the time
+    /// left (D2a), unless its window cannot hold the request (D2b); a failure
+    /// carries the registry's report (D10).
+    pub async fn generate_chat_within(
+        &self,
+        alias: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+        llm_timeout: std::time::Duration,
+    ) -> Result<ChatResponse, ModelCallFailure> {
+        let (Some(own), Some((model_name, provider))) =
+            (self.alias_fallbacks.get(alias), self.alias_map.get(alias))
+        else {
+            return match tokio::time::timeout(
+                llm_timeout,
+                self.generate_chat(alias, messages, tools, options),
+            )
+            .await
+            {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(ModelCallFailure::unreported(e)),
+                Err(_) => Err(ModelCallFailure::unreported(llm_timeout_error(
+                    alias,
+                    llm_timeout,
+                ))),
+            };
+        };
+
+        info!("LLM inference: alias='{}', model='{}'", alias, model_name);
+        let started = tokio::time::Instant::now();
+        let overall_budget = std::time::Duration::from_secs(self.llm_overall_timeout_secs.max(1));
+        let budget = llm_timeout.min(overall_budget);
+        let primary_budget = primary_bound(budget);
+        let effective_options = self.apply_alias_options(alias, options);
+        let sent = std::sync::atomic::AtomicU32::new(0);
+
+        let end = tokio::time::timeout(
+            primary_budget,
+            self.primary_attempts(
+                alias,
+                model_name,
+                provider,
+                messages,
+                tools,
+                &effective_options,
+                &sent,
+            ),
+        )
+        .await;
+        let (primary, primary_error) = match end {
+            Ok(PrimaryEnd::Answer(r)) => return Ok(r),
+            Ok(PrimaryEnd::NonRetryable(e)) | Ok(PrimaryEnd::Exhausted(e)) => {
+                return Err(ModelCallFailure {
+                    error: e,
+                    report: Some(Box::new(CallReport {
+                        alias: alias.to_string(),
+                        model: model_name.clone(),
+                        attempts: sent.load(std::sync::atomic::Ordering::Relaxed),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        primary: PrimaryFailure::Error,
+                        fallback: None,
+                    })),
+                });
+            }
+            Ok(PrimaryEnd::TimeLimit(t)) => (PrimaryFailure::TimeLimit, t),
+            Err(_) => {
+                let secs = primary_budget.as_secs();
+                warn!(
+                    "LLM silent primary: alias='{}', model='{}', no answer within {}s of the agent's {}s",
+                    alias,
+                    model_name,
+                    secs,
+                    budget.as_secs()
+                );
+                (
+                    PrimaryFailure::Silent { secs },
+                    LLMError::Network(format!(
+                        "model call on alias '{alias}' (model '{model_name}') gave no answer within {secs} s, the primary's share of the agent's llm_timeout_seconds ({} s)",
+                        llm_timeout.as_secs()
+                    )),
+                )
+            }
+        };
+
+        let report = |fallback: FallbackReport| {
+            Box::new(CallReport {
+                alias: alias.to_string(),
+                model: model_name.clone(),
+                attempts: sent.load(std::sync::atomic::Ordering::Relaxed)
+                    + u32::from(matches!(
+                        fallback.outcome,
+                        FallbackOutcome::Silent { .. } | FallbackOutcome::Failed(_)
+                    )),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                primary: primary.clone(),
+                fallback: Some(fallback),
+            })
+        };
+
+        let request_bytes = chat_request_bytes(messages, tools);
+        if let Some(reason) = fallback_window_refusal(alias, own, request_bytes) {
+            return Err(ModelCallFailure {
+                error: with_fallback_note(primary_error, &reason),
+                report: Some(report(FallbackReport {
+                    alias: own.alias.clone(),
+                    model: own.model.clone(),
+                    outcome: FallbackOutcome::Skipped {
+                        request_bytes,
+                        limit_bytes: own.window_bytes,
+                    },
+                })),
+            });
+        }
+
+        let remaining = budget.saturating_sub(started.elapsed());
+        let (outcome, note) = match tokio::time::timeout(
+            remaining,
+            self.send_chat_to_fallback_alias(alias, own, messages, tools, options),
+        )
+        .await
+        {
+            Ok(Ok(r)) => {
+                info!(
+                    "Fallback alias answered: alias='{}', fallback_alias='{}', model='{}'",
+                    alias, own.alias, own.model
+                );
+                return Ok(r);
+            }
+            Ok(Err(fe)) => {
+                let note = format!(
+                    "the fallback model '{}' was tried once and failed: {fe}",
+                    own.model
+                );
+                (FallbackOutcome::Failed(fe), note)
+            }
+            Err(_) => {
+                // The seconds the fallback was given, to the nearest second.
+                let secs = remaining.as_secs_f64().round() as u64;
+                warn!(
+                    "LLM silent fallback: alias='{}', fallback_alias='{}', model='{}', no answer within {}s",
+                    alias, own.alias, own.model, secs
+                );
+                let note = format!(
+                    "the fallback model '{}' was tried once and gave no answer within {secs} s",
+                    own.model
+                );
+                (FallbackOutcome::Silent { secs }, note)
+            }
+        };
+        Err(ModelCallFailure {
+            error: with_fallback_note(primary_error, &note),
+            report: Some(report(FallbackReport {
+                alias: own.alias.clone(),
+                model: own.model.clone(),
+                outcome,
+            })),
+        })
     }
 
     /// Generate text for the given model alias.
@@ -2203,6 +2653,275 @@ mod tests {
         assert!(
             err.contains("'smart'") && err.contains("'coder'"),
             "the error must name both aliases, got: {err}"
+        );
+    }
+
+    // ── ADR-130, Update of 2026-10-05: a silent primary under the agent's
+    // timeout, a fallback too small for the request, the person's sentence.
+    // Each drives `from_config` and the real OpenAI-compatible adapters over
+    // loopback, as the daemon constructs them.
+
+    /// A model endpoint that accepts every connection and never answers.
+    async fn silent_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let addr = listener.local_addr().expect("its address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn user_message(content: String) -> Vec<ChatMessage> {
+        vec![ChatMessage {
+            role: "user".to_string(),
+            content,
+            tool_call_id: None,
+            tool_calls: None,
+        }]
+    }
+
+    /// The share of D2a: production's 120 s leaves the fallback the 78 s
+    /// ADR-130 measured gpt-oss-20b to need; at or under 78 s, half each.
+    #[test]
+    fn silent_primary_bound_leaves_the_fallback_its_measured_time() {
+        use std::time::Duration;
+        assert_eq!(
+            primary_bound(Duration::from_secs(120)),
+            Duration::from_secs(42)
+        );
+        assert_eq!(
+            primary_bound(Duration::from_secs(300)),
+            Duration::from_secs(222)
+        );
+        assert_eq!(
+            primary_bound(Duration::from_secs(60)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            primary_bound(Duration::from_secs(4)),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// The reproduction of execution a0a230fd: `smart` never answers, its
+    /// fallback alias `coder` is healthy. The call is answered by `coder`
+    /// inside the agent's timeout, with `coder`'s options.
+    #[tokio::test]
+    async fn silent_primary_is_answered_by_the_fallback_alias_inside_the_agent_timeout() {
+        let smart_url = silent_server().await;
+        let mut coder = mockito::Server::new_async().await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .match_body(body_of("m-coder", 4321, 0.5))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FALLBACK_ANSWER_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(&smart_url, &coder.url(), None, r#"fallback_alias: "coder""#),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let started = std::time::Instant::now();
+        let res = registry
+            .generate_chat_within(
+                "smart",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(4),
+            )
+            .await;
+        let waited = started.elapsed();
+
+        coder_mock.assert_async().await;
+        match res {
+            Ok(ChatResponse::FinalText(r)) => assert_eq!(r.text, "fallback answer"),
+            other => panic!("the fallback alias must answer a silent primary, got {other:?}"),
+        }
+        assert!(
+            waited < std::time::Duration::from_secs(4),
+            "answered inside the agent's 4 s, took {waited:?}"
+        );
+    }
+
+    /// Both silent: one fallback attempt, the event's fields true to it, and
+    /// the person reads one plain sentence naming both models and seconds.
+    #[tokio::test]
+    async fn silent_primary_and_silent_fallback_end_in_one_plain_sentence() {
+        let smart_url = silent_server().await;
+        let coder_url = silent_server().await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(&smart_url, &coder_url, None, r#"fallback_alias: "coder""#),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let started = std::time::Instant::now();
+        let failure = registry
+            .generate_chat_within(
+                "smart",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(4),
+            )
+            .await
+            .expect_err("both models are silent");
+        let waited = started.elapsed();
+
+        assert!(failure.fallback_attempted(), "{failure:?}");
+        assert_eq!(failure.attempts(), 2, "one to each model: {failure:?}");
+        assert!(failure.elapsed_ms() >= 3_900, "{failure:?}");
+        assert!(
+            waited < std::time::Duration::from_millis(4_500),
+            "took {waited:?}"
+        );
+        assert_eq!(
+            failure.client_sentence(),
+            "The model on alias 'smart' (m-smart) gave no answer within 2 s; its fallback 'coder' (m-coder) was tried and gave no answer within 2 s."
+        );
+        assert!(matches!(failure.error, LLMError::Network(_)), "{failure:?}");
+    }
+
+    /// The fallback's window (8,192 - 4,321 = 3,871 bytes) cannot hold the
+    /// request: it is not sent, and the reason is recorded and said.
+    #[tokio::test]
+    async fn silent_primary_fallback_too_small_for_the_request_is_skipped_with_the_reason() {
+        let smart_url = silent_server().await;
+        let mut coder = mockito::Server::new_async().await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(&smart_url, &coder.url(), None, r#"fallback_alias: "coder""#),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+        let messages = user_message("x".repeat(5_000));
+
+        let failure = registry
+            .generate_chat_within(
+                "smart",
+                &messages,
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(4),
+            )
+            .await
+            .expect_err("the primary is silent and the fallback cannot hold the request");
+
+        coder_mock.assert_async().await;
+        assert!(!failure.fallback_attempted(), "{failure:?}");
+        let request_bytes = chat_request_bytes(&messages, &[]);
+        assert_eq!(
+            failure.client_sentence(),
+            format!(
+                "The model on alias 'smart' (m-smart) gave no answer within 2 s; its fallback 'coder' (m-coder) was not tried: the request is {request_bytes} bytes and its window holds 3871."
+            )
+        );
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("was not sent the request"),
+            "{failure:?}"
+        );
+    }
+
+    /// The same skip after the provider's time limit (execution a15a5bbb's
+    /// 413 from a fallback whose window was smaller than the request).
+    #[tokio::test]
+    async fn fallback_alias_after_3046_too_small_for_the_request_is_not_sent_it() {
+        let mut smart = mockito::Server::new_async().await;
+        let mut coder = mockito::Server::new_async().await;
+        let smart_mock = smart
+            .mock("POST", "/chat/completions")
+            .with_status(408)
+            .with_body(WORKERS_AI_408_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let coder_mock = coder
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(
+                &smart.url(),
+                &coder.url(),
+                None,
+                r#"fallback_alias: "coder""#,
+            ),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let err = registry
+            .generate_chat(
+                "smart",
+                &user_message("x".repeat(5_000)),
+                &[],
+                &GenerationOptions::default(),
+            )
+            .await
+            .expect_err("the fallback cannot hold the request")
+            .to_string();
+
+        smart_mock.assert_async().await;
+        coder_mock.assert_async().await;
+        assert!(
+            err.contains("provider timeout") && err.contains("was not sent the request"),
+            "{err}"
+        );
+    }
+
+    /// No `fallback_alias`: the call is bounded by the agent's timeout as
+    /// before, with today's error and no report.
+    #[tokio::test]
+    async fn silent_primary_without_fallback_alias_is_ended_at_the_agent_timeout_as_before() {
+        let smart_url = silent_server().await;
+        let coder = mockito::Server::new_async().await;
+        let manifest = alias_fallback_manifest(
+            &alias_fallback_providers(&smart_url, &coder.url(), None, ""),
+            ALIAS_FALLBACK_SELECTION,
+        );
+        let registry = alias_fallback_registry(&manifest);
+
+        let started = std::time::Instant::now();
+        let failure = registry
+            .generate_chat_within(
+                "smart",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect_err("a silent primary with no fallback fails");
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_secs(2),
+            "took {waited:?}"
+        );
+        assert!(failure.report.is_none(), "{failure:?}");
+        assert_eq!(failure.attempts(), 0);
+        assert!(!failure.fallback_attempted());
+        assert_eq!(
+            failure.client_sentence(),
+            "Network error: model call on alias 'smart' gave no answer within the agent's llm_timeout_seconds (2 s)"
         );
     }
 }
