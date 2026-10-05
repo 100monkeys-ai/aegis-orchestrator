@@ -1034,6 +1034,10 @@ pub(crate) fn person_sub(identity: Option<&UserIdentity>) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "execution_remote_tools_tests.rs"]
+mod remote_tools_tests;
+
+#[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
@@ -1062,7 +1066,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    struct TestRuntime {
+    pub(super) struct TestRuntime {
         spawned: Mutex<Vec<WorkerRuntimeConfig>>,
         executed_inputs: Mutex<Vec<TaskInput>>,
     }
@@ -1105,8 +1109,8 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TestVolumeService {
-        volumes: HashMap<VolumeId, Volume>,
+    pub(super) struct TestVolumeService {
+        pub(super) volumes: HashMap<VolumeId, Volume>,
     }
 
     #[async_trait]
@@ -1203,7 +1207,7 @@ mod tests {
         }
     }
 
-    fn make_agent(name: &str, role: Option<&str>, mount_path: Option<&str>) -> Agent {
+    pub(super) fn make_agent(name: &str, role: Option<&str>, mount_path: Option<&str>) -> Agent {
         let mut labels = HashMap::new();
         if let Some(role) = role {
             labels.insert("role".to_string(), role.to_string());
@@ -3801,6 +3805,45 @@ impl StandardExecutionService {
         Ok(SchemaInstance::WorkflowState(state_input))
     }
 
+    /// Why a declared tool that is not in the `ToolRouter` index stops the
+    /// start, or `None` when it is a tool of one of the node's remote servers.
+    ///
+    /// A remote tool is `<server>.<tool>` with `<server>` named in
+    /// `seal_gateway.remote_servers`, by the rule the call is routed by
+    /// (`tool_invocation_service::gateway`). It passes here: whether its call
+    /// is made is decided at the call, by the agent's security context and
+    /// the person's granted binding, else `CREDENTIAL_BINDING_REQUIRED`
+    /// (AEGIS ADR-132 H3, Update (6)). With no `seal_gateway` the refusal is
+    /// the one this check has always given.
+    fn undeclarable_tool(
+        tool: &str,
+        seal_gateway: Option<&crate::domain::node_config::SealGatewayConfig>,
+    ) -> Option<String> {
+        let unavailable = format!(
+            "Agent requested tool '{tool}' but it is not available in the current node configuration"
+        );
+        let Some(gateway) = seal_gateway else {
+            return Some(format!("{unavailable}."));
+        };
+        let servers = gateway.remote_servers.join(", ");
+        match tool.split_once('.') {
+            Some((server, name))
+                if !name.is_empty() && gateway.remote_servers.iter().any(|s| s == server) =>
+            {
+                None
+            }
+            Some((server, _)) => Some(format!(
+                "{unavailable}: it is no tool of this node, and '{server}' is not one of its \
+                 remote servers (seal_gateway.remote_servers: [{servers}])."
+            )),
+            None => Some(format!(
+                "{unavailable}: it is no tool of this node, and it names no remote server \
+                 (a remote server's tool is '<server>.<tool>'; seal_gateway.remote_servers: \
+                 [{servers}])."
+            )),
+        }
+    }
+
     /// Whether a JSON Schema admits only objects at its root (`type: object`,
     /// or a type list naming `object` and not `string`).
     fn schema_wants_object(schema: &JsonValue) -> bool {
@@ -4218,18 +4261,22 @@ impl StandardExecutionService {
             }
         }
 
-        // 1.5 Validate that all tools requested by the agent exist in the ToolRouter index (Safety & Polish)
+        // 1.5 Validate that every tool the agent declares is in the ToolRouter
+        // index or belongs to one of the node's remote servers (AEGIS ADR-132):
+        // a remote tool's admission is decided at its call, not here.
         if let Some(router) = &self.tool_router {
             let available_tools = router.list_tools().await.map_err(|e| {
                 ExecutionError::InvalidExecutionInput(format!("Failed to query tool router: {e}"))
             })?;
 
-            let requested_tools = agent.manifest.spec.tools.clone();
-            for req_tool in requested_tools {
-                if !available_tools.iter().any(|t| t.name == req_tool) {
-                    return Err(ExecutionError::InvalidExecutionInput(format!(
-                        "Agent requested tool '{req_tool}' but it is not available in the current node configuration."
-                    )).into());
+            for req_tool in &agent.manifest.spec.tools {
+                if available_tools.iter().any(|t| &t.name == req_tool) {
+                    continue;
+                }
+                if let Some(refusal) =
+                    Self::undeclarable_tool(req_tool, self.config.spec.seal_gateway.as_ref())
+                {
+                    return Err(ExecutionError::InvalidExecutionInput(refusal).into());
                 }
             }
         }
