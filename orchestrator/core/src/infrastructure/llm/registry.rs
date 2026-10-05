@@ -195,7 +195,7 @@ pub enum FallbackOutcome {
         request_bytes: u64,
         limit_bytes: u64,
     },
-    /// Not sent: the try had less time left than the fallback's bound.
+    /// Not sent: the try had less time left than half the fallback's bound.
     NoTime { left_secs: u64, needed_secs: u64 },
     /// No answer within the fallback's bound.
     Silent { secs: u64 },
@@ -309,7 +309,7 @@ impl ModelCallFailure {
                 left_secs,
                 needed_secs,
             } => format!(
-                "was not tried: the try had {left_secs} s left and the fallback needs {needed_secs} s"
+                "was not tried: the try had {left_secs} s left and the fallback needs at least {needed_secs} s"
             ),
             FallbackOutcome::Silent { secs } => {
                 format!("was tried and gave no answer within {secs} s")
@@ -1030,9 +1030,9 @@ impl ProviderRegistry {
     /// On an alias that names a `fallback_alias` (AEGIS ADR-130, Update of
     /// 2026-10-05): the primary keeps the whole timeout, its time limit (3046)
     /// path unchanged. A primary silent for all of it goes once to the
-    /// fallback alias, bounded by `FALLBACK_RESERVE`, where `try_left` (the
-    /// try's time left less the margin it keeps for the next step, at the
-    /// call's start) still holds that bound then (D2a), and where its window
+    /// fallback alias, bounded by `FALLBACK_RESERVE` or by what is left of
+    /// `try_left` (the time to the try's deadline at the call's start) when
+    /// that is shorter but at least half the bound (D2a), and where its window
     /// holds the request (D2b); a failure carries the registry's report (D10).
     pub async fn generate_chat_within(
         &self,
@@ -1144,34 +1144,35 @@ impl ProviderRegistry {
             .llm_attempt_timeout_secs
             .map(std::time::Duration::from_secs)
             .map_or(FALLBACK_RESERVE, |b| b.min(FALLBACK_RESERVE));
+        // The fallback's bound, or the time left to the try's deadline where
+        // that is shorter and at least half the bound; otherwise not tried.
+        let mut bound = bound;
         if let Some(left) = try_left.map(|l| l.saturating_sub(started.elapsed())) {
-            if left < bound {
+            if left < bound / 2 {
                 let left_secs = left.as_secs_f64().round() as u64;
+                let needed_secs = (bound / 2).as_secs();
                 warn!(
-                    "Fallback alias not tried, too little of the try left: alias='{}', fallback_alias='{}', left={}s, bound={}s",
-                    alias,
-                    own.alias,
-                    left_secs,
-                    bound.as_secs()
+                    "Fallback alias not tried, too little of the try left: alias='{}', fallback_alias='{}', left={}s, needed={}s",
+                    alias, own.alias, left_secs, needed_secs
                 );
                 return Err(ModelCallFailure {
                     error: with_fallback_note(
                         primary_error,
                         &format!(
-                            "the fallback model '{}' was not tried: the try had {left_secs} s left and it needs {} s",
-                            own.model,
-                            bound.as_secs()
+                            "the fallback model '{}' was not tried: the try had {left_secs} s left and it needs at least {needed_secs} s",
+                            own.model
                         ),
                     ),
                     report: report(
                         primary,
                         Some(fallback_report(FallbackOutcome::NoTime {
                             left_secs,
-                            needed_secs: bound.as_secs(),
+                            needed_secs,
                         })),
                     ),
                 });
             }
+            bound = bound.min(left);
         }
 
         let request_bytes = chat_request_bytes(messages, tools);
@@ -2870,7 +2871,7 @@ mod tests {
                 &[],
                 &GenerationOptions::default(),
                 std::time::Duration::from_secs(1),
-                Some(std::time::Duration::from_secs(50)),
+                Some(std::time::Duration::from_secs(30)),
             )
             .await
             .expect_err("no fallback fits in the try");
@@ -2880,7 +2881,7 @@ mod tests {
         assert_eq!(failure.attempts(), 1, "{failure:?}");
         assert_eq!(
             failure.client_sentence(),
-            "The model on alias 'smart' (m-smart) gave no answer within 1 s; its fallback 'coder' (m-coder) was not tried: the try had 49 s left and the fallback needs 78 s."
+            "The model on alias 'smart' (m-smart) gave no answer within 1 s; its fallback 'coder' (m-coder) was not tried: the try had 29 s left and the fallback needs at least 39 s."
         );
     }
 

@@ -481,7 +481,6 @@ impl InnerLoopService {
                     &ctx.tenant_id,
                     ctx.llm_timeout_seconds,
                     ctx.deadline,
-                    ctx.command_margin_secs,
                 )
                 .await?;
 
@@ -787,7 +786,6 @@ impl InnerLoopService {
         tenant_id: &TenantId,
         llm_timeout_seconds: u64,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
-        command_margin_secs: u64,
     ) -> anyhow::Result<LlmOutput> {
         let chat_messages: Vec<ChatMessage> = conversation
             .iter()
@@ -934,7 +932,7 @@ impl InnerLoopService {
             &schemas,
             &options,
             llm_timeout_seconds,
-            try_left_after_margin(deadline, command_margin_secs, chrono::Utc::now()),
+            try_time_left(deadline, chrono::Utc::now()),
         )
         .await;
 
@@ -1062,18 +1060,16 @@ impl InnerLoopService {
     }
 }
 
-/// The try's time left less the margin it keeps after a command for the
-/// model to act ([`command_margin_secs`]), the rule [`fit_command_to_try`]
-/// applies to a command, here applied to an alias's fallback (AEGIS ADR-130,
-/// Update of 2026-10-05, D2a). `None` when the try has no deadline.
-fn try_left_after_margin(
+/// The time left to the try's deadline, for an alias's fallback (AEGIS
+/// ADR-130, Update of 2026-10-05, D2a). No command margin is subtracted: the
+/// margin is kept so that a model call can follow a command, and the fallback
+/// is that model call. `None` when the try has no deadline.
+fn try_time_left(
     deadline: Option<chrono::DateTime<chrono::Utc>>,
-    margin_secs: u64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<std::time::Duration> {
     deadline.map(|deadline| {
-        let room = (deadline - now).num_seconds() - margin_secs as i64;
-        std::time::Duration::from_secs(room.max(0) as u64)
+        std::time::Duration::from_secs((deadline - now).num_seconds().max(0) as u64)
     })
 }
 
@@ -1557,6 +1553,19 @@ mod tests {
         async fn health_check(&self) -> Result<(), crate::domain::llm::LLMError> {
             Ok(())
         }
+    }
+
+    /// The fallback is itself the model call a command's margin is kept
+    /// for, so it reserves nothing: run a0a230fd had about 178 s left after
+    /// its first silent call, and all of it is the fallback's (AEGIS ADR-130,
+    /// Update of 2026-10-05, D2a, CORRECTION C3).
+    #[test]
+    fn fallback_time_left_subtracts_no_command_margin() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            try_time_left(Some(now + chrono::Duration::seconds(178)), now),
+            Some(std::time::Duration::from_secs(178))
+        );
     }
 
     fn slow_registry(delay_secs: u64) -> ProviderRegistry {
