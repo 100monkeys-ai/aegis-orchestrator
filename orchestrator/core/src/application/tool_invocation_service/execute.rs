@@ -25,7 +25,7 @@ impl ToolInvocationService {
             Err(refused) => return Ok(refused),
         };
         let result = self
-            .invoke_aegis_execute_intent_tool(args, security_context, scope)
+            .invoke_aegis_execute_intent_tool(args, security_context, caller_identity, scope)
             .await?;
         if let ToolInvocationResult::Direct(answer) = &result {
             if let Some(pipeline) = answer.get("pipeline_execution_id").and_then(Value::as_str) {
@@ -36,11 +36,15 @@ impl ToolInvocationService {
         Ok(result)
     }
 
-    /// Handle `aegis.execute.intent` — start the intent-to-execution pipeline.
+    /// Handle `aegis.execute.intent` — start the intent-to-execution
+    /// pipeline as the person who called the tool, its initiator: the agents
+    /// its states run act for that person (AEGIS ADR-132 H6); a service
+    /// account or no caller records none.
     pub(super) async fn invoke_aegis_execute_intent_tool(
         &self,
         args: &mut Value,
         security_context: &crate::domain::security_context::SecurityContext,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
         _scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
@@ -163,16 +167,18 @@ impl ToolInvocationService {
         let pipeline_start = Instant::now();
 
         let result = start_use_case
-            .start_execution(
+            .start_execution_for_tenant(
+                &tenant_id,
                 crate::application::start_workflow_execution::StartWorkflowExecutionRequest {
                     workflow_id: "builtin-intent-to-execution".to_string(),
                     input,
                     blackboard: None,
                     version: None,
-                    tenant_id: Some(tenant_id),
+                    tenant_id: Some(tenant_id.clone()),
                     security_context_name: Some("aegis-system-agent-runtime".to_string()),
                     intent: Some(intent.to_string()),
                 },
+                caller_identity,
             )
             .await;
 

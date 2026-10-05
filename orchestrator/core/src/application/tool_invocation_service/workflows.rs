@@ -516,17 +516,21 @@ impl ToolInvocationService {
             }
         };
 
+        // Started as the person who called the tool, its initiator: the
+        // agents its states run act for that person (AEGIS ADR-132 H6).
         match start_use_case
-            .start_execution(
+            .start_execution_for_tenant(
+                &tenant_id,
                 crate::application::start_workflow_execution::StartWorkflowExecutionRequest {
                     workflow_id: "builtin-workflow-generator".to_string(),
                     input: serde_json::json!({ "input": input }),
                     blackboard: None,
                     version: None,
-                    tenant_id: Some(tenant_id),
+                    tenant_id: Some(tenant_id.clone()),
                     security_context_name: Some("aegis-system-agent-runtime".to_string()),
                     intent: None,
                 },
+                caller_identity,
             )
             .await
         {

@@ -737,6 +737,9 @@ struct TestStartWorkflowExecutionUseCase {
     /// compare a tool's answer with the run it started.
     last_started:
         Mutex<Option<crate::application::start_workflow_execution::StartedWorkflowExecution>>,
+    /// The subject of the identity the last run was started as (`None`
+    /// inside: started with no identity).
+    last_identity: Mutex<Option<Option<String>>>,
 }
 
 #[async_trait]
@@ -745,9 +748,10 @@ impl StartWorkflowExecutionUseCase for TestStartWorkflowExecutionUseCase {
         &self,
         tenant_id: &TenantId,
         mut request: crate::application::start_workflow_execution::StartWorkflowExecutionRequest,
-        _identity: Option<&crate::domain::iam::UserIdentity>,
+        identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<crate::application::start_workflow_execution::StartedWorkflowExecution> {
         request.tenant_id = Some(tenant_id.clone());
+        *self.last_identity.lock().await = Some(identity.map(|id| id.sub.clone()));
         *self.last_request.lock().await = Some(request.clone());
 
         let started = crate::application::start_workflow_execution::StartedWorkflowExecution {
@@ -2798,6 +2802,70 @@ async fn aegis_workflow_generate_answers_the_started_execution_id() {
     assert_ne!(payload["execution_id"], started.workflow_id);
 }
 
+/// A person calling a tool, as the SEAL session builds them.
+fn calling_person(sub: &str) -> crate::domain::iam::UserIdentity {
+    crate::domain::iam::UserIdentity {
+        sub: sub.to_string(),
+        realm_slug: "zaru-consumer".to_string(),
+        email: None,
+        email_verified: false,
+        name: None,
+        identity_kind: crate::domain::iam::IdentityKind::ConsumerUser {
+            zaru_tier: crate::domain::iam::ZaruTier::Pro,
+            tenant_id: TenantId::default(),
+        },
+    }
+}
+
+/// AEGIS ADR-132 H6 (the retired arc's open finding): `aegis.workflow.generate`
+/// starts the builtin generator workflow as the person who called the tool,
+/// so its agents act for that person; it started it with no initiator.
+#[tokio::test]
+async fn aegis_workflow_generate_records_its_caller_as_the_initiator() {
+    let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+    let (service, _operator_context) = workflow_start_service(start_use_case.clone());
+    let person = calling_person("user-1");
+    let mut args = serde_json::json!({ "input": "a workflow that greets" });
+    service
+        .invoke_aegis_workflow_generate_tool(&mut args, Some(&person), &test_tenant_scope())
+        .await
+        .expect("workflow generate should return a result");
+    assert_eq!(
+        start_use_case.last_identity.lock().await.clone(),
+        Some(Some("user-1".to_string()))
+    );
+}
+
+/// AEGIS ADR-132 H6: `aegis.execute.intent` (as Zaru chat calls it) starts
+/// `builtin-intent-to-execution` as the person who called the tool; it
+/// started it with no initiator.
+#[tokio::test]
+async fn aegis_execute_intent_records_its_caller_as_the_initiator() {
+    let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+    let (service, _operator_context) = workflow_start_service(start_use_case.clone());
+    let person = calling_person("user-1");
+    let mut args = serde_json::json!({ "intent": "add two numbers" });
+    let ToolInvocationResult::Direct(answer) = service
+        .invoke_aegis_execute_intent_for_goal(
+            &mut args,
+            &make_security_context("zaru-pro"),
+            Some(&person),
+            &test_tenant_scope(),
+        )
+        .await
+        .expect("the pipeline starts")
+    else {
+        panic!("expected a direct answer");
+    };
+    assert_eq!(answer["status"], "started", "{answer}");
+    let request = start_use_case.last_request.lock().await.clone().unwrap();
+    assert_eq!(request.workflow_id, "builtin-intent-to-execution");
+    assert_eq!(
+        start_use_case.last_identity.lock().await.clone(),
+        Some(Some("user-1".to_string()))
+    );
+}
+
 #[tokio::test]
 async fn workflow_run_with_version_passes_version_through() {
     let agent_id = AgentId::new();
@@ -2931,7 +2999,7 @@ async fn test_free_tier_volume_id_rejected() {
         "volume_id": "vol-abc123",
     });
     let result = service
-        .invoke_aegis_execute_intent_tool(&mut intent_args, &free_ctx, &test_tenant_scope())
+        .invoke_aegis_execute_intent_tool(&mut intent_args, &free_ctx, None, &test_tenant_scope())
         .await;
 
     assert!(
@@ -2952,7 +3020,7 @@ async fn test_free_tier_no_volume_id_allowed() {
         "intent": "run something",
     });
     let result = service
-        .invoke_aegis_execute_intent_tool(&mut intent_args, &free_ctx, &test_tenant_scope())
+        .invoke_aegis_execute_intent_tool(&mut intent_args, &free_ctx, None, &test_tenant_scope())
         .await;
 
     // The tier check passes; the call falls through to the unconfigured use-case
@@ -2981,7 +3049,7 @@ async fn test_paid_tier_volume_id_allowed() {
         "volume_id": "vol-abc123",
     });
     let result = service
-        .invoke_aegis_execute_intent_tool(&mut intent_args, &pro_ctx, &test_tenant_scope())
+        .invoke_aegis_execute_intent_tool(&mut intent_args, &pro_ctx, None, &test_tenant_scope())
         .await;
 
     // The tier check passes; the call falls through to the unconfigured use-case
