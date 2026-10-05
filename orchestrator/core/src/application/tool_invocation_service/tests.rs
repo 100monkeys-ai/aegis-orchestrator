@@ -3427,8 +3427,9 @@ mod gateway_timeout_regression {
     };
     use crate::infrastructure::seal_gateway_proto::{
         ExploreApiRequest, ExploreApiResponse, InvokeCliRequest as PbInvokeCliRequest,
-        InvokeCliResponse, InvokeWorkflowRequest as PbInvokeWorkflowRequest,
-        InvokeWorkflowResponse, ListToolsRequest as PbListToolsRequest, ListToolsResponse,
+        InvokeCliResponse, InvokeToolRequest as PbInvokeToolRequest, InvokeToolResponse,
+        InvokeWorkflowRequest as PbInvokeWorkflowRequest, InvokeWorkflowResponse,
+        ListToolsRequest as PbListToolsRequest, ListToolsResponse,
     };
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3473,6 +3474,13 @@ mod gateway_timeout_regression {
             futures::future::pending::<()>().await;
             unreachable!("hung gateway");
         }
+        async fn invoke_tool(
+            &self,
+            _req: tonic::Request<PbInvokeToolRequest>,
+        ) -> Result<tonic::Response<InvokeToolResponse>, tonic::Status> {
+            futures::future::pending::<()>().await;
+            unreachable!("hung gateway");
+        }
     }
 
     /// Stub SEAL gateway whose `list_tools` returns an error immediately.
@@ -3503,6 +3511,12 @@ mod gateway_timeout_regression {
             _req: tonic::Request<PbListToolsRequest>,
         ) -> Result<tonic::Response<ListToolsResponse>, tonic::Status> {
             Err(tonic::Status::internal("list_tools failed"))
+        }
+        async fn invoke_tool(
+            &self,
+            _req: tonic::Request<PbInvokeToolRequest>,
+        ) -> Result<tonic::Response<InvokeToolResponse>, tonic::Status> {
+            Err(tonic::Status::internal("boom"))
         }
     }
 
@@ -3666,8 +3680,7 @@ mod gateway_timeout_regression {
                     crate::domain::execution::ExecutionId::new(),
                     "gateway.tool",
                     serde_json::json!({}),
-                    None,
-                    None,
+                    &TenantId::default(),
                 )
                 .await
                 .expect_err("the gateway call fails");
@@ -3747,8 +3760,7 @@ mod gateway_timeout_regression {
                 crate::domain::execution::ExecutionId::new(),
                 "some.tool",
                 serde_json::json!({}),
-                Some("tenant"),
-                Some("token"),
+                &TenantId::default(),
             ),
         )
         .await

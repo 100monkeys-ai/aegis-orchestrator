@@ -196,6 +196,29 @@ pub enum CallerAnswer {
     EdgeUnavailable(String),
     /// An internal failure: the caller is told only its class.
     Internal(InternalFailure),
+    /// The tool needs the acting user's own credential and the call carries
+    /// none: no binding of that user granted to the acting agent or workflow,
+    /// or no person recorded for the run (403 `CREDENTIAL_BINDING_REQUIRED`,
+    /// AEGIS ADR-132 H3; ADR-035's rows for it).
+    CredentialBindingRequired {
+        /// The caller-facing sentence: never a credential.
+        message: String,
+    },
+    /// The remote server refused the user's stored credential (403
+    /// `CREDENTIAL_REJECTED`).
+    CredentialRejected {
+        /// The caller-facing sentence: never a credential.
+        message: String,
+    },
+    /// The remote server refused the call with an error of its own; the
+    /// message is its text, any echo of the credential replaced (422
+    /// `REMOTE_TOOL_ERROR`).
+    RemoteToolError(String),
+    /// A call that would carry a credential found no confidential channel to
+    /// the SEAL gateway (503 `CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL`, an
+    /// internal class: the caller reads the fixed sentence, the operator's
+    /// log the reason; AEGIS ADR-132 H8).
+    CredentialChannelNotConfidential,
 }
 
 /// The class of an internal failure, which alone reaches the caller
@@ -409,6 +432,19 @@ impl SealSessionError {
                     SealRefusal::caller(503, "EDGE_UNAVAILABLE", m.clone())
                 }
                 CallerAnswer::Internal(class) => SealRefusal::internal(*class),
+                CallerAnswer::CredentialBindingRequired { message } => {
+                    SealRefusal::policy(403, "CREDENTIAL_BINDING_REQUIRED", message.clone())
+                }
+                CallerAnswer::CredentialRejected { message } => {
+                    SealRefusal::caller(403, "CREDENTIAL_REJECTED", message.clone())
+                }
+                CallerAnswer::RemoteToolError(m) => {
+                    SealRefusal::caller(422, "REMOTE_TOOL_ERROR", m.clone())
+                }
+                CallerAnswer::CredentialChannelNotConfidential => SealRefusal {
+                    code: "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL",
+                    ..SealRefusal::internal(InternalFailure::Unavailable)
+                },
             },
         }
     }
@@ -1089,5 +1125,62 @@ mod tests {
             .clone()
             .answered(CallerAnswer::NotFound("file 'f' not found".into()));
         assert_eq!(answered.to_string(), shown.to_string());
+    }
+
+    /// AEGIS ADR-132 H3, H5, H8 and ADR-035's four rows for them: each
+    /// refusal the SEAL gateway relays, or the orchestrator builds for a
+    /// remote tool, answers its own code, status and class; the channel's
+    /// refusal is internal and says only its class's fixed sentence.
+    #[test]
+    fn the_remote_tool_refusals_answer_their_rows() {
+        let answered = |a: CallerAnswer| {
+            SealSessionError::InternalError("Mk7-shown-detail".into()).answered(a)
+        };
+        let message = "This tool needs your own credential for 'srv', granted to this agent.";
+        for (error, http_status, code, status, internal, text) in [
+            (
+                answered(CallerAnswer::CredentialBindingRequired {
+                    message: message.into(),
+                }),
+                403,
+                "CREDENTIAL_BINDING_REQUIRED",
+                "policy_violation",
+                false,
+                message,
+            ),
+            (
+                answered(CallerAnswer::CredentialRejected {
+                    message: "The 'srv' server refused your stored credential.".into(),
+                }),
+                403,
+                "CREDENTIAL_REJECTED",
+                "error",
+                false,
+                "The 'srv' server refused your stored credential.",
+            ),
+            (
+                answered(CallerAnswer::RemoteToolError("page not found".into())),
+                422,
+                "REMOTE_TOOL_ERROR",
+                "error",
+                false,
+                "page not found",
+            ),
+            (
+                answered(CallerAnswer::CredentialChannelNotConfidential),
+                503,
+                "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL",
+                "error",
+                true,
+                SERVICE_UNAVAILABLE_MESSAGE,
+            ),
+        ] {
+            let refusal = error.refusal();
+            assert_eq!(refusal.http_status, http_status, "{error:?}");
+            assert_eq!(refusal.code, code, "{error:?}");
+            assert_eq!(refusal.status, status, "{error:?}");
+            assert_eq!(refusal.internal, internal, "{error:?}");
+            assert_eq!(refusal.message, text, "{error:?}");
+        }
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::domain::secrets::SensitiveUrl;
+use crate::infrastructure::seal_gateway_proto::ToolSummary;
 use std::time::Duration;
 
 /// Connect timeout for SEAL Tooling Gateway gRPC connections.
@@ -197,103 +198,116 @@ impl ToolInvocationService {
         Ok(filtered)
     }
 
+    /// The SEAL gateway's node-wide tool list, best effort: a slow, failing or
+    /// unreachable gateway answers an empty list, so built-in dispatch and
+    /// the semantic judge's inventory never wait on it. The request names no
+    /// user and carries no credential: a tool a user's own binding opens is
+    /// never in this list (AEGIS ADR-132's Update (3), H7's row on the
+    /// unauthenticated `GET /v1/seal/tools`).
     pub(super) async fn fetch_gateway_tools_grpc(
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        if self.seal_gateway_url.is_none() {
+            return Err(SealSessionError::ConfigurationError(
+                "seal_gateway.url is not configured".to_string(),
+            ));
+        }
+        let listed = match self
+            .list_gateway_tools(ListToolsRequest::default(), GATEWAY_LIST_TOOLS_TIMEOUT)
+            .await
+        {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "SEAL gateway tool enumeration failed; proceeding with built-in tools only"
+                );
+                return Ok(Vec::new());
+            }
+        };
+        Ok(listed
+            .into_iter()
+            .map(Self::gateway_tool_metadata)
+            .collect())
+    }
+
+    /// A tool the gateway listed, as the orchestrator advertises it.
+    pub(super) fn gateway_tool_metadata(
+        item: ToolSummary,
+    ) -> crate::infrastructure::tool_router::ToolMetadata {
+        let input_schema = if !item.input_schema_json.is_empty() {
+            serde_json::from_str(&item.input_schema_json)
+                .unwrap_or_else(|_| Self::dummy_input_schema(&item.kind))
+        } else {
+            Self::dummy_input_schema(&item.kind)
+        };
+        crate::infrastructure::tool_router::ToolMetadata {
+            name: item.name,
+            description: item.description,
+            input_schema,
+            ..Default::default()
+        }
+    }
+
+    /// The gateway's `ListTools` answer to `listing`, bounded by `timeout`.
+    /// Every failure is an error here; the best-effort callers downgrade it.
+    pub(super) async fn list_gateway_tools(
+        &self,
+        listing: ListToolsRequest,
+        timeout: Duration,
+    ) -> Result<Vec<ToolSummary>, SealSessionError> {
+        let mut client = self.connect_gateway().await?;
+        let mut request = tonic::Request::new(listing);
+        self.authorize_gateway_request(&mut request).await?;
+        match tokio::time::timeout(timeout, client.list_tools(request)).await {
+            Ok(Ok(response)) => Ok(response.into_inner().tools),
+            Ok(Err(status)) => Err(gateway_refusal("list_tools", "", &status)),
+            Err(_) => Err(SealSessionError::InternalError(format!(
+                "seal tooling gateway list_tools timeout after {}s",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
+    /// A channel to the configured gateway, its connect bounded: an
+    /// unreachable gateway fails fast with an internal error that names the
+    /// gateway by its redacted address.
+    pub(super) async fn connect_gateway(
+        &self,
+    ) -> Result<GatewayInvocationServiceClient<tonic::transport::Channel>, SealSessionError> {
         let gateway_url = self.seal_gateway_url.as_deref().ok_or_else(|| {
             SealSessionError::ConfigurationError("seal_gateway.url is not configured".to_string())
         })?;
-
-        // Best-effort connect: a slow/unreachable gateway must NOT block the
-        // pre-dispatch semantic judge. Bound the connect with an explicit
-        // timeout and downgrade any failure (timeout or transport error) to
-        // an empty tool list.
-        let endpoint = match tonic::transport::Endpoint::from_shared(gateway_url.to_string()) {
-            Ok(ep) => ep.connect_timeout(GATEWAY_CONNECT_TIMEOUT),
-            Err(e) => {
-                tracing::warn!(
-                    gateway_url = %SensitiveUrl::new(gateway_url),
-                    error = %e,
-                    "invalid SEAL gateway URL; skipping gateway tool enumeration"
-                );
-                return Ok(Vec::new());
-            }
-        };
-
-        let mut client = match tokio::time::timeout(GATEWAY_CONNECT_TIMEOUT, endpoint.connect())
-            .await
-        {
-            Ok(Ok(channel)) => GatewayInvocationServiceClient::new(channel),
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    gateway_url = %SensitiveUrl::new(gateway_url),
-                    error = %e,
-                    "SEAL gateway connect failed during tool enumeration; proceeding with built-in tools only"
-                );
-                return Ok(Vec::new());
-            }
-            Err(_) => {
-                tracing::warn!(
-                    gateway_url = %SensitiveUrl::new(gateway_url),
-                    timeout_secs = GATEWAY_CONNECT_TIMEOUT.as_secs(),
-                    "SEAL gateway connect timed out during tool enumeration; proceeding with built-in tools only"
-                );
-                return Ok(Vec::new());
-            }
-        };
-
-        let mut request = tonic::Request::new(ListToolsRequest {});
-        if let Err(e) = self.authorize_gateway_request(&mut request).await {
-            tracing::warn!(
-                error = %e,
-                "no SEAL gateway operator token for tool enumeration; proceeding with built-in tools only"
-            );
-            return Ok(Vec::new());
+        let endpoint = self.gateway_endpoint(gateway_url)?;
+        match tokio::time::timeout(GATEWAY_CONNECT_TIMEOUT, endpoint.connect()).await {
+            Ok(Ok(channel)) => Ok(GatewayInvocationServiceClient::new(channel)),
+            Ok(Err(e)) => Err(SealSessionError::InternalError(format!(
+                "seal tooling gateway connect failed ({}): {e}",
+                SensitiveUrl::new(gateway_url)
+            ))),
+            Err(_) => Err(SealSessionError::InternalError(format!(
+                "seal tooling gateway connect timeout after {}s ({})",
+                GATEWAY_CONNECT_TIMEOUT.as_secs(),
+                SensitiveUrl::new(gateway_url)
+            ))),
         }
-        // Bound the RPC await: a hung `list_tools` MUST NOT cause the
-        // orchestrator to hang on the tool-invocation path.
-        let response = match tokio::time::timeout(
-            GATEWAY_LIST_TOOLS_TIMEOUT,
-            client.list_tools(request),
+    }
+
+    /// The endpoint of `gateway_url`.
+    fn gateway_endpoint(
+        &self,
+        gateway_url: &str,
+    ) -> Result<tonic::transport::Endpoint, SealSessionError> {
+        Ok(
+            tonic::transport::Endpoint::from_shared(gateway_url.to_string())
+                .map_err(|e| {
+                    SealSessionError::InternalError(format!(
+                        "seal tooling gateway invalid URL '{}': {e}",
+                        SensitiveUrl::new(gateway_url)
+                    ))
+                })?
+                .connect_timeout(GATEWAY_CONNECT_TIMEOUT),
         )
-        .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    gateway_url = %SensitiveUrl::new(gateway_url),
-                    error = %e,
-                    "SEAL gateway list_tools failed during tool enumeration; proceeding with built-in tools only"
-                );
-                return Ok(Vec::new());
-            }
-            Err(_) => {
-                tracing::warn!(
-                    gateway_url = %SensitiveUrl::new(gateway_url),
-                    timeout_secs = GATEWAY_LIST_TOOLS_TIMEOUT.as_secs(),
-                    "SEAL gateway list_tools timed out during tool enumeration; proceeding with built-in tools only"
-                );
-                return Ok(Vec::new());
-            }
-        };
-
-        let mut converted = Vec::new();
-        for item in response.into_inner().tools {
-            let input_schema = if !item.input_schema_json.is_empty() {
-                serde_json::from_str(&item.input_schema_json)
-                    .unwrap_or_else(|_| Self::dummy_input_schema(&item.kind))
-            } else {
-                Self::dummy_input_schema(&item.kind)
-            };
-            converted.push(crate::infrastructure::tool_router::ToolMetadata {
-                name: item.name,
-                description: item.description,
-                input_schema,
-                ..Default::default()
-            });
-        }
-
-        Ok(converted)
     }
 
     fn dummy_input_schema(kind: &str) -> serde_json::Value {
@@ -311,48 +325,34 @@ impl ToolInvocationService {
         }
     }
 
+    /// Call `tool_name` on the SEAL gateway. The tool goes by the kind the
+    /// gateway lists it under for this tenant: a CLI tool to `InvokeCli`
+    /// (it needs the execution's FSAL mounts), any other to
+    /// `InvokeWorkflow`. A tool the gateway does not list is answered as one
+    /// that does not exist, and nothing is invoked. A refusal the gateway
+    /// answers reaches the caller by its code (AEGIS ADR-132 H5).
     pub(super) async fn invoke_seal_gateway_internal_grpc(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
         tool_name: &str,
         args: serde_json::Value,
-        tenant_id: Option<&str>,
-        zaru_user_token: Option<&str>,
+        tenant_id: &TenantId,
     ) -> Result<serde_json::Value, SealSessionError> {
-        let gateway_url = self.seal_gateway_url.as_deref().ok_or_else(|| {
-            SealSessionError::ConfigurationError("seal_gateway.url is not configured".to_string())
-        })?;
+        let listing = ListToolsRequest {
+            tenant_id: tenant_id.as_str().to_string(),
+            ..Default::default()
+        };
+        let listed = self
+            .list_gateway_tools(listing, GATEWAY_INVOKE_TIMEOUT)
+            .await?
+            .into_iter()
+            .find(|tool| tool.name == tool_name);
+        let Some(listed) = listed else {
+            return Err(tool_not_found(tool_name));
+        };
 
-        // Bound the connect: an unreachable gateway must fail fast with a
-        // clear error rather than hanging the caller indefinitely.
-        let endpoint = tonic::transport::Endpoint::from_shared(gateway_url.to_string())
-            .map_err(|e| {
-                SealSessionError::InternalError(format!(
-                    "seal tooling gateway invalid URL '{}': {e}",
-                    SensitiveUrl::new(gateway_url)
-                ))
-            })?
-            .connect_timeout(GATEWAY_CONNECT_TIMEOUT);
-
-        let mut client =
-            match tokio::time::timeout(GATEWAY_CONNECT_TIMEOUT, endpoint.connect()).await {
-                Ok(Ok(channel)) => GatewayInvocationServiceClient::new(channel),
-                Ok(Err(e)) => {
-                    return Err(SealSessionError::InternalError(format!(
-                        "seal tooling gateway connect failed ({}): {e}",
-                        SensitiveUrl::new(gateway_url)
-                    )));
-                }
-                Err(_) => {
-                    return Err(SealSessionError::InternalError(format!(
-                        "seal tooling gateway connect timeout after {}s ({})",
-                        GATEWAY_CONNECT_TIMEOUT.as_secs(),
-                        SensitiveUrl::new(gateway_url)
-                    )));
-                }
-            };
-
-        if args.get("subcommand").is_some() {
+        let mut client = self.connect_gateway().await?;
+        if listed.kind == "cli" {
             let subcommand = args
                 .get("subcommand")
                 .and_then(|v| v.as_str())
@@ -396,7 +396,8 @@ impl ToolInvocationService {
                 subcommand,
                 args: cli_args,
                 fsal_mounts,
-                tenant_id: tenant_id.unwrap_or("").to_string(),
+                tenant_id: tenant_id.as_str().to_string(),
+                acting: None,
             });
             self.authorize_gateway_request(&mut request).await?;
             let response = match tokio::time::timeout(
@@ -406,11 +407,7 @@ impl ToolInvocationService {
             .await
             {
                 Ok(Ok(resp)) => resp.into_inner(),
-                Ok(Err(e)) => {
-                    return Err(SealSessionError::InternalError(format!(
-                        "seal tooling gateway invoke_cli failed: {e}"
-                    )));
-                }
+                Ok(Err(status)) => return Err(gateway_refusal("invoke_cli", tool_name, &status)),
                 Err(_) => {
                     return Err(SealSessionError::InternalError(format!(
                         "seal tooling gateway invoke_cli timeout after {}s",
@@ -430,8 +427,9 @@ impl ToolInvocationService {
             execution_id: execution_id.to_string(),
             workflow_name: tool_name.to_string(),
             input_json: args.to_string(),
-            zaru_user_token: zaru_user_token.unwrap_or("").to_string(),
-            tenant_id: tenant_id.unwrap_or("").to_string(),
+            zaru_user_token: String::new(),
+            tenant_id: tenant_id.as_str().to_string(),
+            acting: None,
         });
         self.authorize_gateway_request(&mut request).await?;
         let response =
@@ -439,10 +437,8 @@ impl ToolInvocationService {
                 .await
             {
                 Ok(Ok(resp)) => resp.into_inner(),
-                Ok(Err(e)) => {
-                    return Err(SealSessionError::InternalError(format!(
-                        "seal tooling gateway invoke_workflow failed: {e}"
-                    )));
+                Ok(Err(status)) => {
+                    return Err(gateway_refusal("invoke_workflow", tool_name, &status))
                 }
                 Err(_) => {
                     return Err(SealSessionError::InternalError(format!(
@@ -452,12 +448,91 @@ impl ToolInvocationService {
                 }
             };
 
-        if response.result_json.is_empty() {
-            return Ok(serde_json::json!({}));
-        }
+        parse_gateway_result(&response.result_json)
+    }
+}
 
-        serde_json::from_str(&response.result_json)
-            .map_err(|e| SealSessionError::InternalError(e.to_string()))
+/// The gRPC metadata key in which the SEAL gateway carries a refusal's
+/// AEGIS ADR-035 R5 code; the status message is the caller-facing text.
+pub(super) const REFUSAL_CODE_METADATA: &str = "seal-refusal-code";
+
+/// The answer for a tool nothing serves: the caller's tool name, never the
+/// node's tool list.
+pub(super) fn tool_not_found(tool_name: &str) -> SealSessionError {
+    SealSessionError::InternalError(format!("Tool not found: {tool_name}")).answered(
+        crate::domain::seal_session::CallerAnswer::NotFound(format!(
+            "Not found: tool '{tool_name}'."
+        )),
+    )
+}
+
+/// The result a gateway invocation answered, as JSON (`{}` when empty).
+fn parse_gateway_result(result_json: &str) -> Result<serde_json::Value, SealSessionError> {
+    if result_json.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(result_json).map_err(|e| SealSessionError::InternalError(e.to_string()))
+}
+
+/// What the caller is answered for a gateway RPC that failed with `status`
+/// (AEGIS ADR-132 H5; ADR-035 R5 and its rows for the gateway). A refusal
+/// carries its R5 code in [`REFUSAL_CODE_METADATA`] and its caller-facing
+/// text as the message, and is answered by that code's row, never as a tool
+/// that does not exist. What an agent's inner loop sees (ADR-035 R7) is the
+/// `shown` error of each: a refusal the agent cannot cure by retrying (no
+/// binding, a refused credential, a tool the server does not have) is shown
+/// as a not-found, which the loop feeds back as "not available, do not
+/// retry"; the server's own error, as invalid arguments with its text; an
+/// upstream or rate limit, as the upstream's failure. A failure with no code
+/// is internal: its detail goes to the operator's log only.
+pub(super) fn gateway_refusal(
+    rpc: &str,
+    tool_name: &str,
+    status: &tonic::Status,
+) -> SealSessionError {
+    use crate::domain::seal_session::{CallerAnswer, InternalFailure};
+    let code = status
+        .metadata()
+        .get(REFUSAL_CODE_METADATA)
+        .and_then(|value| value.to_str().ok());
+    let message = status.message().to_string();
+    let detail = || {
+        format!(
+            "seal tooling gateway {rpc} refused '{tool_name}' ({}): {message}",
+            code.unwrap_or("no code")
+        )
+    };
+    match code {
+        Some("CREDENTIAL_BINDING_REQUIRED") => SealSessionError::NotFound(message.clone())
+            .answered(CallerAnswer::CredentialBindingRequired { message }),
+        Some("CREDENTIAL_REJECTED") => SealSessionError::NotFound(message.clone())
+            .answered(CallerAnswer::CredentialRejected { message }),
+        Some("REMOTE_TOOL_ERROR") => SealSessionError::InvalidArguments(message.clone())
+            .answered(CallerAnswer::RemoteToolError(message)),
+        Some("CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL") => {
+            tracing::error!(
+                rpc,
+                tool = %tool_name,
+                "the SEAL gateway refused a call carrying a credential because its gRPC \
+                 listener is plaintext; serve the gateway's gRPC over TLS"
+            );
+            SealSessionError::InternalError(detail())
+                .answered(CallerAnswer::CredentialChannelNotConfidential)
+        }
+        Some("NOT_FOUND") => {
+            SealSessionError::InternalError(format!("Tool not found: {tool_name}"))
+                .answered(CallerAnswer::NotFound(message))
+        }
+        Some("INVALID_ARGUMENTS") => SealSessionError::InvalidArguments(message),
+        Some("RATE_LIMIT_EXCEEDED") | Some("UPSTREAM_UNAVAILABLE") => {
+            SealSessionError::UpstreamUnavailable(message)
+        }
+        Some("SERVICE_UNAVAILABLE") => SealSessionError::InternalError(detail())
+            .answered(CallerAnswer::Internal(InternalFailure::Unavailable)),
+        _ => SealSessionError::InternalError(format!(
+            "seal tooling gateway {rpc} failed ({:?}): {message}",
+            status.code()
+        )),
     }
 }
 
@@ -516,3 +591,7 @@ spec:
         assert_eq!(llm_timeout_seconds_of(&agent("")), 300);
     }
 }
+
+#[cfg(test)]
+#[path = "gateway_wire_tests.rs"]
+mod gateway_wire_tests;

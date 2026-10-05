@@ -1187,17 +1187,16 @@ impl ToolInvocationService {
         // No builtin serves the tool: the SEAL gateway is the one path for an
         // external tool (AEGIS ADR-132 G1, G4). The orchestrator runs no MCP
         // server of its own, so nothing here answers for a tool it did not run.
-        if self.seal_gateway_url.is_some() {
-            let gateway_result = self
-                .invoke_seal_gateway_internal_grpc(
-                    execution_id,
-                    &tool_name,
-                    args.clone(),
-                    Some(tenant_id.as_str()),
-                    None,
-                )
-                .await;
-            if let Ok(value) = gateway_result {
+        // What the gateway answers reaches the caller: its result, or its
+        // refusal by code (H5), never a not-found in place of a refusal.
+        let outcome = if self.seal_gateway_url.is_some() {
+            self.invoke_seal_gateway_internal_grpc(execution_id, &tool_name, args, tenant_id)
+                .await
+        } else {
+            Err(super::gateway::tool_not_found(&tool_name))
+        };
+        match outcome {
+            Ok(value) => {
                 self.publish_invocation_completed(
                     invocation_id,
                     execution_id,
@@ -1205,23 +1204,22 @@ impl ToolInvocationService {
                     &value,
                     started_at,
                 );
-                return Ok(ToolInvocationResult::Direct(value));
+                Ok(ToolInvocationResult::Direct(value))
+            }
+            Err(e) => {
+                // A tool nothing serves keeps the words its failure event has
+                // always carried; any other failure carries its own.
+                let message = match &e {
+                    SealSessionError::Answered {
+                        answer: crate::domain::seal_session::CallerAnswer::NotFound(_),
+                        ..
+                    } => format!("Tool not found: {tool_name}"),
+                    other => other.to_string(),
+                };
+                self.publish_invocation_failed(invocation_id, execution_id, *agent_id, message);
+                Err(e)
             }
         }
-        self.publish_invocation_failed(
-            invocation_id,
-            execution_id,
-            *agent_id,
-            format!("Tool not found: {tool_name}"),
-        );
-        // The tool name is the caller's; the node's list of tools is not.
-        Err(
-            SealSessionError::InternalError(format!("Tool not found: {tool_name}")).answered(
-                crate::domain::seal_session::CallerAnswer::NotFound(format!(
-                    "Not found: tool '{tool_name}'."
-                )),
-            ),
-        )
     }
 
     /// Attempt to dispatch an aegis.* tool by name. Returns `Some(result)` if
