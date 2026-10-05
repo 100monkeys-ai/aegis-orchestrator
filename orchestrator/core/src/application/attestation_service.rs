@@ -47,11 +47,12 @@ use crate::application::ports::{
 };
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
+use crate::domain::iam::ZaruTier;
 use crate::domain::seal_session::SealSession;
 use crate::domain::seal_session_repository::SealSessionRepository;
 use crate::domain::secrets::SensitiveString;
 use crate::domain::security_context::repository::SecurityContextRepository;
-use crate::domain::security_context::validate_context_ownership;
+use crate::domain::security_context::security_context::validate_context_entitlement;
 use crate::infrastructure::seal::attestation::{
     AttestationRequest, AttestationResponse, AttestationService,
 };
@@ -59,6 +60,18 @@ use crate::infrastructure::seal::envelope::{
     normalize_public_key_bytes, AudienceClaim, ContextClaims,
 };
 use crate::infrastructure::seal::signature::SecurityTokenIssuer;
+
+/// The principal asked to attest a security context its verified identity
+/// does not entitle it to (AEGIS ADR-035 — Updates, the attest-authority
+/// clauses). `reason` names the requested and the entitled context and goes
+/// only to the operator's log: the route answers 403 `CONTEXT_NOT_ALLOWED`
+/// with a fixed message that tells the caller nothing of which contexts
+/// exist.
+#[derive(Debug, thiserror::Error)]
+#[error("SecurityContext entitlement violation: {reason}")]
+pub struct ContextNotEntitled {
+    pub reason: String,
+}
 
 /// Concrete implementation of the SEAL attestation ceremony.
 ///
@@ -204,18 +217,26 @@ impl AttestationServiceImpl {
         // 1b. Resolve agent identity and applicable security context.
         let context_name = self.resolve_security_context_name(&request)?;
 
-        // 1b. Enforce tenant ownership of the SecurityContext name (ADR-056 Phase 5).
-        validate_context_ownership(&context_name, &request.tenant_id, &request.realm).map_err(
-            |msg| {
-                tracing::warn!(
-                    context_name = %context_name,
-                    tenant_id = %request.tenant_id,
-                    realm = ?request.realm,
-                    "SecurityContext ownership violation: {msg}"
-                );
-                anyhow::anyhow!("SecurityContext ownership violation: {msg}")
-            },
-        )?;
+        // 1b. Enforce that the principal may attest this context: it owns
+        // the name (ADR-056 Phase 5) and a `zaru-*` name is its own tier's.
+        // `request.zaru_tier` is the verified identity's tier, set by the
+        // route from the credential, never from the body.
+        let identity_tier = request.zaru_tier.as_deref().and_then(ZaruTier::from_claim);
+        validate_context_entitlement(
+            &context_name,
+            &request.tenant_id,
+            &request.realm,
+            identity_tier.as_ref(),
+        )
+        .map_err(|reason| {
+            tracing::warn!(
+                context_name = %context_name,
+                tenant_id = %request.tenant_id,
+                realm = ?request.realm,
+                "SecurityContext entitlement violation: {reason}"
+            );
+            anyhow::Error::new(ContextNotEntitled { reason })
+        })?;
 
         let security_context = self
             .security_context_repo
@@ -602,8 +623,8 @@ mod tests {
         assert!(response.is_err());
         let err_msg = response.unwrap_err().to_string();
         assert!(
-            err_msg.contains("ownership violation"),
-            "Expected ownership violation error, got: {err_msg}"
+            err_msg.contains("entitlement violation"),
+            "Expected entitlement violation error, got: {err_msg}"
         );
     }
 
@@ -682,8 +703,8 @@ mod tests {
         assert!(response.is_err());
         let err_msg = response.unwrap_err().to_string();
         assert!(
-            err_msg.contains("ownership violation"),
-            "Expected ownership violation, got: {err_msg}"
+            err_msg.contains("entitlement violation"),
+            "Expected entitlement violation, got: {err_msg}"
         );
     }
 
@@ -759,7 +780,7 @@ mod tests {
                     principal_subject: None,
                     user_id: None,
                     workload_id: None,
-                    zaru_tier: None,
+                    zaru_tier: Some("pro".to_string()),
                     tenant_id: TenantId::consumer(),
                     realm: RealmKind::Consumer,
                     task_summary: Some(summary),

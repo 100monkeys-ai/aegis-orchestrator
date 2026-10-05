@@ -55,9 +55,7 @@ use aegis_orchestrator_core::domain::workflow::WorkflowId;
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use aegis_orchestrator_core::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
 use aegis_orchestrator_core::infrastructure::repositories::InMemoryVolumeRepository;
-use aegis_orchestrator_core::infrastructure::seal::attestation::{
-    AttestationRequest, AttestationService,
-};
+use aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService;
 use aegis_orchestrator_core::infrastructure::seal::envelope::SealEnvelope;
 use aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware;
 use aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository;
@@ -67,7 +65,7 @@ use aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider;
 use aegis_orchestrator_core::infrastructure::tool_router::ToolRouter;
 use aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter;
 
-use super::{attest_binding, AttestCaller, HttpAttestationRequest};
+use super::{attest_binding, attestation_request, AttestCaller, HttpAttestationRequest};
 use crate::daemon::api_key_identity::resolve_api_key;
 use crate::daemon::api_key_identity::test_keys::{key_row, KeyTable};
 
@@ -493,20 +491,7 @@ async fn attest_with(
         .await
         .expect("the key attests");
     // The route's mapping of the body and the binding (`attest_seal_handler`).
-    let internal = AttestationRequest {
-        agent_id: request.agent_id.clone(),
-        execution_id: request.execution_id.clone(),
-        container_id: request.container_id.clone(),
-        public_key_pem: request.public_key.clone(),
-        security_context: request.security_context.clone(),
-        principal_subject: request.principal_subject.clone(),
-        user_id: binding.user_id.clone(),
-        workload_id: request.workload_id.clone(),
-        zaru_tier: request.zaru_tier.clone(),
-        tenant_id: binding.tenant_id.clone(),
-        realm: binding.realm.clone(),
-        task_summary: request.task_summary.clone(),
-    };
+    let internal = attestation_request(&request, &binding);
     assert_eq!(binding.realm, RealmKind::Consumer);
     let attested = attestation
         .attest_with_escalation(internal, binding.escalation)
@@ -1524,5 +1509,390 @@ async fn an_attachment_in_the_callers_own_non_persistent_volume_answers_not_foun
     assert_eq!(
         read,
         json!({"status": "error", "error": "not_found", "message": format!("volume {id} not found")}),
+    );
+}
+
+// ── What a caller may attest: the context and the tier are its identity's ──
+//
+// The audit `seal-conformance-audit` (2026-10-05, deviation 1, High): the
+// attest route took the security context and the tier from the body, so a
+// caller holding any valid consumer credential attested a context of a
+// higher tier, and the tier's limits followed it. Each test below attests
+// through the route's own binding (`attest_binding`), the route's own
+// mapping (`attestation_request`) and the real attestation service, with
+// every context production configures (`aegis-platform-deployment`
+// `podman/pods/core/aegis-config.yaml`: the four `zaru-*` and
+// `aegis-system-operator`).
+
+const OTHER_KEY: &str = "aegis_attest-authority-key";
+
+fn named_context(name: &str) -> SecurityContext {
+    SecurityContext {
+        name: name.to_string(),
+        ..zaru_pro()
+    }
+}
+
+/// What one attestation answered, and the session it saved.
+struct Attested {
+    result: Result<aegis_orchestrator_core::infrastructure::seal::attestation::AttestationResponse>,
+    sessions: Arc<InMemorySealSessionRepository>,
+}
+
+impl Attested {
+    /// The context and the tier the session was granted.
+    async fn granted(&self) -> (String, Option<String>) {
+        let response = self
+            .result
+            .as_ref()
+            .unwrap_or_else(|e| panic!("attested: {e:#}"));
+        let session = aegis_orchestrator_core::domain::seal_session_repository::SealSessionRepository::find_active_by_security_token(
+            self.sessions.as_ref(),
+            &response.security_token,
+        )
+        .await
+        .unwrap()
+        .expect("the attested session is saved");
+        (
+            session.security_context.name.clone(),
+            session.zaru_tier.clone(),
+        )
+    }
+
+    /// Refused, with nothing saved.
+    fn refused(&self) -> &anyhow::Error {
+        match &self.result {
+            Ok(_) => panic!("attestation was granted"),
+            Err(e) => e,
+        }
+    }
+}
+
+/// Attest as `caller` with `body`, through the route's binding and mapping.
+async fn attest_as(caller: &AttestCaller, body: Value) -> Attested {
+    let contexts = Arc::new(InMemorySecurityContextRepository::new());
+    for name in [
+        "zaru-free",
+        "zaru-pro",
+        "zaru-business",
+        "zaru-enterprise",
+        "aegis-system-operator",
+    ] {
+        contexts.save(named_context(name)).await.unwrap();
+    }
+    let sessions = Arc::new(InMemorySealSessionRepository::new());
+    let issuer =
+        Arc::new(SecurityTokenIssuer::new(&seal_signing_pem(), "aegis-orchestrator").unwrap());
+    let attestation = AttestationServiceImpl::new(contexts, sessions.clone(), issuer);
+    let request: HttpAttestationRequest =
+        serde_json::from_value(body).expect("the caller's body parses");
+    let binding = attest_binding(no_lookup(), Some(caller), &request)
+        .await
+        .expect("the caller is bound");
+    let result = attestation
+        .attest_with_escalation(attestation_request(&request, &binding), binding.escalation)
+        .await;
+    Attested { result, sessions }
+}
+
+/// An `aegis_*` key whose stored tier column is `tier` (`None`: NULL), as
+/// `authenticate_attest_request` resolves it.
+async fn key_with_tier(tier: Option<&str>) -> AttestCaller {
+    let tenant = TenantId::for_consumer_user(SUB).unwrap();
+    let mut row = key_row(OTHER_KEY, SUB, tenant.as_str(), None);
+    row.zaru_tier = tier.map(str::to_string);
+    let table = KeyTable {
+        rows: vec![row],
+        escalations: None,
+    };
+    let resolved = resolve_api_key(Some(&table), OTHER_KEY)
+        .await
+        .expect("the key resolves");
+    AttestCaller {
+        identity: resolved.identity,
+        escalation: resolved
+            .escalation
+            .map(|escalation| (escalation, resolved.home_tenant)),
+    }
+}
+
+/// A consumer whose verified token says `tier`, as the IAM service resolves it.
+fn consumer_jwt(tier: ZaruTier) -> AttestCaller {
+    let mut caller = jwt_caller(SUB);
+    caller.identity.identity_kind = IdentityKind::ConsumerUser {
+        zaru_tier: tier,
+        tenant_id: TenantId::for_consumer_user(SUB).unwrap(),
+    };
+    caller
+}
+
+/// A key with no stored role holding an active operator escalation, as
+/// `resolve_api_key` resolves it (AEGIS ADR-129 D14).
+fn escalated_key() -> AttestCaller {
+    let now = chrono::Utc::now();
+    let escalation = aegis_orchestrator_core::domain::operator_escalation::OperatorEscalation {
+        id: uuid::Uuid::new_v4(),
+        api_key_id: uuid::Uuid::new_v4(),
+        consumer_sub: SUB.to_string(),
+        system_sub: "9f000000-system-sub".to_string(),
+        aegis_role: aegis_orchestrator_core::domain::iam::AegisRole::Operator,
+        code_id: uuid::Uuid::new_v4(),
+        started_at: now,
+        expires_at: now + chrono::Duration::minutes(30),
+        ended_at: None,
+        end_reason: None,
+    };
+    AttestCaller {
+        identity: UserIdentity {
+            sub: SUB.to_string(),
+            realm_slug: "aegis-system".to_string(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind: IdentityKind::Operator {
+                aegis_role: aegis_orchestrator_core::domain::iam::AegisRole::Operator,
+            },
+        },
+        escalation: Some((
+            escalation,
+            TenantId::for_consumer_user(SUB)
+                .unwrap()
+                .as_str()
+                .to_string(),
+        )),
+    }
+}
+
+/// The Zaru MCP server's attest body (`aegis-mcp-tools` `688b587`,
+/// `zaru-mcp-server/src/mcp/orchestrator-client.ts` 903-911) for a
+/// consumer: the context `zaru-<tier>` and the tier it holds for the caller.
+fn mcp_server_body(context: &str, tier: &str) -> Value {
+    json!({
+        "workload_id": format!("zaru:{SUB}:session-1"),
+        "security_context": context,
+        "zaru_tier": tier,
+        "public_key": STANDARD.encode([7u8; 32]),
+    })
+}
+
+/// Zaru Web's attest body (`zaru-client` `76ac76e`, `lib/seal/attestation.ts`
+/// 30-56; the turn `lib/chat/turn.ts` 759-766 and the goal runner
+/// `lib/cloudflare/durable-objects.ts` 281-288 call the same function).
+fn zaru_web_body(tier: &str, context: &str) -> Value {
+    json!({
+        "agent_public_key": STANDARD.encode([9u8; 32]),
+        "user_id": SUB,
+        "zaru_tier": tier,
+        "workload_id": format!("zaru-session-{SUB}-1"),
+        "security_context": context,
+    })
+}
+
+/// The finding: a free key's body asks for `zaru-enterprise` with
+/// `zaru_tier: "enterprise"`, as the audit names it. The identity's tier is
+/// free; the body is not trusted for the context or the tier.
+#[tokio::test]
+async fn a_free_key_asking_for_the_enterprise_context_is_refused() {
+    let attested = attest_as(
+        &key_with_tier(Some("free")).await,
+        mcp_server_body("zaru-enterprise", "enterprise"),
+    )
+    .await;
+    if let Ok(_) = &attested.result {
+        let (context, tier) = attested.granted().await;
+        panic!("a free key was granted {context} with tier {tier:?}");
+    }
+}
+
+/// The same for a consumer whose verified token says free.
+#[tokio::test]
+async fn a_free_consumer_token_asking_for_a_higher_tier_is_refused() {
+    for (context, tier) in [
+        ("zaru-pro", "pro"),
+        ("zaru-business", "business"),
+        ("zaru-enterprise", "enterprise"),
+    ] {
+        let attested = attest_as(
+            &consumer_jwt(ZaruTier::Free),
+            mcp_server_body(context, tier),
+        )
+        .await;
+        if let Ok(_) = &attested.result {
+            let (granted, tier) = attested.granted().await;
+            panic!("a free token was granted {granted} with tier {tier:?}");
+        }
+    }
+}
+
+/// The tier a session's rate limits follow is the identity's, whatever the
+/// body says: a pro key naming its own context with `zaru_tier: "enterprise"`
+/// is granted its context with its own tier.
+#[tokio::test]
+async fn the_body_tier_is_not_trusted() {
+    let attested = attest_as(
+        &key_with_tier(Some("pro")).await,
+        mcp_server_body("zaru-pro", "enterprise"),
+    )
+    .await;
+    assert_eq!(
+        attested.granted().await,
+        ("zaru-pro".to_string(), Some("pro".to_string()))
+    );
+}
+
+/// Every caller that attests today, each with what it sends, granted
+/// exactly what its verified identity entitles it to.
+#[tokio::test]
+async fn every_deployed_caller_is_granted_exactly_its_identitys_context_and_tier() {
+    let pro = || Some("pro".to_string());
+    let cases: Vec<(&str, AttestCaller, Value, (String, Option<String>))> = vec![
+        (
+            "Zaru MCP server, an API key whose row says pro",
+            key_with_tier(Some("pro")).await,
+            mcp_server_body("zaru-pro", "pro"),
+            ("zaru-pro".to_string(), pro()),
+        ),
+        (
+            "Zaru MCP server, an API key with no stored tier (free)",
+            key_with_tier(None).await,
+            mcp_server_body("zaru-free", "free"),
+            ("zaru-free".to_string(), Some("free".to_string())),
+        ),
+        (
+            "Zaru MCP server, an OAuth user whose token says business",
+            consumer_jwt(ZaruTier::Business),
+            mcp_server_body("zaru-business", "business"),
+            ("zaru-business".to_string(), Some("business".to_string())),
+        ),
+        (
+            "Zaru MCP server, a key holding an operator escalation",
+            escalated_key(),
+            json!({
+                "workload_id": format!("zaru:{SUB}:session-1"),
+                "security_context": "aegis-system-operator",
+                "aegis_role": "operator",
+                "public_key": STANDARD.encode([7u8; 32]),
+            }),
+            ("aegis-system-operator".to_string(), None),
+        ),
+        (
+            "Zaru Web's turn and goal runner, a signed-in user whose token says enterprise",
+            consumer_jwt(ZaruTier::Enterprise),
+            zaru_web_body("enterprise", "zaru-enterprise"),
+            (
+                "zaru-enterprise".to_string(),
+                Some("enterprise".to_string()),
+            ),
+        ),
+        (
+            "Zaru Web's turn and goal runner, a free user",
+            consumer_jwt(ZaruTier::Free),
+            zaru_web_body("free", "zaru-free"),
+            ("zaru-free".to_string(), Some("free".to_string())),
+        ),
+        (
+            "Zaru Web's turn and goal runner, an API key session whose row says pro",
+            key_with_tier(Some("pro")).await,
+            zaru_web_body("pro", "zaru-pro"),
+            ("zaru-pro".to_string(), pro()),
+        ),
+        (
+            "Zaru Web's turn and goal runner, a key holding an operator escalation",
+            escalated_key(),
+            zaru_web_body("pro", "aegis-system-operator"),
+            ("aegis-system-operator".to_string(), None),
+        ),
+    ];
+    for (who, caller, body, expected) in cases {
+        let attested = attest_as(&caller, body).await;
+        if let Err(e) = &attested.result {
+            panic!("{who}: refused: {e:#}");
+        }
+        assert_eq!(attested.granted().await, expected, "{who}");
+    }
+}
+
+/// Nothing above the identity's own context: another tier's context, the
+/// operator context, an unknown name and a bare name are refused alike.
+#[tokio::test]
+async fn a_consumer_is_refused_every_context_but_its_own() {
+    for context in [
+        "zaru-free",
+        "zaru-business",
+        "zaru-enterprise",
+        "zaru-nonexistent",
+        "aegis-system-operator",
+        "research-safe",
+    ] {
+        let attested = attest_as(
+            &consumer_jwt(ZaruTier::Pro),
+            mcp_server_body(context, "pro"),
+        )
+        .await;
+        attested.refused();
+    }
+}
+
+/// The route's answer to a failed attestation, and the log it wrote.
+async fn attest_answer(error: &anyhow::Error) -> Answer {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let response = tracing::subscriber::with_default(subscriber, || {
+        super::attest_failure_response(error, "u-tenant")
+    });
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+    Answer {
+        status,
+        headers,
+        body,
+        log,
+    }
+}
+
+/// A refused context is 403 `CONTEXT_NOT_ALLOWED` in ADR-035's shape, with
+/// one fixed message: the body names neither the context asked for nor the
+/// caller's own, and an unknown name is answered exactly as a known one, so
+/// nothing tells which contexts exist. The log holds which was asked.
+#[tokio::test]
+async fn a_refused_context_is_403_context_not_allowed_naming_no_context() {
+    let mut bodies = Vec::new();
+    for context in [
+        "zaru-enterprise",
+        "zaru-nonexistent",
+        "aegis-system-operator",
+    ] {
+        let attested = attest_as(
+            &key_with_tier(Some("free")).await,
+            mcp_server_body(context, "enterprise"),
+        )
+        .await;
+        let answer = attest_answer(attested.refused()).await;
+        answer.assert_shape(403, "CONTEXT_NOT_ALLOWED", "policy_violation");
+        assert_eq!(
+            answer.message(),
+            "The security context this attestation asked for is not one your identity may attest."
+        );
+        assert_eq!(answer.body["error"]["context"], Value::Null);
+        assert_eq!(answer.body["error"]["tool"], Value::Null);
+        answer.assert_detail_only_in_log(&[context]);
+        assert!(!answer.body.to_string().contains("zaru-free"));
+        let mut body = answer.body.clone();
+        body["request_id"] = Value::Null;
+        bodies.push(body);
+    }
+    assert!(
+        bodies.windows(2).all(|w| w[0] == w[1]),
+        "every refused context is answered alike: {bodies:?}"
     );
 }

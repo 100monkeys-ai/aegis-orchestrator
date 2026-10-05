@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::capability::Capability;
-use crate::domain::iam::RealmKind;
+use crate::domain::iam::{RealmKind, ZaruTier};
 use crate::domain::tenant::TenantId;
 
 /// Describes why a tool invocation was rejected by security policy evaluation.
@@ -363,10 +363,110 @@ pub fn validate_context_ownership(
     ))
 }
 
+/// Validate that the principal may attest a session bound to `context_name`:
+/// it owns the name ([`validate_context_ownership`]) and, for a `zaru-*`
+/// name, the name is its own tier's.
+///
+/// A consumer's context is its tier's and no other: the records map each
+/// consumer identity to exactly one context (AEGIS ADR-073 §13c,
+/// `zaru_tier.security_context_name()`; ADR-041's ZaruAuthMiddleware,
+/// `tier.to_security_context_name()`; ADR-071, step 4), and none lets it
+/// choose another, higher or lower. `zaru_tier` is the tier of the verified
+/// identity, never a value the caller wrote; a consumer with no verified
+/// tier is entitled to no `zaru-*` context. The `tenant-{slug}-*` and
+/// `aegis-system-*` rules are [`validate_context_ownership`]'s, unchanged.
+///
+/// # Errors
+///
+/// Returns a human-readable reason for the operator's log. It names the
+/// requested context and the entitled one, so it is never shown to the
+/// caller.
+pub fn validate_context_entitlement(
+    context_name: &str,
+    tenant_id: &TenantId,
+    realm: &RealmKind,
+    zaru_tier: Option<&ZaruTier>,
+) -> Result<(), String> {
+    validate_context_ownership(context_name, tenant_id, realm)?;
+    if context_name.starts_with("zaru-") {
+        let entitled = zaru_tier.map(ZaruTier::to_security_context_name);
+        if entitled != Some(context_name) {
+            return Err(format!(
+                "SecurityContext '{}' is not the requesting consumer's own tier context \
+                 (entitled: {}; tenant '{}')",
+                context_name,
+                entitled.unwrap_or("none: no verified tier"),
+                tenant_id.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_consumer_is_entitled_to_its_own_tier_context_only() {
+        let tenant = TenantId::for_consumer_user("user-1").unwrap();
+        let tiers = [
+            ZaruTier::Free,
+            ZaruTier::Pro,
+            ZaruTier::Business,
+            ZaruTier::Enterprise,
+        ];
+        for own in &tiers {
+            for asked in &tiers {
+                let result = validate_context_entitlement(
+                    asked.to_security_context_name(),
+                    &tenant,
+                    &RealmKind::Consumer,
+                    Some(own),
+                );
+                assert_eq!(result.is_ok(), own == asked, "{own:?} asking {asked:?}");
+            }
+        }
+        assert!(
+            validate_context_entitlement("zaru-free", &tenant, &RealmKind::Consumer, None).is_err(),
+            "no verified tier, no zaru context"
+        );
+        assert!(validate_context_entitlement(
+            "zaru-nonexistent",
+            &tenant,
+            &RealmKind::Consumer,
+            Some(&ZaruTier::Enterprise)
+        )
+        .is_err());
+        assert!(validate_context_entitlement(
+            "aegis-system-operator",
+            &tenant,
+            &RealmKind::Consumer,
+            Some(&ZaruTier::Enterprise)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_system_and_tenant_rules_are_ownerships() {
+        let system = TenantId::system();
+        assert!(validate_context_entitlement(
+            "aegis-system-operator",
+            &system,
+            &RealmKind::System,
+            None
+        )
+        .is_ok());
+        let tenant = TenantId::from_realm_slug("acme-corp").unwrap();
+        let realm = RealmKind::Tenant {
+            slug: "acme-corp".to_string(),
+        };
+        assert!(
+            validate_context_entitlement("tenant-acme-corp-research", &tenant, &realm, None)
+                .is_ok()
+        );
+    }
 
     fn test_metadata() -> SecurityContextMetadata {
         SecurityContextMetadata {

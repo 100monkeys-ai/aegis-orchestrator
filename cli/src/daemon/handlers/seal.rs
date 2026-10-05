@@ -9,13 +9,16 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 
+use aegis_orchestrator_core::application::attestation_service::ContextNotEntitled;
 use aegis_orchestrator_core::application::execution::ExecutionService;
-use aegis_orchestrator_core::domain::iam::{IdentityKind, RealmKind, UserIdentity};
+use aegis_orchestrator_core::domain::iam::{IdentityKind, RealmKind, UserIdentity, ZaruTier};
 use aegis_orchestrator_core::domain::shared_kernel::ExecutionId;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 
 use aegis_orchestrator_core::domain::operator_escalation::OperatorEscalation;
-use aegis_orchestrator_core::domain::seal_session::{SealOperatorEscalation, SealSessionError};
+use aegis_orchestrator_core::domain::seal_session::{
+    CallerAnswer, SealOperatorEscalation, SealSessionError,
+};
 
 use crate::daemon::api_key_identity::{key_hash_prefix, lookup_from_repo, resolve_api_key};
 use crate::daemon::state::AppState;
@@ -33,7 +36,9 @@ pub struct HttpAttestationRequest {
     // subject, never a value the body names (AEGIS ADR-035 — Updates, S1). A
     // body that still sends one is ignored.
     pub workload_id: Option<String>,
-    pub zaru_tier: Option<String>,
+    // No `zaru_tier`: the session's tier is the verified identity's, never
+    // a value the body names (AEGIS ADR-035 — Updates, the attest-authority
+    // clauses). A body that still sends one is ignored.
     pub tenant_id: Option<String>,
     pub task_summary: Option<String>,
 }
@@ -398,6 +403,12 @@ pub(crate) struct AttestBinding {
     pub(crate) tenant_id: TenantId,
     pub(crate) realm: RealmKind,
     pub(crate) user_id: Option<String>,
+    /// The tier of the verified identity: a consumer's `zaru_tier` as its
+    /// identity provider signed it, or as its API key's row stores it; none
+    /// for any other identity, an escalated key included. The body's
+    /// `zaru_tier` is never read (AEGIS ADR-035 — Updates, the
+    /// attest-authority clauses).
+    pub(crate) zaru_tier: Option<ZaruTier>,
     pub(crate) escalation: Option<SealOperatorEscalation>,
 }
 
@@ -439,6 +450,7 @@ where
             tenant_id,
             realm: RealmKind::System,
             user_id: Some(escalation.consumer_sub.clone()),
+            zaru_tier: None,
             escalation: Some(SealOperatorEscalation {
                 escalation_id: escalation.id,
                 aegis_role: escalation.aegis_role.clone(),
@@ -454,8 +466,41 @@ where
         tenant_id,
         realm: identity.realm_kind(),
         user_id: Some(identity.sub.clone()),
+        zaru_tier: match &identity.identity_kind {
+            IdentityKind::ConsumerUser { zaru_tier, .. } => Some(zaru_tier.clone()),
+            _ => None,
+        },
         escalation: None,
     })
+}
+
+/// The attestation service's request for one call of `/v1/seal/attest`:
+/// the body's key, workload and requested context, and what the session is
+/// attested as from the binding. The tier is the binding's, the verified
+/// identity's: the body's `zaru_tier` is not read, so neither the context the
+/// service admits nor the tier the session's rate limits follow is a value
+/// the caller wrote.
+pub(crate) fn attestation_request(
+    request: &HttpAttestationRequest,
+    binding: &AttestBinding,
+) -> aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {
+    aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {
+        agent_id: request.agent_id.clone(),
+        execution_id: request.execution_id.clone(),
+        container_id: request.container_id.clone(),
+        public_key_pem: request.public_key.clone(),
+        security_context: request.security_context.clone(),
+        principal_subject: request.principal_subject.clone(),
+        user_id: binding.user_id.clone(),
+        workload_id: request.workload_id.clone(),
+        zaru_tier: binding
+            .zaru_tier
+            .as_ref()
+            .map(|tier| tier.to_claim_str().to_string()),
+        tenant_id: binding.tenant_id.clone(),
+        realm: binding.realm.clone(),
+        task_summary: request.task_summary.clone(),
+    }
 }
 
 pub(crate) async fn attest_seal_handler(
@@ -504,21 +549,7 @@ pub(crate) async fn attest_seal_handler(
     // `aegis-system-*` SecurityContext ownership checks see the right realm
     // for operator-issued attestations.
 
-    let internal_req =
-        aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {
-            agent_id: request.agent_id.clone(),
-            execution_id: request.execution_id.clone(),
-            container_id: request.container_id.clone(),
-            public_key_pem: request.public_key.clone(),
-            security_context: request.security_context.clone(),
-            principal_subject: request.principal_subject.clone(),
-            user_id: binding.user_id.clone(),
-            workload_id: request.workload_id.clone(),
-            zaru_tier: request.zaru_tier.clone(),
-            tenant_id: binding.tenant_id.clone(),
-            realm: binding.realm.clone(),
-            task_summary: request.task_summary.clone(),
-        };
+    let internal_req = attestation_request(&request, &binding);
 
     let tenant_for_log = internal_req.tenant_id.as_str().to_string();
     match state
@@ -543,22 +574,63 @@ pub(crate) async fn attest_seal_handler(
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::warn!(
-                target: "aegis::seal::attest",
-                tenant_id = %tenant_for_log,
-                error = %e,
-                "attestation_service.attest failed"
-            );
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": e.to_string()
-                })),
-            )
-                .into_response()
-        }
+        Err(e) => attest_failure_response(&e, &tenant_for_log),
     }
+}
+
+/// The answer of `/v1/seal/attest` to a failed attestation. A context the
+/// caller's identity is not entitled to is refused 403 `CONTEXT_NOT_ALLOWED`
+/// in AEGIS ADR-035's shape (Update of 2026-10-04, R1), with a fixed message
+/// that names no context; which context was asked and which is the
+/// caller's go only to the log, under the body's `request_id`. Every other
+/// failure is answered as before.
+pub(crate) fn attest_failure_response(
+    e: &anyhow::Error,
+    tenant_for_log: &str,
+) -> axum::response::Response {
+    if let Some(not_entitled) = e.downcast_ref::<ContextNotEntitled>() {
+        let refusal = SealSessionError::InvalidArguments(not_entitled.reason.clone())
+            .answered(CallerAnswer::ContextNotAllowed)
+            .refusal();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        tracing::info!(
+            target: "aegis::seal::attest",
+            request_id = %request_id,
+            code = refusal.code,
+            tenant_id = %tenant_for_log,
+            error = %e,
+            "attestation refused"
+        );
+        let status = StatusCode::from_u16(refusal.http_status).unwrap_or(StatusCode::FORBIDDEN);
+        return (
+            status,
+            Json(serde_json::json!({
+                "protocol": "seal/v1",
+                "request_id": request_id,
+                "status": refusal.status,
+                "error": {
+                    "code": refusal.code,
+                    "message": refusal.message,
+                    "context": serde_json::Value::Null,
+                    "tool": serde_json::Value::Null,
+                },
+            })),
+        )
+            .into_response();
+    }
+    tracing::warn!(
+        target: "aegis::seal::attest",
+        tenant_id = %tenant_for_log,
+        error = %e,
+        "attestation_service.attest failed"
+    );
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": e.to_string()
+        })),
+    )
+        .into_response()
 }
 
 pub(crate) async fn invoke_seal_handler(
@@ -735,7 +807,6 @@ mod attest_tenant_resolution_tests {
             security_context: None,
             principal_subject: None,
             workload_id: None,
-            zaru_tier: None,
             tenant_id: None,
             task_summary: None,
         }
@@ -988,7 +1059,6 @@ mod operator_escalation_attest_tests {
             security_context: Some(security_context.to_string()),
             principal_subject: None,
             workload_id: Some("zaru:u:s".to_string()),
-            zaru_tier: None,
             // The body naming another tenant changes nothing for an
             // escalated key.
             tenant_id: Some("u-someoneelse".to_string()),
@@ -1049,6 +1119,7 @@ mod operator_escalation_attest_tests {
                 tenant_id: home(),
                 realm: RealmKind::System,
                 user_id: Some(CONSUMER_SUB.to_string()),
+                zaru_tier: None,
                 escalation: Some(SealOperatorEscalation {
                     escalation_id: e.id,
                     aegis_role: AegisRole::Operator,

@@ -185,6 +185,11 @@ pub enum CallerAnswer {
     PathNotAllowed(String),
     /// The caller named a resource of another tenant (403 `TENANT_MISMATCH`).
     TenantMismatch(String),
+    /// The caller asked `POST /v1/seal/attest` for a security context its
+    /// verified identity does not entitle it to (403 `CONTEXT_NOT_ALLOWED`,
+    /// AEGIS ADR-035 — Updates, the attest-authority clauses). The message is
+    /// fixed: it names no context, so it tells nothing of which exist.
+    ContextNotAllowed,
     /// The operation the caller asked for is not built yet (501 `NOT_IMPLEMENTED`).
     NotImplemented(String),
     /// The caller's own edge did not answer (503 `EDGE_UNAVAILABLE`).
@@ -233,6 +238,10 @@ pub struct SealRefusal {
     pub rate_limit: Option<RateLimitHint>,
 }
 
+/// The fixed message of an attestation refused for a context the caller's
+/// identity is not entitled to.
+pub const CONTEXT_NOT_ALLOWED_MESSAGE: &str =
+    "The security context this attestation asked for is not one your identity may attest.";
 /// The fixed message of an internal failure of each class (R3).
 pub const INTERNAL_ERROR_MESSAGE: &str =
     "The request could not be completed because of an internal error.";
@@ -388,6 +397,11 @@ impl SealSessionError {
                 CallerAnswer::TenantMismatch(m) => {
                     SealRefusal::caller(403, "TENANT_MISMATCH", m.clone())
                 }
+                CallerAnswer::ContextNotAllowed => SealRefusal::policy(
+                    403,
+                    "CONTEXT_NOT_ALLOWED",
+                    CONTEXT_NOT_ALLOWED_MESSAGE.to_string(),
+                ),
                 CallerAnswer::NotImplemented(m) => {
                     SealRefusal::caller(501, "NOT_IMPLEMENTED", m.clone())
                 }
@@ -979,6 +993,12 @@ mod tests {
                 403,
                 "TENANT_MISMATCH",
                 "error",
+            ),
+            (
+                answered(CallerAnswer::ContextNotAllowed),
+                403,
+                "CONTEXT_NOT_ALLOWED",
+                "policy_violation",
             ),
             (
                 answered(CallerAnswer::NotImplemented("x".into())),
