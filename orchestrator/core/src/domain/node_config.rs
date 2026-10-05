@@ -1847,8 +1847,16 @@ pub struct GrpcAuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SealGatewayConfig {
     /// gRPC endpoint URL of the gateway invocation service.
-    /// Example: "http://aegis-seal-gateway:50055"
+    /// Example: "https://aegis-seal-gateway:50055". An `https` address is
+    /// dialled over TLS and the gateway's certificate verified; a call that
+    /// would carry a person's credential is never sent to an `http` address
+    /// (AEGIS ADR-132 H8).
     pub url: SensitiveUrl,
+
+    /// The PEM file of the CA the gateway's TLS certificate is verified
+    /// against (AEGIS ADR-132 H8). Absent: the system's root certificates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<std::path::PathBuf>,
 }
 
 /// Configuration for the Zaru consumer product service.

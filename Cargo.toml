@@ -75,7 +75,11 @@ nfsserve = "0.10"
 bincode = "1"
 
 # gRPC
-tonic = "0.14"
+# `tls-ring` dials the SEAL gateway over TLS, verified against a configured CA
+# (AEGIS ADR-132 H8); `tls-native-roots` gives the system roots when none is
+# configured. Both are compiled already through opentelemetry-otlp's
+# `tls-ring` and `tls-roots`; naming them here makes the dependency direct.
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 prost = "0.14"
 
 # Utilities

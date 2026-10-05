@@ -114,6 +114,9 @@ tokio-test = "0.4"
 tempfile = "3.27"
 mockito = "1"
 tower = { version = "0.4", features = ["util"] }
+# Generates the throwaway certificate the loopback SEAL gateway serves in the
+# TLS tests (tool_invocation_service/gateway_wire_tests.rs).
+rcgen = "0.14"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

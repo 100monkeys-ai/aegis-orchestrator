@@ -293,21 +293,35 @@ impl ToolInvocationService {
         }
     }
 
-    /// The endpoint of `gateway_url`.
+    /// The endpoint of `gateway_url`. An `https` gateway is dialled over TLS
+    /// and its certificate verified against the configured CA, or the
+    /// system's roots when none is configured (AEGIS ADR-132 H8); the name
+    /// verified is the URL's host.
     fn gateway_endpoint(
         &self,
         gateway_url: &str,
     ) -> Result<tonic::transport::Endpoint, SealSessionError> {
-        Ok(
-            tonic::transport::Endpoint::from_shared(gateway_url.to_string())
-                .map_err(|e| {
-                    SealSessionError::InternalError(format!(
-                        "seal tooling gateway invalid URL '{}': {e}",
-                        SensitiveUrl::new(gateway_url)
-                    ))
-                })?
-                .connect_timeout(GATEWAY_CONNECT_TIMEOUT),
-        )
+        let endpoint = tonic::transport::Endpoint::from_shared(gateway_url.to_string())
+            .map_err(|e| {
+                SealSessionError::InternalError(format!(
+                    "seal tooling gateway invalid URL '{}': {e}",
+                    SensitiveUrl::new(gateway_url)
+                ))
+            })?
+            .connect_timeout(GATEWAY_CONNECT_TIMEOUT);
+        if !gateway_url_is_tls(gateway_url) {
+            return Ok(endpoint);
+        }
+        let tls = match &self.seal_gateway_ca {
+            Some(ca) => tonic::transport::ClientTlsConfig::new().ca_certificate(ca.clone()),
+            None => tonic::transport::ClientTlsConfig::new().with_native_roots(),
+        };
+        endpoint.tls_config(tls).map_err(|e| {
+            SealSessionError::InternalError(format!(
+                "seal tooling gateway TLS configuration for '{}' failed: {e}",
+                SensitiveUrl::new(gateway_url)
+            ))
+        })
     }
 
     fn dummy_input_schema(kind: &str) -> serde_json::Value {
@@ -450,6 +464,11 @@ impl ToolInvocationService {
 
         parse_gateway_result(&response.result_json)
     }
+}
+
+/// Whether `gateway_url` names a TLS endpoint (`https`).
+pub(super) fn gateway_url_is_tls(gateway_url: &str) -> bool {
+    url::Url::parse(gateway_url).is_ok_and(|url| url.scheme() == "https")
 }
 
 /// The gRPC metadata key in which the SEAL gateway carries a refusal's

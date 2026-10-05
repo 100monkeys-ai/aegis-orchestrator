@@ -132,6 +132,10 @@ pub struct ToolInvocationService {
     /// §6.6). `None` only when none are configured.
     seal_gateway_operator_token:
         Option<Arc<crate::infrastructure::seal::operator_token::OperatorTokenSource>>,
+    /// The CA an `https` SEAL gateway's certificate is verified against
+    /// (`seal_gateway.ca_cert_path`, AEGIS ADR-132 H8); `None`: the system's
+    /// root certificates.
+    seal_gateway_ca: Option<tonic::transport::Certificate>,
     /// Schema registry for builtin schema.get / schema.validate tools.
     schema_registry: Arc<SchemaRegistry>,
     /// Optional port for workflow execution control (cancel, signal, remove).

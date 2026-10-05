@@ -625,7 +625,13 @@ spec:
       - "/aegis.orchestrator.v1.Health/Check"
   #
   # seal_gateway:
-  #   url: "http://aegis-seal-gateway:50055"
+  #   # https: dialled over TLS, the gateway's certificate verified. A call
+  #   # carrying a person's credential (a remote MCP server's tool) is never
+  #   # sent to an http address (AEGIS ADR-132 H8).
+  #   url: "https://aegis-seal-gateway:50055"
+  #   # The CA the gateway's certificate is verified against; omit it for the
+  #   # system's root certificates.
+  #   ca_cert_path: "/etc/aegis/tls/seal-gateway-ca.crt"
 
   # --------------------------------------------------------------------------
   # OAuth Providers (Optional, ADR-078, AEGIS ADR-125 D2)

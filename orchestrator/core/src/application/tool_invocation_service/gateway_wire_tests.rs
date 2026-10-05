@@ -176,6 +176,53 @@ async fn serve_plaintext(stub: StubGateway) -> (String, oneshot::Sender<()>) {
     (format!("http://{addr}"), tx)
 }
 
+/// A throwaway TLS certificate for `localhost`, written where the
+/// orchestrator's `ca_cert_path` reads it.
+struct Tls {
+    ca_path: std::path::PathBuf,
+}
+
+/// Serve `stub` on a loopback port over TLS with a throwaway certificate
+/// for `localhost`; the `https` URL, the certificate (its own CA) and a
+/// shutdown handle.
+async fn serve_tls(stub: StubGateway) -> (String, Tls, oneshot::Sender<()>) {
+    // tonic's TLS server takes rustls's process-wide provider, which this
+    // test binary (ring and aws-lc-rs both compiled in) cannot pick alone.
+    // The orchestrator's client is unaffected: tonic's client falls back to
+    // ring when none is installed.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("throwaway certificate");
+    let dir = std::env::temp_dir().join(format!("aegis-wire-tls-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca_path = dir.join("gateway-ca.crt");
+    std::fs::write(&ca_path, generated.cert.pem()).unwrap();
+    let identity = tonic::transport::Identity::from_pem(
+        generated.cert.pem(),
+        generated.signing_key.serialize_pem(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel::<()>();
+    let mut server = tonic::transport::Server::builder()
+        .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+        .expect("server TLS");
+    tokio::spawn(async move {
+        let _ = server
+            .add_service(GatewayInvocationServiceServer::new(stub))
+            .serve_with_incoming_shutdown(
+                tonic::transport::server::TcpIncoming::from(listener),
+                async {
+                    let _ = rx.await;
+                },
+            )
+            .await;
+    });
+    (format!("https://localhost:{port}"), Tls { ca_path }, tx)
+}
+
 // ---------------------------------------------------------------------------
 // The orchestrator under test
 // ---------------------------------------------------------------------------
@@ -415,6 +462,8 @@ struct Setup {
     context_patterns: Vec<&'static str>,
     agent_tools: Vec<&'static str>,
     router: ToolRouter,
+    /// The CA file the gateway's certificate is verified against.
+    ca: Option<std::path::PathBuf>,
 }
 
 impl Setup {
@@ -424,6 +473,7 @@ impl Setup {
             context_patterns: vec!["*"],
             agent_tools: vec![],
             router: ToolRouter::new(ToolRouter::builtin_dispatchers()),
+            ca: None,
         }
     }
 }
@@ -484,6 +534,12 @@ async fn harness(setup: Setup) -> Harness {
         Arc::new(EventBus::new(1024)),
         setup.gateway_url,
     );
+    let service = match &setup.ca {
+        Some(ca) => service
+            .with_seal_gateway_ca_cert(ca)
+            .expect("the CA file reads"),
+        None => service,
+    };
     Harness {
         service,
         tenant,
@@ -676,4 +732,70 @@ async fn a_listed_tool_is_invoked_by_its_kind_and_its_result_passes_unchanged() 
     assert_eq!(received.workflows[0].workflow_name, "ext.lookup");
     assert_eq!(received.workflows[0].tenant_id, h.tenant.as_str());
     assert!(received.clis.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// H8 from the caller's side: TLS to the gateway, verified against a CA
+// ---------------------------------------------------------------------------
+
+/// An `https` gateway is dialled over TLS and its certificate verified
+/// against the CA `seal_gateway.ca_cert_path` names; the call goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tls_gateway_is_dialled_and_verified_against_the_configured_ca() {
+    let stub = StubGateway::new(
+        vec![listed("ext.lookup", "workflow")],
+        Answer::Result(r#"{"ok":true}"#.to_string()),
+    );
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let h = harness(Setup {
+        ca: Some(tls.ca_path.clone()),
+        ..Setup::gateway(&url)
+    })
+    .await;
+
+    let value = h.call(h.execution, "ext.lookup").await.expect("answered");
+    assert_eq!(value, json!({"ok": true}));
+    assert_eq!(stub.received.lock().unwrap().workflows.len(), 1);
+}
+
+/// A gateway whose certificate the configured CA did not sign is refused at
+/// the handshake: an internal failure, and nothing reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_certificate_the_ca_does_not_sign_is_refused() {
+    let stub = StubGateway::new(
+        vec![listed("ext.lookup", "workflow")],
+        Answer::Result(r#"{"ok":true}"#.to_string()),
+    );
+    let (url, _tls, _shutdown) = serve_tls(stub.clone()).await;
+    let other = serve_tls(StubGateway::new(vec![], Answer::Result("{}".into()))).await;
+    let h = harness(Setup {
+        ca: Some(other.1.ca_path.clone()),
+        ..Setup::gateway(&url)
+    })
+    .await;
+
+    let err = h
+        .call(h.execution, "ext.lookup")
+        .await
+        .expect_err("refused");
+    let refusal = err.refusal();
+    assert_eq!((refusal.http_status, refusal.code), (500, "INTERNAL_ERROR"));
+    let received = stub.received.lock().unwrap();
+    assert!(received.lists.is_empty() && received.workflows.is_empty());
+}
+
+/// `seal_gateway.ca_cert_path` is optional: absent, it reads as none.
+#[test]
+fn the_gateway_ca_cert_path_is_optional() {
+    let with: crate::domain::node_config::SealGatewayConfig = serde_yaml::from_str(
+        "url: https://aegis-seal-gateway:50055\nca_cert_path: /etc/aegis/tls/ca.crt\n",
+    )
+    .unwrap();
+    assert_eq!(
+        with.ca_cert_path.as_deref(),
+        Some(std::path::Path::new("/etc/aegis/tls/ca.crt"))
+    );
+    let without: crate::domain::node_config::SealGatewayConfig =
+        serde_yaml::from_str("url: https://aegis-seal-gateway:50055\n").unwrap();
+    assert!(without.ca_cert_path.is_none());
 }

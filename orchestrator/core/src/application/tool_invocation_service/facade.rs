@@ -95,6 +95,7 @@ impl ToolInvocationService {
             node_config_path: None,
             seal_gateway_url,
             seal_gateway_operator_token: None,
+            seal_gateway_ca: None,
             schema_registry: Arc::new(SchemaRegistry::build()),
             workflow_execution_control: None,
             agent_activity: None,
@@ -162,6 +163,27 @@ impl ToolInvocationService {
     ) -> Self {
         self.seal_gateway_operator_token = Some(source);
         self
+    }
+
+    /// Verify the SEAL gateway's TLS certificate against the CA in the PEM
+    /// file at `path` (`seal_gateway.ca_cert_path`, AEGIS ADR-132 H8).
+    /// Without it an `https` gateway is verified against the system's roots.
+    /// A file that cannot be read, or holds no certificate, is an error.
+    pub fn with_seal_gateway_ca_cert(mut self, path: &Path) -> anyhow::Result<Self> {
+        let pem = std::fs::read(path).map_err(|e| {
+            anyhow::anyhow!(
+                "seal_gateway.ca_cert_path '{}' cannot be read: {e}",
+                path.display()
+            )
+        })?;
+        if !String::from_utf8_lossy(&pem).contains("-----BEGIN CERTIFICATE-----") {
+            anyhow::bail!(
+                "seal_gateway.ca_cert_path '{}' holds no PEM certificate",
+                path.display()
+            );
+        }
+        self.seal_gateway_ca = Some(tonic::transport::Certificate::from_pem(pem));
+        Ok(self)
     }
 
     /// ADR-117: enable the four-step edge dispatch pre-routing hook.
