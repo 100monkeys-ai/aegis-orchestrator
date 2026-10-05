@@ -247,6 +247,7 @@ struct Harness {
     service: ToolInvocationService,
     executions: Arc<Executions>,
     goals: Arc<InMemoryGoalRepository>,
+    goal_service: Arc<GoalService>,
 }
 
 fn harness() -> Harness {
@@ -267,6 +268,11 @@ fn harness_with(shape: impl FnOnce(GoalService) -> GoalService) -> Harness {
     let event_bus = Arc::new(EventBus::new(256));
     let executions = Arc::new(Executions::default());
     let goals = Arc::new(InMemoryGoalRepository::new());
+    let goal_service = Arc::new(shape(GoalService::new(
+        goals.clone(),
+        event_bus.clone(),
+        GoalsConfig::default(),
+    )));
     let service = ToolInvocationService::new(
         Arc::new(InMemorySealSessionRepository::new()),
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new()),
@@ -280,15 +286,12 @@ fn harness_with(shape: impl FnOnce(GoalService) -> GoalService) -> Harness {
         event_bus.clone(),
         None,
     )
-    .with_goals(Arc::new(shape(GoalService::new(
-        goals.clone(),
-        event_bus,
-        GoalsConfig::default(),
-    ))));
+    .with_goals(goal_service.clone());
     Harness {
         service,
         executions,
         goals,
+        goal_service,
     }
 }
 
@@ -621,4 +624,217 @@ async fn goal_id_is_not_advertised_by_the_four_starting_tools() {
         evaluate.input_schema["properties"]["round"]["type"],
         "integer"
     );
+}
+
+// ── U29: the time a goal waits on its work does not count against its
+// lifetime, through the real types the daemon uses ──────────────────────────
+
+/// A test clock the goal service reads, moved by hand.
+#[derive(Clone)]
+struct Clock(Arc<StdMutex<chrono::DateTime<chrono::Utc>>>);
+
+impl Clock {
+    fn new() -> Self {
+        Self(Arc::new(StdMutex::new(chrono::Utc::now())))
+    }
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        *self.0.lock().unwrap()
+    }
+    fn advance(&self, seconds: i64) {
+        *self.0.lock().unwrap() += chrono::Duration::seconds(seconds);
+    }
+}
+
+/// The harness on `clock`, holding each call 60 ms.
+fn harness_on(clock: &Clock) -> Harness {
+    let clock = clock.clone();
+    harness_with(move |goals| {
+        goals
+            .with_wait(
+                std::time::Duration::from_millis(60),
+                std::time::Duration::from_millis(5),
+            )
+            .with_clock(move || clock.now())
+    })
+}
+
+fn execution_id_of(started: &Value) -> ExecutionId {
+    ExecutionId(
+        uuid::Uuid::parse_str(
+            started["execution_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no execution started: {started}")),
+        )
+        .unwrap(),
+    )
+}
+
+impl Harness {
+    /// The execution `id` starts now on `clock` with its recorded limit
+    /// `limit` (none: the node's default), as the supervisor starts it.
+    fn start_at(&self, id: ExecutionId, clock: &Clock, limit: Option<u64>) {
+        self.with_execution(id, |e| {
+            e.start();
+            e.started_at = clock.now();
+            e.timeout_seconds = limit;
+        });
+    }
+
+    /// The one execution started that is none of `known`: the goal-judge
+    /// execution the last evaluation started.
+    fn judge_besides(&self, known: &[ExecutionId]) -> ExecutionId {
+        *self
+            .executions
+            .started
+            .lock()
+            .unwrap()
+            .keys()
+            .find(|id| !known.contains(id))
+            .expect("a goal-judge execution was started")
+    }
+
+    /// The goal-judge execution `id` completes with a verdict of `score`.
+    fn judge_says(&self, id: ExecutionId, score: f64) {
+        self.with_execution(id, |e| {
+            e.start();
+            e.start_iteration("judge".to_string()).unwrap();
+            e.complete_iteration(verdict_output(score));
+            e.complete();
+        });
+    }
+}
+
+/// The reproduction (agentic-run-proof-2, execution 6b99b69f, goal 9163ff15):
+/// work that runs to its full 1,800 s limit and fails is judged once, not
+/// met, after the goal's 1,800 s of wall time; the round is granted (state
+/// open, continue true), the next round's work is admitted by
+/// `open_goal_for` through the starting tool, and when that work completes
+/// inside its limit the goal is judged met. Before U29 the late not_met
+/// closed the goal `expired` and the person got no second round.
+#[tokio::test]
+async fn work_run_to_its_full_limit_is_judged_not_met_and_a_second_round_is_granted_and_met() {
+    let clock = Clock::new();
+    let h = harness_on(&clock);
+    let goal = h.create(OWNER).await;
+    clock.advance(5);
+    let solver = execution_id_of(&h.task_execute(OWNER, goal).await);
+    h.start_at(solver, &clock, Some(1_800));
+    clock.advance(25);
+    let answer = h.evaluate(OWNER, goal, None).await;
+    assert_eq!(answer["waiting_on"], "execution", "{answer}");
+
+    // Two tries time out at 600 s; the execution is stopped at its 1,800 s.
+    clock.advance(1_800 - 25 + 1);
+    h.with_execution(solver, |e| {
+        e.fail("Execution timed out after 1800 seconds".to_string())
+    });
+    let answer = h.evaluate(OWNER, goal, Some(0)).await;
+    assert_eq!(answer["state"], "judging", "{answer}");
+    assert!(
+        answer.get("waiting_on").is_none(),
+        "the judge runs: {answer}"
+    );
+    let judge = h.judge_besides(&[solver]);
+    h.judge_says(judge, 0.0);
+    let answer = h.evaluate(OWNER, goal, Some(0)).await;
+    assert_eq!(answer["outcome"], "not_met", "{answer}");
+    assert_eq!(answer["state"], "open", "{answer}");
+    assert_eq!(answer["continue"], true, "{answer}");
+    assert_eq!(answer["round"], 1, "{answer}");
+
+    // Round 2: its work is admitted and completes inside its limit.
+    clock.advance(20);
+    let second = execution_id_of(&h.task_execute(OWNER, goal).await);
+    h.start_at(second, &clock, Some(1_800));
+    clock.advance(313);
+    h.with_execution(second, |e| {
+        e.start_iteration("solve with a constructive heuristic".to_string())
+            .unwrap();
+        e.complete_iteration("The makespan is 02:45 PM.".to_string());
+        e.complete();
+    });
+    let answer = h.evaluate(OWNER, goal, Some(1)).await;
+    assert_eq!(answer["state"], "judging", "{answer}");
+    let judge2 = h.judge_besides(&[solver, judge, second]);
+    h.judge_says(judge2, 0.95);
+    let answer = h.evaluate(OWNER, goal, Some(1)).await;
+    assert_eq!(answer["outcome"], "met", "{answer}");
+    assert_eq!(answer["state"], "met");
+    let stored = h.goals.find_goal(goal).await.unwrap().unwrap();
+    assert_eq!((stored.state, stored.rounds), (GoalState::Met, 1));
+}
+
+/// U29's proof by the numbers, held as a test: a goal that spends every
+/// round waiting the longest its work can run (the node's 1,800 s plus the
+/// reaper's 600 s), and the rest of its 1,800 s lifetime between waits, and
+/// whose last judge never finishes, lives past four of those waits and is
+/// closed by the sweep no later than the lifetime, plus (max_continuations
+/// + 1) waits of the execution limit plus the margin, plus two goal-judge
+/// attempts of 300 s (D3) plus the margin each, plus one sweep interval.
+#[tokio::test]
+async fn a_goal_that_waits_the_longest_every_round_still_closes_by_the_bound() {
+    use crate::application::goal_service::EXPIRY_SWEEP_INTERVAL;
+    use crate::domain::execution::REAPER_MARGIN_SECONDS;
+    use crate::domain::supervisor::DEFAULT_EXECUTION_TIMEOUT_SECONDS;
+
+    let config = GoalsConfig::default();
+    let wait = DEFAULT_EXECUTION_TIMEOUT_SECONDS + REAPER_MARGIN_SECONDS;
+    let judge_attempt = 300 + REAPER_MARGIN_SECONDS;
+    let longest = config.lifetime_seconds
+        + u64::from(config.max_continuations + 1) * wait
+        + 2 * judge_attempt
+        + EXPIRY_SWEEP_INTERVAL.as_secs();
+    assert_eq!(longest, 13_800, "1,800 + 4 x 2,400 + 2 x 900 + 600");
+
+    let clock = Clock::new();
+    let h = harness_on(&clock);
+    let goal = h.create(OWNER).await;
+    let created = clock.now();
+    let mut known = Vec::new();
+    for round in 0..=config.max_continuations {
+        if round == config.max_continuations {
+            // The rest of the lifetime is spent between waits.
+            clock.advance(1_790);
+        }
+        let work = execution_id_of(&h.task_execute(OWNER, goal).await);
+        known.push(work);
+        h.start_at(work, &clock, None);
+        let asked = (round > 0).then_some(round);
+        let answer = h.evaluate(OWNER, goal, asked).await;
+        assert_eq!(answer["waiting_on"], "execution", "round {round}: {answer}");
+        // The work runs to the last of its bound, still running.
+        clock.advance(wait as i64 + 1);
+        let answer = h.evaluate(OWNER, goal, asked).await;
+        assert_eq!(answer["state"], "judging", "round {round}: {answer}");
+        let judge = h.judge_besides(&known);
+        known.push(judge);
+        if round < config.max_continuations {
+            h.judge_says(judge, 0.0);
+            let answer = h.evaluate(OWNER, goal, asked).await;
+            assert_eq!(answer["continue"], true, "round {round}: {answer}");
+        }
+    }
+    // The last judge runs on; the goal is past its lifetime between waits.
+    let lived = (clock.now() - created).num_seconds();
+    assert!(lived > 4 * wait as i64, "it outlived four waits: {lived}");
+    let goals = &h.goal_service;
+    clock.advance(20);
+    assert_eq!(
+        goals.close_expired(clock.now()).await.unwrap(),
+        0,
+        "a judge in flight after a wait is not swept"
+    );
+    // Swept every interval from here on, it is closed by the bound.
+    let deadline = created + chrono::Duration::seconds(longest as i64);
+    loop {
+        clock.advance(EXPIRY_SWEEP_INTERVAL.as_secs() as i64);
+        goals.close_expired(clock.now()).await.unwrap();
+        let stored = h.goals.find_goal(goal).await.unwrap().unwrap();
+        if stored.state != GoalState::Open {
+            assert_eq!(stored.state, GoalState::Expired);
+            break;
+        }
+        assert!(clock.now() <= deadline, "open past the bound {longest} s");
+    }
+    assert!(clock.now() <= deadline, "closed by the bound {longest} s");
 }

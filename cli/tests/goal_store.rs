@@ -18,7 +18,9 @@
 //! leaves them reading as they did, stores the `stopped` state and a stop
 //! reason, decides a stopped round once, and run again changes nothing; and
 //! a wait for running work (U24) is stored in those columns with no
-//! migration and decides no round.
+//! migration and decides no round; and the goal service's sweep reads the
+//! stored wait rows so that the time a goal waited does not count against
+//! its lifetime, and leaves a goal whose judge runs after a wait (U29).
 
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::goal::{
@@ -676,5 +678,78 @@ async fn migration_040_run_again_changes_nothing() {
         .await
         .expect("migration 040 run again");
     assert_eq!(snapshot().await, before);
+    db.remove().await;
+}
+
+/// U29 through the goal service over the PostgreSQL store: of goals open
+/// 3,000 s, one that waited 2,400 s on its work (a wait row ended) has spent
+/// 600 s of its own and is not swept; one that never waited is swept; one
+/// whose round waited 600 s (2,400 s of its own) and whose judge started 60 s
+/// ago is still running is not swept (the Low row); one whose judge started
+/// after such a wait 1,000 s ago and never reported is swept, past
+/// goal-judge's 300 s plus the margin.
+#[tokio::test]
+async fn the_services_sweep_credits_stored_waits_and_leaves_a_judge_in_flight() {
+    use aegis_orchestrator_core::application::goal_service::GoalService;
+    use aegis_orchestrator_core::domain::node_config::GoalsConfig;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use std::sync::Arc;
+
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = Arc::new(PostgresGoalRepository::new(db.pool.clone()));
+    let at = now();
+    let created = at - Duration::seconds(3_000);
+    let mut goals = Vec::new();
+    for client_ref in ["waited", "never-waited", "judge-running", "judge-silent"] {
+        let mut g = goal(client_ref);
+        g.created_at = created;
+        repo.insert_goal(&g).await.unwrap();
+        goals.push(g);
+    }
+    let [waited, never, running, silent] = &goals[..] else {
+        unreachable!()
+    };
+    let ended_wait = |goal_id: GoalId, seconds: i64| {
+        let ended = created + Duration::seconds(100 + seconds);
+        let mut w = wait(goal_id, 0, ended);
+        w.created_at = created + Duration::seconds(100);
+        w.decided_at = Some(ended);
+        w
+    };
+    repo.insert_evaluation(&ended_wait(waited.id, 2_400))
+        .await
+        .unwrap();
+    for (g, started) in [(running, 60), (silent, 1_000)] {
+        // A 600 s wait: 2,400 s of its own, past the lifetime.
+        repo.insert_evaluation(&ended_wait(g.id, 600))
+            .await
+            .unwrap();
+        let mut judge = evaluation(g.id, 0, 1);
+        judge.created_at = at - Duration::seconds(started);
+        judge.decided_at = None;
+        judge.outcome = None;
+        judge.verdict = None;
+        judge.answer = None;
+        judge.input_digest = None;
+        assert!(judge.is_running(), "a judge in flight");
+        repo.insert_evaluation(&judge).await.unwrap();
+    }
+
+    let service = GoalService::new(
+        repo.clone(),
+        Arc::new(EventBus::new(16)),
+        GoalsConfig::default(),
+    );
+    assert_eq!(service.close_expired(at).await.unwrap(), 2);
+    let state = |id: GoalId| {
+        let repo = repo.clone();
+        async move { repo.find_goal(id).await.unwrap().unwrap().state }
+    };
+    assert_eq!(state(waited.id).await, GoalState::Open, "600 s of its own");
+    assert_eq!(state(never.id).await, GoalState::Expired);
+    assert_eq!(state(running.id).await, GoalState::Open, "its judge runs");
+    assert_eq!(state(silent.id).await, GoalState::Expired);
     db.remove().await;
 }

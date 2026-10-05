@@ -424,12 +424,86 @@ impl Goal {
         &self.tenant_id == tenant_id && self.user_sub == user_sub
     }
 
-    /// Open past its lifetime at `now` (D7).
-    pub fn has_outlived(&self, lifetime_seconds: u64, now: DateTime<Utc>) -> bool {
+    /// The goal's own time at `now` (U29): the time since `created_at`
+    /// less the time it spent waiting on work it started ([`waited`]). A goal
+    /// that never waited has spent all of its time as its own.
+    pub fn active_time(
+        &self,
+        evaluations: &[GoalEvaluation],
+        now: DateTime<Utc>,
+    ) -> chrono::Duration {
+        now.signed_duration_since(self.created_at) - waited(evaluations, now)
+    }
+
+    /// Open past its lifetime at `now` (D7, U29): its own time, the time
+    /// between its waits, has reached `lifetime_seconds`. `evaluations` are
+    /// the goal's own.
+    pub fn has_outlived(
+        &self,
+        lifetime_seconds: u64,
+        evaluations: &[GoalEvaluation],
+        now: DateTime<Utc>,
+    ) -> bool {
         self.is_open()
-            && now.signed_duration_since(self.created_at).num_seconds() >= lifetime_seconds as i64
+            && self.active_time(evaluations, now).num_seconds()
+                >= i64::try_from(lifetime_seconds).unwrap_or(i64::MAX)
     }
 }
+
+/// The time a goal has spent waiting on work it started, at `now` (U29), from
+/// its wait rows (U24): each wait counts from when it began to when it ended,
+/// or to `now` while it is open, and never past its `wait_until` (U23), so a
+/// wait whose evaluations stopped coming counts no further than its work can
+/// run. A round's waits are counted once where they overlap, and a round is
+/// credited at most its longest single wait bound (`wait_until` less the
+/// wait's start): however many times a round waits again after an
+/// approval's answer, it is credited no more than one wait of its work.
+pub fn waited(evaluations: &[GoalEvaluation], now: DateTime<Utc>) -> chrono::Duration {
+    let mut rounds: HashMap<u32, Vec<&GoalEvaluation>> = HashMap::new();
+    for wait in evaluations.iter().filter(|e| e.is_wait()) {
+        rounds.entry(wait.round).or_default().push(wait);
+    }
+    let zero = chrono::Duration::zero();
+    rounds
+        .values()
+        .map(|waits| {
+            let mut spans: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+            let mut cap = zero;
+            for wait in waits {
+                let began = wait.created_at;
+                let until = wait.wait_until().unwrap_or(began);
+                cap = cap.max(until - began);
+                let ended = wait.decided_at.unwrap_or(now).min(now).min(until);
+                if ended > began {
+                    spans.push((began, ended));
+                }
+            }
+            spans.sort();
+            let mut total = zero;
+            let mut current: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+            for (began, ended) in spans {
+                current = match current {
+                    Some((b, e)) if began <= e => Some((b, e.max(ended))),
+                    Some((b, e)) => {
+                        total += e - b;
+                        Some((began, ended))
+                    }
+                    None => Some((began, ended)),
+                };
+            }
+            if let Some((b, e)) = current {
+                total += e - b;
+            }
+            total.min(cap.max(zero))
+        })
+        .fold(zero, |sum, round| sum + round)
+}
+
+/// The bound on one goal-judge execution, in seconds: the template's
+/// `spec.security.resources.timeout: 300s` (D3). With the reaper's
+/// [`REAPER_MARGIN_SECONDS`] it bounds how long a judge started after a wait
+/// holds the goal against the expiry sweep (U29).
+pub const GOAL_JUDGE_TIMEOUT_SECONDS: u64 = 300;
 
 /// Which table a bound execution lives in (D1, U1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,6 +693,7 @@ pub trait GoalRepository: Send + Sync {
 mod tests {
     use super::*;
     use crate::domain::validation::ValidationSignal;
+    use chrono::SubsecRound;
 
     fn verdict(score: f64, confidence: f64, feasibility: Option<f64>) -> GradientResult {
         GradientResult {
@@ -691,8 +766,86 @@ mod tests {
             created_at: created,
             closed_at: None,
         };
-        assert!(!goal.has_outlived(1800, created + chrono::Duration::seconds(1799)));
-        assert!(goal.has_outlived(1800, created + chrono::Duration::seconds(1800)));
+        assert!(!goal.has_outlived(1800, &[], created + chrono::Duration::seconds(1799)));
+        assert!(goal.has_outlived(1800, &[], created + chrono::Duration::seconds(1800)));
+    }
+
+    /// A wait of `round` that began `began` seconds after `t0`, ended `ended`
+    /// seconds after it (open when none), with its `wait_until` `until`.
+    fn wait_span(
+        t0: DateTime<Utc>,
+        round: u32,
+        began: i64,
+        ended: Option<i64>,
+        until: i64,
+    ) -> GoalEvaluation {
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        GoalEvaluation {
+            round,
+            waiting_on: Some(serde_json::json!({
+                "kind": WAITING_ON_EXECUTION,
+                "execution_ids": [ExecutionId::new().to_string()],
+                "wait_until": wait_time_text(at(until)),
+            })),
+            created_at: at(began),
+            decided_at: ended.map(at),
+            ..wait_row(false)
+        }
+    }
+
+    /// U29: the time a goal waited is each wait from its start to its end,
+    /// to `now` while open, never past its `wait_until`; a round's
+    /// overlapping waits count once, and a round is credited at most its
+    /// longest single wait bound; a judge's evaluation is never a wait.
+    #[test]
+    fn the_time_waited_is_each_wait_clipped_to_its_bound_and_capped_per_round() {
+        let t0 = Utc::now().trunc_subsecs(3);
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let secs = |e: &[GoalEvaluation], now: i64| waited(e, at(now)).num_seconds();
+
+        let ended = [wait_span(t0, 0, 100, Some(700), 2_500)];
+        assert_eq!(secs(&ended, 3_000), 600, "began to ended");
+        let open = [wait_span(t0, 0, 100, None, 2_500)];
+        assert_eq!(secs(&open, 1_000), 900, "began to now while open");
+        assert_eq!(secs(&open, 9_000), 2_400, "never past its wait_until");
+
+        let again = [
+            wait_span(t0, 1, 0, Some(1_000), 1_200),
+            wait_span(t0, 1, 500, Some(1_500), 1_600),
+            wait_span(t0, 1, 2_000, Some(2_600), 3_100),
+        ];
+        assert_eq!(
+            secs(&again, 4_000),
+            1_200,
+            "1,500 + 600 counted once is 2,100, capped at the round's longest bound 1,200"
+        );
+        let rounds = [
+            ended[0].clone(),
+            wait_span(t0, 1, 3_000, Some(3_100), 5_000),
+        ];
+        assert_eq!(secs(&rounds, 6_000), 700, "rounds add up");
+
+        let mut judge = ended[0].clone();
+        judge.judge_execution_id = Some(ExecutionId::new());
+        assert_eq!(secs(&[judge], 3_000), 0, "a judge is not a wait");
+
+        let goal = Goal {
+            id: GoalId::new(),
+            tenant_id: TenantId::default(),
+            user_sub: "u".to_string(),
+            statement: "s".to_string(),
+            client_ref: "c".to_string(),
+            channel: GoalChannel::Web,
+            state: GoalState::Open,
+            rounds: 0,
+            created_at: t0,
+            closed_at: None,
+        };
+        assert!(
+            !goal.has_outlived(1800, &ended, at(2_399)),
+            "1,799 s of its own"
+        );
+        assert!(goal.has_outlived(1800, &ended, at(2_400)));
     }
 
     /// U23: an execution's wait ends at its start plus its recorded bound
