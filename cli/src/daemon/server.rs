@@ -421,6 +421,31 @@ fn daemon_validation_service(
         .with_judge_context(judge_context)
 }
 
+/// The SEAL middleware the daemon runs for every `POST /v1/seal/invoke`:
+/// ADR-072's rate limits when configured, and always the replay-nonce store
+/// AEGIS ADR-035's Amendment "SEAL Replay-Nonce Store" decides: one
+/// in-memory, process-local store per daemon, entries kept for
+/// `SEAL_REPLAY_TTL` (30 s), so an envelope seen once is refused
+/// `ENVELOPE_REPLAYED` if it comes again inside that window.
+pub(crate) fn daemon_seal_middleware(
+    rate_limit_enforcer: Option<
+        Arc<dyn aegis_orchestrator_core::domain::rate_limit::RateLimitEnforcer>,
+    >,
+    rate_limit_resolver: Option<
+        Arc<dyn aegis_orchestrator_core::domain::rate_limit::RateLimitPolicyResolver>,
+    >,
+) -> Arc<aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware> {
+    Arc::new(
+        aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware::with_rate_limiting(
+            rate_limit_enforcer,
+            rate_limit_resolver,
+        )
+        .with_replay_protection(Arc::new(
+            aegis_orchestrator_core::infrastructure::seal::nonce_store::InMemoryNonceStore::new(),
+        )),
+    )
+}
+
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     // Write PID file
     let pid = std::process::id();
@@ -1342,12 +1367,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Initialize SEAL / Tool Routing Services (now hoisted for ExecutionService dependency)
     info!("Initializing SEAL & Tool Routing services...");
 
-    let seal_middleware = Arc::new(
-        aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware::with_rate_limiting(
-            rate_limit_enforcer.clone(),
-            rate_limit_resolver.clone(),
-        ),
-    );
+    let seal_middleware =
+        daemon_seal_middleware(rate_limit_enforcer.clone(), rate_limit_resolver.clone());
     // Derive builtin dispatchers from the canonical tool router registry.
     // User-configured dispatchers from aegis-config.yaml take precedence.
     let mut builtin_dispatchers = config.spec.builtin_dispatchers.clone().unwrap_or_default();

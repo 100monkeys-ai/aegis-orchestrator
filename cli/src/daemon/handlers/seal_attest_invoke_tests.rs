@@ -477,6 +477,15 @@ async fn attest_with(
     context: SecurityContext,
     configure: impl FnOnce(ToolInvocationService, Arc<AegisFSAL>) -> ToolInvocationService,
 ) -> Mcp {
+    attest_through(context, Arc::new(SealMiddleware::new()), configure).await
+}
+
+/// As [`attest_with`], the service verifying envelopes with `middleware`.
+async fn attest_through(
+    context: SecurityContext,
+    middleware: Arc<SealMiddleware>,
+    configure: impl FnOnce(ToolInvocationService, Arc<AegisFSAL>) -> ToolInvocationService,
+) -> Mcp {
     let contexts = Arc::new(InMemorySecurityContextRepository::new());
     contexts.save(context).await.unwrap();
     let sessions = Arc::new(InMemorySealSessionRepository::new());
@@ -513,7 +522,7 @@ async fn attest_with(
     let service = ToolInvocationService::new(
         sessions,
         contexts,
-        Arc::new(SealMiddleware::new()),
+        middleware,
         router,
         fsal.clone(),
         NfsVolumeRegistry::new(),
@@ -1895,4 +1904,47 @@ async fn a_refused_context_is_403_context_not_allowed_naming_no_context() {
         bodies.windows(2).all(|w| w[0] == w[1]),
         "every refused context is answered alike: {bodies:?}"
     );
+}
+
+// ── Replay protection at the daemon's construction (finding 2) ──────────────
+//
+// The audit `seal-conformance-audit` (deviation 2, Medium): the daemon built
+// its SEAL middleware with no nonce store, so a captured envelope could be
+// replayed for as long as it was fresh, although ADR-035's Amendment "SEAL
+// Replay-Nonce Store" says a replayed envelope is refused. The middleware
+// here is the one the daemon builds (`server::daemon_seal_middleware`), and
+// the answer is the route's (`invoke_refusal_response`).
+
+#[tokio::test]
+async fn the_daemons_middleware_refuses_a_replayed_envelope_and_admits_a_fresh_one() {
+    let mut mcp = attest_through(
+        zaru_pro(),
+        crate::daemon::server::daemon_seal_middleware(None, None),
+        |service, _| service,
+    )
+    .await;
+    let create = json!({
+        "statement": "Run palindrome-checker on \"racecar\".",
+        "client_ref": "conversation-replay",
+        "channel": "api",
+    });
+    let envelope = mcp.envelope("aegis.goal.create", create.clone());
+    mcp.service
+        .invoke_tool(&envelope)
+        .await
+        .expect("the first envelope is answered");
+
+    let replayed = mcp
+        .service
+        .invoke_tool(&envelope)
+        .await
+        .expect_err("the same envelope again is refused");
+    let answer = answer(&replayed, "aegis.goal.create").await;
+    answer.assert_shape(401, "ENVELOPE_REPLAYED", "error");
+
+    let fresh = mcp.envelope("aegis.goal.create", create);
+    mcp.service
+        .invoke_tool(&fresh)
+        .await
+        .expect("a fresh envelope of the same call is answered");
 }
