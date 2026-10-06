@@ -659,8 +659,70 @@ pub(crate) async fn invoke_seal_handler(
 
     // The ToolInvocationService is responsible for validating the security_token
     // and extracting any required claims (such as agent_id) from it as appropriate.
-    match state.tool_invocation_service.invoke_tool(&envelope).await {
+    // The signed payload's `params._meta` carries a conversation's choice of
+    // a binding per remote server (AEGIS ADR-132 S7); it never reaches the
+    // remote server.
+    let meta = payload_meta(&envelope.payload);
+    match state
+        .tool_invocation_service
+        .invoke_tool_with_meta(&envelope, meta.as_ref())
+        .await
+    {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+        Err(e) => invoke_refusal_response(&e, &envelope.payload),
+    }
+}
+
+/// The payload's `params._meta`, if any.
+fn payload_meta(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    payload
+        .get("params")
+        .and_then(|params| params.get("_meta"))
+        .cloned()
+}
+
+/// `POST /v1/seal/context-tools` (AEGIS ADR-132 S8): a SEAL envelope whose
+/// payload is `tools/list` with `params._meta.contexts`, verified as
+/// `/v1/seal/invoke` verifies a call; answers the tools of each remote server
+/// the conversation chose a binding for, listed with that binding, as
+/// `{"protocol": "seal/v1", "tools": [...]}`, or a refusal in the invoke
+/// route's shape.
+pub(crate) async fn context_tools_seal_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<HttpSealEnvelope>,
+) -> impl IntoResponse {
+    let (protocol, timestamp) = match (request.protocol, request.timestamp) {
+        (Some(p), Some(t)) => (p, t),
+        _ => {
+            return invoke_refusal_response(
+                &SealSessionError::MalformedPayload(
+                    "SEAL envelope requires both 'protocol' and 'timestamp' fields".to_string(),
+                ),
+                &request.payload,
+            );
+        }
+    };
+    let envelope = aegis_orchestrator_core::infrastructure::seal::envelope::SealEnvelope {
+        protocol,
+        security_token: request.security_token,
+        signature: request.signature,
+        payload: request.payload,
+        timestamp,
+    };
+    let meta = payload_meta(&envelope.payload);
+    match state
+        .tool_invocation_service
+        .list_context_tools(&envelope, meta.as_ref())
+        .await
+    {
+        Ok(tools) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "protocol": "seal/v1",
+                "tools": tools,
+            })),
+        )
+            .into_response(),
         Err(e) => invoke_refusal_response(&e, &envelope.payload),
     }
 }
@@ -1197,5 +1259,32 @@ mod envelope_wire_tests {
             serde_json::to_string(&envelope).unwrap(),
             HTTP_ENVELOPE_FIXTURE
         );
+    }
+
+    /// AEGIS ADR-132 S7, S8: the routes hand the service the signed
+    /// payload's `params._meta` whole, and nothing when it carries none.
+    #[test]
+    fn the_routes_read_the_payloads_meta() {
+        let meta = serde_json::json!({"contexts": {"notes-1": null}});
+        let mut complaints = Vec::new();
+        let read = payload_meta(&serde_json::json!({
+            "method": "tools/call",
+            "params": {"name": "notes-1.pages.read", "arguments": {}, "_meta": meta.clone()}
+        }));
+        if read.as_ref() != Some(&meta) {
+            complaints.push(format!("a call's _meta was read as {read:?}"));
+        }
+        let read = payload_meta(
+            &serde_json::json!({"method": "tools/list", "params": {"_meta": meta.clone()}}),
+        );
+        if read.as_ref() != Some(&meta) {
+            complaints.push(format!("a listing's _meta was read as {read:?}"));
+        }
+        let read =
+            payload_meta(&serde_json::json!({"method": "tools/call", "params": {"name": "x"}}));
+        if read.is_some() {
+            complaints.push(format!("a payload with no _meta was read as {read:?}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

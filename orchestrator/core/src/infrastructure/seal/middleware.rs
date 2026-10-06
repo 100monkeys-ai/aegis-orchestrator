@@ -77,6 +77,43 @@ impl SealMiddleware {
         self
     }
 
+    /// Replay protection alone (audit 002 §4.17): refuse an envelope whose
+    /// nonce was already seen inside the freshness window, and record it
+    /// otherwise. No security-context check: a caller that verified the
+    /// session and the signature itself (the context-tools listing, AEGIS
+    /// ADR-132 S8) uses it so a replayed request is refused as a replayed
+    /// tool call is. Without a configured [`NonceStore`] it refuses nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`SealSessionError::ReplayProtectionFailed`] for a nonce already seen.
+    pub fn check_replay(
+        &self,
+        session: &SealSession,
+        envelope: &(impl EnvelopeVerifier + ?Sized),
+    ) -> Result<(), SealSessionError> {
+        let Some(store) = &self.nonce_store else {
+            return Ok(());
+        };
+        match store.record(&envelope.replay_nonce()) {
+            NonceOutcome::Fresh => Ok(()),
+            NonceOutcome::Replay => {
+                warn!(
+                    session_id = %session.id,
+                    "SEAL envelope replay detected (duplicate nonce within freshness window)"
+                );
+                metrics::counter!(
+                    "aegis_seal_policy_violations_total",
+                    "violation_type" => "replay_protection_failed"
+                )
+                .increment(1);
+                Err(SealSessionError::ReplayProtectionFailed(
+                    "envelope nonce already seen within freshness window".to_string(),
+                ))
+            }
+        }
+    }
+
     /// Verify the envelope against the given session and extract the inner MCP arguments.
     ///
     /// This is the **single choke-point** through which all MCP tool calls must pass.
@@ -115,26 +152,7 @@ impl SealMiddleware {
                 // whose nonce (signature) we've seen inside the freshness
                 // window. This runs BEFORE rate limiting so a replay does
                 // not bump the legitimate caller's quota.
-                if let Some(store) = &self.nonce_store {
-                    let nonce = envelope.replay_nonce();
-                    match store.record(&nonce) {
-                        NonceOutcome::Fresh => {}
-                        NonceOutcome::Replay => {
-                            warn!(
-                                session_id = %session.id,
-                                "SEAL envelope replay detected (duplicate nonce within freshness window)"
-                            );
-                            metrics::counter!(
-                                "aegis_seal_policy_violations_total",
-                                "violation_type" => "replay_protection_failed"
-                            )
-                            .increment(1);
-                            return Err(SealSessionError::ReplayProtectionFailed(
-                                "envelope nonce already seen within freshness window".to_string(),
-                            ));
-                        }
-                    }
-                }
+                self.check_replay(session, envelope)?;
 
                 // ADR-072: Rate limit check after policy evaluation succeeds.
                 if let (Some(enforcer), Some(resolver)) =
@@ -849,5 +867,35 @@ mod tests {
             matches!(err, SealSessionError::ReplayProtectionFailed(_)),
             "expected ReplayProtectionFailed, got {err:?}"
         );
+    }
+
+    /// AEGIS ADR-132 S8: the replay-only check refuses a replayed envelope
+    /// inside the window and reads no security context: a `tools/list`
+    /// envelope on a session whose context admits nothing passes once.
+    #[test]
+    fn the_replay_only_check_refuses_a_replay_and_reads_no_context() {
+        use crate::infrastructure::seal::nonce_store::InMemoryNonceStore;
+
+        let store: Arc<dyn NonceStore> = Arc::new(InMemoryNonceStore::new());
+        let middleware = SealMiddleware::new().with_replay_protection(store);
+        let mut admits_nothing = allow_all_context();
+        admits_nothing.capabilities.clear();
+        let session = session_with_context(admits_nothing);
+        let listing = || DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("tools/list".to_string()),
+            arguments: Some(json!({})),
+            nonce: "listing-signature-bytes".to_string(),
+        };
+
+        let mut complaints = Vec::new();
+        if let Err(e) = middleware.check_replay(&session, &listing()) {
+            complaints.push(format!("a fresh listing was refused: {e:?}"));
+        }
+        match middleware.check_replay(&session, &listing()) {
+            Err(SealSessionError::ReplayProtectionFailed(_)) => {}
+            other => complaints.push(format!("a replayed listing was not refused: {other:?}")),
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

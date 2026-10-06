@@ -526,6 +526,8 @@ struct Setup {
     /// The executions' dispatch choices, kept in their input's reserved key
     /// `contexts` (Zaru ADR-0055 D14), if any.
     contexts: Option<Value>,
+    /// Whether the SEAL middleware keeps a nonce store (replay protection).
+    replay_protection: bool,
 }
 
 impl Setup {
@@ -542,6 +544,7 @@ impl Setup {
             approvals: None,
             agent_contexts: Vec::new(),
             contexts: None,
+            replay_protection: false,
         }
     }
 }
@@ -631,7 +634,13 @@ async fn harness(setup: Setup) -> Harness {
     let service = ToolInvocationService::new(
         sessions.clone(),
         security_context_repo,
-        Arc::new(SealMiddleware::new()),
+        Arc::new(if setup.replay_protection {
+            SealMiddleware::new().with_replay_protection(Arc::new(
+                crate::infrastructure::seal::nonce_store::InMemoryNonceStore::new(),
+            ))
+        } else {
+            SealMiddleware::new()
+        }),
         Arc::new(setup.router),
         fsal,
         NfsVolumeRegistry::new(),
@@ -2864,4 +2873,498 @@ async fn a_declared_filled_context_lists_its_servers_tools_and_an_undeclared_one
         }
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-132 S7, S8: a conversation's call to a remote server, out of band
+// from any execution
+// ---------------------------------------------------------------------------
+
+/// The payload's `_meta` choosing `choice` for `SERVER`.
+fn meta_choosing(choice: Value) -> Value {
+    json!({ "contexts": choosing(choice) })
+}
+
+impl Harness {
+    /// A session of `USER` for `execution` and `agent` (an execution-free
+    /// one when `execution` has no record), with a context of `patterns`.
+    async fn session_for(
+        &self,
+        agent: AgentId,
+        execution: ExecutionId,
+        patterns: &[&str],
+    ) -> String {
+        let token = format!("token-{}", uuid::Uuid::new_v4());
+        let session = crate::domain::seal_session::SealSession::new(
+            agent,
+            execution,
+            vec![],
+            token.clone(),
+            security_context(patterns),
+            self.tenant.clone(),
+        )
+        .with_principal_metadata(
+            Some(USER.to_string()),
+            Some(USER.to_string()),
+            None,
+            None,
+        );
+        self.sessions.save(session).await.unwrap();
+        token
+    }
+
+    /// One `tools/call` through the invoke route with the payload's `_meta`.
+    async fn route_with_meta(
+        &self,
+        token: &str,
+        tool: &str,
+        meta: Option<Value>,
+    ) -> Result<Value, SealSessionError> {
+        self.service
+            .invoke_tool_with_meta(
+                &RouteEnvelope {
+                    token: token.to_string().into(),
+                    tool: tool.to_string(),
+                    args: json!({"query": "q"}),
+                    nonce: uuid::Uuid::new_v4().to_string(),
+                },
+                meta.as_ref(),
+            )
+            .await
+    }
+
+    /// One `tools/list` through the context-tools route, with `nonce`.
+    async fn list_with_meta(
+        &self,
+        token: &str,
+        meta: Option<Value>,
+        nonce: &str,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        self.service
+            .list_context_tools(
+                &RouteEnvelope {
+                    token: token.to_string().into(),
+                    tool: "tools/list".to_string(),
+                    args: json!({}),
+                    nonce: nonce.to_string(),
+                },
+                meta.as_ref(),
+            )
+            .await
+    }
+}
+
+/// S7: a conversation's call (a session with no execution) carries the
+/// binding its payload's `_meta.contexts` chose, though it is granted to
+/// nothing and a newer binding is granted to all the person's agents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversations_call_carries_the_binding_its_meta_chose_with_no_grant() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let chosen = vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", NEWEST_GRANTED)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+
+    h.route_with_meta(
+        &token,
+        &format!("{SERVER}.pages.read"),
+        Some(meta_choosing(json!(chosen.0.to_string()))),
+    )
+    .await
+    .expect("the call is made");
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.tools.len(), 1);
+    assert_eq!(
+        received.tools[0].credential.as_ref().unwrap().value,
+        CHOSEN,
+        "the conversation's call did not carry the binding its _meta chose"
+    );
+}
+
+/// S7 with D15's rules: a conversation that chose none is refused under an
+/// all-agents grant; a binding that is not the person's own active one for
+/// the server (another person's, or the person's own revoked one) is
+/// refused; each with its sentence, and nothing reaches the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversations_choice_of_none_or_of_a_binding_not_the_persons_own_active_one_is_refused()
+{
+    let tool = format!("{SERVER}.pages.read");
+    let none_sentence = format!(
+        "This tool needs your own credential for '{SERVER}', and none was chosen for this run."
+    );
+    let not_yours_sentence = format!(
+        "This tool needs your own credential for '{SERVER}', and the one chosen for this run is not an active credential of yours for it."
+    );
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", NEWEST_GRANTED)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let others = vault
+        .bind(
+            &TenantId::for_consumer_user("user-2").unwrap(),
+            "user-2",
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let revoked = vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    let mut binding = vault.bindings.find_by_id(&revoked).await.unwrap().unwrap();
+    binding.status = CredentialStatus::Revoked;
+    vault.bindings.save(&binding).await.unwrap();
+
+    let mut complaints = Vec::new();
+    for (case, choice, expected) in [
+        ("none", Value::Null, none_sentence),
+        (
+            "another person's binding",
+            json!(others.0.to_string()),
+            not_yours_sentence.clone(),
+        ),
+        (
+            "the person's own revoked binding",
+            json!(revoked.0.to_string()),
+            not_yours_sentence,
+        ),
+    ] {
+        let stub = StubGateway::new(vec![], remote_result());
+        let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+        let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+        let token = h
+            .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+            .await;
+        match h
+            .route_with_meta(&token, &tool, Some(meta_choosing(choice)))
+            .await
+        {
+            Ok(value) => complaints.push(format!("{case}: the call was made: {value}")),
+            Err(err) => {
+                let refusal = err.refusal();
+                if refusal.code != "CREDENTIAL_BINDING_REQUIRED" {
+                    complaints.push(format!("{case}: refused {}", refusal.code));
+                }
+                if refusal.message != expected {
+                    complaints.push(format!("{case}: the sentence was \"{}\"", refusal.message));
+                }
+            }
+        }
+        if !stub.received.lock().unwrap().tools.is_empty() {
+            complaints.push(format!("{case}: a call reached the gateway"));
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// D15, D17 beside S7: a session whose execution has a record takes the
+/// execution's choice and ignores the call's `_meta.contexts`, though the
+/// `_meta` names another binding of the same person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inside_an_execution_the_records_choice_governs_and_meta_is_ignored() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    let dispatched = vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    let in_meta = vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", NEWEST_GRANTED)],
+            &[],
+        )
+        .await;
+    let h = harness(Setup {
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        contexts: Some(choosing(json!(dispatched.0.to_string()))),
+        ..Setup::gateway(&url)
+    })
+    .await;
+    let token = h.session_for(h.agent_id, h.execution, &["*"]).await;
+
+    h.route_with_meta(
+        &token,
+        &format!("{SERVER}.pages.read"),
+        Some(meta_choosing(json!(in_meta.0.to_string()))),
+    )
+    .await
+    .expect("the call is made");
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.tools.len(), 1);
+    assert_eq!(
+        received.tools[0].credential.as_ref().unwrap().value,
+        CHOSEN,
+        "inside an execution the call's _meta chose the credential, not the record"
+    );
+}
+
+/// S7: `_meta` never reaches the remote server: the call's arguments go to
+/// the gateway exactly as the model wrote them, with no `_meta` and no
+/// `contexts` added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_never_reaches_the_remote_servers_arguments() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let chosen = vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+
+    h.route_with_meta(
+        &token,
+        &format!("{SERVER}.pages.read"),
+        Some(meta_choosing(json!(chosen.0.to_string()))),
+    )
+    .await
+    .expect("the call is made");
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.tools.len(), 1);
+    let sent: Value = serde_json::from_str(&received.tools[0].arguments_json).unwrap();
+    assert_eq!(
+        sent,
+        json!({"query": "q"}),
+        "the remote server's arguments carried more than the call's own"
+    );
+}
+
+/// S7: a malformed `_meta.contexts` is refused before anything runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_meta_contexts_is_refused_before_anything_runs() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+
+    let err = h
+        .route_with_meta(
+            &token,
+            &format!("{SERVER}.pages.read"),
+            Some(json!({"contexts": {SERVER: "not-a-uuid"}})),
+        )
+        .await
+        .expect_err("a malformed choice is refused");
+    let refusal = err.refusal();
+    assert_eq!(
+        (refusal.code, refusal.message.as_str()),
+        (
+            "INVALID_ARGUMENTS",
+            "Invalid tool arguments: 'contexts' must be an object naming a binding id or null for each server"
+        )
+    );
+    assert!(stub.received.lock().unwrap().tools.is_empty());
+}
+
+/// S8: the context-tools listing lists, with the chosen binding's
+/// credential, only the servers the conversation chose a binding for (a
+/// server bound under an all-agents grant but not named is not listed), only
+/// their tools the session's context permits, and nothing with no choice;
+/// a session whose execution has a record is refused 403.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_context_tools_listing_lists_only_the_chosen_binding_filtered_and_refuses_an_agents_run(
+) {
+    const OTHER: &str = "notes-2";
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup {
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string(), OTHER.to_string()],
+        ..Setup::gateway(&url)
+    })
+    .await;
+    let chosen = vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            OTHER,
+            CredentialType::Secret,
+            &[("value", NEWEST_GRANTED)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let meta = || Some(meta_choosing(json!(chosen.0.to_string())));
+    let mut complaints = Vec::new();
+
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+    match h.list_with_meta(&token, meta(), "n-1").await {
+        Ok(tools) => {
+            if names(&tools) != vec![format!("{SERVER}.lookup")] {
+                complaints.push(format!("the chosen listing was {:?}", names(&tools)));
+            }
+        }
+        Err(e) => complaints.push(format!("the chosen listing was refused: {e:?}")),
+    }
+    {
+        let received = stub.received.lock().unwrap();
+        let bound: Vec<(String, String)> = received
+            .lists
+            .iter()
+            .flat_map(|list| list.bound_servers.iter())
+            .map(|b| {
+                (
+                    b.server.clone(),
+                    b.credential.as_ref().unwrap().value.clone(),
+                )
+            })
+            .collect();
+        if bound != vec![(SERVER.to_string(), CHOSEN.to_string())] {
+            complaints.push(format!("the gateway was asked to list {bound:?}"));
+        }
+    }
+
+    let narrow = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["ext.*"])
+        .await;
+    match h.list_with_meta(&narrow, meta(), "n-2").await {
+        Ok(tools) if tools.is_empty() => {}
+        other => complaints.push(format!(
+            "a context not permitting the server listed {:?}",
+            other.map(|t| names(&t))
+        )),
+    }
+
+    match h.list_with_meta(&token, None, "n-3").await {
+        Ok(tools) if tools.is_empty() => {}
+        other => complaints.push(format!("no choice listed {:?}", other.map(|t| names(&t)))),
+    }
+
+    let run = h.session_for(h.agent_id, h.execution, &["*"]).await;
+    match h.list_with_meta(&run, meta(), "n-4").await {
+        Ok(tools) => complaints.push(format!("an agent's run was listed {:?}", names(&tools))),
+        Err(e) => {
+            let refusal = e.refusal();
+            if (refusal.http_status, refusal.code, refusal.message.as_str())
+                != (
+                    403,
+                    "EXECUTION_BOUND_SESSION",
+                    "This listing is for a conversation, not an agent's run.",
+                )
+            {
+                complaints.push(format!("an agent's run was refused {refusal:?}"));
+            }
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// S8: a replayed listing within the freshness window is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_context_tools_listing_is_refused() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = harness(Setup {
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        replay_protection: true,
+        ..Setup::gateway(&url)
+    })
+    .await;
+    let chosen = vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+    let meta = || Some(meta_choosing(json!(chosen.0.to_string())));
+
+    h.list_with_meta(&token, meta(), "same-signature")
+        .await
+        .expect("the first listing is answered");
+    let err = h
+        .list_with_meta(&token, meta(), "same-signature")
+        .await
+        .expect_err("a replayed listing is refused");
+    assert!(
+        matches!(err, SealSessionError::ReplayProtectionFailed(_)),
+        "the replayed listing was answered {err:?}"
+    );
 }

@@ -553,27 +553,128 @@ impl ToolInvocationService {
     /// H4, H6): the caller when the caller is a person, never a service
     /// account; the workflow the execution's workflow run belongs to, read in
     /// the same tenant. A workflow that cannot be read is named as none. The
-    /// dispatch's choices are the execution record's (Zaru ADR-0055 D15);
-    /// an execution that cannot be read carries none.
+    /// dispatch's choices are the execution record's (Zaru ADR-0055 D15,
+    /// D17), and a call's own choices are then not read. When the execution
+    /// has no record (a session attested for a conversation, with no
+    /// execution), the choices are the call's (`call_contexts`, the payload's
+    /// `_meta.contexts`, AEGIS ADR-132 S7), and none when it carries none.
     pub(super) async fn gateway_acting(
         &self,
         agent_id: AgentId,
         execution_id: crate::domain::execution::ExecutionId,
         tenant_id: &TenantId,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
     ) -> GatewayActing {
-        let contexts = self
+        let contexts = match self
             .execution_service
             .get_execution_unscoped(execution_id)
             .await
-            .map(|execution| execution.input.contexts())
-            .unwrap_or_default();
+        {
+            Ok(execution) => execution.input.contexts(),
+            Err(_) => call_contexts.cloned().unwrap_or_default(),
+        };
         GatewayActing {
             user_id: crate::application::execution::person_sub(caller_identity),
             agent_id,
             workflow_id: self.workflow_of(execution_id, tenant_id).await,
             contexts,
         }
+    }
+
+    /// The tools of each remote server a conversation chose a binding for
+    /// (AEGIS ADR-132 S8), for `POST /v1/seal/context-tools`: the envelope
+    /// is a `tools/list` request verified as a tool call's is (the session
+    /// by its token, its status, its expiry, the signature, the replay
+    /// window), its `params._meta.contexts` the choices. A session whose
+    /// execution has a record is refused: an agent's run lists its own
+    /// tools. Each named server known to the node and chosen with a binding
+    /// is listed by the gateway with that binding's credential (D15's rules:
+    /// the person's own active binding for the server, no grant); a server
+    /// chosen `null`, or not named, is listed with none, so no grant path
+    /// opens it. Only those servers' `<server>.<tool>` tools the session's
+    /// security context permits are answered.
+    pub async fn list_context_tools(
+        &self,
+        envelope: &(impl EnvelopeVerifier + Send + Sync),
+        meta: Option<&Value>,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        let mut session = self
+            .seal_session_repo
+            .find_active_by_security_token(envelope.security_token())
+            .await
+            .map_err(|e| {
+                SealSessionError::InternalError(format!("session repository lookup failed: {e}"))
+            })?
+            .ok_or(SealSessionError::SessionInactive(
+                crate::domain::seal_session::SessionStatus::Expired,
+            ))?;
+        verify_listing_envelope(&mut session, envelope)?;
+        self.seal_middleware.check_replay(&session, envelope)?;
+        let choices = match meta {
+            Some(meta) => super::context_args::parse_contexts(meta)?,
+            None => None,
+        }
+        .unwrap_or_default();
+        if self
+            .execution_service
+            .get_execution_unscoped(session.execution_id)
+            .await
+            .is_ok()
+        {
+            return Err(SealSessionError::InvalidArguments(
+                crate::domain::seal_session::EXECUTION_BOUND_SESSION_MESSAGE.to_string(),
+            )
+            .answered(CallerAnswer::ExecutionBoundSession));
+        }
+        // Every server the node knows: the binding the call chose, else none.
+        let mut every_server = serde_json::Map::new();
+        for server in &self.remote_tool_servers {
+            let choice = match choices.get(server) {
+                Some(Value::String(id)) => Value::String(id.clone()),
+                _ => Value::Null,
+            };
+            every_server.insert(server.clone(), choice);
+        }
+        let contexts = crate::domain::execution::ExecutionContexts::from_value(Some(
+            &Value::Object(every_server),
+        ));
+        let chosen: Vec<&str> = self
+            .remote_tool_servers
+            .iter()
+            .map(String::as_str)
+            .filter(|server| contexts.is_filled(server))
+            .collect();
+        if chosen.is_empty() || self.seal_gateway_url.is_none() {
+            return Ok(Vec::new());
+        }
+        let acting = GatewayActing {
+            user_id: session.user_id.clone(),
+            agent_id: session.agent_id,
+            workflow_id: None,
+            contexts,
+        };
+        let bound_servers = self.bound_servers(&session.tenant_id, &acting).await;
+        if bound_servers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listing = ListToolsRequest {
+            tenant_id: session.tenant_id.as_str().to_string(),
+            acting: Some(acting.to_proto()),
+            bound_servers,
+        };
+        let listed = self
+            .list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
+            .await?;
+        Ok(listed
+            .into_iter()
+            .map(Self::gateway_tool_metadata)
+            .filter(|tool| {
+                self.remote_tool_of(&tool.name)
+                    .is_some_and(|(server, _)| chosen.contains(&server))
+                    && session.security_context.permits_tool_name(&tool.name)
+            })
+            .collect())
     }
 
     /// The workflow whose run `execution_id` is a state of, if any.
@@ -1152,3 +1253,35 @@ impl RemoteServerGrounding for ToolInvocationService {
 #[cfg(test)]
 #[path = "gateway_wire_tests.rs"]
 mod gateway_wire_tests;
+
+/// The checks a tool call's envelope passes before its context is evaluated
+/// (`SealSession::evaluate_call`'s first four), for the context-tools
+/// listing (AEGIS ADR-132 S8), whose `tools/list` names no tool for a
+/// security context to evaluate: the session is active and unexpired, the
+/// envelope carries its token, the signature verifies, and the payload is a
+/// `tools/list` request.
+fn verify_listing_envelope(
+    session: &mut crate::domain::seal_session::SealSession,
+    envelope: &(impl EnvelopeVerifier + ?Sized),
+) -> Result<(), SealSessionError> {
+    use crate::domain::seal_session::SessionStatus;
+    if session.status != SessionStatus::Active {
+        return Err(SealSessionError::SessionInactive(session.status.clone()));
+    }
+    if chrono::Utc::now() > session.expires_at {
+        session.status = SessionStatus::Expired;
+        return Err(SealSessionError::SessionExpired);
+    }
+    if envelope.security_token() != &session.security_token_raw {
+        return Err(SealSessionError::SignatureVerificationFailed(
+            "security token does not match the active SEAL session".to_string(),
+        ));
+    }
+    envelope.verify_signature(&session.agent_public_key)?;
+    match envelope.extract_tool_name().as_deref() {
+        Some("tools/list") => Ok(()),
+        _ => Err(SealSessionError::MalformedPayload(
+            "a context-tools listing is a 'tools/list' request".to_string(),
+        )),
+    }
+}

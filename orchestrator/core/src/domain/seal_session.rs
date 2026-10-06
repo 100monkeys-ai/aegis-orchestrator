@@ -219,6 +219,11 @@ pub enum CallerAnswer {
     /// internal class: the caller reads the fixed sentence, the operator's
     /// log the reason; AEGIS ADR-132 H8).
     CredentialChannelNotConfidential,
+    /// The context-tools listing was asked on a session bound to an agent's
+    /// execution: the listing serves a conversation only, an agent's run
+    /// listing its own tools (403 `EXECUTION_BOUND_SESSION`, AEGIS ADR-132
+    /// S8). The message is fixed.
+    ExecutionBoundSession,
 }
 
 /// The class of an internal failure, which alone reaches the caller
@@ -265,6 +270,10 @@ pub struct SealRefusal {
 /// identity is not entitled to.
 pub const CONTEXT_NOT_ALLOWED_MESSAGE: &str =
     "The security context this attestation asked for is not one your identity may attest.";
+/// The fixed message of a context-tools listing asked on a session bound to
+/// an agent's execution (AEGIS ADR-132 S8).
+pub const EXECUTION_BOUND_SESSION_MESSAGE: &str =
+    "This listing is for a conversation, not an agent's run.";
 /// The fixed message of an internal failure of each class (R3).
 pub const INTERNAL_ERROR_MESSAGE: &str =
     "The request could not be completed because of an internal error.";
@@ -445,6 +454,11 @@ impl SealSessionError {
                     code: "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL",
                     ..SealRefusal::internal(InternalFailure::Unavailable)
                 },
+                CallerAnswer::ExecutionBoundSession => SealRefusal::policy(
+                    403,
+                    "EXECUTION_BOUND_SESSION",
+                    EXECUTION_BOUND_SESSION_MESSAGE.to_string(),
+                ),
             },
         }
     }
@@ -1173,6 +1187,14 @@ mod tests {
                 "error",
                 true,
                 SERVICE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                answered(CallerAnswer::ExecutionBoundSession),
+                403,
+                "EXECUTION_BOUND_SESSION",
+                "policy_violation",
+                false,
+                EXECUTION_BOUND_SESSION_MESSAGE,
             ),
         ] {
             let refusal = error.refusal();

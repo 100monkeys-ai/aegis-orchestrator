@@ -77,7 +77,7 @@ use crate::daemon::handlers::script::{
     create_script, delete_script, get_script, list_scripts, update_script,
 };
 use crate::daemon::handlers::seal::{
-    attest_seal_handler, invoke_seal_handler, list_seal_tools_handler,
+    attest_seal_handler, context_tools_seal_handler, invoke_seal_handler, list_seal_tools_handler,
 };
 use crate::daemon::handlers::stimulus::{ingest_stimulus_handler, webhook_handler};
 use crate::daemon::handlers::swarms::{get_swarm_handler, list_swarms_handler};
@@ -200,6 +200,7 @@ pub(crate) fn create_router(
         .route("/v1/seal/attest", post(attest_seal_handler))
         .route("/v1/seal/invoke", post(invoke_seal_handler))
         .route("/v1/seal/tools", get(list_seal_tools_handler))
+        .route("/v1/seal/context-tools", post(context_tools_seal_handler))
         .route("/v1/cluster/status", get(cluster_status_handler))
         .route("/v1/cluster/nodes", get(cluster_nodes_handler))
         .route("/v1/swarms", get(list_swarms_handler))

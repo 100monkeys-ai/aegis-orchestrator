@@ -423,6 +423,21 @@ impl ToolInvocationService {
         &self,
         envelope: &(impl EnvelopeVerifier + Send + Sync),
     ) -> Result<Value, SealSessionError> {
+        self.invoke_tool_with_meta(envelope, None).await
+    }
+
+    /// [`Self::invoke_tool`] with the payload's `params._meta`, as the invoke
+    /// route reads it from the signed payload. Its `contexts`
+    /// (`{"<server>": "<binding id>" | null}`) is a conversation's choice of
+    /// a binding per remote server (AEGIS ADR-132 S7): it chooses the
+    /// credential of a remote tool call only when the session's execution
+    /// has no record, and it never reaches the remote server. Any other
+    /// shape is refused before anything runs.
+    pub async fn invoke_tool_with_meta(
+        &self,
+        envelope: &(impl EnvelopeVerifier + Send + Sync),
+        meta: Option<&Value>,
+    ) -> Result<Value, SealSessionError> {
         // 1. Look up the active session by the opaque security_token string.
         let mut session = self
             .seal_session_repo
@@ -452,6 +467,17 @@ impl ToolInvocationService {
         // 2b. Validate required arguments against the tool's input contract (ADR-055).
         ToolInputContract::validate(&tool_name, &args)
             .map_err(SealSessionError::InvalidArguments)?;
+
+        // 2b2. AEGIS ADR-132 S7: the conversation's choices, refused before
+        // anything runs when malformed.
+        let call_contexts = match meta {
+            Some(meta) => super::context_args::parse_contexts(meta)?.map(|choices| {
+                crate::domain::execution::ExecutionContexts::from_value(Some(&Value::Object(
+                    choices,
+                )))
+            }),
+            None => None,
+        };
 
         // 2c. AEGIS ADR-129 D19: a session attested under an operator
         // escalation runs a call only while that escalation is active,
@@ -520,6 +546,7 @@ impl ToolInvocationService {
                 0,
                 Vec::new(),
                 seal_caller_identity.as_ref(),
+                call_contexts.as_ref(),
             )
             .await?;
 
@@ -728,6 +755,7 @@ impl ToolInvocationService {
             iteration_number,
             tool_audit_history,
             caller_identity.as_ref(),
+            None,
         )
         .await
     }
@@ -752,6 +780,9 @@ impl ToolInvocationService {
         iteration_number: u8,
         tool_audit_history: Vec<TrajectoryStep>,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        // A conversation's choices from the call's payload (AEGIS ADR-132
+        // S7); `None` on every path but the invoke route's.
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         // Convenience binding for code paths that only need the authenticated
         // tenant — agent lookups, judge spawning, gateway forwarding, etc.
@@ -884,7 +915,7 @@ impl ToolInvocationService {
         }
 
         let outcome = self
-            .dispatch_after_gate(
+            .dispatch_after_gate_choosing(
                 agent_id,
                 execution_id,
                 tenant_scope,
@@ -896,6 +927,7 @@ impl ToolInvocationService {
                 caller_identity,
                 invocation_id,
                 started_at,
+                call_contexts,
             )
             .await;
         if let (Some(approval_id), Some(approvals)) = (auto_allowed, &self.tool_approval_service) {
@@ -921,9 +953,45 @@ impl ToolInvocationService {
     /// inner-loop judge, then edge, `aegis.*`, built-in, router and gateway
     /// dispatch. Called by [`Self::dispatch_tool_core`] for every call the
     /// gate lets through, and by the run of a stored call on its user's
-    /// approval (`approvals.rs`), with the stored arguments.
+    /// approval (`approvals.rs`), with the stored arguments and no call
+    /// choices: a stored call carries no `_meta`.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn dispatch_after_gate(
+        &self,
+        agent_id: &AgentId,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_scope: &TenantScope,
+        security_context: &crate::domain::security_context::SecurityContext,
+        tool_name: String,
+        args: Value,
+        iteration_number: u8,
+        tool_audit_history: Vec<TrajectoryStep>,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        invocation_id: ToolInvocationId,
+        started_at: Instant,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        self.dispatch_after_gate_choosing(
+            agent_id,
+            execution_id,
+            tenant_scope,
+            security_context,
+            tool_name,
+            args,
+            iteration_number,
+            tool_audit_history,
+            caller_identity,
+            invocation_id,
+            started_at,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::dispatch_after_gate`] with a conversation's choices from the
+    /// call's payload (AEGIS ADR-132 S7), handed to the gateway's acting
+    /// identity.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_after_gate_choosing(
         &self,
         agent_id: &AgentId,
         execution_id: crate::domain::execution::ExecutionId,
@@ -936,6 +1004,7 @@ impl ToolInvocationService {
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
         invocation_id: ToolInvocationId,
         started_at: Instant,
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = &tenant_scope.authenticated_tenant;
 
@@ -1285,7 +1354,13 @@ impl ToolInvocationService {
         // refusal by code (H5), never a not-found in place of a refusal.
         let outcome = if self.seal_gateway_url.is_some() {
             let acting = self
-                .gateway_acting(*agent_id, execution_id, tenant_id, caller_identity)
+                .gateway_acting(
+                    *agent_id,
+                    execution_id,
+                    tenant_id,
+                    caller_identity,
+                    call_contexts,
+                )
                 .await;
             self.invoke_seal_gateway_internal_grpc(
                 execution_id,

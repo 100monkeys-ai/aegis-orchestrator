@@ -114,6 +114,7 @@ const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/v1/operator-escalations",
     "/v1/seal/attest",
     "/v1/seal/invoke",
+    "/v1/seal/context-tools",
     "/v1/seal/tools",
     "/v1/webhooks",
 ];
@@ -276,6 +277,7 @@ mod tests {
         assert!(is_exempt("/v1/dispatch-gateway/some-id"));
         assert!(is_exempt("/v1/seal/attest"));
         assert!(is_exempt("/v1/seal/invoke"));
+        assert!(is_exempt("/v1/seal/context-tools"));
         assert!(is_exempt("/v1/seal/tools"));
         assert!(is_exempt("/v1/webhooks/github"));
     }
