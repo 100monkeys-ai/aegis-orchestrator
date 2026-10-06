@@ -1248,6 +1248,7 @@ mod tests {
                     input_data: None,
                 }),
                 context: Vec::new(),
+                contexts: Vec::new(),
                 execution: None,
                 security: None,
                 schedule: None,
@@ -4049,6 +4050,271 @@ mod tests {
         );
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+
+    // ── Zaru ADR-0055 D14, D16: the dispatch's binding choices ──────────────
+
+    const CONTEXT_BINDING: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+
+    /// An agent declaring the `nuclear-notes` context, `required` as given.
+    fn nuclear_notes_reader(required: bool) -> Agent {
+        let mut agent = make_agent("nn-reader", None, None);
+        agent.manifest.spec.contexts = vec![crate::domain::agent::ContextDeclaration {
+            service: "nuclear-notes".to_string(),
+            required,
+        }];
+        agent
+    }
+
+    fn input_with(input: serde_json::Value) -> ExecutionInput {
+        ExecutionInput {
+            intent: Some("read my notes".to_string()),
+            input,
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    const REQUIRED_CONTEXT_REFUSAL: &str =
+        "Execution refused: agent 'nn-reader' requires a nuclear-notes context and none was chosen";
+
+    /// D16: a required context with no binding chosen, none named or `null`,
+    /// is refused at start with the sentence, and nothing starts.
+    #[tokio::test]
+    async fn a_required_context_left_unfilled_is_refused_at_start_and_nothing_starts() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = nuclear_notes_reader(true);
+        let (service, runtime, execution_repo, event_bus) =
+            refusal_service(&tenant_id, &[&agent], &[]).await;
+        let mut events = event_bus.subscribe();
+
+        let mut complaints = Vec::new();
+        for (case, input) in [
+            (
+                "no contexts",
+                serde_json::json!({ "tenant_id": tenant_id.as_str() }),
+            ),
+            (
+                "a null choice",
+                serde_json::json!({
+                    "tenant_id": tenant_id.as_str(),
+                    "contexts": { "nuclear-notes": null }
+                }),
+            ),
+            (
+                "another server's binding",
+                serde_json::json!({
+                    "tenant_id": tenant_id.as_str(),
+                    "contexts": { "elsewhere": CONTEXT_BINDING }
+                }),
+            ),
+        ] {
+            match service
+                .start_execution(agent.id, input_with(input), "test-ctx".to_string(), None)
+                .await
+            {
+                Ok(id) => complaints.push(format!("{case}: the execution started as {id}")),
+                Err(e) => {
+                    if e.to_string() != REQUIRED_CONTEXT_REFUSAL {
+                        complaints.push(format!("{case}: the start answered \"{e}\""));
+                    }
+                    if !matches!(
+                        e.downcast_ref::<ExecutionError>(),
+                        Some(ExecutionError::Refused(_))
+                    ) {
+                        complaints
+                            .push(format!("{case}: the error is not ExecutionError::Refused"));
+                    }
+                }
+            }
+        }
+        complaints.extend(
+            left_behind(
+                &tenant_id,
+                agent.id,
+                &execution_repo,
+                &mut events,
+                runtime.as_ref(),
+            )
+            .await,
+        );
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// D16: an optional context runs without a binding; a required one runs
+    /// with one, and the persisted input keeps the choice.
+    #[tokio::test]
+    async fn an_optional_context_runs_unfilled_and_a_required_one_runs_filled() {
+        let tenant_id = CoreTenantId::consumer();
+        let optional = nuclear_notes_reader(false);
+        let (service, _runtime, _repo, _bus) = refusal_service(&tenant_id, &[&optional], &[]).await;
+        service
+            .start_execution(
+                optional.id,
+                input_with(serde_json::json!({ "tenant_id": tenant_id.as_str() })),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("an optional context with no binding was refused: {e}"));
+
+        let required = nuclear_notes_reader(true);
+        let (service, _runtime, _repo, _bus) = refusal_service(&tenant_id, &[&required], &[]).await;
+        let id = service
+            .start_execution(
+                required.id,
+                input_with(serde_json::json!({
+                    "tenant_id": tenant_id.as_str(),
+                    "contexts": { "nuclear-notes": CONTEXT_BINDING }
+                })),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a required context with a binding was refused: {e}"));
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert!(
+            execution.input.contexts().is_filled("nuclear-notes"),
+            "the persisted input lost the choice: {}",
+            execution.input.input
+        );
+    }
+
+    /// D14: the agent's input schema and its rendered prompt never see the
+    /// reserved `contexts`; the persisted input keeps it.
+    #[tokio::test]
+    async fn the_contexts_are_kept_from_the_input_schema_and_the_prompt() {
+        let tenant_id = CoreTenantId::consumer();
+        let mut agent = make_agent("schema-closed", None, None);
+        agent.manifest.spec.input_schema = Some(serde_json::json!({
+            "type": "object",
+            "required": ["topic"],
+            "properties": {
+                "topic": { "type": "string" },
+                "tenant_id": { "type": "string" }
+            },
+            "additionalProperties": false
+        }));
+        let (service, _runtime, _repo, _bus) = refusal_service(&tenant_id, &[&agent], &[]).await;
+        let id = service
+            .start_execution(
+                agent.id,
+                input_with(serde_json::json!({
+                    "topic": "units",
+                    "tenant_id": tenant_id.as_str(),
+                    "contexts": { "nuclear-notes": CONTEXT_BINDING }
+                })),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the input schema saw the contexts: {e}"));
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert!(
+            execution.input.contexts().is_filled("nuclear-notes"),
+            "the persisted input lost the choice: {}",
+            execution.input.input
+        );
+        let prompt = StandardExecutionService::render_task(&execution.input, &agent)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            !prompt.contains(CONTEXT_BINDING) && !prompt.contains("\"contexts\""),
+            "the rendered prompt carries the contexts: {prompt}"
+        );
+        assert!(
+            prompt.contains("units"),
+            "the prompt lost the input: {prompt}"
+        );
+    }
+
+    /// D14: an agent state with no choices of its own takes its workflow
+    /// execution's, as it takes its person.
+    #[tokio::test]
+    async fn an_agent_state_takes_its_workflow_executions_contexts() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = nuclear_notes_reader(true);
+        let workflow_execution_id = uuid::Uuid::new_v4();
+        let workflows = Arc::new(
+            crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new(),
+        );
+        let now = Utc::now();
+        let contexts = serde_json::json!({ "nuclear-notes": CONTEXT_BINDING });
+        crate::domain::repository::WorkflowExecutionRepository::save_for_tenant(
+            workflows.as_ref(),
+            &tenant_id,
+            &crate::domain::workflow::WorkflowExecution {
+                id: crate::domain::execution::ExecutionId(workflow_execution_id),
+                workflow_id: crate::domain::workflow::WorkflowId::new(),
+                tenant_id: tenant_id.clone(),
+                status: crate::domain::execution::ExecutionStatus::Running,
+                current_state: crate::domain::workflow::StateName::new("START").unwrap(),
+                blackboard: crate::domain::workflow::Blackboard::new(),
+                input: serde_json::json!({ "topic": "units", "contexts": contexts }),
+                state_outputs: HashMap::new(),
+                final_output: None,
+                started_at: now,
+                last_transition_at: now,
+                initiating_user_sub: Some("u-starter".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        let service = service.with_workflow_executions(workflows);
+
+        let id = service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), workflow_execution_id),
+                "test-ctx".to_string(),
+                Some(&temporal_worker()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the state did not take its workflow's contexts: {e}"));
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert_eq!(
+            execution.input.input.get("contexts"),
+            Some(&contexts),
+            "the state's persisted input lacks its workflow's contexts"
+        );
+    }
+
+    /// D14: a child with no choices of its own takes its parent's.
+    #[tokio::test]
+    async fn a_child_execution_takes_its_parents_contexts() {
+        let tenant = CoreTenantId::from_string("u-abc123").unwrap();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = nuclear_notes_reader(true);
+        let contexts = serde_json::json!({ "nuclear-notes": CONTEXT_BINDING });
+        let mut parent_execution = make_parent_execution_with_tenant(parent_agent.id, "u-abc123");
+        parent_execution.input.input["contexts"] = contexts.clone();
+        let (service, execution_repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+
+        let child_id = service
+            .start_child_execution(
+                child_agent.id,
+                input_with(serde_json::json!({ "task": "read" })),
+                parent_execution.id,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the child did not take its parent's contexts: {e}"));
+        let child = execution_repo
+            .find_by_id_for_tenant(&tenant, child_id)
+            .await
+            .unwrap()
+            .expect("the child was persisted");
+        assert_eq!(
+            child.input.input.get("contexts"),
+            Some(&contexts),
+            "the child's persisted input lacks its parent's contexts"
+        );
+    }
 }
 
 struct ExecutionMonitor {
@@ -4575,12 +4841,32 @@ impl StandardExecutionService {
     }
 
     /// The input as the agent's `input_schema` sees it: without the caller's
-    /// reserved `outputs`, which are the platform's, not the agent's.
+    /// reserved `outputs` and `contexts`, which are the platform's, not the
+    /// agent's (Zaru ADR-0055 D14 for `contexts`).
     fn without_caller_outputs(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
         match payload {
-            JsonValue::Object(map) if map.contains_key("outputs") => {
+            JsonValue::Object(map)
+                if map.contains_key("outputs")
+                    || map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY) =>
+            {
                 let mut map = map.clone();
                 map.remove("outputs");
+                map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
+                std::borrow::Cow::Owned(JsonValue::Object(map))
+            }
+            _ => std::borrow::Cow::Borrowed(payload),
+        }
+    }
+
+    /// The input without the reserved `contexts` (Zaru ADR-0055 D14): the
+    /// rendered prompt never carries the dispatch's binding choices.
+    fn without_contexts(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
+        match payload {
+            JsonValue::Object(map)
+                if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY) =>
+            {
+                let mut map = map.clone();
+                map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 std::borrow::Cow::Owned(JsonValue::Object(map))
             }
             _ => std::borrow::Cow::Borrowed(payload),
@@ -4644,7 +4930,9 @@ impl StandardExecutionService {
         let context_overrides = Self::extract_context_overrides(&input.input)?;
 
         // Attempt to extract structured user input.
-        let user_input_result = Self::extract_user_input(&input.input);
+        // The dispatch's binding choices are the platform's (Zaru ADR-0055
+        // D14): the prompt never sees them.
+        let user_input_result = Self::extract_user_input(&Self::without_contexts(&input.input));
         let has_input = user_input_result.is_ok();
 
         if has_input {
@@ -4795,6 +5083,67 @@ impl StandardExecutionService {
             return Ok(());
         }
         Err(ExecutionError::Refused(refusal.to_string()).into())
+    }
+
+    /// Zaru ADR-0055 D5, D16: an agent declaring a required context is
+    /// refused at start, before any record or container, when its dispatch
+    /// chose no binding for that service (none named, or `null`).
+    fn refuse_unfilled_context(
+        agent: &crate::domain::agent::Agent,
+        input: &ExecutionInput,
+    ) -> Result<()> {
+        let contexts = input.contexts();
+        if let Some(unfilled) = agent
+            .manifest
+            .spec
+            .contexts
+            .iter()
+            .find(|declared| declared.required && !contexts.is_filled(declared.service.trim()))
+        {
+            return Err(ExecutionError::Refused(format!(
+                "agent '{}' requires a {} context and none was chosen",
+                agent.manifest.metadata.name,
+                unfilled.service.trim()
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Keep `from`'s dispatch choices on `input` when it carries none of its
+    /// own (Zaru ADR-0055 D14): an agent state takes its workflow
+    /// execution's, a child its parent's, as each takes its person.
+    fn inherit_contexts(input: &mut ExecutionInput, from: Option<&JsonValue>) {
+        let key = crate::domain::execution::CONTEXTS_INPUT_KEY;
+        let Some(contexts) = from.and_then(|from| from.get(key)) else {
+            return;
+        };
+        if let JsonValue::Object(map) = &mut input.input {
+            map.entry(key.to_string())
+                .or_insert_with(|| contexts.clone());
+        }
+    }
+
+    /// The input of the workflow execution an agent state runs in, read in
+    /// the state's tenant, when the state carries a `workflow_execution_id`.
+    async fn workflow_execution_input(
+        &self,
+        tenant_id: &TenantId,
+        workflow_execution_id: Option<uuid::Uuid>,
+    ) -> Result<Option<JsonValue>> {
+        let (Some(workflow_execution_id), Some(workflow_executions)) =
+            (workflow_execution_id, &self.workflow_executions)
+        else {
+            return Ok(None);
+        };
+        let workflow_execution = workflow_executions
+            .find_by_id_for_tenant(
+                tenant_id,
+                crate::domain::execution::ExecutionId(workflow_execution_id),
+            )
+            .await
+            .context("reading the workflow execution an agent state runs in")?;
+        Ok(workflow_execution.map(|w| w.input))
     }
 
     /// Shared implementation for `start_execution` and `start_execution_with_id`.
@@ -4957,6 +5306,22 @@ impl StandardExecutionService {
 
         // AEGIS ADR-005 O6: an agent O4 or O5 refuses is refused before anything starts.
         Self::refuse_at_start(&agent, &input)?;
+
+        // Zaru ADR-0055 D14: an agent state with no binding choices of its
+        // own takes its workflow execution's; then D16: a required context
+        // left unfilled refuses the start.
+        let mut input = input;
+        if input
+            .input
+            .get(crate::domain::execution::CONTEXTS_INPUT_KEY)
+            .is_none()
+        {
+            let workflow_input = self
+                .workflow_execution_input(&tenant_id, input.workflow_execution_id)
+                .await?;
+            Self::inherit_contexts(&mut input, workflow_input.as_ref());
+        }
+        Self::refuse_unfilled_context(&agent, &input)?;
 
         // ADR-102: Use manifest-declared security_context if present; otherwise use caller's context.
         let security_context_name = agent
@@ -5147,11 +5512,18 @@ impl StandardExecutionService {
                     // An empty tools list (system agents with no declared restrictions)
                     // falls back to ["*"]. Attestation will overwrite this session with
                     // manifest-derived patterns via the same logic; the two must agree.
-                    let pre_create_tool_patterns = if agent.manifest.spec.tools.is_empty() {
+                    let mut pre_create_tool_patterns = if agent.manifest.spec.tools.is_empty() {
                         vec!["*".to_string()]
                     } else {
                         agent.manifest.spec.tools.clone()
                     };
+                    // Zaru ADR-0055 D16: each declared context the dispatch
+                    // filled adds its server's tools.
+                    crate::domain::agent::add_filled_context_patterns(
+                        &mut pre_create_tool_patterns,
+                        &agent.manifest.spec.contexts,
+                        &persisted_input.contexts(),
+                    );
                     let session_request = crate::application::ports::SealSessionCreateRequest {
                         execution_id: execution_id.0.to_string(),
                         agent_id: agent_id.0.to_string(),
@@ -5998,6 +6370,10 @@ impl ExecutionService for StandardExecutionService {
             .await?;
         // AEGIS ADR-005 O6: an agent O4 or O5 refuses is refused before anything starts.
         Self::refuse_at_start(&agent, &input)?;
+        // Zaru ADR-0055 D14: a child with no binding choices of its own takes
+        // its parent's; D16: a required context left unfilled refuses it.
+        Self::inherit_contexts(&mut input, Some(&parent.input.input));
+        Self::refuse_unfilled_context(&agent, &input)?;
         // 3. Prepare input (render judge's prompt template). The persisted
         // copy preserves the caller's intent; the runtime copy carries the
         // rendered prompt for the supervisor.

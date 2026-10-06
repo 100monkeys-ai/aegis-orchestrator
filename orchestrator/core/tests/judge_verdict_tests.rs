@@ -305,6 +305,7 @@ fn stub_agent(id: AgentId) -> Agent {
             },
             task: None,
             context: vec![],
+            contexts: Vec::new(),
             execution: None,
             security: None,
             schedule: None,

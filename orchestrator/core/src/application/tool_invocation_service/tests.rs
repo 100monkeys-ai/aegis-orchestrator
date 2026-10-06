@@ -3753,6 +3753,7 @@ mod gateway_timeout_regression {
                         user_id: None,
                         agent_id: AgentId::new(),
                         workflow_id: None,
+                        contexts: Default::default(),
                     },
                 )
                 .await
@@ -3838,6 +3839,7 @@ mod gateway_timeout_regression {
                     user_id: None,
                     agent_id: AgentId::new(),
                     workflow_id: None,
+                    contexts: Default::default(),
                 },
             ),
         )
@@ -5994,4 +5996,142 @@ async fn the_workflow_wait_answers_no_files_key_without_an_execution_store() {
         payload.get("produced_files").is_none(),
         "I9: answered produced_files with no execution store: {payload}"
     );
+}
+
+// Zaru ADR-0055 D14: each starting tool carries its call's `contexts` into
+// the input it starts, in the reserved key `contexts`, and refuses any other
+// shape before anything starts.
+
+const CHOSEN_BINDING: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+
+fn chosen_contexts() -> serde_json::Value {
+    serde_json::json!({ "nuclear-notes": CHOSEN_BINDING, "elsewhere": null })
+}
+
+#[tokio::test]
+async fn each_starting_tool_carries_the_calls_contexts_into_the_input_it_starts() {
+    let mut complaints = Vec::new();
+
+    // The two agent starts.
+    for (tool, agent_name, mut args) in [
+        (
+            "aegis.task.execute",
+            "doc-summarizer",
+            serde_json::json!({
+                "agent_id": "doc-summarizer",
+                "input": { "topic": "units" },
+                "contexts": chosen_contexts(),
+            }),
+        ),
+        (
+            "aegis.agent.generate",
+            "agent-creator-agent",
+            serde_json::json!({ "input": "build me a bot", "contexts": chosen_contexts() }),
+        ),
+    ] {
+        let (service, captured) = build_attachments_capturing_service(agent_name, AgentId::new());
+        let context = empty_security_context();
+        let answer = if tool == "aegis.task.execute" {
+            service
+                .invoke_aegis_task_execute_tool(&mut args, &context, None, &test_tenant_scope())
+                .await
+        } else {
+            service
+                .invoke_aegis_agent_generate_tool(&mut args, &context, None, &test_tenant_scope())
+                .await
+        };
+        if let Err(e) = answer {
+            complaints.push(format!("{tool}: {e}"));
+            continue;
+        }
+        let started = captured.lock().unwrap().clone();
+        match started {
+            Some(input) if input.input.get("contexts") == Some(&chosen_contexts()) => {}
+            Some(input) => complaints.push(format!("{tool} started {}", input.input)),
+            None => complaints.push(format!("{tool} started nothing")),
+        }
+    }
+
+    // The three workflow starts.
+    for tool in [
+        "aegis.execute.intent",
+        "aegis.workflow.generate",
+        "aegis.workflow.run",
+    ] {
+        let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+        let (service, operator_context) = workflow_start_service(start_use_case.clone());
+        let answer = match tool {
+            "aegis.execute.intent" => {
+                let mut args = serde_json::json!({
+                    "intent": "add two numbers",
+                    "contexts": chosen_contexts(),
+                });
+                service
+                    .invoke_aegis_execute_intent_tool(
+                        &mut args,
+                        &make_security_context("zaru-pro"),
+                        None,
+                        &test_tenant_scope(),
+                    )
+                    .await
+            }
+            "aegis.workflow.generate" => {
+                let mut args = serde_json::json!({
+                    "input": "a workflow that greets",
+                    "contexts": chosen_contexts(),
+                });
+                service
+                    .invoke_aegis_workflow_generate_tool(&mut args, None, &test_tenant_scope())
+                    .await
+            }
+            _ => {
+                let mut args = serde_json::json!({
+                    "name": "my-workflow",
+                    "input": { "topic": "units" },
+                    "contexts": chosen_contexts(),
+                });
+                service
+                    .invoke_aegis_workflow_run_tool(
+                        &mut args,
+                        &operator_context,
+                        None,
+                        &test_tenant_scope(),
+                    )
+                    .await
+            }
+        };
+        if let Err(e) = answer {
+            complaints.push(format!("{tool}: {e}"));
+            continue;
+        }
+        let started = start_use_case.last_request.lock().await.clone();
+        match started {
+            Some(request) if request.input.get("contexts") == Some(&chosen_contexts()) => {}
+            Some(request) => complaints.push(format!("{tool} started {}", request.input)),
+            None => complaints.push(format!("{tool} started nothing")),
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+#[tokio::test]
+async fn a_starting_tool_refuses_contexts_of_another_shape_and_starts_nothing() {
+    let (service, captured) = build_attachments_capturing_service("doc-summarizer", AgentId::new());
+    let context = empty_security_context();
+    let mut args = serde_json::json!({
+        "agent_id": "doc-summarizer",
+        "input": {},
+        "contexts": { "nuclear-notes": "my-token" },
+    });
+    match service
+        .invoke_aegis_task_execute_tool(&mut args, &context, None, &test_tenant_scope())
+        .await
+    {
+        Err(SealSessionError::InvalidArguments(message)) => assert_eq!(
+            message,
+            "'contexts' must be an object naming a binding id or null for each server"
+        ),
+        other => panic!("contexts of another shape were not refused: {other:?}"),
+    }
+    assert!(captured.lock().unwrap().is_none(), "an execution started");
 }

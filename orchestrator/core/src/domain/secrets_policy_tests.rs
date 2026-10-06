@@ -324,6 +324,7 @@ fn actor<'a>(tenant: &'a TenantId, sub: &'a str) -> ToolCallActor<'a> {
         user_id: sub,
         agent_id: AgentId::new(),
         workflow_id: None,
+        context: crate::domain::execution::ContextChoice::NotGiven,
     }
 }
 

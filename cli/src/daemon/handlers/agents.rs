@@ -46,6 +46,11 @@ pub(crate) struct ExecuteRequest {
     /// verbatim so the dispatch path matches the SEAL JSON-RPC invoke shape.
     #[serde(default)]
     attachments: Vec<aegis_orchestrator_core::domain::execution::AttachmentRef>,
+    /// The caller's choice of a credential binding per remote tool server,
+    /// `{"<server>": "<binding id>" | null}` (Zaru ADR-0055 D14), carried
+    /// unchanged into the execution input's reserved key `contexts`.
+    #[serde(default)]
+    contexts: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -143,11 +148,20 @@ pub(crate) async fn execute_agent_handler(
 
     let input = ExecutionInput {
         intent: request.intent,
-        input: serde_json::json!({
-            "input": request.input,
-            "context_overrides": request.context_overrides,
-            "tenant_id": tenant_id.to_string(),
-        }),
+        input: {
+            let mut input = serde_json::json!({
+                "input": request.input,
+                "context_overrides": request.context_overrides,
+                "tenant_id": tenant_id.to_string(),
+            });
+            if let (Some(contexts), Some(map)) = (request.contexts, input.as_object_mut()) {
+                map.insert(
+                    aegis_orchestrator_core::domain::execution::CONTEXTS_INPUT_KEY.to_string(),
+                    contexts,
+                );
+            }
+            input
+        },
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,

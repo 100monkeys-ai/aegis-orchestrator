@@ -1678,6 +1678,7 @@ mod tests {
                     },
                     task: None,
                     context: vec![],
+                    contexts: Vec::new(),
                     execution: None,
                     security: None,
                     schedule: None,

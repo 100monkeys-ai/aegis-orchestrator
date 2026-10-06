@@ -12,12 +12,16 @@ use std::time::Duration;
 /// Who a call to the SEAL gateway acts for (AEGIS ADR-132 H4, H6): the
 /// person the run acts for (`None` for a run with no recorded person), the
 /// calling agent, and the workflow the run belongs to, if any. Taken from
-/// the execution's identity, never from a token a caller supplied.
+/// the execution's identity, never from a token a caller supplied. With
+/// them, the execution's dispatch choices of a binding per remote server
+/// (Zaru ADR-0055 D15), read from the execution record; they never reach
+/// the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayActing {
     pub(crate) user_id: Option<String>,
     pub(crate) agent_id: AgentId,
     pub(crate) workflow_id: Option<uuid::Uuid>,
+    pub(crate) contexts: crate::domain::execution::ExecutionContexts,
 }
 
 impl GatewayActing {
@@ -226,7 +230,29 @@ impl ToolInvocationService {
                 ))
             })?;
         let declared_tools = agent.manifest.spec.tools;
-        if declared_tools.is_empty() {
+        // The run's person and its dispatch's choices, as the execution
+        // recorded them: never a service account's person (G2,
+        // `execution::person_sub`).
+        let execution = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .ok();
+        let contexts = execution
+            .as_ref()
+            .map(|execution| execution.input.contexts())
+            .unwrap_or_default();
+        // Zaru ADR-0055 D16: a declared context the dispatch filled with a
+        // binding brings its server's tools; an undeclared one brings none.
+        let filled_contexts: Vec<String> = agent
+            .manifest
+            .spec
+            .contexts
+            .iter()
+            .map(|declared| declared.service.trim().to_string())
+            .filter(|service| contexts.is_filled(service))
+            .collect();
+        if declared_tools.is_empty() && filled_contexts.is_empty() {
             return Ok(Vec::new());
         }
         let security_context = self
@@ -245,18 +271,13 @@ impl ToolInvocationService {
                 SealSessionError::InternalError(format!("Failed to list tools: {e}"))
             })?;
         if self.seal_gateway_url.is_some() {
-            // The run's person, as the execution recorded it: never a
-            // service account (G2, `execution::person_sub`).
-            let user_id = self
-                .execution_service
-                .get_execution_unscoped(execution_id)
-                .await
-                .ok()
-                .and_then(|execution| execution.initiating_user_sub);
             let acting = GatewayActing {
-                user_id,
+                user_id: execution
+                    .as_ref()
+                    .and_then(|execution| execution.initiating_user_sub.clone()),
                 agent_id,
                 workflow_id: self.workflow_of(execution_id, tenant_id).await,
+                contexts,
             };
             let listing = ListToolsRequest {
                 tenant_id: tenant_id.as_str().to_string(),
@@ -277,15 +298,20 @@ impl ToolInvocationService {
         Ok(tools
             .into_iter()
             .filter(|tool| {
-                declared_tools.iter().any(|name| name == &tool.name)
-                    && security_context.permits_tool_name(&tool.name)
+                let declared = declared_tools.iter().any(|name| name == &tool.name)
+                    || self.remote_tool_of(&tool.name).is_some_and(|(server, _)| {
+                        filled_contexts.iter().any(|service| service == server)
+                    });
+                declared && security_context.permits_tool_name(&tool.name)
             })
             .collect())
     }
 
     /// Each remote server the acting person holds a binding to granted to
     /// the acting agent or its workflow, with that person's credential, for
-    /// the gateway to list its tools (AEGIS ADR-132 H4). None for a run with
+    /// the gateway to list its tools (AEGIS ADR-132 H4); for a server the
+    /// execution's dispatch chose a binding or none for, that choice instead
+    /// (Zaru ADR-0055 D15). None for a run with
     /// no person, and none over a plaintext channel (H8): a credential is
     /// never sent there, and the reason is logged.
     async fn bound_servers(
@@ -308,14 +334,15 @@ impl ToolInvocationService {
             );
             return Vec::new();
         }
-        let actor = ToolCallActor {
-            tenant_id,
-            user_id,
-            agent_id: acting.agent_id,
-            workflow_id: acting.workflow_id,
-        };
         let mut bound = Vec::new();
         for server in &self.remote_tool_servers {
+            let actor = ToolCallActor {
+                tenant_id,
+                user_id,
+                agent_id: acting.agent_id,
+                workflow_id: acting.workflow_id,
+                context: acting.contexts.choice(server),
+            };
             match source.tool_server_credential(&actor, server).await {
                 Ok(Some(credential)) => {
                     bound.push(crate::infrastructure::seal_gateway_proto::BoundServer {
@@ -525,7 +552,9 @@ impl ToolInvocationService {
     /// Who a call of `agent_id` in `execution_id` acts for (AEGIS ADR-132
     /// H4, H6): the caller when the caller is a person, never a service
     /// account; the workflow the execution's workflow run belongs to, read in
-    /// the same tenant. A workflow that cannot be read is named as none.
+    /// the same tenant. A workflow that cannot be read is named as none. The
+    /// dispatch's choices are the execution record's (Zaru ADR-0055 D15);
+    /// an execution that cannot be read carries none.
     pub(super) async fn gateway_acting(
         &self,
         agent_id: AgentId,
@@ -533,10 +562,17 @@ impl ToolInvocationService {
         tenant_id: &TenantId,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> GatewayActing {
+        let contexts = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .map(|execution| execution.input.contexts())
+            .unwrap_or_default();
         GatewayActing {
             user_id: crate::application::execution::person_sub(caller_identity),
             agent_id,
             workflow_id: self.workflow_of(execution_id, tenant_id).await,
+            contexts,
         }
     }
 
@@ -575,8 +611,10 @@ impl ToolInvocationService {
     /// The acting user's credential for `server` (AEGIS ADR-132 H1, H3,
     /// H6), or the refusal `CREDENTIAL_BINDING_REQUIRED`: for a run with no
     /// recorded person, saying so; for a user with no binding to the server
-    /// granted to this agent or its workflow. No other credential path is
-    /// tried.
+    /// granted to this agent or its workflow; for an execution whose dispatch
+    /// chose none for the server, or chose a binding that is not the user's
+    /// own active one for it (Zaru ADR-0055 D15). No other credential path
+    /// is tried.
     async fn credential_for(
         &self,
         tenant_id: &TenantId,
@@ -598,17 +636,27 @@ impl ToolInvocationService {
             ))
             .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
         })?;
+        let context = acting.contexts.choice(server);
         let actor = ToolCallActor {
             tenant_id,
             user_id,
             agent_id: acting.agent_id,
             workflow_id: acting.workflow_id,
+            context,
         };
         match source.tool_server_credential(&actor, server).await {
             Ok(Some(credential)) => Ok(credential),
-            Ok(None) => Err(binding_required(format!(
-                "This tool needs your own credential for '{server}', granted to this agent."
-            ))),
+            Ok(None) => Err(binding_required(match context {
+                crate::domain::execution::ContextChoice::None => format!(
+                    "This tool needs your own credential for '{server}', and none was chosen for this run."
+                ),
+                crate::domain::execution::ContextChoice::Binding(_) => format!(
+                    "This tool needs your own credential for '{server}', and the one chosen for this run is not an active credential of yours for it."
+                ),
+                crate::domain::execution::ContextChoice::NotGiven => format!(
+                    "This tool needs your own credential for '{server}', granted to this agent."
+                ),
+            })),
             Err(e) => Err(SealSessionError::InternalError(format!(
                 "resolving the credential for the remote tool server '{server}' failed: {e}"
             ))),

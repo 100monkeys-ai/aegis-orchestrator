@@ -303,7 +303,7 @@ impl AttestationServiceImpl {
                         {
                             Ok(agent) => {
                                 let tools = agent.manifest.spec.tools.clone();
-                                if tools.is_empty() {
+                                let mut patterns: Vec<String> = if tools.is_empty() {
                                     tracing::debug!(
                                         execution_id = %exec_id_str,
                                         agent_id = %execution.agent_id,
@@ -322,7 +322,16 @@ impl AttestationServiceImpl {
                                         "Derived allowed_tool_patterns from agent manifest spec.tools"
                                     );
                                     tools
-                                }
+                                };
+                                // Zaru ADR-0055 D16: each declared context the
+                                // dispatch filled adds its server's tools, as at
+                                // the session's pre-creation.
+                                crate::domain::agent::add_filled_context_patterns(
+                                    &mut patterns,
+                                    &agent.manifest.spec.contexts,
+                                    &execution.input.contexts(),
+                                );
+                                patterns
                             }
                             Err(e) => {
                                 tracing::warn!(

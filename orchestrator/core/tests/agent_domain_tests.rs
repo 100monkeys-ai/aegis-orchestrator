@@ -55,6 +55,7 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
                 input_data: None,
             }),
             context: vec![],
+            contexts: Vec::new(),
             execution: None,
             security: None,
             schedule: None,
@@ -1177,4 +1178,94 @@ fn agent_id_equality() {
     let id = AgentId::new();
     let cloned = id;
     assert_eq!(id, cloned);
+}
+
+// ============================================================================
+// Declared contexts (Zaru ADR-0055 D5, D16)
+// ============================================================================
+
+fn declaring(services: &[(&str, bool)]) -> AgentManifest {
+    let mut manifest = make_standard_manifest("context-reader");
+    manifest.spec.contexts = services
+        .iter()
+        .map(
+            |(service, required)| aegis_orchestrator_core::domain::agent::ContextDeclaration {
+                service: service.to_string(),
+                required: *required,
+            },
+        )
+        .collect();
+    manifest
+}
+
+#[test]
+fn a_declared_context_parses_with_required_defaulting_to_false() {
+    let spec: AgentSpec = serde_yaml::from_str(
+        r#"
+runtime:
+  language: python
+  version: "3.11"
+contexts:
+  - service: nuclear-notes
+  - service: other
+    required: true
+"#,
+    )
+    .expect("the spec parses");
+    let declared: Vec<(String, bool)> = spec
+        .contexts
+        .iter()
+        .map(|c| (c.service.clone(), c.required))
+        .collect();
+    assert_eq!(
+        declared,
+        vec![
+            ("nuclear-notes".to_string(), false),
+            ("other".to_string(), true)
+        ]
+    );
+}
+
+#[test]
+fn validate_refuses_a_context_naming_no_service_and_a_service_declared_twice() {
+    let control = declaring(&[("nuclear-notes", true)]).validate();
+    assert_eq!(
+        control,
+        make_standard_manifest("context-reader").validate(),
+        "one declared context changed the manifest's verdict"
+    );
+    assert_eq!(
+        declaring(&[("  ", false)]).validate(),
+        Err("spec.contexts: a context names no service".to_string())
+    );
+    assert_eq!(
+        declaring(&[("nuclear-notes", false), ("nuclear-notes", true)]).validate(),
+        Err("spec.contexts: the service 'nuclear-notes' is declared twice".to_string())
+    );
+}
+
+#[test]
+fn a_filled_declared_context_adds_its_servers_pattern_to_the_sessions_patterns() {
+    use aegis_orchestrator_core::domain::agent::add_filled_context_patterns;
+    use aegis_orchestrator_core::domain::execution::ExecutionContexts;
+    let declared = declaring(&[("nuclear-notes", false), ("unfilled", true)])
+        .spec
+        .contexts;
+    let contexts = ExecutionContexts::from_value(Some(&serde_json::json!({
+        "nuclear-notes": "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e",
+        "unfilled": null,
+        "undeclared": "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e"
+    })));
+
+    let mut patterns = vec!["cmd.run".to_string()];
+    add_filled_context_patterns(&mut patterns, &declared, &contexts);
+    assert_eq!(patterns, vec!["cmd.run", "nuclear-notes.*"]);
+
+    let mut everything = vec!["*".to_string()];
+    add_filled_context_patterns(&mut everything, &declared, &contexts);
+    assert_eq!(
+        everything,
+        vec!["*"],
+        "a pattern allowing every tool was widened"
+    );
 }

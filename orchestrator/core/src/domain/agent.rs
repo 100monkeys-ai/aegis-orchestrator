@@ -168,6 +168,17 @@ pub struct AgentSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ContextItem>,
 
+    // Zaru ADR-0055 D5, D16. The doc comment below is the manifest schema's
+    // description, text a person and a model read, so it names no record.
+    /// The services a person's binding fills for this agent's executions: a
+    /// declared context the dispatch fills with a binding brings that
+    /// service's tools, as the service lists them for the binding's token,
+    /// without `tools` naming them; a required one with no binding chosen
+    /// refuses the execution at start. Not the prompt attachments of
+    /// `context`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<ContextDeclaration>,
+
     /// Optional execution strategy
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionStrategy>,
@@ -222,6 +233,40 @@ pub struct AgentSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
+}
+
+// Zaru ADR-0055 D5, D16; the doc comment is the manifest schema's text.
+/// One service an agent declares as a context, named as the node names the
+/// remote server (`seal_gateway.remote_servers`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ContextDeclaration {
+    /// The service, today `nuclear-notes`.
+    pub service: String,
+    /// Whether an execution with no binding chosen for the service is
+    /// refused at start.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Add `<service>.*` to a SEAL session's tool patterns for each context
+/// `declared` that `contexts` fills with a binding (Zaru ADR-0055 D16), so
+/// the session's patterns and the run's tool list agree. Patterns that
+/// already allow every tool are left as they are.
+pub fn add_filled_context_patterns(
+    patterns: &mut Vec<String>,
+    declared: &[ContextDeclaration],
+    contexts: &crate::domain::execution::ExecutionContexts,
+) {
+    if patterns.iter().any(|pattern| pattern == "*") {
+        return;
+    }
+    for context in declared {
+        let service = context.service.trim();
+        let pattern = format!("{service}.*");
+        if contexts.is_filled(service) && !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
 }
 
 /// Runtime configuration
@@ -1010,6 +1055,20 @@ impl AgentManifest {
             }
         }
 
+        // Each declared context names a service, once (Zaru ADR-0055 D16).
+        let mut services = std::collections::HashSet::new();
+        for declared in &self.spec.contexts {
+            let service = declared.service.trim();
+            if service.is_empty() {
+                return Err("spec.contexts: a context names no service".to_string());
+            }
+            if !services.insert(service) {
+                return Err(format!(
+                    "spec.contexts: the service '{service}' is declared twice"
+                ));
+            }
+        }
+
         // spec.task is required — an agent without a task block has no instruction and cannot run
         match &self.spec.task {
             None => {
@@ -1079,6 +1138,7 @@ mod tests {
                     input_data: None,
                 }),
                 context: vec![],
+                contexts: Vec::new(),
                 execution: None,
                 security: None,
                 schedule: None,

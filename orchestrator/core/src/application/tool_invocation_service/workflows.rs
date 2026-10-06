@@ -153,7 +153,10 @@ impl ToolInvocationService {
             )
         })?;
 
-        let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let mut input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+        // Zaru ADR-0055 D14: the dispatch's binding choices ride in the
+        // input's reserved key `contexts`.
+        super::context_args::carry_contexts(args, &mut input)?;
         let blackboard = args.get("blackboard").cloned();
         let intent = args
             .get("intent")
@@ -592,6 +595,11 @@ impl ToolInvocationService {
             )
         })?;
 
+        let mut payload = serde_json::json!({ "input": input });
+        // Zaru ADR-0055 D14: the dispatch's binding choices ride in the
+        // input's reserved key `contexts`.
+        super::context_args::carry_contexts(args, &mut payload)?;
+
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,
             None => {
@@ -609,7 +617,7 @@ impl ToolInvocationService {
                 &tenant_id,
                 crate::application::start_workflow_execution::StartWorkflowExecutionRequest {
                     workflow_id: "builtin-workflow-generator".to_string(),
-                    input: serde_json::json!({ "input": input }),
+                    input: payload,
                     blackboard: None,
                     version: None,
                     tenant_id: Some(tenant_id.clone()),

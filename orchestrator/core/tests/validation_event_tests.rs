@@ -236,6 +236,7 @@ impl AgentLifecycleService for MockAgentLifecycleService {
                 },
                 task: None,
                 context: vec![],
+                contexts: Vec::new(),
                 execution: None,
                 security: None,
                 schedule: None,

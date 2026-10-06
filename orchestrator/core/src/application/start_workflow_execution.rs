@@ -340,6 +340,20 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         .context("Failed to query workflow repository")?
         .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.workflow_id))?;
 
+        // The dispatch's binding choices (Zaru ADR-0055 D14) are the
+        // platform's: the workflow's schema and its Temporal input never see
+        // them; the persisted execution keeps them for its agent states.
+        let input_without_contexts = match &request.input {
+            serde_json::Value::Object(map)
+                if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY) =>
+            {
+                let mut map = map.clone();
+                map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
+                serde_json::Value::Object(map)
+            }
+            other => other.clone(),
+        };
+
         // Step 1.5: Validate request input against workflow's declared input_schema (ADR-092 D7)
         if let Some(schema) = &workflow.metadata.input_schema {
             let compiled = jsonschema::validator_for(schema).map_err(|e| {
@@ -351,7 +365,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 )
             })?;
             let errors: Vec<String> = compiled
-                .iter_errors(&request.input)
+                .iter_errors(&input_without_contexts)
                 .map(|e| e.to_string())
                 .collect();
             if !errors.is_empty() {
@@ -412,14 +426,14 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 workflow_id: &workflow_id,
                 execution_id,
                 tenant_id: tenant_id.as_str(),
-                input: match &request.input {
+                input: match &input_without_contexts {
                     serde_json::Value::Object(map) => {
                         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
                     }
                     _ => {
                         // Wrap non-object inputs
                         let mut map = HashMap::new();
-                        map.insert("input".to_string(), request.input.clone());
+                        map.insert("input".to_string(), input_without_contexts.clone());
                         map
                     }
                 },

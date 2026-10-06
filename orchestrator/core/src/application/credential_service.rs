@@ -682,6 +682,9 @@ pub struct ToolCallActor<'a> {
     pub user_id: &'a str,
     pub agent_id: AgentId,
     pub workflow_id: Option<uuid::Uuid>,
+    /// What the execution's dispatch chose for this server (Zaru ADR-0055
+    /// D15): a binding, none, or nothing, which leaves the grant path.
+    pub context: crate::domain::execution::ContextChoice,
 }
 
 /// The credential a remote tool server's call carries (AEGIS ADR-132 H1):
@@ -698,6 +701,12 @@ pub trait ToolCredentialSource: Send + Sync {
     /// `OAuth2` binding answers its access token, refreshed when it is
     /// within 60 seconds of `expires_at` (`access_token_for`); any other
     /// answers its `token` or `value` field.
+    ///
+    /// The execution's choice for the server comes first (Zaru ADR-0055
+    /// D15): a chosen binding is the credential, no grant needed, when it is
+    /// the acting user's own active binding for the server in the tenant,
+    /// and `Ok(None)` otherwise; a choice of none answers `Ok(None)` whatever
+    /// is granted; with no choice the grant path above stands.
     async fn tool_server_credential(
         &self,
         actor: &ToolCallActor<'_>,
@@ -731,6 +740,46 @@ impl ToolCredentialSource for StandardCredentialManagementService {
         server: &str,
     ) -> anyhow::Result<Option<SensitiveString>> {
         let provider = CredentialProvider::new(server);
+        let binding = match actor.context {
+            // Zaru ADR-0055 D2: `null` chose no credential for the server,
+            // whatever is granted.
+            crate::domain::execution::ContextChoice::None => return Ok(None),
+            // D15: the chosen binding, no grant needed, when it is the acting
+            // person's own active binding for this server in this tenant;
+            // nothing otherwise, another person's binding included.
+            crate::domain::execution::ContextChoice::Binding(id) => {
+                match self.repo.find_by_id(&id).await? {
+                    Some(binding)
+                        if binding.owner_user_id == actor.user_id
+                            && &binding.tenant_id == actor.tenant_id
+                            && binding.provider == provider
+                            && binding.status == CredentialStatus::Active =>
+                    {
+                        binding
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            crate::domain::execution::ContextChoice::NotGiven => {
+                match self.newest_granted(actor, &provider).await? {
+                    Some(binding) => binding,
+                    None => return Ok(None),
+                }
+            }
+        };
+        self.binding_secret(binding).await
+    }
+}
+
+impl StandardCredentialManagementService {
+    /// The acting person's newest active binding for `provider` granted to
+    /// the calling agent, its workflow or all their agents (AEGIS ADR-132
+    /// H1, S6).
+    async fn newest_granted(
+        &self,
+        actor: &ToolCallActor<'_>,
+        provider: &CredentialProvider,
+    ) -> anyhow::Result<Option<UserCredentialBinding>> {
         // The newest granted binding, when a user holds several.
         let mut granted: Vec<UserCredentialBinding> = self
             .repo
@@ -738,17 +787,22 @@ impl ToolCredentialSource for StandardCredentialManagementService {
             .await?
             .into_iter()
             .filter(|binding| {
-                binding.provider == provider
+                &binding.provider == provider
                     && binding.owner_user_id == actor.user_id
                     && &binding.tenant_id == actor.tenant_id
                     && granted_to(binding, actor)
             })
             .collect();
         granted.sort_by_key(|binding| std::cmp::Reverse(binding.created_at));
-        let Some(binding) = granted.into_iter().next() else {
-            return Ok(None);
-        };
+        Ok(granted.into_iter().next())
+    }
 
+    /// The secret a remote tool server's call carries from `binding`: an
+    /// OAuth access token, refreshed as needed, or the stored token or value.
+    async fn binding_secret(
+        &self,
+        binding: UserCredentialBinding,
+    ) -> anyhow::Result<Option<SensitiveString>> {
         if binding.credential_type == CredentialType::OAuth2 {
             return match self.access_token_for(&binding.id).await {
                 Ok(token) => Ok(Some(token)),

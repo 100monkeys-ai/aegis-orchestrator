@@ -253,7 +253,13 @@ async fn serve_tls(stub: StubGateway) -> (String, Tls, oneshot::Sender<()>) {
 // ---------------------------------------------------------------------------
 
 fn agent(tools: &[&str]) -> Agent {
-    let manifest: AgentManifest = serde_yaml::from_str(&format!(
+    agent_with_contexts(tools, &[])
+}
+
+/// An agent declaring `tools` and the contexts `(service, required)` (Zaru
+/// ADR-0055 D16).
+fn agent_with_contexts(tools: &[&str], contexts: &[(&str, bool)]) -> Agent {
+    let mut manifest: AgentManifest = serde_yaml::from_str(&format!(
         r#"
 apiVersion: 100monkeys.ai/v1
 kind: Agent
@@ -271,6 +277,15 @@ spec:
         serde_json::to_string(tools).unwrap()
     ))
     .unwrap();
+    manifest.spec.contexts = contexts
+        .iter()
+        .map(
+            |(service, required)| crate::domain::agent::ContextDeclaration {
+                service: service.to_string(),
+                required: *required,
+            },
+        )
+        .collect();
     Agent {
         id: AgentId::new(),
         tenant_id: TenantId::default(),
@@ -506,6 +521,11 @@ struct Setup {
     workflow_id: Option<uuid::Uuid>,
     /// The approval gate, if enabled.
     approvals: Option<Arc<crate::application::tool_approval_service::ToolApprovalService>>,
+    /// The contexts the agent declares, `(service, required)`.
+    agent_contexts: Vec<(&'static str, bool)>,
+    /// The executions' dispatch choices, kept in their input's reserved key
+    /// `contexts` (Zaru ADR-0055 D14), if any.
+    contexts: Option<Value>,
 }
 
 impl Setup {
@@ -520,13 +540,15 @@ impl Setup {
             remote_servers: Vec::new(),
             workflow_id: None,
             approvals: None,
+            agent_contexts: Vec::new(),
+            contexts: None,
         }
     }
 }
 
 async fn harness(setup: Setup) -> Harness {
     let tenant = TenantId::for_consumer_user(USER).unwrap();
-    let agent = agent(&setup.agent_tools);
+    let agent = agent_with_contexts(&setup.agent_tools, &setup.agent_contexts);
     let agent_id = agent.id;
     let workflow_executions =
         Arc::new(crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
@@ -563,7 +585,10 @@ async fn harness(setup: Setup) -> Harness {
             agent_id,
             ExecutionInput {
                 intent: None,
-                input: json!({}),
+                input: match &setup.contexts {
+                    Some(contexts) => json!({ "contexts": contexts }),
+                    None => json!({}),
+                },
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
@@ -2615,4 +2640,228 @@ async fn an_empty_grounding_falls_back_to_the_results_text() {
         (Some("play2"), Some("inst-play2-id")),
         "the reach was not read from the result's text"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Zaru ADR-0055 D15, D16: the dispatch chooses the binding, and a declared
+// context it fills brings the server's tools
+// ---------------------------------------------------------------------------
+
+const CHOSEN: &str = "Mk12-chosen-binding-token";
+
+/// The dispatch's `contexts`: `choice` for `SERVER`.
+fn choosing(choice: Value) -> Value {
+    let mut contexts = serde_json::Map::new();
+    contexts.insert(SERVER.to_string(), choice);
+    Value::Object(contexts)
+}
+const NEWEST_GRANTED: &str = "Mk12-newest-granted-token";
+
+/// D15: a call carries the binding the execution's dispatch chose, though
+/// it is older and granted to nothing, where the newest binding is granted
+/// to all the person's agents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_carries_the_binding_the_dispatch_chose() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    let chosen = vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", NEWEST_GRANTED)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let h = harness(Setup {
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        contexts: Some(choosing(json!(chosen.0.to_string()))),
+        ..Setup::gateway(&url)
+    })
+    .await;
+
+    h.call(h.execution, &format!("{SERVER}.pages.read"))
+        .await
+        .expect("the call is made");
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.tools.len(), 1);
+    assert_eq!(
+        received.tools[0].credential.as_ref().unwrap().value,
+        CHOSEN,
+        "the call did not carry the chosen binding's secret"
+    );
+}
+
+/// D2, D15: a choice of none refuses the call `CREDENTIAL_BINDING_REQUIRED`
+/// under an all-agents grant, and a chosen binding that is not the person's
+/// own active one for the server is refused the same; each with its
+/// sentence, and nothing reaches the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choice_of_none_or_of_a_binding_not_the_persons_is_refused_and_nothing_is_sent() {
+    let tool = format!("{SERVER}.pages.read");
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", NEWEST_GRANTED)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let others = vault
+        .bind(
+            &TenantId::for_consumer_user("user-2").unwrap(),
+            "user-2",
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    let mut complaints = Vec::new();
+    for (case, choice, expected) in [
+        (
+            "none",
+            Value::Null,
+            format!("This tool needs your own credential for '{SERVER}', and none was chosen for this run."),
+        ),
+        (
+            "another person's binding",
+            json!(others.0.to_string()),
+            format!(
+                "This tool needs your own credential for '{SERVER}', and the one chosen for this run is not an active credential of yours for it."
+            ),
+        ),
+    ] {
+        let stub = StubGateway::new(vec![], remote_result());
+        let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+        let h = harness(Setup {
+            ca: Some(tls.ca_path.clone()),
+            credentials: Some(vault.service.clone()),
+            remote_servers: vec![SERVER.to_string()],
+            contexts: Some(choosing(choice)),
+            ..Setup::gateway(&url)
+        })
+        .await;
+        match h.call(h.execution, &tool).await {
+            Ok(value) => complaints.push(format!("{case}: the call was made: {value}")),
+            Err(err) => {
+                let refusal = err.refusal();
+                if refusal.code != "CREDENTIAL_BINDING_REQUIRED" {
+                    complaints.push(format!("{case}: refused {}", refusal.code));
+                }
+                if refusal.message != expected {
+                    complaints.push(format!("{case}: the sentence was \"{}\"", refusal.message));
+                }
+            }
+        }
+        if !stub.received.lock().unwrap().tools.is_empty() {
+            complaints.push(format!("{case}: a call reached the gateway"));
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// D16: an agent declaring the server as a context, filled with a binding,
+/// lists the server's tools without `tools` naming them, the gateway listing
+/// them with the chosen binding; an agent that does not declare it lists
+/// none of them; the security context still filters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_filled_context_lists_its_servers_tools_and_an_undeclared_one_none() {
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    let chosen = vault
+        .bind(
+            &tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    let contexts = Some(choosing(json!(chosen.0.to_string())));
+
+    let mut complaints = Vec::new();
+    for (case, tools, declared, patterns, expected) in [
+        (
+            "declared",
+            vec![],
+            vec![(SERVER, false)],
+            vec!["*"],
+            vec!["notes-1.lookup"],
+        ),
+        (
+            "undeclared",
+            vec!["ext.lookup"],
+            vec![],
+            vec!["*"],
+            vec!["ext.lookup"],
+        ),
+        (
+            "declared, filtered out",
+            vec!["ext.lookup"],
+            vec![(SERVER, true)],
+            vec!["ext.*"],
+            vec!["ext.lookup"],
+        ),
+    ] {
+        let h = harness(Setup {
+            agent_tools: tools,
+            agent_contexts: declared,
+            context_patterns: patterns,
+            ca: Some(tls.ca_path.clone()),
+            credentials: Some(vault.service.clone()),
+            remote_servers: vec![SERVER.to_string()],
+            contexts: contexts.clone(),
+            ..Setup::gateway(&url)
+        })
+        .await;
+        let listed = h
+            .service
+            .get_available_tools_for_agent_run(&h.tenant, h.agent_id, h.execution, CONTEXT)
+            .await
+            .unwrap();
+        if names(&listed) != expected {
+            complaints.push(format!(
+                "{case}: listed {:?}, expected {expected:?}",
+                names(&listed)
+            ));
+        }
+        if case == "declared" {
+            let received = stub.received.lock().unwrap();
+            let listing = received.lists.last();
+            let carried = listing
+                .and_then(|l| l.bound_servers.first())
+                .and_then(|b| b.credential.as_ref())
+                .map(|c| c.value.clone());
+            if carried.as_deref() != Some(CHOSEN) {
+                complaints.push(format!(
+                    "{case}: the listing carried {carried:?}, not the chosen binding's secret"
+                ));
+            }
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

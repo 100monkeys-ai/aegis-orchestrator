@@ -239,6 +239,82 @@ pub struct ExecutionInput {
     pub attachments: Vec<AttachmentRef>,
 }
 
+/// The reserved key of an execution's `input` that carries the person's
+/// choice of a credential binding for each remote tool server, as
+/// `{"<server>": "<binding id>" | null}` (Zaru ADR-0055 D9, D14). Like the
+/// caller's `outputs`, it is the platform's and never the agent's: the input
+/// schema and the rendered prompt never see it.
+pub const CONTEXTS_INPUT_KEY: &str = "contexts";
+
+/// What an execution's dispatch chose for one remote server's credential
+/// (Zaru ADR-0055 D2, D9, D15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextChoice {
+    /// The dispatch named nothing for the server: the per-agent grant path
+    /// (AEGIS ADR-132 S6) stands.
+    NotGiven,
+    /// The dispatch named `null`: the execution has no credential for the
+    /// server, whatever is granted.
+    None,
+    /// The dispatch named this binding: it is the credential, no grant
+    /// needed, when it is the acting person's own active binding for the
+    /// server.
+    Binding(crate::domain::credential::CredentialBindingId),
+}
+
+/// An execution's choices, server by server, read from its input's
+/// reserved key [`CONTEXTS_INPUT_KEY`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionContexts {
+    choices: std::collections::BTreeMap<String, ContextChoice>,
+}
+
+impl ExecutionContexts {
+    /// Read the choices from a `contexts` value: a binding id string is a
+    /// choice of that binding, `null` is none; anything else is no choice
+    /// (the starting tools refuse such a value before anything starts).
+    pub fn from_value(value: Option<&serde_json::Value>) -> Self {
+        let mut choices = std::collections::BTreeMap::new();
+        if let Some(serde_json::Value::Object(map)) = value {
+            for (server, choice) in map {
+                let choice = match choice {
+                    serde_json::Value::Null => ContextChoice::None,
+                    serde_json::Value::String(id) => match uuid::Uuid::parse_str(id) {
+                        Ok(id) => ContextChoice::Binding(
+                            crate::domain::credential::CredentialBindingId(id),
+                        ),
+                        Err(_) => continue,
+                    },
+                    _ => continue,
+                };
+                choices.insert(server.clone(), choice);
+            }
+        }
+        Self { choices }
+    }
+
+    /// The choice for `server`.
+    pub fn choice(&self, server: &str) -> ContextChoice {
+        self.choices
+            .get(server)
+            .copied()
+            .unwrap_or(ContextChoice::NotGiven)
+    }
+
+    /// Whether the dispatch chose a binding for `server` (a declared context
+    /// is filled only then, Zaru ADR-0055 D16).
+    pub fn is_filled(&self, server: &str) -> bool {
+        matches!(self.choice(server), ContextChoice::Binding(_))
+    }
+}
+
+impl ExecutionInput {
+    /// The dispatch's credential choices (Zaru ADR-0055 D14).
+    pub fn contexts(&self) -> ExecutionContexts {
+        ExecutionContexts::from_value(self.input.get(CONTEXTS_INPUT_KEY))
+    }
+}
+
 /// Structured reference to a file attached at dispatch time (ADR-113).
 ///
 /// Mirrors the `aegis_runtime.AttachmentRef` proto message and is carried on
