@@ -91,6 +91,7 @@ pub mod team;
 pub mod tenancy;
 pub mod tenant;
 pub mod tool_approval;
+pub mod tool_requirement;
 pub mod validation;
 pub mod volume;
 pub mod workflow;

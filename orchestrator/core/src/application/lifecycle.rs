@@ -97,6 +97,8 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
     ) -> Result<AgentId> {
         // Validate manifest before deploying
         manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
+        // AEGIS ADR-005 O4 and O5: refuse an agent whose declarations cannot do its work.
+        crate::domain::tool_requirement::check(&manifest)?;
 
         // Quota check: ensure the tenant has not exceeded its max_agents limit (ADR-056).
         if let Some(quota_svc) = &self.quota_service {
@@ -235,6 +237,8 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         id: AgentId,
         manifest: AgentManifest,
     ) -> Result<()> {
+        // AEGIS ADR-005 O4 and O5: refuse an agent whose declarations cannot do its work.
+        crate::domain::tool_requirement::check(&manifest)?;
         let mut agent = self.get_agent_for_tenant(tenant_id, id).await?;
         let old_version = agent.manifest.metadata.version.clone();
         let new_version = manifest.metadata.version.clone();
