@@ -106,8 +106,9 @@ pub fn check(manifest: &AgentManifest) -> Result<(), ToolRequirementRefusal> {
         }
         if !reasons.is_empty() {
             return Err(ToolRequirementRefusal {
+                // tool-requirement/no-tools: AEGIS ADR-005 O4.
                 sentence: format!(
-                    "Agent '{name}' is refused (AEGIS ADR-005 O4): its instruction requires \
+                    "Agent '{name}' is refused (tool-requirement/no-tools): its instruction requires \
                      writing files or running commands and it declares no tools; {}. Declare \
                      the tools it needs in spec.tools (fs.write to write files, cmd.run to run \
                      commands).",
@@ -127,8 +128,9 @@ pub fn check(manifest: &AgentManifest) -> Result<(), ToolRequirementRefusal> {
     let has_writable_volume = spec.volumes.iter().any(|v| is_writable(&v.access_mode));
     if !writing.is_empty() && !has_writable_volume {
         return Err(ToolRequirementRefusal {
+            // tool-requirement/no-volume: AEGIS ADR-005 O5.
             sentence: format!(
-                "Agent '{name}' is refused (AEGIS ADR-005 O5): it declares {} and no read-write \
+                "Agent '{name}' is refused (tool-requirement/no-volume): it declares {} and no read-write \
                  volume, so those tools have nothing to write to in a run of its own. Declare a \
                  read-write volume with mount_path /workspace; inside a workflow it yields to \
                  the workflow's workspace.",

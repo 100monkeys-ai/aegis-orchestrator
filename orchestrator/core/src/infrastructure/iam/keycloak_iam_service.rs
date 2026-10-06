@@ -402,7 +402,7 @@ impl StandardIamService {
                                 claim_value = %slug,
                                 error = %e,
                                 sub = %claims.sub,
-                                "tenant_id claim malformed; deriving per-user tenant from `sub` (ADR-097)"
+                                "tenant_id claim malformed; deriving per-user tenant from `sub`"
                             );
                             crate::domain::tenant::TenantId::for_consumer_user(&claims.sub)
                                 .map_err(|de| IamError::InvalidTenantSlug {
@@ -417,7 +417,7 @@ impl StandardIamService {
                         tracing::warn!(
                             claim = %self.claims_config.tenant_id,
                             sub = %claims.sub,
-                            "tenant_id claim absent from token; deriving per-user tenant from `sub` (ADR-097)"
+                            "tenant_id claim absent from token; deriving per-user tenant from `sub`"
                         );
                         crate::domain::tenant::TenantId::for_consumer_user(&claims.sub).map_err(
                             |e| IamError::InvalidTenantSlug {

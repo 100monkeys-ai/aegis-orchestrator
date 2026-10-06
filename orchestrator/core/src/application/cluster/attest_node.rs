@@ -48,9 +48,7 @@ impl AttestNodeUseCase {
         // enrolment token on `AttestNode` (security audit 002 §4.9).
         if req.role != NodeRole::Edge {
             if req.enrolment_token.trim().is_empty() {
-                return Err(anyhow!(
-                    "Cluster admission denied: missing enrolment_token (audit 002 §4.9)"
-                ));
+                return Err(anyhow!("Cluster admission denied: missing enrolment_token"));
             }
             match self
                 .enrolment_token_repo
@@ -220,7 +218,7 @@ mod tests {
             .expect_err("attest must reject empty enrolment_token");
         let msg = format!("{err}");
         assert!(
-            msg.contains("missing enrolment_token") || msg.contains("audit 002 §4.9"),
+            msg.contains("missing enrolment_token"),
             "unexpected error: {msg}"
         );
 

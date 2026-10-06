@@ -569,7 +569,7 @@ impl GitRepoService {
                 let msg = format!("refresh via ephemeral CLI not yet implemented: {e}");
                 self.fail_refresh(binding, msg.clone()).await;
                 return Err(GitRepoError::NotYetImplemented(
-                    "refresh for non-HostPath volumes requires ephemeral-cli re-clone (ADR-081 Phase 5)",
+                    "refresh for non-HostPath volumes requires an ephemeral-cli re-clone, not implemented yet",
                 ));
             }
         };
@@ -1115,8 +1115,8 @@ pub fn verify_webhook(auth: &WebhookAuth, payload: &[u8], secret: &[u8]) -> bool
                 warn!(
                     provider = "bitbucket",
                     algorithm = "hmac-sha1",
-                    "accepted Bitbucket webhook with deprecated HMAC-SHA1 signature \
-                     (audit 002 §4.37.5) — track upgrade to HMAC-SHA256 when Bitbucket \
+                    "accepted Bitbucket webhook with deprecated HMAC-SHA1 signature; \
+                     track upgrade to HMAC-SHA256 when Bitbucket \
                      publishes the alternative header"
                 );
             }

@@ -1378,7 +1378,7 @@ impl AgentRuntime for ContainerRuntime {
                                 mountpoint = %mountpoint,
                                 container_path = %container_path,
                                 read_only = is_read_only,
-                                "Configured gRPC FUSE mount for agent container (ADR-107)"
+                                "Configured gRPC FUSE mount for agent container"
                             );
                             pending_grpc_fuse_pairs.push((
                                 config.execution_id.0.to_string(),
@@ -1497,7 +1497,7 @@ impl AgentRuntime for ContainerRuntime {
                                         mountpoint = %mountpoint_path,
                                         container_path = %container_path,
                                         read_only = is_read_only,
-                                        "Configured FUSE bind mount for agent container (ADR-107)"
+                                        "Configured FUSE bind mount for agent container"
                                     );
                                     Ok((
                                         handle,
@@ -1537,7 +1537,7 @@ impl AgentRuntime for ContainerRuntime {
                 if !mounts.is_empty() {
                     host_config.mounts = Some(mounts);
                     info!(
-                        "Configured {} FUSE bind mount(s) for container (ADR-107)",
+                        "Configured {} FUSE bind mount(s) for container",
                         config.volumes.len()
                     );
                 }
@@ -1601,7 +1601,7 @@ impl AgentRuntime for ContainerRuntime {
 
                 host_config.mounts = Some(mounts);
                 info!(
-                    "Configured {} NFS volume mount(s) for container (ADR-036)",
+                    "Configured {} NFS volume mount(s) for container",
                     config.volumes.len()
                 );
             }

@@ -528,10 +528,10 @@ pub enum WorkflowStorageClass {
     Persistent,
 }
 
-/// Declarative volume specification at the workflow level (ADR-050)
+/// Declarative volume specification at the workflow level
 ///
 /// Volumes declared here are matched by name in `ContainerVolumeMount` entries.
-/// Volume provisioning itself is handled by the Storage Gateway Context (ADR-036/ADR-032);
+/// Volume provisioning itself is handled by the Storage Gateway Context;
 /// this declaration is the intent layer consumed by the manifest parser and Temporal mapper.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowVolumeSpec {
@@ -559,7 +559,7 @@ pub struct WorkflowStorageSpec {
     pub shared_volumes: Vec<WorkflowVolumeSpec>,
 }
 
-/// Specifies how a workflow execution manages its workspace volume (ADR-087).
+/// Specifies how a workflow execution manages its workspace volume.
 /// Follows the spec.storage.workspace schema from WORKFLOW_MANIFEST_SPEC_V1.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowWorkspaceSpec {
@@ -740,7 +740,7 @@ pub struct ContainerRunConfig {
     #[serde(default)]
     pub workdir: Option<String>,
 
-    /// Volume mounts — accessed via the NFS Server Gateway (ADR-036)
+    /// Volume mounts — accessed via the NFS Server Gateway
     #[serde(default)]
     pub volumes: Vec<ContainerVolumeMount>,
 
@@ -769,7 +769,7 @@ pub enum ParallelCompletionStrategy {
     BestEffort,
 }
 
-/// Execution mode for a subworkflow invocation (ADR-065)
+/// Execution mode for a subworkflow invocation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubworkflowMode {

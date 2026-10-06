@@ -96,7 +96,7 @@ pub async fn check_rate_limit(
         warn!(
             user = %identity.sub,
             error = %e,
-            "rejecting request: tenant slug in token is invalid (ADR-097)"
+            "rejecting request: tenant slug in token is invalid"
         );
         Status::unauthenticated(format!("invalid tenant slug in token: {e}"))
     })?;

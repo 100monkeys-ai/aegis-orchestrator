@@ -912,7 +912,7 @@ impl InnerLoopService {
         } else {
             tracing::debug!(
                 model_alias = %model_alias,
-                "BYOK detected — skipping LlmCall rate limit check (ADR-072)"
+                "BYOK detected — skipping LlmCall rate limit check"
             );
         }
 

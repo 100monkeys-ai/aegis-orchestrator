@@ -76,7 +76,7 @@ spec:
               (i)  Declare an `attachments` field in `spec.input_schema` of shape:
                      attachments:
                        type: array
-                       description: Files attached to this dispatch (ADR-113).
+                       description: Files attached to this dispatch.
                        items:
                          type: object
                          required: [volume_id, path, name, mime_type, size]
@@ -207,11 +207,11 @@ spec:
            `cmd.run` to run a command or script), and the manifest MUST declare a read-write volume
            with mount_path `/workspace`. The platform refuses at deploy, with the reason, an agent
            that names a /workspace file or declares a writable volume or filesystem.write and
-           declares no tools (AEGIS ADR-005 O4).
+           declares no tools (`tool-requirement/no-tools`).
          - An agent that declares `fs.write`, `fs.edit`, `fs.multi_edit`, `fs.create_dir` or
            `fs.delete` MUST declare a read-write volume with mount_path `/workspace`, including an
            agent built only for workflow steps: inside a workflow the declared volume yields to the
-           workflow's workspace. The platform refuses it at deploy otherwise (AEGIS ADR-005 O5).
+           workflow's workspace. The platform refuses it at deploy otherwise (`tool-requirement/no-volume`).
          - When composing `spec.tools`, select the full relevant tool suite for the agent's capability.
            Do NOT give a code-writing or code-execution agent only `fs.write` + `cmd.run` and rely on
            instruction text to prevent `cmd.run` misuse — give it the correct tools instead.
@@ -256,7 +256,7 @@ spec:
          - When in doubt: if a human will read the result directly, add the output_handler.
          SECURITY CONTEXT — STRICTLY FORBIDDEN IN GENERATED MANIFESTS:
          - Generated manifests MUST NOT include `spec.security_context`. This field is
-           reserved for platform operators only (ADR-102). Including it in a generated
+           reserved for platform operators only. Including it in a generated
            manifest is a policy violation and the deployment will be rejected.
       7. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error

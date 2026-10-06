@@ -473,7 +473,7 @@ impl NodeClusterService for NodeClusterServiceHandler {
 
         let forward_uc = self.forward_execution_use_case.as_ref().ok_or_else(|| {
             Status::failed_precondition(
-                "ForwardExecution disabled on this node (relay-coordinator role does not host agent execution; ADR-117)",
+                "ForwardExecution disabled on this node (relay-coordinator role does not host agent execution)",
             )
         })?;
         let stream = forward_uc

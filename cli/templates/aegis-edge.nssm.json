@@ -1,7 +1,7 @@
 {
   "service_name": "AegisEdge",
   "display_name": "AEGIS Edge Daemon",
-  "description": "AEGIS Edge Daemon (ADR-117): user-installed daemon enrolled to a tenant.",
+  "description": "AEGIS Edge Daemon: user-installed daemon enrolled to a tenant.",
   "binary_path": "{{BINARY_PATH}}",
   "args": ["edge", "daemon", "--state-dir", "%USERPROFILE%\\.aegis\\edge"],
   "start_type": "auto",

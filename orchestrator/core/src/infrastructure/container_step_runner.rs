@@ -563,7 +563,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                         mountpoint = %mountpoint,
                                         mount_path = %vm.mount_path,
                                         read_only = vm.read_only,
-                                        "Configured gRPC FUSE mount for container step (ADR-107)"
+                                        "Configured gRPC FUSE mount for container step"
                                     );
                                     grpc_mounted_volumes.push((
                                         config.execution_id.0.to_string(),
@@ -593,7 +593,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                         info!(
                             step_name = %config.name,
                             count = config.volumes.len(),
-                            "Configured gRPC FUSE mount(s) for container step (ADR-107)"
+                            "Configured gRPC FUSE mount(s) for container step"
                         );
                     }
                 } else if let Some(ref fuse_daemon) = self.fuse_daemon {
@@ -659,7 +659,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                         mountpoint = %mountpoint_path,
                                         mount_path = %vm.mount_path,
                                         read_only = vm.read_only,
-                                        "Configured FUSE bind mount for container step (ADR-107)"
+                                        "Configured FUSE bind mount for container step"
                                     );
 
                                     Some((
@@ -693,7 +693,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                         info!(
                             step_name = %config.name,
                             count = config.volumes.len(),
-                            "Configured FUSE bind mount(s) for container step (ADR-107)"
+                            "Configured FUSE bind mount(s) for container step"
                         );
                     }
 

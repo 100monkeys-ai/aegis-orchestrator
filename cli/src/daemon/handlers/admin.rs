@@ -178,7 +178,7 @@ fn authorize_rate_limit_admin(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": "operator_required",
-                "message": "Rate-limit administration spans all tenants and users and is restricted to operators (ADR-073).",
+                "message": "Rate-limit administration spans all tenants and users and is restricted to operators.",
             })),
         )
             .into_response()),

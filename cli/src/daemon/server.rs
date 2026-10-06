@@ -644,7 +644,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         }
                         info!(
                             version = %merged.version,
-                            "Applied merged database config overlay (ADR-060)"
+                            "Applied merged database config overlay"
                         );
                     }
                 } else {
@@ -1058,7 +1058,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             aegis_orchestrator_core::infrastructure::fuse::daemon::FuseFsalDaemon::new(fsal);
         info!(
             mount_prefix = %fuse_mount_prefix,
-            "FUSE FSAL daemon initialized (ADR-107)"
+            "FUSE FSAL daemon initialized"
         );
         Some(Arc::new(daemon))
     };
@@ -1224,7 +1224,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         if let Some(ref merged) = merged_registry {
             match StandardRuntimeRegistry::from_merged_config(merged) {
                 Ok(registry) => {
-                    info!("StandardRuntime registry loaded from merged config (ADR-060)");
+                    info!("StandardRuntime registry loaded from merged config");
                     Arc::new(registry)
                 }
                 Err(e) => {
@@ -1319,7 +1319,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 }
             }
         });
-        tracing::info!("NFS deregistration listener started (ADR-036)");
+        tracing::info!("NFS deregistration listener started");
     }
 
     info!("Initializing workflow engine...");
@@ -1388,7 +1388,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
         let resolver: Arc<dyn RateLimitPolicyResolver> =
             Arc::new(HierarchicalPolicyResolver::new(pool.clone()));
-        info!("Rate limiting enabled (ADR-072)");
+        info!("Rate limiting enabled");
         (Some(enforcer), Some(resolver))
     } else {
         info!("Rate limiting disabled (no database connection)");
@@ -1554,7 +1554,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let private_key_for_issuer = std::env::var("AEGIS_SEAL_PRIVATE_KEY").map_err(|_| {
         anyhow::anyhow!(
             "SEAL private key not configured: set AEGIS_SEAL_PRIVATE_KEY \
-             (PEM-encoded RSA private key; see ADR-034/ADR-035)"
+             (PEM-encoded RSA private key)"
         )
     })?;
     let private_key_for_issuer = normalize_seal_private_key(&private_key_for_issuer);
@@ -1808,7 +1808,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // to environment variables for env: paths.
     let docker_for_steps =
         connect_container_runtime(config.spec.runtime.container_socket_path.as_deref())
-            .context("Failed to connect container runtime for ContainerStepRunner (ADR-050)")?;
+            .context("Failed to connect container runtime for ContainerStepRunner")?;
     let step_credential_resolver: Arc<
         dyn aegis_orchestrator_core::infrastructure::image_manager::CredentialResolver,
     > = Arc::new(
@@ -2425,7 +2425,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
     > = match (colony_tenant_repo.clone(), colony_keycloak_admin.clone()) {
         (Some(repo), Some(client)) => {
-            info!("Tenant provisioning service initialized (ADR-097)");
+            info!("Tenant provisioning service initialized");
             Some(Arc::new(
                 aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService::new(
                     repo,
@@ -2590,7 +2590,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         tracing::info!(
                             role = ?cluster_role,
                             relay = %SensitiveUrl::new(endpoint.as_str()),
-                            "edge enrollment-token issuer: gRPC to relay-coordinator (ADR-117)"
+                            "edge enrollment-token issuer: gRPC to relay-coordinator"
                         );
                         Arc::new(
                             RelayGrpcEnrollmentTokenIssuer::connect_lazy(endpoint).expect(
@@ -3190,7 +3190,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 tracing::info!(
                     stale_threshold_secs = stale_threshold.as_secs(),
                     sweep_interval_secs = sweep_interval.as_secs(),
-                    "ADR-062: Health sweeper started"
+                    "Health sweeper started"
                 );
             }
         } else {

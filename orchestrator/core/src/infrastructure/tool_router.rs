@@ -186,13 +186,13 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid.").skip_judge(),
     BuiltinToolDefinition::new("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes.").skip_judge(),
     BuiltinToolDefinition::new("aegis.attachment.read", "Read the contents of a file attached to a chat message. Returns the file content (UTF-8 text or base64-encoded bytes for binary), MIME type, size, and SHA-256 digest. Tenant-scoped and read-only.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.edge.fleet.list", "ADR-117: resolve an edge fleet target (selector / group / @node / all) and return the matched node ids without dispatching. Operator-tier.").skip_judge().edge_executor(),
-    BuiltinToolDefinition::new("aegis.edge.fleet.invoke", "ADR-117: dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /v1/edge/fleet/invoke. Operator-tier, fleet-capable.").skip_judge().edge_executor().fleet_capable(),
-    BuiltinToolDefinition::new("aegis.edge.fleet.cancel", "ADR-117: cancel an in-flight fleet operation by fleet_command_id. Operator-tier.").skip_judge().edge_executor(),
+    BuiltinToolDefinition::new("aegis.edge.fleet.list", "Resolve an edge fleet target (selector / group / @node / all) and return the matched node ids without dispatching. Operator-tier.").skip_judge().edge_executor(),
+    BuiltinToolDefinition::new("aegis.edge.fleet.invoke", "Dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /v1/edge/fleet/invoke. Operator-tier, fleet-capable.").skip_judge().edge_executor().fleet_capable(),
+    BuiltinToolDefinition::new("aegis.edge.fleet.cancel", "Cancel an in-flight fleet operation by fleet_command_id. Operator-tier.").skip_judge().edge_executor(),
     BuiltinToolDefinition::new("aegis.approval.status", "Returns the status of a tool call that waited for its user's approval (approval_pending, approved_once, approved_always, denied, expired, auto_allowed) and, once it ran, its result. Only the call's own user can read it.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.goal.create", "AEGIS ADR-131: hold the user's request as a goal that the executions started for it are bound to. Called by the turn, never by a model.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.goal.evaluate", "AEGIS ADR-131: judge the goal after an execution turn with the built-in judge agent goal-judge, and answer whether a round is granted. Blocks at most 45 s, answering judging until the verdict is in. Called by the turn, never by a model.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.goal.status", "AEGIS ADR-131: the goal, its bound executions with their states, and every verdict. Read-only.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.create", "Hold the user's request as a goal that the executions started for it are bound to. Called by the turn, never by a model.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.evaluate", "Judge the goal after an execution turn with the built-in judge agent goal-judge, and answer whether a round is granted. Blocks at most 45 s, answering judging until the verdict is in. Called by the turn, never by a model.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.status", "The goal, its bound executions with their states, and every verdict. Read-only.").skip_judge(),
 ];
 
 impl ToolRouter {
@@ -717,7 +717,7 @@ impl ToolRouter {
                 },
                 "attachments": {
                     "type": "array",
-                    "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                    "description": "Files attached to this dispatch. Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
                     "items": {
                         "type": "object",
                         "required": ["volume_id", "path", "name", "mime_type", "size"],
@@ -1103,7 +1103,7 @@ impl ToolRouter {
                 },
                 "attachments": {
                     "type": "array",
-                    "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                    "description": "Files attached to this dispatch. Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
                     "items": {
                         "type": "object",
                         "required": ["volume_id", "path", "name", "mime_type", "size"],
@@ -1185,7 +1185,7 @@ impl ToolRouter {
                 },
                 "attachments": {
                     "type": "array",
-                    "description": "Files attached to this dispatch (ADR-113). Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
+                    "description": "Files attached to this dispatch. Each entry references a file in a tenant-scoped volume; the agent reads each via aegis.attachment.read({volume_id, path}).",
                     "items": {
                         "type": "object",
                         "required": ["volume_id", "path", "name", "mime_type", "size"],

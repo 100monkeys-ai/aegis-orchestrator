@@ -641,7 +641,8 @@ mod refused_agent_routes {
     use serde_json::json;
     use std::collections::HashMap;
 
-    const REFUSAL: &str = "Agent 'unit-conversion-agent' is refused (AEGIS ADR-005 O5): it \
+    const REFUSAL: &str =
+        "Agent 'unit-conversion-agent' is refused (tool-requirement/no-volume): it \
         declares fs.write and no read-write volume, so those tools have nothing to write to in a \
         run of its own. Declare a read-write volume with mount_path /workspace; inside a workflow \
         it yields to the workflow's workspace.";

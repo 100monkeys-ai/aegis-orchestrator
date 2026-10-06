@@ -449,7 +449,7 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
                 orchestrator_url = %SensitiveUrl::new(orchestrator_url.as_str()),
                 mount_prefix = %mount_prefix,
                 listen_addr = %listen_addr,
-                "Starting AEGIS FUSE daemon (ADR-107)"
+                "Starting AEGIS FUSE daemon"
             );
 
             // Connect to orchestrator FsalService

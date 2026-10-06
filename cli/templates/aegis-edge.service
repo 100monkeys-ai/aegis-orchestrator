@@ -1,5 +1,5 @@
 [Unit]
-Description=AEGIS Edge Daemon (ADR-117)
+Description=AEGIS Edge Daemon
 Documentation=https://github.com/100monkeys-ai/aegis-orchestrator
 After=network-online.target
 Wants=network-online.target

@@ -118,7 +118,7 @@ enum Commands {
         command: NodeCommand,
     },
 
-    /// AEGIS Edge Mode (ADR-117): user-installed daemons enrolled to a tenant
+    /// AEGIS Edge Mode: user-installed daemons enrolled to a tenant
     #[command(name = "edge")]
     Edge(commands::edge::EdgeArgs),
 
@@ -163,7 +163,7 @@ enum Commands {
         command: AuthCommand,
     },
 
-    /// Host-side FUSE daemon for out-of-process volume mounts (ADR-107)
+    /// Host-side FUSE daemon for out-of-process volume mounts
     #[command(name = "fuse-daemon")]
     FuseDaemon {
         #[command(subcommand)]

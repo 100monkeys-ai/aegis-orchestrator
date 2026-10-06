@@ -44,7 +44,7 @@ fn operator_required_response(resource: &str) -> axum::response::Response {
         Json(serde_json::json!({
             "error": "operator_required",
             "message": format!(
-                "{resource} aggregates across all tenants and is operator-restricted (ADR-097)."
+                "{resource} aggregates across all tenants and is operator-restricted."
             ),
         })),
     )
@@ -158,7 +158,7 @@ pub(crate) async fn dashboard_summary_handler(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": "operator_required",
-                "message": "Dashboard summary aggregates data across all tenants and is restricted to operators (ADR-097)."
+                "message": "Dashboard summary aggregates data across all tenants and is restricted to operators."
             })),
         )
             .into_response();

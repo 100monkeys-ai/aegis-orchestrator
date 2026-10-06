@@ -201,7 +201,7 @@ pub struct AgentSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
 
-    /// Optional named security context for this agent's executions (ADR-102).
+    /// Optional named security context for this agent's executions.
     /// When set, overrides the caller's context at runtime.
     /// Only `aegis-system-*` names permitted; only Operators/ServiceAccounts may set this.
     #[serde(
@@ -211,7 +211,7 @@ pub struct AgentSpec {
     )]
     pub security_context: Option<String>,
 
-    /// Optional egress handler fired after execution completes (ADR-103).
+    /// Optional egress handler fired after execution completes.
     ///
     /// When set, the [`crate::application::output_handler_service::OutputHandlerService`]
     /// invokes this handler immediately after `ExecutionCompleted` is published.
@@ -434,18 +434,16 @@ pub struct ExecutionStrategy {
     pub tool_validation: Option<ValidationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryConfig>,
-    /// Files an execution of this agent must leave in its workspace (AEGIS
-    /// ADR-005, Update of 2026-10-06, O1). Before an iteration counts as
-    /// completed the supervisor reads each one from the execution's volume;
-    /// a missing, short or wrong-prefix file fails the iteration (O2), and a
-    /// completed execution records each one it found (O3).
+    /// Files an execution of this agent must leave in its workspace. Before
+    /// an iteration counts as completed the supervisor reads each one from the
+    /// execution's volume; a missing, short or wrong-prefix file fails the
+    /// iteration, and a completed execution records each one it found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<DeclaredOutput>,
 }
 
 /// One file an execution must produce: `spec.execution.outputs[]` in the
-/// manifest, or an entry of a caller's `input.outputs` for one execution
-/// (AEGIS ADR-005, Update of 2026-10-06, O1).
+/// manifest, or an entry of a caller's `input.outputs` for one execution.
 ///
 /// # YAML example
 /// ```yaml
@@ -520,7 +518,7 @@ pub enum ExecutionMode {
 /// in sequence; a step whose `min_score` is not met causes the iteration to be marked
 /// as failed and triggers the refinement loop.
 ///
-/// `semantic` and `multi_judge` variants spawn isolated child executions (ADR-016).
+/// `semantic` and `multi_judge` variants spawn isolated child executions.
 ///
 /// # YAML example
 /// ```yaml
@@ -565,8 +563,8 @@ pub enum ValidatorSpec {
     },
     /// Spawns a judge agent as a child execution to semantically evaluate output.
     ///
-    /// The judge agent is looked up by name in the agent registry. Implements
-    /// ADR-016 (Agent-as-Judge) and ADR-017 (Gradient Validation).
+    /// The judge agent is looked up by name in the agent registry and returns a
+    /// score from 0.0 to 1.0 with a confidence.
     Semantic {
         /// Name of the judge agent to spawn (must be a deployed agent).
         judge_agent: String,
@@ -583,8 +581,6 @@ pub enum ValidatorSpec {
         timeout_seconds: u64,
     },
     /// Spawns multiple judge agents in parallel and aggregates their verdicts.
-    ///
-    /// Implements ADR-016 (Agent-as-Judge) and ADR-017 (Gradient Validation).
     MultiJudge {
         /// Names of judge agents to spawn (must be deployed agents).
         judges: Vec<String>,

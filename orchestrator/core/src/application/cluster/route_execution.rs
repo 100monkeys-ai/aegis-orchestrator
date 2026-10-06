@@ -58,7 +58,7 @@ impl RouteExecutionUseCase {
                     tracing::warn!(
                         node_id = %p.node_id,
                         staleness_secs = staleness.num_seconds(),
-                        "ADR-062: excluding stale peer from routing despite Active status"
+                        "excluding stale peer from routing despite Active status"
                     );
                     false
                 } else {

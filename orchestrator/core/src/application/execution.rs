@@ -695,7 +695,7 @@ impl StandardExecutionService {
         }
 
         tracing::info!(
-            "ADR-049: injecting {} read-only inherited worker volume(s) into judge execution {}",
+            "injecting {} read-only inherited worker volume(s) into judge execution {}",
             mounts.len(),
             child_execution_id
         );
@@ -3800,7 +3800,7 @@ mod tests {
     }
 
     const UNIT_CONVERSION_REFUSAL: &str = "Execution refused: Agent 'unit-conversion-agent' is \
-        refused (AEGIS ADR-005 O5): it declares fs.write and no read-write volume, so those tools \
+        refused (tool-requirement/no-volume): it declares fs.write and no read-write volume, so those tools \
         have nothing to write to in a run of its own. Declare a read-write volume with mount_path \
         /workspace; inside a workflow it yields to the workflow's workspace.";
 
@@ -3977,8 +3977,9 @@ mod tests {
         {
             Ok(id) => complaints.push(format!("the workflow step started as {id}")),
             Err(e) => {
-                let expected = "Execution refused: Agent 'executor' is refused (AEGIS ADR-005 \
-                                O4): its instruction requires writing files or running commands \
+                let expected = "Execution refused: Agent 'executor' is refused \
+                                (tool-requirement/no-tools): its instruction requires writing \
+                                files or running commands \
                                 and it declares no tools; it declares the read-write volume \
                                 'workspace' at /workspace. Declare the tools it needs in \
                                 spec.tools (fs.write to write files, cmd.run to run commands).";
@@ -5556,7 +5557,7 @@ impl StandardExecutionService {
                     return Err(anyhow!(
                         "StandardRuntime registry not configured; cannot resolve image for \
                          language='{language}' version='{version}'. Call `.with_runtime_registry()` when \
-                         building StandardExecutionService (ADR-043)."
+                         building StandardExecutionService."
                     ));
                 }
             },

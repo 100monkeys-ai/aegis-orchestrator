@@ -364,7 +364,7 @@ async fn container_output_handler_returns_not_yet_implemented_instead_of_panicki
                 "NotYetImplemented message must name the Container variant, got: {msg}"
             );
             assert!(
-                msg.contains("ADR-103 phase 2"),
+                msg.contains("not implemented yet"),
                 "NotYetImplemented message must reference the deferred ADR phase, got: {msg}"
             );
         }
@@ -391,7 +391,7 @@ async fn mcp_tool_output_handler_returns_not_yet_implemented_instead_of_panickin
                 "NotYetImplemented message must name the McpTool variant, got: {msg}"
             );
             assert!(
-                msg.contains("ADR-103 phase 2"),
+                msg.contains("not implemented yet"),
                 "NotYetImplemented message must reference the deferred ADR phase, got: {msg}"
             );
         }

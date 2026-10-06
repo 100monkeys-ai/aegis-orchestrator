@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn execute_of_a_refused_agent_answers_422_with_the_refusal() {
         use aegis_orchestrator_core::domain::execution::ExecutionError;
-        let sentence = "Agent 'unit-conversion-agent' is refused (AEGIS ADR-005 O5): it \
+        let sentence = "Agent 'unit-conversion-agent' is refused (tool-requirement/no-volume): it \
                         declares fs.write and no read-write volume, so those tools have nothing \
                         to write to in a run of its own. Declare a read-write volume with \
                         mount_path /workspace; inside a workflow it yields to the workflow's \

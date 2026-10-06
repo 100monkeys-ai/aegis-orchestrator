@@ -169,11 +169,11 @@ impl OutputHandlerService for StandardOutputHandlerService {
             // these variants fail cleanly at the execution boundary rather
             // than crashing the worker loop.
             OutputHandlerConfig::Container { .. } => Err(OutputHandlerError::NotYetImplemented(
-                "Container output handler is deferred to ADR-103 phase 2".into(),
+                "Container output handler is not implemented yet".into(),
             )),
 
             OutputHandlerConfig::McpTool { .. } => Err(OutputHandlerError::NotYetImplemented(
-                "McpTool output handler is deferred to ADR-103 phase 2".into(),
+                "McpTool output handler is not implemented yet".into(),
             )),
 
             OutputHandlerConfig::Webhook {

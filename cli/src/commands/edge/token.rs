@@ -20,7 +20,7 @@ use super::grpc;
 pub enum TokenCommand {
     /// Re-attest with the controller using the same Ed25519 keypair to get a
     /// fresh `NodeSecurityToken`. Reuses the `RotateEdgeKey` RPC with
-    /// `new_public_key == old_public_key` per ADR-117.
+    /// `new_public_key == old_public_key`.
     Refresh,
 }
 

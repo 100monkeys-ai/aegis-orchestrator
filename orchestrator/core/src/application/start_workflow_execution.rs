@@ -116,7 +116,7 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
         // shared consumer tenant.
         let tenant_id = request.tenant_id.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "StartWorkflowExecutionRequest.tenant_id is required (ADR-097): \
+                "StartWorkflowExecutionRequest.tenant_id is required: \
                  caller must supply an explicit tenant or invoke \
                  start_execution_for_tenant directly with TenantId::system() \
                  for system-initiated workflows"

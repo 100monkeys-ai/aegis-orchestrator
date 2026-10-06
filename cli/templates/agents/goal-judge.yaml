@@ -3,7 +3,7 @@ kind: Agent
 metadata:
   name: goal-judge
   version: "1.0.0"
-  description: Judge agent for deciding whether the executions started for a user's goal, as reported to the user, did what was asked (AEGIS ADR-131).
+  description: Judge agent for deciding whether the executions started for a user's goal, as reported to the user, did what was asked.
   labels:
     role: judge
     category: validation

@@ -26,8 +26,6 @@ use crate::domain::workflow::RetryConfig;
 
 /// Generalized egress handler fired after an agent execution or workflow state completes.
 ///
-/// ADR-103: Agent Output Handler.
-///
 /// The handler is declared as an optional field on [`crate::domain::agent::AgentSpec`]
 /// (`output_handler`) and on the `Agent`, `ContainerRun`, and `ParallelAgents`
 /// [`crate::domain::workflow::StateKind`] variants. It is invoked by
@@ -62,7 +60,7 @@ pub enum OutputHandlerConfig {
 
     /// Execute a container step to transform or deliver the output.
     ///
-    /// **ADR-103 phase 2 — not yet implemented.** The runtime will panic with a
+    /// **Not yet implemented.** The runtime will panic with a
     /// descriptive message if this variant is used.
     Container {
         /// Container image reference (registry/repo:tag).
@@ -86,7 +84,7 @@ pub enum OutputHandlerConfig {
 
     /// Invoke an MCP/SEAL tool (e.g. `webhook_send`, `slack`, `email`).
     ///
-    /// **ADR-103 phase 2 — not yet implemented.** The runtime will panic with a
+    /// **Not yet implemented.** The runtime will panic with a
     /// descriptive message if this variant is used.
     McpTool {
         /// Registered tool name (e.g. `"webhook_send"`, `"slack_message"`).

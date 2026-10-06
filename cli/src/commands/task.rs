@@ -43,8 +43,8 @@ pub enum TaskCommand {
         #[arg(long, value_name = "DICT")]
         context: Option<String>,
 
-        /// Structured attachments as a JSON array, inline or `@file.json`
-        /// (ADR-113). Mutually exclusive with `--attachment`.
+        /// Structured attachments as a JSON array, inline or `@file.json`.
+        /// Mutually exclusive with `--attachment`.
         #[arg(long, value_name = "JSON", conflicts_with = "attachment")]
         attachments: Option<String>,
 

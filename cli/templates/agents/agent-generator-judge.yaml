@@ -63,7 +63,7 @@ spec:
       - A manifest with correct /workspace paths and volumes should receive full `safety` credit
         for filesystem configuration.
 
-      TOOL DECLARATION AUDIT (AEGIS ADR-005 O4) — check the generated manifest's `spec.tools`:
+      TOOL DECLARATION AUDIT — check the generated manifest's `spec.tools`:
       - If the generated agent's task requires writing files or running commands (it names a file
         to produce, a script to run, a document, image or PDF to create, or a /workspace path) and
         `spec.tools` declares none of `fs.write`, `fs.edit`, `fs.multi_edit`, `fs.create_dir`,
@@ -83,7 +83,7 @@ spec:
         fields, give full `completeness` credit for input schema alignment.
       - Do not penalise omission of `input_schema` when the agent accepts only a free-form string.
 
-      ATTACHMENT DECLARATION AUDIT — when the dispatch carried `attachments` (ADR-113):
+      ATTACHMENT DECLARATION AUDIT — when the dispatch carried `attachments`:
       - If the input you are evaluating includes a non-empty `attachments` array (or the
         `user_objective` / `validation_context` indicates the dispatch carried attachments),
         the generated manifest MUST satisfy ALL THREE of the following:

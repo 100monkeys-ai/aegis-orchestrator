@@ -1247,7 +1247,7 @@ impl AegisRuntime for AegisRuntimeService {
             %remote_path,
             ttl_hours,
             size_limit_mb,
-            "Created workspace volume (ADR-087)"
+            "Created workspace volume"
         );
 
         Ok(Response::new(CreateWorkspaceVolumeResponse {
@@ -1278,7 +1278,7 @@ impl AegisRuntime for AegisRuntimeService {
         tracing::info!(
             volume_id = %req.volume_id,
             workflow_execution_id = %req.workflow_execution_id,
-            "Destroying workspace volume (ADR-087)"
+            "Destroying workspace volume"
         );
 
         // Unmount any FUSE mounts for this volume before destroying it (ADR-107).

@@ -87,7 +87,7 @@ spec:
       to use /workspace/* for all filesystem write paths. Writing to /tmp, /var, /home, or
       any path outside /workspace will cause runtime failure.
 
-      ATTACHMENT-AWARENESS (ADR-113): when the dispatch carries `attachments`, every
+      ATTACHMENT-AWARENESS: when the dispatch carries `attachments`, every
       generation_prompt for a missing agent that consumes those attachments MUST instruct
       the agent-creator-agent to produce a generic attachment-consumer manifest:
         - declare an `attachments` array field in `spec.input_schema` matching

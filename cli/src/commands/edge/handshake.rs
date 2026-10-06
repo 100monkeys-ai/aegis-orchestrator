@@ -216,7 +216,7 @@ pub async fn run_attest_and_challenge(
 fn map_attest_status(status: Status) -> anyhow::Error {
     match status.code() {
         tonic::Code::ResourceExhausted => anyhow!(
-            "AttestNode rate-limited by controller (5/min per source per ADR-117): {}",
+            "AttestNode rate-limited by controller (5 per minute per source): {}",
             status.message()
         ),
         _ => anyhow!(

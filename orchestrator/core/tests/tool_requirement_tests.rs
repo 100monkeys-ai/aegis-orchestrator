@@ -76,7 +76,7 @@ fn o4_refuses_a_tool_less_agent_that_declares_a_read_write_volume() {
         .expect_err("O4 must refuse a tool-less agent that declares a read-write volume");
     assert_eq!(
         refusal.to_string(),
-        "Agent 'delivery-itinerary-pdf-agent' is refused (AEGIS ADR-005 O4): its instruction \
+        "Agent 'delivery-itinerary-pdf-agent' is refused (tool-requirement/no-tools): its instruction \
          requires writing files or running commands and it declares no tools; it declares the \
          read-write volume 'workspace' at /workspace. Declare the tools it needs in spec.tools \
          (fs.write to write files, cmd.run to run commands)."
@@ -90,7 +90,7 @@ fn o4_refuses_a_tool_less_agent_whose_instruction_names_a_workspace_file() {
     );
     assert_eq!(
         refusal.to_string(),
-        "Agent 'unit-conversion-agent' is refused (AEGIS ADR-005 O4): its instruction requires \
+        "Agent 'unit-conversion-agent' is refused (tool-requirement/no-tools): its instruction requires \
          writing files or running commands and it declares no tools; its instruction names the \
          workspace file /workspace/convert.py. Declare the tools it needs in spec.tools \
          (fs.write to write files, cmd.run to run commands)."
@@ -167,7 +167,7 @@ spec:
         check(&manifest).expect_err("O4 must refuse a tool-less agent on every trigger at once");
     assert_eq!(
         refusal.to_string(),
-        "Agent 'report-agent' is refused (AEGIS ADR-005 O4): its instruction requires writing \
+        "Agent 'report-agent' is refused (tool-requirement/no-tools): its instruction requires writing \
          files or running commands and it declares no tools; it declares the read-write volume \
          'scratch' at /workspace; it declares security.filesystem.write /workspace; its \
          instruction names the workspace file /workspace/data.csv; its instruction names the \
@@ -182,7 +182,7 @@ fn o5_refuses_a_writing_fs_tool_without_a_read_write_volume() {
         .expect_err("O5 must refuse an agent declaring a writing fs tool and no read-write volume");
     assert_eq!(
         refusal.to_string(),
-        "Agent 'unit-conversion-agent' is refused (AEGIS ADR-005 O5): it declares fs.write and \
+        "Agent 'unit-conversion-agent' is refused (tool-requirement/no-volume): it declares fs.write and \
          no read-write volume, so those tools have nothing to write to in a run of its own. \
          Declare a read-write volume with mount_path /workspace; inside a workflow it yields to \
          the workflow's workspace."
@@ -278,7 +278,8 @@ fn o6_an_existing_agent_of_unit_conversion_agents_earlier_shape_answers_o5s_sent
     let mut complaints = Vec::new();
     match refusal_of(&Agent::new(unit_conversion(EARLIER))) {
         Some(refusal) => {
-            let expected = "Agent 'unit-conversion-agent' is refused (AEGIS ADR-005 O5): it \
+            let expected =
+                "Agent 'unit-conversion-agent' is refused (tool-requirement/no-volume): it \
                             declares fs.write and no read-write volume, so those tools have \
                             nothing to write to in a run of its own. Declare a read-write volume \
                             with mount_path /workspace; inside a workflow it yields to the \
@@ -300,7 +301,7 @@ fn o6_an_existing_agent_of_unit_conversion_agents_earlier_shape_answers_o5s_sent
         ));
     }
     match refusal_of(&Agent::new(unit_conversion(NO_TOOLS))) {
-        Some(refusal) if refusal.to_string().contains("(AEGIS ADR-005 O4)") => {}
+        Some(refusal) if refusal.to_string().contains("(tool-requirement/no-tools)") => {}
         other => complaints.push(format!("the tool-less shape answered {other:?}")),
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));

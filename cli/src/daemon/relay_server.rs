@@ -53,7 +53,7 @@ pub async fn run_relay_coordinator(
     event_bus: Arc<EventBus>,
     iam_service: Option<Arc<dyn IdentityProvider>>,
 ) -> Result<()> {
-    info!("RelayCoordinator role: starting relay-only boot path (ADR-117)");
+    info!("RelayCoordinator role: starting relay-only boot path");
 
     // ── Secrets manager ─────────────────────────────────────────────────
     // The relay holds the OpenBao policy `transit/sign/edge-enrollment-token`
@@ -185,7 +185,7 @@ pub async fn run_relay_coordinator(
 
     info!(
         "RelayCoordinator role: skipping HTTP listener — gRPC NodeClusterService is the only \
-         ingress (ADR-117). Idling on cluster gRPC server task."
+         ingress. Idling on cluster gRPC server task."
     );
 
     // The cluster gRPC server task owns the lifetime of the process for

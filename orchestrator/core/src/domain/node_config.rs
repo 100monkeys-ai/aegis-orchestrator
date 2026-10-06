@@ -2685,8 +2685,7 @@ impl NodeConfigManifest {
                         "spec.network.allow_insecure_bind is set: this pod is bound to a \
                          non-loopback interface ('{}') without TLS. Operator-acknowledged for \
                          trusted-network deployments where TLS is terminated upstream (e.g. \
-                         Caddy ingress). DO NOT set this on a publicly-exposed host \
-                         (security audit 002 §4.27).",
+                         Caddy ingress). DO NOT set this on a publicly-exposed host.",
                         network.bind_address
                     );
                 } else {
@@ -2694,7 +2693,7 @@ impl NodeConfigManifest {
                         "spec.network.bind_address '{}' is non-loopback but spec.network.tls is not configured. \
                          Bind to '127.0.0.1' for local development, configure TLS to expose externally, \
                          or set spec.network.allow_insecure_bind: true to acknowledge that TLS is \
-                         terminated upstream of this pod (security audit 002 §4.27).",
+                         terminated upstream of this pod.",
                         network.bind_address
                     );
                 }
@@ -2716,7 +2715,7 @@ impl NodeConfigManifest {
                         "Cluster mode is enabled with a non-loopback bind ('{}'), \
                          but spec.cluster.tls.ca_cert is not configured. mTLS with a \
                          client-CA bundle is required before the cluster gRPC server \
-                         will accept connections (security audit 002 §4.9).",
+                         will accept connections.",
                         network.bind_address
                     );
                 }
@@ -3358,7 +3357,7 @@ path: "/metrics"
             .expect_err("non-loopback bind without TLS must fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("non-loopback") && msg.contains("§4.27"),
+            msg.contains("non-loopback") && msg.contains("terminated upstream"),
             "unexpected error: {msg}"
         );
     }
@@ -3408,7 +3407,7 @@ path: "/metrics"
             .expect_err("explicit allow_insecure_bind=false must keep fail-closed default");
         let msg = format!("{err}");
         assert!(
-            msg.contains("non-loopback") && msg.contains("§4.27"),
+            msg.contains("non-loopback") && msg.contains("terminated upstream"),
             "unexpected error: {msg}"
         );
     }
@@ -3491,7 +3490,7 @@ grpc_port: 50051
             .expect_err("clustered non-loopback bind without mTLS must fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("§4.9") && msg.contains("ca_cert"),
+            msg.contains("mTLS") && msg.contains("ca_cert"),
             "unexpected error: {msg}"
         );
     }

@@ -562,8 +562,9 @@ spec:
         .expect("the delivery itinerary manifest parses")
     }
 
-    const O4_SENTENCE: &str = "Agent 'delivery-itinerary-pdf-agent' is refused (AEGIS ADR-005 \
-        O4): its instruction requires writing files or running commands and it declares no \
+    const O4_SENTENCE: &str = "Agent 'delivery-itinerary-pdf-agent' is refused \
+        (tool-requirement/no-tools): its instruction requires writing files or running commands \
+        and it declares no \
         tools; it declares the read-write volume 'workspace' at /workspace; its instruction \
         names the workspace file /workspace/delivery_itinerary.pdf. Declare the tools it needs \
         in spec.tools (fs.write to write files, cmd.run to run commands).";

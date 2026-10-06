@@ -55,7 +55,7 @@ spec:
            Writing outside /workspace is not permitted and will cause runtime failure.
            When authoring or referencing agents that produce file artifacts, verify their
            volume and filesystem.write configuration uses /workspace/* paths.
-         - ATTACHMENT-AWARENESS (ADR-113): if the dispatch input includes a non-empty
+         - ATTACHMENT-AWARENESS: if the dispatch input includes a non-empty
            `attachments` array, every agent referenced by a state that consumes those
            attachments MUST: (a) declare an `attachments` field in its `spec.input_schema`
            matching `{volume_id, path, name, mime_type, size, sha256?}`, (b) include
@@ -148,7 +148,7 @@ spec:
       {{input}}
 
       {{#if attachments}}
-      This dispatch carries file attachments. Apply the ATTACHMENT-AWARENESS (ADR-113) rule above.
+      This dispatch carries file attachments. Apply the ATTACHMENT-AWARENESS rule above.
       The workflow's `metadata.input_schema` MUST declare an `attachments` array field so the
       dispatch attachments propagate through to states. Every agent referenced by a state that
       consumes those attachments MUST be a generic attachment-consumer (input_schema.attachments

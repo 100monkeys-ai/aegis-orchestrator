@@ -129,21 +129,21 @@ pub enum StateKindYaml {
     Agent {
         agent: String,
         input: String,
-        /// Optional per-state intent template (Handlebars, ADR-092).
+        /// Optional per-state intent template (Handlebars).
         #[serde(default)]
         intent: Option<String>,
         #[serde(default)]
         isolation: Option<IsolationMode>,
-        /// Judge agents declared per-state (ADR-016 / ADR-017)
+        /// Judge agents declared per-state
         #[serde(default)]
         judges: Vec<JudgeConfigYaml>,
         /// Maximum inner-loop iterations for this state (overrides global default)
         #[serde(default)]
         max_iterations: Option<u32>,
-        /// Optional pre-execution validator agent ID (ADR-049 Pillar 1)
+        /// Optional pre-execution validator agent ID
         #[serde(default)]
         pre_execution_validator: Option<String>,
-        /// Optional egress handler fired after this state completes (ADR-103).
+        /// Optional egress handler fired after this state completes.
         #[serde(default)]
         output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
@@ -162,14 +162,14 @@ pub enum StateKindYaml {
     ParallelAgents {
         agents: Vec<ParallelAgentConfigYaml>,
         consensus: ConsensusConfigYaml,
-        /// External judge agents for validating combined parallel output (ADR-016)
+        /// External judge agents for validating combined parallel output
         #[serde(default)]
         judges_for_parallel: Vec<JudgeConfigYaml>,
-        /// Optional egress handler fired after this state completes (ADR-103).
+        /// Optional egress handler fired after this state completes.
         #[serde(default)]
         output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
-    /// Deterministic CI/CD container step — no LLM loop (ADR-050)
+    /// Deterministic CI/CD container step — no LLM loop
     ContainerRun {
         name: String,
         image: String,
@@ -191,25 +191,25 @@ pub enum StateKindYaml {
         retry: Option<crate::domain::workflow::RetryConfig>,
         #[serde(default)]
         shell: bool,
-        /// If true, the container's root filesystem is mounted read-only (ADR-087 D5).
+        /// If true, the container's root filesystem is mounted read-only.
         #[serde(default)]
         read_only_root_filesystem: bool,
-        /// User the container process runs as, e.g. "65534:65534" (ADR-087 D5).
+        /// User the container process runs as, e.g. "65534:65534".
         #[serde(default)]
         run_as_user: Option<String>,
-        /// Docker network mode for this step, e.g. "none" (ADR-087 D5).
+        /// Docker network mode for this step, e.g. "none".
         #[serde(default)]
         network_mode: Option<String>,
-        /// Optional egress handler fired after this state completes (ADR-103).
+        /// Optional egress handler fired after this state completes.
         #[serde(default)]
         output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
-    /// Parallel deterministic container steps — no LLM loop (ADR-050)
+    /// Parallel deterministic container steps — no LLM loop
     ParallelContainerRun {
         steps: Vec<crate::domain::workflow::ContainerRunConfig>,
         completion: crate::domain::workflow::ParallelCompletionStrategy,
     },
-    /// Invoke a child workflow — blocking or fire-and-forget (ADR-065)
+    /// Invoke a child workflow — blocking or fire-and-forget
     #[serde(rename = "Subworkflow")]
     Subworkflow {
         /// The workflow to invoke (name or UUID)
@@ -268,7 +268,7 @@ fn default_min_judges() -> Option<usize> {
     Some(1)
 }
 
-/// YAML representation of a judge agent configuration (ADR-016 / ADR-017)
+/// YAML representation of a judge agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct JudgeConfigYaml {
     pub agent_id: String,
@@ -311,7 +311,7 @@ pub enum TransitionConditionYaml {
     ConfidenceAbove {
         threshold: f64,
     },
-    /// Both validation score AND confidence are above the same threshold (ADR-049)
+    /// Both validation score AND confidence are above the same threshold
     ScoreAndConfidenceAbove {
         threshold: f64,
     },

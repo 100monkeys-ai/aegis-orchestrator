@@ -70,7 +70,7 @@ pub fn derive_tenant_id(identity: &UserIdentity) -> TenantId {
             tracing::warn!(
                 sub = %identity.sub,
                 error = %e,
-                "tenant slug rejected; failing closed onto TenantId::system() (ADR-097)"
+                "tenant slug rejected; failing closed onto TenantId::system()"
             );
             TenantId::system()
         }
@@ -193,7 +193,7 @@ pub async fn tenant_context_middleware(
                 sub = %id.sub,
                 error = %e,
                 route = %crate::presentation::matched_route(&request),
-                "rejecting request: tenant slug in token is invalid (ADR-097)"
+                "rejecting request: tenant slug in token is invalid"
             );
             return (
                 StatusCode::UNAUTHORIZED,

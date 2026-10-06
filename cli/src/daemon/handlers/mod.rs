@@ -128,7 +128,7 @@ pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> Tenant
                             sub = %identity.sub,
                             tenant_slug = %tenant_slug,
                             error = %e,
-                            "tenant_slug rejected; failing closed onto TenantId::system() (ADR-097)"
+                            "tenant_slug rejected; failing closed onto TenantId::system()"
                         );
                         TenantId::system()
                     }
