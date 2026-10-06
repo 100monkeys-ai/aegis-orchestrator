@@ -11,13 +11,16 @@ use axum::response::IntoResponse;
 use futures::StreamExt;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::application::execution::ExecutionService;
 use aegis_orchestrator_core::application::file_operations_service::{
     FileContent, FileOperationsError,
 };
+use aegis_orchestrator_core::application::goal_service::{cancel_ending_its_goal, GoalService};
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::domain::repository::ExecutionRepository;
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::{
@@ -109,6 +112,25 @@ pub(crate) async fn execution_status(
     }
 }
 
+/// `POST /v1/executions/{id}/cancel`'s cancel (AEGIS ADR-131 U33a): the
+/// execution is cancelled, and when it is bound to an open goal the goal is
+/// closed `cancelled` before the route answers, so no round re-dispatches
+/// the work the person stopped.
+pub(crate) async fn cancel_execution_ending_its_goal(
+    executions: &dyn ExecutionService,
+    goals: Option<&GoalService>,
+    tenant_id: &TenantId,
+    execution_id: ExecutionId,
+) -> anyhow::Result<()> {
+    cancel_ending_its_goal(
+        goals,
+        tenant_id,
+        execution_id,
+        executions.cancel_execution_for_tenant(tenant_id, execution_id),
+    )
+    .await
+}
+
 pub(crate) async fn cancel_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
@@ -120,10 +142,16 @@ pub(crate) async fn cancel_execution_handler(
 > {
     scope_guard.require("execution:cancel")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    match state
-        .execution_service
-        .cancel_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
-        .await
+    match cancel_execution_ending_its_goal(
+        state.execution_service.as_ref(),
+        state
+            .tool_invocation_service
+            .goal_service()
+            .map(|goals| goals.as_ref()),
+        &tenant_id,
+        ExecutionId(execution_id),
+    )
+    .await
     {
         Ok(_) => Ok((
             StatusCode::OK,
@@ -535,5 +563,215 @@ mod tests {
         )
         .await;
         assert_eq!(status.as_u16(), 404);
+    }
+}
+
+#[cfg(test)]
+mod cancel_ends_goal_tests {
+    //! AEGIS ADR-131 U33a: `POST /v1/executions/{id}/cancel` (Zaru Web's
+    //! stop) cancels the execution and closes the open goal it is bound to
+    //! `cancelled`, with the reason naming it, before it answers; a following
+    //! starting call is refused `goal_not_open`. Driven through the route's
+    //! own cancel with a real `GoalService` over the in-memory store.
+
+    use super::cancel_execution_ending_its_goal;
+    use aegis_orchestrator_core::application::execution::ExecutionService;
+    use aegis_orchestrator_core::application::goal_service::{GoalCaller, GoalService};
+    use aegis_orchestrator_core::domain::agent::AgentId;
+    use aegis_orchestrator_core::domain::events::ExecutionEvent;
+    use aegis_orchestrator_core::domain::execution::{
+        Execution, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
+    };
+    use aegis_orchestrator_core::domain::goal::{
+        BoundKind, GoalChannel, GoalRepository, GoalState,
+    };
+    use aegis_orchestrator_core::domain::iam::UserIdentity;
+    use aegis_orchestrator_core::domain::node_config::GoalsConfig;
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
+    use aegis_orchestrator_core::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
+    use anyhow::Result;
+    use futures::Stream;
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    /// One running execution per id; a cancel ends it as the real service does.
+    #[derive(Default)]
+    struct Executions(Mutex<HashMap<ExecutionId, Execution>>);
+
+    #[async_trait::async_trait]
+    impl ExecutionService for Executions {
+        async fn start_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_execution_with_id(
+            &self,
+            _: ExecutionId,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Execution> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_iterations_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Vec<Iteration>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn cancel_execution_for_tenant(
+            &self,
+            tenant: &TenantId,
+            id: ExecutionId,
+        ) -> Result<()> {
+            let mut all = self.0.lock().unwrap();
+            let e = all
+                .get_mut(&id)
+                .filter(|e| &e.tenant_id == tenant)
+                .ok_or_else(|| anyhow::anyhow!("Execution not found"))?;
+            e.status = ExecutionStatus::Cancelled;
+            Ok(())
+        }
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_executions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: Option<AgentId>,
+            _: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
+            _: usize,
+        ) -> Result<Vec<Execution>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: aegis_orchestrator_core::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<aegis_orchestrator_core::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rest_cancel_of_a_bound_execution_closes_its_goal_before_it_answers() {
+        let tenant = TenantId::for_consumer_user("owner-sub").unwrap();
+        let caller = GoalCaller {
+            tenant_id: tenant.clone(),
+            user_sub: "owner-sub".to_string(),
+        };
+        let repo = Arc::new(InMemoryGoalRepository::new());
+        let goals = GoalService::new(
+            repo.clone(),
+            Arc::new(EventBus::new(16)),
+            GoalsConfig::default(),
+        );
+        let goal = goals
+            .create(
+                &caller,
+                "Solve the routing problem.",
+                "conversation-1",
+                GoalChannel::Web,
+            )
+            .await
+            .unwrap();
+        let mut execution = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("solve".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            5,
+            "zaru-free".to_string(),
+        );
+        execution.tenant_id = tenant.clone();
+        execution.start();
+        let id = execution.id;
+        goals.bind(goal.id, id, BoundKind::Agent).await.unwrap();
+        let executions = Executions::default();
+        executions.0.lock().unwrap().insert(id, execution);
+
+        cancel_execution_ending_its_goal(&executions, Some(&goals), &tenant, id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            executions.0.lock().unwrap()[&id].status,
+            ExecutionStatus::Cancelled
+        );
+        let stored = repo.find_goal(goal.id).await.unwrap().unwrap();
+        println!(
+            "after POST /v1/executions/{id}/cancel: the goal is {} ({:?})",
+            stored.state.as_str(),
+            stored.closed_reason
+        );
+        assert_eq!(
+            stored.state,
+            GoalState::Cancelled,
+            "the REST cancel ends the goal"
+        );
+        assert_eq!(
+            stored.closed_reason,
+            Some(format!("its execution {id} was cancelled"))
+        );
+        let refused = goals.open_goal_for(&caller, goal.id).await.unwrap_err();
+        assert_eq!(
+            refused.code(),
+            "goal_not_open",
+            "a following starting call is refused"
+        );
     }
 }

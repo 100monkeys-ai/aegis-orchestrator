@@ -31,6 +31,21 @@ use crate::domain::validation::GradientResult;
 /// The longest statement a goal holds, in characters (D1).
 pub const MAX_STATEMENT_CHARS: usize = 32_768;
 
+/// The longest reason a cancelled goal keeps, in characters (U33): the
+/// person's reason is kept whole up to it and cut on a character boundary
+/// past it.
+pub const MAX_CLOSED_REASON_CHARS: usize = 1_000;
+
+/// The reason a goal ended by `aegis.goal.cancel` keeps when the call gives
+/// none (U33).
+pub const DEFAULT_CANCEL_REASON: &str = "The person asked to stop.";
+
+/// The reason a goal keeps when a cancel of its execution `execution_id`
+/// ended it (U33a).
+pub fn execution_cancelled_reason(execution_id: ExecutionId) -> String {
+    format!("its execution {execution_id} was cancelled")
+}
+
 /// The `kind` of a [`GoalEvaluation`]'s `waiting_on` while its round waits
 /// for bound work still running (U21, U24), and the `waiting_on` of the
 /// answer that says so (U22).
@@ -247,6 +262,9 @@ pub enum GoalState {
     /// its judge input was larger than the judge's model holds (U16), or the
     /// round repeated the round before it (U17).
     Stopped,
+    /// The person ended the goal: by `aegis.goal.cancel`, or by cancelling
+    /// an execution bound to it (U33, U33a). Its `closed_reason` says which.
+    Cancelled,
 }
 
 impl GoalState {
@@ -259,6 +277,7 @@ impl GoalState {
             Self::Expired => "expired",
             Self::Superseded => "superseded",
             Self::Stopped => "stopped",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -271,6 +290,7 @@ impl GoalState {
             "expired" => Some(Self::Expired),
             "superseded" => Some(Self::Superseded),
             "stopped" => Some(Self::Stopped),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -412,6 +432,11 @@ pub struct Goal {
     pub rounds: u32,
     pub created_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
+    /// Why the goal closed, where a reason was given: the person's on
+    /// `aegis.goal.cancel`, or the execution whose cancel ended it (U33,
+    /// U33a). `None` on every other close, and on a goal closed before
+    /// migration 043.
+    pub closed_reason: Option<String>,
 }
 
 impl Goal {
@@ -635,13 +660,22 @@ pub trait GoalRepository: Send + Sync {
         client_ref: &str,
     ) -> Result<Vec<Goal>, RepositoryError>;
 
-    /// Close an open goal; `false` when it was no longer open.
+    /// Close an open goal, with the reason it closed where there is one
+    /// (U33); `false` when it was no longer open.
     async fn close_goal(
         &self,
         id: GoalId,
         state: GoalState,
         closed_at: DateTime<Utc>,
+        reason: Option<&str>,
     ) -> Result<bool, RepositoryError>;
+
+    /// The goal an execution is bound to, whether an agent execution or a
+    /// workflow execution (U33a); `None` when it is bound to none.
+    async fn find_goal_of_execution(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Option<GoalId>, RepositoryError>;
 
     /// Grant a continuation: `rounds` from `expected_rounds` to one more, on
     /// an open goal; `false` when the goal moved meanwhile.
@@ -765,6 +799,7 @@ mod tests {
             rounds: 0,
             created_at: created,
             closed_at: None,
+            closed_reason: None,
         };
         assert!(!goal.has_outlived(1800, &[], created + chrono::Duration::seconds(1799)));
         assert!(goal.has_outlived(1800, &[], created + chrono::Duration::seconds(1800)));
@@ -840,6 +875,7 @@ mod tests {
             rounds: 0,
             created_at: t0,
             closed_at: None,
+            closed_reason: None,
         };
         assert!(
             !goal.has_outlived(1800, &ended, at(2_399)),

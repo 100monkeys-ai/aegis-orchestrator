@@ -13,18 +13,23 @@ use axum::Json;
 use sqlx::Row;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::application::goal_service::{cancel_ending_its_goal, GoalService};
 use aegis_orchestrator_core::domain::events::WorkflowEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
+use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution as TemporalWorkflowExecution;
 use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::workflowservice::v1::DeleteWorkflowExecutionRequest;
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
-use crate::daemon::ports::{cancel_workflow_run, CancelOutcome, TemporalGrpcRunControl};
+use crate::daemon::ports::{
+    cancel_workflow_run, CancelOutcome, TemporalGrpcRunControl, TemporalRunControl,
+};
 use crate::daemon::state::AppState;
 use crate::daemon::temporal_helpers::{connect_temporal_workflow_client, temporal_namespace};
 
@@ -921,6 +926,34 @@ pub(crate) async fn stream_workflow_logs_handler(
     mk_sse(Box::pin(stream))
 }
 
+/// `POST /v1/workflows/executions/{id}/cancel`'s cancel (AEGIS ADR-131
+/// U33a): the workflow execution is cancelled (or its cancel requested of
+/// Temporal), and when it is bound to an open goal the goal is closed
+/// `cancelled` before the route answers.
+pub(crate) async fn cancel_workflow_ending_its_goal(
+    run_control: &dyn TemporalRunControl,
+    workflow_execution_repo: &Arc<dyn WorkflowExecutionRepository>,
+    event_bus: &Arc<EventBus>,
+    goals: Option<&GoalService>,
+    tenant_id: &TenantId,
+    execution_id: ExecutionId,
+) -> anyhow::Result<CancelOutcome> {
+    cancel_ending_its_goal(
+        goals,
+        tenant_id,
+        execution_id,
+        cancel_workflow_run(
+            run_control,
+            workflow_execution_repo,
+            event_bus,
+            tenant_id,
+            execution_id,
+            "Cancelled by aegis workflow cancel",
+        ),
+    )
+    .await
+}
+
 pub(crate) async fn cancel_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
@@ -962,15 +995,18 @@ pub(crate) async fn cancel_workflow_execution_handler(
             .into_response());
     }
 
-    match cancel_workflow_run(
+    match cancel_workflow_ending_its_goal(
         &TemporalGrpcRunControl {
             config: &state.config,
         },
         &state.workflow_execution_repo,
         &state.event_bus,
+        state
+            .tool_invocation_service
+            .goal_service()
+            .map(|goals| goals.as_ref()),
         &tenant_id,
         ExecutionId(execution_id),
-        "Cancelled by aegis workflow cancel",
     )
     .await
     {
@@ -1110,5 +1146,103 @@ pub(crate) async fn remove_workflow_execution_handler(
             })),
         )
             .into_response()),
+    }
+}
+
+#[cfg(test)]
+mod cancel_ends_goal_tests {
+    //! AEGIS ADR-131 U33a: `POST /v1/workflows/executions/{id}/cancel`
+    //! cancels the workflow execution (here an open Temporal run, whose
+    //! cancel is requested) and closes the open goal it is bound to
+    //! `cancelled`, with the reason naming it, before it answers; a following
+    //! starting call is refused `goal_not_open`.
+
+    use super::cancel_workflow_ending_its_goal;
+    use crate::daemon::ports::{CancelOutcome, TemporalRun, TemporalRunControl};
+    use aegis_orchestrator_core::application::goal_service::{GoalCaller, GoalService};
+    use aegis_orchestrator_core::domain::execution::ExecutionId;
+    use aegis_orchestrator_core::domain::goal::{
+        BoundKind, GoalChannel, GoalRepository, GoalState,
+    };
+    use aegis_orchestrator_core::domain::node_config::GoalsConfig;
+    use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
+    use aegis_orchestrator_core::infrastructure::repositories::InMemoryWorkflowExecutionRepository;
+    use std::sync::{Arc, Mutex};
+
+    /// An open Temporal run; each cancel request is recorded.
+    #[derive(Default)]
+    struct OpenRun(Mutex<Vec<ExecutionId>>);
+
+    #[async_trait::async_trait]
+    impl TemporalRunControl for OpenRun {
+        async fn run(&self, _: ExecutionId) -> anyhow::Result<TemporalRun> {
+            Ok(TemporalRun::Open)
+        }
+        async fn request_cancel(&self, execution_id: ExecutionId, _: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(execution_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rest_cancel_of_a_bound_workflow_execution_closes_its_goal_before_it_answers() {
+        let tenant = TenantId::for_consumer_user("owner-sub").unwrap();
+        let caller = GoalCaller {
+            tenant_id: tenant.clone(),
+            user_sub: "owner-sub".to_string(),
+        };
+        let repo = Arc::new(InMemoryGoalRepository::new());
+        let bus = Arc::new(EventBus::new(16));
+        let goals = GoalService::new(repo.clone(), bus.clone(), GoalsConfig::default());
+        let goal = goals
+            .create(
+                &caller,
+                "Run the pipeline.",
+                "conversation-1",
+                GoalChannel::Web,
+            )
+            .await
+            .unwrap();
+        let id = ExecutionId::new();
+        goals.bind(goal.id, id, BoundKind::Workflow).await.unwrap();
+        let run = OpenRun::default();
+        let workflows: Arc<dyn WorkflowExecutionRepository> =
+            Arc::new(InMemoryWorkflowExecutionRepository::new());
+
+        let outcome =
+            cancel_workflow_ending_its_goal(&run, &workflows, &bus, Some(&goals), &tenant, id)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome, CancelOutcome::CancelRequested);
+        assert_eq!(
+            *run.0.lock().unwrap(),
+            vec![id],
+            "Temporal is asked to cancel"
+        );
+        let stored = repo.find_goal(goal.id).await.unwrap().unwrap();
+        println!(
+            "after POST /v1/workflows/executions/{id}/cancel: the goal is {} ({:?})",
+            stored.state.as_str(),
+            stored.closed_reason
+        );
+        assert_eq!(
+            stored.state,
+            GoalState::Cancelled,
+            "the REST cancel ends the goal"
+        );
+        assert_eq!(
+            stored.closed_reason,
+            Some(format!("its execution {id} was cancelled"))
+        );
+        let refused = goals.open_goal_for(&caller, goal.id).await.unwrap_err();
+        assert_eq!(
+            refused.code(),
+            "goal_not_open",
+            "a following starting call is refused"
+        );
     }
 }

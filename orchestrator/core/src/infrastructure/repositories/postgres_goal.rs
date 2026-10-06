@@ -5,7 +5,8 @@
 //! [`PostgresGoalRepository`] stores goals and their evaluations in the
 //! `goals` and `goal_evaluations` tables of migration `039_goals.sql`, with
 //! the `stopped` state and the `stop_reason` and `input_digest` columns of
-//! `040_goal_stopped.sql` (U16, U17), and
+//! `040_goal_stopped.sql` (U16, U17), the `cancelled` state and the
+//! `closed_reason` column of `043_goal_cancelled.sql` (U33, U33a), and
 //! binds an execution to its goal by the `goal_id` column that migration adds
 //! to `executions` and `workflow_executions`. [`InMemoryGoalRepository`]
 //! keeps them in process, for tests and for a daemon run without a database.
@@ -28,7 +29,8 @@ use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
 
 const GOAL_COLUMNS: &str =
-    "id, tenant_id, user_sub, statement, client_ref, channel, state, rounds, created_at, closed_at";
+    "id, tenant_id, user_sub, statement, client_ref, channel, state, rounds, created_at, closed_at, \
+     closed_reason";
 
 const EVALUATION_COLUMNS: &str = "id, goal_id, round, attempt, judge_execution_id, \
      companion_answer, verdict, outcome, continue, waiting_on, answer, created_at, decided_at, \
@@ -80,6 +82,7 @@ fn hydrate_goal(row: &PgRow) -> Result<Goal, RepositoryError> {
         rounds: non_negative(column(row, "rounds")?, "rounds")?,
         created_at: column(row, "created_at")?,
         closed_at: column(row, "closed_at")?,
+        closed_reason: column(row, "closed_reason")?,
     })
 }
 
@@ -121,7 +124,7 @@ fn hydrate_evaluation(row: &PgRow) -> Result<GoalEvaluation, RepositoryError> {
 impl GoalRepository for PostgresGoalRepository {
     async fn insert_goal(&self, goal: &Goal) -> Result<(), RepositoryError> {
         sqlx::query(&format!(
-            "INSERT INTO goals ({GOAL_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+            "INSERT INTO goals ({GOAL_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
         ))
         .bind(goal.id.0)
         .bind(goal.tenant_id.as_str())
@@ -133,6 +136,7 @@ impl GoalRepository for PostgresGoalRepository {
         .bind(goal.rounds as i32)
         .bind(goal.created_at)
         .bind(goal.closed_at)
+        .bind(&goal.closed_reason)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -169,16 +173,37 @@ impl GoalRepository for PostgresGoalRepository {
         id: GoalId,
         state: GoalState,
         closed_at: DateTime<Utc>,
+        reason: Option<&str>,
     ) -> Result<bool, RepositoryError> {
         let done = sqlx::query(
-            "UPDATE goals SET state = $2, closed_at = $3 WHERE id = $1 AND state = 'open'",
+            "UPDATE goals SET state = $2, closed_at = $3, closed_reason = $4 \
+             WHERE id = $1 AND state = 'open'",
         )
         .bind(id.0)
         .bind(state.as_str())
         .bind(closed_at)
+        .bind(reason)
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    async fn find_goal_of_execution(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Option<GoalId>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT goal_id FROM executions WHERE id = $1 AND goal_id IS NOT NULL \
+             UNION ALL \
+             SELECT goal_id FROM workflow_executions WHERE id = $1 AND goal_id IS NOT NULL \
+             LIMIT 1",
+        )
+        .bind(execution_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref()
+            .map(|row| column::<Uuid>(row, "goal_id").map(GoalId))
+            .transpose()
     }
 
     async fn grant_round(&self, id: GoalId, expected_rounds: u32) -> Result<bool, RepositoryError> {
@@ -408,16 +433,31 @@ impl GoalRepository for InMemoryGoalRepository {
         id: GoalId,
         state: GoalState,
         closed_at: DateTime<Utc>,
+        reason: Option<&str>,
     ) -> Result<bool, RepositoryError> {
         let mut goals = self.goals.write().await;
         match goals.get_mut(&id) {
             Some(goal) if goal.is_open() => {
                 goal.state = state;
                 goal.closed_at = Some(closed_at);
+                goal.closed_reason = reason.map(str::to_string);
                 Ok(true)
             }
             _ => Ok(false),
         }
+    }
+
+    async fn find_goal_of_execution(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Option<GoalId>, RepositoryError> {
+        Ok(self
+            .bound
+            .read()
+            .await
+            .iter()
+            .find(|(_, bound)| bound.iter().any(|b| b.execution_id == execution_id))
+            .map(|(goal_id, _)| *goal_id))
     }
 
     async fn grant_round(&self, id: GoalId, expected_rounds: u32) -> Result<bool, RepositoryError> {

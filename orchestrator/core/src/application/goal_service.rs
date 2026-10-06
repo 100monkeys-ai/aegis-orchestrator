@@ -42,11 +42,11 @@ use uuid::Uuid;
 use crate::domain::events::GoalEvent;
 use crate::domain::execution::{ExecutionId, ProducedFile};
 use crate::domain::goal::{
-    execution_wait_bound, judge_context_or_default, judge_input_digest, outcome_of, truncate_chars,
-    wait_time_text, BoundExecution, BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId,
-    GoalOutcome, GoalRepository, GoalState, JudgeContextSource, OverLimit, StopReason,
-    FAULT_OUTPUT_SHOWN_CHARS, GOAL_JUDGE_TIMEOUT_SECONDS, JUDGE_PROMPT_RESERVE_BYTES,
-    MAX_STATEMENT_CHARS, WAITING_ON_EXECUTION,
+    execution_cancelled_reason, execution_wait_bound, judge_context_or_default, judge_input_digest,
+    outcome_of, truncate_chars, wait_time_text, BoundExecution, BoundKind, Goal, GoalChannel,
+    GoalEvaluation, GoalId, GoalOutcome, GoalRepository, GoalState, JudgeContextSource, OverLimit,
+    StopReason, DEFAULT_CANCEL_REASON, FAULT_OUTPUT_SHOWN_CHARS, GOAL_JUDGE_TIMEOUT_SECONDS,
+    JUDGE_PROMPT_RESERVE_BYTES, MAX_CLOSED_REASON_CHARS, MAX_STATEMENT_CHARS, WAITING_ON_EXECUTION,
 };
 use crate::domain::node_config::GoalsConfig;
 use crate::domain::repository::RepositoryError;
@@ -240,6 +240,17 @@ pub trait GoalWorld: Send + Sync {
 
     /// Where the judge's execution stands.
     async fn judge_progress(&self, goal: &Goal, judge_execution_id: ExecutionId) -> JudgeProgress;
+
+    /// Cancel one execution of the goal, as the goal's user: an agent
+    /// execution (a bound one, or the round's judge) as `aegis.task.cancel`
+    /// cancels one, a workflow or intent execution as `aegis.workflow.cancel`
+    /// cancels one (U33, U33a). A world that can cancel nothing says so.
+    async fn cancel_execution(&self, _goal: &Goal, bound: &BoundExecution) -> Result<(), String> {
+        Err(format!(
+            "this orchestrator cannot cancel execution {}",
+            bound.execution_id
+        ))
+    }
 }
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -349,6 +360,7 @@ impl GoalService {
             rounds: 0,
             created_at: now,
             closed_at: None,
+            closed_reason: None,
         };
         self.repo.insert_goal(&goal).await?;
         tracing::info!(goal_id = %goal.id, client_ref, "Goal created");
@@ -436,7 +448,12 @@ impl GoalService {
             .find(|e| e.round == asked && e.decides_round())
         {
             if let Some(answer) = &decided.answer {
-                return Ok(answer.clone());
+                // U33: a round decided as the goal closed under it granted
+                // nothing; its stored `continue: true` is answered as the
+                // goal's closed state.
+                if goal.is_open() || answer.get("continue") != Some(&Value::Bool(true)) {
+                    return Ok(answer.clone());
+                }
             }
         }
 
@@ -690,6 +707,12 @@ impl GoalService {
         companion_answer: &str,
         evaluations: &[GoalEvaluation],
     ) -> Result<Attempt, GoalError> {
+        // U33: no judge starts on a goal that is not open: the person may
+        // have ended it while this call waited for its work.
+        let current = self.reload(goal.id).await?;
+        if !current.is_open() {
+            return Ok(Attempt::Stopped(self.closed_answer(world, &current).await?));
+        }
         let input = self.judge_input(world, goal, companion_answer).await?;
         // U17's digest is of the input as the judge is given it, after U30's
         // facts were fitted to its room.
@@ -1052,12 +1075,25 @@ impl GoalService {
                 return Ok(stored);
             }
         }
-        self.publish_evaluated(goal, score, confidence, outcome, granted);
         if granted && !self.repo.grant_round(goal.id, goal.rounds).await? {
             tracing::warn!(goal_id = %goal.id, "The goal moved before its round was granted");
+            // U33: the goal closed while its round was judged (the person
+            // ended it): the round grants nothing, and the answer is the
+            // goal's closed state.
+            let current = self.reload(goal.id).await?;
+            if !current.is_open() {
+                self.publish_evaluated(goal, score, confidence, outcome, false);
+                return self.closed_answer(world, &current).await;
+            }
         }
+        self.publish_evaluated(goal, score, confidence, outcome, granted);
         if let Some(state) = closes {
-            self.close(goal, state, now).await?;
+            if !self.close(goal, state, now).await? {
+                let current = self.reload(goal.id).await?;
+                if !current.is_open() {
+                    return self.closed_answer(world, &current).await;
+                }
+            }
         }
         Ok(answer)
     }
@@ -1091,6 +1127,8 @@ impl GoalService {
         Ok(json!({
             "goal_id": goal.id.to_string(),
             "state": goal.state.as_str(),
+            // U33: why it closed, where a reason was given.
+            "closed_reason": goal.closed_reason,
             "round": goal.rounds,
             "rounds_left": self.config.max_continuations.saturating_sub(goal.rounds),
             "continue": false,
@@ -1197,10 +1235,143 @@ impl GoalService {
             "rounds": goal.rounds,
             "created_at": goal.created_at,
             "closed_at": goal.closed_at,
+            // U33: why it closed, where a reason was given.
+            "closed_reason": goal.closed_reason,
             "executions": executions,
             "verdicts": verdicts,
             "waits": waits,
         }))
+    }
+
+    // ── aegis.goal.cancel (U33, U33a) ──────────────────────────────────────
+
+    /// End the caller's goal: close it `cancelled` with `reason`, cancel
+    /// every bound execution still running and the round's judge in flight,
+    /// and answer the goal's closed state. Another user's goal is answered
+    /// as not found.
+    pub async fn cancel(
+        &self,
+        world: &dyn GoalWorld,
+        caller: &GoalCaller,
+        goal_id: GoalId,
+        reason: Option<&str>,
+    ) -> Result<Value, GoalError> {
+        let goal = match self.repo.find_goal(goal_id).await? {
+            Some(goal) if goal.belongs_to(&caller.tenant_id, &caller.user_sub) => goal,
+            _ => return Err(GoalError::NotFound),
+        };
+        let now = (self.clock)();
+        let reason = truncate_chars(
+            reason
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .unwrap_or(DEFAULT_CANCEL_REASON),
+            MAX_CLOSED_REASON_CHARS,
+        );
+        // The goal closes first, so a round judged meanwhile grants nothing
+        // (`decide_round`) and no judge starts after it (`start_attempt`).
+        let closed = goal.is_open()
+            && self
+                .close_with_reason(&goal, GoalState::Cancelled, now, Some(&reason))
+                .await?;
+        let mut cancelled = Vec::new();
+        // The round's judge in flight is cancelled; its evaluation ends with
+        // the reason as its fault and decides no round.
+        for mut evaluation in self.repo.list_evaluations(goal.id).await? {
+            if evaluation.is_open_wait() {
+                evaluation.decided_at = Some(now);
+                self.repo.finish_evaluation(&evaluation).await?;
+                continue;
+            }
+            let Some(judge) = evaluation
+                .judge_execution_id
+                .filter(|_| evaluation.is_running())
+            else {
+                continue;
+            };
+            let target = BoundExecution {
+                execution_id: judge,
+                kind: BoundKind::Agent,
+                started_at: evaluation.created_at,
+            };
+            match world.cancel_execution(&goal, &target).await {
+                Ok(()) => cancelled.push(judge),
+                Err(e) => {
+                    tracing::warn!(goal_id = %goal.id, judge = %judge, error = %e, "The goal's judge could not be cancelled")
+                }
+            }
+            evaluation.verdict = Some(fault_json(&JudgeFault {
+                judge_agent: GOAL_JUDGE_AGENT_NAME.to_string(),
+                reason: "the goal was cancelled before the judge answered".to_string(),
+                output: String::new(),
+            }));
+            evaluation.decided_at = Some(now);
+            self.repo.finish_evaluation(&evaluation).await?;
+        }
+        // Every bound execution that has not ended is cancelled, by its kind;
+        // one whose row cannot be read is asked to cancel too, so no work the
+        // person stopped is left running on a failed read.
+        for bound in self.repo.list_bound(goal.id).await? {
+            if let Some(view) = world.read_execution(&goal, &bound).await {
+                if matches!(view.status.as_str(), "completed" | "failed" | "cancelled") {
+                    continue;
+                }
+            }
+            match world.cancel_execution(&goal, &bound).await {
+                Ok(()) => cancelled.push(bound.execution_id),
+                Err(e) => tracing::warn!(
+                    goal_id = %goal.id,
+                    execution_id = %bound.execution_id,
+                    error = %e,
+                    "A bound execution could not be cancelled"
+                ),
+            }
+        }
+        tracing::info!(
+            goal_id = %goal.id,
+            closed,
+            cancelled = cancelled.len(),
+            "The person cancelled the goal"
+        );
+        let goal = self.reload(goal.id).await?;
+        let mut answer = self.closed_answer(world, &goal).await?;
+        answer["cancelled"] = json!(closed);
+        answer["cancelled_executions"] = json!(cancelled
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>());
+        Ok(answer)
+    }
+
+    /// A cancel of `execution_id` succeeded in `tenant_id` (U33a): close the
+    /// open goal it is bound to `cancelled`, with the reason naming it.
+    /// `true` when a goal was closed by it.
+    pub async fn end_for_cancelled_execution(
+        &self,
+        tenant_id: &TenantId,
+        execution_id: ExecutionId,
+    ) -> Result<bool, GoalError> {
+        let Some(goal_id) = self.repo.find_goal_of_execution(execution_id).await? else {
+            return Ok(false);
+        };
+        let Some(goal) = self.repo.find_goal(goal_id).await? else {
+            return Ok(false);
+        };
+        if &goal.tenant_id != tenant_id || !goal.is_open() {
+            return Ok(false);
+        }
+        let closed = self
+            .close_with_reason(
+                &goal,
+                GoalState::Cancelled,
+                (self.clock)(),
+                Some(&execution_cancelled_reason(execution_id)),
+            )
+            .await?;
+        if closed {
+            tracing::info!(goal_id = %goal.id, execution_id = %execution_id, "A cancel of the goal's execution ended the goal");
+        }
+        Ok(closed)
     }
 
     // ── The lifetime (D7) ───────────────────────────────────────────────────
@@ -1252,7 +1423,19 @@ impl GoalService {
         state: GoalState,
         now: DateTime<Utc>,
     ) -> Result<bool, GoalError> {
-        let closed = self.repo.close_goal(goal.id, state, now).await?;
+        self.close_with_reason(goal, state, now, None).await
+    }
+
+    /// Close an open goal with the reason it closed (U33); `false` when it
+    /// was no longer open.
+    async fn close_with_reason(
+        &self,
+        goal: &Goal,
+        state: GoalState,
+        now: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> Result<bool, GoalError> {
+        let closed = self.repo.close_goal(goal.id, state, now, reason).await?;
         if closed {
             tracing::info!(goal_id = %goal.id, state = state.as_str(), "Goal closed");
             self.event_bus.publish_goal_event(GoalEvent::GoalClosed {
@@ -1301,6 +1484,33 @@ impl GoalService {
             evaluated_at: (self.clock)(),
         });
     }
+}
+
+/// U33a: run `cancel`, the cancel of one execution by any of its four paths
+/// (`aegis.task.cancel`, `aegis.workflow.cancel` and their two REST routes),
+/// and when it succeeds close the open goal the execution is bound to,
+/// before the cancel answers. A goal that cannot be closed is logged and the
+/// cancel's own answer stands: the execution was cancelled.
+pub async fn cancel_ending_its_goal<T, E>(
+    goals: Option<&GoalService>,
+    tenant_id: &TenantId,
+    execution_id: ExecutionId,
+    cancel: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let cancelled = cancel.await?;
+    if let Some(goals) = goals {
+        if let Err(e) = goals
+            .end_for_cancelled_execution(tenant_id, execution_id)
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution_id,
+                error = %e,
+                "The execution was cancelled; its goal could not be closed"
+            );
+        }
+    }
+    Ok(cancelled)
 }
 
 /// What starting a round's judgment came to.
@@ -1527,6 +1737,14 @@ mod tests {
         /// dispatches, produced_files}`; none dispatched and none produced
         /// when unset.
         facts: Mutex<Option<Value>>,
+        /// U33: every execution this world was asked to cancel, in order.
+        cancelled: Mutex<Vec<ExecutionId>>,
+        /// U33: the first read of a bound execution closes this goal
+        /// `cancelled` (the person's cancel lands while the round waits).
+        close_on_read: Mutex<Option<(Arc<InMemoryGoalRepository>, GoalId)>>,
+        /// U33: the first read of the judge's progress closes this goal
+        /// `cancelled` (the person's cancel lands while the judge runs).
+        close_on_progress: Mutex<Option<(Arc<InMemoryGoalRepository>, GoalId)>>,
     }
 
     impl World {
@@ -1550,11 +1768,34 @@ mod tests {
         fn set_status(&self, id: ExecutionId, status: &str) {
             self.states.lock().unwrap().insert(id, status.to_string());
         }
+        fn cancelled(&self) -> Vec<ExecutionId> {
+            self.cancelled.lock().unwrap().clone()
+        }
+        fn judge_ids(&self) -> Vec<ExecutionId> {
+            self.judges.lock().unwrap().iter().map(|j| j.0).collect()
+        }
+    }
+
+    /// U33: the person's cancel, landed from elsewhere, as the store keeps it.
+    async fn close_cancelled(closing: Option<(Arc<InMemoryGoalRepository>, GoalId)>) {
+        if let Some((repo, goal_id)) = closing {
+            assert!(repo
+                .close_goal(
+                    goal_id,
+                    GoalState::Cancelled,
+                    Utc::now(),
+                    Some("The person asked to stop.")
+                )
+                .await
+                .unwrap());
+        }
     }
 
     #[async_trait]
     impl GoalWorld for World {
         async fn read_execution(&self, _: &Goal, b: &BoundExecution) -> Option<ExecutionView> {
+            let closing = self.close_on_read.lock().unwrap().take();
+            close_cancelled(closing).await;
             {
                 let mut reads = self.reads.lock().unwrap();
                 *reads += 1;
@@ -1647,12 +1888,31 @@ mod tests {
             Ok(id)
         }
         async fn judge_progress(&self, _: &Goal, id: ExecutionId) -> JudgeProgress {
+            let closing = self.close_on_progress.lock().unwrap().take();
+            close_cancelled(closing).await;
             let judges = self.judges.lock().unwrap();
             match &judges.iter().find(|(j, _, _)| *j == id).unwrap().1 {
                 Judge::Says(output) => JudgeProgress::Completed(output.clone()),
                 Judge::Runs => JudgeProgress::Running,
                 Judge::Fails => JudgeProgress::Ended("failed".to_string()),
             }
+        }
+        async fn cancel_execution(&self, _: &Goal, b: &BoundExecution) -> Result<(), String> {
+            self.cancelled.lock().unwrap().push(b.execution_id);
+            self.states
+                .lock()
+                .unwrap()
+                .insert(b.execution_id, "cancelled".to_string());
+            if let Some(judge) = self
+                .judges
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|j| j.0 == b.execution_id)
+            {
+                judge.1 = Judge::Fails;
+            }
+            Ok(())
         }
     }
 
@@ -3157,5 +3417,305 @@ mod tests {
         let answer = h.evaluate(&world, &goal, Some(1)).await;
         assert_eq!(answer["state"], "expired");
         assert_eq!(world.judges_started(), 1, "round 1 is not judged");
+    }
+
+    // ── U33, U33a: the person ends the goal ────────────────────────────────
+
+    /// A goal with its first execution completed, a second agent execution
+    /// and a workflow execution still running.
+    async fn goal_with_running_work(
+        h: &Harness,
+        world: &World,
+    ) -> (Goal, ExecutionId, ExecutionId) {
+        let goal = h.goal().await;
+        let agent = ExecutionId::new();
+        let workflow = ExecutionId::new();
+        h.service
+            .bind(goal.id, agent, BoundKind::Agent)
+            .await
+            .unwrap();
+        h.service
+            .bind(goal.id, workflow, BoundKind::Workflow)
+            .await
+            .unwrap();
+        world.set_status(agent, "running");
+        world.set_status(workflow, "running");
+        (goal, agent, workflow)
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_goal_answers_cancelled_with_continue_false_and_no_judge_starts() {
+        let h = Harness::new();
+        let world = World::scripted(vec![says(0.3, 0.9, 0.9)]);
+        let (goal, agent, workflow) = goal_with_running_work(&h, &world).await;
+
+        let answer = h
+            .service
+            .cancel(&world, &h.caller, goal.id, Some("I changed my mind."))
+            .await
+            .unwrap();
+        println!("aegis.goal.cancel answered: {answer}");
+        assert_eq!(
+            answer["state"], "cancelled",
+            "the goal closes cancelled: {answer}"
+        );
+        assert_eq!(answer["closed_reason"], "I changed my mind.");
+        assert_eq!(answer["continue"], false);
+        assert_eq!(answer["cancelled"], true);
+        let mut stopped = world.cancelled();
+        stopped.sort_by_key(|id| id.0);
+        let mut running = vec![agent, workflow];
+        running.sort_by_key(|id| id.0);
+        assert_eq!(
+            stopped, running,
+            "every bound execution still running is cancelled, the completed one is not"
+        );
+        let stored = h.stored(&goal).await;
+        assert_eq!(stored.state, GoalState::Cancelled);
+        assert_eq!(stored.closed_reason.as_deref(), Some("I changed my mind."));
+
+        // No further round: the runner's next evaluation is answered closed.
+        let answer = h.evaluate(&world, &goal, None).await;
+        println!("aegis.goal.evaluate after the cancel answered: {answer}");
+        assert_eq!(answer["state"], "cancelled");
+        assert_eq!(answer["continue"], false);
+        assert_eq!(answer["closed_reason"], "I changed my mind.");
+        assert_eq!(
+            world.judges_started(),
+            0,
+            "no judge starts on a cancelled goal"
+        );
+        let err = h
+            .service
+            .open_goal_for(&h.caller, goal.id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), GOAL_NOT_OPEN, "a cancelled goal binds nothing");
+    }
+
+    #[tokio::test]
+    async fn cancel_without_a_reason_keeps_the_default_and_a_second_cancel_changes_nothing() {
+        let h = Harness::new();
+        let world = World::default();
+        let goal = h.goal().await;
+        let answer = h
+            .service
+            .cancel(&world, &h.caller, goal.id, None)
+            .await
+            .unwrap();
+        assert_eq!(answer["state"], "cancelled", "{answer}");
+        assert_eq!(answer["closed_reason"], DEFAULT_CANCEL_REASON);
+        let again = h
+            .service
+            .cancel(&world, &h.caller, goal.id, Some("again"))
+            .await
+            .unwrap();
+        assert_eq!(again["state"], "cancelled");
+        assert_eq!(again["cancelled"], false, "the goal was already closed");
+        assert_eq!(
+            again["closed_reason"], DEFAULT_CANCEL_REASON,
+            "the first reason stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_the_judge_in_flight_and_its_round_is_never_decided() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![Judge::Runs]);
+        let answer = h.evaluate(&world, &goal, None).await;
+        assert_eq!(answer["state"], "judging", "{answer}");
+        let judge = world.judge_ids()[0];
+
+        h.service
+            .cancel(&world, &h.caller, goal.id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            world.cancelled(),
+            vec![judge],
+            "the judge in flight is cancelled"
+        );
+        let evaluations = h.repo.list_evaluations(goal.id).await.unwrap();
+        assert!(
+            evaluations.iter().all(|e| !e.is_running()),
+            "no evaluation is left running: {evaluations:?}"
+        );
+        assert!(
+            evaluations.iter().all(|e| !e.decides_round()),
+            "no round is decided"
+        );
+
+        let answer = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(answer["state"], "cancelled", "{answer}");
+        assert_eq!(answer["continue"], false);
+        assert_eq!(world.judges_started(), 1, "no second judge");
+    }
+
+    #[tokio::test]
+    async fn another_users_goal_is_not_found_by_cancel() {
+        let h = Harness::new();
+        let world = World::default();
+        let goal = h.goal().await;
+        let other = GoalCaller {
+            tenant_id: TenantId::for_consumer_user("user-b").unwrap(),
+            user_sub: "user-b".to_string(),
+        };
+        let err = h
+            .service
+            .cancel(&world, &other, goal.id, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), GOAL_NOT_FOUND, "{err}");
+        assert_eq!(
+            h.stored(&goal).await.state,
+            GoalState::Open,
+            "the goal stays open"
+        );
+        assert!(world.cancelled().is_empty(), "nothing is cancelled");
+    }
+
+    #[tokio::test]
+    async fn status_carries_cancelled_and_its_closed_reason() {
+        let h = Harness::new();
+        let world = World::default();
+        let goal = h.goal().await;
+        h.service
+            .cancel(&world, &h.caller, goal.id, Some("Stop, please."))
+            .await
+            .unwrap();
+        let status = h.service.status(&world, &h.caller, goal.id).await.unwrap();
+        println!(
+            "aegis.goal.status after the cancel: state {}, closed_reason {}",
+            status["state"], status["closed_reason"]
+        );
+        assert_eq!(status["state"], "cancelled");
+        assert_eq!(status["closed_reason"], "Stop, please.");
+        assert!(status["closed_at"].is_string(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn a_round_decided_after_the_goal_closed_answers_the_closed_state_and_continue_false() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        // A not_met verdict, which grants a round on an open goal.
+        let world = World::scripted(vec![says(0.3, 0.9, 0.9)]);
+        *world.close_on_progress.lock().unwrap() = Some((h.repo.clone(), goal.id));
+        let answer = h.evaluate(&world, &goal, None).await;
+        println!("the round decided after the close answered: {answer}");
+        assert_eq!(
+            answer["continue"], false,
+            "a round decided after the goal closed grants nothing: {answer}"
+        );
+        assert_eq!(answer["state"], "cancelled");
+        assert_eq!(h.stored(&goal).await.rounds, 0, "no round was granted");
+        // The runner asks again: the same closed answer.
+        let again = h.evaluate(&world, &goal, Some(0)).await;
+        assert_eq!(again["continue"], false, "{again}");
+        assert_eq!(again["state"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn no_judge_starts_on_a_goal_closed_while_its_round_was_read() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![says(0.3, 0.9, 0.9)]);
+        *world.close_on_read.lock().unwrap() = Some((h.repo.clone(), goal.id));
+        let answer = h.evaluate(&world, &goal, None).await;
+        println!("the round read after the close answered: {answer}");
+        assert_eq!(
+            world.judges_started(),
+            0,
+            "no judge starts on a goal not open"
+        );
+        assert_eq!(answer["state"], "cancelled", "{answer}");
+        assert_eq!(answer["continue"], false);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_bound_execution_ends_its_goal_with_the_reason() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let bound = h.bound(&goal).await[0];
+
+        assert!(h
+            .service
+            .end_for_cancelled_execution(&h.caller.tenant_id, bound)
+            .await
+            .unwrap());
+        let stored = h.stored(&goal).await;
+        println!(
+            "the goal after its execution's cancel: {} ({:?})",
+            stored.state.as_str(),
+            stored.closed_reason
+        );
+        assert_eq!(stored.state, GoalState::Cancelled);
+        assert_eq!(
+            stored.closed_reason,
+            Some(format!("its execution {bound} was cancelled"))
+        );
+        let err = h
+            .service
+            .open_goal_for(&h.caller, goal.id)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            GOAL_NOT_OPEN,
+            "a following starting call is refused"
+        );
+        assert!(
+            !h.service
+                .end_for_cancelled_execution(&h.caller.tenant_id, bound)
+                .await
+                .unwrap(),
+            "a goal already closed is left as it is"
+        );
+        assert!(
+            !h.service
+                .end_for_cancelled_execution(&h.caller.tenant_id, ExecutionId::new())
+                .await
+                .unwrap(),
+            "an execution bound to no goal ends none"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_in_another_tenant_ends_no_goal() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let bound = h.bound(&goal).await[0];
+        let other = TenantId::for_consumer_user("user-b").unwrap();
+        assert!(!h
+            .service
+            .end_for_cancelled_execution(&other, bound)
+            .await
+            .unwrap());
+        assert_eq!(h.stored(&goal).await.state, GoalState::Open);
+    }
+
+    #[tokio::test]
+    async fn the_four_paths_close_the_goal_through_one_helper_only_on_a_cancel_that_succeeded() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let bound = h.bound(&goal).await[0];
+        let failed: Result<(), String> =
+            cancel_ending_its_goal(Some(&h.service), &h.caller.tenant_id, bound, async {
+                Err("no such execution".to_string())
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            h.stored(&goal).await.state,
+            GoalState::Open,
+            "a failed cancel ends no goal"
+        );
+        let done: Result<(), String> =
+            cancel_ending_its_goal(Some(&h.service), &h.caller.tenant_id, bound, async {
+                Ok(())
+            })
+            .await;
+        assert!(done.is_ok());
+        assert_eq!(h.stored(&goal).await.state, GoalState::Cancelled);
     }
 }

@@ -140,6 +140,7 @@ fn goal(client_ref: &str) -> Goal {
         rounds: 0,
         created_at: now(),
         closed_at: None,
+        closed_reason: None,
     }
 }
 
@@ -255,11 +256,11 @@ async fn a_goal_and_its_evaluations_round_trip() {
 
     let closed_at = now();
     assert!(repo
-        .close_goal(g.id, GoalState::Met, closed_at)
+        .close_goal(g.id, GoalState::Met, closed_at, None)
         .await
         .unwrap());
     assert!(!repo
-        .close_goal(g.id, GoalState::Expired, closed_at)
+        .close_goal(g.id, GoalState::Expired, closed_at, None)
         .await
         .unwrap());
     let stored = repo.find_goal(g.id).await.unwrap().unwrap();
@@ -578,6 +579,14 @@ async fn migration_040_over_rows_from_before_it_leaves_them_reading_as_they_did(
         .execute(&db.pool)
         .await
         .expect("migration 040 over the old rows");
+    // Today's store reads today's schema: the migrations after 040 are
+    // applied too (043 adds `closed_reason`, AEGIS ADR-131 U33).
+    for later in MIGRATOR.iter().filter(|m| m.version > 40) {
+        sqlx::raw_sql(&later.sql)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|e| panic!("migration {}: {e}", later.version));
+    }
 
     let repo = PostgresGoalRepository::new(db.pool.clone());
     let goal = repo.find_goal(GoalId(goal_id)).await.unwrap().unwrap();
@@ -625,7 +634,7 @@ async fn a_stopped_goal_and_its_stop_reason_round_trip_and_stop_a_round_once() {
     );
     assert_eq!(repo.list_evaluations(g.id).await.unwrap(), vec![first]);
     assert!(repo
-        .close_goal(g.id, GoalState::Stopped, now())
+        .close_goal(g.id, GoalState::Stopped, now(), None)
         .await
         .unwrap());
     assert_eq!(
