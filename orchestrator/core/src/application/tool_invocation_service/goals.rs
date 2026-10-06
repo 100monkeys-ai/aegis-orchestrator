@@ -10,7 +10,7 @@
 use super::*;
 use crate::application::goal_service::{
     DispatchFact, ExecutionView, GoalCaller, GoalError, GoalService, GoalWorld, JudgeProgress,
-    GOAL_JUDGE_AGENT_NAME,
+    ProducedFileFact, GOAL_JUDGE_AGENT_NAME,
 };
 use crate::domain::execution::{Execution, ExecutionId, ExecutionStatus};
 use crate::domain::goal::{
@@ -252,6 +252,50 @@ impl ToolInvocationService {
         }
     }
 
+    /// U32: the facts of the workflow or intent execution `id`, from its
+    /// step executions read each on its own (U32a). `None` when it has none,
+    /// when no execution store is configured, or when they cannot be listed:
+    /// unknown, never zero.
+    async fn workflow_step_facts(&self, tenant: &TenantId, id: ExecutionId) -> Option<StepFacts> {
+        let Some(executions) = self.execution_repository.as_ref() else {
+            tracing::warn!(
+                workflow_execution_id = %id,
+                "goal judge input: no execution repository configured; a workflow's facts are unknown"
+            );
+            return None;
+        };
+        match executions
+            .read_steps_of_workflow_execution_for_tenant(tenant, id.0)
+            .await
+        {
+            Ok(steps) => {
+                let steps: Vec<Result<Execution, ExecutionId>> = steps
+                    .into_iter()
+                    .map(|step| {
+                        step.map_err(|(step_id, error)| {
+                            tracing::warn!(
+                                workflow_execution_id = %id,
+                                step_execution_id = %step_id,
+                                %error,
+                                "goal judge input: a step execution could not be read"
+                            );
+                            step_id
+                        })
+                    })
+                    .collect();
+                step_facts(&steps)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workflow_execution_id = %id,
+                    %error,
+                    "goal judge input: a workflow's step executions could not be listed; its facts are unknown"
+                );
+                None
+            }
+        }
+    }
+
     async fn workflow_name(
         &self,
         tenant: &TenantId,
@@ -288,6 +332,7 @@ fn run_dispatches(exec: &Execution) -> (usize, Vec<DispatchFact>) {
                 .iter()
                 .flatten()
                 .map(move |step| DispatchFact {
+                    execution_id: None,
                     iteration: iteration.number,
                     tool: step.tool_name.clone(),
                     status: step.status.clone(),
@@ -296,6 +341,73 @@ fn run_dispatches(exec: &Execution) -> (usize, Vec<DispatchFact>) {
         .collect();
     let executed = dispatches.iter().filter(|d| d.executed()).count();
     (executed, dispatches)
+}
+
+/// U30: the files the execution produced, as the judge is given them.
+fn run_produced_files(exec: &Execution) -> Vec<ProducedFileFact> {
+    exec.produced_files()
+        .iter()
+        .map(|file| ProducedFileFact {
+            execution_id: None,
+            file: file.clone(),
+        })
+        .collect()
+}
+
+/// The facts of a workflow or intent execution's run (U32): its step
+/// executions' facts.
+#[derive(Debug, Default, PartialEq)]
+struct StepFacts {
+    tool_calls_executed: usize,
+    dispatches: Vec<DispatchFact>,
+    produced_files: Vec<ProducedFileFact>,
+    steps_unread: usize,
+}
+
+/// U32: fold a workflow or intent execution's step executions, as read in
+/// their start order, into its facts. A step that ended (completed, failed
+/// or cancelled) adds its executed calls to the count and its dispatches and
+/// files to the lists, each naming the step (U32b, U32d); one still pending
+/// or running adds nothing, so the count and the lists agree. A step whose
+/// record could not be read leaves the lists as they are and is counted in
+/// `steps_unread` (U32a, U32c). `None` when there are no steps: unknown,
+/// never zero.
+fn step_facts(steps: &[Result<Execution, ExecutionId>]) -> Option<StepFacts> {
+    if steps.is_empty() {
+        return None;
+    }
+    let mut facts = StepFacts::default();
+    for step in steps {
+        let Ok(step) = step else {
+            facts.steps_unread += 1;
+            continue;
+        };
+        if !matches!(
+            step.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+        ) {
+            continue;
+        }
+        let (executed, dispatches) = run_dispatches(step);
+        facts.tool_calls_executed += executed;
+        facts
+            .dispatches
+            .extend(dispatches.into_iter().map(|dispatch| DispatchFact {
+                execution_id: Some(step.id),
+                ..dispatch
+            }));
+        facts
+            .produced_files
+            .extend(
+                run_produced_files(step)
+                    .into_iter()
+                    .map(|file| ProducedFileFact {
+                        execution_id: Some(step.id),
+                        ..file
+                    }),
+            );
+    }
+    Some(facts)
 }
 
 /// One goal call's view of the orchestrator, as the goal's user.
@@ -337,7 +449,8 @@ impl GoalWorld for GoalCallWorld<'_> {
                     iterations: Some(exec.iterations().len()),
                     tool_calls_executed: Some(tool_calls_executed),
                     dispatches: Some(dispatches),
-                    produced_files: Some(exec.produced_files().to_vec()),
+                    produced_files: Some(run_produced_files(&exec)),
+                    steps_unread: None,
                     last_output: last.and_then(|i| i.output.clone()),
                     last_error: last
                         .and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
@@ -376,6 +489,8 @@ impl GoalWorld for GoalCallWorld<'_> {
                         | ExecutionStatus::Failed
                         | ExecutionStatus::Cancelled
                 );
+                // U32: what its step executions were recorded doing.
+                let facts = self.service.workflow_step_facts(tenant, wf.id).await;
                 Some(ExecutionView {
                     execution_id: wf.id,
                     kind,
@@ -384,11 +499,10 @@ impl GoalWorld for GoalCallWorld<'_> {
                     started_at: wf.started_at,
                     ended_at: terminal.then_some(wf.last_transition_at),
                     iterations: None,
-                    // U30: a workflow or intent execution keeps no record of
-                    // its own tool calls or files: unknown, never zero.
-                    tool_calls_executed: None,
-                    dispatches: None,
-                    produced_files: None,
+                    tool_calls_executed: facts.as_ref().map(|f| f.tool_calls_executed),
+                    steps_unread: facts.as_ref().map(|f| f.steps_unread),
+                    dispatches: facts.as_ref().map(|f| f.dispatches.clone()),
+                    produced_files: facts.map(|f| f.produced_files),
                     last_output: output,
                     last_error: error,
                     // U23: a workflow or intent execution records no time
@@ -579,5 +693,749 @@ mod run_facts_tests {
             ));
         }
         assert!(complaints.is_empty(), "U30: {complaints:#?}");
+    }
+}
+
+/// AEGIS ADR-131 U32 and U32a to U32d, through the real types the daemon
+/// uses: the goal service's `judge_input` over the world a goal is judged in
+/// (`GoalCallWorld`), reading a workflow execution from the workflow
+/// execution store and its step executions from the execution store.
+#[cfg(test)]
+mod step_facts_tests {
+    use super::*;
+    use crate::domain::agent::AgentId;
+    use crate::domain::events::ExecutionEvent;
+    use crate::domain::execution::{ExecutionInput, Iteration, ProducedFile, TrajectoryStep};
+    use crate::domain::goal::AliasTableJudgeContext;
+    use crate::domain::node_config::GoalsConfig;
+    use crate::domain::repository::{
+        ExecutionRepository, RepositoryError, WorkflowExecutionRepository,
+    };
+    use crate::domain::workflow::{Blackboard, StateName, WorkflowExecution, WorkflowId};
+    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
+    use crate::infrastructure::repositories::{
+        InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryVolumeRepository,
+        InMemoryWorkflowExecutionRepository,
+    };
+    use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
+    use crate::infrastructure::storage::LocalHostStorageProvider;
+    use chrono::{DateTime, Utc};
+    use futures::Stream;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::pin::Pin;
+
+    const USER: &str = "user-a";
+
+    fn tenant() -> TenantId {
+        TenantId::for_consumer_user(USER).unwrap()
+    }
+
+    /// The execution service is not read for a workflow execution.
+    struct NoExecutions;
+
+    #[async_trait::async_trait]
+    impl ExecutionService for NoExecutions {
+        async fn start_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&UserIdentity>,
+        ) -> anyhow::Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_execution_with_id(
+            &self,
+            _: ExecutionId,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&UserIdentity>,
+        ) -> anyhow::Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> anyhow::Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> anyhow::Result<Execution> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_unscoped(&self, _: ExecutionId) -> anyhow::Result<Execution> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_iterations_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> anyhow::Result<Vec<Iteration>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn cancel_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<ExecutionEvent>> + Send>>>
+        {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<DomainEvent>> + Send>>>
+        {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_executions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: Option<AgentId>,
+            _: Option<WorkflowId>,
+            _: usize,
+        ) -> anyhow::Result<Vec<Execution>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn delete_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: crate::domain::execution::LlmInteraction,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<TrajectoryStep>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+    }
+
+    struct NoOpPublisher;
+
+    #[async_trait::async_trait]
+    impl crate::domain::fsal::EventPublisher for NoOpPublisher {
+        async fn publish_storage_event(&self, _event: crate::domain::events::StorageEvent) {}
+    }
+
+    /// A step store whose row for `unread` cannot be read (U32a): it answers
+    /// that step as its id with the error, the others whole.
+    struct OneUnreadable {
+        steps: Vec<Execution>,
+        unread: ExecutionId,
+    }
+
+    fn not_exercised<T>() -> Result<T, RepositoryError> {
+        Err(RepositoryError::Unknown("not exercised".to_string()))
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionRepository for OneUnreadable {
+        async fn save_for_tenant(
+            &self,
+            _: &TenantId,
+            _: &Execution,
+        ) -> Result<(), RepositoryError> {
+            not_exercised()
+        }
+        async fn find_by_id_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Option<Execution>, RepositoryError> {
+            not_exercised()
+        }
+        async fn find_by_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentId,
+            _: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            not_exercised()
+        }
+        async fn find_by_workflow_for_tenant(
+            &self,
+            _: &TenantId,
+            _: WorkflowId,
+            _: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            not_exercised()
+        }
+        async fn find_by_workflow_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: uuid::Uuid,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            Err(RepositoryError::Serialization(format!(
+                "Failed to deserialize iterations of {}",
+                self.unread
+            )))
+        }
+        async fn read_steps_of_workflow_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: uuid::Uuid,
+        ) -> Result<Vec<Result<Execution, (ExecutionId, RepositoryError)>>, RepositoryError>
+        {
+            Ok(self
+                .steps
+                .iter()
+                .map(|step| {
+                    if step.id == self.unread {
+                        Err((
+                            step.id,
+                            RepositoryError::Serialization(
+                                "Failed to deserialize iterations".to_string(),
+                            ),
+                        ))
+                    } else {
+                        Ok(step.clone())
+                    }
+                })
+                .collect())
+        }
+        async fn find_recent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            not_exercised()
+        }
+        async fn list_recent_all_paginated(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            not_exercised()
+        }
+        async fn delete_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<(), RepositoryError> {
+            not_exercised()
+        }
+        async fn count_by_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentId,
+        ) -> Result<i64, RepositoryError> {
+            not_exercised()
+        }
+        async fn find_by_id_unscoped(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Option<Execution>, RepositoryError> {
+            not_exercised()
+        }
+        async fn count_running(&self, _: &TenantId) -> Result<u64, RepositoryError> {
+            not_exercised()
+        }
+    }
+
+    /// A workflow execution of the user's, ended `completed`.
+    fn workflow_execution() -> WorkflowExecution {
+        let now = Utc::now();
+        WorkflowExecution {
+            id: ExecutionId::new(),
+            workflow_id: WorkflowId::from_uuid(uuid::Uuid::new_v4()),
+            tenant_id: tenant(),
+            status: ExecutionStatus::Completed,
+            current_state: StateName::new("DONE").unwrap(),
+            blackboard: Blackboard::new(),
+            input: json!({}),
+            state_outputs: HashMap::new(),
+            final_output: Some(json!("The report is at /workspace/report.pdf.")),
+            started_at: now,
+            last_transition_at: now,
+            initiating_user_sub: Some(USER.to_string()),
+        }
+    }
+
+    /// A step execution of `workflow`, started `offset` seconds after
+    /// `base`, whose one try made `calls` (tool, status) and left `files`,
+    /// ended with `status`.
+    fn step(
+        workflow: &WorkflowExecution,
+        base: DateTime<Utc>,
+        offset: i64,
+        calls: &[(&str, &str)],
+        files: &[&str],
+        status: ExecutionStatus,
+    ) -> Execution {
+        let input = ExecutionInput {
+            intent: None,
+            input: json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: Some(workflow.id.0),
+            attachments: Vec::new(),
+        };
+        let mut exec = Execution::new_with_id(
+            ExecutionId::new(),
+            AgentId::new(),
+            input,
+            5,
+            "zaru-free".into(),
+        );
+        exec.tenant_id = tenant();
+        exec.start();
+        exec.started_at = base + chrono::Duration::seconds(offset);
+        exec.start_iteration("the step's try".to_string()).unwrap();
+        exec.store_iteration_trajectory(
+            1,
+            calls
+                .iter()
+                .map(|(tool, status)| TrajectoryStep {
+                    tool_name: tool.to_string(),
+                    arguments_json: "{}".to_string(),
+                    status: status.to_string(),
+                    result_json: None,
+                    error: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+        exec.store_produced_files(
+            1,
+            files
+                .iter()
+                .map(|path| ProducedFile {
+                    path: path.to_string(),
+                    size_bytes: 21,
+                    content_type: "application/pdf".to_string(),
+                    volume_id: None,
+                    path_in_volume: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+        exec.complete_iteration("step done".to_string());
+        match status {
+            ExecutionStatus::Completed => exec.complete(),
+            ExecutionStatus::Failed => exec.fail("the step failed".to_string()),
+            other => exec.status = other,
+        }
+        exec
+    }
+
+    /// The goal service and the world, over `executions` as the step store,
+    /// with `workflow` stored and bound to a new goal; `room` sets the
+    /// judge alias's `(context_window, max_output_tokens)`.
+    async fn judge_input_for(
+        workflow: &WorkflowExecution,
+        executions: Arc<dyn ExecutionRepository>,
+        room: Option<(u32, u32)>,
+    ) -> Value {
+        let router = Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers()));
+        let storage_root =
+            std::env::temp_dir().join(format!("aegis-step-facts-{}", uuid::Uuid::new_v4()));
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+            Arc::new(InMemoryVolumeRepository::new()),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoOpPublisher),
+        ));
+        let event_bus = Arc::new(EventBus::new(16));
+        let workflows = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        workflows
+            .save_for_tenant(&tenant(), workflow)
+            .await
+            .unwrap();
+        let service = ToolInvocationService::new(
+            Arc::new(InMemorySealSessionRepository::new()),
+            Arc::new(
+                crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+            ),
+            Arc::new(SealMiddleware::new()),
+            router,
+            fsal,
+            NfsVolumeRegistry::new(),
+            Arc::new(InMemoryAgentRepository::new()),
+            Arc::new(NoExecutions),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+            event_bus.clone(),
+            None,
+        )
+        .with_workflow_execution_repo(workflows)
+        .with_execution_repository(executions);
+        let mut goals = GoalService::new(
+            Arc::new(InMemoryGoalRepository::new()),
+            event_bus,
+            GoalsConfig::default(),
+        );
+        if let Some((context_window, max_output_tokens)) = room {
+            let providers: Vec<crate::domain::node_config::LLMProviderConfig> =
+                serde_yaml::from_str(&format!(
+                    "- name: workers-ai\n  type: openai-compatible\n  endpoint: https://example.invalid/v1\n  \
+                     models:\n    - alias: judge\n      model: gemma\n      capabilities: [chat]\n      \
+                     context_window: {context_window}\n      max_output_tokens: {max_output_tokens}\n"
+                ))
+                .unwrap();
+            goals = goals
+                .with_judge_context(Arc::new(AliasTableJudgeContext::from_providers(&providers)));
+        }
+        let caller = GoalCaller {
+            tenant_id: tenant(),
+            user_sub: USER.to_string(),
+        };
+        let goal = goals
+            .create(
+                &caller,
+                "Write the quarterly report as a PDF.",
+                "conversation-1",
+                GoalChannel::Web,
+            )
+            .await
+            .unwrap();
+        goals
+            .bind(goal.id, workflow.id, BoundKind::Workflow)
+            .await
+            .unwrap();
+        let world = GoalCallWorld {
+            service: &service,
+            identity: None,
+            security_context_name: "zaru-free".to_string(),
+        };
+        goals
+            .judge_input(&world, &goal, "The report is at /workspace/report.pdf.")
+            .await
+            .unwrap()
+    }
+
+    async fn stored(steps: &[Execution]) -> Arc<dyn ExecutionRepository> {
+        let store = Arc::new(InMemoryExecutionRepository::new());
+        // Stored latest first: the order read is the steps' start order.
+        for step in steps.iter().rev() {
+            store.save_for_tenant(&tenant(), step).await.unwrap();
+        }
+        store
+    }
+
+    /// U32, U32b, U32d: a workflow with two completed steps (one with a
+    /// produced file and two dispatches, one with none) and one failed step
+    /// is judged on its steps' facts: the count summed, the lists
+    /// concatenated in start order, each entry naming its step, none unread.
+    #[tokio::test]
+    async fn a_workflows_judge_input_carries_its_steps_facts_summed_and_in_start_order() {
+        let workflow = workflow_execution();
+        let base = workflow.started_at;
+        let writer = step(
+            &workflow,
+            base,
+            1,
+            &[("fs.write", "succeeded"), ("cmd.run", "succeeded")],
+            &["/workspace/report.pdf"],
+            ExecutionStatus::Completed,
+        );
+        let quiet = step(&workflow, base, 2, &[], &[], ExecutionStatus::Completed);
+        let failed = step(
+            &workflow,
+            base,
+            3,
+            &[("cmd.run", "failed")],
+            &[],
+            ExecutionStatus::Failed,
+        );
+        let input = judge_input_for(
+            &workflow,
+            stored(&[writer.clone(), quiet.clone(), failed.clone()]).await,
+            None,
+        )
+        .await;
+        let run = &input["executions"][0];
+        println!("U32 goal-judge input, a workflow of three steps: {run}");
+        let mut complaints = Vec::new();
+        if run["tool_calls_executed"] != json!(3) {
+            complaints.push(format!(
+                "tool_calls_executed is {}, not 3 (2 + 0 + 1 over the steps)",
+                run["tool_calls_executed"]
+            ));
+        }
+        let dispatches = json!([
+            {"execution_id": writer.id.to_string(), "iteration": 1, "tool": "fs.write", "status": "succeeded"},
+            {"execution_id": writer.id.to_string(), "iteration": 1, "tool": "cmd.run", "status": "succeeded"},
+            {"execution_id": failed.id.to_string(), "iteration": 1, "tool": "cmd.run", "status": "failed"},
+        ]);
+        if run["dispatches"] != dispatches {
+            complaints.push(format!(
+                "dispatches are {}, not the steps' in start order, each naming its step: {dispatches}",
+                run["dispatches"]
+            ));
+        }
+        let produced = json!([
+            {"execution_id": writer.id.to_string(), "path": "/workspace/report.pdf", "size_bytes": 21, "content_type": "application/pdf"},
+        ]);
+        if run["produced_files"] != produced {
+            complaints.push(format!(
+                "produced_files are {}, not the steps' naming their step: {produced}",
+                run["produced_files"]
+            ));
+        }
+        if run["steps_unread"] != json!(0) {
+            complaints.push(format!("steps_unread is {}, not 0", run["steps_unread"]));
+        }
+        assert!(complaints.is_empty(), "U32: {complaints:#?}\n{run}");
+    }
+
+    /// U32, U32a: a step whose row cannot be read leaves the lists as the
+    /// other steps make them and is counted in `steps_unread`.
+    #[tokio::test]
+    async fn an_unreadable_step_is_counted_in_steps_unread_and_the_others_facts_stand() {
+        let workflow = workflow_execution();
+        let base = workflow.started_at;
+        let writer = step(
+            &workflow,
+            base,
+            1,
+            &[("fs.write", "succeeded"), ("cmd.run", "succeeded")],
+            &["/workspace/report.pdf"],
+            ExecutionStatus::Completed,
+        );
+        let unread = step(
+            &workflow,
+            base,
+            2,
+            &[("cmd.run", "succeeded")],
+            &[],
+            ExecutionStatus::Completed,
+        );
+        let failed = step(
+            &workflow,
+            base,
+            3,
+            &[("cmd.run", "failed")],
+            &[],
+            ExecutionStatus::Failed,
+        );
+        let store = Arc::new(OneUnreadable {
+            steps: vec![writer.clone(), unread.clone(), failed.clone()],
+            unread: unread.id,
+        });
+        let input = judge_input_for(&workflow, store, None).await;
+        let run = &input["executions"][0];
+        println!("U32a goal-judge input, one step unreadable: {run}");
+        let mut complaints = Vec::new();
+        if run["steps_unread"] != json!(1) {
+            complaints.push(format!("steps_unread is {}, not 1", run["steps_unread"]));
+        }
+        if run["tool_calls_executed"] != json!(3) {
+            complaints.push(format!(
+                "tool_calls_executed is {}, not 3 (the two steps read)",
+                run["tool_calls_executed"]
+            ));
+        }
+        let named: Vec<&str> = run["dispatches"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d["execution_id"].as_str())
+            .collect();
+        let expected = [
+            writer.id.to_string(),
+            writer.id.to_string(),
+            failed.id.to_string(),
+        ];
+        if named != expected {
+            complaints.push(format!(
+                "the dispatches name {named:?}, not the steps read in start order {expected:?}"
+            ));
+        }
+        if run["produced_files"][0]["execution_id"] != json!(writer.id.to_string()) {
+            complaints.push(format!(
+                "produced_files are {}, not the writer's file",
+                run["produced_files"]
+            ));
+        }
+        assert!(complaints.is_empty(), "U32a: {complaints:#?}\n{run}");
+    }
+
+    /// U32: a workflow with no step executions keeps its facts null:
+    /// unknown, never zero.
+    #[tokio::test]
+    async fn a_workflow_with_no_step_executions_keeps_null_facts() {
+        let workflow = workflow_execution();
+        let input = judge_input_for(&workflow, stored(&[]).await, None).await;
+        let run = &input["executions"][0];
+        println!("U32 goal-judge input, a workflow with no step executions: {run}");
+        let mut complaints = Vec::new();
+        for field in [
+            "tool_calls_executed",
+            "dispatches",
+            "produced_files",
+            "steps_unread",
+        ] {
+            if !run[field].is_null() {
+                complaints.push(format!("{field} is {}, not null (unknown)", run[field]));
+            }
+        }
+        assert!(complaints.is_empty(), "U32: {complaints:#?}\n{run}");
+    }
+
+    /// U32b: a step that has not ended adds nothing to the count or the
+    /// lists, so the two agree.
+    #[tokio::test]
+    async fn a_step_still_running_adds_nothing_to_the_count_or_the_lists() {
+        let workflow = workflow_execution();
+        let base = workflow.started_at;
+        let done = step(
+            &workflow,
+            base,
+            1,
+            &[("fs.write", "succeeded")],
+            &[],
+            ExecutionStatus::Completed,
+        );
+        let running = step(
+            &workflow,
+            base,
+            2,
+            &[("cmd.run", "succeeded")],
+            &[],
+            ExecutionStatus::Running,
+        );
+        let input = judge_input_for(&workflow, stored(&[done.clone(), running]).await, None).await;
+        let run = &input["executions"][0];
+        println!("U32b goal-judge input, one step still running: {run}");
+        let mut complaints = Vec::new();
+        if run["tool_calls_executed"] != json!(1) {
+            complaints.push(format!(
+                "tool_calls_executed is {}, not 1 (the ended step's)",
+                run["tool_calls_executed"]
+            ));
+        }
+        if run["dispatches"]
+            != json!([{"execution_id": done.id.to_string(), "iteration": 1, "tool": "fs.write", "status": "succeeded"}])
+        {
+            complaints.push(format!(
+                "dispatches are {}, not the ended step's only",
+                run["dispatches"]
+            ));
+        }
+        assert!(complaints.is_empty(), "U32b: {complaints:#?}\n{run}");
+    }
+
+    /// U32 under U16a (J2): a workflow's lists, whose entries name several
+    /// step executions, cut to the judge's room keep whole entries in start
+    /// order, each naming its step, and carry `*_omitted`; the count stays
+    /// whole.
+    #[tokio::test]
+    async fn a_workflows_lists_cut_to_the_room_keep_whole_entries_naming_their_steps() {
+        let workflow = workflow_execution();
+        let base = workflow.started_at;
+        let calls: Vec<(&str, &str)> = (0..50)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ("fs.write", "succeeded")
+                } else {
+                    ("cmd.run", "succeeded")
+                }
+            })
+            .collect();
+        let steps: Vec<Execution> = (0..6)
+            .map(|i| {
+                step(
+                    &workflow,
+                    base,
+                    i + 1,
+                    &calls,
+                    &["/workspace/report.pdf"],
+                    ExecutionStatus::Completed,
+                )
+            })
+            .collect();
+        // 30,000 and 4,000: a prompt limit of 26,000 bytes, 17,808 for the
+        // input beside goal-judge's reserve.
+        let input = judge_input_for(&workflow, stored(&steps).await, Some((30_000, 4_000))).await;
+        let size = serde_json::to_string(&input).unwrap().len();
+        let run = &input["executions"][0];
+        let kept: Vec<Value> = run["dispatches"].as_array().cloned().unwrap_or_default();
+        println!(
+            "U32 under U16a: input {size} bytes against a room of 17808; tool_calls_executed {}, \
+             produced_files {}, dispatches kept {}, dispatches_omitted {}, first kept {}, last kept {}",
+            run["tool_calls_executed"],
+            run["produced_files"],
+            kept.len(),
+            run["dispatches_omitted"],
+            kept.first().cloned().unwrap_or(Value::Null),
+            kept.last().cloned().unwrap_or(Value::Null),
+        );
+        let mut complaints = Vec::new();
+        if size > 17_808 {
+            complaints.push(format!("the input is {size} bytes, over the room"));
+        }
+        if run["tool_calls_executed"] != json!(300) {
+            complaints.push(format!(
+                "tool_calls_executed is {}, not the whole count 300",
+                run["tool_calls_executed"]
+            ));
+        }
+        if run["produced_files"].as_array().map(Vec::len) != Some(6) {
+            complaints.push(format!(
+                "produced_files are {}, not the six whole",
+                run["produced_files"]
+            ));
+        }
+        if kept.is_empty() || kept.len() >= 300 {
+            complaints.push(format!("{} dispatches kept, not a cut prefix", kept.len()));
+        }
+        let whole: Vec<Value> = steps
+            .iter()
+            .flat_map(|s| {
+                calls.iter().map(move |(tool, status)| {
+                    json!({"execution_id": s.id.to_string(), "iteration": 1, "tool": tool, "status": status})
+                })
+            })
+            .collect();
+        if kept[..] != whole[..kept.len().min(whole.len())] {
+            complaints.push(
+                "the dispatches kept are not the first ones, whole, each naming its step"
+                    .to_string(),
+            );
+        }
+        let named: std::collections::BTreeSet<&str> = kept
+            .iter()
+            .filter_map(|d| d["execution_id"].as_str())
+            .collect();
+        if named.len() < 2 {
+            complaints.push(format!(
+                "the dispatches kept name {} step(s), not several",
+                named.len()
+            ));
+        }
+        if run["dispatches_omitted"] != json!(300 - kept.len()) {
+            complaints.push(format!(
+                "dispatches_omitted is {}, not {}",
+                run["dispatches_omitted"],
+                300 - kept.len()
+            ));
+        }
+        assert!(complaints.is_empty(), "U32 under U16a: {complaints:#?}");
     }
 }

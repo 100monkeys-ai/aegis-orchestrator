@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! AEGIS ADR-131 U30 and U31: the prompt `goal-judge` reads, rendered as an
+//! AEGIS ADR-131 U30, U31 and U32: the prompt `goal-judge` reads, rendered as an
 //! execution renders it (its manifest's `prompt_template` over its
 //! instruction and the judge input as `{{input}}`), for the PDF run of
 //! 2026-10-05: an agent execution that ran no tool, produced no file, and
@@ -44,6 +44,7 @@ impl GoalWorld for PdfRun {
             produced_files: Some(Vec::new()),
             last_output: Some("/workspace/delivery_itinerary.pdf".to_string()),
             last_error: None,
+            steps_unread: None,
             bound_until: b.started_at,
         })
     }
@@ -115,7 +116,16 @@ async fn the_rendered_goal_judge_prompt_says_last_output_is_the_agents_own_text_
          produced_files show it.",
         "Score evidence 0 only when the companion_answer or a last_output claims a file and \
          neither holds",
-        "Where an execution's facts are null (a workflow or intent execution), they are unknown",
+        // U32: a workflow's facts are its steps', each entry naming its step.
+        "For a workflow or intent execution those three are its step executions' facts: \
+         tool_calls_executed is their sum, and each entry of dispatches and produced_files \
+         carries the execution_id of the step that made it, in the steps' start order; \
+         steps_unread counts the steps whose record could not be read, whose facts are missing \
+         from those three. A workflow or intent execution with no step executions has those \
+         three null.",
+        "(for a workflow or intent execution, the step its entries' execution_id names)",
+        "Where an execution's facts are null (a workflow or intent execution with no step \
+         executions), or for the steps steps_unread counts, they are unknown",
         "\"tool_calls_executed\":0",
         "\"dispatches\":[]",
         "\"produced_files\":[]",
@@ -128,6 +138,6 @@ async fn the_rendered_goal_judge_prompt_says_last_output_is_the_agents_own_text_
     }
     assert!(
         complaints.is_empty(),
-        "U30, U31: {complaints:#?}\nthe prompt: {prompt}"
+        "U30, U31, U32: {complaints:#?}\nthe prompt: {prompt}"
     );
 }

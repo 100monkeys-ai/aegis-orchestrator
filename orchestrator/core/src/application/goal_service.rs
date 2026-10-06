@@ -140,16 +140,26 @@ pub struct ExecutionView {
     pub last_output: Option<String>,
     pub last_error: Option<String>,
     /// How many of its tool calls ran (U30): every call its tries made,
-    /// less those refused before running or still pending. `None` for a
-    /// workflow or intent execution, which keeps no record of its own.
+    /// less those refused before running or still pending. For a workflow
+    /// or intent execution, the sum over its completed, failed and cancelled
+    /// step executions (U32, U32b); `None` when it has no step executions,
+    /// or they could not be listed: unknown, never zero.
     pub tool_calls_executed: Option<usize>,
     /// Each tool call its tries made, oldest first, from the stored
-    /// trajectory (U30). `None` for a workflow or intent execution.
+    /// trajectory (U30). For a workflow or intent execution, the same
+    /// steps' calls in their start order, each naming its step (U32d);
+    /// `None` as `tool_calls_executed` is.
     pub dispatches: Option<Vec<DispatchFact>>,
     /// The files the orchestrator read in its volume when it completed
-    /// (U30; AEGIS ADR-005, Update of 2026-10-06, O3). `None` for a workflow
-    /// or intent execution.
-    pub produced_files: Option<Vec<ProducedFile>>,
+    /// (U30; AEGIS ADR-005, Update of 2026-10-06, O3). For a workflow or
+    /// intent execution, the same steps' files in their start order, each
+    /// naming its step (U32d); `None` as `tool_calls_executed` is.
+    pub produced_files: Option<Vec<ProducedFileFact>>,
+    /// For a workflow or intent execution, how many of its step executions
+    /// could not be read: their facts are missing from the three above
+    /// (U32, U32a, U32c). `None` for an agent execution, and where the facts
+    /// are `None`.
+    pub steps_unread: Option<usize>,
     /// The latest a round waits for this execution (U23):
     /// [`crate::domain::goal::execution_wait_bound`] of its start and its
     /// recorded time limit.
@@ -170,6 +180,11 @@ impl ExecutionView {
 /// (`succeeded`, `failed`, `fatal`, `refused`, `dispatched` or `pending`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DispatchFact {
+    /// The step execution that made the call, in a workflow or intent
+    /// execution's facts (U32d); `None`, and not written, in an agent
+    /// execution's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<ExecutionId>,
     pub iteration: u8,
     pub tool: String,
     pub status: String,
@@ -180,6 +195,20 @@ impl DispatchFact {
     pub fn executed(&self) -> bool {
         !matches!(self.status.as_str(), "refused" | "pending")
     }
+}
+
+/// One file an execution produced (U30, O3), as the judge is given it:
+/// `{path, size_bytes, content_type}`, and in a workflow or intent
+/// execution's facts the step execution that produced it (U32d).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProducedFileFact {
+    /// The step execution that produced the file, in a workflow or intent
+    /// execution's facts; `None`, and not written, in an agent execution's
+    /// own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<ExecutionId>,
+    #[serde(flatten)]
+    pub file: ProducedFile,
 }
 
 /// Where the judge's execution stands.
@@ -817,9 +846,11 @@ impl GoalService {
     /// answer whole (U14: no text a judge is given is cut), the round and the
     /// rounds left. `approval_pending` covers executions bound directly
     /// to the goal only (U5). Each execution also carries the facts of its
-    /// run (U30): `tool_calls_executed`, `dispatches` and `produced_files`,
-    /// null for a workflow or intent execution, their lists fitted to the
-    /// judge's room under U16a (`fit_run_facts`).
+    /// run (U30): `tool_calls_executed`, `dispatches` and `produced_files`;
+    /// for a workflow or intent execution its step executions' facts and
+    /// `steps_unread` (U32), the facts null and `steps_unread` absent where
+    /// it has no step executions; their
+    /// lists fitted to the judge's room under U16a (`fit_run_facts`).
     pub async fn judge_input(
         &self,
         world: &dyn GoalWorld,
@@ -838,7 +869,7 @@ impl GoalService {
                 .filter(|(id, _)| *id == view.execution_id)
                 .map(|(_, approval)| approval)
                 .collect();
-            executions.push(json!({
+            let mut execution = json!({
                 "execution_id": view.execution_id.to_string(),
                 "kind": view.kind,
                 "agent_or_workflow": view.agent_or_workflow,
@@ -852,7 +883,13 @@ impl GoalService {
                 "tool_calls_executed": view.tool_calls_executed,
                 "dispatches": view.dispatches,
                 "produced_files": view.produced_files,
-            }));
+            });
+            // U32: a workflow or intent execution's unread steps; an agent
+            // execution's input is as it was.
+            if let Some(unread) = view.steps_unread {
+                execution["steps_unread"] = json!(unread);
+            }
+            executions.push(execution);
         }
         let mut input = json!({
             "goal": goal.statement,
@@ -1582,6 +1619,7 @@ mod tests {
                         .unwrap_or_else(|| "x".repeat(10_000)),
                 ),
                 last_error: None,
+                steps_unread: None,
             })
         }
         async fn pending_approvals(

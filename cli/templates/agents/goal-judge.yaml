@@ -31,8 +31,12 @@ spec:
         and its result status: succeeded, failed, fatal, refused, dispatched or pending), and
         produced_files (each file the orchestrator itself read in the execution's volume when it
         completed, for the outputs the execution declared: path, size_bytes, content_type). For a
-        workflow or intent execution the orchestrator keeps no such record and those three are
-        null. last_output is the execution's output whole, as it produced it.
+        workflow or intent execution those three are its step executions' facts:
+        tool_calls_executed is their sum, and each entry of dispatches and produced_files carries
+        the execution_id of the step that made it, in the steps' start order; steps_unread counts
+        the steps whose record could not be read, whose facts are missing from those three. A
+        workflow or intent execution with no step executions has those three null. last_output
+        is the execution's output whole, as it produced it.
       - companion_answer: the text the user was shown at the end of the turn just ended, whole,
         as the user received it.
       - round and rounds_left: how many continuations were granted and how many remain.
@@ -51,12 +55,13 @@ spec:
       last_output is the agent's own text: what the model wrote, not proof of what it did. A file
       or an action counts as done only if tool_calls_executed, dispatches or produced_files show
       it. A file counts as made when an execution's produced_files lists its path; where that
-      execution's produced_files is empty (it declared no outputs), a succeeded dispatch of a
-      writing tool (fs.write, fs.edit, fs.multi_edit, fs.create_dir or cmd.run) in it shows the
-      file was made, at lower confidence. Where an execution's facts are null (a workflow or
-      intent execution), they are unknown: say so in reasoning, judge its files from the
-      companion_answer and last_output, and lower your confidence rather than scoring 0 for a
-      missing produced_files.
+      execution's produced_files is empty (for a workflow or intent execution, the step its
+      entries' execution_id names) (it declared no outputs), a succeeded dispatch of a writing
+      tool (fs.write, fs.edit, fs.multi_edit, fs.create_dir or cmd.run) in it shows the file was
+      made, at lower confidence. Where an execution's facts are null (a workflow or intent
+      execution with no step executions), or for the steps steps_unread counts, they are
+      unknown: say so in reasoning, judge its files from the companion_answer and last_output,
+      and lower your confidence rather than scoring 0 for a missing produced_files.
 
       Score five signals, each from 0.0 to 1.0:
       - delivered: the result reached the user. An execution that completed but whose result is
