@@ -29,8 +29,12 @@ impl ToolInvocationService {
             .await?;
         if let ToolInvocationResult::Direct(answer) = &result {
             if let Some(pipeline) = answer.get("pipeline_execution_id").and_then(Value::as_str) {
-                self.bind_to_goal(goal_id, pipeline, crate::domain::goal::BoundKind::Workflow)
-                    .await;
+                if let Some(closed) = self
+                    .bind_to_goal(goal_id, pipeline, crate::domain::goal::BoundKind::Workflow)
+                    .await
+                {
+                    return Ok(ToolInvocationResult::Direct(closed));
+                }
             }
         }
         Ok(result)

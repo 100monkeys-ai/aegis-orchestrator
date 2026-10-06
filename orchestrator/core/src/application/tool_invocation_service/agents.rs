@@ -286,12 +286,16 @@ impl ToolInvocationService {
             .await
         {
             Ok(exec_id) => {
-                self.bind_to_goal(
-                    goal_id,
-                    &exec_id.to_string(),
-                    crate::domain::goal::BoundKind::Agent,
-                )
-                .await;
+                if let Some(closed) = self
+                    .bind_to_goal(
+                        goal_id,
+                        &exec_id.to_string(),
+                        crate::domain::goal::BoundKind::Agent,
+                    )
+                    .await
+                {
+                    return Ok(ToolInvocationResult::Direct(closed));
+                }
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.agent.generate",
                     "execution_id": exec_id.to_string(),

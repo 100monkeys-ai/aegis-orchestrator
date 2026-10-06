@@ -1845,6 +1845,45 @@ mod cancel_path_tests {
         }
     }
 
+    /// Starts a workflow execution as the use case would, answering its id;
+    /// the next start may close a goal first (C4, finding 2's call sites).
+    #[derive(Default)]
+    struct Starts {
+        close_on_start: StdMutex<Option<(Arc<InMemoryGoalRepository>, GoalId)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::application::start_workflow_execution::StartWorkflowExecutionUseCase for Starts {
+        async fn start_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            request: crate::application::start_workflow_execution::StartWorkflowExecutionRequest,
+            _: Option<&UserIdentity>,
+        ) -> anyhow::Result<crate::application::start_workflow_execution::StartedWorkflowExecution>
+        {
+            let closing = self.close_on_start.lock().unwrap().take();
+            if let Some((repo, goal_id)) = closing {
+                repo.close_goal(
+                    goal_id,
+                    GoalState::Cancelled,
+                    chrono::Utc::now(),
+                    Some("The person asked to stop."),
+                )
+                .await
+                .unwrap();
+            }
+            Ok(
+                crate::application::start_workflow_execution::StartedWorkflowExecution {
+                    execution_id: ExecutionId::new().to_string(),
+                    workflow_id: request.workflow_id,
+                    temporal_run_id: "run".to_string(),
+                    status: "running".to_string(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+        }
+    }
+
     struct NoOpPublisher;
 
     #[async_trait::async_trait]
@@ -1856,6 +1895,7 @@ mod cancel_path_tests {
         service: ToolInvocationService,
         executions: Arc<Executions>,
         workflows: Arc<WorkflowControl>,
+        starts: Arc<Starts>,
         goals: Arc<InMemoryGoalRepository>,
     }
 
@@ -1872,6 +1912,7 @@ mod cancel_path_tests {
         let event_bus = Arc::new(EventBus::new(256));
         let executions = Arc::new(Executions::default());
         let workflows = Arc::new(WorkflowControl::default());
+        let starts = Arc::new(Starts::default());
         let goals = Arc::new(InMemoryGoalRepository::new());
         let goal_service = Arc::new(GoalService::new(
             goals.clone(),
@@ -1894,11 +1935,13 @@ mod cancel_path_tests {
             None,
         )
         .with_goals(goal_service)
-        .with_workflow_execution_control(workflows.clone());
+        .with_workflow_execution_control(workflows.clone())
+        .with_workflow_execution(starts.clone());
         Harness {
             service,
             executions,
             workflows,
+            starts,
             goals,
         }
     }
@@ -2112,9 +2155,16 @@ mod cancel_path_tests {
         let h = harness();
         let goal = h.create().await;
         *h.executions.close_on_start.lock().unwrap() = Some((h.goals.clone(), goal));
-        let started = h.task_execute(goal).await;
-        let execution =
-            ExecutionId::from_string(started["execution_id"].as_str().unwrap()).unwrap();
+        h.task_execute(goal).await;
+        let started: Vec<ExecutionId> = h
+            .executions
+            .started
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        let execution = started[0];
         println!(
             "finding 2: the execution started across the cancel was cancelled: {:?}",
             h.executions.cancels.lock().unwrap()
@@ -2131,5 +2181,89 @@ mod cancel_path_tests {
             .expect("a binding to a closed goal answers its state");
         assert_eq!(answer["state"], "cancelled", "{answer}");
         assert_eq!(answer["continue"], false);
+    }
+
+    // ── C4: the four starting tools answer the closed state ────────────────
+
+    fn assert_closed(tool: &str, answer: &Value) {
+        println!("C4: {tool} started across the cancel answered {answer}");
+        assert_eq!(
+            answer["state"], "cancelled",
+            "{tool} answers the closed state for work bound after the goal closed: {answer}"
+        );
+        assert_eq!(answer["continue"], false, "{tool}: {answer}");
+    }
+
+    #[tokio::test]
+    async fn task_execute_answers_the_closed_state_for_work_bound_after_the_goal_closed() {
+        let h = harness();
+        let goal = h.create().await;
+        *h.executions.close_on_start.lock().unwrap() = Some((h.goals.clone(), goal));
+        let answer = h.task_execute(goal).await;
+        assert_closed("aegis.task.execute", &answer);
+        assert_eq!(h.executions.cancels.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_generate_answers_the_closed_state_for_work_bound_after_the_goal_closed() {
+        let h = harness();
+        let goal = h.create().await;
+        *h.executions.close_on_start.lock().unwrap() = Some((h.goals.clone(), goal));
+        let mut args =
+            json!({"input": "an agent that solves routing", "goal_id": goal.to_string()});
+        let answer = direct(
+            h.service
+                .invoke_aegis_agent_generate_tool(
+                    &mut args,
+                    &zaru_free(),
+                    Some(&identity(OWNER)),
+                    &scope(OWNER),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_closed("aegis.agent.generate", &answer);
+        assert_eq!(h.executions.cancels.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_generate_answers_the_closed_state_for_work_bound_after_the_goal_closed() {
+        let h = harness();
+        let goal = h.create().await;
+        *h.starts.close_on_start.lock().unwrap() = Some((h.goals.clone(), goal));
+        let mut args = json!({"input": "a routing pipeline", "goal_id": goal.to_string()});
+        let answer = direct(
+            h.service
+                .invoke_aegis_workflow_generate_tool(
+                    &mut args,
+                    Some(&identity(OWNER)),
+                    &scope(OWNER),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_closed("aegis.workflow.generate", &answer);
+        assert_eq!(h.workflows.cancels.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_intent_answers_the_closed_state_for_work_bound_after_the_goal_closed() {
+        let h = harness();
+        let goal = h.create().await;
+        *h.starts.close_on_start.lock().unwrap() = Some((h.goals.clone(), goal));
+        let mut args = json!({"intent": "solve the routing problem", "goal_id": goal.to_string()});
+        let answer = direct(
+            h.service
+                .invoke_aegis_execute_intent_for_goal(
+                    &mut args,
+                    &zaru_free(),
+                    Some(&identity(OWNER)),
+                    &scope(OWNER),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_closed("aegis.execute.intent", &answer);
+        assert_eq!(h.workflows.cancels.lock().unwrap().len(), 1);
     }
 }

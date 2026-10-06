@@ -629,12 +629,16 @@ impl ToolInvocationService {
             .await
         {
             Ok(started) => {
-                self.bind_to_goal(
-                    goal_id,
-                    &started.execution_id,
-                    crate::domain::goal::BoundKind::Workflow,
-                )
-                .await;
+                if let Some(closed) = self
+                    .bind_to_goal(
+                        goal_id,
+                        &started.execution_id,
+                        crate::domain::goal::BoundKind::Workflow,
+                    )
+                    .await
+                {
+                    return Ok(ToolInvocationResult::Direct(closed));
+                }
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.generate",
                     "execution_id": started.execution_id,
