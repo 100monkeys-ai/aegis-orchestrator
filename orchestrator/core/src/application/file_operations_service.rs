@@ -12,6 +12,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use crate::domain::fsal::{AegisFSAL, FsalError};
 use crate::domain::path_sanitizer::PathSanitizer;
+use crate::domain::repository::{AgentRepository, ExecutionRepository};
 use crate::domain::storage::{FileType, OpenMode, StorageError};
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::VolumeId;
@@ -32,6 +33,9 @@ pub struct DirEntry {
 pub struct FileContent {
     pub data: Vec<u8>,
     pub content_type: String,
+    /// The file's size as its storage stat gave it: the route's
+    /// `Content-Length` (AEGIS ADR-005 I8).
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -101,13 +105,25 @@ impl From<FsalError> for FileOperationsError {
 pub struct FileOperationsService {
     fsal: Arc<AegisFSAL>,
     path_sanitizer: PathSanitizer,
+    /// The execution records an execution's file is read through: its
+    /// tenant, its produced files and its workspace (AEGIS ADR-005 I8).
+    executions: Arc<dyn ExecutionRepository>,
+    /// The agents whose manifest names the volume an execution mounted at
+    /// `/workspace` (I8, P2).
+    agents: Arc<dyn AgentRepository>,
 }
 
 impl FileOperationsService {
-    pub fn new(fsal: Arc<AegisFSAL>) -> Self {
+    pub fn new(
+        fsal: Arc<AegisFSAL>,
+        executions: Arc<dyn ExecutionRepository>,
+        agents: Arc<dyn AgentRepository>,
+    ) -> Self {
         Self {
             fsal,
             path_sanitizer: PathSanitizer::new(),
+            executions,
+            agents,
         }
     }
 
@@ -201,7 +217,11 @@ impl FileOperationsService {
         let _ = self.fsal.storage_provider().close_file(&handle).await;
 
         let content_type = guess_content_type(path);
-        Ok(FileContent { data, content_type })
+        Ok(FileContent {
+            data,
+            content_type,
+            size_bytes: attrs.size,
+        })
     }
 
     pub async fn write_file(
@@ -444,11 +464,6 @@ impl FileOperationsService {
         })
     }
 
-    /// Read a file from an execution-owned workspace volume (post-mortem).
-    ///
-    /// Looks up the volume by `VolumeOwnership::Execution { execution_id }`,
-    /// verifies the volume belongs to the given tenant, sanitizes the path,
-    /// and returns the file content.
     /// Read a file from a tenant-scoped persistent user volume, used by the
     /// `aegis.attachment.read` tool (ADR-113).
     ///
@@ -492,66 +507,216 @@ impl FileOperationsService {
         self.read_file(volume_id, tenant_id, &owner, path).await
     }
 
+    /// Read a file of an execution post-mortem: the route
+    /// `GET /v1/executions/:id/files/*path` and `aegis.execution.file`
+    /// (AEGIS ADR-005 I8, choices P2 and P3).
+    ///
+    /// `path` is relative to the container's `/workspace` (the route and the
+    /// tool strip that prefix). The execution is loaded for `tenant_id`.
+    /// A path its record lists among its produced files is read from the
+    /// volume and the path the supervisor read it at; any other path is read
+    /// from the volume mounted at `/workspace`: the workflow's workspace when
+    /// the execution is a workflow step, otherwise the execution's volume the
+    /// agent's current manifest mounts there. Reads go through the FSAL as
+    /// the execution, then as its workflow execution when refused. Another
+    /// tenant's execution, a missing execution, a missing volume and another
+    /// tenant's volume are all answered as not found, never telling which.
     pub async fn read_file_for_execution(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
         tenant_id: &crate::domain::tenant::TenantId,
         path: &str,
     ) -> Result<FileContent, FileOperationsError> {
-        use crate::domain::volume::VolumeOwnership;
-
-        let ownership = VolumeOwnership::execution(execution_id);
-        let volumes = self
-            .fsal
-            .volume_repository()
-            .find_by_ownership(&ownership)
-            .await
-            .map_err(|e| FileOperationsError::Repository(e.to_string()))?;
-
-        let volume = volumes.into_iter().next().ok_or_else(|| {
+        let no_workspace = || {
             FileOperationsError::NotFound(format!(
                 "no workspace volume for execution {}",
                 execution_id.0
             ))
-        })?;
-
-        // Tenant isolation check
-        if &volume.tenant_id != tenant_id {
-            return Err(FileOperationsError::Unauthorized);
-        }
+        };
+        let execution = self
+            .executions
+            .find_by_id_for_tenant(tenant_id, execution_id)
+            .await
+            .map_err(|e| FileOperationsError::Repository(e.to_string()))?
+            .ok_or_else(no_workspace)?;
 
         let sanitized = self.sanitize(path)?;
-        let full_path = routed_path(&volume, &sanitized);
+        let container_path = if sanitized == "/" {
+            "/workspace".to_string()
+        } else {
+            format!("/workspace{sanitized}")
+        };
 
-        let handle = self
-            .fsal
-            .storage_provider()
-            .open_file(&full_path, OpenMode::ReadOnly)
+        let recorded = execution
+            .produced_files()
+            .iter()
+            .find(|file| file.path == container_path)
+            .and_then(|file| Some((file.volume_id?, file.path_in_volume.clone()?)));
+        if let Some((volume_id, path_in_volume)) = recorded {
+            let no_file = || {
+                FileOperationsError::NotFound(format!(
+                    "no file {container_path} in execution {}",
+                    execution_id.0
+                ))
+            };
+            return self
+                .read_in_volume(&execution, tenant_id, volume_id, &path_in_volume, path)
+                .await
+                .map_err(|error| match error {
+                    FileOperationsError::NotFound(_) | FileOperationsError::Unauthorized => {
+                        no_file()
+                    }
+                    other => other,
+                });
+        }
+
+        let volume_id = self
+            .workspace_volume(&execution, tenant_id)
+            .await?
+            .ok_or_else(no_workspace)?;
+        self.read_in_volume(&execution, tenant_id, volume_id, &sanitized, path)
             .await
-            .map_err(|e| match e {
-                StorageError::FileNotFound(p) => FileOperationsError::NotFound(p),
-                StorageError::NotFound(p) => FileOperationsError::NotFound(p),
-                other => FileOperationsError::Fsal(other.to_string()),
-            })?;
+            .map_err(|error| match error {
+                FileOperationsError::Unauthorized => no_workspace(),
+                other => other,
+            })
+    }
 
-        let attrs = self
-            .fsal
-            .storage_provider()
-            .stat(&full_path)
+    /// The volume an execution mounted at `/workspace` (I8, P2): the
+    /// workflow's workspace volume when the execution is a workflow step
+    /// mounting it there; otherwise the execution's own volume that the
+    /// agent's current manifest mounts at `/workspace`. `None` when there is
+    /// none. The manifest read is the agent's current one, not necessarily
+    /// the one the run used.
+    async fn workspace_volume(
+        &self,
+        execution: &crate::domain::execution::Execution,
+        tenant_id: &TenantId,
+    ) -> Result<Option<VolumeId>, FileOperationsError> {
+        use crate::domain::volume::VolumeOwnership;
+
+        let at_workspace = |mount: &str| mount.trim_end_matches('/') == "/workspace";
+        if let Some(workspace) = execution.input.workspace_volume_id {
+            let mount = execution
+                .input
+                .workspace_volume_mount_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/workspace".to_string());
+            if at_workspace(&mount) {
+                return Ok(Some(workspace));
+            }
+        }
+
+        let Some(agent) = self
+            .agents
+            .find_by_id_for_tenant(tenant_id, execution.agent_id)
             .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
-
-        let data = self
+            .map_err(|e| FileOperationsError::Repository(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let Some(spec) = agent
+            .manifest
+            .spec
+            .volumes
+            .iter()
+            .find(|spec| at_workspace(&spec.mount_path))
+        else {
+            return Ok(None);
+        };
+        let volumes = self
             .fsal
-            .storage_provider()
-            .read_at(&handle, 0, attrs.size as usize)
+            .volume_repository()
+            .find_by_ownership(&VolumeOwnership::execution(execution.id))
             .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+            .map_err(|e| FileOperationsError::Repository(e.to_string()))?;
+        Ok(volumes
+            .into_iter()
+            .find(|volume| volume.name == spec.name)
+            .map(|volume| volume.id))
+    }
 
-        let _ = self.fsal.storage_provider().close_file(&handle).await;
+    /// Read `path_in_volume` from `volume_id` through the FSAL as
+    /// `execution`, then as its workflow execution on `UnauthorizedAccess`
+    /// (as `FsalOutputReader::read_head` reads a declared output). A volume
+    /// that is missing or of another tenant is not found.
+    async fn read_in_volume(
+        &self,
+        execution: &crate::domain::execution::Execution,
+        tenant_id: &TenantId,
+        volume_id: VolumeId,
+        path_in_volume: &str,
+        requested: &str,
+    ) -> Result<FileContent, FileOperationsError> {
+        use crate::domain::fsal::{AegisFileHandle, FsalAccessPolicy};
 
-        let content_type = guess_content_type(path);
-        Ok(FileContent { data, content_type })
+        let volume = self
+            .fsal
+            .volume_repository()
+            .find_by_id(volume_id)
+            .await
+            .map_err(|e| FileOperationsError::Repository(e.to_string()))?
+            .ok_or_else(|| FileOperationsError::NotFound(format!("volume {}", volume_id.0)))?;
+        if &volume.tenant_id != tenant_id {
+            return Err(FileOperationsError::NotFound(format!(
+                "volume {}",
+                volume_id.0
+            )));
+        }
+
+        let workflow_execution_id = execution.input.workflow_execution_id;
+        let attributes = self
+            .fsal
+            .getattr(
+                execution.id,
+                volume_id,
+                path_in_volume,
+                execution.container_uid,
+                execution.container_gid,
+                workflow_execution_id,
+            )
+            .await?;
+        if attributes.file_type != FileType::File {
+            return Err(FileOperationsError::NotFound(path_in_volume.to_string()));
+        }
+        let length =
+            usize::try_from(attributes.size).map_err(|_| FileOperationsError::FileTooLarge)?;
+        let policy = FsalAccessPolicy {
+            read: vec!["/*".to_string()],
+            write: Vec::new(),
+        };
+        let as_execution = AegisFileHandle::new(execution.id, volume_id, path_in_volume);
+        let data = match self
+            .fsal
+            .read(&as_execution, path_in_volume, &policy, 0, length)
+            .await
+        {
+            Ok(data) => data,
+            Err(FsalError::UnauthorizedAccess { .. }) if workflow_execution_id.is_some() => {
+                let as_workflow = AegisFileHandle::new_for_workflow(
+                    workflow_execution_id.unwrap_or_default(),
+                    volume_id,
+                    path_in_volume,
+                );
+                self.fsal
+                    .read(&as_workflow, path_in_volume, &policy, 0, length)
+                    .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if data.len() as u64 != attributes.size {
+            return Err(FileOperationsError::Fsal(format!(
+                "{path_in_volume} changed while it was read: {} bytes of {}",
+                data.len(),
+                attributes.size
+            )));
+        }
+        Ok(FileContent {
+            data,
+            content_type: guess_content_type(requested),
+            size_bytes: attributes.size,
+        })
     }
 }
 

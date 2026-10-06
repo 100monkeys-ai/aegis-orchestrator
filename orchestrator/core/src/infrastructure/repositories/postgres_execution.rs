@@ -527,6 +527,39 @@ impl ExecutionRepository for PostgresExecutionRepository {
         Ok(executions)
     }
 
+    async fn find_by_workflow_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_execution_id: uuid::Uuid,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        // The step's workflow execution is in its stored input (the gRPC
+        // ExecuteAgent request's `workflow_execution_id`); the column of the
+        // same name is never written (AEGIS ADR-005 I9, P4 and P5).
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM executions
+            WHERE tenant_id = $1 AND input->>'workflow_execution_id' = $2
+            ORDER BY started_at ASC, id ASC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(workflow_execution_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut executions = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(execution) = self
+                .find_by_id_for_tenant(tenant_id, ExecutionId(id))
+                .await?
+            {
+                executions.push(execution);
+            }
+        }
+        Ok(executions)
+    }
+
     async fn find_recent_for_tenant(
         &self,
         tenant_id: &TenantId,

@@ -763,7 +763,11 @@ async fn with_files() -> Mcp {
     attest_with(
         zaru_pro_allowing(&["aegis.goal.*", "aegis.file.*"]),
         |service, fsal| {
-            service.with_file_operations_service(Arc::new(FileOperationsService::new(fsal)))
+            service.with_file_operations_service(Arc::new(FileOperationsService::new(
+                fsal,
+                Arc::new(aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository::new()),
+                Arc::new(aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository::new()),
+            )))
         },
     )
     .await
@@ -1116,13 +1120,76 @@ async fn a_storage_backend_failure_is_500_and_its_text_is_only_in_the_log() {
 
 /// A session allowed the three tools, with the file service configured.
 async fn with_file_reads() -> Mcp {
+    with_file_reads_over(
+        Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository::new(
+            ),
+        ),
+        Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository::new(),
+        ),
+    )
+    .await
+}
+
+/// As [`with_file_reads`], the file service reading execution records and
+/// agents from these stores (AEGIS ADR-005 I8).
+async fn with_file_reads_over(
+    executions: Arc<
+        aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository,
+    >,
+    agents: Arc<aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository>,
+) -> Mcp {
     attest_with(
         zaru_pro_allowing(&["aegis.execution.*", "aegis.attachment.*", "aegis.file.*"]),
         |service, fsal| {
-            service.with_file_operations_service(Arc::new(FileOperationsService::new(fsal)))
+            service.with_file_operations_service(Arc::new(FileOperationsService::new(
+                fsal, executions, agents,
+            )))
         },
     )
     .await
+}
+
+/// A completed execution `execution` of `tenant`, whose agent mounts its
+/// volume named "workspace" at `/workspace`: the record the route reads
+/// before it reads a file (AEGIS ADR-005 I8, P2).
+async fn execution_record(
+    executions: &aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository,
+    agents: &aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository,
+    tenant: &TenantId,
+    execution: uuid::Uuid,
+) {
+    use aegis_orchestrator_core::domain::repository::{AgentRepository, ExecutionRepository};
+    let manifest: AgentManifest = serde_yaml::from_str(
+        "apiVersion: aegis.ai/v1\nkind: Agent\nmetadata:\n  name: file-agent\n  \
+         version: \"1.0.0\"\nspec:\n  runtime:\n    language: python\n    \
+         version: \"3.11\"\n    model: smart\n  volumes:\n    - name: workspace\n      \
+         storage_class: persistent\n      mount_path: /workspace\n      \
+         access_mode: read-write\n      size_limit: 1Gi\n",
+    )
+    .unwrap();
+    let agent = Agent::new(manifest);
+    agents.save_for_tenant(tenant, &agent).await.unwrap();
+    let mut record = Execution::new(
+        agent.id,
+        ExecutionInput {
+            intent: None,
+            input: json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        },
+        1,
+        "ctx".to_string(),
+    );
+    record.id = ExecutionId(execution);
+    record.tenant_id = tenant.clone();
+    record.start();
+    record.complete();
+    executions.save_for_tenant(tenant, &record).await.unwrap();
 }
 
 impl Mcp {
@@ -1192,7 +1259,14 @@ async fn an_execution_file_of_another_tenant_answers_byte_for_byte_as_a_missing_
     let args = json!({"execution_id": execution.to_string(), "path": "output.md"});
     let other = TenantId::for_consumer_user(SOMEONE_ELSE).unwrap();
 
-    let mut foreign = with_file_reads().await;
+    let executions = Arc::new(
+        aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository::new(),
+    );
+    let agents = Arc::new(
+        aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository::new(),
+    );
+    execution_record(&executions, &agents, &other, execution).await;
+    let mut foreign = with_file_reads_over(executions, agents).await;
     foreign
         .execution_volume(&other, execution, "/aegis-host/other-exec")
         .await;
@@ -1219,7 +1293,14 @@ async fn an_execution_file_of_another_tenant_answers_byte_for_byte_as_a_missing_
 #[tokio::test]
 async fn an_execution_file_of_the_callers_own_execution_is_read_as_before() {
     let execution = uuid::Uuid::new_v4();
-    let mut mcp = with_file_reads().await;
+    let executions = Arc::new(
+        aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository::new(),
+    );
+    let agents = Arc::new(
+        aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository::new(),
+    );
+    execution_record(&executions, &agents, &own_tenant(), execution).await;
+    let mut mcp = with_file_reads_over(executions, agents).await;
     mcp.execution_volume(&own_tenant(), execution, "/aegis-host/own-exec")
         .await;
     mcp.put_file("/aegis-host/own-exec", "output.md", "mine");

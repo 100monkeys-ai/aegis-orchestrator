@@ -181,6 +181,15 @@ pub trait ExecutionRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Execution>, RepositoryError>;
 
+    /// The step executions of one workflow execution, oldest first: every
+    /// execution of `tenant_id` whose input names `workflow_execution_id`
+    /// (AEGIS ADR-005 I9, P4).
+    async fn find_by_workflow_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_execution_id: uuid::Uuid,
+    ) -> Result<Vec<Execution>, RepositoryError>;
+
     async fn find_recent_for_tenant(
         &self,
         tenant_id: &TenantId,

@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Builtin `aegis.execution.file` Tool
 //!
-//! Reads a single file from a completed execution's workspace volume post-mortem.
-//! The tool looks up the volume by execution ownership and reads via FSAL.
+//! Reads a single file of a completed execution post-mortem, through
+//! `FileOperationsService::read_file_for_execution`: a produced file from the
+//! volume the supervisor read it in, any other path from the volume mounted
+//! at `/workspace`, both through the FSAL (AEGIS ADR-005 I8).
 
 use crate::application::file_operations_service::{FileOperationsError, FileOperationsService};
 use crate::application::tool_invocation_service::ToolInvocationResult;

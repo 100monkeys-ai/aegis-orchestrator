@@ -625,6 +625,14 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn find_by_workflow_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _workflow_execution_id: uuid::Uuid,
+        ) -> std::result::Result<Vec<Execution>, RepositoryError> {
+            Ok(Vec::new())
+        }
+
         async fn find_recent_for_tenant(
             &self,
             _tenant_id: &TenantId,

@@ -561,6 +561,23 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         Ok(Vec::new())
     }
 
+    async fn find_by_workflow_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_execution_id: uuid::Uuid,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let mut steps: Vec<Execution> = executions
+            .get(tenant_id)
+            .into_iter()
+            .flat_map(|tenant_execs| tenant_execs.values())
+            .filter(|e| e.input.workflow_execution_id == Some(workflow_execution_id))
+            .cloned()
+            .collect();
+        steps.sort_by_key(|e| (e.started_at, e.id.0));
+        Ok(steps)
+    }
+
     async fn find_recent_for_tenant(
         &self,
         tenant_id: &TenantId,

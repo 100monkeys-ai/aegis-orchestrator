@@ -1851,6 +1851,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let file_operations_service = Arc::new(
         aegis_orchestrator_core::application::file_operations_service::FileOperationsService::new(
             nfs_gateway.fsal().clone(),
+            execution_repo.clone(),
+            agent_repo.clone(),
         ),
     );
 

@@ -215,6 +215,13 @@ impl crate::domain::repository::ExecutionRepository for Records {
     ) -> Result<Vec<Execution>, crate::domain::repository::RepositoryError> {
         Ok(vec![])
     }
+    async fn find_by_workflow_execution_for_tenant(
+        &self,
+        _: &TenantId,
+        _: uuid::Uuid,
+    ) -> Result<Vec<Execution>, crate::domain::repository::RepositoryError> {
+        Ok(vec![])
+    }
     async fn find_recent_for_tenant(
         &self,
         _: &TenantId,

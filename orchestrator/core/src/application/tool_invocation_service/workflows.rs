@@ -442,7 +442,7 @@ impl ToolInvocationService {
                     );
 
                     if is_terminal {
-                        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        let mut answer = serde_json::json!({
                             "tool": "aegis.workflow.wait",
                             "execution_id": execution_id_str,
                             "workflow_id": execution.workflow_id.to_string(),
@@ -452,7 +452,50 @@ impl ToolInvocationService {
                             "last_output": execution.final_output,
                             "started_at": execution.started_at,
                             "last_transition_at": execution.last_transition_at,
-                        })));
+                        });
+                        // AEGIS ADR-005 I9 (P4): the files each completed
+                        // step execution produced, in the steps' start
+                        // order, each naming its execution. With no record
+                        // read the key is absent: never "no files".
+                        match &self.execution_repository {
+                            Some(executions) => match executions
+                                .find_by_workflow_execution_for_tenant(&tenant_id, execution_id.0)
+                                .await
+                            {
+                                Ok(steps) => {
+                                    let files: Vec<Value> = steps
+                                        .iter()
+                                        .filter(|step| {
+                                            step.status
+                                                == crate::domain::execution::ExecutionStatus::Completed
+                                        })
+                                        .flat_map(|step| {
+                                            step.produced_files().iter().map(move |file| {
+                                                serde_json::json!({
+                                                    "execution_id": step.id.0.to_string(),
+                                                    "path": file.path,
+                                                    "size_bytes": file.size_bytes,
+                                                    "content_type": file.content_type,
+                                                })
+                                            })
+                                        })
+                                        .collect();
+                                    answer["produced_files"] = Value::Array(files);
+                                }
+                                Err(error) => tracing::warn!(
+                                    workflow_execution_id = %execution_id_str,
+                                    %error,
+                                    "aegis.workflow.wait: step executions not read; \
+                                     answering no produced_files"
+                                ),
+                            },
+                            None => tracing::warn!(
+                                workflow_execution_id = %execution_id_str,
+                                "aegis.workflow.wait: no execution repository configured; \
+                                 answering no produced_files"
+                            ),
+                        }
+                        return Ok(ToolInvocationResult::Direct(answer));
                     }
 
                     if std::time::Instant::now() >= deadline {

@@ -11,7 +11,9 @@ use axum::response::IntoResponse;
 use futures::StreamExt;
 use uuid::Uuid;
 
-use aegis_orchestrator_core::application::file_operations_service::FileOperationsError;
+use aegis_orchestrator_core::application::file_operations_service::{
+    FileContent, FileOperationsError,
+};
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
@@ -312,13 +314,7 @@ pub(crate) async fn get_execution_file_handler(
         .file_operations_service
         .read_file_for_execution(ExecutionId(execution_id), &tenant_id, normalized)
         .await
-        .map(|content| {
-            (
-                [(axum::http::header::CONTENT_TYPE, content.content_type)],
-                content.data,
-            )
-                .into_response()
-        })
+        .map(execution_file_response)
         .map_err(|e| {
             let (status, message) = match &e {
                 FileOperationsError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
@@ -330,6 +326,58 @@ pub(crate) async fn get_execution_file_handler(
             };
             (status, axum::Json(serde_json::json!({"error": message})))
         })
+}
+
+/// The files route's answer: the bytes, their content type, and their
+/// `Content-Length` from the storage stat (AEGIS ADR-005 I8).
+fn execution_file_response(content: FileContent) -> axum::response::Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content.content_type),
+            (
+                axum::http::header::CONTENT_LENGTH,
+                content.size_bytes.to_string(),
+            ),
+        ],
+        content.data,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod file_response_tests {
+    //! AEGIS ADR-005 I8: the files route answers `Content-Length` from the
+    //! FSAL stat, so a download names its size before its first byte.
+
+    use super::*;
+
+    #[test]
+    fn the_files_route_answers_content_length_from_the_stat() {
+        let response = execution_file_response(FileContent {
+            data: b"%PDF-1.7 the report".to_vec(),
+            content_type: "application/pdf".to_string(),
+            size_bytes: 19,
+        });
+        let headers = response.headers();
+        println!(
+            "files route headers: content-type {:?}, content-length {:?}",
+            headers.get(axum::http::header::CONTENT_TYPE),
+            headers.get(axum::http::header::CONTENT_LENGTH)
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| v.as_bytes()),
+            Some(&b"application/pdf"[..]),
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .map(|v| v.as_bytes()),
+            Some(&b"19"[..]),
+            "I8: the files route answers no Content-Length from the stat"
+        );
+    }
 }
 
 #[cfg(test)]

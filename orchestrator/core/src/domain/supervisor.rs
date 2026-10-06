@@ -289,6 +289,10 @@ pub async fn check_declared_outputs(
                         path: path.to_string(),
                         size_bytes: found.size_bytes,
                         content_type: found.content_type,
+                        // Where it was read, so the download route reads
+                        // this file and no other (ADR-005 I8).
+                        volume_id: Some(location.volume_id),
+                        path_in_volume: Some(location.path_in_volume.clone()),
                     });
                 }
             }
@@ -1795,23 +1799,49 @@ mod tests {
             complaints.push(format!("the execution ended {result:?}"));
         }
         let verified = observer.verified.lock().await.clone();
+        let reads = volume.reads.lock().unwrap().clone();
         let expected = vec![(
             1u8,
             vec![ProducedFile {
                 path: "/workspace/x.pdf".to_string(),
                 size_bytes: 24,
                 content_type: "application/pdf".to_string(),
+                volume_id: reads.first().map(|read| read.volume_id),
+                path_in_volume: Some("/x.pdf".to_string()),
             }],
         )];
         if verified != expected {
             complaints.push(format!("the verified outputs were {verified:?}"));
         }
-        let reads = volume.reads.lock().unwrap().clone();
         if reads.len() != 1 || reads[0].path_in_volume != "/x.pdf" {
             complaints.push(format!("the volume was read at {reads:?}"));
         }
         println!("declared output present: execution {result:?}; produced_files {verified:?}");
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// AEGIS ADR-005 I8 (P1): a produced file records the volume and the path
+    /// inside it that the supervisor read it at, so the download route reads
+    /// that file and no other.
+    #[tokio::test]
+    async fn a_produced_file_records_the_volume_and_path_it_was_read_at() {
+        let volume = VolumeDouble::holding(&[("/x.pdf", b"%PDF-1.7 a real document")]);
+        let (_runtime, observer, _result) =
+            run_declaring(vec![pdf_output()], Some(volume.clone()), 2, None).await;
+        let verified = observer.verified.lock().await.clone();
+        let reads = volume.reads.lock().unwrap().clone();
+        let read_at = reads.first().map(|read| read.volume_id);
+        let recorded = verified
+            .first()
+            .and_then(|(_, files)| files.first())
+            .map(|file| (file.volume_id, file.path_in_volume.clone()));
+        println!("I8: read at volume {read_at:?}; recorded location {recorded:?}");
+        assert!(read_at.is_some(), "the volume was never read");
+        assert_eq!(
+            recorded,
+            Some((read_at, Some("/x.pdf".to_string()))),
+            "I8: the produced file does not record the volume and path it was read at"
+        );
     }
 
     /// Test 3. A short file and a wrong prefix each give their own sentence,

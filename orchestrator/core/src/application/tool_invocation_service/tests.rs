@@ -5729,3 +5729,269 @@ spec:
         );
     }
 }
+
+// ============================================================================
+// AEGIS ADR-005 I9 (P4): the workflow wait tools answer the files each
+// completed step execution produced, each entry naming its execution.
+// ============================================================================
+
+/// A workflow execution of `status` with three step executions: two
+/// completed, each with its produced files, and one failed. The service
+/// reads them from `executions`.
+async fn workflow_with_three_steps(
+    status: ExecutionStatus,
+) -> (ToolInvocationService, ExecutionId, Vec<ExecutionId>) {
+    use crate::domain::repository::ExecutionRepository;
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
+    let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+    let executions =
+        Arc::new(crate::infrastructure::repositories::InMemoryExecutionRepository::new());
+    let tenant_id = TenantId::consumer();
+    let workflow = build_test_workflow("produced-files-wait");
+    let mut workflow_execution = crate::domain::workflow::WorkflowExecution::new(
+        &workflow,
+        ExecutionId::new(),
+        serde_json::json!({}),
+    );
+    workflow_execution.status = status;
+    workflow_execution_repo
+        .save_for_tenant(&tenant_id, &workflow_execution)
+        .await
+        .unwrap();
+
+    let started = chrono::Utc::now();
+    let file = |path: &str, size: u64| crate::domain::execution::ProducedFile {
+        path: path.to_string(),
+        size_bytes: size,
+        content_type: "application/pdf".to_string(),
+        volume_id: Some(crate::domain::shared_kernel::VolumeId::new()),
+        path_in_volume: Some(path.trim_start_matches("/workspace").to_string()),
+    };
+    let steps: Vec<(Vec<crate::domain::execution::ProducedFile>, bool)> = vec![
+        (vec![file("/workspace/draft.pdf", 11)], true),
+        (
+            vec![
+                file("/workspace/final.pdf", 22),
+                file("/workspace/cover.pdf", 33),
+            ],
+            true,
+        ),
+        (Vec::new(), false),
+    ];
+    let mut ids = Vec::new();
+    // Saved newest first, so the answer's order is the steps' start order
+    // and not the order they were stored in.
+    for (index, (produced, completed)) in steps.into_iter().enumerate().rev() {
+        let mut step = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: None,
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: Some(workflow_execution.id.0),
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        step.tenant_id = tenant_id.clone();
+        step.start();
+        step.started_at = started + chrono::Duration::seconds(index as i64);
+        step.start_iteration("act".to_string()).unwrap();
+        step.complete_iteration("done".to_string());
+        if !produced.is_empty() {
+            step.store_produced_files(1, produced).unwrap();
+        }
+        if completed {
+            step.complete();
+        } else {
+            step.fail("the step failed".to_string());
+        }
+        executions.save_for_tenant(&tenant_id, &step).await.unwrap();
+        ids.push((index, step.id));
+    }
+    ids.sort_by_key(|(index, _)| *index);
+    // An execution of another workflow execution lists nothing here.
+    let mut stranger = Execution::new(
+        AgentId::new(),
+        ExecutionInput {
+            intent: None,
+            input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: Some(uuid::Uuid::new_v4()),
+            attachments: Vec::new(),
+        },
+        1,
+        "aegis-system-operator".to_string(),
+    );
+    stranger.start();
+    stranger.start_iteration("act".to_string()).unwrap();
+    stranger.complete_iteration("done".to_string());
+    stranger
+        .store_produced_files(1, vec![file("/workspace/stranger.pdf", 44)])
+        .unwrap();
+    stranger.complete();
+    executions
+        .save_for_tenant(&tenant_id, &stranger)
+        .await
+        .unwrap();
+
+    let service = ToolInvocationService::new(
+        Arc::new(InMemorySealSessionRepository::new()),
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new()),
+        Arc::new(SealMiddleware::new()),
+        Arc::new(ToolRouter::new(vec![])),
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution_repo(workflow_execution_repo)
+    .with_execution_repository(executions);
+    (
+        service,
+        workflow_execution.id,
+        ids.into_iter().map(|(_, id)| id).collect(),
+    )
+}
+
+#[tokio::test]
+async fn the_workflow_wait_tools_answer_each_completed_steps_files_with_its_execution() {
+    let mut complaints: Vec<String> = Vec::new();
+    // `aegis.workflow.wait` and `aegis.execute.wait` are both served by this
+    // one handler (facade.rs, the two dispatch arms).
+    {
+        let tool = "invoke_aegis_workflow_wait_tool";
+        let (service, workflow_execution_id, steps) =
+            workflow_with_three_steps(ExecutionStatus::Completed).await;
+        let mut args = serde_json::json!({
+            "execution_id": workflow_execution_id.to_string(),
+            "timeout_seconds": 5,
+            "poll_interval_seconds": 1,
+        });
+        let ToolInvocationResult::Direct(payload) = service
+            .invoke_aegis_workflow_wait_tool(&mut args, &test_tenant_scope())
+            .await
+            .expect("the wait answers")
+        else {
+            panic!("expected a direct payload");
+        };
+        println!("{tool}: produced_files {}", payload["produced_files"]);
+        let expected = serde_json::json!([
+            {"execution_id": steps[0].to_string(), "path": "/workspace/draft.pdf",
+             "size_bytes": 11, "content_type": "application/pdf"},
+            {"execution_id": steps[1].to_string(), "path": "/workspace/final.pdf",
+             "size_bytes": 22, "content_type": "application/pdf"},
+            {"execution_id": steps[1].to_string(), "path": "/workspace/cover.pdf",
+             "size_bytes": 33, "content_type": "application/pdf"},
+        ]);
+        if payload["produced_files"] != expected {
+            complaints.push(format!(
+                "I9: {tool} did not answer each completed step's files with its execution, \
+                 in order: {}",
+                payload["produced_files"]
+            ));
+        }
+    }
+
+    // A failed workflow still lists the files its completed steps made.
+    let (service, workflow_execution_id, steps) =
+        workflow_with_three_steps(ExecutionStatus::Failed).await;
+    let mut args = serde_json::json!({ "execution_id": workflow_execution_id.to_string() });
+    let ToolInvocationResult::Direct(payload) = service
+        .invoke_aegis_workflow_wait_tool(&mut args, &test_tenant_scope())
+        .await
+        .expect("the wait answers")
+    else {
+        panic!("expected a direct payload");
+    };
+    println!(
+        "failed workflow: produced_files {}",
+        payload["produced_files"]
+    );
+    if payload["produced_files"][0]["execution_id"] != steps[0].to_string() {
+        complaints.push(format!(
+            "I9: a failed workflow's answer did not list its completed steps' files: {payload}"
+        ));
+    }
+
+    // A wait that times out answers no record of files at all.
+    let (service, workflow_execution_id, _) =
+        workflow_with_three_steps(ExecutionStatus::Running).await;
+    let mut args = serde_json::json!({
+        "execution_id": workflow_execution_id.to_string(),
+        "timeout_seconds": 0,
+    });
+    let ToolInvocationResult::Direct(payload) = service
+        .invoke_aegis_workflow_wait_tool(&mut args, &test_tenant_scope())
+        .await
+        .expect("the wait answers")
+    else {
+        panic!("expected a direct payload");
+    };
+    println!(
+        "timed out: timed_out {}, produced_files key present {}",
+        payload["timed_out"],
+        payload.get("produced_files").is_some()
+    );
+    if payload["timed_out"] != true || payload.get("produced_files").is_some() {
+        complaints.push(format!(
+            "I9: a timed-out wait answered a produced_files key: {payload}"
+        ));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// A node with no execution store answers no `produced_files` key: no
+/// record was read, so the answer does not say "no files" (I9, P4).
+#[tokio::test]
+async fn the_workflow_wait_answers_no_files_key_without_an_execution_store() {
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
+    let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+    let workflow = build_test_workflow("produced-files-no-store");
+    let mut workflow_execution = crate::domain::workflow::WorkflowExecution::new(
+        &workflow,
+        ExecutionId::new(),
+        serde_json::json!({}),
+    );
+    workflow_execution.status = ExecutionStatus::Completed;
+    workflow_execution_repo
+        .save_for_tenant(&TenantId::consumer(), &workflow_execution)
+        .await
+        .unwrap();
+    let service = ToolInvocationService::new(
+        Arc::new(InMemorySealSessionRepository::new()),
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new()),
+        Arc::new(SealMiddleware::new()),
+        Arc::new(ToolRouter::new(vec![])),
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution_repo(workflow_execution_repo);
+    let mut args = serde_json::json!({ "execution_id": workflow_execution.id.to_string() });
+    let ToolInvocationResult::Direct(payload) = service
+        .invoke_aegis_workflow_wait_tool(&mut args, &test_tenant_scope())
+        .await
+        .expect("the wait answers")
+    else {
+        panic!("expected a direct payload");
+    };
+    println!("no execution store: {payload}");
+    assert_eq!(payload["status"], "completed", "{payload}");
+    assert!(
+        payload.get("produced_files").is_none(),
+        "I9: answered produced_files with no execution store: {payload}"
+    );
+}

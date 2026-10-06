@@ -324,9 +324,42 @@ pub struct Iteration {
     /// The declared outputs this iteration left in the execution's volume,
     /// as the supervisor read them before the iteration counted as completed
     /// (AEGIS ADR-005, Update of 2026-10-06, O3). Stored in the `iterations`
-    /// column; an iteration stored before it carries none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// column; an iteration stored before it carries none. Stored with each
+    /// file's volume and path in it (AEGIS ADR-005 I8, P1).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "stored_produced_files"
+    )]
     pub produced_files: Vec<ProducedFile>,
+}
+
+/// The stored form of one produced file: its answer form and where the
+/// supervisor read it (AEGIS ADR-005 I8, P1). Only an iteration's stored
+/// `produced_files` is written this way; every answer serialises
+/// [`ProducedFile`] itself, `{path, size_bytes, content_type}`.
+#[derive(Serialize)]
+struct StoredProducedFile<'a> {
+    path: &'a str,
+    size_bytes: u64,
+    content_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_id: Option<crate::domain::shared_kernel::VolumeId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_in_volume: Option<&'a str>,
+}
+
+fn stored_produced_files<S: serde::Serializer>(
+    files: &[ProducedFile],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(files.iter().map(|file| StoredProducedFile {
+        path: &file.path,
+        size_bytes: file.size_bytes,
+        content_type: &file.content_type,
+        volume_id: file.volume_id,
+        path_in_volume: file.path_in_volume.as_deref(),
+    }))
 }
 
 /// A file a completed execution produced, read from its volume rather than
@@ -339,6 +372,14 @@ pub struct ProducedFile {
     pub size_bytes: u64,
     /// Its content type, as the execution file route answers it.
     pub content_type: String,
+    /// The volume the supervisor read it in (AEGIS ADR-005 I8, P1). Kept in
+    /// the stored form only: every answer is `{path, size_bytes,
+    /// content_type}`. `None` for a file recorded before I8.
+    #[serde(default, skip_serializing)]
+    pub volume_id: Option<crate::domain::shared_kernel::VolumeId>,
+    /// Its path inside that volume, rooted at `/` (I8, P1). Stored form only.
+    #[serde(default, skip_serializing)]
+    pub path_in_volume: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1220,6 +1261,8 @@ mod tests {
             path: "/workspace/x.pdf".to_string(),
             size_bytes: 2048,
             content_type: "application/pdf".to_string(),
+            volume_id: Some(crate::domain::shared_kernel::VolumeId::new()),
+            path_in_volume: Some("/x.pdf".to_string()),
         }];
         if let Err(e) = exec.store_produced_files(1, produced.clone()) {
             complaints.push(format!("store_produced_files refused iteration 1: {e}"));
@@ -1238,6 +1281,90 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&exec).unwrap()).unwrap();
         if round_trip.produced_files() != produced.as_slice() {
             complaints.push("produced_files did not survive the stored form".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// AEGIS ADR-005 I8 (P1): the stored form of an iteration keeps where
+    /// each produced file was read (five fields); every answer built from
+    /// the record keeps `{path, size_bytes, content_type}`; and a record
+    /// stored before I8, without the two fields, still reads whole. Every
+    /// clause is reported.
+    #[test]
+    fn a_produced_file_keeps_its_location_only_in_the_stored_form() {
+        let mut complaints: Vec<String> = Vec::new();
+        let volume_id = crate::domain::shared_kernel::VolumeId::new();
+        let file = ProducedFile {
+            path: "/workspace/x.pdf".to_string(),
+            size_bytes: 21,
+            content_type: "application/pdf".to_string(),
+            volume_id: Some(volume_id),
+            path_in_volume: Some("/x.pdf".to_string()),
+        };
+
+        let answer = serde_json::to_value(std::slice::from_ref(&file)).unwrap();
+        let mut answer_keys: Vec<String> = answer[0]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        answer_keys.sort();
+        println!("answer form: {answer}");
+        if answer_keys != ["content_type", "path", "size_bytes"] {
+            complaints.push(format!(
+                "the answer form is not the three keys: {answer_keys:?}"
+            ));
+        }
+
+        let mut exec = Execution::new(
+            AgentId::new(),
+            make_input("make a pdf"),
+            3,
+            "ctx".to_string(),
+        );
+        exec.start();
+        exec.start_iteration("act".to_string()).unwrap();
+        exec.complete_iteration("/workspace/x.pdf".to_string());
+        exec.store_produced_files(1, vec![file.clone()]).unwrap();
+        exec.complete();
+        let stored = serde_json::to_value(exec.iterations()).unwrap();
+        let stored_file = &stored[0]["produced_files"][0];
+        println!("stored form: {stored_file}");
+        let mut stored_keys: Vec<String> = stored_file
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        stored_keys.sort();
+        if stored_keys
+            != [
+                "content_type",
+                "path",
+                "path_in_volume",
+                "size_bytes",
+                "volume_id",
+            ]
+        {
+            complaints.push(format!(
+                "the stored form is not the five fields: {stored_keys:?}"
+            ));
+        }
+        let read_back: Vec<Iteration> = serde_json::from_value(stored).unwrap();
+        if read_back[0].produced_files != vec![file.clone()] {
+            complaints.push(format!(
+                "the stored form did not read back whole: {:?}",
+                read_back[0].produced_files
+            ));
+        }
+
+        let before_i8 = serde_json::json!(
+            {"path": "/workspace/x.pdf", "size_bytes": 21, "content_type": "application/pdf"}
+        );
+        match serde_json::from_value::<ProducedFile>(before_i8) {
+            Ok(old) if old.volume_id.is_none() && old.path_in_volume.is_none() => {
+                println!("a record without the new fields reads as {old:?}");
+            }
+            other => complaints.push(format!(
+                "a record serialised without the new fields did not read: {other:?}"
+            )),
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
