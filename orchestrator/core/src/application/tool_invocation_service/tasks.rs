@@ -496,10 +496,17 @@ impl ToolInvocationService {
                 .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
         );
 
-        match self
-            .execution_service
-            .cancel_execution_for_tenant(&tenant_id, exec_id)
-            .await
+        // AEGIS ADR-131 U33a: a cancel of an execution bound to an open goal
+        // closes the goal `cancelled` before this call answers, so no round
+        // re-dispatches the work the person stopped.
+        match crate::application::goal_service::cancel_ending_its_goal(
+            self.goal_service.as_deref(),
+            &tenant_id,
+            exec_id,
+            self.execution_service
+                .cancel_execution_for_tenant(&tenant_id, exec_id),
+        )
+        .await
         {
             // A cancel of an execution that had already ended leaves it as it
             // was; the answer carries the state the execution is in after the

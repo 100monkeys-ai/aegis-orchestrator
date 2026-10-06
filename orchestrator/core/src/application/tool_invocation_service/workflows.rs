@@ -807,7 +807,16 @@ impl ToolInvocationService {
             }
         };
 
-        match port.cancel_workflow_execution(&tenant_id, exec_id).await {
+        // AEGIS ADR-131 U33a: a cancel of a workflow execution bound to an
+        // open goal closes the goal `cancelled` before this call answers.
+        match crate::application::goal_service::cancel_ending_its_goal(
+            self.goal_service.as_deref(),
+            &tenant_id,
+            exec_id,
+            port.cancel_workflow_execution(&tenant_id, exec_id),
+        )
+        .await
+        {
             Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.cancel",
                 "cancelled": true,

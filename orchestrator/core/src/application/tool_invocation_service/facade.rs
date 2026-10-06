@@ -1501,6 +1501,15 @@ impl ToolInvocationService {
                 )
                 .await,
             ),
+            "aegis.goal.cancel" => Some(
+                self.invoke_aegis_goal_cancel_tool(
+                    args,
+                    security_context,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
+            ),
             // ── ADR-117 Edge fleet system tools ────────────────────
             "aegis.edge.fleet.list" => Some(
                 self.invoke_aegis_edge_fleet_list_tool(args, tenant_scope)

@@ -1,7 +1,8 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 //! The tool invocation service's half of goals (AEGIS ADR-131): the tools
-//! `aegis.goal.create`, `aegis.goal.evaluate` and `aegis.goal.status` (D2),
+//! `aegis.goal.create`, `aegis.goal.evaluate`, `aegis.goal.status` (D2) and
+//! `aegis.goal.cancel` (U33),
 //! the optional `goal_id` of the four tools that start work (D2, U6), and the
 //! [`GoalWorld`] a goal is judged in: the bound executions' rows, their
 //! pending approvals, and the `goal-judge` execution, run as the goal's user
@@ -47,6 +48,12 @@ impl ToolInvocationService {
     pub fn with_goals(mut self, service: Arc<GoalService>) -> Self {
         self.goal_service = Some(service);
         self
+    }
+
+    /// The goal service, when goals are configured: the REST cancel routes
+    /// end a cancelled execution's goal through it (U33a).
+    pub fn goal_service(&self) -> Option<&Arc<GoalService>> {
+        self.goal_service.as_ref()
     }
 
     fn goals(&self, tool: &str) -> Result<&Arc<GoalService>, SealSessionError> {
@@ -245,6 +252,47 @@ impl ToolInvocationService {
         };
         match goals.status(&world, &caller, goal_id).await {
             Ok(status) => Ok(ToolInvocationResult::Direct(status)),
+            Err(e @ GoalError::Repository(_)) => {
+                Err(SealSessionError::InternalError(e.to_string()))
+            }
+            Err(e) => Ok(refusal(TOOL, &e)),
+        }
+    }
+
+    /// `aegis.goal.cancel` (U33): the person ends the goal. `reason` is
+    /// optional; the goal keeps it, or
+    /// [`crate::domain::goal::DEFAULT_CANCEL_REASON`].
+    pub(super) async fn invoke_aegis_goal_cancel_tool(
+        &self,
+        args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
+        caller_identity: Option<&UserIdentity>,
+        tenant_scope: &TenantScope,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        const TOOL: &str = "aegis.goal.cancel";
+        let goals = self.goals(TOOL)?;
+        let caller = Self::goal_caller(TOOL, caller_identity, tenant_scope)?;
+        let goal_id = Self::goal_id_arg(TOOL, args)?.ok_or_else(|| {
+            SealSessionError::InvalidArguments(format!(
+                "{TOOL}: required field 'goal_id' is missing"
+            ))
+        })?;
+        let reason = match args.get("reason") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(reason)) => Some(reason.as_str()),
+            Some(_) => {
+                return Err(SealSessionError::InvalidArguments(format!(
+                    "{TOOL}: reason must be a string"
+                )))
+            }
+        };
+        let world = GoalCallWorld {
+            service: self,
+            identity: caller_identity.cloned(),
+            security_context_name: security_context.name.clone(),
+        };
+        match goals.cancel(&world, &caller, goal_id, reason).await {
+            Ok(answer) => Ok(ToolInvocationResult::Direct(answer)),
             Err(e @ GoalError::Repository(_)) => {
                 Err(SealSessionError::InternalError(e.to_string()))
             }
@@ -601,6 +649,31 @@ impl GoalWorld for GoalCallWorld<'_> {
                     .unwrap_or_else(|| status_name(&exec.status)),
             ),
             _ => JudgeProgress::Running,
+        }
+    }
+
+    /// U33, U33a: an agent execution (bound, or the round's judge) is
+    /// cancelled as `aegis.task.cancel` cancels one, a workflow or intent
+    /// execution as `aegis.workflow.cancel` cancels one, in the goal's
+    /// tenant.
+    async fn cancel_execution(&self, goal: &Goal, bound: &BoundExecution) -> Result<(), String> {
+        match bound.kind {
+            BoundKind::Agent => self
+                .service
+                .execution_service
+                .cancel_execution_for_tenant(&goal.tenant_id, bound.execution_id)
+                .await
+                .map_err(|e| e.to_string()),
+            BoundKind::Workflow => {
+                let port = self
+                    .service
+                    .workflow_execution_control
+                    .as_ref()
+                    .ok_or_else(|| "workflow execution control is not configured".to_string())?;
+                port.cancel_workflow_execution(&goal.tenant_id, bound.execution_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 }
@@ -1437,5 +1510,564 @@ mod step_facts_tests {
             ));
         }
         assert!(complaints.is_empty(), "U32 under U16a: {complaints:#?}");
+    }
+}
+
+/// AEGIS ADR-131 U33 and U33a in the tool path, through the real handlers of
+/// a `ToolInvocationService` with a real `GoalService` over the in-memory
+/// store and the real `GoalCallWorld`: `aegis.goal.cancel` ends the goal and
+/// cancels its work by kind; `aegis.task.cancel` and `aegis.workflow.cancel`
+/// of a bound execution close its goal with the reason before they answer,
+/// and a following starting call is refused `goal_not_open`.
+#[cfg(test)]
+mod cancel_path_tests {
+    use super::*;
+    use crate::application::agent::AgentLifecycleService;
+    use crate::application::ports::WorkflowExecutionControlPort;
+    use crate::domain::agent::{Agent, AgentId, AgentManifest};
+    use crate::domain::events::ExecutionEvent;
+    use crate::domain::execution::{ExecutionInput, Iteration};
+    use crate::domain::goal::{GoalRepository, GoalState};
+    use crate::domain::iam::{IdentityKind, ZaruTier};
+    use crate::domain::node_config::GoalsConfig;
+    use crate::domain::repository::AgentVersion;
+    use crate::domain::security_context::SecurityContext;
+    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
+    use crate::infrastructure::repositories::InMemoryVolumeRepository;
+    use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
+    use crate::infrastructure::storage::LocalHostStorageProvider;
+    use crate::infrastructure::tool_router::ToolRouter;
+    use futures::Stream;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+
+    const OWNER: &str = "1a2b0000-owner";
+
+    fn identity(sub: &str) -> UserIdentity {
+        UserIdentity {
+            sub: sub.to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Free,
+                tenant_id: TenantId::for_consumer_user(sub).unwrap(),
+            },
+        }
+    }
+
+    fn scope(sub: &str) -> TenantScope {
+        TenantScope::new(
+            TenantId::for_consumer_user(sub).unwrap(),
+            identity(sub).identity_kind,
+        )
+    }
+
+    fn zaru_free() -> SecurityContext {
+        SecurityContext {
+            name: "zaru-free".to_string(),
+            description: "consumer".to_string(),
+            capabilities: vec![],
+            deny_list: vec![],
+            metadata: crate::domain::security_context::SecurityContextMetadata {
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                version: 1,
+            },
+        }
+    }
+
+    /// Starts an execution and keeps it; a cancel ends one not yet ended, as
+    /// the real service does.
+    #[derive(Default)]
+    struct Executions {
+        started: StdMutex<HashMap<ExecutionId, Execution>>,
+        cancels: StdMutex<Vec<ExecutionId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionService for Executions {
+        async fn start_execution(
+            &self,
+            agent_id: AgentId,
+            input: ExecutionInput,
+            security_context_name: String,
+            identity: Option<&UserIdentity>,
+        ) -> anyhow::Result<ExecutionId> {
+            let id = ExecutionId::new();
+            let mut e = Execution::new_with_id(id, agent_id, input, 5, security_context_name);
+            if let Some(identity) = identity {
+                e.tenant_id = TenantId::for_consumer_user(&identity.sub).unwrap();
+            }
+            e.start();
+            self.started.lock().unwrap().insert(id, e);
+            Ok(id)
+        }
+        async fn start_execution_with_id(
+            &self,
+            _: ExecutionId,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&UserIdentity>,
+        ) -> anyhow::Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> anyhow::Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_for_tenant(
+            &self,
+            tenant: &TenantId,
+            id: ExecutionId,
+        ) -> anyhow::Result<Execution> {
+            self.started
+                .lock()
+                .unwrap()
+                .get(&id)
+                .filter(|e| &e.tenant_id == tenant)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Execution not found"))
+        }
+        async fn get_execution_unscoped(&self, _: ExecutionId) -> anyhow::Result<Execution> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_iterations_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> anyhow::Result<Vec<Iteration>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn cancel_execution_for_tenant(
+            &self,
+            tenant: &TenantId,
+            id: ExecutionId,
+        ) -> anyhow::Result<()> {
+            let mut started = self.started.lock().unwrap();
+            let e = started
+                .get_mut(&id)
+                .filter(|e| &e.tenant_id == tenant)
+                .ok_or_else(|| anyhow::anyhow!("Execution not found"))?;
+            if !e.is_completed() {
+                e.status = ExecutionStatus::Cancelled;
+            }
+            self.cancels.lock().unwrap().push(id);
+            Ok(())
+        }
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<ExecutionEvent>> + Send>>>
+        {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<DomainEvent>> + Send>>>
+        {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_executions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: Option<AgentId>,
+            _: Option<crate::domain::workflow::WorkflowId>,
+            _: usize,
+        ) -> anyhow::Result<Vec<Execution>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn delete_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: crate::domain::execution::LlmInteraction,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+    }
+
+    /// Every agent name resolves to one agent, which has no manifest to read.
+    struct OneAgent(AgentId);
+
+    #[async_trait::async_trait]
+    impl AgentLifecycleService for OneAgent {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentManifest,
+            _: bool,
+            _: crate::domain::agent::AgentScope,
+            _: Option<&UserIdentity>,
+        ) -> anyhow::Result<AgentId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> anyhow::Result<Agent> {
+            anyhow::bail!("no manifest")
+        }
+        async fn update_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentId,
+            _: AgentManifest,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn delete_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> anyhow::Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_agents_for_tenant(&self, _: &TenantId) -> anyhow::Result<Vec<Agent>> {
+            Ok(vec![])
+        }
+        async fn lookup_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: &str,
+        ) -> anyhow::Result<Option<AgentId>> {
+            Ok(Some(self.0))
+        }
+        async fn lookup_agent_visible_for_tenant(
+            &self,
+            _: &TenantId,
+            _: &str,
+        ) -> anyhow::Result<Option<AgentId>> {
+            Ok(Some(self.0))
+        }
+        async fn lookup_agent_for_tenant_with_version(
+            &self,
+            _: &TenantId,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<Option<AgentId>> {
+            Ok(Some(self.0))
+        }
+        async fn list_agents_visible_for_tenant(&self, _: &TenantId) -> anyhow::Result<Vec<Agent>> {
+            Ok(vec![])
+        }
+        async fn list_versions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentId,
+        ) -> anyhow::Result<Vec<AgentVersion>> {
+            Ok(vec![])
+        }
+    }
+
+    /// Records each workflow cancel, as the daemon's port would request it.
+    #[derive(Default)]
+    struct WorkflowControl {
+        cancels: StdMutex<Vec<ExecutionId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowExecutionControlPort for WorkflowControl {
+        async fn cancel_workflow_execution(
+            &self,
+            _: &TenantId,
+            execution_id: ExecutionId,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.cancels.lock().unwrap().push(execution_id);
+            Ok(())
+        }
+        async fn signal_workflow_execution(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("not exercised".into())
+        }
+        async fn remove_workflow_execution(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("not exercised".into())
+        }
+    }
+
+    struct NoOpPublisher;
+
+    #[async_trait::async_trait]
+    impl crate::domain::fsal::EventPublisher for NoOpPublisher {
+        async fn publish_storage_event(&self, _event: crate::domain::events::StorageEvent) {}
+    }
+
+    struct Harness {
+        service: ToolInvocationService,
+        executions: Arc<Executions>,
+        workflows: Arc<WorkflowControl>,
+        goals: Arc<InMemoryGoalRepository>,
+    }
+
+    fn harness() -> Harness {
+        let router = Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers()));
+        let storage_root =
+            std::env::temp_dir().join(format!("aegis-goal-cancel-{}", uuid::Uuid::new_v4()));
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+            Arc::new(InMemoryVolumeRepository::new()),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoOpPublisher),
+        ));
+        let event_bus = Arc::new(EventBus::new(256));
+        let executions = Arc::new(Executions::default());
+        let workflows = Arc::new(WorkflowControl::default());
+        let goals = Arc::new(InMemoryGoalRepository::new());
+        let goal_service = Arc::new(GoalService::new(
+            goals.clone(),
+            event_bus.clone(),
+            GoalsConfig::default(),
+        ));
+        let service = ToolInvocationService::new(
+            Arc::new(InMemorySealSessionRepository::new()),
+            Arc::new(
+                crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+            ),
+            Arc::new(SealMiddleware::new()),
+            router,
+            fsal,
+            NfsVolumeRegistry::new(),
+            Arc::new(OneAgent(AgentId::new())),
+            executions.clone(),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+            event_bus,
+            None,
+        )
+        .with_goals(goal_service)
+        .with_workflow_execution_control(workflows.clone());
+        Harness {
+            service,
+            executions,
+            workflows,
+            goals,
+        }
+    }
+
+    fn direct(result: ToolInvocationResult) -> Value {
+        match result {
+            ToolInvocationResult::Direct(v) => v,
+            other => panic!("answers directly, not {other:?}"),
+        }
+    }
+
+    impl Harness {
+        async fn create(&self) -> GoalId {
+            let answer = direct(
+                self.service
+                    .invoke_aegis_goal_create_tool(
+                        &json!({
+                            "statement": "Solve the routing problem.",
+                            "client_ref": "conversation-1",
+                            "channel": "web",
+                        }),
+                        Some(&identity(OWNER)),
+                        &scope(OWNER),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            GoalId::from_string(answer["goal_id"].as_str().unwrap()).unwrap()
+        }
+
+        async fn task_execute(&self, goal_id: GoalId) -> Value {
+            let mut args = json!({
+                "agent_id": "vrp-solver-agent",
+                "input": {"prompt": "solve it"},
+                "goal_id": goal_id.to_string(),
+            });
+            direct(
+                self.service
+                    .invoke_aegis_task_execute_tool(
+                        &mut args,
+                        &zaru_free(),
+                        Some(&identity(OWNER)),
+                        &scope(OWNER),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        }
+
+        /// A running agent execution started for the goal.
+        async fn running_agent(&self, goal_id: GoalId) -> ExecutionId {
+            let started = self.task_execute(goal_id).await;
+            assert_eq!(started["status"], "started", "{started}");
+            ExecutionId::from_string(started["execution_id"].as_str().unwrap()).unwrap()
+        }
+
+        /// A workflow execution bound to the goal, as a starting tool binds one.
+        async fn bound_workflow(&self, goal_id: GoalId) -> ExecutionId {
+            let id = ExecutionId::new();
+            assert!(self
+                .goals
+                .bind_workflow_execution(goal_id, id)
+                .await
+                .unwrap());
+            id
+        }
+
+        async fn goal_cancel(&self, args: Value) -> Value {
+            direct(
+                self.service
+                    .invoke_aegis_goal_cancel_tool(
+                        &args,
+                        &zaru_free(),
+                        Some(&identity(OWNER)),
+                        &scope(OWNER),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        }
+
+        async fn state(&self, goal_id: GoalId) -> (GoalState, Option<String>) {
+            let goal = self.goals.find_goal(goal_id).await.unwrap().unwrap();
+            (goal.state, goal.closed_reason)
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_cancel_ends_the_goal_and_cancels_its_agent_and_workflow_executions() {
+        let h = harness();
+        let goal = h.create().await;
+        let agent = h.running_agent(goal).await;
+        let workflow = h.bound_workflow(goal).await;
+
+        let answer = h
+            .goal_cancel(json!({"goal_id": goal.to_string(), "reason": "Stop it."}))
+            .await;
+        println!("aegis.goal.cancel answered: {answer}");
+        assert_eq!(answer["state"], "cancelled", "{answer}");
+        assert_eq!(answer["closed_reason"], "Stop it.");
+        assert_eq!(answer["continue"], false);
+        assert_eq!(
+            *h.executions.cancels.lock().unwrap(),
+            vec![agent],
+            "the agent execution is cancelled as aegis.task.cancel cancels one"
+        );
+        assert_eq!(
+            *h.workflows.cancels.lock().unwrap(),
+            vec![workflow],
+            "the workflow execution is cancelled as aegis.workflow.cancel cancels one"
+        );
+        assert_eq!(
+            h.state(goal).await,
+            (GoalState::Cancelled, Some("Stop it.".to_string()))
+        );
+        let refused = h.task_execute(goal).await;
+        assert_eq!(refused["error"], "goal_not_open", "{refused}");
+    }
+
+    #[tokio::test]
+    async fn goal_cancel_refuses_another_users_goal_as_not_found() {
+        let h = harness();
+        let goal = h.create().await;
+        let other = "3c4d0000-other";
+        let answer = direct(
+            h.service
+                .invoke_aegis_goal_cancel_tool(
+                    &json!({"goal_id": goal.to_string()}),
+                    &zaru_free(),
+                    Some(&identity(other)),
+                    &scope(other),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(answer["error"], "goal_not_found", "{answer}");
+        assert_eq!(h.state(goal).await.0, GoalState::Open);
+    }
+
+    #[tokio::test]
+    async fn task_cancel_of_a_bound_execution_closes_its_goal_before_it_answers() {
+        let h = harness();
+        let goal = h.create().await;
+        let agent = h.running_agent(goal).await;
+        let mut args = json!({"execution_id": agent.to_string()});
+        let answer = direct(
+            h.service
+                .invoke_aegis_task_cancel_tool(&mut args, &scope(OWNER))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(answer["cancelled"], true, "{answer}");
+        let (state, reason) = h.state(goal).await;
+        println!(
+            "after aegis.task.cancel: the goal is {} ({reason:?})",
+            state.as_str()
+        );
+        assert_eq!(state, GoalState::Cancelled);
+        assert_eq!(reason, Some(format!("its execution {agent} was cancelled")));
+        let refused = h.task_execute(goal).await;
+        assert_eq!(refused["error"], "goal_not_open", "{refused}");
+    }
+
+    #[tokio::test]
+    async fn workflow_cancel_of_a_bound_execution_closes_its_goal_before_it_answers() {
+        let h = harness();
+        let goal = h.create().await;
+        let workflow = h.bound_workflow(goal).await;
+        let mut args = json!({"execution_id": workflow.to_string()});
+        let answer = direct(
+            h.service
+                .invoke_aegis_workflow_cancel_tool(&mut args, &scope(OWNER))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(answer["cancelled"], true, "{answer}");
+        let (state, reason) = h.state(goal).await;
+        println!(
+            "after aegis.workflow.cancel: the goal is {} ({reason:?})",
+            state.as_str()
+        );
+        assert_eq!(state, GoalState::Cancelled);
+        assert_eq!(
+            reason,
+            Some(format!("its execution {workflow} was cancelled"))
+        );
+        let refused = h.task_execute(goal).await;
+        assert_eq!(refused["error"], "goal_not_open", "{refused}");
+    }
+
+    #[tokio::test]
+    async fn the_cancel_tool_is_listed_with_goal_id_required_and_an_optional_reason() {
+        let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+        let tools = router.list_tools().await.unwrap();
+        let cancel = tools
+            .iter()
+            .find(|t| t.name == "aegis.goal.cancel")
+            .expect("aegis.goal.cancel is listed");
+        assert_eq!(cancel.input_schema["required"], json!(["goal_id"]));
+        assert_eq!(
+            cancel.input_schema["properties"]["reason"]["type"],
+            "string"
+        );
+        assert!(router.is_skip_judge("aegis.goal.cancel").await);
     }
 }

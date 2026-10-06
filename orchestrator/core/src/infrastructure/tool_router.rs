@@ -193,6 +193,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.goal.create", "Hold the user's request as a goal that the executions started for it are bound to. Called by the turn, never by a model.").skip_judge(),
     BuiltinToolDefinition::new("aegis.goal.evaluate", "Judge the goal after an execution turn with the built-in judge agent goal-judge, and answer whether a round is granted. Blocks at most 45 s, answering judging until the verdict is in. Called by the turn, never by a model.").skip_judge(),
     BuiltinToolDefinition::new("aegis.goal.status", "The goal, its bound executions with their states, and every verdict. Read-only.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.cancel", "Stop the person's goal: no further round, every execution still running for it cancelled, and the goal closed cancelled with the reason given. Call it when the person asks to stop.").skip_judge(),
 ];
 
 impl ToolRouter {
@@ -375,6 +376,7 @@ impl ToolRouter {
             "aegis.goal.create" => Self::schema_aegis_goal_create(),
             "aegis.goal.evaluate" => Self::schema_aegis_goal_evaluate(),
             "aegis.goal.status" => Self::schema_aegis_goal_status(),
+            "aegis.goal.cancel" => Self::schema_aegis_goal_cancel(),
             _ => json!({ "type": "object" }),
         }
     }
@@ -1272,6 +1274,21 @@ impl ToolRouter {
         })
     }
 
+    /// JSON schema for the `aegis.goal.cancel` builtin tool (ADR-131 U33).
+    fn schema_aegis_goal_cancel() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "goal_id": { "type": "string" },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the person stopped the goal, in their words; kept with the goal, to 1,000 characters."
+                }
+            },
+            "required": ["goal_id"]
+        })
+    }
+
     /// JSON schema for the `aegis.task.status` builtin tool.
     fn schema_aegis_task_status() -> Value {
         json!({
@@ -2091,6 +2108,10 @@ mod tests {
         "aegis.goal.create",
         "aegis.goal.evaluate",
         "aegis.goal.status",
+        // AEGIS ADR-131 U33: the person's stop, called by the companion's
+        // model or the person's page, never by an agent's inner loop (no
+        // agent context admits it), added deliberately.
+        "aegis.goal.cancel",
     ];
 
     /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).
