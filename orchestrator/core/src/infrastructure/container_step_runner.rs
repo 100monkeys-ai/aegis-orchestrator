@@ -35,7 +35,7 @@ use bollard::container::LogOutput;
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum};
 use bollard::query_parameters::{
     AttachContainerOptions, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
-    StartContainerOptions, WaitContainerOptions,
+    StartContainerOptions, UploadToContainerOptions, WaitContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -823,6 +823,33 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             }
         }
 
+        // ─── 6c. Place the step's files before the process starts ────────────
+        // (AEGIS ADR-005 O7c: an agent's program and its sample input.)
+        if !config.files.is_empty() {
+            let placed =
+                match crate::infrastructure::runtime::container_files_archive(&config.files) {
+                    Ok(archive) => self
+                        .docker
+                        .upload_to_container(
+                            &container_id,
+                            Some(UploadToContainerOptions {
+                                path: "/".to_string(),
+                                ..Default::default()
+                            }),
+                            bollard::body_full(archive.into()),
+                        )
+                        .await
+                        .map_err(|e| format!("upload_to_container: {e}")),
+                    Err(e) => Err(e),
+                };
+            if let Err(e) = placed {
+                self.remove_after_failure(&container_id).await;
+                let error = ContainerStepError::DockerError(e);
+                self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                return Err(error);
+            }
+        }
+
         // ─── 7. Start container ───────────────────────────────────────────────
         if let Err(e) = self
             .docker
@@ -1347,6 +1374,7 @@ mod tests {
             run_as_user: Some("65534:65534".to_string()),
             network_mode: Some("none".to_string()),
             workflow_execution_id: None,
+            files: Vec::new(),
         };
 
         assert!(config.read_only_root_filesystem);
@@ -1546,6 +1574,7 @@ mod tests {
             run_as_user: None,
             network_mode: None,
             workflow_execution_id: None,
+            files: Vec::new(),
         };
 
         // While the step sleeps, read what the engine shows about it.

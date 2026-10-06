@@ -106,6 +106,55 @@ pub struct RuntimeConfig {
     /// authorises the workflow's workspace volume by its owner.
     #[serde(default)]
     pub workflow_execution_id: Option<uuid::Uuid>,
+    /// The program the agent carries (AEGIS ADR-005 O7b): placed read-only
+    /// under `/opt/aegis/program` in the container at each spawn. Empty for
+    /// an agent that carries none.
+    #[serde(default)]
+    pub program_files: Vec<crate::domain::agent::ProgramFile>,
+    /// The execution's input, as JSON text, placed at
+    /// `/opt/aegis/program/input.json` beside the program (O7b). `None` for
+    /// an agent that carries no program.
+    #[serde(default)]
+    pub program_input: Option<String>,
+}
+
+/// One file placed in a container before it starts: an absolute path, its
+/// bytes and its mode, owned by root (AEGIS ADR-005 O7b, O7c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerStepFile {
+    /// Absolute path inside the container.
+    pub path: String,
+    /// The file's bytes.
+    pub content: Vec<u8>,
+    /// The file's mode, for example `0o644`.
+    pub mode: u32,
+}
+
+/// The files that place an agent's program in a container (AEGIS ADR-005
+/// O7b): each program file at `/opt/aegis/program/<path>`, mode 0755 when
+/// executable and 0644 otherwise, and the input, when given, at
+/// `/opt/aegis/program/input.json`, mode 0644.
+pub fn program_container_files(
+    files: &[crate::domain::agent::ProgramFile],
+    input: Option<&str>,
+) -> Vec<ContainerStepFile> {
+    use crate::domain::agent::{PROGRAM_DIR, PROGRAM_INPUT_FILE};
+    let mut placed: Vec<ContainerStepFile> = files
+        .iter()
+        .map(|file| ContainerStepFile {
+            path: format!("{PROGRAM_DIR}/{}", file.path),
+            content: file.content.clone().into_bytes(),
+            mode: if file.executable { 0o755 } else { 0o644 },
+        })
+        .collect();
+    if let Some(input) = input {
+        placed.push(ContainerStepFile {
+            path: format!("{PROGRAM_DIR}/{PROGRAM_INPUT_FILE}"),
+            content: input.as_bytes().to_vec(),
+            mode: 0o644,
+        });
+    }
+    placed
 }
 
 fn default_container_uid() -> u32 {
@@ -548,6 +597,10 @@ pub struct ContainerStepConfig {
     /// `workflow_execution_id` in the NFS volume registry so FSAL can
     /// authorize `VolumeOwnership::WorkflowExecution` without DB mutations.
     pub workflow_execution_id: Option<uuid::Uuid>,
+
+    /// Files placed in the container before it starts, owned by root
+    /// (AEGIS ADR-005 O7c: an agent's program and its sample input).
+    pub files: Vec<ContainerStepFile>,
 }
 
 /// Result of a successfully completed container step (ADR-050).

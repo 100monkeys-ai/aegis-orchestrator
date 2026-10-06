@@ -806,6 +806,8 @@ impl World {
             bootstrap_path: None,
             execution_id: self.execution_id,
             workflow_execution_id: None,
+            program_files: Vec::new(),
+            program_input: None,
         };
         let max_retries = config.execution.max_retries;
         Supervisor::new(container)
@@ -1066,4 +1068,155 @@ fn a_command_still_running_when_the_try_was_cut_off_is_named_with_how_long_it_ra
     assert!(told.contains("600 s"), "how long it ran: {told}");
     assert!(told.contains("/workspace/solve.py"), "{told}");
     assert!(told.contains("timed out after 600 seconds"), "{told}");
+}
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-135 D5, ADR-005 O7e: a text answer where a tool call was required
+// ---------------------------------------------------------------------------
+
+/// An agent of one try whose `spec` ends with `tail`.
+fn requiring_agent(tail: &str) -> Agent {
+    let manifest: AgentManifest = serde_yaml::from_str(&format!(
+        r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: requiring-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: {ALIAS}
+  tools:
+    - cmd.run
+{tail}
+"#
+    ))
+    .unwrap();
+    Agent {
+        id: AgentId::new(),
+        tenant_id: TenantId::default(),
+        scope: crate::domain::agent::AgentScope::default(),
+        name: manifest.metadata.name.clone(),
+        manifest,
+        status: AgentStatus::Active,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+const ONE_TRY: &str = "  execution:\n    mode: iterative\n    max_retries: 1\n    iteration_timeout: \"60s\"\n    llm_timeout_seconds: 30\n";
+
+const PROGRAM_RUN: &str = "printf 7.5";
+
+fn carrying_a_program() -> Agent {
+    requiring_agent(&format!(
+        "{ONE_TRY}  program:\n    files:\n      - path: solve.py\n        content: print(7.5)\n    run: {PROGRAM_RUN}\n"
+    ))
+}
+
+fn the_users_after_the_prompt(conversation: &[ChatMessage]) -> Vec<String> {
+    conversation
+        .iter()
+        .filter(|m| m.role == "user")
+        .skip(1)
+        .map(|m| m.content.clone())
+        .collect()
+}
+
+/// T6: an agent carrying a program answers text, is sent back once with the
+/// requirement, answers text again, and the try fails with D5's sentence;
+/// a command that is not the program's does not meet the requirement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_where_the_program_had_to_run_is_sent_back_once_then_fails_the_try() {
+    let mut complaints = Vec::new();
+    let w = world(
+        carrying_a_program(),
+        vec![
+            run_command(json!({"command": "printf other", "cwd": "/tmp"})),
+            answer("the total is 7.5"),
+            answer("the total is still 7.5"),
+        ],
+    )
+    .await;
+    let outcome = w.run(None).await;
+    if outcome.is_ok() {
+        complaints.push(format!("the run completed: {outcome:?}"));
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 3 {
+        complaints.push(format!(
+            "the model was called {calls} times; the text answer was to be sent back once"
+        ));
+    } else {
+        let reminded = the_users_after_the_prompt(&w.model.conversation(2));
+        let expected_reminder = format!(
+            "You answered with text, but this agent must run its program before it answers. \
+             Call cmd.run with the command \"{PROGRAM_RUN}\" now, then present its output."
+        );
+        if reminded != vec![expected_reminder] {
+            complaints.push(format!("the model was sent back with {reminded:?}"));
+        }
+    }
+    let record = w.records.get(w.execution_id);
+    match record.iterations.first().and_then(|i| i.error.clone()) {
+        Some(error) if error.message.contains(TEXT_WHERE_A_TOOL_CALL_WAS_REQUIRED) => {}
+        other => complaints.push(format!("the try ended with {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// T6: sent back once, the model runs the program's command and the try
+/// completes with its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_before_the_program_ran_completes_once_the_program_runs() {
+    let w = world(
+        carrying_a_program(),
+        vec![
+            answer("the total is 7.5"),
+            run_command(json!({"command": "printf", "args": ["7.5"], "cwd": "/tmp"})),
+            answer("7.5"),
+        ],
+    )
+    .await;
+    let outcome = w.run(None).await;
+    assert_eq!(outcome.expect("the try completes"), "7.5");
+    assert!(
+        last_tool_message(&w.model.conversation(2)).contains("7.5"),
+        "the program's output was the tool result"
+    );
+}
+
+/// T6: an executor declaring `require_tool_call` that answers text twice
+/// fails the try; one that calls a tool completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_executor_that_must_call_a_tool_fails_on_text_and_completes_after_a_call() {
+    let tail = format!("{ONE_TRY}    require_tool_call: true\n");
+    let w = world(
+        requiring_agent(&tail),
+        vec![answer("done"), answer("done, really")],
+    )
+    .await;
+    let outcome = w.run(None).await;
+    let record = w.records.get(w.execution_id);
+    let error = record.iterations[0].error.clone().map(|e| e.message);
+    assert!(
+        outcome.is_err()
+            && error
+                .as_deref()
+                .is_some_and(|m| m.contains(TEXT_WHERE_A_TOOL_CALL_WAS_REQUIRED)),
+        "outcome {outcome:?}, try error {error:?}"
+    );
+
+    let w = world(
+        requiring_agent(&tail),
+        vec![
+            run_command(json!({"command": "printf ok", "cwd": "/tmp"})),
+            answer("ok"),
+        ],
+    )
+    .await;
+    assert_eq!(w.run(None).await.expect("the try completes"), "ok");
 }

@@ -72,6 +72,23 @@ spec:
         Such a manifest is non-deployable and must be rejected: an agent with no tools can only
         return text.
 
+      PROGRAM AUDIT — an agent whose task is a computation carries its program:
+      - If the generated agent computes a result from its input (a solver, converter, calculator,
+        optimiser, parser), it MUST declare `spec.program` (files, `run`, and a `sample_input`
+        taken from the user's request), and its instruction MUST tell the model to call `cmd.run`
+        with the program's `run` command and present the output.
+      - If the instruction asks the model to write a script, program or code on each run, or to
+        compute the result in its own text, and `spec.program` is absent, set `correctness` and
+        `deployability` to 0.0 and the overall `score` to 0.0, and note exactly: "agent '<name>'
+        has no program: its instruction asks the model to write or compute the solution on each
+        run; the agent must carry its program and run it".
+      - Read the `program_check` that `aegis.agent.create` or `aegis.agent.update` answered in the
+        tool call history. If it is absent for an agent declaring `spec.program`, or its
+        `exit_code` is not 0, or its `stdout` is empty, set `deployability` to 0.0 and the overall
+        `score` to at most 0.3, quoting the check.
+      - An agent that only routes, writes prose or calls services needs no program; do not
+        penalise its absence there.
+
       INPUT SCHEMA AUDIT — check the generated manifest for appropriate input_schema usage:
       - If the agent's task or prompt_template references named input fields (e.g., `{{input.repo_url}}`,
         `{{input.language}}`) but no `spec.input_schema` is declared, reduce the `completeness`

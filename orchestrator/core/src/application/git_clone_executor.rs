@@ -230,6 +230,7 @@ impl EphemeralCliEngine {
             run_as_user: None,
             network_mode: None,
             workflow_execution_id: None,
+            files: Vec::new(),
         };
 
         let result = self.runner.run_step(cfg).await.map_err(|e| {

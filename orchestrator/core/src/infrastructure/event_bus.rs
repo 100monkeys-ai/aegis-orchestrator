@@ -1689,6 +1689,7 @@ mod tests {
                     input_schema: None,
                     security_context: None,
                     output_handler: None,
+                    program: None,
                 },
             },
             deployed_at: Utc::now(),

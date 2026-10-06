@@ -1739,6 +1739,21 @@ impl AgentRuntime for ContainerRuntime {
             info!(target: "runtime_spawn", step = "copy_bootstrap_complete", container_id = %id);
         }
 
+        // The program the agent carries, beside the bootstrap (AEGIS ADR-005
+        // O7b): read-only under /opt/aegis/program, with the execution's input,
+        // placed in every container so each try runs the same program.
+        if !config.program_files.is_empty() {
+            let files = crate::domain::runtime::program_container_files(
+                &config.program_files,
+                config.program_input.as_deref(),
+            );
+            if let Err(error) = self.upload_files(&id, &files).await {
+                self.cleanup_spawned_container(&id).await;
+                return Err(error);
+            }
+            info!(target: "runtime_spawn", step = "copy_program_complete", container_id = %id);
+        }
+
         Ok(InstanceId::new(id))
     }
 
@@ -2184,6 +2199,8 @@ mod tests {
             bootstrap_path: None,
             execution_id: ExecutionId::new(),
             workflow_execution_id: None,
+            program_files: Vec::new(),
+            program_input: None,
         };
 
         let labels =
@@ -2421,6 +2438,8 @@ mod tests {
             bootstrap_path: None,
             execution_id: ExecutionId::new(),
             workflow_execution_id: None,
+            program_files: Vec::new(),
+            program_input: None,
         }
     }
 
@@ -3116,9 +3135,109 @@ mod tests {
             "a stop that timed out"
         );
     }
+
+    /// T3, AEGIS ADR-005 O7b: the archive that places an agent's program
+    /// holds each parent directory (0755) before its files, each program
+    /// file at /opt/aegis/program/<path> with its mode (0755 when executable,
+    /// 0644 otherwise), and the execution's input at
+    /// /opt/aegis/program/input.json; every entry is owned by root.
+    #[test]
+    fn the_program_archive_places_each_file_with_its_mode_owned_by_root() {
+        use crate::domain::agent::ProgramFile;
+        let files = crate::domain::runtime::program_container_files(
+            &[
+                ProgramFile {
+                    path: "solve.py".to_string(),
+                    content: "print(7.5)\n".to_string(),
+                    executable: false,
+                },
+                ProgramFile {
+                    path: "bin/run.sh".to_string(),
+                    content: "python /opt/aegis/program/solve.py\n".to_string(),
+                    executable: true,
+                },
+            ],
+            Some(r#"{"amounts":[3,4.5]}"#),
+        );
+        let archive = super::container_files_archive(&files).expect("the archive builds");
+        let mut entries = Vec::new();
+        let mut reader = tar::Archive::new(archive.as_slice());
+        for entry in reader.entries().expect("the archive reads") {
+            let mut entry = entry.expect("an entry");
+            let header = entry.header().clone();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut content).unwrap();
+            entries.push((
+                path,
+                format!("{:o}", header.mode().unwrap()),
+                header.uid().unwrap(),
+                header.gid().unwrap(),
+                content,
+            ));
+        }
+        let expected: Vec<(String, String, u64, u64, String)> = [
+            ("opt/", "755", ""),
+            ("opt/aegis/", "755", ""),
+            ("opt/aegis/program/", "755", ""),
+            ("opt/aegis/program/solve.py", "644", "print(7.5)\n"),
+            ("opt/aegis/program/bin/", "755", ""),
+            (
+                "opt/aegis/program/bin/run.sh",
+                "755",
+                "python /opt/aegis/program/solve.py\n",
+            ),
+            (
+                "opt/aegis/program/input.json",
+                "644",
+                r#"{"amounts":[3,4.5]}"#,
+            ),
+        ]
+        .iter()
+        .map(|(p, m, c)| (p.to_string(), m.to_string(), 0, 0, c.to_string()))
+        .collect();
+        assert_eq!(entries, expected);
+
+        let refused =
+            super::container_files_archive(&[crate::domain::runtime::ContainerStepFile {
+                path: "/opt/aegis/../etc/passwd".to_string(),
+                content: Vec::new(),
+                mode: 0o644,
+            }]);
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("cannot place '/opt/aegis/../etc/passwd': the path is not plain")
+        );
+    }
 }
 // Private helper methods for ContainerRuntime (Docker/Podman)
 impl ContainerRuntime {
+    /// Upload `files` into the container, each at its absolute path, owned
+    /// by root, with its parent directories (AEGIS ADR-005 O7b).
+    async fn upload_files(
+        &self,
+        container_id: &str,
+        files: &[crate::domain::runtime::ContainerStepFile],
+    ) -> Result<(), RuntimeError> {
+        let archive = container_files_archive(files).map_err(RuntimeError::SpawnFailed)?;
+        let options = UploadToContainerOptions {
+            path: "/".to_string(),
+            ..Default::default()
+        };
+        self.docker
+            .upload_to_container(
+                container_id,
+                Some(options),
+                bollard::body_full(archive.into()),
+            )
+            .await
+            .map_err(|e| {
+                RuntimeError::SpawnFailed(format!(
+                    "Failed to copy the agent's program into the container: {e}"
+                ))
+            })
+    }
+
     /// Copy bootstrap.py into a running container (if not already present)
     async fn copy_bootstrap_to_container(&self, container_id: &str) -> Result<(), RuntimeError> {
         // First, check if bootstrap script already exists in the container
@@ -3233,4 +3352,59 @@ impl ContainerRuntime {
         );
         Ok(())
     }
+}
+
+/// A tar archive, to be unpacked at `/`, that places each of `files` at its
+/// absolute path with its mode, owned by root, with every parent directory
+/// (mode 0755, owned by root) listed before what it holds (AEGIS ADR-005 O7b,
+/// O7c). A path that is not absolute, or is not plain, is refused.
+pub(crate) fn container_files_archive(
+    files: &[crate::domain::runtime::ContainerStepFile],
+) -> Result<Vec<u8>, String> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut directories: Vec<String> = Vec::new();
+    for file in files {
+        let relative = file
+            .path
+            .strip_prefix('/')
+            .ok_or_else(|| format!("cannot place '{}': the path is not absolute", file.path))?;
+        let segments: Vec<&str> = relative.split('/').collect();
+        if segments
+            .iter()
+            .any(|s| s.is_empty() || *s == "." || *s == "..")
+        {
+            return Err(format!(
+                "cannot place '{}': the path is not plain",
+                file.path
+            ));
+        }
+        for depth in 1..segments.len() {
+            let directory = format!("{}/", segments[..depth].join("/"));
+            if directories.contains(&directory) {
+                continue;
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_uid(0);
+            header.set_gid(0);
+            builder
+                .append_data(&mut header, &directory, std::io::empty())
+                .map_err(|e| format!("cannot place '{directory}': {e}"))?;
+            directories.push(directory);
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(file.content.len() as u64);
+        header.set_mode(file.mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        builder
+            .append_data(&mut header, relative, file.content.as_slice())
+            .map_err(|e| format!("cannot place '{}': {e}", file.path))?;
+    }
+    builder
+        .into_inner()
+        .map_err(|e| format!("cannot finish the archive: {e}"))
 }

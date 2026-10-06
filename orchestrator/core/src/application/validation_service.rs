@@ -867,6 +867,7 @@ impl GradientValidator for SemanticAgentValidator {
                 "task": ctx.task,
                 "output": output_value,
                 "generation_evidence": generation_evidence,
+                "program_checks": program_checks_of(&tool_audit_history),
                 "tool_audit_history": tool_audit_history,
                 "worker_mounts": ctx.worker_mounts.clone(),
                 "criteria": self.criteria,
@@ -1249,6 +1250,34 @@ pub fn build_validation_pipeline(
     }
 
     ValidationPipeline::new(entries)
+}
+
+/// Each `program_check` that `aegis.agent.create` or `aegis.agent.update`
+/// answered in the worker's tool calls, with the agent it checked, for the
+/// judge to read (AEGIS ADR-005 O7c).
+pub(crate) fn program_checks_of(
+    trajectory: &[crate::domain::execution::TrajectoryStep],
+) -> Vec<serde_json::Value> {
+    trajectory
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.tool_name.as_str(),
+                "aegis.agent.create" | "aegis.agent.update"
+            )
+        })
+        .filter_map(|step| {
+            let result: serde_json::Value =
+                serde_json::from_str(step.result_json.as_deref()?).ok()?;
+            let check = result.get("program_check")?.clone();
+            Some(serde_json::json!({
+                "tool": step.tool_name,
+                "name": result.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                "program_check": check,
+                "errors": result.get("errors").cloned().unwrap_or(serde_json::Value::Null),
+            }))
+        })
+        .collect()
 }
 
 #[cfg(test)]

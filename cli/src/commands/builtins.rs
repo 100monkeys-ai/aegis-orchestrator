@@ -1521,4 +1521,141 @@ mod tests {
             std::path::PathBuf::from("/tmp/custom-stack/generated")
         );
     }
+
+    /// The generator's step 6 example, as a manifest: the lines after its
+    /// heading, dedented, under a metadata block.
+    fn generator_example() -> Option<aegis_orchestrator_core::domain::agent::AgentManifest> {
+        let heading = "Example for an agent whose task is a computation (it carries its program):";
+        let lines: Vec<&str> = AGENT_GENERATOR_AGENT_TEMPLATE.lines().collect();
+        let start = lines.iter().position(|l| l.trim() == heading)?;
+        let indent = lines[start + 1].len() - lines[start + 1].trim_start().len();
+        let body: Vec<&str> = lines[start + 1..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || l.len() - l.trim_start().len() >= indent)
+            .map(|l| if l.len() >= indent { &l[indent..] } else { "" })
+            .collect();
+        let yaml = format!(
+            "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: sum-agent\n  version: \"1.0.0\"\n{}\n",
+            body.join("\n")
+        );
+        Some(
+            serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("the example parses: {e}\n{yaml}")),
+        )
+    }
+
+    /// T7, AEGIS ADR-005 O7: the generator's example is an agent that carries
+    /// its program, runs it with cmd.run, and passes the manifest's own checks
+    /// and the tool requirement; the example that had the model write the
+    /// solution on each run is gone.
+    #[test]
+    fn the_generators_example_carries_its_program_and_passes_every_check() {
+        let mut complaints = Vec::new();
+        for gone in [
+            "Write a complete Python solution",
+            "Confirm the write succeeded",
+        ] {
+            if AGENT_GENERATOR_AGENT_TEMPLATE.contains(gone) {
+                complaints.push(format!("the generator still teaches \"{gone}\""));
+            }
+        }
+        if !AGENT_GENERATOR_AGENT_TEMPLATE
+            .contains("AN AGENT WHOSE TASK IS A COMPUTATION CARRIES ITS PROGRAM.")
+        {
+            complaints.push("the generator states no program rule".to_string());
+        }
+        let Some(example) = generator_example() else {
+            complaints
+                .push("the generator has no example of an agent carrying its program".to_string());
+            panic!("{}", complaints.join("\n"));
+        };
+        if let Err(e) = example.validate() {
+            complaints.push(format!("validate refused the example: {e}"));
+        }
+        if let Err(e) = aegis_orchestrator_core::domain::tool_requirement::check(&example) {
+            complaints.push(format!("the tool requirement refused the example: {e}"));
+        }
+        match &example.spec.program {
+            None => complaints.push("the example carries no program".to_string()),
+            Some(program) => {
+                if program.run != "python /opt/aegis/program/solve.py"
+                    || program.sample_input.is_none()
+                    || program.files.len() != 1
+                {
+                    complaints.push(format!("the example's program: {program:?}"));
+                }
+            }
+        }
+        let instruction = example
+            .spec
+            .task
+            .as_ref()
+            .and_then(|t| t.instruction.clone())
+            .unwrap_or_default();
+        if !instruction.contains("Call cmd.run with command \"python /opt/aegis/program/solve.py\"")
+        {
+            complaints.push(format!(
+                "the example's instruction does not run the program: {instruction}"
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T7, AEGIS ADR-005 O7: the judge's program audit refuses an agent with
+    /// no program with O7's sentence word for word and reads `program_check`.
+    #[test]
+    fn the_generator_judge_audits_the_program_with_o7s_sentence() {
+        let manifest: serde_yaml::Value =
+            serde_yaml::from_str(AGENT_GENERATOR_JUDGE_TEMPLATE).expect("the judge parses");
+        let instruction = manifest["spec"]["task"]["instruction"]
+            .as_str()
+            .expect("the judge's instruction")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut complaints = Vec::new();
+        for needed in [
+            "PROGRAM AUDIT — an agent whose task is a computation carries its program:",
+            "note exactly: \"agent '<name>' has no program: its instruction asks the model to write or compute the solution on each run; the agent must carry its program and run it\"",
+            "Read the `program_check` that `aegis.agent.create` or `aegis.agent.update` answered",
+        ] {
+            if !instruction.contains(needed) {
+                complaints.push(format!("the judge lacks \"{needed}\""));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T7, AEGIS ADR-135 D5: each executor must call a tool before a text
+    /// answer completes it, and none forbids a package the image holds.
+    #[test]
+    fn the_executors_require_a_tool_call() {
+        let mut complaints = Vec::new();
+        for (name, template) in [
+            (
+                AEGIS_PYTHON_EXECUTOR_AGENT_NAME,
+                AEGIS_PYTHON_EXECUTOR_AGENT_TEMPLATE,
+            ),
+            (
+                AEGIS_BASH_EXECUTOR_AGENT_NAME,
+                AEGIS_BASH_EXECUTOR_AGENT_TEMPLATE,
+            ),
+            (
+                AEGIS_JAVASCRIPT_EXECUTOR_AGENT_NAME,
+                AEGIS_JAVASCRIPT_EXECUTOR_AGENT_TEMPLATE,
+            ),
+        ] {
+            let manifest: aegis_orchestrator_core::domain::agent::AgentManifest =
+                serde_yaml::from_str(template).expect("the executor parses");
+            if aegis_orchestrator_core::domain::agent::ToolCallRequirement::of(&manifest)
+                != aegis_orchestrator_core::domain::agent::ToolCallRequirement::AnyTool
+            {
+                complaints.push(format!("{name} does not require a tool call"));
+            }
+            if template.contains("standard library (no") {
+                complaints.push(format!("{name} still forbids every package"));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 }

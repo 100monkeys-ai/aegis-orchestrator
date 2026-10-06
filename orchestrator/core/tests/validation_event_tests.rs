@@ -248,6 +248,7 @@ impl AgentLifecycleService for MockAgentLifecycleService {
                 input_schema: None,
                 output_handler: None,
                 security_context: None,
+                program: None,
             },
         };
         Ok(Agent {

@@ -6,6 +6,7 @@ impl ToolInvocationService {
         &self,
         args: &mut Value,
         _scope: &crate::domain::iam::TenantScope,
+        calling_agent: Option<&str>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let manifest_yaml = args
             .get("manifest_yaml")
@@ -30,6 +31,18 @@ impl ToolInvocationService {
                 })));
             }
         };
+
+        // AEGIS ADR-005 O7d: the generator's floor.
+        if let Some(sentence) = generator_floor(calling_agent, &manifest) {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.create",
+                "validated": false,
+                "deployed": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "errors": [sentence]
+            })));
+        }
 
         // ADR-087: Validate that all declared tools exist in the tool catalog.
         if let Some(catalog) = &self.tool_catalog {
@@ -68,6 +81,19 @@ impl ToolInvocationService {
             }
         }
 
+        // AEGIS ADR-005 O7c: the program runs on its sample input before the
+        // agent is deployed.
+        let program_check = match self.check_program(&manifest).await {
+            Ok(check) => check,
+            Err(refusal) => {
+                return Ok(ToolInvocationResult::Direct(refusal.answer(
+                    "aegis.agent.create",
+                    "deployed",
+                    &manifest,
+                )));
+            }
+        };
+
         match self
             .agent_lifecycle
             .deploy_agent_for_tenant(
@@ -92,7 +118,7 @@ impl ToolInvocationService {
                             "Agent deployed but failed to persist manifest: {e}"
                         ))
                     })?;
-                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                let mut answer = serde_json::json!({
                     "tool": "aegis.agent.create",
                     "validated": true,
                     "deployed": true,
@@ -102,7 +128,11 @@ impl ToolInvocationService {
                     "force": force,
                     "manifest_yaml": manifest_yaml,
                     "manifest_path": persisted_path
-                })))
+                });
+                if let Some(check) = program_check {
+                    answer["program_check"] = check;
+                }
+                Ok(ToolInvocationResult::Direct(answer))
             }
             Err(e) => {
                 let err_str = e.to_string();
@@ -313,6 +343,7 @@ impl ToolInvocationService {
         &self,
         args: &mut Value,
         _scope: &crate::domain::iam::TenantScope,
+        calling_agent: Option<&str>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let manifest_yaml = args
@@ -346,6 +377,18 @@ impl ToolInvocationService {
                 "name": manifest.metadata.name,
                 "version": manifest.metadata.version,
                 "error": format!("Schema validation failed: {}", e)
+            })));
+        }
+
+        // AEGIS ADR-005 O7d: the generator's floor.
+        if let Some(sentence) = generator_floor(calling_agent, &manifest) {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.update",
+                "validated": false,
+                "updated": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "errors": [sentence]
             })));
         }
 
@@ -428,6 +471,19 @@ impl ToolInvocationService {
             }
         }
 
+        // AEGIS ADR-005 O7c: the program runs on its sample input before the
+        // agent is updated.
+        let program_check = match self.check_program(&manifest).await {
+            Ok(check) => check,
+            Err(refusal) => {
+                return Ok(ToolInvocationResult::Direct(refusal.answer(
+                    "aegis.agent.update",
+                    "updated",
+                    &manifest,
+                )));
+            }
+        };
+
         match self
             .agent_lifecycle
             .update_agent_for_tenant(&tenant_id, agent_id, manifest.clone())
@@ -446,7 +502,7 @@ impl ToolInvocationService {
                             "Agent updated but failed to persist manifest: {e}"
                         ))
                     })?;
-                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                let mut answer = serde_json::json!({
                     "tool": "aegis.agent.update",
                     "validated": true,
                     "updated": true,
@@ -455,7 +511,11 @@ impl ToolInvocationService {
                     "agent_id": agent_id.0.to_string(),
                     "manifest_yaml": manifest_yaml,
                     "manifest_path": persisted_path,
-                })))
+                });
+                if let Some(check) = program_check {
+                    answer["program_check"] = check;
+                }
+                Ok(ToolInvocationResult::Direct(answer))
             }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.agent.update",
@@ -601,6 +661,212 @@ impl ToolInvocationService {
                 "error": format!("Failed to fetch agent logs: {e}")
             }))),
         }
+    }
+}
+
+/// The built-in agent that generates agents (AEGIS ADR-005 O7d).
+pub(crate) const AGENT_GENERATOR_NAME: &str = "agent-creator-agent";
+
+/// The bound on one run of an agent's program on its sample input (O7c).
+pub(crate) const PROGRAM_CHECK_TIMEOUT_SECS: u64 = 120;
+
+/// The most stdout, and stderr, a program check answers (O7c).
+const PROGRAM_CHECK_SHOWN_CHARS: usize = 4096;
+
+/// O7's sentence for an agent that has no program.
+pub(crate) fn no_program_sentence(name: &str) -> String {
+    format!(
+        "agent '{name}' has no program: its instruction asks the model to write or compute the \
+         solution on each run; the agent must carry its program and run it"
+    )
+}
+
+/// AEGIS ADR-005 O7d: a manifest the generator creates or updates that
+/// declares `cmd.run` and carries no program is refused with O7's sentence.
+pub(crate) fn generator_floor(
+    calling_agent: Option<&str>,
+    manifest: &crate::domain::agent::AgentManifest,
+) -> Option<String> {
+    if calling_agent != Some(AGENT_GENERATOR_NAME) {
+        return None;
+    }
+    let runs_commands = manifest.spec.tools.iter().any(|tool| tool == "cmd.run");
+    if runs_commands && manifest.spec.program.is_none() {
+        return Some(no_program_sentence(&manifest.metadata.name));
+    }
+    None
+}
+
+fn head_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn tail_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    text.chars().skip(count.saturating_sub(max)).collect()
+}
+
+/// Why a program check refused an agent, with what the check saw (O7c).
+pub(crate) struct ProgramRefusal {
+    sentence: String,
+    check: Option<Value>,
+}
+
+impl ProgramRefusal {
+    fn answer(
+        &self,
+        tool: &str,
+        done_key: &str,
+        manifest: &crate::domain::agent::AgentManifest,
+    ) -> Value {
+        let mut answer = serde_json::json!({
+            "tool": tool,
+            "validated": true,
+            "name": manifest.metadata.name,
+            "version": manifest.metadata.version,
+            "errors": [self.sentence],
+        });
+        answer[done_key] = Value::Bool(false);
+        if let Some(check) = &self.check {
+            answer["program_check"] = check.clone();
+        }
+        answer
+    }
+}
+
+impl ToolInvocationService {
+    /// The tool call an execution of the agent must make before a text
+    /// answer completes it (AEGIS ADR-135 D5, ADR-005 O7e).
+    pub(crate) async fn agent_tool_call_requirement(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> anyhow::Result<crate::domain::agent::ToolCallRequirement> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent_visible(tenant_id, agent_id)
+            .await?;
+        Ok(crate::domain::agent::ToolCallRequirement::of(
+            &agent.manifest,
+        ))
+    }
+
+    /// The calling agent's name, when the call comes from an execution
+    /// (AEGIS ADR-005 O7d).
+    pub(super) async fn calling_agent_name(
+        &self,
+        scope: &crate::domain::iam::TenantScope,
+        agent_id: AgentId,
+    ) -> Option<String> {
+        self.agent_lifecycle
+            .get_agent_visible(&scope.authenticated_tenant, agent_id)
+            .await
+            .ok()
+            .map(|agent| agent.manifest.metadata.name)
+    }
+
+    /// AEGIS ADR-005 O7c: run the program `manifest` carries on its sample
+    /// input, in the agent's own image with no network, and answer what it
+    /// did; refuse when it exits non-zero, prints nothing or does not finish.
+    /// `Ok(None)`: no program, or no sample input to run it on.
+    pub(crate) async fn check_program(
+        &self,
+        manifest: &crate::domain::agent::AgentManifest,
+    ) -> Result<Option<Value>, ProgramRefusal> {
+        use crate::domain::runtime::{
+            program_container_files, ContainerResources, ContainerStepConfig, ContainerStepError,
+        };
+        let Some(program) = &manifest.spec.program else {
+            return Ok(None);
+        };
+        let name = &manifest.metadata.name;
+        let cannot = |why: String| ProgramRefusal {
+            sentence: format!("agent '{name}' program cannot be checked: {why}"),
+            check: None,
+        };
+        let Some(runner) = &self.program_runner else {
+            return Err(cannot("this node has no program runner".to_string()));
+        };
+        let Some(sample) = &program.sample_input else {
+            return Ok(None);
+        };
+        let runtime = &manifest.spec.runtime;
+        let image = match &runtime.image {
+            Some(image) => image.clone(),
+            None => {
+                let language = runtime.language.as_deref().unwrap_or("");
+                let version = runtime.version.as_deref().unwrap_or("");
+                let Some(registry) = &self.runtime_registry else {
+                    return Err(cannot(format!(
+                        "this node cannot resolve the image for {language} {version}"
+                    )));
+                };
+                registry
+                    .resolve(language, version)
+                    .map_err(|e| cannot(format!("{e}")))?
+            }
+        };
+        let state_name = crate::domain::workflow::StateName::new("PROGRAM_CHECK")
+            .map_err(|e| cannot(e.to_string()))?;
+        let config = ContainerStepConfig {
+            name: format!("program-check-{name}"),
+            image,
+            image_pull_policy: runtime.image_pull_policy,
+            entrypoint: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+            command: vec![program.run.clone()],
+            stdin: None,
+            env: std::collections::HashMap::new(),
+            workdir: Some(crate::domain::agent::PROGRAM_DIR.to_string()),
+            volumes: Vec::new(),
+            resources: Some(ContainerResources {
+                cpu: None,
+                memory: None,
+                timeout: Some(std::time::Duration::from_secs(PROGRAM_CHECK_TIMEOUT_SECS)),
+            }),
+            registry_credentials: None,
+            execution_id: crate::domain::execution::ExecutionId::new(),
+            state_name,
+            read_only_root_filesystem: false,
+            run_as_user: Some("1000:1000".to_string()),
+            network_mode: Some("none".to_string()),
+            workflow_execution_id: None,
+            files: program_container_files(&program.files, Some(&sample.to_string())),
+        };
+        let result = match runner.run_step(config).await {
+            Ok(result) => result,
+            Err(ContainerStepError::TimeoutExpired { timeout_secs }) => {
+                return Err(ProgramRefusal {
+                    sentence: format!(
+                        "agent '{name}' program did not finish on its sample input within {timeout_secs} s"
+                    ),
+                    check: None,
+                });
+            }
+            Err(error) => return Err(cannot(error.to_string())),
+        };
+        let check = serde_json::json!({
+            "exit_code": result.exit_code,
+            "stdout": head_chars(&result.stdout, PROGRAM_CHECK_SHOWN_CHARS),
+            "stderr": tail_chars(&result.stderr, PROGRAM_CHECK_SHOWN_CHARS),
+            "duration_ms": result.duration_ms,
+        });
+        if result.exit_code != 0 {
+            return Err(ProgramRefusal {
+                sentence: format!(
+                    "agent '{name}' program failed on its sample input: it exited {}; {}",
+                    result.exit_code,
+                    tail_chars(result.stderr.trim(), PROGRAM_CHECK_SHOWN_CHARS)
+                ),
+                check: Some(check),
+            });
+        }
+        if result.stdout.trim().is_empty() {
+            return Err(ProgramRefusal {
+                sentence: format!("agent '{name}' program printed nothing on its sample input"),
+                check: Some(check),
+            });
+        }
+        Ok(Some(check))
     }
 }
 
@@ -1276,6 +1542,354 @@ spec:
             answer.get("error").and_then(Value::as_str),
             Some(reason.as_str()),
             "aegis.workflow.wait answered {answer}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AEGIS ADR-005 O7c and O7d: the program check and the generator's floor
+    // -----------------------------------------------------------------------
+
+    /// `vrp-solver-agent` 1.0.1 as `aegis.agent.export` answered it on
+    /// 2026-10-06: it declares `cmd.run` and carries no program.
+    const VRP_SOLVER: &str = include_str!("../../../tests/fixtures/vrp-solver-agent-1.0.1.yaml");
+
+    const O7_SENTENCE: &str = "agent 'vrp-solver-agent' has no program: its instruction asks the \
+        model to write or compute the solution on each run; the agent must carry its program and \
+        run it";
+
+    /// A program runner that answers as it is told and keeps what it was given.
+    struct ScriptedRunner {
+        answer: std::sync::Mutex<
+            Option<
+                Result<
+                    crate::domain::runtime::ContainerStepResult,
+                    crate::domain::runtime::ContainerStepError,
+                >,
+            >,
+        >,
+        seen: std::sync::Mutex<Vec<crate::domain::runtime::ContainerStepConfig>>,
+    }
+
+    impl ScriptedRunner {
+        fn exits(exit_code: i32, stdout: &str, stderr: &str) -> Arc<Self> {
+            Arc::new(Self {
+                answer: std::sync::Mutex::new(Some(Ok(
+                    crate::domain::runtime::ContainerStepResult {
+                        exit_code,
+                        stdout: stdout.to_string(),
+                        stderr: stderr.to_string(),
+                        duration_ms: 12,
+                    },
+                ))),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn times_out() -> Arc<Self> {
+            Arc::new(Self {
+                answer: std::sync::Mutex::new(Some(Err(
+                    crate::domain::runtime::ContainerStepError::TimeoutExpired {
+                        timeout_secs: PROGRAM_CHECK_TIMEOUT_SECS,
+                    },
+                ))),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::domain::runtime::ContainerStepRunner for ScriptedRunner {
+        async fn run_step(
+            &self,
+            config: crate::domain::runtime::ContainerStepConfig,
+        ) -> Result<
+            crate::domain::runtime::ContainerStepResult,
+            crate::domain::runtime::ContainerStepError,
+        > {
+            self.seen.lock().unwrap().push(config);
+            self.answer
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the program ran once")
+        }
+    }
+
+    /// A manifest named `name` carrying a program, run on its sample input.
+    fn program_yaml(name: &str, version: &str) -> String {
+        format!(
+            r#"apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: {name}
+  version: "{version}"
+spec:
+  runtime:
+    image: ghcr.io/example/python:3.11
+  task:
+    instruction: Call cmd.run with "python /opt/aegis/program/solve.py" and present its output.
+  program:
+    files:
+      - path: solve.py
+        content: |
+          import json
+          data = json.load(open("/opt/aegis/program/input.json"))
+          print(json.dumps({{"total": sum(data["amounts"])}}))
+    run: python /opt/aegis/program/solve.py
+    sample_input: {{"amounts": [3, 4.5]}}
+  tools:
+    - cmd.run
+"#
+        )
+    }
+
+    async fn deployed(h: &Harness, name: &str) -> bool {
+        h.service
+            .agent_lifecycle
+            .lookup_agent_for_tenant(&tenant(), name)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    async fn create(service: &ToolInvocationService, yaml: &str, caller: Option<&str>) -> Value {
+        direct(
+            service
+                .invoke_aegis_agent_create_tool(
+                    &mut json!({ "manifest_yaml": yaml }),
+                    &tenant_scope(),
+                    caller,
+                )
+                .await
+                .expect("aegis.agent.create answers"),
+        )
+    }
+
+    async fn update(service: &ToolInvocationService, yaml: &str, caller: Option<&str>) -> Value {
+        direct(
+            service
+                .invoke_aegis_agent_update_tool(
+                    &mut json!({ "manifest_yaml": yaml }),
+                    &tenant_scope(),
+                    caller,
+                )
+                .await
+                .expect("aegis.agent.update answers"),
+        )
+    }
+
+    fn errors(answer: &Value) -> Vec<String> {
+        answer
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// T1, O7d: the generator's `aegis.agent.create` and `aegis.agent.update`
+    /// of `vrp-solver-agent` 1.0.1 are refused with O7's sentence and nothing
+    /// is deployed; the same manifest from another caller meets no floor.
+    #[tokio::test]
+    async fn the_generator_cannot_deploy_vrp_solver_agent_without_a_program() {
+        let h = harness().await;
+        let mut complaints = Vec::new();
+
+        let answer = create(&h.service, VRP_SOLVER, Some(AGENT_GENERATOR_NAME)).await;
+        if errors(&answer) != vec![O7_SENTENCE.to_string()] {
+            complaints.push(format!("the generator's create answered {answer}"));
+        }
+        if answer.get("deployed") != Some(&Value::Bool(false)) {
+            complaints.push(format!(
+                "the generator's create did not say deployed false: {answer}"
+            ));
+        }
+        if deployed(&h, "vrp-solver-agent").await {
+            complaints.push("vrp-solver-agent was deployed by the generator".to_string());
+        }
+
+        // Deployed by a person, then updated by the generator: refused.
+        let by_person = create(&h.service, VRP_SOLVER, None).await;
+        if by_person.get("deployed") != Some(&Value::Bool(true)) {
+            complaints.push(format!("a person's create was refused: {by_person}"));
+        }
+        let raised = VRP_SOLVER.replace("version: 1.0.1", "version: 1.0.2");
+        let answer = update(&h.service, &raised, Some(AGENT_GENERATOR_NAME)).await;
+        if errors(&answer) != vec![O7_SENTENCE.to_string()] {
+            complaints.push(format!("the generator's update answered {answer}"));
+        }
+        if answer.get("updated") != Some(&Value::Bool(false)) {
+            complaints.push(format!(
+                "the generator's update did not say updated false: {answer}"
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T5, O7c: a program that exits 1, prints nothing or does not finish is
+    /// refused with its sentence and the agent is not deployed; a program
+    /// that prints its result is deployed with `program_check` in the answer.
+    #[tokio::test]
+    async fn create_runs_the_program_on_its_sample_input_before_deploying() {
+        let mut complaints = Vec::new();
+        let cases: Vec<(&str, Arc<ScriptedRunner>, Option<String>)> = vec![
+            (
+                "exits-one-agent",
+                ScriptedRunner::exits(1, "", "Traceback\nKeyError: 'amounts'\n"),
+                Some(
+                    "agent 'exits-one-agent' program failed on its sample input: it exited 1; \
+                     Traceback\nKeyError: 'amounts'"
+                        .to_string(),
+                ),
+            ),
+            (
+                "silent-agent",
+                ScriptedRunner::exits(0, "  \n", ""),
+                Some("agent 'silent-agent' program printed nothing on its sample input".to_string()),
+            ),
+            (
+                "endless-agent",
+                ScriptedRunner::times_out(),
+                Some(format!(
+                    "agent 'endless-agent' program did not finish on its sample input within {PROGRAM_CHECK_TIMEOUT_SECS} s"
+                )),
+            ),
+            ("sum-agent", ScriptedRunner::exits(0, "{\"total\": 7.5}\n", ""), None),
+        ];
+        for (name, runner, refusal) in cases {
+            let h = harness().await;
+            let service = h.service.with_program_runner(runner.clone());
+            let answer = create(&service, &program_yaml(name, "1.0.0"), None).await;
+            let is_deployed = service
+                .agent_lifecycle
+                .lookup_agent_for_tenant(&tenant(), name)
+                .await
+                .unwrap()
+                .is_some();
+            match refusal {
+                Some(sentence) => {
+                    if errors(&answer) != vec![sentence.clone()] {
+                        complaints.push(format!(
+                            "{name}: expected \"{sentence}\", answered {answer}"
+                        ));
+                    }
+                    if is_deployed || answer.get("deployed") != Some(&Value::Bool(false)) {
+                        complaints.push(format!("{name}: deployed after a failed check: {answer}"));
+                    }
+                }
+                None => {
+                    if !is_deployed || answer.get("deployed") != Some(&Value::Bool(true)) {
+                        complaints.push(format!("{name}: not deployed: {answer}"));
+                    }
+                    let expected = json!({
+                        "exit_code": 0,
+                        "stdout": "{\"total\": 7.5}\n",
+                        "stderr": "",
+                        "duration_ms": 12,
+                    });
+                    if answer.get("program_check") != Some(&expected) {
+                        complaints.push(format!(
+                            "{name}: program_check is not in the answer: {answer}"
+                        ));
+                    }
+                }
+            }
+            let seen = runner.seen.lock().unwrap();
+            match seen.first() {
+                None => complaints.push(format!("{name}: the program never ran")),
+                Some(config) => {
+                    let paths: Vec<(&str, u32)> = config
+                        .files
+                        .iter()
+                        .map(|f| (f.path.as_str(), f.mode))
+                        .collect();
+                    if paths
+                        != vec![
+                            ("/opt/aegis/program/solve.py", 0o644),
+                            ("/opt/aegis/program/input.json", 0o644),
+                        ]
+                    {
+                        complaints.push(format!("{name}: files placed {paths:?}"));
+                    }
+                    if config.files[1].content != br#"{"amounts":[3,4.5]}"#.to_vec() {
+                        complaints.push(format!(
+                            "{name}: the sample input placed was {}",
+                            String::from_utf8_lossy(&config.files[1].content)
+                        ));
+                    }
+                    if config.command != vec!["python /opt/aegis/program/solve.py".to_string()]
+                        || config.entrypoint != Some(vec!["/bin/sh".to_string(), "-c".to_string()])
+                        || config.image != "ghcr.io/example/python:3.11"
+                        || config.network_mode.as_deref() != Some("none")
+                    {
+                        complaints.push(format!(
+                            "{name}: ran {:?} {:?} in {} on network {:?}",
+                            config.entrypoint, config.command, config.image, config.network_mode
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// O7c: an update runs the check too; a passing check carries
+    /// `program_check` in the update's answer.
+    #[tokio::test]
+    async fn update_runs_the_program_on_its_sample_input_before_updating() {
+        let h = harness().await;
+        let first = ScriptedRunner::exits(0, "7.5\n", "");
+        let service = h.service.with_program_runner(first);
+        let created = create(&service, &program_yaml("sum-agent", "1.0.0"), None).await;
+        assert_eq!(
+            created.get("deployed"),
+            Some(&Value::Bool(true)),
+            "{created}"
+        );
+        let failing = ScriptedRunner::exits(2, "", "SyntaxError\n");
+        let service = service.with_program_runner(failing);
+        let answer = update(&service, &program_yaml("sum-agent", "1.0.1"), None).await;
+        assert_eq!(
+            errors(&answer),
+            vec![
+                "agent 'sum-agent' program failed on its sample input: it exited 2; SyntaxError"
+                    .to_string()
+            ],
+            "{answer}"
+        );
+        assert_eq!(answer.get("updated"), Some(&Value::Bool(false)), "{answer}");
+        let passing = ScriptedRunner::exits(0, "7.5\n", "");
+        let service = service.with_program_runner(passing);
+        let answer = update(&service, &program_yaml("sum-agent", "1.0.1"), None).await;
+        assert_eq!(answer.get("updated"), Some(&Value::Bool(true)), "{answer}");
+        assert_eq!(
+            answer.pointer("/program_check/stdout"),
+            Some(&json!("7.5\n")),
+            "{answer}"
+        );
+    }
+
+    /// C2: a node with no program runner refuses a manifest carrying a
+    /// program, never deploying it unchecked.
+    #[tokio::test]
+    async fn a_node_with_no_program_runner_refuses_a_program_unchecked() {
+        let h = harness().await;
+        let answer = create(&h.service, &program_yaml("sum-agent", "1.0.0"), None).await;
+        assert_eq!(
+            errors(&answer),
+            vec![
+                "agent 'sum-agent' program cannot be checked: this node has no program runner"
+                    .to_string()
+            ],
+            "{answer}"
+        );
+        assert!(
+            !deployed(&h, "sum-agent").await,
+            "deployed unchecked: {answer}"
         );
     }
 }

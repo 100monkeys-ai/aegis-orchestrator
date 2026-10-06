@@ -27,7 +27,8 @@ spec:
       REQUIRED PROCEDURE, IN ORDER:
 
       1. Write /workspace/solution.js via fs.write. The script must:
-         - Use only the Node.js standard library (no npm packages). The
+         - Use only the modules the runtime image holds: a run has no
+           network, so a package cannot be installed. The
            file is run as CommonJS (no package.json present in /workspace),
            so use `const assert = require("node:assert/strict");`.
          - Define `function solve(inputs)` that accepts an object and
@@ -107,6 +108,7 @@ spec:
     mode: iterative
     max_iterations: 3
     llm_timeout_seconds: 120
+    require_tool_call: true
 
   tools:
     - fs.write

@@ -1273,6 +1273,7 @@ mod tests {
                 input_schema: None,
                 security_context: None,
                 output_handler: None,
+                program: None,
             },
         })
     }
@@ -4315,6 +4316,152 @@ mod tests {
             "the child's persisted input lacks its parent's contexts"
         );
     }
+
+    /// An agent carrying a two-file program, run with `cmd.run`.
+    fn program_agent(name: &str) -> Agent {
+        let mut agent = make_agent(name, None, None);
+        agent.manifest.spec.tools = vec!["cmd.run".to_string()];
+        agent.manifest.spec.program = Some(crate::domain::agent::ProgramSpec {
+            files: vec![
+                crate::domain::agent::ProgramFile {
+                    path: "solve.py".to_string(),
+                    content: "print(7.5)\n".to_string(),
+                    executable: false,
+                },
+                crate::domain::agent::ProgramFile {
+                    path: "bin/run.sh".to_string(),
+                    content: "python /opt/aegis/program/solve.py\n".to_string(),
+                    executable: true,
+                },
+            ],
+            run: "python /opt/aegis/program/solve.py".to_string(),
+            sample_input: None,
+        });
+        agent
+    }
+
+    /// What a spawn was given of the agent's program, or why it differs.
+    fn program_complaints(
+        path: &str,
+        spawned: &WorkerRuntimeConfig,
+        agent: &Agent,
+        input: &serde_json::Value,
+    ) -> Vec<String> {
+        let mut complaints = Vec::new();
+        let files = &agent.manifest.spec.program.as_ref().unwrap().files;
+        if &spawned.program_files != files {
+            complaints.push(format!("{path}: program_files {:?}", spawned.program_files));
+        }
+        let placed: Option<serde_json::Value> = spawned
+            .program_input
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok());
+        if placed.as_ref() != Some(input) {
+            complaints.push(format!("{path}: program_input {:?}", spawned.program_input));
+        }
+        complaints
+    }
+
+    /// T4, AEGIS ADR-005 O7b: both start paths give the spawn the program
+    /// the agent carries and the execution's input; an agent carrying none
+    /// is given neither.
+    #[tokio::test]
+    async fn both_start_paths_give_the_spawn_the_program_and_the_input() {
+        let mut complaints = Vec::new();
+        let tenant_id = CoreTenantId::consumer();
+        let input = serde_json::json!({ "tenant_id": "zaru-consumer", "amounts": [3, 4.5] });
+
+        // do_start_execution
+        let agent = program_agent("sum-agent");
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        service
+            .start_execution(
+                agent.id,
+                input_with(input.clone()),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        complaints.extend(program_complaints("start", &spawned, &agent, &input));
+
+        let plain = make_agent("plain-agent", None, None);
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&plain], HashMap::new(), &[]).await;
+        service
+            .start_execution(
+                plain.id,
+                input_with(input.clone()),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        if !spawned.program_files.is_empty() || spawned.program_input.is_some() {
+            complaints.push(format!(
+                "a plain agent was given {:?} {:?}",
+                spawned.program_files, spawned.program_input
+            ));
+        }
+
+        // start_child_execution
+        let tenant = CoreTenantId::from_string("u-abc123").unwrap();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = program_agent("child-sum-agent");
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "u-abc123");
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        for agent in [&parent_agent, &child_agent] {
+            agent_repo.save_for_tenant(&tenant, agent).await.unwrap();
+        }
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        execution_repo
+            .save_for_tenant(&tenant, &parent_execution)
+            .await
+            .unwrap();
+        let runtime = Arc::new(TestRuntime::default());
+        let service = StandardExecutionService::new(
+            agent_repo,
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(runtime.clone())),
+            execution_repo,
+            Arc::new(EventBus::with_default_capacity()),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+        let child_input = serde_json::json!({ "amounts": [1, 2] });
+        service
+            .start_child_execution(
+                child_agent.id,
+                input_with(child_input.clone()),
+                parent_execution.id,
+            )
+            .await
+            .unwrap();
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        let mut expected = child_input.clone();
+        // The child inherits its parent's tenant into its input.
+        if let Some(tenant_id) = spawned
+            .program_input
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|placed| placed.get("tenant_id").cloned())
+        {
+            expected["tenant_id"] = tenant_id;
+        }
+        complaints.extend(program_complaints(
+            "child",
+            &spawned,
+            &child_agent,
+            &expected,
+        ));
+
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 }
 
 struct ExecutionMonitor {
@@ -5041,6 +5188,19 @@ impl StandardExecutionService {
     /// prompt — caused every execution by the same agent to surface the
     /// agent's static manifest instruction as its summary regardless of
     /// per-call user input.
+    /// The program `agent` carries and the execution's `input` as JSON text,
+    /// placed beside it in each container (AEGIS ADR-005 O7b); nothing for
+    /// an agent that carries none.
+    pub(crate) fn program_for(
+        agent: &crate::domain::agent::Agent,
+        input: &JsonValue,
+    ) -> (Vec<crate::domain::agent::ProgramFile>, Option<String>) {
+        match &agent.manifest.spec.program {
+            Some(program) => (program.files.clone(), Some(input.to_string())),
+            None => (Vec::new(), None),
+        }
+    }
+
     pub(crate) fn prepare_execution_input(
         input: ExecutionInput,
         agent: &crate::domain::agent::Agent,
@@ -5403,6 +5563,7 @@ impl StandardExecutionService {
         // the Execution aggregate stores; `runtime_input` carries the
         // rendered prompt and is handed to the supervisor only.
         let (persisted_input, runtime_input) = Self::prepare_execution_input(input, &agent)?;
+        let (program_files, program_input) = Self::program_for(&agent, &persisted_input.input);
 
         // 3. Create Execution Record
         let max_retries = if let Some(exec) = &agent.manifest.spec.execution {
@@ -5942,6 +6103,10 @@ impl StandardExecutionService {
                 .advanced
                 .as_ref()
                 .and_then(|a| a.bootstrap_path.clone()),
+            // The program the agent carries and the execution's input (AEGIS
+            // ADR-005 O7b).
+            program_files,
+            program_input,
             // Attach execution_id so ContainerRuntime can correlate image events (ADR-045).
             execution_id,
             workflow_execution_id,
@@ -6378,6 +6543,7 @@ impl ExecutionService for StandardExecutionService {
         // copy preserves the caller's intent; the runtime copy carries the
         // rendered prompt for the supervisor.
         let (persisted_input, runtime_input) = Self::prepare_execution_input(input, &agent)?;
+        let (program_files, program_input) = Self::program_for(&agent, &persisted_input.input);
 
         // 4. Create child execution record with hierarchy.
         let max_retries = agent
@@ -6685,6 +6851,10 @@ impl ExecutionService for StandardExecutionService {
                 .advanced
                 .as_ref()
                 .and_then(|a| a.bootstrap_path.clone()),
+            // The program the agent carries and the execution's input (AEGIS
+            // ADR-005 O7b).
+            program_files,
+            program_input,
             execution_id: child_execution_id,
             workflow_execution_id: None,
         };

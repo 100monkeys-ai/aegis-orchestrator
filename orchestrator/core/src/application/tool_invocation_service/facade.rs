@@ -104,6 +104,7 @@ impl ToolInvocationService {
             tool_catalog: None,
             discovery_service: None,
             runtime_registry: None,
+            program_runner: None,
             file_operations_service: None,
             user_volume_service: None,
             git_repo_service: None,
@@ -1341,14 +1342,22 @@ impl ToolInvocationService {
         tenant_scope: &TenantScope,
     ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
         match tool_name {
-            "aegis.agent.create" => Some(
-                self.invoke_aegis_agent_create_tool(args, tenant_scope)
-                    .await,
-            ),
-            "aegis.agent.update" => Some(
-                self.invoke_aegis_agent_update_tool(args, tenant_scope)
-                    .await,
-            ),
+            "aegis.agent.create" => {
+                // The calling agent's name reaches the generator's floor
+                // (AEGIS ADR-005 O7d).
+                let caller = self.calling_agent_name(tenant_scope, agent_id).await;
+                Some(
+                    self.invoke_aegis_agent_create_tool(args, tenant_scope, caller.as_deref())
+                        .await,
+                )
+            }
+            "aegis.agent.update" => {
+                let caller = self.calling_agent_name(tenant_scope, agent_id).await;
+                Some(
+                    self.invoke_aegis_agent_update_tool(args, tenant_scope, caller.as_deref())
+                        .await,
+                )
+            }
             "aegis.agent.delete" => Some(
                 self.invoke_aegis_agent_delete_tool(args, tenant_scope)
                     .await,

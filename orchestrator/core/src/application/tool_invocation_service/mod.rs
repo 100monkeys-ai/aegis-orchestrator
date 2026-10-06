@@ -157,6 +157,10 @@ pub struct ToolInvocationService {
     discovery_service: Option<Arc<dyn crate::application::discovery_service::DiscoveryService>>,
     /// Optional StandardRuntime registry for aegis.runtime.list tool.
     runtime_registry: Option<Arc<StandardRuntimeRegistry>>,
+    /// Runs an agent's program on its sample input before it is created or
+    /// updated (AEGIS ADR-005 O7c). `None`: a manifest carrying a program is
+    /// refused, never deployed unchecked.
+    program_runner: Option<Arc<dyn crate::domain::runtime::ContainerStepRunner>>,
     /// File operations service for post-mortem execution file reads (aegis.execution.file)
     /// and user-volume file operations (aegis.file.*).
     file_operations_service:
@@ -193,4 +197,17 @@ pub struct ToolInvocationService {
     /// AEGIS ADR-131: goals, their evaluation by `goal-judge`, and the
     /// `goal_id` of the four starting tools. `None` refuses every goal.
     goal_service: Option<Arc<crate::application::goal_service::GoalService>>,
+}
+
+impl ToolInvocationService {
+    /// The runner that checks an agent's program on its sample input before
+    /// `aegis.agent.create` or `aegis.agent.update` deploys it (AEGIS ADR-005
+    /// O7c).
+    pub fn with_program_runner(
+        mut self,
+        runner: Arc<dyn crate::domain::runtime::ContainerStepRunner>,
+    ) -> Self {
+        self.program_runner = Some(runner);
+        self
+    }
 }

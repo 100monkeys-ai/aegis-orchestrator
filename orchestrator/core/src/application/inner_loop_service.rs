@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::application::execution::ExecutionService;
 use crate::application::tool_invocation_service::ToolInvocationService;
-use crate::domain::agent::AgentId;
+use crate::domain::agent::{AgentId, ToolCallRequirement};
 use crate::domain::dispatch::{
     AgentMessage, ConversationMessage, DispatchAction, DispatchId, OrchestratorMessage, ToolCall,
 };
@@ -98,6 +98,74 @@ struct ExecutionContext {
     command_margin_secs: u64,
     /// The command in flight, as asked for and as dispatched.
     pending_command: Option<PendingCommand>,
+    /// The tool call this try must make before a text answer completes it
+    /// (AEGIS ADR-135 D5, ADR-005 O7e).
+    tool_call_requirement: ToolCallRequirement,
+    /// Whether a text answer was already sent back once for that requirement.
+    tool_call_reminded: bool,
+}
+
+/// The sentence a try fails with when the model answers text where it had to
+/// call a tool (AEGIS ADR-135 D5).
+pub(crate) const TEXT_WHERE_A_TOOL_CALL_WAS_REQUIRED: &str =
+    "The agent answered with text where it had to call a tool.";
+
+/// The command line a `cmd.run` call ran: its `command`, then each of its
+/// `args`, with runs of whitespace made single spaces.
+fn command_line_of(arguments_json: &str) -> Option<String> {
+    let args: Value = serde_json::from_str(arguments_json).ok()?;
+    let mut line = args.get("command")?.as_str()?.to_string();
+    let extra: Vec<String> = match args.get("args") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    for arg in extra {
+        line.push(' ');
+        line.push_str(&arg);
+    }
+    Some(single_spaced(&line))
+}
+
+fn single_spaced(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether the try's tool calls so far meet `requirement`.
+fn tool_call_requirement_met(
+    requirement: &ToolCallRequirement,
+    tool_calls: usize,
+    trajectory: &[TrajectoryStep],
+) -> bool {
+    match requirement {
+        ToolCallRequirement::None => true,
+        ToolCallRequirement::AnyTool => tool_calls > 0,
+        ToolCallRequirement::RunProgram(run) => {
+            let run = single_spaced(run);
+            trajectory.iter().any(|step| {
+                step.tool_name == "cmd.run"
+                    && step.status == "succeeded"
+                    && command_line_of(&step.arguments_json).as_deref() == Some(run.as_str())
+            })
+        }
+    }
+}
+
+/// What the model is told when it answered text before the call it had to
+/// make.
+fn tool_call_reminder(requirement: &ToolCallRequirement) -> String {
+    match requirement {
+        ToolCallRequirement::RunProgram(run) => format!(
+            "You answered with text, but this agent must run its program before it answers. \
+             Call cmd.run with the command \"{run}\" now, then present its output."
+        ),
+        _ => "You answered with text, but this agent must call a tool before it answers. \
+              Call the tool the task needs now."
+            .to_string(),
+    }
 }
 
 /// A dispatched command: the timeout the model asked for, the one it was
@@ -287,6 +355,16 @@ impl InnerLoopService {
                             parsed_agent_id.0
                         )
                     })?;
+                let tool_call_requirement = self
+                    .tool_invocation_service
+                    .agent_tool_call_requirement(&tenant_id, parsed_agent_id)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "loading agent {} for its tool call requirement: {e}",
+                            parsed_agent_id.0
+                        )
+                    })?;
                 let now = chrono::Utc::now();
                 let iteration_bound_delta =
                     chrono::Duration::seconds(iteration_bound.as_secs() as i64);
@@ -349,6 +427,8 @@ impl InnerLoopService {
                             iteration_bound,
                         ),
                         pending_command: None,
+                        tool_call_requirement,
+                        tool_call_reminded: false,
                     },
                 );
 
@@ -486,6 +566,40 @@ impl InnerLoopService {
 
             match llm_output {
                 LlmOutput::FinalText(text) => {
+                    // AEGIS ADR-135 D5, ADR-005 O7e: a text answer completes the
+                    // try only once the call it had to make was made.
+                    if !tool_call_requirement_met(
+                        &ctx.tool_call_requirement,
+                        ctx.iterations,
+                        &ctx.trajectory,
+                    ) {
+                        if !ctx.tool_call_reminded {
+                            ctx.tool_call_reminded = true;
+                            ctx.conversation.push(ConversationMessage {
+                                role: "assistant".to_string(),
+                                content: text,
+                                tool_call_id: None,
+                                tool_calls: None,
+                            });
+                            ctx.conversation.push(ConversationMessage {
+                                role: "user".to_string(),
+                                content: tool_call_reminder(&ctx.tool_call_requirement),
+                                tool_call_id: None,
+                                tool_calls: None,
+                            });
+                            self.active_executions
+                                .write()
+                                .await
+                                .insert(execution_id_str.to_string(), ctx);
+                            continue;
+                        }
+                        self.persist_trajectory(execution_id_str, &ctx).await;
+                        self.active_executions
+                            .write()
+                            .await
+                            .remove(execution_id_str);
+                        anyhow::bail!(TEXT_WHERE_A_TOOL_CALL_WAS_REQUIRED);
+                    }
                     tracing::debug!(
                         execution_id = %execution_id_str,
                         iterations = ctx.iterations,

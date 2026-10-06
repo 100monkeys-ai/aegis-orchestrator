@@ -233,6 +233,144 @@ pub struct AgentSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
+
+    // AEGIS ADR-005 O7, O7a. The doc comment below is the manifest schema's
+    // text, so it names no record.
+    /// The program this agent carries: files written once, when the agent is
+    /// made, placed read-only under `/opt/aegis/program` in every container
+    /// of its executions, with the execution's input at
+    /// `/opt/aegis/program/input.json`. The agent runs it with `cmd.run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<ProgramSpec>,
+}
+
+/// The tool call an execution must make before a text answer completes it
+/// (AEGIS ADR-135 D5, ADR-005 O7e).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallRequirement {
+    /// A text answer completes the try.
+    None,
+    /// At least one tool call first (`spec.execution.require_tool_call`).
+    AnyTool,
+    /// A successful `cmd.run` of the agent's own program (`spec.program.run`).
+    RunProgram(String),
+}
+
+impl ToolCallRequirement {
+    /// What `manifest` requires: its program's run command when it carries
+    /// one, otherwise any tool call when `spec.execution.require_tool_call`.
+    pub fn of(manifest: &AgentManifest) -> Self {
+        if let Some(program) = &manifest.spec.program {
+            return Self::RunProgram(program.run.clone());
+        }
+        let required = manifest
+            .spec
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.require_tool_call);
+        if required {
+            Self::AnyTool
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// Where an agent's program is placed in each container of its executions.
+pub const PROGRAM_DIR: &str = "/opt/aegis/program";
+
+/// The file, under [`PROGRAM_DIR`], that holds the execution's input.
+pub const PROGRAM_INPUT_FILE: &str = "input.json";
+
+/// The most bytes an agent's program files may hold together.
+pub const PROGRAM_MAX_BYTES: usize = 256 * 1024;
+
+// AEGIS ADR-005 O7a; the doc comments are the manifest schema's text.
+/// The program an agent carries: its files, the command line that runs it,
+/// and an input it is run on when the agent is created or updated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramSpec {
+    /// The program's files, each placed at `/opt/aegis/program/<path>`.
+    pub files: Vec<ProgramFile>,
+    /// The command line that runs the program, for example
+    /// `python /opt/aegis/program/solve.py`.
+    pub run: String,
+    /// An input the program is run on when the agent is created or updated;
+    /// the agent is refused when the program exits non-zero or prints nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_input: Option<serde_json::Value>,
+}
+
+/// One file of an agent's program.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramFile {
+    /// The file's path, relative to `/opt/aegis/program`.
+    pub path: String,
+    /// The file's text.
+    pub content: String,
+    /// Whether the file is executable (mode 0755; otherwise 0644).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub executable: bool,
+}
+
+impl ProgramSpec {
+    /// Why this program cannot be carried, or `None` when it can (O7a).
+    /// `tools` is the agent's `spec.tools`: the agent runs its program with
+    /// `cmd.run`, so it must declare it.
+    pub fn refusal(&self, tools: &[String]) -> Option<String> {
+        if self.files.is_empty() {
+            return Some("spec.program: it carries no files".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0usize;
+        for file in &self.files {
+            let path = file.path.as_str();
+            if path.trim().is_empty() {
+                return Some("spec.program: a file has an empty path".to_string());
+            }
+            if path.starts_with('/') {
+                return Some(format!(
+                    "spec.program: the file path '{path}' must be relative to {PROGRAM_DIR}"
+                ));
+            }
+            if path
+                .split('/')
+                .any(|segment| segment == ".." || segment == "." || segment.is_empty())
+            {
+                return Some(format!(
+                    "spec.program: the file path '{path}' must not contain '..', '.' or an empty segment"
+                ));
+            }
+            if path == PROGRAM_INPUT_FILE {
+                return Some(format!(
+                    "spec.program: the file path '{PROGRAM_INPUT_FILE}' is where the execution's input is placed"
+                ));
+            }
+            if !seen.insert(path) {
+                return Some(format!(
+                    "spec.program: the file path '{path}' is declared twice"
+                ));
+            }
+            total = total.saturating_add(file.content.len());
+        }
+        if total > PROGRAM_MAX_BYTES {
+            return Some(format!(
+                "spec.program: its files hold {total} bytes, over the {PROGRAM_MAX_BYTES}-byte limit"
+            ));
+        }
+        if self.run.trim().is_empty() {
+            return Some("spec.program: run is empty".to_string());
+        }
+        if !tools.iter().any(|tool| tool == "cmd.run") {
+            return Some(
+                "spec.program: an agent carrying a program must declare cmd.run in spec.tools to run it"
+                    .to_string(),
+            );
+        }
+        None
+    }
 }
 
 // Zaru ADR-0055 D5, D16; the doc comment is the manifest schema's text.
@@ -485,6 +623,12 @@ pub struct ExecutionStrategy {
     /// iteration, and a completed execution records each one it found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<DeclaredOutput>,
+    // AEGIS ADR-135 D5, ADR-005 O7e; the doc comment is the manifest schema's text.
+    /// Whether an execution must call a tool before it answers: a text answer
+    /// with no tool call is sent back once with that requirement, then fails
+    /// the try.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_tool_call: bool,
 }
 
 /// One file an execution must produce: `spec.execution.outputs[]` in the
@@ -545,6 +689,7 @@ impl Default for ExecutionStrategy {
             tool_validation: None,
             delivery: None,
             outputs: Vec::new(),
+            require_tool_call: false,
         }
     }
 }
@@ -1055,6 +1200,13 @@ impl AgentManifest {
             }
         }
 
+        // The program an agent carries (AEGIS ADR-005 O7a).
+        if let Some(program) = &self.spec.program {
+            if let Some(refusal) = program.refusal(&self.spec.tools) {
+                return Err(refusal);
+            }
+        }
+
         // Each declared context names a service, once (Zaru ADR-0055 D16).
         let mut services = std::collections::HashSet::new();
         for declared in &self.spec.contexts {
@@ -1149,6 +1301,7 @@ mod tests {
                 input_schema: None,
                 security_context: None,
                 output_handler: None,
+                program: None,
             },
         }
     }

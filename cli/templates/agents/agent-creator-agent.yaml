@@ -144,45 +144,43 @@ spec:
          - spec.task.instruction       (REQUIRED — the core steering instruction for this agent; must be non-empty)
            The instruction is the system-level directive that defines what the agent does generically.
            Write it as a complete, role-establishing directive in the imperative voice.
-           Example for a python-code-execution-agent:
+           Example for an agent whose task is a computation (it carries its program):
              spec:
                runtime:
                  language: python
                  version: "3.11"
                  isolation: inherit
                  model: smart
-                 temperature: 0.2
+                 temperature: 0.1
                task:
                  instruction: |
-                   You are a Python code execution agent.
-
-                   CRITICAL — NO HALLUCINATION: The Intent you receive in the prompt IS the
-                   task. Implement it EXACTLY as stated. Do NOT invent, assume, substitute,
-                   simplify, or write placeholder, example, or demonstration code. Writing
-                   print("Hello, object!") or any unrelated code when given a real intent is
-                   a hard failure.
+                   You run this agent's program and present its result.
 
                    For every execution:
-                   1. Read the Intent field from the prompt. That is the complete task definition.
-                   2. Read the Input values field. Embed those exact values directly into the code.
-                   3. Write a complete Python solution that implements the intent literally and
-                      prints the final result to stdout. Use fs.write to save it to the file
-                      path specified in the prompt (default: /workspace/solution.py).
-                   4. Confirm the write succeeded before returning.
+                   1. Call cmd.run with command "python /opt/aegis/program/solve.py" and cwd
+                      "/opt/aegis/program". The program reads this execution's input from
+                      /opt/aegis/program/input.json and prints its result as JSON.
+                   2. If it exits 0, present its stdout as the answer, in plain words,
+                      changing no value.
+                   3. If it exits non-zero, report its stderr as the reason. Never write code
+                      and never compute the result yourself.
+               program:
+                 files:
+                   - path: solve.py
+                     content: |
+                       import json
+                       with open("/opt/aegis/program/input.json") as f:
+                           data = json.load(f)
+                       print(json.dumps({"total": sum(data["amounts"])}))
+                 run: python /opt/aegis/program/solve.py
+                 sample_input: {"amounts": [3, 4.5]}
+               input_schema:
+                 type: object
+                 required: [amounts]
+                 properties:
+                   amounts: {type: array, description: The numbers to add.}
                tools:
-                 - fs.write
-                 - fs.read
-                 - fs.list
-                 - fs.glob
-                 - fs.grep
                  - cmd.run
-               volumes:
-                 - name: workspace
-                   storage_class: ephemeral
-                   mount_path: /workspace
-                   access_mode: read-write
-                   size_limit: 1Gi
-                   ttl_hours: 1
            A manifest without spec.task or with an empty spec.task.instruction is INVALID and will
            be rejected by the schema validator and the manifest parser. Do not submit it.
          - Populate `metadata.tags` with 3 to 5 free-form lowercase hyphenated strings describing the
@@ -212,10 +210,20 @@ spec:
            `fs.delete` MUST declare a read-write volume with mount_path `/workspace`, including an
            agent built only for workflow steps: inside a workflow the declared volume yields to the
            workflow's workspace. The platform refuses it at deploy otherwise (`tool-requirement/no-volume`).
+         - AN AGENT WHOSE TASK IS A COMPUTATION CARRIES ITS PROGRAM. Write the program once, now,
+           as `spec.program.files`, with `spec.program.run` (the command line that runs it) and
+           `spec.program.sample_input` (an input taken from the user's request). The program reads
+           the execution's input from /opt/aegis/program/input.json and prints its result to
+           stdout, using only what the runtime image holds (a run has no network, so nothing can be
+           installed). Declare `cmd.run`. The instruction tells the model to run
+           `spec.program.run` with cmd.run and present its output; it never asks the model to write
+           code or compute the result itself. The platform runs the program on `sample_input` when
+           the agent is created or updated and refuses the agent if it exits non-zero or prints
+           nothing.
          - When composing `spec.tools`, select the full relevant tool suite for the agent's capability.
            Do NOT give a code-writing or code-execution agent only `fs.write` + `cmd.run` and rely on
            instruction text to prevent `cmd.run` misuse — give it the correct tools instead.
-           Agents that write and execute code require the complete `fs.*` inspection suite:
+           The built-in code-writing executors, which write code for a caller's intent, require the complete `fs.*` inspection suite:
              tools:
                - fs.write
                - fs.read

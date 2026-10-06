@@ -111,6 +111,7 @@ spec:
     mode: iterative
     max_iterations: 3
     llm_timeout_seconds: 120
+    require_tool_call: true
 
   tools:
     - fs.write

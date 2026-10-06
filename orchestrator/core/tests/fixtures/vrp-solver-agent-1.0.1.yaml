@@ -1,0 +1,116 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: vrp-solver-agent
+  version: 1.0.1
+  description: Solves time-windowed vehicle routing problem with capacity constraints and depot reloading, producing exact chronological itineraries.
+spec:
+  runtime:
+    language: python
+    version: '3.11'
+    image_pull_policy: IfNotPresent
+    isolation: inherit
+    model: smart
+    temperature: 0.2
+  task:
+    instruction: |
+      You are a Vehicle Routing Problem solver agent.
+
+      CRITICAL — NO HALLUCINATION: The Intent you receive in the prompt IS the task. Implement it EXACTLY as stated. Do NOT invent, assume, substitute, simplify, or write placeholder, example, or demonstration code.
+
+      For every execution:
+      1. Read the Intent field from the prompt. That is the complete task definition.
+      2. Read the Input values field. Embed those exact values directly into the code.
+      3. Write a complete Python solution that implements the intent literally and prints the final result to stdout. Use fs.write to save it to the file path specified in the prompt (default: /workspace/itinerary.md).
+      4. Confirm the write succeeded before returning.
+
+      The solver must handle:
+      - Set of delivery locations with grid coordinates (x,y), box demands, and strict arrival+unload time windows (earliest start, latest finish).
+      - Fleet of vehicles each with a distinct box capacity.
+      - Depot at coordinate (0,0).
+      - Travel time of 1.5 minutes per straight-line grid unit (Euclidean distance).
+      - Fixed unload time of 15 minutes per stop regardless of box count.
+      - Reloading at the depot taking 30 minutes to restore the vehicle to full capacity whenever it runs out of boxes (or when it chooses to return).
+      - A vehicle cannot arrive at a clinic before its window opens (it may wait), and unloading must finish before the window closes.
+      - Find a feasible, efficient set of routes covering ALL clinics, minimizing makespan or total route time, with feasibility as hard constraint.
+      - Output for each van a precise chronological itinerary: departure from depot, each stop with exact arrival time, unload start/end (15 min), box count carried on arrival and remaining after drop-off, any reload trips back to the depot (30 min reload), and final route finish time.
+      - All times must be computed exactly (use fractions of minutes, e.g. 1.5-minute travel steps, and round display to the nearest minute or half-minute consistently), presented in HH:MM AM/PM format.
+      - Verify feasibility rigorously (each stop within its window, capacity never exceeded, all clinics served) and report the verification.
+      - Write the final itinerary to /workspace/itinerary.md and also print it.
+  security:
+    network:
+      mode: ''
+    filesystem:
+      read:
+      - /workspace
+      write:
+      - /workspace
+      read_only: false
+    resources:
+      cpu: 1000
+      memory: 512Mi
+      disk: 1Gi
+  tools:
+  - fs.write
+  - fs.read
+  - fs.list
+  - fs.glob
+  - fs.grep
+  - cmd.run
+  volumes:
+  - name: workspace
+    storage_class: ephemeral
+    type: seaweedfs
+    provider: seaweedfs
+    mount_path: /workspace
+    access_mode: read-write
+    size_limit: 1Gi
+  input_schema:
+    properties:
+      locations:
+        description: List of delivery locations.
+        items:
+          properties:
+            demand:
+              description: Number of boxes to deliver at this location.
+              type: integer
+            id:
+              description: Unique identifier for the location.
+              type: string
+            window_end:
+              description: Latest finish time for service (HH:MM AM/PM format).
+              type: string
+            window_start:
+              description: Earliest start time for service (HH:MM AM/PM format).
+              type: string
+            x:
+              description: X coordinate of the location.
+              type: number
+            y:
+              description: Y coordinate of the location.
+              type: number
+          required:
+          - id
+          - x
+          - y
+          - demand
+          - window_start
+          - window_end
+          type: object
+        type: array
+      vehicles:
+        description: List of vehicles.
+        items:
+          properties:
+            capacity:
+              description: Maximum number of boxes the vehicle can carry.
+              type: integer
+            id:
+              description: Vehicle identifier.
+              type: string
+          required:
+          - id
+          - capacity
+          type: object
+        type: array
+    type: object

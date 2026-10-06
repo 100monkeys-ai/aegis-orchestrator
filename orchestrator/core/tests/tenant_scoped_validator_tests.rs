@@ -312,6 +312,7 @@ fn stub_agent(id: AgentId) -> Agent {
             input_schema: None,
             output_handler: None,
             security_context: None,
+            program: None,
         },
     };
     Agent {

@@ -1090,6 +1090,7 @@ mod tests {
                 tool_validation: None,
                 delivery: None,
                 outputs: Vec::new(),
+                require_tool_call: false,
             },
             volumes: Vec::new(),
             keep_container_on_failure: false,
@@ -1097,6 +1098,8 @@ mod tests {
             bootstrap_path: None,
             execution_id: crate::domain::execution::ExecutionId::new(),
             workflow_execution_id: None,
+            program_files: Vec::new(),
+            program_input: None,
         }
     }
 

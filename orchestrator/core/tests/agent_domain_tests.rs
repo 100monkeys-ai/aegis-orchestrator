@@ -66,6 +66,7 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
             input_schema: None,
             security_context: None,
             output_handler: None,
+            program: None,
         },
     }
 }
@@ -641,6 +642,7 @@ fn execution_strategy_iterative_with_validation() {
         tool_validation: None,
         delivery: None,
         outputs: Vec::new(),
+        require_tool_call: false,
     };
     assert!(matches!(es.mode, ExecutionMode::Iterative));
     assert_eq!(es.max_retries, 10);
@@ -953,6 +955,7 @@ fn execution_strategy_json_round_trip() {
         tool_validation: None,
         delivery: None,
         outputs: Vec::new(),
+        require_tool_call: false,
     };
     let json = serde_json::to_string(&original).expect("serialize");
     let deserialized: ExecutionStrategy = serde_json::from_str(&json).expect("deserialize");

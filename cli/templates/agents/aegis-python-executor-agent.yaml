@@ -27,7 +27,8 @@ spec:
       REQUIRED PROCEDURE, IN ORDER:
 
       1. Write /workspace/solution.py via fs.write. The script must:
-         - Use only the Python standard library (no pip packages).
+         - Use only the modules the runtime image holds: a run has no
+           network, so a package cannot be installed.
          - Define `def solve(inputs):` that accepts a dict and returns the
            computed result.
          - In `if __name__ == "__main__":` it must:
@@ -103,6 +104,7 @@ spec:
     mode: iterative
     max_iterations: 3
     llm_timeout_seconds: 120
+    require_tool_call: true
 
   tools:
     - fs.write

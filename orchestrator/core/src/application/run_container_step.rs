@@ -112,6 +112,7 @@ impl RunContainerStepUseCase {
                 run_as_user: input.run_as_user.clone(),
                 network_mode: input.network_mode.clone(),
                 workflow_execution_id: input.workflow_execution_id,
+                files: Vec::new(),
             };
 
             match self.runner.run_step(config).await {
