@@ -48,6 +48,11 @@ pub enum DispatchAction {
         env_additions: HashMap<String, String>,
         timeout_secs: u32,
         max_output_bytes: u64,
+        /// Written to the command's standard input, then closed (AEGIS
+        /// ADR-040, Update of 2026-10-06, R2); absent, the command reads an
+        /// immediate end of input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin: Option<String>,
     },
     // Future: QueryEnv, Ping, StreamExec
 }

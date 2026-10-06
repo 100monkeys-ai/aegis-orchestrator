@@ -1210,6 +1210,7 @@ fn fit_command_to_try(
         env_additions,
         timeout_secs,
         max_output_bytes,
+        stdin,
     } = action;
     let mut fitted = timeout_secs;
     if let Some(deadline) = deadline {
@@ -1233,6 +1234,7 @@ fn fit_command_to_try(
             env_additions,
             timeout_secs: fitted,
             max_output_bytes,
+            stdin,
         },
         PendingCommand {
             requested_timeout_secs: timeout_secs,

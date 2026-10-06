@@ -397,6 +397,10 @@ impl ToolRouter {
                     "type": "object",
                     "additionalProperties": { "type": "string" },
                     "description": "Environment variables added for this command, as an object of string values, such as {\"INTENT_INPUTS\": \"{\\\"text\\\": \\\"hello\\\"}\"}. env_additions is an object, not a JSON string."
+                },
+                "stdin": {
+                    "type": "string",
+                    "description": "Text written to the command's standard input, which is then closed. Use it to feed a script that reads standard input, such as {\"value\": 43}. Without it the command reads an immediate end of input. At most max_output_bytes bytes."
                 }
             },
             "required": ["command"]
@@ -2270,6 +2274,30 @@ mod tests {
         assert!(
             env_desc.contains("not a JSON string"),
             "env_additions description: {env_desc}"
+        );
+    }
+
+    /// AEGIS ADR-040, Update of 2026-10-06, R2: `cmd.run` declares `stdin`,
+    /// an optional string, so the model can feed a script that reads it.
+    #[test]
+    fn cmd_run_schema_declares_optional_stdin_string() {
+        let cmd_run = ToolRouter::schema_for_builtin("cmd.run");
+        assert_eq!(
+            cmd_run["properties"]["stdin"]["type"],
+            json!("string"),
+            "cmd.run schema does not declare stdin as a string: {cmd_run}"
+        );
+        let desc = cmd_run["properties"]["stdin"]["description"]
+            .as_str()
+            .expect("stdin must carry a description");
+        assert!(desc.contains("standard input"), "stdin description: {desc}");
+        assert!(
+            !cmd_run["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .any(|v| v.as_str() == Some("stdin")),
+            "stdin must be optional: {cmd_run}"
         );
     }
 

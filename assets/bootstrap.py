@@ -21,6 +21,7 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE):
 import base64
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -325,10 +326,20 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
     dispatch_id = msg["dispatch_id"]
 
     if action == "exec":
-        # Build a shell command string. The orchestrator sends "command" as a
-        # single string (e.g. "touch /workspace/hello.txt") and optional "args".
-        parts = [msg["command"]] + msg.get("args", [])
-        command = " ".join(parts)
+        # The command line (AEGIS ADR-040, Update of 2026-10-06, R1 and R1a):
+        # "command" as the operator wrote it, run by the shell, followed by
+        # each of "args" quoted for the shell, so an argument holding a space
+        # or a quote reaches the program whole. With no args (absent or [])
+        # "command" runs as the shell line it is.
+        args = msg.get("args") or []
+        command = msg["command"]
+        if args:
+            command = command + " " + " ".join(shlex.quote(a) for a in args)
+        # Standard input (R2, R1b): the dispatch's "stdin" written whole and
+        # closed; without it, an immediate end of input, never the
+        # bootstrap's own standard input.
+        stdin_text = msg.get("stdin")
+        stdin_bytes = None if stdin_text is None else stdin_text.encode("utf-8")
         cwd = msg.get("cwd", "/workspace")
         timeout_secs = msg.get("timeout_secs", 60)
         max_bytes = msg.get("max_output_bytes", 1048576)  # the orchestrator's default
@@ -338,7 +349,8 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
         env = os.environ.copy()
         env.update(msg.get("env_additions", {}))
 
-        debug_print(f"exec: {command!r} cwd={cwd!r} timeout={timeout_secs}s")
+        stdin_shown = "none" if stdin_bytes is None else f"{len(stdin_bytes)}B"
+        debug_print(f"exec: {command!r} cwd={cwd!r} timeout={timeout_secs}s stdin={stdin_shown}")
         started_at = time.monotonic()
         try:
             # Its own session, so a timeout ends the command and everything
@@ -348,6 +360,7 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
                 shell=True,
                 cwd=cwd,
                 env=env,
+                stdin=subprocess.DEVNULL if stdin_bytes is None else subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
@@ -374,7 +387,7 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
 
         timed_out = False
         try:
-            stdout_b, stderr_b = proc.communicate(timeout=timeout_secs)
+            stdout_b, stderr_b = proc.communicate(input=stdin_bytes, timeout=timeout_secs)
         except subprocess.TimeoutExpired:
             timed_out = True
             stdout_b, stderr_b = _end_command(proc)

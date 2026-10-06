@@ -454,6 +454,126 @@ class ReadPromptTests(unittest.TestCase):
         )
 
 
+
+class ArgvAndStdinTests(unittest.TestCase):
+    """AEGIS ADR-040, Update of 2026-10-06 (R1, R2, R1a, R1b): an `exec`
+    dispatch keeps its arguments and may carry standard input. Executions
+    6c6999ec, 71e702a7 and 93637ef3 of `unit-conversion-agent`: `sh -c 'echo
+    hello'` answered a bare newline, `python3 -c "print('hello')"` exited 2,
+    and a script reading standard input could not be fed."""
+
+    # Echoes the `value` of the JSON on its standard input.
+    CONVERT = "import json, sys\nprint(json.load(sys.stdin)['value'])\n"
+    # Reports what its standard input held, or that it had to wait for it.
+    READ_ALL = "import sys\nprint(repr(sys.stdin.read()))\n"
+    # Prints its first argument.
+    FIRST_ARG = "import sys\nprint(sys.argv[1])\n"
+
+    def setUp(self):
+        self.bootstrap = load_bootstrap()
+        self.dir = pathlib.Path(self._tmp())
+        (self.dir / "convert.py").write_text(self.CONVERT)
+        (self.dir / "read_all.py").write_text(self.READ_ALL)
+        (self.dir / "first_arg.py").write_text(self.FIRST_ARG)
+
+    def _tmp(self):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory(prefix="aegis-argv-")
+        self.addCleanup(tmp.cleanup)
+        return tmp.name
+
+    def run_exec(self, **fields):
+        msg = {"action": "exec", "dispatch_id": "d", "cwd": str(self.dir), "timeout_secs": 10}
+        msg.update(fields)
+        return self.bootstrap.run_dispatch(msg, "e")
+
+    def test_an_argument_holding_a_space_reaches_the_command_whole(self):
+        result = self.run_exec(command="sh", args=["-c", "echo hello"])
+        self.assertEqual(
+            result["stdout"],
+            "hello\n",
+            f"sh -c 'echo hello' did not answer hello: {result}",
+        )
+        self.assertEqual(result["exit_code"], 0, result)
+
+    def test_an_argument_holding_quotes_and_parentheses_reaches_the_command_whole(self):
+        result = self.run_exec(command="python3", args=["-c", "print('hello')"])
+        self.assertEqual(
+            result["stdout"],
+            "hello\n",
+            f"python3 -c \"print('hello')\" did not answer hello: {result}",
+        )
+        self.assertEqual(result["exit_code"], 0, result)
+
+    def test_a_command_written_as_a_shell_line_takes_its_arguments_after_it(self):
+        # R1a: the command string as the operator wrote it, each argument
+        # quoted after it.
+        result = self.run_exec(command="python3 first_arg.py", args=["43"])
+        self.assertEqual(
+            result["exit_code"], 0, f"python3 first_arg.py 43 did not run: {result}"
+        )
+        self.assertEqual(result["stdout"], "43\n", result)
+
+    def test_stdin_is_written_to_the_command_and_closed(self):
+        result = self.run_exec(command="python3", args=["convert.py"], stdin='{"value":43}')
+        self.assertEqual(
+            result["stdout"],
+            "43\n",
+            f"the script reading stdin was not given the piped JSON: {result}",
+        )
+        self.assertEqual(result["exit_code"], 0, result)
+
+    def test_without_stdin_the_command_reads_an_immediate_end_of_input(self):
+        # R1b: never the bootstrap's own standard input. The bootstrap here
+        # runs with an open pipe on its standard input that is never written
+        # or closed, as a container's would be if the prompt pipe stayed open:
+        # a command inheriting it waits until its timeout.
+        runner = (
+            "import importlib.util, json, sys\n"
+            "sys.dont_write_bytecode = True\n"
+            f"spec = importlib.util.spec_from_file_location('b', {str(BOOTSTRAP)!r})\n"
+            "b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)\n"
+            "msg = json.loads(sys.argv[1])\n"
+            "sys.stdout.write(json.dumps(b.run_dispatch(msg, 'e')))\n"
+        )
+        msg = {
+            "action": "exec",
+            "dispatch_id": "d",
+            "command": "python3",
+            "args": ["read_all.py"],
+            "cwd": str(self.dir),
+            "timeout_secs": 3,
+        }
+        proc = subprocess.Popen(
+            [sys.executable, "-B", "-c", runner, json.dumps(msg)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            env=dict(os.environ, AEGIS_MODEL_ALIAS="default"),
+        )
+        # Not communicate(), which would close the pipe: it stays open and
+        # unwritten until the bootstrap has answered.
+        try:
+            proc.wait(timeout=30)
+            out = proc.stdout.read()
+        finally:
+            proc.stdin.close()
+            proc.stdout.close()
+        result = json.loads(out)
+        self.assertEqual(
+            result["stdout"],
+            "''\n",
+            f"a command given no stdin did not read an immediate end of input: {result}",
+        )
+        self.assertEqual(result["exit_code"], 0, result)
+
+    def test_a_shell_line_with_empty_args_runs_as_today(self):
+        for fields in ({}, {"args": []}):
+            result = self.run_exec(command="echo a b | tr a-z A-Z", **fields)
+            self.assertEqual(result["stdout"], "A B\n", f"{fields}: {result}")
+            self.assertEqual(result["exit_code"], 0, result)
+
+
 if __name__ == "__main__":
     os.environ.setdefault("AEGIS_MODEL_ALIAS", "default")
     unittest.main()

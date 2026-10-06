@@ -88,6 +88,8 @@ impl DispatchEncoder {
             u64::MAX,
         )?;
 
+        let stdin = read_stdin(args.get("stdin"), max_output_bytes)?;
+
         Ok(DispatchAction::Exec {
             command,
             args: extra_args,
@@ -95,6 +97,7 @@ impl DispatchEncoder {
             env_additions: Self::scrub_env(env_additions, env_denylist),
             timeout_secs,
             max_output_bytes,
+            stdin,
         })
     }
 }
@@ -155,6 +158,29 @@ fn read_args(value: Option<&Value>) -> Result<Vec<String>, SealSessionError> {
             other => Err(refuse(&format!("args[{i}]"), "a string", other)),
         })
         .collect()
+}
+
+/// `stdin`: a string written to the command's standard input, at most
+/// `max_output_bytes` bytes of UTF-8 (AEGIS ADR-040, Update of 2026-10-06, R2
+/// and R1c). The bootstrap trusts the bound and writes it whole.
+fn read_stdin(
+    value: Option<&Value>,
+    max_output_bytes: u64,
+) -> Result<Option<String>, SealSessionError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            if text.len() as u64 > max_output_bytes {
+                return Err(SealSessionError::MalformedPayload(format!(
+                    "cmd.run: 'stdin' must be at most max_output_bytes ({max_output_bytes}) bytes \
+                     of UTF-8; received a string of {} bytes",
+                    text.len()
+                )));
+            }
+            Ok(Some(text.clone()))
+        }
+        Some(other) => Err(refuse("stdin", "a string", other)),
+    }
 }
 
 /// `env_additions`: an object whose values are strings (numbers and booleans
@@ -245,6 +271,7 @@ mod tests {
         env_additions: HashMap<String, String>,
         timeout_secs: u32,
         max_output_bytes: u64,
+        stdin: Option<String>,
     }
 
     fn encode_ok(raw: Value) -> Exec {
@@ -255,6 +282,7 @@ mod tests {
                 env_additions,
                 timeout_secs,
                 max_output_bytes,
+                stdin,
                 ..
             } => Exec {
                 args,
@@ -262,6 +290,7 @@ mod tests {
                 env_additions,
                 timeout_secs,
                 max_output_bytes,
+                stdin,
             },
         }
     }
@@ -417,7 +446,51 @@ mod tests {
             assert!(exec.env_additions.is_empty());
             assert_eq!(exec.timeout_secs, 600);
             assert_eq!(exec.max_output_bytes, 1_048_576);
+            assert_eq!(exec.stdin, None);
         }
+    }
+
+    /// AEGIS ADR-040, Update of 2026-10-06, R2: the JSON a script reads on
+    /// its standard input (execution 93637ef3, `unit-conversion-agent`).
+    #[test]
+    fn stdin_string_is_passed_through_whole() {
+        let exec = encode_ok(json!({
+            "command": "python3",
+            "args": ["/workspace/convert.py"],
+            "stdin": "{\"value\":43}"
+        }));
+        assert_eq!(exec.stdin.as_deref(), Some("{\"value\":43}"));
+    }
+
+    /// R1c: `stdin` is a string; any other shape is refused naming it.
+    #[test]
+    fn stdin_that_is_not_a_string_is_refused_naming_stdin() {
+        for bad in [json!(43), json!({"value": 43}), json!(["a"]), json!(true)] {
+            let msg = refusal(json!({"command": "cat", "stdin": bad}));
+            assert!(
+                msg.starts_with("cmd.run: 'stdin' must be a string; received "),
+                "{msg}"
+            );
+        }
+    }
+
+    /// R1c: `stdin` is bounded by the dispatch's `max_output_bytes`, counted
+    /// in bytes of UTF-8, not characters.
+    #[test]
+    fn stdin_over_max_output_bytes_is_refused_naming_stdin_and_the_bound() {
+        // Five characters, ten bytes.
+        let msg = refusal(json!({"command": "cat", "stdin": "ééééé", "max_output_bytes": 9}));
+        assert_eq!(
+            msg,
+            "cmd.run: 'stdin' must be at most max_output_bytes (9) bytes of UTF-8; \
+             received a string of 10 bytes"
+        );
+        let exec = encode_ok(json!({"command": "cat", "stdin": "ééééé", "max_output_bytes": 10}));
+        assert_eq!(
+            exec.stdin.as_deref(),
+            Some("ééééé"),
+            "at the bound it is passed"
+        );
     }
 
     /// The inner loop classifies `MalformedPayload` as recoverable and feeds

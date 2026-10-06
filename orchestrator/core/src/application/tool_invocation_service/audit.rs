@@ -178,6 +178,17 @@ impl ToolInvocationService {
                                     JUDGE_COMMAND_HEAD_CHARS,
                                     JUDGE_COMMAND_TAIL_CHARS,
                                 ),
+                                // AEGIS ADR-040, Update of 2026-10-06, R1d:
+                                // what a command is fed is shown by its
+                                // presence and size, never its content.
+                                ("stdin", Value::String(text)) => serde_json::json!({
+                                    "present": true,
+                                    "bytes": text.len(),
+                                }),
+                                ("stdin", other) => serde_json::json!({
+                                    "present": true,
+                                    "bytes": other.to_string().len(),
+                                }),
                                 _ => Self::file_tool_argument_view(value),
                             };
                             (key.clone(), view)
@@ -498,5 +509,45 @@ impl ToolInvocationService {
                 ),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod stdin_view_tests {
+    use super::*;
+
+    /// AEGIS ADR-040, Update of 2026-10-06, R1d: the audit and the tool judge
+    /// see that a `cmd.run` fed its command standard input, and how many
+    /// bytes, never the text.
+    #[test]
+    fn cmd_run_stdin_is_shown_by_presence_and_length_never_its_text() {
+        let secret = "{\"value\":43,\"note\":\"do-not-show-this-text\"}";
+        let view = ToolInvocationService::compact_tool_arguments(
+            "cmd.run",
+            &serde_json::json!({
+                "command": "python3",
+                "args": ["/workspace/convert.py"],
+                "stdin": secret
+            }),
+        );
+        assert_eq!(
+            view["stdin"],
+            serde_json::json!({"present": true, "bytes": secret.len()}),
+            "the cmd.run view: {view}"
+        );
+        assert!(
+            !view.to_string().contains("do-not-show-this-text"),
+            "the cmd.run view shows stdin's text: {view}"
+        );
+        assert_eq!(view["command"], serde_json::json!("python3"));
+    }
+
+    #[test]
+    fn cmd_run_without_stdin_shows_no_stdin_key() {
+        let view = ToolInvocationService::compact_tool_arguments(
+            "cmd.run",
+            &serde_json::json!({"command": "ls"}),
+        );
+        assert!(view.get("stdin").is_none(), "{view}");
     }
 }
