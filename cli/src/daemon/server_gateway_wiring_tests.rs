@@ -122,6 +122,7 @@ impl GatewayInvocationService for Recorder {
         self.0.lock().unwrap().tools.push(req.into_inner());
         Ok(tonic::Response::new(InvokeToolResponse {
             result_json: "{}".to_string(),
+            grounding_json: String::new(),
         }))
     }
 }

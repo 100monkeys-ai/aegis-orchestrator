@@ -71,6 +71,10 @@ struct StubGateway {
     /// The node-wide tools it lists.
     tools: Vec<ToolSummary>,
     answer: Answer,
+    /// The `grounding_json` it writes beside an `InvokeTool` result (empty:
+    /// none, as a gateway answers when the server's `initialize` carried no
+    /// `_grounding`).
+    grounding_json: String,
     received: Arc<StdMutex<Received>>,
 }
 
@@ -79,8 +83,16 @@ impl StubGateway {
         Self {
             tools,
             answer,
+            grounding_json: String::new(),
             received: Arc::new(StdMutex::new(Received::default())),
         }
+    }
+
+    /// The same stub, writing `grounding_json` beside every `InvokeTool`
+    /// result (AEGIS ADR-132 H9a).
+    fn with_grounding(mut self, grounding_json: String) -> Self {
+        self.grounding_json = grounding_json;
+        self
     }
 
     fn answer<T>(&self, ok: impl FnOnce(String) -> T) -> Result<tonic::Response<T>, tonic::Status> {
@@ -149,7 +161,10 @@ impl GrpcGatewayInvocationService for StubGateway {
         req: tonic::Request<PbInvokeToolRequest>,
     ) -> Result<tonic::Response<InvokeToolResponse>, tonic::Status> {
         self.received.lock().unwrap().tools.push(req.into_inner());
-        self.answer(|result_json| InvokeToolResponse { result_json })
+        self.answer(|result_json| InvokeToolResponse {
+            result_json,
+            grounding_json: self.grounding_json.clone(),
+        })
     }
 }
 
@@ -2491,4 +2506,113 @@ async fn a_plaintext_gateway_address_never_carries_a_token_to_be_grounded() {
             if code == "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL"
     ));
     assert!(stub.received.lock().unwrap().tools.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The grounding a gateway answers beside the result (ADR-132 H9a)
+// ---------------------------------------------------------------------------
+
+/// The `_grounding` object a server answers on `initialize`, as the gateway
+/// writes it into `grounding_json`, for a token reaching `instances`.
+fn grounding_json(instances: &[(&str, &str)]) -> String {
+    json!({
+        "instance": {"id": "root-id", "slug": "main"},
+        "you": {
+            "currentWorkspace": null,
+            "instances": instances
+                .iter()
+                .map(|(id, slug)| json!({"id": id, "slug": slug, "name": slug, "role": "member"}))
+                .collect::<Vec<_>>(),
+        },
+    })
+    .to_string()
+}
+
+/// Store a token through a TLS gateway served by `stub`: the store's answer
+/// and the reach the binding recorded, if one was stored.
+async fn store_through(
+    stub: &StubGateway,
+) -> (
+    anyhow::Result<CredentialBindingId>,
+    Option<crate::domain::credential::BindingReach>,
+) {
+    use crate::application::credential_service::CredentialManagementService;
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let tenant = h.tenant.clone();
+    let service = Arc::new(h.service);
+    grounded_by(&vault, &service);
+    let stored = vault.service.store_api_key(store_command(&tenant)).await;
+    let reach = match &stored {
+        Ok(id) => vault
+            .bindings
+            .find_by_id(id)
+            .await
+            .unwrap()
+            .and_then(|binding| binding.metadata.reach),
+        Err(_) => None,
+    };
+    (stored, reach)
+}
+
+/// H9a: a gateway that answers `grounding_json` beside the `cortex.ground`
+/// result grounds the binding from it, and the result is not read: neither
+/// a result naming another instance nor one that is not JSON changes the
+/// reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grounding_answered_beside_the_result_grounds_the_binding_without_the_result() {
+    let cases = [
+        (
+            "a result naming another instance",
+            grounding_result(&[("inst-other-id", "other")]),
+        ),
+        (
+            "a result that is not JSON",
+            Answer::Result("not json".to_string()),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, answer) in cases {
+        let stub = StubGateway::new(vec![], answer)
+            .with_grounding(grounding_json(&[("inst-play2-id", "play2")]));
+        let (stored, reach) = store_through(&stub).await;
+        if let Err(e) = &stored {
+            failures.push(format!("{case}: the store refused: {e}"));
+            continue;
+        }
+        let reach = reach.expect("reach recorded");
+        println!("{case}: reach {}", serde_json::to_value(&reach).unwrap());
+        let left = (reach.instance_slug.as_deref(), reach.instance_id.as_deref());
+        let right = (Some("play2"), Some("inst-play2-id"));
+        if left != right {
+            failures.push(format!(
+                "{case}: the reach was not read from grounding_json: left {left:?} right {right:?}"
+            ));
+        }
+        if stub.received.lock().unwrap().tools.len() != 1 {
+            failures.push(format!("{case}: the grounding was not one InvokeTool"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// H9a: a gateway that answers `grounding_json` empty (an older gateway, or
+/// a server whose `initialize` carried no `_grounding`) leaves the grounding
+/// to the result's text, as before the field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_grounding_falls_back_to_the_results_text() {
+    let stub = StubGateway::new(vec![], grounding_result(&[("inst-play2-id", "play2")]));
+    let (stored, reach) = store_through(&stub).await;
+    if let Err(e) = &stored {
+        panic!("the store refused a grounding in the result's text: {e}");
+    }
+    let reach = reach.expect("reach recorded");
+    println!("fallback: reach {}", serde_json::to_value(&reach).unwrap());
+    assert_eq!(reach.kind, crate::domain::credential::ReachKind::Instance);
+    assert_eq!(
+        (reach.instance_slug.as_deref(), reach.instance_id.as_deref()),
+        (Some("play2"), Some("inst-play2-id")),
+        "the reach was not read from the result's text"
+    );
 }

@@ -92,6 +92,7 @@ impl GrpcGateway for Gateway {
         Ok(tonic::Response::new(InvokeToolResponse {
             result_json: r#"{"content":[{"type":"text","text":"page"}],"isError":false}"#
                 .to_string(),
+            grounding_json: String::new(),
         }))
     }
 }

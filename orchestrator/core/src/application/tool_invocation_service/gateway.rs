@@ -968,10 +968,15 @@ impl ToolInvocationService {
     /// the gateway's `InvokeTool` with arguments `{}`, the token as the
     /// call's credential and the binding's owner as the acting identity. The
     /// orchestrator makes no connection of its own to the server (H2). The
-    /// grounding payload is the text of the result's first content item,
-    /// parsed as JSON; a result that carries none answers `null`, which the
-    /// caller reads as a grounding that reports no reach. Nothing is sent
-    /// over a plaintext gateway address (H8).
+    /// grounding payload is the response's `grounding_json` when the gateway
+    /// answers it (H9a: the `_grounding` the server answered on this call's
+    /// `initialize`, with the same token), parsed as JSON, and the result is
+    /// then not read, `isError` included; JSON that does not parse is
+    /// `INTERNAL_ERROR`. When `grounding_json` is empty, the payload is the
+    /// text of the result's first content item, parsed as JSON; a result
+    /// that carries none answers `null`, which the caller reads as a
+    /// grounding that reports no reach. Nothing is sent over a plaintext
+    /// gateway address (H8).
     pub async fn ground_remote_token(
         &self,
         tenant_id: &TenantId,
@@ -1051,6 +1056,10 @@ impl ToolInvocationService {
                     ));
                 }
             };
+        if !response.grounding_json.is_empty() {
+            return serde_json::from_str(&response.grounding_json)
+                .map_err(|e| unreachable("INTERNAL_ERROR", e.to_string()));
+        }
         let result = parse_gateway_result(&response.result_json)
             .map_err(|e| unreachable("INTERNAL_ERROR", e.to_string()))?;
         grounding_payload(&result)
