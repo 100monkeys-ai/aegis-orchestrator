@@ -560,6 +560,39 @@ impl ExecutionRepository for PostgresExecutionRepository {
         Ok(executions)
     }
 
+    async fn read_steps_of_workflow_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_execution_id: uuid::Uuid,
+    ) -> Result<Vec<Result<Execution, (ExecutionId, RepositoryError)>>, RepositoryError> {
+        // The same steps as `find_by_workflow_execution_for_tenant`, each row
+        // read on its own: one that cannot be read is its id with the error,
+        // never left out (AEGIS ADR-131 U32a).
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM executions
+            WHERE tenant_id = $1 AND input->>'workflow_execution_id' = $2
+            ORDER BY started_at ASC, id ASC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(workflow_execution_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut steps = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = ExecutionId(id);
+            steps.push(match self.find_by_id_for_tenant(tenant_id, id).await {
+                Ok(Some(execution)) => Ok(execution),
+                Ok(None) => Err((id, RepositoryError::NotFound(format!("execution {id}")))),
+                Err(error) => Err((id, error)),
+            });
+        }
+        Ok(steps)
+    }
+
     async fn find_recent_for_tenant(
         &self,
         tenant_id: &TenantId,

@@ -190,6 +190,26 @@ pub trait ExecutionRepository: Send + Sync {
         workflow_execution_id: uuid::Uuid,
     ) -> Result<Vec<Execution>, RepositoryError>;
 
+    /// The step executions of one workflow execution, oldest first, each
+    /// read on its own: a step whose row cannot be read is its id with the
+    /// error, never left out (AEGIS ADR-131 U32, U32a: `steps_unread`). The
+    /// default reads them all at once, as
+    /// [`Self::find_by_workflow_execution_for_tenant`] does; an implementation
+    /// that loads its rows one by one overrides it.
+    #[allow(clippy::type_complexity)]
+    async fn read_steps_of_workflow_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_execution_id: uuid::Uuid,
+    ) -> Result<Vec<Result<Execution, (ExecutionId, RepositoryError)>>, RepositoryError> {
+        Ok(self
+            .find_by_workflow_execution_for_tenant(tenant_id, workflow_execution_id)
+            .await?
+            .into_iter()
+            .map(Ok)
+            .collect())
+    }
+
     async fn find_recent_for_tenant(
         &self,
         tenant_id: &TenantId,
