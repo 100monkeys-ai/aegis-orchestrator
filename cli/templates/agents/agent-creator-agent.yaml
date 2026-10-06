@@ -169,6 +169,20 @@ spec:
                       prints the final result to stdout. Use fs.write to save it to the file
                       path specified in the prompt (default: /workspace/solution.py).
                    4. Confirm the write succeeded before returning.
+               tools:
+                 - fs.write
+                 - fs.read
+                 - fs.list
+                 - fs.glob
+                 - fs.grep
+                 - cmd.run
+               volumes:
+                 - name: workspace
+                   storage_class: ephemeral
+                   mount_path: /workspace
+                   access_mode: read-write
+                   size_limit: 1Gi
+                   ttl_hours: 1
            A manifest without spec.task or with an empty spec.task.instruction is INVALID and will
            be rejected by the schema validator and the manifest parser. Do not submit it.
          - Populate `metadata.tags` with 3 to 5 free-form lowercase hyphenated strings describing the
@@ -186,6 +200,18 @@ spec:
          - If the requested capability already has a good canonical name (e.g. "copywriter"),
            use it. Strip task-specific nouns (topics, target channels, specific filenames) from
            the name and description entirely.
+         - TOOLS ARE THE ONLY WAY AN AGENT ACTS. An agent whose `spec.tools` is empty can only return
+           text: it cannot write a file, read a file, or run a command. If the agent's task requires
+           writing files (any output file, report, PDF, image or script) or running commands,
+           `spec.tools` MUST declare the tools that do it (at least `fs.write` to write files,
+           `cmd.run` to run a command or script), and the manifest MUST declare a read-write volume
+           with mount_path `/workspace`. The platform refuses at deploy, with the reason, an agent
+           that names a /workspace file or declares a writable volume or filesystem.write and
+           declares no tools (AEGIS ADR-005 O4).
+         - An agent that declares `fs.write`, `fs.edit`, `fs.multi_edit`, `fs.create_dir` or
+           `fs.delete` MUST declare a read-write volume with mount_path `/workspace`, including an
+           agent built only for workflow steps: inside a workflow the declared volume yields to the
+           workflow's workspace. The platform refuses it at deploy otherwise (AEGIS ADR-005 O5).
          - When composing `spec.tools`, select the full relevant tool suite for the agent's capability.
            Do NOT give a code-writing or code-execution agent only `fs.write` + `cmd.run` and rely on
            instruction text to prevent `cmd.run` misuse — give it the correct tools instead.

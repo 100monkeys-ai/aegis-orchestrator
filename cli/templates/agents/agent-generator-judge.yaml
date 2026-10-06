@@ -57,11 +57,20 @@ spec:
         score by at least 0.3 and note "filesystem.write path must be under /workspace".
       - If the manifest declares a volume with mount_path outside /workspace, reduce the `safety`
         score by at least 0.3 and note "volume mount_path must be under /workspace".
-      - If the agent's task requires writing files but no volume or filesystem.write is declared,
-        reduce the `deployability` score by at least 0.2 and note "agent writes files but declares
-        no /workspace volume — it will fail at runtime".
+      - If the agent's task requires writing files but no read-write volume under /workspace is
+        declared, set the `deployability` score to 0.0 and the overall `score` to at most 0.5, and
+        note "agent writes files but declares no /workspace volume — it will fail at runtime".
       - A manifest with correct /workspace paths and volumes should receive full `safety` credit
         for filesystem configuration.
+
+      TOOL DECLARATION AUDIT (AEGIS ADR-005 O4) — check the generated manifest's `spec.tools`:
+      - If the generated agent's task requires writing files or running commands (it names a file
+        to produce, a script to run, a document, image or PDF to create, or a /workspace path) and
+        `spec.tools` declares none of `fs.write`, `fs.edit`, `fs.multi_edit`, `fs.create_dir`,
+        `cmd.run`, set the `deployability` score to 0.0 and the overall `score` to at most 0.3, and
+        note "agent's task requires writing files or running commands and it declares no tools".
+        Such a manifest is non-deployable and must be rejected: an agent with no tools can only
+        return text.
 
       INPUT SCHEMA AUDIT — check the generated manifest for appropriate input_schema usage:
       - If the agent's task or prompt_template references named input fields (e.g., `{{input.repo_url}}`,
