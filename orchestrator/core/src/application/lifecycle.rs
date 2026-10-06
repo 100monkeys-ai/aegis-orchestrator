@@ -533,4 +533,111 @@ mod tests {
             other => panic!("expected AgentRemoved, got {other:?}"),
         }
     }
+
+    /// AEGIS ADR-005 O4: the shape of `delivery-itinerary-pdf-agent`
+    /// (3b367333), a `/workspace` volume, with the tools given.
+    fn delivery_itinerary(version: &str, tools: &str) -> AgentManifest {
+        crate::infrastructure::agent_manifest_parser::AgentManifestParser::parse_yaml(&format!(
+            r#"apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: delivery-itinerary-pdf-agent
+  version: "{version}"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+  task:
+    instruction: Write the delivery itinerary PDF to /workspace/delivery_itinerary.pdf.
+{tools}
+  volumes:
+    - name: workspace
+      storage_class: persistent
+      type: seaweedfs
+      mount_path: /workspace
+      access_mode: read-write
+      size_limit: 1Gi
+"#
+        ))
+        .expect("the delivery itinerary manifest parses")
+    }
+
+    const O4_SENTENCE: &str = "Agent 'delivery-itinerary-pdf-agent' is refused (AEGIS ADR-005 \
+        O4): its instruction requires writing files or running commands and it declares no \
+        tools; it declares the read-write volume 'workspace' at /workspace; its instruction \
+        names the workspace file /workspace/delivery_itinerary.pdf. Declare the tools it needs \
+        in spec.tools (fs.write to write files, cmd.run to run commands).";
+
+    #[tokio::test]
+    async fn deploy_refuses_a_tool_less_work_agent_with_the_o4_sentence() {
+        let (svc, _bus) = make_service();
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let err = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                delivery_itinerary("1.0.0", ""),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect_err("deploy must refuse a tool-less agent whose instruction writes a file");
+        assert_eq!(err.to_string(), O4_SENTENCE);
+        assert_eq!(
+            svc.lookup_agent_for_tenant(&alice, "delivery-itinerary-pdf-agent")
+                .await
+                .expect("lookup ok"),
+            None,
+            "a refused agent is not saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_accepts_the_same_agent_once_it_declares_fs_write() {
+        let (svc, _bus) = make_service();
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        svc.deploy_agent_for_tenant(
+            &alice,
+            delivery_itinerary("1.0.0", "  tools:\n    - fs.write"),
+            false,
+            AgentScope::Tenant,
+            None,
+        )
+        .await
+        .expect("deploy accepts the agent once it declares fs.write");
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_tool_less_work_agent_with_the_o4_sentence() {
+        let (svc, _bus) = make_service();
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let id = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                delivery_itinerary("1.0.0", "  tools:\n    - fs.write"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect("deploy v1 ok");
+
+        let err = svc
+            .update_agent_for_tenant(&alice, id, delivery_itinerary("1.1.0", ""))
+            .await
+            .expect_err("update must refuse a tool-less agent whose instruction writes a file");
+        assert_eq!(err.to_string(), O4_SENTENCE);
+        let kept = svc.get_agent_for_tenant(&alice, id).await.expect("get ok");
+        assert_eq!(
+            kept.manifest.spec.tools,
+            vec!["fs.write".to_string()],
+            "a refused update leaves the deployed manifest in place"
+        );
+    }
 }
