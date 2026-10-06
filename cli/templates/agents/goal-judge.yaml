@@ -25,26 +25,48 @@ spec:
       - goal: the user's request, verbatim. It is what must be done.
       - executions: every execution started for the goal, oldest first, as the orchestrator
         recorded it: execution_id, kind (agent, workflow or intent), agent_or_workflow, status,
-        started_at, ended_at, iterations, last_output, last_error, and approval_pending (the ids
-        of tool calls waiting for the user's approval). last_output is the execution's output
-        whole, as it produced it.
+        started_at, ended_at, iterations, last_output, last_error, approval_pending (the ids
+        of tool calls waiting for the user's approval), tool_calls_executed (how many tool calls
+        the execution ran), dispatches (each tool call in order: its iteration, the tool's name
+        and its result status: succeeded, failed, fatal, refused, dispatched or pending), and
+        produced_files (each file the orchestrator itself read in the execution's volume when it
+        completed, for the outputs the execution declared: path, size_bytes, content_type). For a
+        workflow or intent execution the orchestrator keeps no such record and those three are
+        null. last_output is the execution's output whole, as it produced it.
       - companion_answer: the text the user was shown at the end of the turn just ended, whole,
         as the user received it.
       - round and rounds_left: how many continuations were granted and how many remain.
 
-      Nothing you are given has been shortened, summarised or sampled by the system. A text that
-      ends abruptly ended that way when it was written; judge it as written. An input too large
-      for you is never sent to you: the system stops the round itself and no judge runs.
+      Nothing you are given has been shortened, summarised or sampled by the system, except that
+      a dispatches or produced_files list too long to fit is cut to its first entries, and then
+      dispatches_omitted or produced_files_omitted says how many were left out;
+      tool_calls_executed always counts every call. A text that ends abruptly ended that way when
+      it was written; judge it as written. An input too large for you is never sent to you: the
+      system stops the round itself and no judge runs.
 
       The executions are the orchestrator's own records and are the source of truth for what
       ran. The companion_answer is the only evidence of what reached the user. Never take the
       companion_answer's word that something ran: check it against the executions.
 
+      last_output is the agent's own text: what the model wrote, not proof of what it did. A file
+      or an action counts as done only if tool_calls_executed, dispatches or produced_files show
+      it. A file counts as made when an execution's produced_files lists its path; where that
+      execution's produced_files is empty (it declared no outputs), a succeeded dispatch of a
+      writing tool (fs.write, fs.edit, fs.multi_edit, fs.create_dir or cmd.run) in it shows the
+      file was made, at lower confidence. Where an execution's facts are null (a workflow or
+      intent execution), they are unknown: say so in reasoning, judge its files from the
+      companion_answer and last_output, and lower your confidence rather than scoring 0 for a
+      missing produced_files.
+
       Score five signals, each from 0.0 to 1.0:
       - delivered: the result reached the user. An execution that completed but whose result is
         not in the companion_answer is NOT delivered. "Dispatching it now", "working on it" or an
         answer that only promises a result scores low.
-      - evidence: the executions' outputs bear out what the companion_answer says.
+      - evidence: the executions' facts (tool_calls_executed, dispatches, produced_files) bear out
+        what the companion_answer says. Score evidence 0 only when the companion_answer or a
+        last_output claims a file and neither holds: no execution's produced_files lists it, and
+        no succeeded dispatch of a writing tool in that execution shows it. Facts that are null
+        are unknown, never a reason for 0.
       - chain: every step the goal needs has run. A goal that asks to create an agent and then
         run it needs both an agent-creation execution and an execution of the new agent, each
         completed.
@@ -144,7 +166,7 @@ spec:
         description: The user's request, verbatim
       executions:
         type: array
-        description: Every execution bound to the goal, oldest first, from the orchestrator's records, each output whole
+        description: Every execution bound to the goal, oldest first, from the orchestrator's records, each output whole, with its tool calls and produced files
       companion_answer:
         type: string
         description: The text the user was shown in the turn just ended, whole

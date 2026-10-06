@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::domain::events::GoalEvent;
-use crate::domain::execution::ExecutionId;
+use crate::domain::execution::{ExecutionId, ProducedFile};
 use crate::domain::goal::{
     execution_wait_bound, judge_context_or_default, judge_input_digest, outcome_of, truncate_chars,
     wait_time_text, BoundExecution, BoundKind, Goal, GoalChannel, GoalEvaluation, GoalId,
@@ -139,6 +139,17 @@ pub struct ExecutionView {
     pub iterations: Option<usize>,
     pub last_output: Option<String>,
     pub last_error: Option<String>,
+    /// How many of its tool calls ran (U30): every call its tries made,
+    /// less those refused before running or still pending. `None` for a
+    /// workflow or intent execution, which keeps no record of its own.
+    pub tool_calls_executed: Option<usize>,
+    /// Each tool call its tries made, oldest first, from the stored
+    /// trajectory (U30). `None` for a workflow or intent execution.
+    pub dispatches: Option<Vec<DispatchFact>>,
+    /// The files the orchestrator read in its volume when it completed
+    /// (U30; AEGIS ADR-005, Update of 2026-10-06, O3). `None` for a workflow
+    /// or intent execution.
+    pub produced_files: Option<Vec<ProducedFile>>,
     /// The latest a round waits for this execution (U23):
     /// [`crate::domain::goal::execution_wait_bound`] of its start and its
     /// recorded time limit.
@@ -151,6 +162,23 @@ impl ExecutionView {
     /// whatever its row still says.
     pub fn runs_at(&self, now: DateTime<Utc>) -> bool {
         matches!(self.status.as_str(), "pending" | "running") && now < self.bound_until
+    }
+}
+
+/// One tool call an execution made, as its stored trajectory records it
+/// (U30): the try that made it, the tool's name, and its status verbatim
+/// (`succeeded`, `failed`, `fatal`, `refused`, `dispatched` or `pending`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DispatchFact {
+    pub iteration: u8,
+    pub tool: String,
+    pub status: String,
+}
+
+impl DispatchFact {
+    /// The call ran: it was neither refused before running nor left pending.
+    pub fn executed(&self) -> bool {
+        !matches!(self.status.as_str(), "refused" | "pending")
     }
 }
 
@@ -634,9 +662,11 @@ impl GoalService {
         evaluations: &[GoalEvaluation],
     ) -> Result<Attempt, GoalError> {
         let input = self.judge_input(world, goal, companion_answer).await?;
+        // U17's digest is of the input as the judge is given it, after U30's
+        // facts were fitted to its room.
         let digest = judge_input_digest(&input);
-        // U16: a prompt the judge's model cannot hold is never sent and
-        // never cut; the round ends with the sizes, in a sentence.
+        // U16: a prompt the judge's model cannot hold is never sent and its
+        // texts are never cut; the round ends with the sizes, in a sentence.
         let input_text = serde_json::to_string(&input).unwrap_or_default();
         let context = judge_context_or_default(self.judge_context.as_deref(), GOAL_JUDGE_ALIAS);
         if let Some(over) = OverLimit::check(&input_text, JUDGE_PROMPT_RESERVE_BYTES, context) {
@@ -784,9 +814,12 @@ impl GoalService {
 
     /// D4: the goal verbatim, every bound execution oldest first as the
     /// orchestrator's rows hold it, its last output whole, the companion's
-    /// answer whole (U14: nothing a judge is given is cut), the round and the
+    /// answer whole (U14: no text a judge is given is cut), the round and the
     /// rounds left. `approval_pending` covers executions bound directly
-    /// to the goal only (U5).
+    /// to the goal only (U5). Each execution also carries the facts of its
+    /// run (U30): `tool_calls_executed`, `dispatches` and `produced_files`,
+    /// null for a workflow or intent execution, their lists fitted to the
+    /// judge's room under U16a (`fit_run_facts`).
     pub async fn judge_input(
         &self,
         world: &dyn GoalWorld,
@@ -816,15 +849,28 @@ impl GoalService {
                 "last_output": view.last_output,
                 "last_error": view.last_error,
                 "approval_pending": approvals,
+                "tool_calls_executed": view.tool_calls_executed,
+                "dispatches": view.dispatches,
+                "produced_files": view.produced_files,
             }));
         }
-        Ok(json!({
+        let mut input = json!({
             "goal": goal.statement,
             "executions": executions,
             "companion_answer": companion_answer,
             "round": goal.rounds,
             "rounds_left": self.config.max_continuations.saturating_sub(goal.rounds),
-        }))
+        });
+        // U30 under U16a: the facts' lists are fitted to the judge's room;
+        // the texts never are (U14, U16).
+        let context = judge_context_or_default(self.judge_context.as_deref(), GOAL_JUDGE_ALIAS);
+        fit_run_facts(
+            &mut input,
+            context
+                .prompt_limit_bytes()
+                .saturating_sub(JUDGE_PROMPT_RESERVE_BYTES),
+        );
+        Ok(input)
     }
 
     /// D5 and D6 on a verdict read.
@@ -1309,6 +1355,84 @@ fn fault_json(fault: &JudgeFault) -> Value {
     })
 }
 
+/// The lists of the facts of a run (U30), in the order their entries are
+/// kept when the input does not fit: produced files before dispatches.
+const RUN_FACT_LISTS: [(&str, &str); 2] = [
+    ("produced_files", "produced_files_omitted"),
+    ("dispatches", "dispatches_omitted"),
+];
+
+/// U30 under U16a: fit the facts' lists of a judge input to `room` bytes of
+/// compact JSON. An input that fits is left as it is. Otherwise the lists
+/// keep their first whole entries, oldest execution first and in each its
+/// produced files before its dispatches, as many as fit; from the first
+/// entry that does not fit, no later entry is kept; each list cut carries
+/// `<list>_omitted`, the count left out. `tool_calls_executed` is never
+/// touched, so it always counts every call. When the input does not fit even
+/// with every list empty, nothing is cut: its texts alone are over the
+/// bound, which U16 answers by stopping the round on the whole input.
+fn fit_run_facts(input: &mut Value, room: usize) {
+    fn size(value: &Value) -> usize {
+        serde_json::to_string(value).map_or(usize::MAX, |text| text.len())
+    }
+    if size(input) <= room {
+        return;
+    }
+    let whole = input.clone();
+    let Some(executions) = input.get_mut("executions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // Every list taken out, with its whole count as omitted: the most bytes
+    // the count can take, since what is left out is never more.
+    let mut taken: Vec<(usize, &str, &str, Vec<Value>)> = Vec::new();
+    for (index, run) in executions.iter_mut().enumerate() {
+        for (list, omitted) in RUN_FACT_LISTS {
+            let Some(entries) = run.get_mut(list).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            let entries = std::mem::take(entries);
+            run[omitted] = json!(entries.len());
+            taken.push((index, list, omitted, entries));
+        }
+    }
+    let base = size(input);
+    if base > room {
+        *input = whole;
+        return;
+    }
+    let mut left = room - base;
+    let mut full = false;
+    for (index, list, omitted, entries) in taken {
+        let total = entries.len();
+        let mut kept = Vec::new();
+        for entry in entries {
+            if full {
+                break;
+            }
+            let cost = size(&entry) + usize::from(!kept.is_empty());
+            if cost > left {
+                full = true;
+                break;
+            }
+            left -= cost;
+            kept.push(entry);
+        }
+        let run = &mut input["executions"][index];
+        let left_out = total - kept.len();
+        run[list] = Value::Array(kept);
+        if left_out == 0 {
+            if let Some(run) = run.as_object_mut() {
+                run.remove(omitted);
+            }
+        } else {
+            run[omitted] = json!(left_out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,6 +1486,10 @@ mod tests {
         /// `running` takes this status (the work ends inside a call).
         end_after_reads: Mutex<Option<(usize, &'static str)>>,
         reads: Mutex<usize>,
+        /// An agent execution's facts (U30), as JSON `{tool_calls_executed,
+        /// dispatches, produced_files}`; none dispatched and none produced
+        /// when unset.
+        facts: Mutex<Option<Value>>,
     }
 
     impl World {
@@ -1412,6 +1540,9 @@ mod tests {
                 .unwrap_or_else(|| "completed".to_string());
             let timeout = self.timeouts.lock().unwrap().get(&b.execution_id).copied();
             let ended = !matches!(status.as_str(), "pending" | "running");
+            // U30: an agent execution's facts; a workflow keeps none.
+            let agent = b.kind == BoundKind::Agent;
+            let facts = self.facts.lock().unwrap().clone();
             Some(ExecutionView {
                 execution_id: b.execution_id,
                 kind: if b.kind == BoundKind::Agent {
@@ -1425,6 +1556,24 @@ mod tests {
                 ended_at: ended.then_some(b.started_at),
                 bound_until: crate::domain::goal::execution_wait_bound(b.started_at, timeout),
                 iterations: Some(1),
+                tool_calls_executed: agent.then(|| {
+                    facts
+                        .as_ref()
+                        .and_then(|f| f["tool_calls_executed"].as_u64())
+                        .unwrap_or(0) as usize
+                }),
+                dispatches: agent.then(|| {
+                    facts
+                        .as_ref()
+                        .map(|f| serde_json::from_value(f["dispatches"].clone()).unwrap())
+                        .unwrap_or_default()
+                }),
+                produced_files: agent.then(|| {
+                    facts
+                        .as_ref()
+                        .map(|f| serde_json::from_value(f["produced_files"].clone()).unwrap())
+                        .unwrap_or_default()
+                }),
                 last_output: Some(
                     self.output
                         .lock()
@@ -2261,6 +2410,217 @@ mod tests {
         assert_eq!(answer["stopped"]["reason"], "too_large");
         assert_eq!(answer["stopped"]["limit_bytes"], 24_576);
         assert_eq!(world.judges_started(), 0);
+    }
+
+    // ── U30: the judge is given the facts of each run ─────────────────────
+
+    /// The PDF run of 2026-10-05 (execution 9506f85b): one model call, no
+    /// tool dispatch, its whole output a path, and no file produced. The
+    /// judge is told so in facts, beside the agent's own words.
+    #[tokio::test]
+    async fn a_run_with_no_dispatch_whose_output_names_a_file_reaches_the_judge_with_none() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![says(0.9, 0.9, 0.9)]);
+        *world.output.lock().unwrap() = Some("/workspace/delivery_itinerary.pdf".to_string());
+        let input = h
+            .service
+            .judge_input(
+                &world,
+                &goal,
+                "Your PDF is ready at /workspace/delivery_itinerary.pdf.",
+            )
+            .await
+            .unwrap();
+        let run = &input["executions"][0];
+        println!("U30 judge input, the PDF run: {run}");
+        assert_eq!(run["last_output"], "/workspace/delivery_itinerary.pdf");
+        assert_eq!(
+            run["tool_calls_executed"],
+            json!(0),
+            "U30: the judge is told no tool call ran: {run}"
+        );
+        assert_eq!(run["dispatches"], json!([]), "U30: no dispatch: {run}");
+        assert_eq!(
+            run["produced_files"],
+            json!([]),
+            "U30: no file was produced: {run}"
+        );
+    }
+
+    /// U30: each dispatch's tool and status, and each produced file, reach
+    /// the judge whole and in order when they fit; nothing is said omitted.
+    #[tokio::test]
+    async fn each_runs_dispatches_and_produced_files_reach_the_judge_whole_and_in_order() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let world = World::scripted(vec![says(0.9, 0.9, 0.9)]);
+        *world.output.lock().unwrap() = Some("Wrote /workspace/x.pdf".to_string());
+        let facts = json!({
+            "tool_calls_executed": 2,
+            "dispatches": [
+                {"iteration": 1, "tool": "fs.write", "status": "succeeded"},
+                {"iteration": 1, "tool": "cmd.run", "status": "failed"},
+                {"iteration": 2, "tool": "cmd.run", "status": "refused"},
+            ],
+            "produced_files": [
+                {"path": "/workspace/x.pdf", "size_bytes": 21, "content_type": "application/pdf"},
+            ],
+        });
+        *world.facts.lock().unwrap() = Some(facts.clone());
+        let input = h.service.judge_input(&world, &goal, "Done.").await.unwrap();
+        let run = &input["executions"][0];
+        assert_eq!(
+            run["tool_calls_executed"], 2,
+            "U30: the count of calls that ran: {run}"
+        );
+        assert_eq!(
+            run["dispatches"], facts["dispatches"],
+            "U30: every dispatch, in order: {run}"
+        );
+        assert_eq!(
+            run["produced_files"], facts["produced_files"],
+            "U30: every produced file: {run}"
+        );
+        assert!(
+            run.get("dispatches_omitted").is_none() && run.get("produced_files_omitted").is_none(),
+            "nothing was cut, so nothing is said omitted: {run}"
+        );
+    }
+
+    /// U30 under U16a: a run with more dispatches than the judge's model
+    /// holds is judged, its facts cut to fit: the count stays whole, the
+    /// produced files (first) are whole, the dispatches keep their first
+    /// entries whole and in order, as many as fit, and the rest is counted.
+    #[tokio::test]
+    async fn a_run_with_more_dispatches_than_the_judge_holds_keeps_the_counts_and_the_first_entries(
+    ) {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        let service = service_with(&h, Some(alias_table(30_000, 4_000)));
+        let room = 26_000 - JUDGE_PROMPT_RESERVE_BYTES;
+        let world = World::scripted(vec![says(0.9, 0.9, 0.9)]);
+        *world.output.lock().unwrap() = Some("All 2,000 files written.".to_string());
+        let dispatches: Vec<Value> = (0..2_000)
+            .map(|i| {
+                json!({
+                    "iteration": 1 + i / 1_000,
+                    "tool": if i % 2 == 0 { "fs.write" } else { "cmd.run" },
+                    "status": "succeeded",
+                })
+            })
+            .collect();
+        let produced = json!([
+            {"path": "/workspace/a.pdf", "size_bytes": 21, "content_type": "application/pdf"},
+            {"path": "/workspace/b.txt", "size_bytes": 4, "content_type": "text/plain"},
+        ]);
+        *world.facts.lock().unwrap() = Some(json!({
+            "tool_calls_executed": 2_000,
+            "dispatches": dispatches,
+            "produced_files": produced,
+        }));
+        let input = service.judge_input(&world, &goal, "Done.").await.unwrap();
+        let size = serde_json::to_string(&input).unwrap().len();
+        let run = &input["executions"][0];
+        let kept = run["dispatches"].as_array().map(Vec::len).unwrap_or(0);
+        println!(
+            "U30 bound: input {size} bytes against a room of {room}; tool_calls_executed {}, \
+             dispatches kept {kept}, dispatches_omitted {}, produced_files {}",
+            run["tool_calls_executed"], run["dispatches_omitted"], run["produced_files"]
+        );
+        let mut complaints = Vec::new();
+        if size > room {
+            complaints.push(format!(
+                "the input is {size} bytes, over the room of {room}"
+            ));
+        }
+        if run["tool_calls_executed"] != json!(2_000) {
+            complaints.push(format!(
+                "tool_calls_executed is {}, not the whole count 2000",
+                run["tool_calls_executed"]
+            ));
+        }
+        if run["produced_files"] != produced {
+            complaints.push(format!(
+                "produced_files is {}, not whole",
+                run["produced_files"]
+            ));
+        }
+        if !(0 < kept && kept < 2_000) {
+            complaints.push(format!("{kept} dispatches kept, not a cut prefix"));
+        }
+        if run["dispatches"]
+            .as_array()
+            .map(|d| d[..] != dispatches[..kept])
+            != Some(false)
+        {
+            complaints.push("the dispatches kept are not the first ones, whole".to_string());
+        }
+        if run["dispatches_omitted"] != json!(2_000 - kept) {
+            complaints.push(format!(
+                "dispatches_omitted is {}, not {}",
+                run["dispatches_omitted"],
+                2_000 - kept
+            ));
+        }
+        if run.get("produced_files_omitted").is_some() {
+            complaints.push("produced_files were not cut, yet said omitted".to_string());
+        }
+        if (0 < kept && kept < 2_000) && complaints.is_empty() {
+            // As many as fit: one more whole entry would not.
+            let mut more = input.clone();
+            more["executions"][0]["dispatches"]
+                .as_array_mut()
+                .unwrap()
+                .push(dispatches[kept].clone());
+            more["executions"][0]["dispatches_omitted"] = json!(2_000 - kept - 1);
+            let more_size = serde_json::to_string(&more).unwrap().len();
+            if more_size <= room {
+                complaints.push(format!(
+                    "one more dispatch fits ({more_size} bytes): the cut kept too few"
+                ));
+            }
+        }
+        let answer = service
+            .evaluate(&world, &h.caller, goal.id, "Done.", None)
+            .await
+            .unwrap();
+        if world.judges_started() != 1 {
+            complaints.push(format!(
+                "the round was not judged: {} judges started, answer {answer}",
+                world.judges_started()
+            ));
+        }
+        assert!(complaints.is_empty(), "U30 under U16a: {complaints:#?}");
+    }
+
+    /// U30: a workflow or intent execution has no record of its own tool
+    /// calls or produced files; the judge is told they are unknown (null).
+    #[tokio::test]
+    async fn a_workflow_executions_facts_are_null_never_zero() {
+        let h = Harness::new();
+        let goal = h.goal().await;
+        h.service
+            .bind(goal.id, ExecutionId::new(), BoundKind::Workflow)
+            .await
+            .unwrap();
+        let world = World::scripted(vec![says(0.9, 0.9, 0.9)]);
+        *world.output.lock().unwrap() = Some("Wrote /workspace/report.pdf".to_string());
+        let input = h.service.judge_input(&world, &goal, "Done.").await.unwrap();
+        let workflow = input["executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "workflow")
+            .expect("the workflow execution is in the input")
+            .clone();
+        for field in ["tool_calls_executed", "dispatches", "produced_files"] {
+            assert_eq!(
+                workflow.get(field),
+                Some(&Value::Null),
+                "U30: a workflow's {field} is unknown, given as null: {workflow}"
+            );
+        }
     }
 
     // ── U21 to U23, U26: work still running is waited for, never judged ──

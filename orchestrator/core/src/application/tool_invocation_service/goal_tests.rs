@@ -838,3 +838,48 @@ async fn a_goal_that_waits_the_longest_every_round_still_closes_by_the_bound() {
     }
     assert!(clock.now() <= deadline, "closed by the bound {longest} s");
 }
+
+/// AEGIS ADR-131 U30, the reproduction of Jeshua's PDF request of 2026-10-05
+/// (agent 3b367333, execution 9506f85b), through the real types the daemon
+/// uses: the work ran one model call and no tool, its whole output was a
+/// path, and no file was produced. The goal-judge execution the evaluation
+/// starts is given that in facts beside the agent's own words: no tool call
+/// ran, no dispatch, no produced file.
+#[tokio::test]
+async fn a_pdf_claimed_with_no_dispatch_reaches_the_goal_judge_as_no_tool_call_and_no_file() {
+    let h = harness_with(|goals| {
+        goals.with_wait(
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(5),
+        )
+    });
+    let goal = h.create(OWNER).await;
+    let solver = execution_id_of(&h.task_execute(OWNER, goal).await);
+    h.with_execution(solver, |e| {
+        e.start();
+        e.start_iteration("make the delivery itinerary PDF".to_string())
+            .unwrap();
+        e.complete_iteration("/workspace/delivery_itinerary.pdf".to_string());
+        e.complete();
+    });
+    let answer = h.evaluate(OWNER, goal, None).await;
+    assert_eq!(
+        answer["state"], "judging",
+        "the round's judge starts: {answer}"
+    );
+    let judge = h.judge_besides(&[solver]);
+    let input = h.with_execution(judge, |e| e.input.input.clone());
+    let run = &input["executions"][0];
+    println!("U30 goal-judge input, the PDF run through the tool handler: {run}");
+    assert_eq!(run["execution_id"], solver.to_string());
+    assert_eq!(run["last_output"], "/workspace/delivery_itinerary.pdf");
+    assert_eq!(
+        (
+            &run["tool_calls_executed"],
+            &run["dispatches"],
+            &run["produced_files"]
+        ),
+        (&json!(0), &json!([]), &json!([])),
+        "U30: the judge is told no tool call ran, no dispatch and no file: {run}"
+    );
+}

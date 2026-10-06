@@ -9,10 +9,10 @@
 
 use super::*;
 use crate::application::goal_service::{
-    ExecutionView, GoalCaller, GoalError, GoalService, GoalWorld, JudgeProgress,
+    DispatchFact, ExecutionView, GoalCaller, GoalError, GoalService, GoalWorld, JudgeProgress,
     GOAL_JUDGE_AGENT_NAME,
 };
-use crate::domain::execution::{ExecutionId, ExecutionStatus};
+use crate::domain::execution::{Execution, ExecutionId, ExecutionStatus};
 use crate::domain::goal::{
     execution_wait_bound, BoundExecution, BoundKind, Goal, GoalChannel, GoalId,
 };
@@ -276,6 +276,28 @@ impl ToolInvocationService {
     }
 }
 
+/// U30: each tool call the execution's tries made, oldest first, from the
+/// stored trajectory, and how many of them ran.
+fn run_dispatches(exec: &Execution) -> (usize, Vec<DispatchFact>) {
+    let dispatches: Vec<DispatchFact> = exec
+        .iterations()
+        .iter()
+        .flat_map(|iteration| {
+            iteration
+                .trajectory
+                .iter()
+                .flatten()
+                .map(move |step| DispatchFact {
+                    iteration: iteration.number,
+                    tool: step.tool_name.clone(),
+                    status: step.status.clone(),
+                })
+        })
+        .collect();
+    let executed = dispatches.iter().filter(|d| d.executed()).count();
+    (executed, dispatches)
+}
+
 /// One goal call's view of the orchestrator, as the goal's user.
 struct GoalCallWorld<'a> {
     service: &'a ToolInvocationService,
@@ -303,6 +325,8 @@ impl GoalWorld for GoalCallWorld<'_> {
                     .map(|a| a.manifest.metadata.name)
                     .unwrap_or_else(|_| exec.agent_id.0.to_string());
                 let last = exec.iterations().last();
+                // U30: what the orchestrator recorded it doing, beside its words.
+                let (tool_calls_executed, dispatches) = run_dispatches(&exec);
                 Some(ExecutionView {
                     execution_id: exec.id,
                     kind: "agent",
@@ -311,6 +335,9 @@ impl GoalWorld for GoalCallWorld<'_> {
                     started_at: exec.started_at,
                     ended_at: exec.ended_at,
                     iterations: Some(exec.iterations().len()),
+                    tool_calls_executed: Some(tool_calls_executed),
+                    dispatches: Some(dispatches),
+                    produced_files: Some(exec.produced_files().to_vec()),
                     last_output: last.and_then(|i| i.output.clone()),
                     last_error: last
                         .and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
@@ -357,6 +384,11 @@ impl GoalWorld for GoalCallWorld<'_> {
                     started_at: wf.started_at,
                     ended_at: terminal.then_some(wf.last_transition_at),
                     iterations: None,
+                    // U30: a workflow or intent execution keeps no record of
+                    // its own tool calls or files: unknown, never zero.
+                    tool_calls_executed: None,
+                    dispatches: None,
+                    produced_files: None,
                     last_output: output,
                     last_error: error,
                     // U23: a workflow or intent execution records no time
@@ -456,5 +488,96 @@ impl GoalWorld for GoalCallWorld<'_> {
             ),
             _ => JudgeProgress::Running,
         }
+    }
+}
+
+#[cfg(test)]
+mod run_facts_tests {
+    use super::*;
+    use crate::domain::agent::AgentId;
+    use crate::domain::execution::{ExecutionInput, IterationError, TrajectoryStep};
+
+    fn step(tool: &str, status: &str) -> TrajectoryStep {
+        TrajectoryStep {
+            tool_name: tool.to_string(),
+            arguments_json: "{}".to_string(),
+            status: status.to_string(),
+            result_json: None,
+            error: None,
+        }
+    }
+
+    /// AEGIS ADR-131 U30: an agent execution's dispatches are read from
+    /// every try's stored trajectory, oldest first, each with its try, its
+    /// tool and its status verbatim; a call refused before it ran or still
+    /// pending is listed but not counted as executed.
+    #[test]
+    fn an_agent_executions_dispatches_are_read_from_every_tries_trajectory() {
+        let input = ExecutionInput {
+            intent: None,
+            input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+        let mut exec = Execution::new_with_id(
+            ExecutionId::new(),
+            AgentId::new(),
+            input,
+            5,
+            "zaru-free".into(),
+        );
+        exec.start();
+        exec.start_iteration("try 1".to_string()).unwrap();
+        exec.store_iteration_trajectory(
+            1,
+            vec![step("fs.write", "succeeded"), step("cmd.run", "failed")],
+        )
+        .unwrap();
+        exec.fail_iteration(IterationError {
+            message: "declared output /workspace/x.pdf does not exist".to_string(),
+            details: None,
+        });
+        exec.start_iteration("try 2".to_string()).unwrap();
+        exec.store_iteration_trajectory(
+            2,
+            vec![
+                step("cmd.run", "refused"),
+                step("cmd.run", "fatal"),
+                step("fs.read", "pending"),
+                step("cmd.run", "dispatched"),
+            ],
+        )
+        .unwrap();
+        exec.complete_iteration("/workspace/x.pdf".to_string());
+        exec.complete();
+
+        let (executed, dispatches) = run_dispatches(&exec);
+        let read: Vec<(u8, &str, &str)> = dispatches
+            .iter()
+            .map(|d| (d.iteration, d.tool.as_str(), d.status.as_str()))
+            .collect();
+        let mut complaints = Vec::new();
+        let expected = vec![
+            (1, "fs.write", "succeeded"),
+            (1, "cmd.run", "failed"),
+            (2, "cmd.run", "refused"),
+            (2, "cmd.run", "fatal"),
+            (2, "fs.read", "pending"),
+            (2, "cmd.run", "dispatched"),
+        ];
+        if read != expected {
+            complaints.push(format!(
+                "the dispatches read are {read:?}, not every try's calls in order {expected:?}"
+            ));
+        }
+        if executed != 4 {
+            complaints.push(format!(
+                "{executed} calls counted as executed, not 4 (refused and pending did not run)"
+            ));
+        }
+        assert!(complaints.is_empty(), "U30: {complaints:#?}");
     }
 }
