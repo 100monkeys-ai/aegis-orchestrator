@@ -286,6 +286,43 @@ pub struct CredentialMetadata {
     /// for every other binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mailbox: Option<MailboxSettings>,
+    /// What the binding's token reaches on the remote tool server its
+    /// provider names, read from that server's grounding of the token, never
+    /// typed by a person (AEGIS ADR-132 (7a) S2). `None` for every binding
+    /// whose provider is not a remote server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<BindingReach>,
+}
+
+/// Whether a remote server's token reaches one instance or several (AEGIS
+/// ADR-132 (7a) S2): read from the instances its grounding reports the
+/// token reaching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachKind {
+    /// The grounding reports several instances.
+    Apex,
+    /// The grounding reports exactly one instance.
+    Instance,
+}
+
+/// What a binding's token reaches, as the remote server's grounding of it
+/// reported at `grounded_at` (AEGIS ADR-132 (7a) S2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingReach {
+    pub kind: ReachKind,
+    /// The one instance's slug; `None` for `apex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_slug: Option<String>,
+    /// The one instance's id; `None` for `apex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Reserved for a workspace-scoped token, once the grounding says so;
+    /// never written today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// When the server grounded the token.
+    pub grounded_at: DateTime<Utc>,
 }
 
 // ============================================================================
@@ -485,6 +522,7 @@ mod tests {
                 external_account_id: None,
                 oauth_scopes: None,
                 mailbox: None,
+                reach: None,
             },
             grants: Vec::new(),
             created_at: Utc::now(),

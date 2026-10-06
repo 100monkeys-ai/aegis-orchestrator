@@ -14,6 +14,7 @@
 //! | `GET /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialRead` |
 //! | `DELETE /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialDelete` |
 //! | `POST /v1/credentials/{id}/rotate` | ConsumerUser \| TenantUser \| Operator | `CredentialRotate` |
+//! | `POST /v1/credentials/{id}/introspect` | ConsumerUser \| TenantUser \| Operator | `CredentialRead` |
 //! | `GET /v1/credentials/{id}/grants` | ConsumerUser \| TenantUser \| Operator | `CredentialRead` |
 //! | `POST /v1/credentials/{id}/grants` | ConsumerUser \| TenantUser \| Operator | `CredentialGrant` |
 //! | `DELETE /v1/credentials/{id}/grants/{grant_id}` | ConsumerUser \| TenantUser \| Operator | `CredentialGrant` |
@@ -139,6 +140,37 @@ fn credential_actor(
     }
 }
 
+/// The answer for a refusal about a remote server's token's reach (AEGIS
+/// ADR-132 (7a) S2), or `None` for any other error: 422
+/// `binding_reach_unknown` with the gateway's code and the sentence when the
+/// grounding was refused or reported no reach; 502 with the code when the
+/// gateway could not be reached; 422 `not_a_remote_server_binding` for an
+/// introspection of a binding that is not to a remote server.
+fn reach_refusal(e: &anyhow::Error) -> Option<Response> {
+    let error = e.downcast_ref::<CredentialError>()?;
+    let message = error.to_string();
+    let (status, body) = match error {
+        CredentialError::ReachRefused { code, .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "binding_reach_unknown", "code": code, "message": message}),
+        ),
+        CredentialError::ReachUnreachable { code, .. } => (
+            StatusCode::BAD_GATEWAY,
+            json!({"error": "binding_reach_unknown", "code": code, "message": message}),
+        ),
+        CredentialError::ReachNotReported { .. } | CredentialError::ReachesNoInstance { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "binding_reach_unknown", "message": message}),
+        ),
+        CredentialError::NotARemoteServerBinding { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "not_a_remote_server_binding", "message": message}),
+        ),
+        _ => return None,
+    };
+    Some((status, Json(body)).into_response())
+}
+
 /// State of the by-id credential sub-router.
 #[derive(Clone)]
 pub(crate) struct CredentialsByIdState {
@@ -157,6 +189,10 @@ pub(crate) fn credentials_by_id_router(state: CredentialsByIdState) -> Router {
         .route(
             "/v1/credentials/{id}/rotate",
             post(rotate_credential_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/introspect",
+            post(introspect_credential_handler),
         )
         .route(
             "/v1/credentials/{id}/grants",
@@ -505,9 +541,20 @@ pub(crate) async fn list_credentials_handler(
     }
 }
 
-/// `POST /v1/credentials/api-keys` — store a new API key credential.
+/// `POST /v1/credentials/api-keys` — store a new API key credential. A key
+/// whose provider names a remote server of this node is grounded there
+/// first and stored with its `reach`, or refused and not stored (AEGIS
+/// ADR-132 (7a) S2).
 pub(crate) async fn store_api_key_handler(
     State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    store_api_key_answer(state.credential_service.clone(), request).await
+}
+
+/// The answer of `POST /v1/credentials/api-keys` over `credential_service`.
+pub(crate) async fn store_api_key_answer(
+    credential_service: Option<Arc<dyn CredentialManagementService>>,
     request: axum::extract::Request,
 ) -> Response {
     let (user_id, tenant_id) =
@@ -553,7 +600,7 @@ pub(crate) async fn store_api_key_handler(
         Err(r) => return r,
     };
 
-    let svc = match &state.credential_service {
+    let svc = match &credential_service {
         Some(s) => s.clone(),
         None => {
             return (
@@ -581,11 +628,13 @@ pub(crate) async fn store_api_key_handler(
             Json(json!({"id": binding_id.to_string()})),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => reach_refusal(&e).unwrap_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }),
     }
 }
 
@@ -843,11 +892,68 @@ pub(crate) async fn rotate_credential_handler(
         .await
     {
         Ok(()) => (StatusCode::OK, Json(json!({"status": "rotated", "id": id}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => reach_refusal(&e).unwrap_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }),
+    }
+}
+
+/// `POST /v1/credentials/{id}/introspect` — ground the binding's token at
+/// the remote server its provider names again and rewrite its `reach`
+/// (AEGIS ADR-132 (7a) S2, "and on demand"): 200 with the binding; 422 or
+/// 502 `binding_reach_unknown` when the grounding gives no reach, the
+/// stored reach unchanged; 422 `not_a_remote_server_binding` for a binding
+/// that is not to a remote server; 404 for a binding the caller may not
+/// manage, as for one that does not exist.
+pub(crate) async fn introspect_credential_handler(
+    State(state): State<CredentialsByIdState>,
+    Path(id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    let (actor, _sub) = match credential_actor(request.extensions()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let binding_id = match parse_binding_id(&id) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+
+    let svc = match &state.credential_service {
+        Some(s) => s.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Credential service not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match svc.introspect_binding(&actor, &binding_id).await {
+        Ok(binding) => (StatusCode::OK, Json(json!({"credential": binding}))).into_response(),
+        Err(e) => {
+            if let Some(answer) = reach_refusal(&e) {
+                return answer;
+            }
+            if e.to_string().starts_with("Credential binding not found") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "Credential binding not found"})),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2388,5 +2494,396 @@ spec:
         .await;
         assert_eq!(status, 401, "{body}");
         assert!(!body.to_string().contains(CLIENT_SECRET));
+    }
+}
+
+#[cfg(test)]
+mod reach_route_tests {
+    //! A remote server's token's reach on the routes (AEGIS ADR-132 (7a)
+    //! S2; the coordinator's B1 to B5): `POST /v1/credentials/api-keys`,
+    //! `GET /v1/credentials/{id}`, `POST /v1/credentials/{id}/rotate` and
+    //! `POST /v1/credentials/{id}/introspect`, driven through the daemon's
+    //! authentication stack against the real
+    //! `StandardCredentialManagementService`, with a fake grounding where
+    //! the daemon hands it the SEAL gateway's `InvokeTool` of `cortex.ground`.
+
+    use super::{credentials_by_id_router, store_api_key_answer, CredentialsByIdState};
+    use crate::daemon::handlers::test_support::{consumer, identity_provider, send, serve};
+    use aegis_orchestrator_core::application::credential_service::{
+        CredentialManagementService, GroundingRefusal, OAuthProviderRegistry,
+        RemoteServerGrounding, StandardCredentialManagementService,
+    };
+    use aegis_orchestrator_core::domain::credential::{
+        CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialProvider,
+        GrantTarget, OAuthPendingState, UserCredentialBinding,
+    };
+    use aegis_orchestrator_core::domain::secrets::SensitiveString;
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::secrets_manager::{
+        SecretsManager, TestSecretStore,
+    };
+    use axum::routing::post;
+    use chrono::{DateTime, Utc};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, Weak};
+    use tokio::sync::RwLock;
+
+    const OWNER: &str = "reach-route-owner";
+    const SERVER: &str = "nuclear-notes";
+    const TOKEN: &str = "Mk12-route-nn_mcp-token";
+    const SCOPES: &str = "credential:create credential:list credential:read credential:rotate";
+
+    #[derive(Default)]
+    struct Bindings {
+        rows: RwLock<HashMap<CredentialBindingId, UserCredentialBinding>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialBindingRepository for Bindings {
+        async fn save(&self, binding: &UserCredentialBinding) -> anyhow::Result<()> {
+            self.rows.write().await.insert(binding.id, binding.clone());
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            id: &CredentialBindingId,
+        ) -> anyhow::Result<Option<UserCredentialBinding>> {
+            Ok(self.rows.read().await.get(id).cloned())
+        }
+        async fn find_by_owner(
+            &self,
+            _t: &TenantId,
+            _o: &str,
+        ) -> anyhow::Result<Vec<UserCredentialBinding>> {
+            Ok(self.rows.read().await.values().cloned().collect())
+        }
+        async fn find_active_grants_for_target(
+            &self,
+            _t: &TenantId,
+            _o: &str,
+            _p: &CredentialProvider,
+            _g: &GrantTarget,
+        ) -> anyhow::Result<Vec<CredentialGrant>> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, id: &CredentialBindingId) -> anyhow::Result<()> {
+            self.rows.write().await.remove(id);
+            Ok(())
+        }
+        async fn save_oauth_state(
+            &self,
+            _s: &str,
+            _b: &CredentialBindingId,
+            _v: &str,
+            _r: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_oauth_state(&self, _s: &str) -> anyhow::Result<Option<OAuthPendingState>> {
+            Ok(None)
+        }
+        async fn delete_oauth_state(&self, _s: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_expired_oauth_states(&self, _o: DateTime<Utc>) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Answers every grounding with its current answer and counts calls.
+    struct Grounding {
+        answer: Mutex<Result<Value, GroundingRefusal>>,
+        tokens: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteServerGrounding for Grounding {
+        async fn ground_token(
+            &self,
+            _tenant_id: &TenantId,
+            _user_id: &str,
+            _server: &str,
+            token: &SensitiveString,
+        ) -> Result<Value, GroundingRefusal> {
+            self.tokens.lock().unwrap().push(token.expose().to_string());
+            self.answer.lock().unwrap().clone()
+        }
+    }
+
+    fn payload(instances: &[(&str, &str)]) -> Value {
+        json!({"you": {"instances": instances
+            .iter()
+            .map(|(id, slug)| json!({"id": id, "slug": slug, "name": slug, "role": "admin"}))
+            .collect::<Vec<_>>()}})
+    }
+
+    struct Route {
+        base: String,
+        bindings: Arc<Bindings>,
+        grounding: Arc<Grounding>,
+    }
+
+    async fn route(answer: Result<Value, GroundingRefusal>) -> Route {
+        let bindings = Arc::new(Bindings::default());
+        let event_bus = Arc::new(EventBus::new(64));
+        let secrets = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            event_bus.clone(),
+        ));
+        let service = StandardCredentialManagementService::new(
+            bindings.clone(),
+            secrets,
+            event_bus,
+            Arc::new(OAuthProviderRegistry::new()),
+        );
+        let grounding = Arc::new(Grounding {
+            answer: Mutex::new(answer),
+            tokens: Mutex::new(Vec::new()),
+        });
+        let weak: Weak<Grounding> = Arc::downgrade(&grounding);
+        let weak: Weak<dyn RemoteServerGrounding> = weak;
+        assert!(service.set_remote_grounding(weak, vec![SERVER.to_string()]));
+        let service = Arc::new(service) as Arc<dyn CredentialManagementService>;
+        let store_service = service.clone();
+        let router = credentials_by_id_router(CredentialsByIdState {
+            credential_service: Some(service),
+        })
+        .route(
+            "/v1/credentials/api-keys",
+            post(move |request: axum::extract::Request| {
+                store_api_key_answer(Some(store_service.clone()), request)
+            }),
+        );
+        let base = serve(
+            router,
+            Some(identity_provider(&[(
+                "owner-token",
+                consumer(OWNER),
+                SCOPES,
+            )])),
+            None,
+        )
+        .await;
+        Route {
+            base,
+            bindings,
+            grounding,
+        }
+    }
+
+    fn key(provider: &str, value: &str) -> Option<Value> {
+        Some(json!({
+            "provider": provider,
+            "label": "Work instance",
+            "value": value,
+            "credential_type": "secret",
+        }))
+    }
+
+    async fn store(r: &Route, provider: &str) -> (u16, Value) {
+        send(
+            &r.base,
+            &reqwest::Method::POST,
+            "/v1/credentials/api-keys",
+            &key(provider, TOKEN),
+            Some("owner-token"),
+        )
+        .await
+    }
+
+    async fn get(r: &Route, id: &str) -> (u16, Value) {
+        send(
+            &r.base,
+            &reqwest::Method::GET,
+            &format!("/v1/credentials/{id}"),
+            &None,
+            Some("owner-token"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_stored_instance_token_answers_its_reach_on_get() {
+        let r = route(Ok(payload(&[("inst-play2-id", "play2")]))).await;
+        let (status, answer) = store(&r, SERVER).await;
+        assert_eq!(status, 201, "{answer}");
+        let id = answer["id"].as_str().expect("id").to_string();
+
+        let (status, answer) = get(&r, &id).await;
+        assert_eq!(status, 200, "{answer}");
+        let reach = &answer["credential"]["metadata"]["reach"];
+        println!("GET reach {reach}");
+        assert_eq!(reach["kind"], "instance");
+        assert_eq!(reach["instance_slug"], "play2");
+        assert_eq!(reach["instance_id"], "inst-play2-id");
+        assert!(reach["grounded_at"].is_string(), "{reach}");
+        assert!(!answer.to_string().contains(TOKEN), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_stored_apex_token_answers_apex_on_get() {
+        let r = route(Ok(payload(&[
+            ("inst-100m-id", "100monkeys-ai"),
+            ("inst-main-id", "main"),
+        ])))
+        .await;
+        let (status, answer) = store(&r, SERVER).await;
+        assert_eq!(status, 201, "{answer}");
+        let (_, answer) = get(&r, answer["id"].as_str().unwrap()).await;
+        let reach = &answer["credential"]["metadata"]["reach"];
+        println!("GET reach {reach}");
+        assert_eq!(reach["kind"], "apex");
+        assert!(reach.get("instance_slug").is_none(), "{reach}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_grounding_answers_422_with_the_code_and_sentence_and_stores_nothing() {
+        let r = route(Err(GroundingRefusal::Refused {
+            code: "CREDENTIAL_REJECTED".to_string(),
+            message: "The 'nuclear-notes' server refused your stored credential.".to_string(),
+        }))
+        .await;
+        let (status, answer) = store(&r, SERVER).await;
+        println!("{status} {answer}");
+        assert_eq!(status, 422, "{answer}");
+        assert_eq!(
+            answer,
+            json!({
+                "error": "binding_reach_unknown",
+                "code": "CREDENTIAL_REJECTED",
+                "message": "The token was not stored: grounding it at the remote server \
+                            'nuclear-notes' was refused (CREDENTIAL_REJECTED): The \
+                            'nuclear-notes' server refused your stored credential.",
+            })
+        );
+        assert!(
+            r.bindings.rows.read().await.is_empty(),
+            "a binding was stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_gateway_answers_502_and_a_payload_without_instances_422() {
+        let r = route(Err(GroundingRefusal::Unreachable {
+            code: "UPSTREAM_UNAVAILABLE".to_string(),
+            detail: "connect refused".to_string(),
+        }))
+        .await;
+        let (status, answer) = store(&r, SERVER).await;
+        println!("{status} {answer}");
+        assert_eq!(status, 502, "{answer}");
+        assert_eq!(answer["error"], "binding_reach_unknown");
+        assert_eq!(answer["code"], "UPSTREAM_UNAVAILABLE");
+        assert!(!answer.to_string().contains("connect refused"), "{answer}");
+
+        *r.grounding.answer.lock().unwrap() = Ok(json!({"you": {}}));
+        let (status, answer) = store(&r, SERVER).await;
+        println!("{status} {answer}");
+        assert_eq!(status, 422, "{answer}");
+        assert_eq!(
+            answer["message"],
+            "The token was not stored: the grounding 'nuclear-notes' answered did not say which \
+             instances the token reaches."
+        );
+        assert!(
+            r.bindings.rows.read().await.is_empty(),
+            "a binding was stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn introspect_rewrites_the_reach_after_the_payload_changes() {
+        let r = route(Ok(payload(&[("inst-play2-id", "play2")]))).await;
+        let (_, answer) = store(&r, SERVER).await;
+        let id = answer["id"].as_str().expect("id").to_string();
+
+        *r.grounding.answer.lock().unwrap() = Ok(payload(&[
+            ("inst-play2-id", "play2"),
+            ("inst-main-id", "main"),
+        ]));
+        let (status, answer) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            &format!("/v1/credentials/{id}/introspect"),
+            &None,
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "{answer}");
+        println!(
+            "introspect reach {}",
+            answer["credential"]["metadata"]["reach"]
+        );
+        assert_eq!(answer["credential"]["metadata"]["reach"]["kind"], "apex");
+        let (_, answer) = get(&r, &id).await;
+        println!("GET reach {}", answer["credential"]["metadata"]["reach"]);
+        assert_eq!(answer["credential"]["metadata"]["reach"]["kind"], "apex");
+        assert_eq!(*r.grounding.tokens.lock().unwrap(), vec![TOKEN, TOKEN]);
+    }
+
+    #[tokio::test]
+    async fn a_binding_to_no_remote_server_is_never_grounded_and_has_no_reach() {
+        let r = route(Ok(payload(&[("inst-play2-id", "play2")]))).await;
+        let (status, answer) = store(&r, "openai").await;
+        assert_eq!(status, 201, "{answer}");
+        let id = answer["id"].as_str().expect("id").to_string();
+        let (_, answer) = get(&r, &id).await;
+        println!(
+            "grounding calls {}, reach {}",
+            r.grounding.tokens.lock().unwrap().len(),
+            answer["credential"]["metadata"]["reach"]
+        );
+        assert!(
+            answer["credential"]["metadata"].get("reach").is_none(),
+            "{answer}"
+        );
+        assert!(
+            r.grounding.tokens.lock().unwrap().is_empty(),
+            "a grounding was made"
+        );
+
+        let (status, answer) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            &format!("/v1/credentials/{id}/introspect"),
+            &None,
+            Some("owner-token"),
+        )
+        .await;
+        println!("{status} {answer}");
+        assert_eq!(status, 422, "{answer}");
+        assert_eq!(answer["error"], "not_a_remote_server_binding");
+        assert!(
+            r.grounding.tokens.lock().unwrap().is_empty(),
+            "a grounding was made"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_grounds_the_new_token_first() {
+        let r = route(Ok(payload(&[("inst-play2-id", "play2")]))).await;
+        let (_, answer) = store(&r, SERVER).await;
+        let id = answer["id"].as_str().expect("id").to_string();
+
+        *r.grounding.answer.lock().unwrap() = Ok(payload(&[("inst-100m-id", "100monkeys-ai")]));
+        let (status, answer) = send(
+            &r.base,
+            &reqwest::Method::POST,
+            &format!("/v1/credentials/{id}/rotate"),
+            &Some(json!({"value": "Mk12-rotated"})),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "{answer}");
+        let tokens = r.grounding.tokens.lock().unwrap().clone();
+        println!("grounding calls {}", tokens.len());
+        assert_eq!(tokens, vec![TOKEN, "Mk12-rotated"]);
+        let (_, answer) = get(&r, &id).await;
+        assert_eq!(
+            answer["credential"]["metadata"]["reach"]["instance_slug"],
+            "100monkeys-ai"
+        );
     }
 }

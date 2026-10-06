@@ -1,5 +1,7 @@
 use super::*;
-use crate::application::credential_service::ToolCallActor;
+use crate::application::credential_service::{
+    GroundingRefusal, RemoteServerGrounding, ToolCallActor,
+};
 use crate::domain::seal_session::{CallerAnswer, InternalFailure};
 use crate::domain::secrets::{SensitiveString, SensitiveUrl};
 use crate::infrastructure::seal_gateway_proto::{
@@ -957,6 +959,136 @@ spec:
     #[test]
     fn without_an_execution_block_the_default_300_is_read() {
         assert_eq!(llm_timeout_seconds_of(&agent("")), 300);
+    }
+}
+
+impl ToolInvocationService {
+    /// `cortex.ground` on the remote server `server` with `token`, a token a
+    /// person is storing, rotating or introspecting (AEGIS ADR-132 (7a) S2):
+    /// the gateway's `InvokeTool` with arguments `{}`, the token as the
+    /// call's credential and the binding's owner as the acting identity. The
+    /// orchestrator makes no connection of its own to the server (H2). The
+    /// grounding payload is the text of the result's first content item,
+    /// parsed as JSON; a result that carries none answers `null`, which the
+    /// caller reads as a grounding that reports no reach. Nothing is sent
+    /// over a plaintext gateway address (H8).
+    pub async fn ground_remote_token(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        server: &str,
+        token: &SensitiveString,
+    ) -> Result<serde_json::Value, GroundingRefusal> {
+        let tool_name = format!("{server}.cortex.ground");
+        let unreachable = |code: &str, detail: String| GroundingRefusal::Unreachable {
+            code: code.to_string(),
+            detail,
+        };
+        if !self.gateway_channel_is_confidential() {
+            tracing::error!(
+                server = %server,
+                "grounding a remote server's token would carry it to the SEAL gateway over a \
+                 plaintext channel; nothing was sent. Configure seal_gateway.url as an https \
+                 address (and seal_gateway.ca_cert_path for a private CA)"
+            );
+            return Err(unreachable(
+                "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL",
+                format!("the SEAL gateway channel is not confidential; '{tool_name}' was not sent"),
+            ));
+        }
+        let mut client = self
+            .connect_gateway()
+            .await
+            .map_err(|e| unreachable("UPSTREAM_UNAVAILABLE", e.to_string()))?;
+        let mut request = tonic::Request::new(InvokeToolRequest {
+            execution_id: String::new(),
+            tenant_id: tenant_id.as_str().to_string(),
+            acting: Some(ActingIdentity {
+                user_id: user_id.to_string(),
+                agent_id: String::new(),
+                workflow_id: String::new(),
+            }),
+            server: server.to_string(),
+            tool: "cortex.ground".to_string(),
+            arguments_json: "{}".to_string(),
+            credential: Some(ResolvedCredential {
+                kind: CredentialKind::BearerToken as i32,
+                value: token.expose().to_string(),
+            }),
+        });
+        self.authorize_gateway_request(&mut request)
+            .await
+            .map_err(|e| unreachable("SERVICE_UNAVAILABLE", e.to_string()))?;
+        let response =
+            match tokio::time::timeout(GATEWAY_INVOKE_TIMEOUT, client.invoke_tool(request)).await {
+                Ok(Ok(response)) => response.into_inner(),
+                Ok(Err(status)) => {
+                    let code = status
+                        .metadata()
+                        .get(REFUSAL_CODE_METADATA)
+                        .and_then(|value| value.to_str().ok());
+                    return Err(match code {
+                        Some(code) => GroundingRefusal::Refused {
+                            code: code.to_string(),
+                            message: status.message().to_string(),
+                        },
+                        None => unreachable(
+                            "INTERNAL_ERROR",
+                            format!(
+                            "seal tooling gateway invoke_tool refused '{tool_name}' (no code): {}",
+                            status.message()
+                        ),
+                        ),
+                    });
+                }
+                Err(_) => {
+                    return Err(unreachable(
+                        "UPSTREAM_UNAVAILABLE",
+                        format!(
+                            "seal tooling gateway invoke_tool timeout after {}s",
+                            GATEWAY_INVOKE_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+            };
+        let result = parse_gateway_result(&response.result_json)
+            .map_err(|e| unreachable("INTERNAL_ERROR", e.to_string()))?;
+        grounding_payload(&result)
+    }
+}
+
+/// The grounding payload in a `tools/call` result: its first content item's
+/// text, parsed as JSON (`null` when there is none). A result marked
+/// `isError` is the server's refusal, `REMOTE_TOOL_ERROR`, with its text.
+fn grounding_payload(result: &serde_json::Value) -> Result<serde_json::Value, GroundingRefusal> {
+    let text = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str);
+    if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(GroundingRefusal::Refused {
+            code: "REMOTE_TOOL_ERROR".to_string(),
+            message: text.unwrap_or("The server refused the call.").to_string(),
+        });
+    }
+    Ok(text
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or(serde_json::Value::Null))
+}
+
+#[async_trait::async_trait]
+impl RemoteServerGrounding for ToolInvocationService {
+    async fn ground_token(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        server: &str,
+        token: &SensitiveString,
+    ) -> Result<serde_json::Value, GroundingRefusal> {
+        self.ground_remote_token(tenant_id, user_id, server, token)
+            .await
     }
 }
 

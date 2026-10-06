@@ -25,6 +25,10 @@ use sqlx::{Executor, Row};
 const MIGRATION_011: &str = include_str!("../../../cli/migrations/011_credential_bindings.sql");
 const MIGRATION_035: &str =
     include_str!("../../../cli/migrations/035_credential_mailbox_settings.sql");
+/// The repository reads every column the current schema has; 042
+/// (`reach`, AEGIS ADR-132 (7a) S2) is applied before it reads.
+const MIGRATION_042: &str =
+    include_str!("../../../cli/migrations/042_credential_binding_reach.sql");
 
 async fn pool_in_fresh_schema() -> Option<(PgPool, String)> {
     let url = std::env::var("AEGIS_DATABASE_URL")
@@ -148,6 +152,7 @@ async fn migration_035_keeps_existing_rows_and_stores_mailbox_settings() {
     let mut before: serde_json::Value = serde_json::from_str(&before).unwrap();
     before["mailbox_settings"] = serde_json::Value::Null;
     assert_eq!(after, before, "migration 035 changed an existing row");
+    pool.execute(MIGRATION_042).await.expect("migration 042");
 
     let repo = PostgresCredentialBindingRepository::new(pool.clone());
     let read = repo
@@ -172,6 +177,7 @@ async fn migration_035_keeps_existing_rows_and_stores_mailbox_settings() {
             external_account_id: Some("outreach@example.test".to_string()),
             oauth_scopes: None,
             mailbox: Some(imap_settings()),
+            reach: None,
         },
     );
     repo.save(&imap).await.expect("save imap mailbox");
@@ -198,6 +204,7 @@ async fn migration_035_keeps_existing_rows_and_stores_mailbox_settings() {
             external_account_id: Some("jeshua@100monkeys.example".to_string()),
             oauth_scopes: Some(vec!["openid".to_string()]),
             mailbox: None,
+            reach: None,
         },
     );
     repo.save(&google).await.unwrap();

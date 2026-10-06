@@ -1058,6 +1058,7 @@ impl Vault {
                 external_account_id: None,
                 oauth_scopes: None,
                 mailbox: None,
+                reach: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -2326,4 +2327,168 @@ async fn without_a_gateway_an_agents_run_is_offered_what_it_was_offered_before()
     let mut expected = as_offered;
     expected.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(shown, expected);
+}
+
+// ---------------------------------------------------------------------------
+// A remote server's token grounded through the gateway (ADR-132 (7a) S2, B1)
+// ---------------------------------------------------------------------------
+
+/// The `tools/call` result of `cortex.ground` whose token reaches one
+/// instance, as Nuclear Notes answers it: the payload as the text of the
+/// first content item.
+fn grounding_result(instances: &[(&str, &str)]) -> Answer {
+    let payload = json!({
+        "instance": {"id": "root-id", "slug": "main"},
+        "you": {
+            "currentWorkspace": null,
+            "instances": instances
+                .iter()
+                .map(|(id, slug)| json!({"id": id, "slug": slug, "name": slug, "role": "member"}))
+                .collect::<Vec<_>>(),
+        },
+    });
+    Answer::Result(json!({"content": [{"type": "text", "text": payload.to_string()}]}).to_string())
+}
+
+/// The credential service of `vault`, handed `service` as its grounding of
+/// the remote server `SERVER`, as the daemon hands it.
+fn grounded_by(vault: &Vault, service: &Arc<ToolInvocationService>) {
+    let weak = Arc::downgrade(service);
+    let weak: std::sync::Weak<dyn crate::application::credential_service::RemoteServerGrounding> =
+        weak;
+    assert!(vault
+        .service
+        .set_remote_grounding(weak, vec![SERVER.to_string()]));
+}
+
+fn store_command(tenant: &TenantId) -> crate::application::credential_service::StoreApiKeyCommand {
+    crate::application::credential_service::StoreApiKeyCommand {
+        owner_user_id: USER.to_string(),
+        tenant_id: tenant.clone(),
+        provider: CredentialProvider::new(SERVER),
+        label: "Work instance".to_string(),
+        scope: CredentialScope::Personal,
+        api_key_value: SensitiveString::new(MARKER),
+        credential_type: CredentialType::Secret,
+    }
+}
+
+/// B1: a token being stored is grounded by the gateway's `InvokeTool` of
+/// `cortex.ground`, arguments `{}`, the token as the credential and its
+/// owner as the acting identity, over TLS; the payload in the result's text
+/// gives the binding its reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_token_is_grounded_through_invoke_tool_and_its_reach_recorded() {
+    use crate::application::credential_service::CredentialManagementService;
+    let stub = StubGateway::new(vec![], grounding_result(&[("inst-play2-id", "play2")]));
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let tenant = h.tenant.clone();
+    let service = Arc::new(h.service);
+    grounded_by(&vault, &service);
+
+    let id = vault
+        .service
+        .store_api_key(store_command(&tenant))
+        .await
+        .expect("stored");
+
+    let binding = vault.bindings.find_by_id(&id).await.unwrap().unwrap();
+    let reach = binding.metadata.reach.expect("reach recorded");
+    println!("reach {}", serde_json::to_value(&reach).unwrap());
+    assert_eq!(reach.kind, crate::domain::credential::ReachKind::Instance);
+    assert_eq!(reach.instance_slug.as_deref(), Some("play2"));
+    assert_eq!(reach.instance_id.as_deref(), Some("inst-play2-id"));
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.tools.len(), 1);
+    let call = &received.tools[0];
+    assert_eq!(
+        (call.server.as_str(), call.tool.as_str()),
+        (SERVER, "cortex.ground")
+    );
+    assert_eq!(call.arguments_json, "{}");
+    assert_eq!(call.tenant_id, tenant.as_str());
+    let acting = call.acting.as_ref().expect("acting identity");
+    assert_eq!(
+        (
+            acting.user_id.as_str(),
+            acting.agent_id.as_str(),
+            acting.workflow_id.as_str()
+        ),
+        (USER, "", "")
+    );
+    let credential = call.credential.as_ref().expect("credential");
+    assert_eq!(credential.kind, CredentialKind::BearerToken as i32);
+    assert_eq!(credential.value, MARKER);
+}
+
+/// B5: the gateway's refusal of the grounding (a 401 from the server is
+/// `CREDENTIAL_REJECTED` on this path) is the store's refusal with that code
+/// and sentence; nothing is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_refusal_of_the_grounding_stores_nothing() {
+    use crate::application::credential_service::{CredentialError, CredentialManagementService};
+    let stub = StubGateway::new(
+        vec![],
+        Answer::Refuse(
+            tonic::Code::PermissionDenied,
+            Some("CREDENTIAL_REJECTED"),
+            format!("The '{SERVER}' server refused your stored credential."),
+        ),
+    );
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let tenant = h.tenant.clone();
+    let service = Arc::new(h.service);
+    grounded_by(&vault, &service);
+
+    let err = vault
+        .service
+        .store_api_key(store_command(&tenant))
+        .await
+        .expect_err("refused");
+    println!("refusal {err}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "The token was not stored: grounding it at the remote server '{SERVER}' was refused \
+             (CREDENTIAL_REJECTED): The '{SERVER}' server refused your stored credential."
+        )
+    );
+    assert!(matches!(
+        err.downcast_ref::<CredentialError>(),
+        Some(CredentialError::ReachRefused { .. })
+    ));
+    assert!(
+        vault.bindings.0.read().await.is_empty(),
+        "a binding was stored"
+    );
+    assert_eq!(stub.received.lock().unwrap().tools.len(), 1);
+}
+
+/// H8: over a plaintext gateway address the token is never sent to be
+/// grounded; the grounding answers the channel's code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plaintext_gateway_address_never_carries_a_token_to_be_grounded() {
+    let stub = StubGateway::new(vec![], grounding_result(&[("inst-play2-id", "play2")]));
+    let (url, _shutdown) = serve_plaintext(stub.clone()).await;
+    let h = harness(Setup {
+        remote_servers: vec![SERVER.to_string()],
+        ..Setup::gateway(&url)
+    })
+    .await;
+
+    let refusal = h
+        .service
+        .ground_remote_token(&h.tenant, USER, SERVER, &SensitiveString::new(MARKER))
+        .await
+        .expect_err("refused");
+    assert!(matches!(
+        refusal,
+        crate::application::credential_service::GroundingRefusal::Unreachable { ref code, .. }
+            if code == "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL"
+    ));
+    assert!(stub.received.lock().unwrap().tools.is_empty());
 }

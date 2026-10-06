@@ -26,9 +26,9 @@
 
 use crate::domain::agent::AgentId;
 use crate::domain::credential::{
-    CredentialBindingId, CredentialBindingRepository, CredentialGrantId, CredentialMetadata,
-    CredentialProvider, CredentialScope, CredentialStatus, CredentialType, GrantTarget,
-    MailboxSettings, OAuthPendingState, UserCredentialBinding,
+    BindingReach, CredentialBindingId, CredentialBindingRepository, CredentialGrantId,
+    CredentialMetadata, CredentialProvider, CredentialScope, CredentialStatus, CredentialType,
+    GrantTarget, MailboxSettings, OAuthPendingState, ReachKind, UserCredentialBinding,
 };
 use crate::domain::events::CredentialEvent;
 use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry};
@@ -346,6 +346,58 @@ pub enum CredentialError {
     /// The binding holds no OAuth access token to hand out or refresh.
     #[error("credential binding {binding_id} holds no OAuth access token")]
     NoAccessToken { binding_id: String },
+    /// The gateway refused the grounding of a remote server's token with
+    /// its R5 `code` and caller-facing `message` (AEGIS ADR-132 (7a) S2):
+    /// nothing was stored, or the stored reach was not rewritten.
+    #[error("{prefix}: grounding it at the remote server '{server}' was refused ({code}): {message}", prefix = .stage.prefix())]
+    ReachRefused {
+        stage: ReachStage,
+        server: String,
+        code: String,
+        message: String,
+    },
+    /// The gateway could not be reached, or the call could not be made, to
+    /// ground a remote server's token; the detail is in the operator's log.
+    #[error("{prefix}: the remote server '{server}' could not be reached to ground it.", prefix = .stage.prefix())]
+    ReachUnreachable {
+        stage: ReachStage,
+        server: String,
+        code: String,
+    },
+    /// The grounding answered without `you.instances`.
+    #[error("{prefix}: the grounding '{server}' answered did not say which instances the token reaches.", prefix = .stage.prefix())]
+    ReachNotReported { stage: ReachStage, server: String },
+    /// The grounding answered an empty `you.instances`.
+    #[error("{prefix}: the grounding '{server}' answered says the token reaches no instance.", prefix = .stage.prefix())]
+    ReachesNoInstance { stage: ReachStage, server: String },
+    /// An introspection of a binding whose provider is not a remote server
+    /// of this node.
+    #[error("Binding {binding_id} is to '{provider}', which is not a remote server of this node; it has no reach to introspect.")]
+    NotARemoteServerBinding {
+        binding_id: String,
+        provider: String,
+    },
+}
+
+/// Which act a remote server's grounding of a token serves: a store (or a
+/// rotation, by the same rule), or an introspection of a stored binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachStage {
+    /// `store_api_key` or `rotate_credential`: the token is not stored when
+    /// its reach is unknown.
+    Store,
+    /// `introspect_binding`: the stored reach is not rewritten.
+    Introspect,
+}
+
+impl ReachStage {
+    /// The opening of every refusal sentence of this stage.
+    pub fn prefix(&self) -> &'static str {
+        match self {
+            Self::Store => "The token was not stored",
+            Self::Introspect => "The binding's reach was not rewritten",
+        }
+    }
 }
 
 /// Enforce HTTPS on the token URL per RFC 6749 §3.1.2.1, with a development
@@ -601,6 +653,19 @@ pub trait CredentialManagementService: Send + Sync {
         actor: &CredentialActor,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<Option<UserCredentialBinding>>;
+
+    /// Ground the binding's token at the remote server its provider names
+    /// again and rewrite its `reach` (AEGIS ADR-132 (7a) S2, "and on
+    /// demand"). `actor` must be able to manage the binding; anyone else is
+    /// answered as for a binding that does not exist. A binding whose
+    /// provider is not a remote server is
+    /// [`CredentialError::NotARemoteServerBinding`]; a grounding that gives
+    /// no reach leaves the stored one unchanged.
+    async fn introspect_binding(
+        &self,
+        actor: &CredentialActor,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<UserCredentialBinding>;
 }
 
 // ============================================================================
@@ -730,6 +795,100 @@ impl ToolCredentialSource for StandardCredentialManagementService {
 }
 
 // ============================================================================
+// A remote server's grounding of a token (AEGIS ADR-132 (7a) S2)
+// ============================================================================
+
+/// Why a remote server's grounding of a token answered no payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroundingRefusal {
+    /// The SEAL gateway refused the call: its R5 `code` and caller-facing
+    /// `message`.
+    Refused { code: String, message: String },
+    /// The gateway could not be reached or the call could not be made;
+    /// `detail` goes to the operator's log only.
+    Unreachable { code: String, detail: String },
+}
+
+/// Grounds a token at a remote tool server: `cortex.ground` through the
+/// SEAL gateway's `InvokeTool`, the token as the call's credential and the
+/// binding's owner as the acting identity (AEGIS ADR-132 (7a) S2; H2: the
+/// orchestrator makes no connection of its own to a remote server).
+#[async_trait]
+pub trait RemoteServerGrounding: Send + Sync {
+    /// The grounding payload `server` answers for `token`, acting for
+    /// `user_id` in `tenant_id`.
+    async fn ground_token(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        server: &str,
+        token: &SensitiveString,
+    ) -> Result<serde_json::Value, GroundingRefusal>;
+}
+
+/// Why a grounding payload gives no reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachReading {
+    /// No `you.instances` list of instances with a slug and an id.
+    NotReported,
+    /// `you.instances` is empty.
+    NoInstance,
+}
+
+/// The reach a grounding payload reports (AEGIS ADR-132 (7a) S2, the
+/// coordinator's B2): read from `you.instances` alone. Exactly one entry is
+/// `instance`, with that entry's slug and id; more than one is `apex`.
+/// An apex token whose holder reaches one instance reads `instance` until
+/// it is introspected again. `workspace_id` is never written: the payload
+/// does not say whether a token is narrowed to workspaces.
+pub fn reach_from_grounding(
+    payload: &serde_json::Value,
+    grounded_at: chrono::DateTime<Utc>,
+) -> Result<BindingReach, ReachReading> {
+    let instances = payload
+        .get("you")
+        .and_then(|you| you.get("instances"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or(ReachReading::NotReported)?;
+    let mut named = Vec::with_capacity(instances.len());
+    for instance in instances {
+        let id = instance.get("id").and_then(serde_json::Value::as_str);
+        let slug = instance.get("slug").and_then(serde_json::Value::as_str);
+        match (id, slug) {
+            (Some(id), Some(slug)) if !id.is_empty() && !slug.is_empty() => {
+                named.push((id.to_string(), slug.to_string()))
+            }
+            _ => return Err(ReachReading::NotReported),
+        }
+    }
+    match named.as_slice() {
+        [] => Err(ReachReading::NoInstance),
+        [(id, slug)] => Ok(BindingReach {
+            kind: ReachKind::Instance,
+            instance_slug: Some(slug.clone()),
+            instance_id: Some(id.clone()),
+            workspace_id: None,
+            grounded_at,
+        }),
+        _ => Ok(BindingReach {
+            kind: ReachKind::Apex,
+            instance_slug: None,
+            instance_id: None,
+            workspace_id: None,
+            grounded_at,
+        }),
+    }
+}
+
+/// The grounding handle and the remote servers it grounds for, handed to
+/// the service after the tool invocation service that implements it is
+/// built (the two are built in that order and each refers to the other).
+struct RemoteGroundingHandle {
+    grounding: std::sync::Weak<dyn RemoteServerGrounding>,
+    servers: Vec<String>,
+}
+
+// ============================================================================
 // Helper — build the OpenBao secret path for a user credential
 // ============================================================================
 
@@ -772,6 +931,10 @@ pub struct StandardCredentialManagementService {
     membership_repo: Option<Arc<dyn MembershipRepository>>,
     /// The live IMAP and SMTP check run before an `imap` mailbox is stored.
     mailbox_probe: Arc<dyn MailboxProbe>,
+    /// Grounds a remote server's token (AEGIS ADR-132 (7a) S2); set once,
+    /// late, by [`Self::set_remote_grounding`]. Unset: no provider is a
+    /// remote server and nothing is grounded.
+    remote_grounding: std::sync::OnceLock<RemoteGroundingHandle>,
 }
 
 impl StandardCredentialManagementService {
@@ -801,6 +964,7 @@ impl StandardCredentialManagementService {
             oauth_providers,
             membership_repo: None,
             mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
+            remote_grounding: std::sync::OnceLock::new(),
         }
     }
 
@@ -822,6 +986,7 @@ impl StandardCredentialManagementService {
             oauth_providers,
             membership_repo: None,
             mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
+            remote_grounding: std::sync::OnceLock::new(),
         }
     }
 
@@ -836,6 +1001,99 @@ impl StandardCredentialManagementService {
     pub fn with_membership_repo(mut self, repo: Arc<dyn MembershipRepository>) -> Self {
         self.membership_repo = Some(repo);
         self
+    }
+
+    /// Hand the service the grounding of remote servers' tokens and the
+    /// names of the remote servers (`seal_gateway.remote_servers`): a
+    /// binding whose provider is one of them is grounded when it is stored,
+    /// rotated or introspected (AEGIS ADR-132 (7a) S2). Set once; a second
+    /// call changes nothing and answers `false`. The handle is weak: the
+    /// tool invocation service that implements it holds this service.
+    pub fn set_remote_grounding(
+        &self,
+        grounding: std::sync::Weak<dyn RemoteServerGrounding>,
+        servers: Vec<String>,
+    ) -> bool {
+        self.remote_grounding
+            .set(RemoteGroundingHandle { grounding, servers })
+            .is_ok()
+    }
+
+    /// Whether `provider` names a remote server of this node.
+    fn is_remote_server(&self, provider: &CredentialProvider) -> bool {
+        self.remote_grounding
+            .get()
+            .is_some_and(|handle| handle.servers.iter().any(|s| s == provider.as_str()))
+    }
+
+    /// What `token` reaches on the remote server `provider` names, or
+    /// `None` when `provider` is no remote server of this node (AEGIS
+    /// ADR-132 (7a) S2). A grounding that gives no reach is the refusal of
+    /// `stage`, and nothing is grounded twice.
+    async fn ground_reach(
+        &self,
+        stage: ReachStage,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+        provider: &CredentialProvider,
+        token: &SensitiveString,
+    ) -> anyhow::Result<Option<BindingReach>> {
+        let Some(handle) = self.remote_grounding.get() else {
+            return Ok(None);
+        };
+        let server = provider.as_str();
+        if !handle.servers.iter().any(|s| s == server) {
+            return Ok(None);
+        }
+        let Some(grounding) = handle.grounding.upgrade() else {
+            tracing::error!(
+                server,
+                "the remote server grounding is gone; nothing was grounded"
+            );
+            return Err(CredentialError::ReachUnreachable {
+                stage,
+                server: server.to_string(),
+                code: "SERVICE_UNAVAILABLE".to_string(),
+            }
+            .into());
+        };
+        let payload = match grounding
+            .ground_token(tenant_id, owner_user_id, server, token)
+            .await
+        {
+            Ok(payload) => payload,
+            Err(GroundingRefusal::Refused { code, message }) => {
+                return Err(CredentialError::ReachRefused {
+                    stage,
+                    server: server.to_string(),
+                    code,
+                    message,
+                }
+                .into());
+            }
+            Err(GroundingRefusal::Unreachable { code, detail }) => {
+                tracing::warn!(server, code = %code, detail = %detail, "a remote server's token could not be grounded");
+                return Err(CredentialError::ReachUnreachable {
+                    stage,
+                    server: server.to_string(),
+                    code,
+                }
+                .into());
+            }
+        };
+        match reach_from_grounding(&payload, Utc::now()) {
+            Ok(reach) => Ok(Some(reach)),
+            Err(ReachReading::NotReported) => Err(CredentialError::ReachNotReported {
+                stage,
+                server: server.to_string(),
+            }
+            .into()),
+            Err(ReachReading::NoInstance) => Err(CredentialError::ReachesNoInstance {
+                stage,
+                server: server.to_string(),
+            }
+            .into()),
+        }
     }
 
     /// Whether `actor` may perform `access` on `binding`.
@@ -1091,6 +1349,17 @@ impl CredentialManagementService for StandardCredentialManagementService {
             api_key_value,
             credential_type,
         } = cmd;
+        // A remote server's token is grounded before anything is written:
+        // a token whose reach is unknown is never stored (ADR-132 (7a) S2).
+        let reach = self
+            .ground_reach(
+                ReachStage::Store,
+                &tenant_id,
+                &owner_user_id,
+                &provider,
+                &api_key_value,
+            )
+            .await?;
         let binding_id = CredentialBindingId::new();
         let secret_path = user_credential_path(&tenant_id, &owner_user_id, &binding_id);
 
@@ -1123,6 +1392,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 external_account_id: None,
                 oauth_scopes: None,
                 mailbox: None,
+                reach,
             },
             grants: Vec::new(),
             created_at: now,
@@ -1227,6 +1497,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 external_account_id: Some(settings.address.clone()),
                 oauth_scopes: None,
                 mailbox: Some(settings),
+                reach: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -1428,6 +1699,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 external_account_id: None,
                 oauth_scopes: None,
                 mailbox: None,
+                reach: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -1633,8 +1905,20 @@ impl CredentialManagementService for StandardCredentialManagementService {
         binding_id: &CredentialBindingId,
         new_value: SensitiveString,
     ) -> anyhow::Result<()> {
-        let binding = self
+        let mut binding = self
             .load_for(actor, binding_id, BindingAccess::Manage)
+            .await?;
+
+        // A rotated remote server's token is grounded before its secret is
+        // written, by the same rule as a store (ADR-132 (7a) S2; B4).
+        let reach = self
+            .ground_reach(
+                ReachStage::Store,
+                &binding.tenant_id,
+                &binding.owner_user_id,
+                &binding.provider,
+                &new_value,
+            )
             .await?;
 
         let mut secret_data = HashMap::new();
@@ -1647,6 +1931,11 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 &AccessContext::system("aegis-credential-service"),
             )
             .await?;
+        if reach.is_some() {
+            binding.metadata.reach = reach;
+            binding.updated_at = Utc::now();
+            self.repo.save(&binding).await?;
+        }
 
         self.event_bus
             .publish_credential_event(CredentialEvent::CredentialRotated {
@@ -1790,6 +2079,69 @@ impl CredentialManagementService for StandardCredentialManagementService {
         } else {
             Ok(None)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // introspect_binding (ADR-132 (7a) S2)
+    // -----------------------------------------------------------------------
+
+    async fn introspect_binding(
+        &self,
+        actor: &CredentialActor,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<UserCredentialBinding> {
+        let mut binding = self
+            .load_for(actor, binding_id, BindingAccess::Manage)
+            .await?;
+        if !self.is_remote_server(&binding.provider) {
+            return Err(CredentialError::NotARemoteServerBinding {
+                binding_id: binding_id.to_string(),
+                provider: binding.provider.to_string(),
+            }
+            .into());
+        }
+        if binding.status != CredentialStatus::Active {
+            return Err(CredentialError::BindingNotActive {
+                binding_id: binding_id.to_string(),
+                status: format!("{:?}", binding.status).to_lowercase(),
+            }
+            .into());
+        }
+        let token = if binding.credential_type == CredentialType::OAuth2 {
+            self.access_token_for(binding_id).await?
+        } else {
+            let stored = self
+                .secrets
+                .read_secret(
+                    &binding.secret_path.effective_mount(),
+                    &binding.secret_path.path,
+                    &AccessContext::system("aegis-credential-service"),
+                )
+                .await?;
+            stored
+                .get("token")
+                .or_else(|| stored.get("value"))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "credential binding {} holds no token or value field",
+                        binding.id
+                    )
+                })?
+        };
+        let reach = self
+            .ground_reach(
+                ReachStage::Introspect,
+                &binding.tenant_id,
+                &binding.owner_user_id,
+                &binding.provider,
+                &token,
+            )
+            .await?;
+        binding.metadata.reach = reach;
+        binding.updated_at = Utc::now();
+        self.repo.save(&binding).await?;
+        Ok(binding)
     }
 }
 

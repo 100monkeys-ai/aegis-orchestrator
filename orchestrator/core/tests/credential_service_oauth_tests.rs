@@ -174,6 +174,7 @@ async fn setup_harness_with(authorization_url: &str, token_url: String) -> Harne
             external_account_id: None,
             oauth_scopes: None,
             mailbox: None,
+            reach: None,
         },
         grants: Vec::new(),
         created_at: now,

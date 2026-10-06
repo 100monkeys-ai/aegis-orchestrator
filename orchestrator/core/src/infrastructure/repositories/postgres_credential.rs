@@ -12,7 +12,7 @@
 //! credential_bindings (id, owner_user_id, tenant_id, credential_type, provider,
 //!                      label, secret_path, scope, scope_team_id, status,
 //!                      oauth_scopes, external_account_id, service_url, tags,
-//!                      created_at, updated_at)
+//!                      created_at, updated_at, mailbox_settings, reach)
 //! credential_grants    (id, binding_id, target_type, target_value, granted_at, granted_by)
 //! oauth_pending_states (state, binding_id, pkce_verifier, redirect_uri, created_at)
 //! ```
@@ -161,6 +161,13 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> anyhow::Result<UserCredential
         .map(serde_json::from_value)
         .transpose()
         .map_err(|e| anyhow::anyhow!("Invalid mailbox_settings for binding {id}: {e}"))?;
+    // Migration 042 (AEGIS ADR-132 (7a) S2); NULL for every binding whose
+    // provider is not a remote server.
+    let reach_json: Option<serde_json::Value> = row.try_get("reach")?;
+    let reach = reach_json
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid reach for binding {id}: {e}"))?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -200,6 +207,7 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> anyhow::Result<UserCredential
             external_account_id,
             oauth_scopes,
             mailbox,
+            reach,
         },
         grants: Vec::new(),
         created_at,
@@ -249,6 +257,13 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|e| anyhow::anyhow!("Failed to encode mailbox_settings: {e}"))?;
+        let reach: Option<serde_json::Value> = binding
+            .metadata
+            .reach
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Failed to encode reach: {e}"))?;
 
         sqlx::query(
             r#"
@@ -256,9 +271,9 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
                 id, owner_user_id, tenant_id, credential_type, provider,
                 label, secret_path, scope, scope_team_id, status,
                 oauth_scopes, external_account_id, service_url, tags,
-                created_at, updated_at, mailbox_settings
+                created_at, updated_at, mailbox_settings, reach
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (id) DO UPDATE SET
                 owner_user_id       = EXCLUDED.owner_user_id,
                 tenant_id           = EXCLUDED.tenant_id,
@@ -274,7 +289,8 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
                 service_url         = EXCLUDED.service_url,
                 tags                = EXCLUDED.tags,
                 updated_at          = EXCLUDED.updated_at,
-                mailbox_settings    = EXCLUDED.mailbox_settings
+                mailbox_settings    = EXCLUDED.mailbox_settings,
+                reach               = EXCLUDED.reach
             "#,
         )
         .bind(binding.id.0)
@@ -294,6 +310,7 @@ impl CredentialBindingRepository for PostgresCredentialBindingRepository {
         .bind(binding.created_at)
         .bind(binding.updated_at)
         .bind(&mailbox_settings)
+        .bind(&reach)
         .execute(&self.pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to save credential binding {}: {e}", binding.id))?;
@@ -624,6 +641,11 @@ mod provider_storage_tests {
         ))
         .await
         .unwrap();
+        pool.execute(include_str!(
+            "../../../../../cli/migrations/042_credential_binding_reach.sql"
+        ))
+        .await
+        .unwrap();
         let repo = PostgresCredentialBindingRepository::new(pool.clone());
         let tenant = TenantId::for_consumer_user("owner-sub").unwrap();
         let binding = |provider: &str, credential_type: CredentialType| {
@@ -644,6 +666,7 @@ mod provider_storage_tests {
                     external_account_id: None,
                     oauth_scopes: None,
                     mailbox: None,
+                    reach: None,
                 },
                 grants: Vec::new(),
                 created_at: chrono::Utc::now(),

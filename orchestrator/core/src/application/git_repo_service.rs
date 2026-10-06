@@ -1463,6 +1463,7 @@ mod tests {
                     external_account_id: None,
                     oauth_scopes: None,
                     mailbox: None,
+                    reach: None,
                 },
                 grants: Vec::new(),
                 created_at: chrono::Utc::now(),

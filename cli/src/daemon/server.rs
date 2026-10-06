@@ -144,7 +144,7 @@ use aegis_orchestrator_core::{
 };
 
 use aegis_orchestrator_core::application::credential_service::{
-    oauth_provider_registry_from_config, CredentialManagementService,
+    oauth_provider_registry_from_config, CredentialManagementService, RemoteServerGrounding,
     StandardCredentialManagementService, ToolCredentialSource,
 };
 use aegis_orchestrator_core::domain::credential::CredentialBindingRepository;
@@ -1755,6 +1755,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // The same store answers a remote tool call's credential (AEGIS ADR-132
     // H1), wired into the tool invocation service with `seal_gateway`.
     let mut tool_credentials: Option<Arc<dyn ToolCredentialSource>> = None;
+    // Handed the remote servers' grounding once the tool invocation service
+    // that implements it is built (AEGIS ADR-132 (7a) S2).
+    let mut grounded_credentials: Option<Arc<StandardCredentialManagementService>> = None;
     let credential_service: Option<Arc<dyn CredentialManagementService>> = match db_pool.as_ref() {
         None => None,
         Some(pool) => {
@@ -1793,6 +1796,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .with_membership_repo(memberships),
             );
             tool_credentials = Some(service.clone() as Arc<dyn ToolCredentialSource>);
+            grounded_credentials = Some(service.clone());
             Some(service as Arc<dyn CredentialManagementService>)
         }
     };
@@ -2134,6 +2138,23 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tool_invocation_service_builder = tool_invocation_service_builder.with_goals(goal_service);
 
     let tool_invocation_service = Arc::new(tool_invocation_service_builder);
+
+    // A remote server's token is grounded through the SEAL gateway when it is
+    // stored, rotated or introspected (AEGIS ADR-132 (7a) S2): the credential
+    // service, built before the tool invocation service that makes the call,
+    // is handed it now, weakly, with the remote servers' names.
+    if let (Some(credentials), Some(gateway)) =
+        (&grounded_credentials, config.spec.seal_gateway.as_ref())
+    {
+        let service = Arc::downgrade(&tool_invocation_service);
+        let grounding: std::sync::Weak<dyn RemoteServerGrounding> = service;
+        credentials.set_remote_grounding(
+            grounding,
+            gateway
+                .remote_server_names()
+                .context("seal_gateway configuration")?,
+        );
+    }
 
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
 
