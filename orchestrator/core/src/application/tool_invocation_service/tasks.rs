@@ -191,6 +191,7 @@ impl ToolInvocationService {
                     "ended_at": exec.ended_at,
                     "iteration_count": exec.iterations().len(),
                     "last_output": last_iter.and_then(|i| i.output.as_ref()),
+                    "produced_files": exec.produced_files(),
                     "last_error": last_iter.and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
                 })))
             }
@@ -266,6 +267,7 @@ impl ToolInvocationService {
                             "ended_at": exec.ended_at,
                             "iteration_count": exec.iterations().len(),
                             "last_output": last_iter.and_then(|i| i.output.as_ref()),
+                            "produced_files": exec.produced_files(),
                             "last_error": last_iter.and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
                         })));
                     }

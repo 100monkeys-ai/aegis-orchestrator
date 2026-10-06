@@ -321,6 +321,24 @@ pub struct Iteration {
     /// Tool names that were blocked by policy during this iteration.
     #[serde(default)]
     pub policy_violations: Vec<String>,
+    /// The declared outputs this iteration left in the execution's volume,
+    /// as the supervisor read them before the iteration counted as completed
+    /// (AEGIS ADR-005, Update of 2026-10-06, O3). Stored in the `iterations`
+    /// column; an iteration stored before it carries none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produced_files: Vec<ProducedFile>,
+}
+
+/// A file a completed execution produced, read from its volume rather than
+/// taken from the model's text (AEGIS ADR-005, Update of 2026-10-06, O3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducedFile {
+    /// The path the output was declared at, inside the container.
+    pub path: String,
+    /// Its size in bytes when it was read.
+    pub size_bytes: u64,
+    /// Its content type, as the execution file route answers it.
+    pub content_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +550,7 @@ impl Execution {
             llm_interactions: Vec::new(),
             trajectory: None,
             policy_violations: Vec::new(),
+            produced_files: Vec::new(),
         };
 
         self.iterations.push(iteration);
@@ -585,6 +604,47 @@ impl Execution {
         } else {
             Err(ExecutionError::IterationNotFound(iteration_number))
         }
+    }
+
+    /// Record what the current iteration answered without ending it: an
+    /// iteration failed by its declared outputs keeps the model's text
+    /// (AEGIS ADR-005, Update of 2026-10-06, O2).
+    pub fn record_iteration_output(&mut self, output: String) {
+        if let Some(iter) = self.iterations.last_mut() {
+            iter.output = Some(output);
+        }
+    }
+
+    /// Record the declared outputs an iteration left in the volume (O3).
+    pub fn store_produced_files(
+        &mut self,
+        iteration_number: u8,
+        produced_files: Vec<ProducedFile>,
+    ) -> Result<(), ExecutionError> {
+        if let Some(iter) = self
+            .iterations
+            .iter_mut()
+            .find(|i| i.number == iteration_number)
+        {
+            iter.produced_files = produced_files;
+            Ok(())
+        } else {
+            Err(ExecutionError::IterationNotFound(iteration_number))
+        }
+    }
+
+    /// The files this execution produced: its last iteration's declared
+    /// outputs once the execution has completed, and none before (AEGIS
+    /// ADR-005, Update of 2026-10-06, O3). This record, not the model's text,
+    /// is what "made a file" means downstream.
+    pub fn produced_files(&self) -> &[ProducedFile] {
+        if self.status != ExecutionStatus::Completed {
+            return &[];
+        }
+        self.iterations
+            .last()
+            .map(|iteration| iteration.produced_files.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn fail_iteration(&mut self, error: IterationError) {
@@ -1119,5 +1179,66 @@ mod tests {
         assert_eq!(exec.status, ExecutionStatus::Completed);
         assert_eq!(exec.ended_at, before);
         assert!(exec.error.is_none());
+    }
+
+    // ── Produced files (AEGIS ADR-005, Update of 2026-10-06, O3) ──────────────
+
+    /// An iteration stored before `produced_files` existed reads with none,
+    /// and an execution answers its last iteration's produced files once it
+    /// has completed, and none before. Every clause is reported.
+    #[test]
+    fn produced_files_read_from_old_rows_as_empty_and_answer_only_once_completed() {
+        let mut complaints: Vec<String> = Vec::new();
+        let old_row = serde_json::json!({
+            "number": 1,
+            "status": "Success",
+            "action": "act",
+            "output": "/workspace/x.pdf",
+            "validation_results": null,
+            "error": null,
+            "code_changes": null,
+            "started_at": "2026-10-05T17:11:23Z",
+            "ended_at": "2026-10-05T17:12:24Z"
+        });
+        match serde_json::from_value::<Iteration>(old_row) {
+            Ok(iteration) if iteration.produced_files.is_empty() => {}
+            other => complaints.push(format!(
+                "an iteration stored without produced_files did not read as empty: {other:?}"
+            )),
+        }
+
+        let mut exec = Execution::new(
+            AgentId::new(),
+            make_input("make a pdf"),
+            3,
+            "ctx".to_string(),
+        );
+        exec.start();
+        exec.start_iteration("act".to_string()).unwrap();
+        exec.complete_iteration("/workspace/x.pdf".to_string());
+        let produced = vec![ProducedFile {
+            path: "/workspace/x.pdf".to_string(),
+            size_bytes: 2048,
+            content_type: "application/pdf".to_string(),
+        }];
+        if let Err(e) = exec.store_produced_files(1, produced.clone()) {
+            complaints.push(format!("store_produced_files refused iteration 1: {e}"));
+        }
+        if !exec.produced_files().is_empty() {
+            complaints.push("a running execution answered produced files".to_string());
+        }
+        exec.complete();
+        if exec.produced_files() != produced.as_slice() {
+            complaints.push(format!(
+                "a completed execution answered {:?}, not its last iteration's files",
+                exec.produced_files()
+            ));
+        }
+        let round_trip: Execution =
+            serde_json::from_value(serde_json::to_value(&exec).unwrap()).unwrap();
+        if round_trip.produced_files() != produced.as_slice() {
+            complaints.push("produced_files did not survive the stored form".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

@@ -54,7 +54,8 @@ use crate::domain::node_config::resolve_env_value;
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::RuntimeError;
 use crate::domain::supervisor::{
-    Supervisor, SupervisorObserver, DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    DeclaredOutputReader, OutputHead, OutputLocation, Supervisor, SupervisorObserver,
+    DEFAULT_EXECUTION_TIMEOUT_SECONDS,
 };
 use crate::domain::volume::{
     AccessMode, FilerEndpoint, TenantId, VolumeId, VolumeMount, VolumeOwnership,
@@ -928,8 +929,16 @@ impl StandardExecutionService {
         self
     }
 
-    /// Attach an NFS gateway so volume contexts are registered before agent containers spawn
+    /// Attach an NFS gateway so volume contexts are registered before agent containers spawn.
+    ///
+    /// The supervisor then checks declared outputs through the gateway's FSAL,
+    /// the path the container's own reads and writes take (AEGIS ADR-005,
+    /// Update of 2026-10-06, O2).
     pub fn with_nfs_gateway(mut self, gateway: Arc<NfsGatewayService>) -> Self {
+        let reader: Arc<dyn DeclaredOutputReader> = Arc::new(FsalOutputReader {
+            fsal: gateway.fsal().clone(),
+        });
+        self.supervisor = Arc::new(self.supervisor.as_ref().clone().with_output_reader(reader));
         self.nfs_gateway = Some(gateway);
         self
     }
@@ -3499,6 +3508,264 @@ mod tests {
             assert_eq!(execution.timeout_seconds, Some(expected), "execution {id}");
         }
     }
+
+    // ── Declared outputs, end to end (AEGIS ADR-005, Update of 2026-10-06) ───
+
+    /// A worker whose model answers the path of a PDF with no tool call, as
+    /// the three runs of Jeshua's PDF request did (9506f85b).
+    #[derive(Default)]
+    struct ClaimingRuntime;
+
+    #[async_trait]
+    impl AgentRuntime for ClaimingRuntime {
+        async fn spawn(&self, _config: WorkerRuntimeConfig) -> Result<InstanceId, RuntimeError> {
+            Ok(InstanceId::new("claiming-instance"))
+        }
+
+        async fn execute(
+            &self,
+            _id: &InstanceId,
+            _input: TaskInput,
+        ) -> Result<TaskOutput, RuntimeError> {
+            Ok(TaskOutput {
+                result: serde_json::Value::String("/workspace/x.pdf".to_string()),
+                logs: Vec::new(),
+                tool_calls: Vec::new(),
+                exit_code: 0,
+                trajectory: vec![],
+            })
+        }
+
+        async fn terminate(&self, _id: &InstanceId) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn status(&self, _id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
+            Ok(InstanceStatus {
+                id: InstanceId::new("claiming-instance"),
+                state: "running".to_string(),
+                uptime_seconds: 0,
+                memory_usage_mb: 0,
+                cpu_usage_percent: 0.0,
+            })
+        }
+    }
+
+    /// Test 8. A workflow step's agent runs against a real FSAL over a local
+    /// directory: the gateway the daemon builds, with no double of the
+    /// reader. Its model answers "/workspace/x.pdf" and writes nothing. With
+    /// the manifest declaring the PDF, the execution fails past max retries
+    /// with "declared output /workspace/x.pdf does not exist" and each failed
+    /// iteration keeps the model's text; with the caller declaring it under
+    /// `input.outputs` and the file in the volume, the execution completes
+    /// and `produced_files` names it.
+    #[tokio::test]
+    async fn a_claimed_file_that_is_not_in_the_volume_fails_the_execution_and_one_that_is_is_recorded(
+    ) {
+        let mut complaints: Vec<String> = Vec::new();
+        let tenant_id = CoreTenantId::consumer();
+
+        for file_present in [false, true] {
+            let storage_root = tempfile::tempdir().unwrap();
+            let storage_provider: Arc<dyn StorageProvider> =
+                Arc::new(LocalHostStorageProvider::new(storage_root.path()).unwrap());
+            let volume_repository: Arc<dyn VolumeRepository> =
+                Arc::new(InMemoryVolumeRepository::new());
+            let workflow_execution_id = uuid::Uuid::new_v4();
+            let workspace_id = VolumeId::new();
+            // The workflow's workspace, on the backend whose files the
+            // gateway's storage provider holds, at the remote path the step
+            // input names: where the container's writes land.
+            let remote_path = format!("/aegis/volumes/zaru-consumer/{workspace_id}");
+            let mut workspace = Volume::new(
+                "workspace".to_string(),
+                tenant_id.clone(),
+                StorageClass::persistent(),
+                VolumeBackend::SeaweedFS {
+                    filer_endpoint: crate::domain::volume::FilerEndpoint::new(
+                        "http://localhost:8888",
+                    )
+                    .unwrap(),
+                    remote_path: remote_path.clone(),
+                },
+                1024 * 1024,
+                VolumeOwnership::workflow(workflow_execution_id),
+            )
+            .unwrap();
+            workspace.id = workspace_id;
+            workspace.mark_available().unwrap();
+            volume_repository.save(&workspace).await.unwrap();
+            let volume_dir = storage_root
+                .path()
+                .join(remote_path.trim_start_matches('/'));
+            if file_present {
+                std::fs::create_dir_all(&volume_dir).unwrap();
+                std::fs::write(volume_dir.join("x.pdf"), b"%PDF-1.7\nan itinerary").unwrap();
+            }
+            let event_bus = Arc::new(EventBus::with_default_capacity());
+            let nfs_gateway = Arc::new(NfsGatewayService::new(
+                storage_provider,
+                volume_repository,
+                Arc::new(EventBusPublisher::new(event_bus.clone())),
+                Some(0),
+            ));
+
+            let mut agent = make_agent("delivery-itinerary-pdf-agent", None, None);
+            let declared = crate::domain::agent::DeclaredOutput {
+                path: "/workspace/x.pdf".to_string(),
+                min_bytes: Some(8),
+                magic: Some("%PDF".to_string()),
+            };
+            agent.manifest.spec.execution = Some(crate::domain::agent::ExecutionStrategy {
+                max_retries: 2,
+                outputs: if file_present {
+                    Vec::new()
+                } else {
+                    vec![declared.clone()]
+                },
+                ..Default::default()
+            });
+            let agent_repo = Arc::new(InMemoryAgentRepository::new());
+            agent_repo
+                .save_for_tenant(&tenant_id, &agent)
+                .await
+                .unwrap();
+            let execution_repo: Arc<dyn ExecutionRepository> =
+                Arc::new(InMemoryExecutionRepository::new());
+            let service = StandardExecutionService::new(
+                agent_repo,
+                Arc::new(TestVolumeService {
+                    volumes: HashMap::new(),
+                }),
+                Arc::new(Supervisor::new(Arc::new(ClaimingRuntime))),
+                execution_repo.clone(),
+                event_bus.clone(),
+                Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+            )
+            .with_nfs_gateway(nfs_gateway);
+
+            let mut input = workflow_step_input(workspace.id, workflow_execution_id);
+            if file_present {
+                input.input["outputs"] = serde_json::to_value(vec![declared]).unwrap();
+            }
+            let mut receiver = event_bus.subscribe();
+            let execution_id = service
+                .start_execution(agent.id, input, "test-ctx".to_string(), None)
+                .await
+                .unwrap();
+            let terminal = wait_for_terminal_event(&mut receiver).await;
+            let execution = execution_repo
+                .find_by_id_for_tenant(&tenant_id, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let iteration_errors: Vec<Option<String>> = execution
+                .iterations()
+                .iter()
+                .map(|i| i.error.as_ref().map(|e| e.message.clone()))
+                .collect();
+            let iteration_outputs: Vec<Option<String>> = execution
+                .iterations()
+                .iter()
+                .map(|i| i.output.clone())
+                .collect();
+            println!(
+                "file present {file_present}: status {:?}, error {:?}, iteration errors {:?}, \
+                 iteration outputs {:?}, produced_files {:?}",
+                execution.status,
+                execution.error,
+                iteration_errors,
+                iteration_outputs,
+                execution.produced_files()
+            );
+
+            let sentence = "declared output /workspace/x.pdf does not exist";
+            if file_present {
+                if !matches!(terminal, ExecutionEvent::ExecutionCompleted { .. }) {
+                    complaints.push(format!("with the file present the run ended {terminal:?}"));
+                }
+                let expected = vec![crate::domain::execution::ProducedFile {
+                    path: "/workspace/x.pdf".to_string(),
+                    size_bytes: 21,
+                    content_type: "application/pdf".to_string(),
+                }];
+                if execution.produced_files() != expected.as_slice() {
+                    complaints.push(format!(
+                        "with the file present produced_files was {:?}",
+                        execution.produced_files()
+                    ));
+                }
+            } else {
+                match &terminal {
+                    // The service's own prefix on every supervisor failure.
+                    ExecutionEvent::ExecutionFailed { reason, .. }
+                        if reason
+                            == &format!(
+                                "Failed to execute task: Max retries exceeded: {sentence}"
+                            ) => {}
+                    other => complaints.push(format!("with no file the run ended {other:?}")),
+                }
+                if iteration_errors != vec![Some(sentence.to_string()); 2] {
+                    complaints.push(format!("the iterations failed with {iteration_errors:?}"));
+                }
+                if iteration_outputs != vec![Some("/workspace/x.pdf".to_string()); 2] {
+                    complaints.push(format!(
+                        "the failed iterations kept {iteration_outputs:?}, not the model's text"
+                    ));
+                }
+                if !execution.produced_files().is_empty() {
+                    complaints.push("a failed execution answered produced files".to_string());
+                }
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// I2: a caller's `outputs` are not the agent's input: an agent whose
+    /// `input_schema` admits no other key still starts, and malformed or
+    /// refused outputs are refused at the start with their reason.
+    #[test]
+    fn caller_outputs_are_read_refused_and_kept_from_the_input_schema() {
+        let mut complaints: Vec<String> = Vec::new();
+        let payload = serde_json::json!({
+            "topic": "delivery",
+            "outputs": [{ "path": "/workspace/x.pdf", "magic": "%PDF" }]
+        });
+        match StandardExecutionService::caller_outputs(&payload) {
+            Ok(outputs) if outputs.len() == 1 && outputs[0].path == "/workspace/x.pdf" => {}
+            other => complaints.push(format!("the caller's outputs read as {other:?}")),
+        }
+        let seen = StandardExecutionService::without_caller_outputs(&payload);
+        if seen.as_ref() != &serde_json::json!({ "topic": "delivery" }) {
+            complaints.push(format!("the input schema would see {seen}"));
+        }
+        for (bad, why) in [
+            (
+                serde_json::json!({ "outputs": "x.pdf" }),
+                "must be a list of",
+            ),
+            (
+                serde_json::json!({ "outputs": [{ "path": "/etc/x" }] }),
+                "must be a file under /workspace",
+            ),
+            (
+                serde_json::json!({ "outputs": [{ "path": "/workspace/x", "mode": 1 }] }),
+                "must be a list of",
+            ),
+        ] {
+            match StandardExecutionService::caller_outputs(&bad) {
+                Err(e) if e.to_string().contains(why) => {}
+                other => complaints.push(format!("{bad} was not refused ({why}): {other:?}")),
+            }
+        }
+        if !matches!(
+            StandardExecutionService::caller_outputs(&serde_json::json!({ "topic": "x" })),
+            Ok(outputs) if outputs.is_empty()
+        ) {
+            complaints.push("an input with no outputs declared some".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 }
 
 struct ExecutionMonitor {
@@ -3507,6 +3774,95 @@ struct ExecutionMonitor {
     tenant_id: TenantId,
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
+}
+
+/// Reads a declared output through the FSAL, authorised as the execution
+/// itself and routed per volume backend, exactly as the container's NFS reads
+/// are (AEGIS ADR-005, Update of 2026-10-06, O2).
+struct FsalOutputReader {
+    fsal: Arc<crate::domain::fsal::AegisFSAL>,
+}
+
+#[async_trait]
+impl DeclaredOutputReader for FsalOutputReader {
+    async fn read_head(
+        &self,
+        location: &OutputLocation,
+        head_len: usize,
+    ) -> std::result::Result<Option<OutputHead>, String> {
+        use crate::domain::fsal::{AegisFileHandle, FsalError};
+        use crate::domain::storage::{FileType, StorageError};
+
+        let not_found = |error: &FsalError| {
+            matches!(
+                error,
+                FsalError::Storage(StorageError::FileNotFound(_) | StorageError::NotFound(_))
+            )
+        };
+        let attributes = match self
+            .fsal
+            .getattr(
+                location.execution_id,
+                location.volume_id,
+                &location.path_in_volume,
+                location.container_uid,
+                location.container_gid,
+                location.workflow_execution_id,
+            )
+            .await
+        {
+            Ok(attributes) => attributes,
+            Err(error) if not_found(&error) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        if attributes.file_type != FileType::File {
+            return Ok(None);
+        }
+        let length = head_len.min(usize::try_from(attributes.size).unwrap_or(usize::MAX));
+        let head = if length == 0 {
+            Vec::new()
+        } else {
+            let policy = FsalAccessPolicy {
+                read: vec!["/*".to_string()],
+                write: Vec::new(),
+            };
+            // As the execution first; a workflow's workspace volume answers
+            // to the workflow execution that owns it.
+            let as_execution = AegisFileHandle::new(
+                location.execution_id,
+                location.volume_id,
+                &location.path_in_volume,
+            );
+            match self
+                .fsal
+                .read(&as_execution, &location.path_in_volume, &policy, 0, length)
+                .await
+            {
+                Ok(head) => head,
+                Err(FsalError::UnauthorizedAccess { .. })
+                    if location.workflow_execution_id.is_some() =>
+                {
+                    let as_workflow = AegisFileHandle::new_for_workflow(
+                        location.workflow_execution_id.unwrap_or_default(),
+                        location.volume_id,
+                        &location.path_in_volume,
+                    );
+                    self.fsal
+                        .read(&as_workflow, &location.path_in_volume, &policy, 0, length)
+                        .await
+                        .map_err(|error| error.to_string())?
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        Ok(Some(OutputHead {
+            size_bytes: attributes.size,
+            head,
+            content_type: crate::application::file_operations_service::guess_content_type(
+                &location.path_in_volume,
+            ),
+        }))
+    }
 }
 
 #[async_trait]
@@ -3657,6 +4013,47 @@ impl SupervisorObserver for ExecutionMonitor {
                 instance_id: instance_id.clone(),
                 terminated_at: now,
             });
+    }
+
+    async fn on_outputs_verified(
+        &self,
+        iteration: u8,
+        produced: &[crate::domain::execution::ProducedFile],
+    ) {
+        if let Ok(Some(mut exec)) = self
+            .repository
+            .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
+            .await
+        {
+            if let Err(e) = exec.store_produced_files(iteration, produced.to_vec()) {
+                tracing::warn!(
+                    "Failed to store produced files for execution {} iteration {}: {}",
+                    self.execution_id,
+                    iteration,
+                    e
+                );
+            }
+            let _ = self
+                .repository
+                .save_for_tenant(&self.tenant_id, &exec)
+                .await;
+        }
+    }
+
+    async fn on_outputs_missing(&self, iteration: u8, output: &str, reason: &str) {
+        // The iteration keeps what the model answered, then fails (O2).
+        if let Ok(Some(mut exec)) = self
+            .repository
+            .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
+            .await
+        {
+            exec.record_iteration_output(output.to_string());
+            let _ = self
+                .repository
+                .save_for_tenant(&self.tenant_id, &exec)
+                .await;
+        }
+        self.on_iteration_fail(iteration, reason).await;
     }
 
     async fn on_validation_complete(
@@ -3869,6 +4266,42 @@ impl StandardExecutionService {
         }
 
         Ok(())
+    }
+
+    /// The outputs a caller declares for one execution: the reserved key
+    /// `outputs` of its input, each `{path, min_bytes?, magic?}` (AEGIS
+    /// ADR-005, Update of 2026-10-06, O1), refused as the manifest's are.
+    fn caller_outputs(
+        payload: &serde_json::Value,
+    ) -> Result<Vec<crate::domain::agent::DeclaredOutput>> {
+        let Some(outputs) = payload.get("outputs") else {
+            return Ok(Vec::new());
+        };
+        let outputs: Vec<crate::domain::agent::DeclaredOutput> =
+            serde_json::from_value(outputs.clone()).map_err(|e| {
+                ExecutionError::InvalidExecutionInput(format!(
+                    "input.outputs must be a list of {{path, min_bytes, magic}}: {e}"
+                ))
+            })?;
+        if let Some(refusal) = outputs.iter().find_map(|output| output.refusal()) {
+            return Err(
+                ExecutionError::InvalidExecutionInput(format!("input.outputs: {refusal}")).into(),
+            );
+        }
+        Ok(outputs)
+    }
+
+    /// The input as the agent's `input_schema` sees it: without the caller's
+    /// reserved `outputs`, which are the platform's, not the agent's.
+    fn without_caller_outputs(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
+        match payload {
+            JsonValue::Object(map) if map.contains_key("outputs") => {
+                let mut map = map.clone();
+                map.remove("outputs");
+                std::borrow::Cow::Owned(JsonValue::Object(map))
+            }
+            _ => std::borrow::Cow::Borrowed(payload),
+        }
     }
 
     fn extract_context_overrides(
@@ -4228,6 +4661,12 @@ impl StandardExecutionService {
             .map(|s| s.to_string())
             .unwrap_or(security_context_name);
 
+        // AEGIS ADR-005, Update of 2026-10-06, O1: the outputs a caller adds
+        // for this execution, under the reserved key `outputs` of its input.
+        // Like a dispatch's attachments, they are not the agent's own input:
+        // the schema below never sees them.
+        let caller_outputs = Self::caller_outputs(&input.input)?;
+
         // ADR-092 D7: Validate structured input against agent's declared input_schema.
         // The `intent` field is excluded from schema validation. A workflow state's
         // agent is checked against the state's own input (`input_schema_instance`);
@@ -4236,7 +4675,8 @@ impl StandardExecutionService {
             let compiled = jsonschema::validator_for(schema).map_err(|e| {
                 ExecutionError::InvalidExecutionInput(format!("Agent input_schema is invalid: {e}"))
             })?;
-            let instance = Self::input_schema_instance(&input.input)?;
+            let schema_input = Self::without_caller_outputs(&input.input);
+            let instance = Self::input_schema_instance(&schema_input)?;
             if let SchemaInstance::WorkflowState(serde_json::Value::String(_)) = &instance {
                 if Self::schema_wants_object(schema) {
                     return Err(ExecutionError::InvalidExecutionInput(
@@ -4755,7 +5195,14 @@ impl StandardExecutionService {
             env,
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
-            execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
+            // The manifest's declared outputs and the caller's for this
+            // execution, checked by the supervisor (ADR-005, Update of
+            // 2026-10-06, O1 and O2).
+            execution: {
+                let mut execution = agent.manifest.spec.execution.clone().unwrap_or_default();
+                execution.outputs.extend(caller_outputs);
+                execution
+            },
             // The workflow's workspace first, so a manifest volume under it is
             // bound on top of it.
             volumes: workflow_workspace

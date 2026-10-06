@@ -434,6 +434,61 @@ pub struct ExecutionStrategy {
     pub tool_validation: Option<ValidationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryConfig>,
+    /// Files an execution of this agent must leave in its workspace (AEGIS
+    /// ADR-005, Update of 2026-10-06, O1). Before an iteration counts as
+    /// completed the supervisor reads each one from the execution's volume;
+    /// a missing, short or wrong-prefix file fails the iteration (O2), and a
+    /// completed execution records each one it found (O3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<DeclaredOutput>,
+}
+
+/// One file an execution must produce: `spec.execution.outputs[]` in the
+/// manifest, or an entry of a caller's `input.outputs` for one execution
+/// (AEGIS ADR-005, Update of 2026-10-06, O1).
+///
+/// # YAML example
+/// ```yaml
+/// spec:
+///   execution:
+///     outputs:
+///       - path: /workspace/report.pdf
+///         min_bytes: 1024
+///         magic: "%PDF"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredOutput {
+    /// Absolute path inside the container: `/workspace` or under it.
+    pub path: String,
+    /// The fewest bytes the file may hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_bytes: Option<u64>,
+    /// The text the file must start with (UTF-8), for example `%PDF`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic: Option<String>,
+}
+
+impl DeclaredOutput {
+    /// Why this declaration cannot be checked, or `None` when it can: its
+    /// path must be `/workspace` or under it (where every mount lives), and a
+    /// `magic` must not be empty.
+    pub fn refusal(&self) -> Option<String> {
+        let path = self.path.as_str();
+        let under_workspace =
+            path.starts_with("/workspace/") && !path.split('/').any(|segment| segment == "..");
+        if !under_workspace {
+            return Some(format!(
+                "declared output '{path}' must be a file under /workspace"
+            ));
+        }
+        if self.magic.as_deref() == Some("") {
+            return Some(format!(
+                "declared output '{path}' has an empty magic; give the text the file starts with, or none"
+            ));
+        }
+        None
+    }
 }
 
 impl Default for ExecutionStrategy {
@@ -446,6 +501,7 @@ impl Default for ExecutionStrategy {
             validation: None,
             tool_validation: None,
             delivery: None,
+            outputs: Vec::new(),
         }
     }
 }
@@ -950,6 +1006,13 @@ impl AgentManifest {
         }
 
         // Execution strategy is optional and validated by its own invariants.
+        // Its declared outputs are checked here (AEGIS ADR-005, Update of
+        // 2026-10-06, O1).
+        if let Some(execution) = &self.spec.execution {
+            if let Some(refusal) = execution.outputs.iter().find_map(|output| output.refusal()) {
+                return Err(format!("spec.execution.outputs: {refusal}"));
+            }
+        }
 
         // spec.task is required — an agent without a task block has no instruction and cannot run
         match &self.spec.task {
@@ -1257,5 +1320,60 @@ spec:
         if let ValidatorSpec::Semantic { judge_agent, .. } = &tool_val[0] {
             assert_eq!(judge_agent, "code-quality-judge");
         }
+    }
+
+    // ── Declared outputs (AEGIS ADR-005, Update of 2026-10-06, O1) ────────────
+
+    /// `spec.execution.outputs` parses from a manifest, and `validate` refuses
+    /// a path outside `/workspace` and an empty `magic`. Every clause is
+    /// checked and reported, so one red names every broken one.
+    #[test]
+    fn declared_outputs_parse_and_validate_refuses_a_path_outside_workspace_and_an_empty_magic() {
+        let mut complaints: Vec<String> = Vec::new();
+        let strategy: ExecutionStrategy = serde_yaml::from_str(
+            "outputs:\n  - path: /workspace/x.pdf\n    min_bytes: 1024\n    magic: \"%PDF\"\n",
+        )
+        .expect("spec.execution with outputs parses");
+        let expected = vec![DeclaredOutput {
+            path: "/workspace/x.pdf".to_string(),
+            min_bytes: Some(1024),
+            magic: Some("%PDF".to_string()),
+        }];
+        if strategy.outputs != expected {
+            complaints.push(format!("parsed outputs were {:?}", strategy.outputs));
+        }
+
+        let with_outputs = |outputs: Vec<DeclaredOutput>| {
+            let mut manifest = make_manifest("writer");
+            manifest.spec.execution = Some(ExecutionStrategy {
+                outputs,
+                ..Default::default()
+            });
+            manifest.validate()
+        };
+        if let Err(e) = with_outputs(expected.clone()) {
+            complaints.push(format!("a path under /workspace was refused: {e}"));
+        }
+        for outside in ["/etc/passwd", "/workspace", "/workspace/../etc/x", "x.pdf"] {
+            match with_outputs(vec![DeclaredOutput {
+                path: outside.to_string(),
+                min_bytes: None,
+                magic: None,
+            }]) {
+                Err(e) if e.contains("must be a file under /workspace") => {}
+                other => complaints.push(format!(
+                    "the path {outside} outside /workspace was not refused: {other:?}"
+                )),
+            }
+        }
+        match with_outputs(vec![DeclaredOutput {
+            path: "/workspace/x.pdf".to_string(),
+            min_bytes: None,
+            magic: Some(String::new()),
+        }]) {
+            Err(e) if e.contains("has an empty magic") => {}
+            other => complaints.push(format!("an empty magic was not refused: {other:?}")),
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

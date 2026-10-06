@@ -17,6 +17,11 @@
 //! | < threshold, max iterations reached | Mark `Failed` |
 //! | judge fault (unreadable verdict, twice) | Mark `Failed` with the fault as reason, no feedback |
 //!
+//! Before any of these, a declared output that is missing, short or of the
+//! wrong prefix fails the iteration with that sentence as the next
+//! iteration's feedback, with or without a pipeline; past max retries the
+//! execution fails with it (ADR-005, Update of 2026-10-06, O2).
+//!
 //! See ADR-005 (Iterative Execution Strategy).
 
 // ============================================================================
@@ -34,7 +39,8 @@
 // See: adrs/005-iterative-execution-strategy.md
 // ============================================================================
 
-use crate::domain::execution::{ExecutionId, ExecutionInput, TrajectoryStep};
+use crate::domain::agent::DeclaredOutput;
+use crate::domain::execution::{ExecutionId, ExecutionInput, ProducedFile, TrajectoryStep};
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::{AgentRuntime, InstanceId, RuntimeConfig, RuntimeError, TaskInput};
 use crate::domain::validation::{
@@ -149,8 +155,153 @@ pub trait SupervisorObserver: Send + Sync {
         results: &ValidationResults,
         passed: bool,
     );
+
+    /// Called when every declared output of an iteration was found in the
+    /// volume, before the iteration counts as completed, with what was found
+    /// (ADR-005, Update of 2026-10-06, O3).
+    async fn on_outputs_verified(&self, _iteration: u8, _produced: &[ProducedFile]) {}
+
+    /// Called instead of [`Self::on_iteration_complete`] when a declared
+    /// output is missing, short or of the wrong prefix: the iteration answered
+    /// `output` and fails with `reason` (O2). An observer that keeps a record
+    /// stores the output before failing the iteration.
+    async fn on_outputs_missing(&self, iteration: u8, _output: &str, reason: &str) {
+        self.on_iteration_fail(iteration, reason).await;
+    }
 }
 
+/// Where a declared output is read: one volume of the execution and the path
+/// inside that volume, rooted at `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputLocation {
+    pub execution_id: ExecutionId,
+    pub workflow_execution_id: Option<uuid::Uuid>,
+    pub volume_id: crate::domain::volume::VolumeId,
+    pub path_in_volume: String,
+    pub container_uid: u32,
+    pub container_gid: u32,
+}
+
+/// What a [`DeclaredOutputReader`] found at an [`OutputLocation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputHead {
+    /// The file's whole size in bytes.
+    pub size_bytes: u64,
+    /// Its first bytes: as many as were asked for, fewer when it is shorter.
+    pub head: Vec<u8>,
+    /// Its content type.
+    pub content_type: String,
+}
+
+/// Reads a declared output from an execution's volume (ADR-005, Update of
+/// 2026-10-06, O2): the port the supervisor checks outputs through.
+#[async_trait]
+pub trait DeclaredOutputReader: Send + Sync {
+    /// The regular file at `location`, with its first `head_len` bytes;
+    /// `Ok(None)` when no regular file is there; `Err` with the reason when
+    /// the volume cannot be read.
+    async fn read_head(
+        &self,
+        location: &OutputLocation,
+        head_len: usize,
+    ) -> Result<Option<OutputHead>, String>;
+}
+
+/// The volume of `config` a container path lies in, by the longest mount
+/// point that is the path or one of its directories.
+fn output_location(config: &RuntimeConfig, path: &str) -> Option<OutputLocation> {
+    config
+        .volumes
+        .iter()
+        .filter_map(|mount| {
+            let mount_point = mount.mount_point.to_string_lossy();
+            let mount_point = mount_point.trim_end_matches('/');
+            let rest = path.strip_prefix(mount_point)?;
+            if !rest.is_empty() && !rest.starts_with('/') {
+                return None;
+            }
+            Some((mount_point.len(), mount.volume_id, rest.to_string()))
+        })
+        .max_by_key(|(length, _, _)| *length)
+        .map(|(_, volume_id, rest)| OutputLocation {
+            execution_id: config.execution_id,
+            workflow_execution_id: config.workflow_execution_id,
+            volume_id,
+            path_in_volume: if rest.is_empty() {
+                "/".to_string()
+            } else {
+                rest
+            },
+            container_uid: config.container_uid,
+            container_gid: config.container_gid,
+        })
+}
+
+/// Check every declared output against the execution's volumes (ADR-005,
+/// Update of 2026-10-06, O2): the files found, or every failure sentence
+/// joined by "; ". A node with no reader cannot check, and fails each output.
+pub async fn check_declared_outputs(
+    outputs: &[DeclaredOutput],
+    config: &RuntimeConfig,
+    reader: Option<&dyn DeclaredOutputReader>,
+) -> Result<Vec<ProducedFile>, String> {
+    let mut produced = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for output in outputs {
+        let path = output.path.as_str();
+        let Some(reader) = reader else {
+            failures.push(format!(
+                "declared output {path} cannot be checked: this node has no volume reader"
+            ));
+            continue;
+        };
+        let Some(location) = output_location(config, path) else {
+            failures.push(format!("declared output {path} does not exist"));
+            continue;
+        };
+        let head_len = output.magic.as_ref().map_or(0, String::len);
+        match reader.read_head(&location, head_len).await {
+            Err(reason) => failures.push(format!(
+                "declared output {path} cannot be checked: {reason}"
+            )),
+            Ok(None) => failures.push(format!("declared output {path} does not exist")),
+            Ok(Some(found)) => {
+                let mut whole = true;
+                if let Some(min_bytes) = output.min_bytes {
+                    if found.size_bytes < min_bytes {
+                        failures.push(format!(
+                            "declared output {path} is {} bytes, under min_bytes {min_bytes}",
+                            found.size_bytes
+                        ));
+                        whole = false;
+                    }
+                }
+                if let Some(magic) = &output.magic {
+                    if !found.head.starts_with(magic.as_bytes()) {
+                        failures.push(format!(
+                            "declared output {path} does not start with \"{magic}\""
+                        ));
+                        whole = false;
+                    }
+                }
+                if whole {
+                    produced.push(ProducedFile {
+                        path: path.to_string(),
+                        size_bytes: found.size_bytes,
+                        content_type: found.content_type,
+                    });
+                }
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(produced)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[derive(Clone)]
 pub struct Supervisor {
     runtime: Arc<dyn AgentRuntime>,
     /// Optional execution repository used to fetch the stored inner-loop trajectory
@@ -158,6 +309,10 @@ pub struct Supervisor {
     /// `ValidationContext::tool_trajectory` from the persisted trajectory rather than
     /// leaving it empty.
     execution_repository: Option<Arc<dyn ExecutionRepository>>,
+    /// Reads declared outputs from an execution's volume (ADR-005, Update of
+    /// 2026-10-06, O2). Without one, every declared output fails as
+    /// unreadable: an output is never passed unchecked.
+    output_reader: Option<Arc<dyn DeclaredOutputReader>>,
 }
 
 impl Supervisor {
@@ -165,7 +320,14 @@ impl Supervisor {
         Self {
             runtime,
             execution_repository: None,
+            output_reader: None,
         }
+    }
+
+    /// Attach the reader declared outputs are checked through.
+    pub fn with_output_reader(mut self, reader: Arc<dyn DeclaredOutputReader>) -> Self {
+        self.output_reader = Some(reader);
+        self
     }
 
     /// Attach an execution repository so the supervisor can fetch the inner-loop
@@ -307,7 +469,12 @@ impl Supervisor {
         // Track iteration history for context in subsequent attempts
         let mut iteration_history: Vec<serde_json::Value> = Vec::new();
 
+        // Why the last iteration's declared outputs failed it, if they did:
+        // the reason the execution ends with past max retries (O2).
+        let mut outputs_failure: Option<String> = None;
+
         while attempts < max_retries {
+            outputs_failure = None;
             // Check cancellation before each iteration
             if cancellation_token.is_cancelled() {
                 info!("Execution cancelled before iteration {}", attempts + 1);
@@ -477,6 +644,46 @@ impl Supervisor {
                     .await;
             }
 
+            // Before the iteration counts as completed, its declared outputs
+            // must be in the volume (ADR-005, Update of 2026-10-06, O2), with
+            // or without a validation pipeline.
+            let declared_outputs = &runtime_config.execution.outputs;
+            if !declared_outputs.is_empty() {
+                match check_declared_outputs(
+                    declared_outputs,
+                    &runtime_config,
+                    self.output_reader.as_deref(),
+                )
+                .await
+                {
+                    Ok(produced) => {
+                        observer
+                            .on_outputs_verified(attempts as u8, &produced)
+                            .await;
+                    }
+                    Err(reason) => {
+                        warn!(
+                            iteration = attempts,
+                            reason = %reason,
+                            "Declared outputs missing — failing the iteration"
+                        );
+                        observer
+                            .on_outputs_missing(attempts as u8, &stdout, &reason)
+                            .await;
+                        iteration_history.push(serde_json::json!({
+                            "iteration": attempts,
+                            "output": stdout,
+                            "exit_code": output.exit_code,
+                            "validation_failed": true,
+                            "validation_reason": reason,
+                            "feedback": reason
+                        }));
+                        outputs_failure = Some(reason);
+                        continue;
+                    }
+                }
+            }
+
             // Iteration completed without runtime errors — run gradient validation (ADR-017).
             info!("Iteration {} completed", attempts);
             observer
@@ -636,9 +843,10 @@ impl Supervisor {
             }
         }
 
-        Err(RuntimeError::ExecutionFailed(
-            "Max retries exceeded".to_string(),
-        ))
+        Err(RuntimeError::ExecutionFailed(match outputs_failure {
+            Some(reason) => format!("Max retries exceeded: {reason}"),
+            None => "Max retries exceeded".to_string(),
+        }))
     }
 
     fn extract_execution_context(
@@ -792,12 +1000,21 @@ mod tests {
         }
     }
 
+    /// One iteration's verified outputs, as the observer was given them.
+    type VerifiedOutputs = (u8, Vec<ProducedFile>);
+
     // Test observer that records callback invocations.
     #[derive(Default)]
     struct TestObserver {
         iteration_starts: Arc<Mutex<Vec<u8>>>,
         iteration_completes: Arc<Mutex<Vec<u8>>>,
         iteration_fails: Arc<Mutex<Vec<u8>>>,
+        /// Each failed iteration's reason, in order.
+        fail_reasons: Arc<Mutex<Vec<String>>>,
+        /// The output kept by each iteration failed for its declared outputs.
+        missing_outputs_output: Arc<Mutex<Vec<String>>>,
+        /// What each iteration's verified outputs were.
+        verified: Arc<Mutex<Vec<VerifiedOutputs>>>,
     }
 
     #[async_trait]
@@ -812,8 +1029,24 @@ mod tests {
             self.iteration_completes.lock().await.push(iteration);
         }
 
-        async fn on_iteration_fail(&self, iteration: u8, _error: &str) {
+        async fn on_iteration_fail(&self, iteration: u8, error: &str) {
             self.iteration_fails.lock().await.push(iteration);
+            self.fail_reasons.lock().await.push(error.to_string());
+        }
+
+        async fn on_outputs_verified(&self, iteration: u8, produced: &[ProducedFile]) {
+            self.verified
+                .lock()
+                .await
+                .push((iteration, produced.to_vec()));
+        }
+
+        async fn on_outputs_missing(&self, iteration: u8, output: &str, reason: &str) {
+            self.missing_outputs_output
+                .lock()
+                .await
+                .push(output.to_string());
+            self.on_iteration_fail(iteration, reason).await;
         }
 
         async fn on_instance_spawned(&self, _iteration: u8, _instance_id: &InstanceId) {}
@@ -852,6 +1085,7 @@ mod tests {
                 validation: None,
                 tool_validation: None,
                 delivery: None,
+                outputs: Vec::new(),
             },
             volumes: Vec::new(),
             keep_container_on_failure: false,
@@ -1404,5 +1638,279 @@ mod tests {
                 && history.contains("the answer is wrong"),
             "the worker is handed the judge's verdict as feedback, got: {history}"
         );
+    }
+
+    // ── Declared outputs (ADR-005, Update of 2026-10-06, O2 and O3) ──────────
+
+    /// A volume double: the files it holds, by path inside the volume.
+    struct VolumeDouble {
+        files: HashMap<String, Vec<u8>>,
+        reads: std::sync::Mutex<Vec<OutputLocation>>,
+    }
+
+    impl VolumeDouble {
+        fn holding(files: &[(&str, &[u8])]) -> Arc<Self> {
+            Arc::new(Self {
+                files: files
+                    .iter()
+                    .map(|(path, bytes)| (path.to_string(), bytes.to_vec()))
+                    .collect(),
+                reads: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DeclaredOutputReader for VolumeDouble {
+        async fn read_head(
+            &self,
+            location: &OutputLocation,
+            head_len: usize,
+        ) -> Result<Option<OutputHead>, String> {
+            self.reads.lock().unwrap().push(location.clone());
+            Ok(self
+                .files
+                .get(&location.path_in_volume)
+                .map(|bytes| OutputHead {
+                    size_bytes: bytes.len() as u64,
+                    head: bytes.iter().take(head_len).copied().collect(),
+                    content_type: "application/pdf".to_string(),
+                }))
+        }
+    }
+
+    fn pdf_output() -> DeclaredOutput {
+        DeclaredOutput {
+            path: "/workspace/x.pdf".to_string(),
+            min_bytes: Some(8),
+            magic: Some("%PDF".to_string()),
+        }
+    }
+
+    /// The test config with one volume mounted at `/workspace` and the
+    /// given declared outputs.
+    fn config_declaring(outputs: Vec<DeclaredOutput>) -> RuntimeConfig {
+        let mut config = create_test_config();
+        config.volumes = vec![crate::domain::volume::VolumeMount::new(
+            crate::domain::volume::VolumeId::new(),
+            std::path::PathBuf::from("/workspace"),
+            crate::domain::volume::AccessMode::ReadWrite,
+            crate::domain::volume::FilerEndpoint::new("http://localhost:8888").unwrap(),
+            "/aegis/volumes/test/workspace".to_string(),
+        )];
+        config.execution.outputs = outputs;
+        config
+    }
+
+    /// The model answers the path of a file it never wrote, `max_retries`
+    /// times; `reader` is the volume, or none.
+    async fn run_declaring(
+        outputs: Vec<DeclaredOutput>,
+        reader: Option<Arc<dyn DeclaredOutputReader>>,
+        max_retries: u32,
+        pipeline: Option<Arc<ValidationPipeline>>,
+    ) -> (
+        Arc<TestRuntime>,
+        Arc<TestObserver>,
+        Result<String, RuntimeError>,
+    ) {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(max_retries as usize)
+                .with_execute_success(vec!["/workspace/x.pdf".to_string(); max_retries as usize]),
+        );
+        let observer = Arc::new(TestObserver::default());
+        let mut supervisor = Supervisor::new(runtime.clone());
+        if let Some(reader) = reader {
+            supervisor = supervisor.with_output_reader(reader);
+        }
+        let result = supervisor
+            .run_loop(
+                config_declaring(outputs),
+                create_test_input(),
+                max_retries,
+                observer.clone(),
+                CancellationToken::new(),
+                pipeline,
+            )
+            .await;
+        (runtime, observer, result)
+    }
+
+    /// Test 1. The model answers "/workspace/x.pdf" with no tool call and no
+    /// file is there: each iteration fails with "declared output
+    /// /workspace/x.pdf does not exist", keeps the model's text, hands the
+    /// sentence to the next iteration as feedback, and past max retries the
+    /// execution fails with it.
+    #[tokio::test]
+    async fn declared_output_missing_fails_each_iteration_and_the_execution_past_max_retries() {
+        let sentence = "declared output /workspace/x.pdf does not exist";
+        let (runtime, observer, result) = run_declaring(
+            vec![pdf_output()],
+            Some(VolumeDouble::holding(&[])),
+            2,
+            None,
+        )
+        .await;
+        let mut complaints: Vec<String> = Vec::new();
+        let reasons = observer.fail_reasons.lock().await.clone();
+        if reasons != vec![sentence.to_string(), sentence.to_string()] {
+            complaints.push(format!("the iterations failed with {reasons:?}"));
+        }
+        let completes = observer.iteration_completes.lock().await.clone();
+        if !completes.is_empty() {
+            complaints.push(format!("iterations {completes:?} counted as completed"));
+        }
+        let kept = observer.missing_outputs_output.lock().await.clone();
+        if kept != vec!["/workspace/x.pdf".to_string(); 2] {
+            complaints.push(format!("the failed iterations kept {kept:?}"));
+        }
+        let envs = runtime.spawn_envs.lock().await.clone();
+        let history = envs
+            .get(1)
+            .and_then(|env| env.get("AEGIS_ITERATION_HISTORY"))
+            .cloned()
+            .unwrap_or_default();
+        if !history.contains(&format!("\"feedback\":\"{sentence}\"")) {
+            complaints.push(format!("iteration 2 was not told the sentence: {history}"));
+        }
+        match &result {
+            Err(RuntimeError::ExecutionFailed(reason))
+                if reason == &format!("Max retries exceeded: {sentence}") => {}
+            other => complaints.push(format!("the execution ended {other:?}")),
+        }
+        println!("declared output missing: iteration reasons {reasons:?}; execution {result:?}");
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Test 2. The file is there: the execution completes, and the observer
+    /// is given what was found before the iteration counts as completed.
+    #[tokio::test]
+    async fn declared_output_present_completes_with_produced_files() {
+        let volume = VolumeDouble::holding(&[("/x.pdf", b"%PDF-1.7 a real document")]);
+        let (_runtime, observer, result) =
+            run_declaring(vec![pdf_output()], Some(volume.clone()), 2, None).await;
+        let mut complaints: Vec<String> = Vec::new();
+        if !matches!(&result, Ok(out) if out == "/workspace/x.pdf") {
+            complaints.push(format!("the execution ended {result:?}"));
+        }
+        let verified = observer.verified.lock().await.clone();
+        let expected = vec![(
+            1u8,
+            vec![ProducedFile {
+                path: "/workspace/x.pdf".to_string(),
+                size_bytes: 24,
+                content_type: "application/pdf".to_string(),
+            }],
+        )];
+        if verified != expected {
+            complaints.push(format!("the verified outputs were {verified:?}"));
+        }
+        let reads = volume.reads.lock().unwrap().clone();
+        if reads.len() != 1 || reads[0].path_in_volume != "/x.pdf" {
+            complaints.push(format!("the volume was read at {reads:?}"));
+        }
+        println!("declared output present: execution {result:?}; produced_files {verified:?}");
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Test 3. A short file and a wrong prefix each give their own sentence,
+    /// and a file failing both reports both, as does a second output.
+    #[tokio::test]
+    async fn short_and_wrong_prefix_outputs_give_their_own_sentences_and_all_are_reported() {
+        let mut complaints: Vec<String> = Vec::new();
+        let cases: [(&[u8], &str); 3] = [
+            (
+                b"%PDF",
+                "declared output /workspace/x.pdf is 4 bytes, under min_bytes 8",
+            ),
+            (
+                b"<html> not a pdf",
+                "declared output /workspace/x.pdf does not start with \"%PDF\"",
+            ),
+            (
+                b"PK",
+                "declared output /workspace/x.pdf is 2 bytes, under min_bytes 8; \
+                 declared output /workspace/x.pdf does not start with \"%PDF\"",
+            ),
+        ];
+        for (bytes, expected) in cases {
+            let (_r, observer, _result) = run_declaring(
+                vec![pdf_output()],
+                Some(VolumeDouble::holding(&[("/x.pdf", bytes)])),
+                1,
+                None,
+            )
+            .await;
+            let reasons = observer.fail_reasons.lock().await.clone();
+            if reasons != vec![expected.to_string()] {
+                complaints.push(format!("for {bytes:?} the reasons were {reasons:?}"));
+            }
+        }
+        let second = DeclaredOutput {
+            path: "/workspace/out/y.csv".to_string(),
+            min_bytes: None,
+            magic: None,
+        };
+        let (_r, observer, _result) = run_declaring(
+            vec![pdf_output(), second],
+            Some(VolumeDouble::holding(&[])),
+            1,
+            None,
+        )
+        .await;
+        let reasons = observer.fail_reasons.lock().await.clone();
+        let both = "declared output /workspace/x.pdf does not exist; \
+                    declared output /workspace/out/y.csv does not exist";
+        if reasons != vec![both.to_string()] {
+            complaints.push(format!("two missing outputs gave {reasons:?}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Test 4. With a validation pipeline that would pass, a missing output
+    /// still fails the iteration, and no judge is spent on it.
+    #[tokio::test]
+    async fn a_pipeline_that_would_pass_does_not_rescue_a_missing_output() {
+        let pipeline = semantic_pipeline(vec![Ok(verdict(1.0, "looks done"))]);
+        let (_r, observer, result) = run_declaring(
+            vec![pdf_output()],
+            Some(VolumeDouble::holding(&[])),
+            1,
+            Some(pipeline.clone()),
+        )
+        .await;
+        let mut complaints: Vec<String> = Vec::new();
+        match &result {
+            Err(RuntimeError::ExecutionFailed(reason))
+                if reason
+                    == "Max retries exceeded: declared output /workspace/x.pdf does not exist" => {}
+            other => complaints.push(format!("the execution ended {other:?}")),
+        }
+        let reasons = observer.fail_reasons.lock().await.clone();
+        if reasons != vec!["declared output /workspace/x.pdf does not exist".to_string()] {
+            complaints.push(format!("the iteration failed with {reasons:?}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Test 5. A node with no reader cannot check a declared output, and
+    /// never passes it unchecked.
+    #[tokio::test]
+    async fn a_node_with_no_reader_fails_every_declared_output_as_unchecked() {
+        let (_r, observer, result) = run_declaring(vec![pdf_output()], None, 1, None).await;
+        let sentence =
+            "declared output /workspace/x.pdf cannot be checked: this node has no volume reader";
+        let mut complaints: Vec<String> = Vec::new();
+        let reasons = observer.fail_reasons.lock().await.clone();
+        if reasons != vec![sentence.to_string()] {
+            complaints.push(format!("the iteration failed with {reasons:?}"));
+        }
+        match &result {
+            Err(RuntimeError::ExecutionFailed(reason))
+                if reason == &format!("Max retries exceeded: {sentence}") => {}
+            other => complaints.push(format!("the execution ended {other:?}")),
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

@@ -130,6 +130,7 @@ impl ExecutionService for MockExecutionService {
             llm_interactions: vec![],
             trajectory: None,
             policy_violations: vec![],
+            produced_files: vec![],
         };
         Ok(vec![iteration])
     }

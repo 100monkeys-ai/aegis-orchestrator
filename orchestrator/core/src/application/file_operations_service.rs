@@ -586,7 +586,7 @@ fn routed_path(volume: &crate::domain::volume::Volume, path: &str) -> String {
     }
 }
 
-fn guess_content_type(path: &str) -> String {
+pub(crate) fn guess_content_type(path: &str) -> String {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())

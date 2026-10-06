@@ -653,6 +653,7 @@ mod tests {
                 llm_interactions: Vec::new(),
                 trajectory: None,
                 policy_violations: Vec::new(),
+                produced_files: Vec::new(),
             });
             Ok(exec)
         }
