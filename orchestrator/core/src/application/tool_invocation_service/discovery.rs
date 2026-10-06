@@ -82,7 +82,7 @@ impl ToolInvocationService {
             .await
             .map_err(|e| SealSessionError::InternalError(format!("Agent search failed: {e}")))?;
 
-        let results: Vec<serde_json::Value> = response
+        let mut results: Vec<serde_json::Value> = response
             .results
             .iter()
             .map(|r| {
@@ -101,6 +101,31 @@ impl ToolInvocationService {
                 })
             })
             .collect();
+
+        // AEGIS ADR-005 O6: an agent O4 or O5 refuses says so, so a caller
+        // never dispatches it. The index holds no manifest: each result's
+        // agent is read as the caller sees it; one not found carries nothing.
+        for (entry, r) in results.iter_mut().zip(&response.results) {
+            let Ok(uuid) = uuid::Uuid::parse_str(&r.resource_id) else {
+                continue;
+            };
+            match self
+                .agent_lifecycle
+                .get_agent_visible(&tenant_id, crate::domain::agent::AgentId(uuid))
+                .await
+            {
+                Ok(agent) => {
+                    if let Some(refusal) = crate::domain::tool_requirement::refusal_of(&agent) {
+                        entry["refused"] = serde_json::Value::String(refusal.to_string());
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    agent_id = %r.resource_id,
+                    %error,
+                    "aegis.agent.search: indexed agent not read; no refused answered"
+                ),
+            }
+        }
 
         Ok(ToolInvocationResult::Direct(serde_json::json!({
             "tool": "aegis.agent.search",

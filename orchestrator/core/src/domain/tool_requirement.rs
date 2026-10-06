@@ -23,7 +23,7 @@
 //! - **Purpose:** A pure rule over [`AgentManifest`], called by the agent
 //!   lifecycle service at deploy and at update.
 
-use crate::domain::agent::AgentManifest;
+use crate::domain::agent::{Agent, AgentManifest};
 use regex::Regex;
 use std::fmt;
 use std::sync::LazyLock;
@@ -137,4 +137,12 @@ pub fn check(manifest: &AgentManifest) -> Result<(), ToolRequirementRefusal> {
         });
     }
     Ok(())
+}
+
+/// The refusal O4 or O5 answers for an agent already deployed (AEGIS ADR-005
+/// O6): an agent deployed before the rule landed is refused at the start of
+/// each execution and carries the sentence on `aegis.agent.list` and
+/// `aegis.agent.search`.
+pub fn refusal_of(agent: &Agent) -> Option<ToolRequirementRefusal> {
+    check(&agent.manifest).err()
 }

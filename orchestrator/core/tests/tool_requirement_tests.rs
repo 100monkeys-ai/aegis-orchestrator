@@ -8,8 +8,8 @@
 //! are parsed from YAML the way `aegis.agent.create` parses them, and the
 //! built-in templates are read from disk, the files the daemon deploys.
 
-use aegis_orchestrator_core::domain::agent::AgentManifest;
-use aegis_orchestrator_core::domain::tool_requirement::check;
+use aegis_orchestrator_core::domain::agent::{Agent, AgentManifest};
+use aegis_orchestrator_core::domain::tool_requirement::{check, refusal_of};
 use aegis_orchestrator_core::infrastructure::agent_manifest_parser::AgentManifestParser;
 
 /// The shape of `delivery-itinerary-pdf-agent` (3b367333) as exported on
@@ -266,4 +266,42 @@ fn every_builtin_agent_template_passes() {
         refused.is_empty(),
         "a built-in agent template is refused at deploy: {refused:#?}"
     );
+}
+
+/// AEGIS ADR-005 O6: an agent stored before O4 and O5 landed, in the shape
+/// `unit-conversion-agent` had on 2026-10-06 (`fs.write`, `cmd.run`,
+/// `fs.read`, no volume), answers O5's sentence; the same agent with a
+/// read-write volume answers nothing.
+#[test]
+fn o6_an_existing_agent_of_unit_conversion_agents_earlier_shape_answers_o5s_sentence() {
+    const EARLIER: &str = "  tools:\n    - fs.write\n    - cmd.run\n    - fs.read";
+    let mut complaints = Vec::new();
+    match refusal_of(&Agent::new(unit_conversion(EARLIER))) {
+        Some(refusal) => {
+            let expected = "Agent 'unit-conversion-agent' is refused (AEGIS ADR-005 O5): it \
+                            declares fs.write and no read-write volume, so those tools have \
+                            nothing to write to in a run of its own. Declare a read-write volume \
+                            with mount_path /workspace; inside a workflow it yields to the \
+                            workflow's workspace.";
+            if refusal.to_string() != expected {
+                complaints.push(format!("the sentence was {refusal}"));
+            }
+        }
+        None => complaints.push(
+            "an existing agent of unit-conversion-agent's earlier shape answered no refusal"
+                .to_string(),
+        ),
+    }
+    let mut with_volume = unit_conversion(EARLIER);
+    with_volume.spec.volumes = delivery_itinerary(FS_WRITE).spec.volumes;
+    if let Some(refusal) = refusal_of(&Agent::new(with_volume)) {
+        complaints.push(format!(
+            "the agent with a read-write volume was refused: {refusal}"
+        ));
+    }
+    match refusal_of(&Agent::new(unit_conversion(NO_TOOLS))) {
+        Some(refusal) if refusal.to_string().contains("(AEGIS ADR-005 O4)") => {}
+        other => complaints.push(format!("the tool-less shape answered {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

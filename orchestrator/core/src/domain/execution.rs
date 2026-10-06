@@ -441,6 +441,10 @@ pub enum ExecutionError {
     PromptRenderFailed(String),
     #[error("Failed to extract user input from execution input: {0}")]
     InvalidExecutionInput(String),
+    /// AEGIS ADR-005 O6: an agent that O4 or O5 refuses today is refused at
+    /// start, before any container, with O4's or O5's sentence.
+    #[error("Execution refused: {0}")]
+    Refused(String),
     #[error(
         "Cross-tenant spawn forbidden: parent tenant '{parent_tenant}' cannot spawn child in tenant '{child_tenant}'"
     )]

@@ -1403,7 +1403,9 @@ mod tests {
     #[tokio::test]
     async fn judge_inherits_parent_explicit_volumes_as_read_only_mounts() {
         let tenant_id = CoreTenantId::consumer();
-        let parent_agent = make_agent("worker", None, Some("/workspace/project"));
+        let mut parent_agent = make_agent("worker", None, Some("/workspace/project"));
+        // AEGIS ADR-005 O4: a tool-less agent with a read-write volume is refused.
+        parent_agent.manifest.spec.tools = vec!["cmd.run".to_string()];
         let judge_agent = make_agent("judge", Some("judge"), None);
         let parent_execution = make_parent_execution(parent_agent.id);
 
@@ -1531,7 +1533,9 @@ mod tests {
     #[tokio::test]
     async fn judge_fails_fast_when_parent_has_provisioned_volumes_but_no_nfs_gateway() {
         let tenant_id = CoreTenantId::consumer();
-        let parent_agent = make_agent("worker", None, Some("/workspace/project"));
+        let mut parent_agent = make_agent("worker", None, Some("/workspace/project"));
+        // AEGIS ADR-005 O4: a tool-less agent with a read-write volume is refused.
+        parent_agent.manifest.spec.tools = vec!["cmd.run".to_string()];
         let judge_agent = make_agent("judge", Some("judge"), None);
         let parent_execution = make_parent_execution(parent_agent.id);
 
@@ -2541,7 +2545,9 @@ mod tests {
     #[tokio::test]
     async fn manifest_volume_at_the_workspace_path_yields_to_the_workflow_workspace() {
         let tenant_id = CoreTenantId::consumer();
-        let agent = make_agent("executor", None, Some("/workspace"));
+        let mut agent = make_agent("executor", None, Some("/workspace"));
+        // AEGIS ADR-005 O4: a tool-less agent with a read-write volume is refused.
+        agent.manifest.spec.tools = vec!["cmd.run".to_string()];
         let (service, runtime, _gw) =
             workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
 
@@ -3768,6 +3774,280 @@ mod tests {
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+
+    // ─── AEGIS ADR-005 O6: an agent O4 or O5 refuses is refused at start ───
+
+    /// `unit-conversion-agent` as it stood on 2026-10-06 before its update to
+    /// 1.0.1: `fs.write`, `cmd.run`, `fs.read` and no volume, stored as an
+    /// agent deployed before O4 and O5 landed would be.
+    fn unit_conversion_agent_earlier_shape() -> Agent {
+        let mut agent = make_agent("unit-conversion-agent", None, None);
+        agent.manifest.spec.tools = vec![
+            "fs.write".to_string(),
+            "cmd.run".to_string(),
+            "fs.read".to_string(),
+        ];
+        agent.manifest.spec.task = Some(TaskConfig {
+            instruction: Some(
+                "You convert between units. Write the conversion as Python to \
+                 /workspace/convert.py, run it, and return the printed result."
+                    .to_string(),
+            ),
+            prompt_template: None,
+            input_data: None,
+        });
+        agent
+    }
+
+    const UNIT_CONVERSION_REFUSAL: &str = "Execution refused: Agent 'unit-conversion-agent' is \
+        refused (AEGIS ADR-005 O5): it declares fs.write and no read-write volume, so those tools \
+        have nothing to write to in a run of its own. Declare a read-write volume with mount_path \
+        /workspace; inside a workflow it yields to the workflow's workspace.";
+
+    /// A service over in-memory stores, with the event bus and the execution
+    /// store handed back so a test can read what a start left behind.
+    async fn refusal_service(
+        tenant_id: &CoreTenantId,
+        agents: &[&Agent],
+        executions: &[&Execution],
+    ) -> (
+        StandardExecutionService,
+        Arc<TestRuntime>,
+        Arc<dyn ExecutionRepository>,
+        Arc<EventBus>,
+    ) {
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        for agent in agents {
+            agent_repo.save_for_tenant(tenant_id, agent).await.unwrap();
+        }
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        for execution in executions {
+            execution_repo
+                .save_for_tenant(tenant_id, execution)
+                .await
+                .unwrap();
+        }
+        let runtime = Arc::new(TestRuntime::default());
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let service = StandardExecutionService::new(
+            agent_repo,
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(runtime.clone())),
+            execution_repo.clone(),
+            event_bus.clone(),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+        (service, runtime, execution_repo, event_bus)
+    }
+
+    /// What a refused start left behind: every execution stored for the
+    /// agent, every `ExecutionStarted` published, every container spawned.
+    async fn left_behind(
+        tenant_id: &CoreTenantId,
+        agent_id: AgentId,
+        execution_repo: &Arc<dyn ExecutionRepository>,
+        events: &mut crate::infrastructure::event_bus::EventReceiver,
+        runtime: &TestRuntime,
+    ) -> Vec<String> {
+        let mut found = Vec::new();
+        let stored = execution_repo
+            .find_by_agent_for_tenant(tenant_id, agent_id, 100)
+            .await
+            .unwrap();
+        if !stored.is_empty() {
+            found.push(format!("{} execution(s) saved", stored.len()));
+        }
+        while let Ok(event) = events.try_recv() {
+            if let crate::infrastructure::event_bus::DomainEvent::Execution(
+                ExecutionEvent::ExecutionStarted { execution_id, .. },
+            ) = event
+            {
+                found.push(format!("ExecutionStarted for {execution_id}"));
+            }
+        }
+        let spawned = runtime.spawned.lock().unwrap().len();
+        if spawned > 0 {
+            found.push(format!("{spawned} container(s) spawned"));
+        }
+        found
+    }
+
+    /// O6 through the start every route shares: an execution of an agent of
+    /// `unit-conversion-agent`'s earlier shape is refused with O5's sentence
+    /// prefixed "Execution refused: ", and nothing is saved, started or
+    /// spawned.
+    #[tokio::test]
+    async fn o6_an_agent_o5_refuses_is_refused_at_start_and_nothing_starts() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = unit_conversion_agent_earlier_shape();
+        let (service, runtime, execution_repo, event_bus) =
+            refusal_service(&tenant_id, &[&agent], &[]).await;
+        let mut events = event_bus.subscribe();
+
+        let mut complaints = Vec::new();
+        match service
+            .start_execution(
+                agent.id,
+                ExecutionInput {
+                    intent: Some("43 inches in centimeters".to_string()),
+                    input: serde_json::json!({ "tenant_id": tenant_id.as_str() }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                    attachments: Vec::new(),
+                },
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+        {
+            Ok(id) => complaints.push(format!("the execution started as {id}")),
+            Err(e) => {
+                if e.to_string() != UNIT_CONVERSION_REFUSAL {
+                    complaints.push(format!("the start answered \"{e}\""));
+                }
+                if !matches!(
+                    e.downcast_ref::<ExecutionError>(),
+                    Some(ExecutionError::Refused(_))
+                ) {
+                    complaints.push("the error is not ExecutionError::Refused".to_string());
+                }
+            }
+        }
+        complaints.extend(
+            left_behind(
+                &tenant_id,
+                agent.id,
+                &execution_repo,
+                &mut events,
+                runtime.as_ref(),
+            )
+            .await,
+        );
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Q2: a start carrying a `workflow_execution_id` runs in the workflow's
+    /// workspace, which O5's own sentence says the volume yields to, so O5
+    /// does not refuse it.
+    #[tokio::test]
+    async fn o6_a_workflow_step_of_that_shape_starts_in_the_workflows_workspace() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = unit_conversion_agent_earlier_shape();
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+
+        let workspace = VolumeId::new();
+        service
+            .start_execution(
+                agent.id,
+                workflow_step_input(workspace, uuid::Uuid::new_v4()),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .expect("a workflow step of unit-conversion-agent's earlier shape must start");
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        assert_eq!(spawned.volumes[0].volume_id, workspace);
+    }
+
+    /// Q2 never exempts O4: a tool-less agent with a read-write volume is
+    /// refused as a workflow step too, and nothing starts.
+    #[tokio::test]
+    async fn o6_an_agent_o4_refuses_is_refused_as_a_workflow_step() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("executor", None, Some("/workspace"));
+        let (service, runtime, execution_repo, event_bus) =
+            refusal_service(&tenant_id, &[&agent], &[]).await;
+        let mut events = event_bus.subscribe();
+
+        let mut complaints = Vec::new();
+        match service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), uuid::Uuid::new_v4()),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+        {
+            Ok(id) => complaints.push(format!("the workflow step started as {id}")),
+            Err(e) => {
+                let expected = "Execution refused: Agent 'executor' is refused (AEGIS ADR-005 \
+                                O4): its instruction requires writing files or running commands \
+                                and it declares no tools; it declares the read-write volume \
+                                'workspace' at /workspace. Declare the tools it needs in \
+                                spec.tools (fs.write to write files, cmd.run to run commands).";
+                if e.to_string() != expected {
+                    complaints.push(format!("the start answered \"{e}\""));
+                }
+            }
+        }
+        complaints.extend(
+            left_behind(
+                &tenant_id,
+                agent.id,
+                &execution_repo,
+                &mut events,
+                runtime.as_ref(),
+            )
+            .await,
+        );
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// O6 through the child start (judges, output handlers, a gRPC start with
+    /// a parent): the same refusal, and no child is saved, started or spawned.
+    #[tokio::test]
+    async fn o6_a_child_execution_of_that_shape_is_refused_at_start() {
+        let tenant_id = CoreTenantId::consumer();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child = unit_conversion_agent_earlier_shape();
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "zaru-consumer");
+        let (service, runtime, execution_repo, event_bus) =
+            refusal_service(&tenant_id, &[&parent_agent, &child], &[&parent_execution]).await;
+        let mut events = event_bus.subscribe();
+
+        let mut complaints = Vec::new();
+        match service
+            .start_child_execution(
+                child.id,
+                ExecutionInput {
+                    intent: Some("43 inches in centimeters".to_string()),
+                    input: serde_json::json!({}),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                    attachments: Vec::new(),
+                },
+                parent_execution.id,
+            )
+            .await
+        {
+            Ok(id) => complaints.push(format!("the child execution started as {id}")),
+            Err(e) => {
+                if e.to_string() != UNIT_CONVERSION_REFUSAL {
+                    complaints.push(format!("the child start answered \"{e}\""));
+                }
+            }
+        }
+        complaints.extend(
+            left_behind(
+                &tenant_id,
+                child.id,
+                &execution_repo,
+                &mut events,
+                runtime.as_ref(),
+            )
+            .await,
+        );
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 }
 
 struct ExecutionMonitor {
@@ -4496,6 +4776,26 @@ impl StandardExecutionService {
 
 // Private execution lifecycle helpers for StandardExecutionService.
 impl StandardExecutionService {
+    /// AEGIS ADR-005 O6: an execution of an agent that O4 or O5 refuses today
+    /// is refused at start, before any record or container, with the rule's
+    /// sentence ("Execution refused: <sentence>"), so an agent deployed before
+    /// the rule landed cannot run in the shape it refuses. A start carrying a
+    /// `workflow_execution_id` runs in the workflow's workspace, which O5's own
+    /// sentence says the volume yields to, so O5 does not refuse it (Q2); O4
+    /// always does. O4 is the only clause that refuses an agent declaring no
+    /// tools, and O5 the only one that refuses an agent declaring some
+    /// (`tool_requirement::check`).
+    fn refuse_at_start(agent: &crate::domain::agent::Agent, input: &ExecutionInput) -> Result<()> {
+        let Some(refusal) = crate::domain::tool_requirement::refusal_of(agent) else {
+            return Ok(());
+        };
+        let refused_by_o5 = !agent.manifest.spec.tools.is_empty();
+        if refused_by_o5 && input.workflow_execution_id.is_some() {
+            return Ok(());
+        }
+        Err(ExecutionError::Refused(refusal.to_string()).into())
+    }
+
     /// Shared implementation for `start_execution` and `start_execution_with_id`.
     /// When `imported_id` is `Some`, the execution re-uses a pre-assigned identity
     /// (cluster forwarding). When `None`, a fresh ID is generated locally.
@@ -4653,6 +4953,9 @@ impl StandardExecutionService {
                 .into(),
             );
         }
+
+        // AEGIS ADR-005 O6: an agent O4 or O5 refuses is refused before anything starts.
+        Self::refuse_at_start(&agent, &input)?;
 
         // ADR-102: Use manifest-declared security_context if present; otherwise use caller's context.
         let security_context_name = agent
@@ -5692,6 +5995,8 @@ impl ExecutionService for StandardExecutionService {
             .agent_service
             .get_agent_visible(&tenant_id, agent_id)
             .await?;
+        // AEGIS ADR-005 O6: an agent O4 or O5 refuses is refused before anything starts.
+        Self::refuse_at_start(&agent, &input)?;
         // 3. Prepare input (render judge's prompt template). The persisted
         // copy preserves the caller's intent; the runtime copy carries the
         // rendered prompt for the supervisor.

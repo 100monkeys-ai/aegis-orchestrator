@@ -137,10 +137,19 @@ impl ToolInvocationService {
                     "status": "started"
                 })))
             }
-            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.task.execute",
-                "error": format!("Failed to start task execution: {e}")
-            }))),
+            Err(e) => {
+                // AEGIS ADR-005 O6: a refused start answers the refusal itself.
+                let error = match e.downcast_ref::<crate::domain::execution::ExecutionError>() {
+                    Some(refused @ crate::domain::execution::ExecutionError::Refused(_)) => {
+                        refused.to_string()
+                    }
+                    _ => format!("Failed to start task execution: {e}"),
+                };
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.execute",
+                    "error": error
+                })))
+            }
         }
     }
 

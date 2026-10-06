@@ -176,15 +176,30 @@ pub(crate) async fn execute_agent_handler(
             Json(serde_json::json!({"execution_id": id.0})),
         )),
         Err(e) => {
-            let error_str = e.to_string();
-            let status = if error_str.contains("InvalidExecutionInput") {
-                StatusCode::UNPROCESSABLE_ENTITY
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            Ok((status, Json(serde_json::json!({"error": error_str}))))
+            let (status, body) = execute_start_failure(&e);
+            Ok((status, Json(body)))
         }
     }
+}
+
+/// The answer of `POST /v1/agents/{agent_id}/execute` when the execution did
+/// not start.
+fn execute_start_failure(e: &anyhow::Error) -> (StatusCode, serde_json::Value) {
+    use aegis_orchestrator_core::domain::execution::ExecutionError;
+    // AEGIS ADR-005 O6: an agent O4 or O5 refuses is refused at start, 422.
+    if let Some(refused @ ExecutionError::Refused(_)) = e.downcast_ref::<ExecutionError>() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"error": refused.to_string()}),
+        );
+    }
+    let error_str = e.to_string();
+    let status = if error_str.contains("InvalidExecutionInput") {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, serde_json::json!({"error": error_str}))
 }
 
 pub(crate) async fn stream_agent_events_handler(
@@ -775,6 +790,27 @@ mod tests {
             &AgentScope::Tenant,
             &["user".to_string()]
         ));
+    }
+
+    /// AEGIS ADR-005 O6: an execution the start path refuses answers 422 with
+    /// the refusal as `error`, the whole sentence.
+    #[test]
+    fn execute_of_a_refused_agent_answers_422_with_the_refusal() {
+        use aegis_orchestrator_core::domain::execution::ExecutionError;
+        let sentence = "Agent 'unit-conversion-agent' is refused (AEGIS ADR-005 O5): it \
+                        declares fs.write and no read-write volume, so those tools have nothing \
+                        to write to in a run of its own. Declare a read-write volume with \
+                        mount_path /workspace; inside a workflow it yields to the workflow's \
+                        workspace.";
+        let refused: anyhow::Error = ExecutionError::Refused(sentence.to_string()).into();
+        let (status, body) = execute_start_failure(&refused);
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({ "error": format!("Execution refused: {sentence}") })
+            )
+        );
     }
 
     /// Confirms the operator path still resolves correctly when identity IS

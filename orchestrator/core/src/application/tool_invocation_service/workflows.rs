@@ -495,6 +495,49 @@ impl ToolInvocationService {
                                  answering no produced_files"
                             ),
                         }
+                        // AEGIS ADR-005 O6 (Q6): a failed run answers why, the
+                        // last WorkflowExecutionFailed event's `error` (a step
+                        // refused at start says "Execution refused: ...").
+                        if execution.status == crate::domain::execution::ExecutionStatus::Failed {
+                            const PAGE: usize = 500;
+                            let mut offset = 0;
+                            let mut reason: Option<String> = None;
+                            loop {
+                                match repo
+                                    .find_events_by_execution(execution_id, PAGE, offset)
+                                    .await
+                                {
+                                    Ok(events) => {
+                                        for event in &events {
+                                            if event.event_type == "WorkflowExecutionFailed" {
+                                                if let Some(error) = event
+                                                    .payload
+                                                    .get("error")
+                                                    .and_then(Value::as_str)
+                                                {
+                                                    reason = Some(error.to_string());
+                                                }
+                                            }
+                                        }
+                                        if events.len() < PAGE {
+                                            break;
+                                        }
+                                        offset += PAGE;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            workflow_execution_id = %execution_id_str,
+                                            %error,
+                                            "aegis.workflow.wait: events not read; answering no error"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(reason) = reason {
+                                answer["error"] = Value::String(reason);
+                            }
+                        }
                         return Ok(ToolInvocationResult::Direct(answer));
                     }
 
