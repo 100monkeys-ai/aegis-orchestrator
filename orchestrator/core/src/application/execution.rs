@@ -4778,7 +4778,7 @@ impl StandardExecutionService {
 impl StandardExecutionService {
     /// AEGIS ADR-005 O6: an execution of an agent that O4 or O5 refuses today
     /// is refused at start, before any record or container, with the rule's
-    /// sentence ("Execution refused: <sentence>"), so an agent deployed before
+    /// sentence (`Execution refused: <sentence>`), so an agent deployed before
     /// the rule landed cannot run in the shape it refuses. A start carrying a
     /// `workflow_execution_id` runs in the workflow's workspace, which O5's own
     /// sentence says the volume yields to, so O5 does not refuse it (Q2); O4

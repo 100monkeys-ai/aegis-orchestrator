@@ -1047,7 +1047,7 @@ spec:
         complaints
     }
 
-    /// `aegis.agent.list` carries `refused: <sentence>` on the refused agent
+    /// `aegis.agent.list` carries `refused` with the sentence on the refused agent
     /// and no `refused` key on the passing one.
     #[tokio::test]
     async fn agent_list_carries_refused_on_a_refused_agent_only() {
@@ -1063,7 +1063,7 @@ spec:
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 
-    /// `aegis.agent.search` carries `refused: <sentence>` on the refused agent
+    /// `aegis.agent.search` carries `refused` with the sentence on the refused agent
     /// and no `refused` key on the passing one.
     #[tokio::test]
     async fn agent_search_carries_refused_on_a_refused_agent_only() {
