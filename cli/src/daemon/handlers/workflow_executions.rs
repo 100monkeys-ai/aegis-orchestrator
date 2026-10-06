@@ -13,7 +13,9 @@ use axum::Json;
 use sqlx::Row;
 use uuid::Uuid;
 
-use aegis_orchestrator_core::application::goal_service::{cancel_ending_its_goal, GoalService};
+use aegis_orchestrator_core::application::goal_service::{
+    cancel_ending_its_goal, CancelPathError, GoalService,
+};
 use aegis_orchestrator_core::domain::events::WorkflowEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
@@ -937,7 +939,7 @@ pub(crate) async fn cancel_workflow_ending_its_goal(
     goals: Option<&GoalService>,
     tenant_id: &TenantId,
     execution_id: ExecutionId,
-) -> anyhow::Result<CancelOutcome> {
+) -> Result<CancelOutcome, CancelPathError<anyhow::Error>> {
     cancel_ending_its_goal(
         goals,
         tenant_id,

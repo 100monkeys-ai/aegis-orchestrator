@@ -15,7 +15,9 @@ use aegis_orchestrator_core::application::execution::ExecutionService;
 use aegis_orchestrator_core::application::file_operations_service::{
     FileContent, FileOperationsError,
 };
-use aegis_orchestrator_core::application::goal_service::{cancel_ending_its_goal, GoalService};
+use aegis_orchestrator_core::application::goal_service::{
+    cancel_ending_its_goal, CancelPathError, GoalService,
+};
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
@@ -121,7 +123,7 @@ pub(crate) async fn cancel_execution_ending_its_goal(
     goals: Option<&GoalService>,
     tenant_id: &TenantId,
     execution_id: ExecutionId,
-) -> anyhow::Result<()> {
+) -> Result<(), CancelPathError<anyhow::Error>> {
     cancel_ending_its_goal(
         goals,
         tenant_id,

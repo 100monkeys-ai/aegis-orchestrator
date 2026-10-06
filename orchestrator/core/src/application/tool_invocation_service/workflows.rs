@@ -814,6 +814,17 @@ impl ToolInvocationService {
                 "cancelled": true,
                 "execution_id": exec_id_str
             }))),
+            // C3, finding 4: the execution was cancelled but its goal is
+            // still open; the answer says so, naming the goal.
+            Err(e @ crate::application::goal_service::CancelPathError::GoalStillOpen { .. }) => {
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.cancel",
+                    "cancelled": true,
+                    "execution_id": exec_id_str,
+                    "goal_still_open": e.goal_still_open().map(|g| g.to_string()),
+                    "error": e.to_string()
+                })))
+            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.cancel",
                 "cancelled": false,

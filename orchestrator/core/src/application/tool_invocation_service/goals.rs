@@ -124,25 +124,45 @@ impl ToolInvocationService {
         }
     }
 
-    /// Write the goal on the execution just started for it.
+    /// Write the goal on the execution just started for it. When the goal
+    /// closed between the start's check and this binding (the person's
+    /// cancel), the execution is cancelled and the goal's closed state is
+    /// answered (correction C3, finding 2); `None` otherwise.
     pub(super) async fn bind_to_goal(
         &self,
         goal_id: Option<GoalId>,
         execution_id: &str,
         kind: BoundKind,
-    ) {
+    ) -> Option<Value> {
         let (Some(goal_id), Some(goals)) = (goal_id, self.goal_service.as_ref()) else {
-            return;
+            return None;
         };
         let Ok(uuid) = uuid::Uuid::parse_str(execution_id) else {
             tracing::warn!(
                 execution_id,
                 "A started execution's id is not a UUID; not bound"
             );
-            return;
+            return None;
         };
         if let Err(e) = goals.bind(goal_id, ExecutionId(uuid), kind).await {
             tracing::warn!(goal_id = %goal_id, execution_id, error = %e, "Failed to bind an execution to its goal");
+        }
+        let world = GoalCallWorld {
+            service: self,
+            identity: None,
+            security_context_name: String::new(),
+        };
+        let bound = BoundExecution {
+            execution_id: ExecutionId(uuid),
+            kind,
+            started_at: chrono::Utc::now(),
+        };
+        match goals.settle_binding(&world, goal_id, bound).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                tracing::warn!(goal_id = %goal_id, execution_id, error = %e, "Failed to read the goal of a bound execution");
+                None
+            }
         }
     }
 
@@ -1587,6 +1607,9 @@ mod cancel_path_tests {
     struct Executions {
         started: StdMutex<HashMap<ExecutionId, Execution>>,
         cancels: StdMutex<Vec<ExecutionId>>,
+        /// Finding 2: the next start closes this goal `cancelled`, as the
+        /// person's cancel landing between the start's check and its binding.
+        close_on_start: StdMutex<Option<(Arc<InMemoryGoalRepository>, GoalId)>>,
     }
 
     #[async_trait::async_trait]
@@ -1605,6 +1628,17 @@ mod cancel_path_tests {
             }
             e.start();
             self.started.lock().unwrap().insert(id, e);
+            let closing = self.close_on_start.lock().unwrap().take();
+            if let Some((repo, goal_id)) = closing {
+                repo.close_goal(
+                    goal_id,
+                    GoalState::Cancelled,
+                    chrono::Utc::now(),
+                    Some("The person asked to stop."),
+                )
+                .await
+                .unwrap();
+            }
             Ok(id)
         }
         async fn start_execution_with_id(
@@ -2069,5 +2103,33 @@ mod cancel_path_tests {
             "string"
         );
         assert!(router.is_skip_judge("aegis.goal.cancel").await);
+    }
+
+    /// Finding 2: an execution that binds after the person's cancel closed
+    /// its goal is cancelled, and the binding answers the closed state.
+    #[tokio::test]
+    async fn work_bound_after_the_goal_closed_is_cancelled_and_the_closed_state_answered() {
+        let h = harness();
+        let goal = h.create().await;
+        *h.executions.close_on_start.lock().unwrap() = Some((h.goals.clone(), goal));
+        let started = h.task_execute(goal).await;
+        let execution =
+            ExecutionId::from_string(started["execution_id"].as_str().unwrap()).unwrap();
+        println!(
+            "finding 2: the execution started across the cancel was cancelled: {:?}",
+            h.executions.cancels.lock().unwrap()
+        );
+        assert_eq!(
+            *h.executions.cancels.lock().unwrap(),
+            vec![execution],
+            "work bound to a closed goal is cancelled"
+        );
+        let answer = h
+            .service
+            .bind_to_goal(Some(goal), &execution.to_string(), BoundKind::Agent)
+            .await
+            .expect("a binding to a closed goal answers its state");
+        assert_eq!(answer["state"], "cancelled", "{answer}");
+        assert_eq!(answer["continue"], false);
     }
 }
