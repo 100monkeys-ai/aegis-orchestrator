@@ -53,11 +53,26 @@ impl ToolInvocationService {
         };
 
         let response = catalog.list_tools(&permitted_tools, query).await;
-        Ok(ToolInvocationResult::Direct(
-            serde_json::to_value(response).unwrap_or_else(
-                |e| serde_json::json!({"error": format!("Serialization failed: {e}")}),
-            ),
-        ))
+        let mut answer = serde_json::to_value(response)
+            .unwrap_or_else(|e| serde_json::json!({"error": format!("Serialization failed: {e}")}));
+        // AEGIS ADR-132 S7c: a remote server's tools are listed for a person's
+        // binding at run time, never here, so the listing names each server,
+        // the form of its tools and the context that declares them.
+        if let Some(object) = answer.as_object_mut() {
+            let servers: Vec<Value> = self
+                .remote_tool_servers
+                .iter()
+                .map(|server| {
+                    serde_json::json!({
+                        "server": server,
+                        "tools": format!("{server}.*"),
+                        "context": {"service": server}
+                    })
+                })
+                .collect();
+            object.insert("remote_servers".to_string(), Value::Array(servers));
+        }
+        Ok(ToolInvocationResult::Direct(answer))
     }
 
     pub(super) async fn invoke_aegis_tools_search(

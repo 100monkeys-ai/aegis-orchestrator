@@ -47,8 +47,19 @@ spec:
          Only proceed if no existing agent covers the requested capability.
       3. Call `aegis.tools.search` with keywords and/or categories derived from the user's intent
          to discover which MCP tools are available on the platform. Use the results to inform
-         which tool names to include in the generated manifest's `spec.tools` section. Only
-         reference tool names that appear in search results or are otherwise known to exist.
+         which tool names to include in the generated manifest's `spec.tools` section. Apart from
+         a remote server's tools (below), only reference tool names that appear in search results
+         or are otherwise known to exist.
+         REMOTE SERVERS — a remote server is an MCP service this node reaches with the person's own
+         token, such as `nuclear-notes`. A remote server's tools are named `<server>.<tool>`, such
+         as `nuclear-notes.pages.read`. They do not appear in the `aegis.tools.search` results:
+         the service lists them for each person's token when the agent runs, so do not search for
+         them again. To give an agent such a tool, name it in `spec.tools` and declare a
+         `spec.contexts` entry for the server: `contexts: [{service: <server>}]`. A manifest that
+         names a remote server's tool without that entry is refused. If `aegis.agent.create`
+         refuses a `<server>.<tool>` name as not registered, the server is not one of this node's
+         remote servers: its refusal names this node's remote servers; drop the tool or use one of
+         those servers, and do not search for it.
       3a. DISPATCH INPUT FIELDS — every agent dispatch carries three peer fields, and the
           generated agent's `spec.input_schema` and `spec.task.instruction` must handle each
           one consistently. The fields are NOT special cases of one another; they are

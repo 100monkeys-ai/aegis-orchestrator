@@ -166,6 +166,14 @@ impl StandardToolCatalog {
         *cache = entries;
     }
 
+    /// The names of every tool in the catalog, with no page limit: the set an
+    /// agent manifest's `spec.tools` is checked against, so a tool is never
+    /// refused for sitting past a page of [`list_tools`](Self::list_tools).
+    pub async fn registered_names(&self) -> std::collections::HashSet<String> {
+        let cache = self.cache.read().await;
+        cache.iter().map(|entry| entry.name.clone()).collect()
+    }
+
     /// List tools with optional filters, scoped to the caller's permitted tool names.
     ///
     /// `permitted_tools` contains the glob patterns from the caller's
@@ -763,6 +771,28 @@ mod tests {
                 ..Default::default()
             },
         ]
+    }
+
+    /// Every name the catalog holds is registered, past any page of
+    /// `list_tools` (whose limit is capped at 200).
+    #[tokio::test]
+    async fn registered_names_holds_every_tool_past_the_page_cap() {
+        let catalog = StandardToolCatalog::new();
+        let tools: Vec<_> = (0..250)
+            .map(|i| crate::infrastructure::tool_router::ToolMetadata {
+                name: format!("filler.tool_{i:03}"),
+                description: "A filler tool.".to_string(),
+                input_schema: json!({"type": "object"}),
+                ..Default::default()
+            })
+            .collect();
+        catalog.refresh_from(tools).await;
+        let names = catalog.registered_names().await;
+        assert_eq!(names.len(), 250, "the catalog's names are not all read");
+        assert!(
+            names.contains("filler.tool_249"),
+            "the 250th tool is not among the registered names"
+        );
     }
 
     #[tokio::test]

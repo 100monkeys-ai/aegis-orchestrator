@@ -33,7 +33,11 @@ impl ToolInvocationService {
         };
 
         // AEGIS ADR-005 O7d: the generator's floor.
-        if let Some(sentence) = generator_floor(calling_agent, &manifest) {
+        if let Some(sentence) = generator_floor(
+            calling_agent,
+            &manifest,
+            &self.remote_servers_named(&manifest),
+        ) {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.agent.create",
                 "validated": false,
@@ -44,41 +48,15 @@ impl ToolInvocationService {
             })));
         }
 
-        // ADR-087: Validate that all declared tools exist in the tool catalog.
-        if let Some(catalog) = &self.tool_catalog {
-            let declared_tools = &manifest.spec.tools;
-            if !declared_tools.is_empty() {
-                let available = catalog
-                    .list_tools(
-                        &["*".to_string()],
-                        crate::application::tool_catalog::ToolListQuery {
-                            source: None,
-                            category: None,
-                            limit: Some(1000),
-                            offset: Some(0),
-                            fleet_capable: None,
-                        },
-                    )
-                    .await;
-                let available_names: std::collections::HashSet<&str> =
-                    available.tools.iter().map(|t| t.name.as_str()).collect();
-                let unknown: Vec<&str> = declared_tools
-                    .iter()
-                    .filter(|t| !available_names.contains(t.as_str()))
-                    .map(|t| t.as_str())
-                    .collect();
-                if !unknown.is_empty() {
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "tool": "aegis.agent.create",
-                        "validated": false,
-                        "deployed": false,
-                        "errors": [format!(
-                            "Agent manifest references tools not registered on this platform: [{}]. Call aegis.tools.list to see available tools.",
-                            unknown.join(", ")
-                        )]
-                    })));
-                }
-            }
+        // ADR-087, with AEGIS ADR-132 S7a and S7c: every declared tool is in
+        // the tool catalog or is a tool of one of the node's remote servers.
+        if let Some(sentence) = self.unregistered_tools_sentence(&manifest).await {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.create",
+                "validated": false,
+                "deployed": false,
+                "errors": [sentence]
+            })));
         }
 
         // AEGIS ADR-005 O7c: the program runs on its sample input before the
@@ -381,7 +359,11 @@ impl ToolInvocationService {
         }
 
         // AEGIS ADR-005 O7d: the generator's floor.
-        if let Some(sentence) = generator_floor(calling_agent, &manifest) {
+        if let Some(sentence) = generator_floor(
+            calling_agent,
+            &manifest,
+            &self.remote_servers_named(&manifest),
+        ) {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.agent.update",
                 "validated": false,
@@ -434,41 +416,15 @@ impl ToolInvocationService {
             }
         }
 
-        // ADR-087: Validate that all declared tools exist in the tool catalog.
-        if let Some(catalog) = &self.tool_catalog {
-            let declared_tools = &manifest.spec.tools;
-            if !declared_tools.is_empty() {
-                let available = catalog
-                    .list_tools(
-                        &["*".to_string()],
-                        crate::application::tool_catalog::ToolListQuery {
-                            source: None,
-                            category: None,
-                            limit: Some(1000),
-                            offset: Some(0),
-                            fleet_capable: None,
-                        },
-                    )
-                    .await;
-                let available_names: std::collections::HashSet<&str> =
-                    available.tools.iter().map(|t| t.name.as_str()).collect();
-                let unknown: Vec<&str> = declared_tools
-                    .iter()
-                    .filter(|t| !available_names.contains(t.as_str()))
-                    .map(|t| t.as_str())
-                    .collect();
-                if !unknown.is_empty() {
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "tool": "aegis.agent.update",
-                        "validated": false,
-                        "updated": false,
-                        "errors": [format!(
-                            "Agent manifest references tools not registered on this platform: [{}]. Call aegis.tools.list to see available tools.",
-                            unknown.join(", ")
-                        )]
-                    })));
-                }
-            }
+        // ADR-087, with AEGIS ADR-132 S7a and S7c: every declared tool is in
+        // the tool catalog or is a tool of one of the node's remote servers.
+        if let Some(sentence) = self.unregistered_tools_sentence(&manifest).await {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.update",
+                "validated": false,
+                "updated": false,
+                "errors": [sentence]
+            })));
         }
 
         // AEGIS ADR-005 O7c: the program runs on its sample input before the
@@ -664,6 +620,71 @@ impl ToolInvocationService {
     }
 }
 
+impl ToolInvocationService {
+    /// The node's remote servers whose tools `manifest` names in
+    /// `spec.tools`, each once, in the order first named (AEGIS ADR-132
+    /// S7b), by the rule a call is routed by.
+    fn remote_servers_named(&self, manifest: &crate::domain::agent::AgentManifest) -> Vec<String> {
+        let mut servers: Vec<String> = Vec::new();
+        for tool in &manifest.spec.tools {
+            if let Some((server, _)) = self.remote_tool_of(tool) {
+                if !servers.iter().any(|named| named == server) {
+                    servers.push(server.to_string());
+                }
+            }
+        }
+        servers
+    }
+
+    /// The refusal for a manifest declaring a tool that is neither in the
+    /// tool catalog nor a tool of one of the node's remote servers (ADR-087;
+    /// AEGIS ADR-132 S7a, S7c), naming the remote servers and how their
+    /// tools are declared; `None` when every tool is known or the node has
+    /// no catalog. The catalog is read whole, never one page of it (S7f).
+    async fn unregistered_tools_sentence(
+        &self,
+        manifest: &crate::domain::agent::AgentManifest,
+    ) -> Option<String> {
+        let catalog = self.tool_catalog.as_ref()?;
+        let declared_tools = &manifest.spec.tools;
+        if declared_tools.is_empty() {
+            return None;
+        }
+        let registered = catalog.registered_names().await;
+        let unknown: Vec<&str> = declared_tools
+            .iter()
+            .filter(|tool| !registered.contains(tool.as_str()))
+            .filter(|tool| self.remote_tool_of(tool).is_none())
+            .map(String::as_str)
+            .collect();
+        if unknown.is_empty() {
+            return None;
+        }
+        Some(unregistered_tools_sentence(
+            &unknown,
+            &self.remote_tool_servers,
+        ))
+    }
+}
+
+/// The refusal for tools neither registered nor of a remote server.
+pub(crate) fn unregistered_tools_sentence(unknown: &[&str], remote_servers: &[String]) -> String {
+    format!(
+        "Agent manifest references tools not registered on this platform: [{}]. A remote \
+         server's tool is named '<server>.<tool>' and is declared with a spec.contexts entry \
+         {{service: <server>}}; this node's remote servers: [{}]. Call aegis.tools.list to see \
+         available tools.",
+        unknown.join(", "),
+        remote_servers.join(", ")
+    )
+}
+
+/// The context rule's sentence for a remote server whose tools an agent
+/// names without declaring its context.
+pub(crate) fn undeclared_context_sentence(name: &str, server: &str) -> String {
+    format!("agent '{name}' uses {server}.* tools but declares no {server} context")
+}
+
 /// The built-in agent that generates agents (AEGIS ADR-005 O7d).
 pub(crate) const AGENT_GENERATOR_NAME: &str = "agent-creator-agent";
 
@@ -690,11 +711,14 @@ pub(crate) fn undeclared_output_sentence(name: &str, path: &str) -> String {
 /// AEGIS ADR-005 O7d and O8: a manifest the generator creates or updates is
 /// refused when it declares `cmd.run` and carries no program (O7's
 /// sentence), and for each `/workspace` file its instruction or prompt
-/// template names that `spec.execution.outputs` does not list. Every
-/// sentence is reported, joined with "; ".
+/// template names that `spec.execution.outputs` does not list; and (AEGIS
+/// ADR-132 S7b) for each remote server in `remote_servers_named` (the
+/// node's remote servers whose tools it names) that `spec.contexts` does
+/// not declare. Every sentence is reported, joined with "; ".
 pub(crate) fn generator_floor(
     calling_agent: Option<&str>,
     manifest: &crate::domain::agent::AgentManifest,
+    remote_servers_named: &[String],
 ) -> Option<String> {
     if calling_agent != Some(AGENT_GENERATOR_NAME) {
         return None;
@@ -733,6 +757,16 @@ pub(crate) fn generator_floor(
     for file in written {
         if !declared.contains(&file) {
             sentences.push(undeclared_output_sentence(name, file));
+        }
+    }
+    for server in remote_servers_named {
+        let declares = manifest
+            .spec
+            .contexts
+            .iter()
+            .any(|context| context.service.trim() == server);
+        if !declares {
+            sentences.push(undeclared_context_sentence(name, server));
         }
     }
     if sentences.is_empty() {
@@ -2021,7 +2055,7 @@ spec:
             &["/workspace/itinerary.md"],
         ))
         .expect("the declared manifest parses");
-        let floor = generator_floor(Some(AGENT_GENERATOR_NAME), &declared);
+        let floor = generator_floor(Some(AGENT_GENERATOR_NAME), &declared, &[]);
         println!("declared manifest: the floor answered {floor:?}");
         if floor.is_some() {
             complaints.push(format!(
@@ -2031,7 +2065,7 @@ spec:
         let undeclared =
             AgentManifestParser::parse_yaml(&writing_yaml("route-agent", "1.0.0", false, &[]))
                 .expect("the undeclared manifest parses");
-        if let Some(sentence) = generator_floor(None, &undeclared) {
+        if let Some(sentence) = generator_floor(None, &undeclared, &[]) {
             complaints.push(format!("another caller's agent met the floor: {sentence}"));
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
@@ -2042,7 +2076,7 @@ spec:
     #[test]
     fn the_vrp_fixture_is_refused_with_both_sentences() {
         let manifest = AgentManifestParser::parse_yaml(VRP_SOLVER).expect("the fixture parses");
-        let floor = generator_floor(Some(AGENT_GENERATOR_NAME), &manifest);
+        let floor = generator_floor(Some(AGENT_GENERATOR_NAME), &manifest, &[]);
         println!("vrp-solver-agent 1.0.1: the floor answered {floor:?}");
         assert_eq!(
             floor,
@@ -2081,5 +2115,353 @@ spec:
             complaints.push(format!("the update did not say updated false: {answer}"));
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    // AEGIS ADR-132 S7a to S7f: an agent declares a remote server's tools by
+    // context, and the creator is taught so.
+    mod remote_tools {
+        use super::*;
+        use crate::application::tool_catalog::StandardToolCatalog;
+
+        const NOTES_READ: &str = "nuclear-notes.pages.read";
+
+        /// The creator's own template, as the daemon deploys it.
+        const CREATOR_TEMPLATE: &str =
+            include_str!("../../../../../cli/templates/agents/agent-creator-agent.yaml");
+
+        /// A catalog holding the built-in tools, as the daemon fills it.
+        async fn builtin_catalog() -> Arc<StandardToolCatalog> {
+            let catalog = Arc::new(StandardToolCatalog::new());
+            let tools = ToolRouter::new(vec![])
+                .list_tools()
+                .await
+                .expect("the built-in tools list");
+            catalog.refresh_from(tools).await;
+            catalog
+        }
+
+        /// The harness's service with a catalog and the node's remote servers.
+        async fn service_with(servers: &[&str]) -> ToolInvocationService {
+            let h = harness().await;
+            h.service
+                .with_tool_catalog(builtin_catalog().await)
+                .with_remote_tool_servers(servers.iter().map(|s| s.to_string()).collect())
+        }
+
+        async fn is_deployed(service: &ToolInvocationService, name: &str) -> bool {
+            service
+                .agent_lifecycle
+                .lookup_agent_for_tenant(&tenant(), name)
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        /// An agent naming `tools`, with a `nuclear-notes` context or none.
+        fn notes_yaml(name: &str, version: &str, tools: &[&str], context: bool) -> String {
+            let listed: String = tools.iter().map(|t| format!("    - {t}\n")).collect();
+            let contexts = if context {
+                "  contexts:\n    - service: nuclear-notes\n"
+            } else {
+                ""
+            };
+            format!(
+                "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: {name}\n  \
+                 version: \"{version}\"\nspec:\n  runtime:\n    language: python\n    \
+                 version: \"3.11\"\n  task:\n    instruction: Read the pages the request \
+                 names and summarise them.\n{contexts}  tools:\n{listed}"
+            )
+        }
+
+        fn s7b_sentence(name: &str) -> String {
+            format!(
+                "agent '{name}' uses nuclear-notes.* tools but declares no nuclear-notes context"
+            )
+        }
+
+        /// R1: the creator's create and update accept a remote server's tool
+        /// declared with its context when the node names the server.
+        #[tokio::test]
+        async fn create_and_update_accept_a_remote_tool_declared_with_its_context() {
+            let service = service_with(&["nuclear-notes"]).await;
+            let mut complaints = Vec::new();
+            let name = "notes-summarizer-agent";
+            let answer = create(
+                &service,
+                &notes_yaml(name, "1.0.0", &[NOTES_READ], true),
+                Some(AGENT_GENERATOR_NAME),
+            )
+            .await;
+            println!("the creator's create answered {answer}");
+            if answer.get("deployed") != Some(&Value::Bool(true)) {
+                complaints.push(format!(
+                    "a remote tool declared with its context was refused at create: {answer}"
+                ));
+            }
+            let answer = update(
+                &service,
+                &notes_yaml(
+                    name,
+                    "1.0.1",
+                    &[NOTES_READ, "nuclear-notes.pages.list"],
+                    true,
+                ),
+                Some(AGENT_GENERATOR_NAME),
+            )
+            .await;
+            println!("the creator's update answered {answer}");
+            if answer.get("updated") != Some(&Value::Bool(true)) {
+                complaints.push(format!(
+                    "a remote tool declared with its context was refused at update: {answer}"
+                ));
+            }
+            assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        }
+
+        /// R2: a tool of a server the node does not name is still refused as
+        /// not registered, and nothing is deployed.
+        #[tokio::test]
+        async fn a_tool_of_a_server_the_node_does_not_name_is_refused() {
+            let service = service_with(&[]).await;
+            let name = "notes-summarizer-agent";
+            let answer = create(
+                &service,
+                &notes_yaml(name, "1.0.0", &[NOTES_READ], true),
+                None,
+            )
+            .await;
+            println!("create on a node with no remote servers answered {answer}");
+            let refused = errors(&answer).iter().any(|e| {
+                e.starts_with("Agent manifest references tools not registered on this platform: [nuclear-notes.pages.read]")
+            });
+            assert!(
+                refused && !is_deployed(&service, name).await,
+                "a tool of a server the node does not name was not refused as not registered: {answer}"
+            );
+        }
+
+        /// R3: the creator's manifest naming the tool with no context is
+        /// refused with the context sentence, joined with "; " to the floor's
+        /// other sentences.
+        #[tokio::test]
+        async fn the_creators_manifest_with_no_context_is_refused_with_the_sentence() {
+            let service = service_with(&["nuclear-notes"]).await;
+            let mut complaints = Vec::new();
+            let name = "notes-summarizer-agent";
+            let answer = create(
+                &service,
+                &notes_yaml(name, "1.0.0", &[NOTES_READ], false),
+                Some(AGENT_GENERATOR_NAME),
+            )
+            .await;
+            println!("the creator's create with no context answered {answer}");
+            if errors(&answer) != vec![s7b_sentence(name)] {
+                complaints.push(format!(
+                    "the creator's manifest with no context was not refused with the sentence: {answer}"
+                ));
+            }
+            let joined = writing_yaml("route-agent", "1.0.0", false, &[]).replace(
+                "    - cmd.run\n",
+                "    - cmd.run\n    - nuclear-notes.pages.read\n",
+            );
+            let answer = create(&service, &joined, Some(AGENT_GENERATOR_NAME)).await;
+            println!("the creator's create meeting two floors answered {answer}");
+            let expected = format!(
+                "{}; {}",
+                o8_sentence("route-agent"),
+                s7b_sentence("route-agent")
+            );
+            if errors(&answer) != vec![expected.clone()] {
+                complaints.push(format!(
+                    "the two refusals were not joined with \"; \": expected [{expected}], got {answer}"
+                ));
+            }
+            if is_deployed(&service, name).await || is_deployed(&service, "route-agent").await {
+                complaints.push("a refused manifest was deployed".to_string());
+            }
+            assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        }
+
+        /// R4: another caller's manifest naming the tool with no context is
+        /// accepted: the binding-grant route stands for it.
+        #[tokio::test]
+        async fn another_callers_manifest_with_no_context_is_accepted() {
+            let service = service_with(&["nuclear-notes"]).await;
+            let name = "remote-tools-proof-b";
+            let answer = create(
+                &service,
+                &notes_yaml(name, "1.0.0", &[NOTES_READ], false),
+                None,
+            )
+            .await;
+            println!("a person's create with no context answered {answer}");
+            assert!(
+                answer.get("deployed") == Some(&Value::Bool(true)) && is_deployed(&service, name).await,
+                "another caller's manifest naming a remote tool with no context was refused: {answer}"
+            );
+        }
+
+        /// R5: the catalog's refusal names the node's remote servers and the
+        /// context form.
+        #[tokio::test]
+        async fn the_refusal_names_the_remote_servers_and_the_context() {
+            let service = service_with(&["nuclear-notes"]).await;
+            let answer = create(
+                &service,
+                &notes_yaml(
+                    "notes-summarizer-agent",
+                    "1.0.0",
+                    &["notes.pages.read"],
+                    true,
+                ),
+                None,
+            )
+            .await;
+            println!("create naming an unknown tool answered {answer}");
+            let refusal = errors(&answer).join(" ");
+            assert!(
+                refusal.contains("[notes.pages.read]")
+                    && refusal.contains("this node's remote servers: [nuclear-notes]")
+                    && refusal.contains("spec.contexts"),
+                "the refusal does not name the node's remote servers and the context: {refusal}"
+            );
+        }
+
+        /// R6: `aegis.tools.list` answers each remote server with its tools'
+        /// form and its context.
+        #[tokio::test]
+        async fn tools_list_answers_the_remote_servers() {
+            let service = service_with(&["nuclear-notes"]).await;
+            let context = SecurityContext {
+                name: "test".to_string(),
+                description: String::new(),
+                capabilities: vec![crate::domain::security_context::Capability {
+                    tool_pattern: "*".to_string(),
+                    path_allowlist: None,
+                    command_allowlist: None,
+                    subcommand_allowlist: None,
+                    domain_allowlist: None,
+                    max_response_size: None,
+                    rate_limit: None,
+                    max_concurrent: None,
+                }],
+                deny_list: vec![],
+                metadata: crate::domain::security_context::SecurityContextMetadata {
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    version: 1,
+                },
+            };
+            let answer = direct(
+                service
+                    .invoke_aegis_tools_list(&json!({}), &context)
+                    .await
+                    .expect("aegis.tools.list answers"),
+            );
+            let servers = answer.get("remote_servers").cloned();
+            println!("aegis.tools.list answered remote_servers {servers:?}");
+            assert_eq!(
+                servers,
+                Some(json!([{
+                    "server": "nuclear-notes",
+                    "tools": "nuclear-notes.*",
+                    "context": {"service": "nuclear-notes"}
+                }])),
+                "aegis.tools.list does not answer the node's remote servers"
+            );
+        }
+
+        /// R7: the search and list tools declare their inputs, so a model's
+        /// query reaches the handler.
+        #[tokio::test]
+        async fn the_search_and_list_tools_declare_their_inputs() {
+            let tools = ToolRouter::new(vec![]).list_tools().await.unwrap();
+            let schema = |name: &str| {
+                tools
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.input_schema.clone())
+                    .unwrap_or(Value::Null)
+            };
+            let mut complaints = Vec::new();
+            let search = schema("aegis.tools.search");
+            for key in [
+                "keyword",
+                "name_pattern",
+                "source",
+                "category",
+                "tags",
+                "fleet_capable",
+            ] {
+                if search.pointer(&format!("/properties/{key}")).is_none() {
+                    complaints.push(format!(
+                        "aegis.tools.search does not declare {key}: {search}"
+                    ));
+                }
+            }
+            let list = schema("aegis.tools.list");
+            for key in ["offset", "limit", "source", "category", "fleet_capable"] {
+                if list.pointer(&format!("/properties/{key}")).is_none() {
+                    complaints.push(format!("aegis.tools.list does not declare {key}: {list}"));
+                }
+            }
+            assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        }
+
+        /// R8: the creator's step 3 teaches the remote servers' tools, their
+        /// context, and that the search does not show them.
+        #[test]
+        fn the_creator_template_teaches_the_remote_servers() {
+            let manifest: serde_yaml::Value =
+                serde_yaml::from_str(CREATOR_TEMPLATE).expect("the creator template parses");
+            let instruction = manifest["spec"]["task"]["instruction"]
+                .as_str()
+                .expect("the creator has an instruction");
+            let flat = instruction.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut complaints = Vec::new();
+            for sentence in [
+                "A remote server's tools are named `<server>.<tool>`",
+                "declare a `spec.contexts` entry for the server: `contexts: [{service: <server>}]`",
+                "They do not appear in the `aegis.tools.search` results",
+                "its refusal names this node's remote servers",
+            ] {
+                if !flat.contains(sentence) {
+                    complaints.push(format!("step 3 does not say: {sentence}"));
+                }
+            }
+            assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        }
+
+        /// R9: a tool past the 200th catalog entry is not refused as
+        /// unregistered.
+        #[tokio::test]
+        async fn a_tool_past_the_200th_catalog_entry_passes_the_check() {
+            let h = harness().await;
+            let catalog = Arc::new(StandardToolCatalog::new());
+            let mut tools = ToolRouter::new(vec![]).list_tools().await.unwrap();
+            for i in 0..250 {
+                tools.push(crate::infrastructure::tool_router::ToolMetadata {
+                    name: format!("filler.tool_{i:03}"),
+                    description: "A filler tool.".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                });
+            }
+            let last = tools.last().expect("a tool").name.clone();
+            catalog.refresh_from(tools).await;
+            let service = h.service.with_tool_catalog(catalog);
+            let answer = create(
+                &service,
+                &notes_yaml("filler-agent", "1.0.0", &[last.as_str()], false),
+                None,
+            )
+            .await;
+            println!("create naming {last} answered {answer}");
+            assert_eq!(
+                answer.get("deployed"),
+                Some(&Value::Bool(true)),
+                "a tool past the 200th catalog entry was refused as unregistered: {answer}"
+            );
+        }
     }
 }

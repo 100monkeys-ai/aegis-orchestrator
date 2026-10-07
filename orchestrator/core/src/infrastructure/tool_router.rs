@@ -385,8 +385,85 @@ impl ToolRouter {
             "aegis.goal.status" => Self::schema_aegis_goal_status(),
             "aegis.goal.cancel" => Self::schema_aegis_goal_cancel(),
             "aegis.document.render" => Self::schema_aegis_document_render(),
+            "aegis.tools.list" => Self::schema_aegis_tools_list(),
+            "aegis.tools.search" => Self::schema_aegis_tools_search(),
             _ => json!({ "type": "object" }),
         }
+    }
+
+    /// JSON schema for the `aegis.tools.list` builtin tool.
+    fn schema_aegis_tools_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "offset": {
+                    "type": "integer",
+                    "description": "How many matching tools to skip. Default: 0."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "The most tools answered (at most 200). Default: 50."
+                },
+                "source": {
+                    "type": "string",
+                    "enum": ["builtin", "mcp_server", "seal_gateway"],
+                    "description": "Only tools from this source."
+                },
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "agent_management", "workflow_management", "task_management",
+                        "system_management", "schema_validation", "filesystem", "execution",
+                        "web_network", "tool_discovery", "external"
+                    ],
+                    "description": "Only tools of this category."
+                },
+                "fleet_capable": {
+                    "type": "boolean",
+                    "description": "Only tools that can, or cannot, run across an edge fleet."
+                }
+            }
+        })
+    }
+
+    /// JSON schema for the `aegis.tools.search` builtin tool.
+    fn schema_aegis_tools_search() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "Text the tool's name or description contains, matched without regard to case."
+                },
+                "name_pattern": {
+                    "type": "string",
+                    "description": "A glob over tool names, such as \"fs.*\"."
+                },
+                "source": {
+                    "type": "string",
+                    "enum": ["builtin", "mcp_server", "seal_gateway"],
+                    "description": "Only tools from this source."
+                },
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "agent_management", "workflow_management", "task_management",
+                        "system_management", "schema_validation", "filesystem", "execution",
+                        "web_network", "tool_discovery", "external"
+                    ],
+                    "description": "Only tools of this category."
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Tags every answered tool carries."
+                },
+                "fleet_capable": {
+                    "type": "boolean",
+                    "description": "Only tools that can, or cannot, run across an edge fleet."
+                }
+            }
+        })
     }
 
     /// JSON schema for the `cmd.run` builtin tool.

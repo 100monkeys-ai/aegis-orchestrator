@@ -703,7 +703,7 @@ impl ToolInvocationService {
 
     /// The registered remote server `tool_name` belongs to, and the tool's
     /// own name on it (`<server>.<tool>`; a server's name has no dot).
-    fn remote_tool_of<'a>(&self, tool_name: &'a str) -> Option<(&'a str, &'a str)> {
+    pub(super) fn remote_tool_of<'a>(&self, tool_name: &'a str) -> Option<(&'a str, &'a str)> {
         let (server, tool) = tool_name.split_once('.')?;
         (!tool.is_empty() && self.remote_tool_servers.iter().any(|name| name == server))
             .then_some((server, tool))
