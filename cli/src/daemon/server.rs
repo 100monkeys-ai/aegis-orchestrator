@@ -2275,16 +2275,25 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             PostgresCredentialBindingRepository::new(pool.clone()),
         );
 
-        Arc::new(
-            aegis_orchestrator_core::application::git_repo_service::GitRepoService::new(
-                repo,
-                user_volume_service.clone(),
-                clone_executor,
-                secrets_manager.clone(),
-                event_bus.clone(),
-            )
-            .with_credential_repo(credential_repo),
+        let service = aegis_orchestrator_core::application::git_repo_service::GitRepoService::new(
+            repo,
+            user_volume_service.clone(),
+            clone_executor,
+            secrets_manager.clone(),
+            event_bus.clone(),
         )
+        .with_credential_repo(credential_repo);
+        // An OAuth binding's git credential is its access token, read
+        // through the credential service (AEGIS ADR-136 G1b, G2d).
+        let service = match credential_service.as_ref() {
+            Some(credentials) => service.with_access_tokens(Arc::new(
+                aegis_orchestrator_core::application::git_repo_service::CredentialServiceTokens(
+                    credentials.clone(),
+                ),
+            )),
+            None => service,
+        };
+        Arc::new(service)
     });
 
     // Initialize the Script persistence service (ADR-110 §D7). Enabled

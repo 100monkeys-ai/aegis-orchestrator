@@ -158,6 +158,7 @@ impl IntoRefusal for GitRepoError {
             GitRepoError::UrlValidationFailed(_) | GitRepoError::SshHostKeys(_) => {
                 CallerAnswer::InvalidArguments(format!("Invalid tool arguments: {self}"))
             }
+            GitRepoError::CredentialNotYours => CallerAnswer::InvalidArguments(self.to_string()),
             GitRepoError::NothingToCommit
             | GitRepoError::BindingBusy(_)
             | GitRepoError::NoHeadBranch => CallerAnswer::Conflict(format!("Conflict: {self}.")),
@@ -1043,6 +1044,25 @@ mod tests {
                 answer.contains(address),
                 "the git tool answer lost the repository's address {address}: {answer}"
             );
+        }
+    }
+
+    /// A git binding naming a credential that is not the caller's active
+    /// one is answered `INVALID_ARGUMENTS` with the sentence alone (AEGIS
+    /// ADR-136 G2a).
+    #[test]
+    fn a_credential_not_the_callers_is_answered_invalid_arguments_with_the_sentence() {
+        match GitRepoError::CredentialNotYours.into_refusal() {
+            SealSessionError::Answered {
+                answer: CallerAnswer::InvalidArguments(message),
+                ..
+            } => assert_eq!(
+                message,
+                "The credential named for this repository is not an active credential of yours."
+            ),
+            other => panic!(
+                "a credential not the caller's was not answered INVALID_ARGUMENTS with the sentence: {other:?}"
+            ),
         }
     }
 }

@@ -131,6 +131,7 @@ fn git_repo_error_response(e: GitRepoError) -> (StatusCode, Json<serde_json::Val
         GitRepoError::UrlValidationFailed(_) | GitRepoError::SshHostKeys(_) => {
             (StatusCode::BAD_REQUEST, e.to_string())
         }
+        GitRepoError::CredentialNotYours => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
         GitRepoError::NotYetImplemented(_) => (StatusCode::NOT_IMPLEMENTED, e.to_string()),
         GitRepoError::CloneFailed(_) | GitRepoError::GitFailed(_) => {
             (StatusCode::BAD_GATEWAY, e.to_string())
@@ -565,6 +566,23 @@ mod request_tests {
         assert!(
             printed.contains("github.com"),
             "Debug lost the repository host: {printed}"
+        );
+    }
+
+    /// A git binding naming a credential that is not the caller's active
+    /// one is answered 422 with the sentence (AEGIS ADR-136 G2a).
+    #[test]
+    fn a_credential_not_the_callers_is_answered_422_with_the_sentence() {
+        let (status, Json(body)) = git_repo_error_response(GitRepoError::CredentialNotYours);
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({
+                    "error": "The credential named for this repository is not an active credential of yours."
+                })
+            ),
+            "a credential not the caller's was not answered 422 with the sentence"
         );
     }
 }

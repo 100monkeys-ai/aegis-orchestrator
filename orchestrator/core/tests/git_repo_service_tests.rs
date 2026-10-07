@@ -22,14 +22,20 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 
+use aegis_orchestrator_core::application::credential_service::CredentialError;
 use aegis_orchestrator_core::application::git_clone_executor::{
     EphemeralCliEngine, GitCloneExecutor,
 };
 use aegis_orchestrator_core::application::git_repo_service::{
-    CreateGitRepoCommand, GitRepoError, GitRepoService,
+    CreateGitRepoCommand, GitRepoError, GitRepoService, OAuthAccessTokens,
 };
 use aegis_orchestrator_core::application::user_volume_service::UserVolumeService;
 use aegis_orchestrator_core::application::volume_manager::VolumeService;
+use aegis_orchestrator_core::domain::credential::{
+    CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialMetadata,
+    CredentialProvider, CredentialScope, CredentialStatus, CredentialType, GrantTarget,
+    OAuthPendingState, UserCredentialBinding,
+};
 use aegis_orchestrator_core::domain::events::VolumeEvent;
 use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
 use aegis_orchestrator_core::domain::git_repo::{
@@ -38,6 +44,7 @@ use aegis_orchestrator_core::domain::git_repo::{
 use aegis_orchestrator_core::domain::iam::ZaruTier;
 use aegis_orchestrator_core::domain::repository::{RepositoryError, VolumeRepository};
 use aegis_orchestrator_core::domain::runtime::InstanceId;
+use aegis_orchestrator_core::domain::secrets::{SecretPath, SecretStore, SensitiveString};
 use aegis_orchestrator_core::domain::shared_kernel::{TenantId, VolumeId};
 use aegis_orchestrator_core::domain::volume::{
     AccessMode, StorageClass, Volume, VolumeBackend, VolumeMount, VolumeOwnership, VolumeStatus,
@@ -260,6 +267,8 @@ impl EventPublisher for NoopPublisher {
 struct Fixture {
     service: GitRepoService,
     event_bus: Arc<EventBus>,
+    volume_repo: Arc<InMemoryVolumeRepository>,
+    repo: Arc<dyn GitRepoBindingRepository>,
     _tmp: tempfile::TempDir,
 }
 
@@ -327,6 +336,16 @@ fn stub_storage_provider() -> Arc<dyn aegis_orchestrator_core::domain::storage::
 }
 
 fn build_fixture() -> Fixture {
+    build_fixture_with(Arc::new(TestSecretStore::new()), None, None)
+}
+
+/// The fixture with a credential-binding repository, an access-token
+/// reader and the secret store the service reads credentials from.
+fn build_fixture_with(
+    store: Arc<TestSecretStore>,
+    credentials: Option<Arc<Bindings>>,
+    tokens: Option<Arc<dyn OAuthAccessTokens>>,
+) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let event_bus = Arc::new(EventBus::new(64));
     let volume_repo = Arc::new(InMemoryVolumeRepository::new());
@@ -343,10 +362,7 @@ fn build_fixture() -> Fixture {
         aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
     ));
 
-    let secrets_manager = Arc::new(SecretsManager::from_store(
-        Arc::new(TestSecretStore::new()),
-        event_bus.clone(),
-    ));
+    let secrets_manager = Arc::new(SecretsManager::from_store(store, event_bus.clone()));
 
     let fsal = Arc::new(AegisFSAL::new(
         stub_storage_provider(),
@@ -364,17 +380,25 @@ fn build_fixture() -> Fixture {
     let repo =
         Arc::new(InMemoryGitRepoBindingRepository::default()) as Arc<dyn GitRepoBindingRepository>;
 
-    let service = GitRepoService::new(
-        repo,
+    let mut service = GitRepoService::new(
+        repo.clone(),
         user_volume_service,
         clone_executor,
         secrets_manager,
         event_bus.clone(),
     );
+    if let Some(credentials) = credentials {
+        service = service.with_credential_repo(credentials as Arc<dyn CredentialBindingRepository>);
+    }
+    if let Some(tokens) = tokens {
+        service = service.with_access_tokens(tokens);
+    }
 
     Fixture {
         service,
         event_bus,
+        volume_repo,
+        repo,
         _tmp: tmp,
     }
 }
@@ -924,5 +948,610 @@ async fn webhook_secret_is_persisted_as_ciphertext_plus_lookup_hash_only() {
     assert!(
         matches!(res_bogus, Err(GitRepoError::WebhookRejected(_))),
         "unknown secret MUST be rejected by lookup-hash miss; got {res_bogus:?}"
+    );
+}
+
+// ===========================================================================
+// A git binding may name only its owner's active credential (AEGIS ADR-136
+// G1b, G2, G2a to G2d)
+// ===========================================================================
+
+const SENTENCE: &str =
+    "The credential named for this repository is not an active credential of yours.";
+const OWNER: &str = "git-owner-sub";
+const OTHER: &str = "another-person-sub";
+const DECOY_VALUE: &str = "Mk12-decoy-stored-value";
+const ANSWERED_TOKEN: &str = "Mk12-answered-access-token";
+
+#[derive(Default)]
+struct Bindings(RwLock<HashMap<CredentialBindingId, UserCredentialBinding>>);
+
+#[async_trait]
+impl CredentialBindingRepository for Bindings {
+    async fn save(&self, binding: &UserCredentialBinding) -> anyhow::Result<()> {
+        self.0.write().unwrap().insert(binding.id, binding.clone());
+        Ok(())
+    }
+    async fn find_by_id(
+        &self,
+        id: &CredentialBindingId,
+    ) -> anyhow::Result<Option<UserCredentialBinding>> {
+        Ok(self.0.read().unwrap().get(id).cloned())
+    }
+    async fn find_by_owner(
+        &self,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+    ) -> anyhow::Result<Vec<UserCredentialBinding>> {
+        Ok(self
+            .0
+            .read()
+            .unwrap()
+            .values()
+            .filter(|b| &b.tenant_id == tenant_id && b.owner_user_id == owner_user_id)
+            .cloned()
+            .collect())
+    }
+    async fn find_active_grants_for_target(
+        &self,
+        _: &TenantId,
+        _: &str,
+        _: &CredentialProvider,
+        _: &GrantTarget,
+    ) -> anyhow::Result<Vec<CredentialGrant>> {
+        Ok(Vec::new())
+    }
+    async fn delete(&self, id: &CredentialBindingId) -> anyhow::Result<()> {
+        self.0.write().unwrap().remove(id);
+        Ok(())
+    }
+    async fn save_oauth_state(
+        &self,
+        _: &str,
+        _: &CredentialBindingId,
+        _: &str,
+        _: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn find_oauth_state(&self, _: &str) -> anyhow::Result<Option<OAuthPendingState>> {
+        Ok(None)
+    }
+    async fn delete_oauth_state(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn delete_expired_oauth_states(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+}
+
+/// What the stub access-token reader answers.
+enum TokenAnswer {
+    Token,
+    /// The refresh was answered `invalid_grant`: the binding is now Expired.
+    CannotRefresh,
+    /// The binding holds no OAuth token at all.
+    NoToken,
+}
+
+/// Records every binding it is asked about and answers as told.
+struct RecordingTokens {
+    answer: TokenAnswer,
+    asked: Mutex<Vec<CredentialBindingId>>,
+}
+
+impl RecordingTokens {
+    fn answering(answer: TokenAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl OAuthAccessTokens for RecordingTokens {
+    async fn access_token_for(
+        &self,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<SensitiveString> {
+        self.asked.lock().unwrap().push(*binding_id);
+        match self.answer {
+            TokenAnswer::Token => Ok(SensitiveString::new(ANSWERED_TOKEN)),
+            TokenAnswer::CannotRefresh => Err(CredentialError::OAuthExchangeFailed {
+                error: "invalid_grant".to_string(),
+                description: None,
+            }
+            .into()),
+            TokenAnswer::NoToken => Err(CredentialError::NoAccessToken {
+                binding_id: binding_id.to_string(),
+            }
+            .into()),
+        }
+    }
+}
+
+/// A credential binding of `owner` in the consumer tenant, its secret
+/// stored with a decoy `value`.
+async fn credential(
+    credentials: &Bindings,
+    store: &TestSecretStore,
+    owner: &str,
+    credential_type: CredentialType,
+    status: CredentialStatus,
+) -> CredentialBindingId {
+    let id = CredentialBindingId::new();
+    let tenant = TenantId::consumer();
+    let now = chrono::Utc::now();
+    let secret_path = SecretPath::for_tenant(
+        tenant.clone(),
+        "kv",
+        format!("users/{owner}/credentials/{}", id.0),
+    );
+    let mut secret = HashMap::new();
+    secret.insert("value".to_string(), SensitiveString::new(DECOY_VALUE));
+    store
+        .write(&secret_path.effective_mount(), &secret_path.path, secret)
+        .await
+        .expect("store the secret");
+    credentials
+        .save(&UserCredentialBinding {
+            id,
+            owner_user_id: owner.to_string(),
+            tenant_id: tenant,
+            credential_type,
+            provider: CredentialProvider::new("github"),
+            secret_path,
+            scope: CredentialScope::Personal,
+            status,
+            metadata: CredentialMetadata {
+                label: "GitHub".to_string(),
+                tags: None,
+                service_url: None,
+                external_account_id: None,
+                oauth_scopes: None,
+                mailbox: None,
+                reach: None,
+            },
+            grants: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("save the credential binding");
+    id
+}
+
+struct CredentialFixture {
+    fx: Fixture,
+    credentials: Arc<Bindings>,
+    store: Arc<TestSecretStore>,
+}
+
+fn credential_fixture(tokens: Option<Arc<dyn OAuthAccessTokens>>) -> CredentialFixture {
+    let store = Arc::new(TestSecretStore::new());
+    let credentials = Arc::new(Bindings::default());
+    let fx = build_fixture_with(store.clone(), Some(credentials.clone()), tokens);
+    CredentialFixture {
+        fx,
+        credentials,
+        store,
+    }
+}
+
+fn create_command(credential: CredentialBindingId) -> CreateGitRepoCommand {
+    let mut cmd = CreateGitRepoCommand::new(
+        TenantId::consumer(),
+        OWNER,
+        ZaruTier::Pro,
+        "https://git.example.invalid/o/r.git",
+        format!("repo-{}", GitRepoBindingId::new().0.simple()),
+    );
+    cmd.credential_binding_id = Some(credential);
+    cmd
+}
+
+/// A binding of `OWNER` created with no credential, then pointed at
+/// `credential` in the store, as a binding created before the check was
+/// built would be; `ready` marks it cloned so commit and push reach it.
+async fn binding_naming(
+    fx: &Fixture,
+    credential: CredentialBindingId,
+    ready: bool,
+) -> GitRepoBinding {
+    // Each binding's volume is named after its label, so each gets its own.
+    let label = format!("repo-{}", GitRepoBindingId::new().0.simple());
+    let mut binding = fx
+        .service
+        .create_binding(CreateGitRepoCommand::new(
+            TenantId::consumer(),
+            OWNER,
+            ZaruTier::Enterprise,
+            "https://git.example.invalid/o/r.git",
+            label,
+        ))
+        .await
+        .expect("a binding with no credential is created");
+    binding.credential_binding_id = Some(credential);
+    if ready {
+        binding.complete_clone("0".repeat(40), 1);
+    }
+    let _ = binding.take_events();
+    fx.repo.save(&binding).await.unwrap();
+    binding
+}
+
+/// `None` when `result` is the refusal; else the failure, in words.
+fn not_yours<T: std::fmt::Debug>(what: &str, result: Result<T, GitRepoError>) -> Option<String> {
+    match result {
+        Err(GitRepoError::CredentialNotYours) => None,
+        other => Some(format!(
+            "{what}: expected the refusal \"{SENTENCE}\", got {other:?}"
+        )),
+    }
+}
+
+fn assert_not_yours<T: std::fmt::Debug>(what: &str, result: Result<T, GitRepoError>) {
+    if let Some(failure) = not_yours(what, result) {
+        panic!("{failure}");
+    }
+}
+
+fn assert_none_failed(failures: Vec<Option<String>>) {
+    let failures: Vec<String> = failures.into_iter().flatten().collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// G2, G2a, G2b: another person's active credential, a missing one and the
+/// caller's own inactive one are refused at create with the sentence, and
+/// nothing is provisioned.
+#[tokio::test]
+async fn create_refuses_a_credential_that_is_not_an_active_credential_of_the_callers() {
+    let cf = credential_fixture(None);
+    let others = credential(
+        &cf.credentials,
+        &cf.store,
+        OTHER,
+        CredentialType::Secret,
+        CredentialStatus::Active,
+    )
+    .await;
+    let own_revoked = credential(
+        &cf.credentials,
+        &cf.store,
+        OWNER,
+        CredentialType::Secret,
+        CredentialStatus::Revoked,
+    )
+    .await;
+    let own_expired = credential(
+        &cf.credentials,
+        &cf.store,
+        OWNER,
+        CredentialType::OAuth2,
+        CredentialStatus::Expired,
+    )
+    .await;
+    let missing = CredentialBindingId::new();
+
+    let mut failures = Vec::new();
+    for (what, id) in [
+        ("another person's active credential", others),
+        ("a missing credential", missing),
+        ("the caller's own revoked credential", own_revoked),
+        ("the caller's own expired credential", own_expired),
+    ] {
+        match cf.fx.service.create_binding(create_command(id)).await {
+            Err(e @ GitRepoError::CredentialNotYours) => {
+                if e.to_string() != SENTENCE {
+                    failures.push(format!("{what}: refused with \"{e}\", not \"{SENTENCE}\""));
+                }
+            }
+            other => failures.push(format!(
+                "{what}: expected the refusal \"{SENTENCE}\" at create, got {other:?}"
+            )),
+        }
+    }
+    let volumes = cf
+        .fx
+        .volume_repo
+        .find_by_tenant(TenantId::consumer())
+        .await
+        .unwrap();
+    if !volumes.is_empty() {
+        failures.push(format!(
+            "a refused create provisioned {} volume(s)",
+            volumes.len()
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// G2: the caller's own active credential is admitted at create.
+#[tokio::test]
+async fn create_admits_the_callers_own_active_credential() {
+    let cf = credential_fixture(None);
+    let own = credential(
+        &cf.credentials,
+        &cf.store,
+        OWNER,
+        CredentialType::Secret,
+        CredentialStatus::Active,
+    )
+    .await;
+    let binding = cf
+        .fx
+        .service
+        .create_binding(create_command(own))
+        .await
+        .expect("the caller's own active credential is admitted");
+    assert_eq!(binding.credential_binding_id, Some(own));
+}
+
+/// G2b: with no credential repository wired, a binding naming a credential
+/// keeps today's not-implemented refusal.
+#[tokio::test]
+async fn create_naming_a_credential_with_no_credential_repository_is_not_implemented() {
+    let fx = build_fixture();
+    let res = fx
+        .service
+        .create_binding(create_command(CredentialBindingId::new()))
+        .await;
+    assert!(
+        matches!(res, Err(GitRepoError::NotYetImplemented(_))),
+        "expected NotYetImplemented with no credential repository, got {res:?}"
+    );
+}
+
+/// Clone, refresh, commit and push of four bindings of `OWNER` naming
+/// `credential`, each answer checked for the refusal; every failure kept.
+async fn clone_refresh_commit_and_push(
+    fx: &Fixture,
+    credential: CredentialBindingId,
+) -> Vec<Option<String>> {
+    let tenant = TenantId::consumer();
+    let cloning = binding_naming(fx, credential, false).await;
+    let refreshing = binding_naming(fx, credential, true).await;
+    let committing = binding_naming(fx, credential, true).await;
+    let pushing = binding_naming(fx, credential, true).await;
+    vec![
+        not_yours("clone", fx.service.clone_repo(&cloning.id).await),
+        not_yours(
+            "refresh",
+            fx.service
+                .refresh_repo(&refreshing.id, &tenant, OWNER)
+                .await,
+        ),
+        not_yours(
+            "commit",
+            fx.service
+                .commit(&committing.id, &tenant, OWNER, "m", "A", "a@example.com")
+                .await,
+        ),
+        not_yours(
+            "push",
+            fx.service
+                .push(&pushing.id, &tenant, OWNER, None, Some("main"))
+                .await,
+        ),
+    ]
+}
+
+/// G2: another person's active credential is refused at clone, refresh,
+/// commit and push, before any git operation.
+#[tokio::test]
+async fn clone_refresh_commit_and_push_refuse_another_persons_credential() {
+    let cf = credential_fixture(None);
+    let others = credential(
+        &cf.credentials,
+        &cf.store,
+        OTHER,
+        CredentialType::Secret,
+        CredentialStatus::Active,
+    )
+    .await;
+    assert_none_failed(clone_refresh_commit_and_push(&cf.fx, others).await);
+}
+
+/// G2: a missing credential and the caller's own inactive one are refused
+/// at clone, refresh, commit and push the same way.
+#[tokio::test]
+async fn clone_refresh_commit_and_push_refuse_a_missing_or_inactive_credential() {
+    let cf = credential_fixture(None);
+    let revoked = credential(
+        &cf.credentials,
+        &cf.store,
+        OWNER,
+        CredentialType::Secret,
+        CredentialStatus::Revoked,
+    )
+    .await;
+    let mut failures = clone_refresh_commit_and_push(&cf.fx, revoked).await;
+    failures.extend(clone_refresh_commit_and_push(&cf.fx, CredentialBindingId::new()).await);
+    assert_none_failed(failures);
+}
+
+/// G2: the caller's own active credential is admitted at clone, which goes
+/// on to the git host.
+#[tokio::test]
+async fn clone_admits_the_callers_own_active_credential() {
+    let cf = credential_fixture(None);
+    let own = credential(
+        &cf.credentials,
+        &cf.store,
+        OWNER,
+        CredentialType::Secret,
+        CredentialStatus::Active,
+    )
+    .await;
+    let cloning = binding_naming(&cf.fx, own, false).await;
+    let res = cf.fx.service.clone_repo(&cloning.id).await;
+    assert!(
+        matches!(res, Err(GitRepoError::CloneFailed(_))),
+        "the caller's own active credential was not admitted to the clone (the host does not resolve, so it fails there): {res:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A loopback git host that asks for Basic credentials and records them
+// ---------------------------------------------------------------------------
+
+/// Answers the first request with `401` and a Basic challenge, and every
+/// request that carries `Authorization` with `404`, recording the decoded
+/// `user:password` of each. Returns the address and the record.
+async fn basic_auth_recorder() -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<usize>>) {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback listener");
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let requests = Arc::new(Mutex::new(0usize));
+    let (seen_bg, requests_bg) = (seen.clone(), requests.clone());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (seen, requests) = (seen_bg.clone(), requests_bg.clone());
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                *requests.lock().unwrap() += 1;
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let auth = head.lines().find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                });
+                let response: &[u8] = match auth {
+                    Some(value) => {
+                        let decoded = value
+                            .strip_prefix("Basic ")
+                            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                            .unwrap_or(value);
+                        seen.lock().unwrap().push(decoded);
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                    None => b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                };
+                let _ = socket.write_all(response).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}/o/r.git"), seen, requests)
+}
+
+/// An OAuth binding of `OWNER`'s whose clone goes to the loopback host.
+async fn oauth_binding_to(
+    cf: &CredentialFixture,
+    url: &str,
+) -> (GitRepoBinding, CredentialBindingId) {
+    let oauth = credential(
+        &cf.credentials,
+        &cf.store,
+        OWNER,
+        CredentialType::OAuth2,
+        CredentialStatus::Active,
+    )
+    .await;
+    let mut binding = binding_naming(&cf.fx, oauth, false).await;
+    // The create path admits only https remotes; the loopback host is
+    // plain http, so the stored binding is pointed at it directly.
+    binding.repo_url = aegis_orchestrator_core::domain::secrets::SensitiveUrl::new(url);
+    cf.fx.repo.save(&binding).await.unwrap();
+    (binding, oauth)
+}
+
+/// G1b, G2d: an OAuth binding's clone carries the access token the
+/// credential service answers, never the stored `value`.
+#[tokio::test]
+async fn an_oauth_bindings_clone_carries_the_answered_access_token_never_the_stored_value() {
+    let tokens = RecordingTokens::answering(TokenAnswer::Token);
+    let cf = credential_fixture(Some(tokens.clone() as Arc<dyn OAuthAccessTokens>));
+    let (url, seen, _) = basic_auth_recorder().await;
+    let (binding, oauth) = oauth_binding_to(&cf, &url).await;
+
+    let res = cf.fx.service.clone_repo(&binding.id).await;
+
+    let mut failures = Vec::new();
+    if !matches!(res, Err(GitRepoError::CloneFailed(_))) {
+        failures.push(format!(
+            "the loopback host answers 404 after the credential, so the clone fails: {res:?}"
+        ));
+    }
+    let asked = tokens.asked.lock().unwrap().clone();
+    if asked != vec![oauth] {
+        failures.push(format!(
+            "the access-token reader was not asked for the binding's token: asked {asked:?}"
+        ));
+    }
+    let seen = seen.lock().unwrap().clone();
+    if seen.is_empty() {
+        failures.push("the clone sent no credential to the git host".to_string());
+    }
+    for sent in &seen {
+        if sent.contains(DECOY_VALUE) {
+            failures.push(format!(
+                "the clone sent the stored value, not the answered access token: {sent}"
+            ));
+        } else if sent != &format!("x-access-token:{ANSWERED_TOKEN}") {
+            failures.push(format!(
+                "the clone sent a credential other than the answered access token: {sent}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// G2c: a binding whose token can no longer be refreshed is refused at
+/// once with the sentence, and nothing reaches the git host.
+#[tokio::test]
+async fn an_oauth_binding_that_cannot_be_refreshed_is_refused_at_once() {
+    let tokens = RecordingTokens::answering(TokenAnswer::CannotRefresh);
+    let cf = credential_fixture(Some(tokens.clone() as Arc<dyn OAuthAccessTokens>));
+    let (url, _, requests) = basic_auth_recorder().await;
+    let (binding, _) = oauth_binding_to(&cf, &url).await;
+
+    assert_not_yours("clone", cf.fx.service.clone_repo(&binding.id).await);
+    assert_eq!(
+        *requests.lock().unwrap(),
+        0,
+        "a binding that cannot be refreshed reached the git host"
+    );
+}
+
+/// G1b as G2c reads it: a binding holding no OAuth token at all is no
+/// credential, so the clone goes out with none.
+#[tokio::test]
+async fn an_oauth_binding_holding_no_token_is_no_credential() {
+    let tokens = RecordingTokens::answering(TokenAnswer::NoToken);
+    let cf = credential_fixture(Some(tokens.clone() as Arc<dyn OAuthAccessTokens>));
+    let (url, seen, requests) = basic_auth_recorder().await;
+    let (binding, _) = oauth_binding_to(&cf, &url).await;
+
+    let res = cf.fx.service.clone_repo(&binding.id).await;
+    assert!(
+        matches!(res, Err(GitRepoError::CloneFailed(_))),
+        "a clone with no credential fails at the host's challenge: {res:?}"
+    );
+    assert!(
+        *requests.lock().unwrap() >= 1,
+        "the clone never reached the git host"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a binding with no token sent a credential: {:?}",
+        seen.lock().unwrap()
     );
 }

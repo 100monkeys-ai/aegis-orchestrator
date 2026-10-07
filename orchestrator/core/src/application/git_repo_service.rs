@@ -32,6 +32,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::Sha256;
@@ -41,6 +42,7 @@ use tracing::{error, info, instrument, warn};
 
 use chrono::Utc;
 
+use crate::application::credential_service::{CredentialError, CredentialManagementService};
 use crate::application::git_clone_executor::{
     clone_credential, credential_secrets, redact_git_output, strip_remote_user_info, CloneError,
     GitCloneExecutor, ResolvedCredential,
@@ -60,9 +62,9 @@ use crate::domain::git_repo::{
 use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
 use crate::domain::iam::ZaruTier;
 use crate::domain::repository::RepositoryError;
-use crate::domain::secrets::{AccessContext, SensitiveUrl};
+use crate::domain::secrets::{AccessContext, SensitiveString, SensitiveUrl};
 use crate::domain::shared_kernel::TenantId;
-use crate::domain::volume::{Volume, VolumeBackend};
+use crate::domain::volume::{Volume, VolumeBackend, VolumeOwnership};
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::secrets_manager::SecretsManager;
 
@@ -160,6 +162,15 @@ pub enum GitRepoError {
     #[error("not owner")]
     NotOwned,
 
+    /// The credential binding a git binding names is not an active
+    /// credential binding of the caller's: another person's, a missing one,
+    /// the caller's own one that is not `Active`, or an OAuth binding whose
+    /// token can no longer be refreshed (AEGIS ADR-136 G2, G2a, G2c). Maps
+    /// to HTTP `422 Unprocessable Entity` and the tool path's
+    /// `INVALID_ARGUMENTS`.
+    #[error("The credential named for this repository is not an active credential of yours.")]
+    CredentialNotYours,
+
     #[error("clone failed: {0}")]
     CloneFailed(String),
 
@@ -256,6 +267,35 @@ pub struct WebhookAuth {
 }
 
 // ============================================================================
+// OAuth access tokens (AEGIS ADR-136 G1b, G2d)
+// ============================================================================
+
+/// Answers an `OAuth2` credential binding's access token: the stored one
+/// while it is good for more than 60 seconds, otherwise a refreshed one (the
+/// credential service's `access_token_for`). The git path reads an OAuth
+/// binding's token only through this, never OpenBao field `value`.
+#[async_trait]
+pub trait OAuthAccessTokens: Send + Sync {
+    async fn access_token_for(
+        &self,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<SensitiveString>;
+}
+
+/// [`OAuthAccessTokens`] over the credential service the daemon builds.
+pub struct CredentialServiceTokens(pub Arc<dyn CredentialManagementService>);
+
+#[async_trait]
+impl OAuthAccessTokens for CredentialServiceTokens {
+    async fn access_token_for(
+        &self,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<SensitiveString> {
+        self.0.access_token_for(binding_id).await
+    }
+}
+
+// ============================================================================
 // Service
 // ============================================================================
 
@@ -266,6 +306,9 @@ pub struct GitRepoService {
     clone_executor: Arc<GitCloneExecutor>,
     secret_manager: Arc<SecretsManager>,
     credential_repo: Option<Arc<dyn CredentialBindingRepository>>,
+    /// Answers an `OAuth2` binding's access token. Absent, a git binding
+    /// naming an `OAuth2` credential is refused as not implemented.
+    access_tokens: Option<Arc<dyn OAuthAccessTokens>>,
     event_bus: Arc<EventBus>,
     /// Orchestrator identifier used in [`AccessContext`] audit rows.
     orchestrator_id: String,
@@ -285,6 +328,7 @@ impl GitRepoService {
             clone_executor,
             secret_manager,
             credential_repo: None,
+            access_tokens: None,
             event_bus,
             orchestrator_id: "git-repo-service".to_string(),
         }
@@ -296,6 +340,13 @@ impl GitRepoService {
     /// `credential_binding_id` will fail with `NotYetImplemented`.
     pub fn with_credential_repo(mut self, repo: Arc<dyn CredentialBindingRepository>) -> Self {
         self.credential_repo = Some(repo);
+        self
+    }
+
+    /// Inject the reader of `OAuth2` bindings' access tokens (AEGIS ADR-136
+    /// G2d).
+    pub fn with_access_tokens(mut self, tokens: Arc<dyn OAuthAccessTokens>) -> Self {
+        self.access_tokens = Some(tokens);
         self
     }
 
@@ -322,6 +373,13 @@ impl GitRepoService {
         // Read to validate its form.
         validate_repo_url(cmd.repo_url.expose()).map_err(GitRepoError::UrlValidationFailed)?;
         let ssh_host_keys = binding_host_keys(cmd.repo_url.expose(), &cmd.ssh_host_keys)?;
+
+        // Only the caller's own active credential, checked before anything
+        // is counted or provisioned (AEGIS ADR-136 G2, G2b).
+        if let Some(cred_id) = &cmd.credential_binding_id {
+            self.owned_active_credential(cred_id, &cmd.tenant_id, &cmd.owner)
+                .await?;
+        }
 
         let limits = GitRepoTierLimits::for_tier(cmd.zaru_tier.clone());
         if let Some(max) = limits.max_bindings {
@@ -442,7 +500,10 @@ impl GitRepoService {
             }
         };
 
-        let credential = match self.resolve_credential(&binding).await {
+        let credential = match self
+            .resolve_credential(&binding, volume_owner(&volume))
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 let msg = e.to_string();
@@ -550,7 +611,10 @@ impl GitRepoService {
             }
         };
 
-        let credential = match self.resolve_credential(binding).await {
+        let credential = match self
+            .resolve_credential(binding, volume_owner(&volume))
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 let msg = e.to_string();
@@ -704,6 +768,13 @@ impl GitRepoService {
     ) -> Result<String, GitRepoError> {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
         ensure_binding_ready(&binding)?;
+        // A commit reads no credential, but a binding naming one that is not
+        // the caller's active credential is refused here too (AEGIS ADR-136
+        // G2).
+        if let Some(cred_id) = &binding.credential_binding_id {
+            self.owned_active_credential(cred_id, &binding.tenant_id, owner)
+                .await?;
+        }
 
         let target_dir = self.resolve_workdir(&binding).await?;
 
@@ -756,7 +827,7 @@ impl GitRepoService {
         ensure_binding_ready(&binding)?;
 
         let target_dir = self.resolve_workdir(&binding).await?;
-        let credential = self.resolve_credential(&binding).await?;
+        let credential = self.resolve_credential(&binding, Some(owner)).await?;
 
         let remote_name = remote.unwrap_or("origin").to_string();
         let explicit_ref = ref_name.map(str::to_string);
@@ -945,16 +1016,16 @@ impl GitRepoService {
         self.drain_and_publish(binding);
     }
 
-    /// Resolve a [`ResolvedCredential`] from OpenBao if the binding has
-    /// a credential pinned. Returns `Ok(None)` for public repos.
-    async fn resolve_credential(
+    /// The credential binding `cred_id` when it is an active credential
+    /// binding of `owner` in `tenant_id`; otherwise
+    /// [`GitRepoError::CredentialNotYours`], whether it is another person's,
+    /// missing, or the owner's own inactive one (AEGIS ADR-136 G2, G2a).
+    async fn owned_active_credential(
         &self,
-        binding: &GitRepoBinding,
-    ) -> Result<Option<ResolvedCredential>, GitRepoError> {
-        let Some(cred_id) = binding.credential_binding_id else {
-            return Ok(None);
-        };
-
+        cred_id: &CredentialBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+    ) -> Result<UserCredentialBinding, GitRepoError> {
         let repo = self
             .credential_repo
             .as_ref()
@@ -963,36 +1034,58 @@ impl GitRepoService {
             ))?;
 
         let cb = repo
-            .find_by_id(&cred_id)
+            .find_by_id(cred_id)
             .await
-            .map_err(|e| GitRepoError::SecretResolutionFailed(e.to_string()))?
-            .ok_or_else(|| {
-                GitRepoError::SecretResolutionFailed(format!(
-                    "credential binding {cred_id} not found"
-                ))
-            })?;
-
-        // Tenant isolation — the credential must belong to the same
-        // tenant as the git repo binding.
-        if cb.tenant_id != binding.tenant_id {
-            return Err(GitRepoError::SecretResolutionFailed(
-                "credential binding tenant mismatch".into(),
-            ));
+            .map_err(|e| GitRepoError::SecretResolutionFailed(e.to_string()))?;
+        match cb {
+            Some(cb)
+                if &cb.tenant_id == tenant_id
+                    && cb.owner_user_id == owner
+                    && cb.status == CredentialStatus::Active =>
+            {
+                Ok(cb)
+            }
+            _ => {
+                warn!(
+                    credential_binding_id = %cred_id,
+                    "a git binding names a credential that is not an active credential of its owner; refused"
+                );
+                Err(GitRepoError::CredentialNotYours)
+            }
         }
+    }
 
-        if cb.status != CredentialStatus::Active {
-            return Err(GitRepoError::SecretResolutionFailed(format!(
-                "credential binding {cred_id} is not active (status={:?})",
-                cb.status
-            )));
-        }
+    /// Resolve a [`ResolvedCredential`] from OpenBao if the binding has
+    /// a credential pinned. Returns `Ok(None)` for public repos. `owner` is
+    /// the person the binding's volume belongs to; the credential must be
+    /// theirs, active, and of the binding's tenant (AEGIS ADR-136 G2).
+    async fn resolve_credential(
+        &self,
+        binding: &GitRepoBinding,
+        owner: Option<&str>,
+    ) -> Result<Option<ResolvedCredential>, GitRepoError> {
+        let Some(cred_id) = binding.credential_binding_id else {
+            return Ok(None);
+        };
+        let Some(owner) = owner else {
+            // A volume with no persistent owner has no person whose
+            // credential it could carry.
+            return Err(GitRepoError::CredentialNotYours);
+        };
+        let cb = self
+            .owned_active_credential(&cred_id, &binding.tenant_id, owner)
+            .await?;
 
         let ctx = AccessContext::system(&self.orchestrator_id);
         let engine = cb.secret_path.effective_mount();
 
         match cb.credential_type {
-            CredentialType::Secret | CredentialType::OAuth2 | CredentialType::ServiceAccount => {
-                // For PAT / OAuth / service-account credentials we read
+            // An OAuth binding's token comes from the credential service,
+            // refreshed as needed, never from field `value` (AEGIS ADR-136
+            // G1b, G2c, G2d).
+            CredentialType::OAuth2 => self.oauth_credential(&cb).await,
+            CredentialType::Secret | CredentialType::ServiceAccount => {
+                // For PAT / service-account credentials we read
                 // the canonical "value" field from the KV record. The
                 // optional "username" field lets callers override the
                 // default `x-access-token`.
@@ -1042,6 +1135,40 @@ impl GitRepoService {
             CredentialType::Mailbox => Err(GitRepoError::SecretResolutionFailed(
                 "mailbox credentials cannot be used for git authentication".into(),
             )),
+        }
+    }
+
+    /// An `OAuth2` binding's git credential: its access token as the HTTPS
+    /// password. A token that can no longer be refreshed (the binding is now
+    /// `Expired`) is refused at once (AEGIS ADR-136 G2c); a binding holding
+    /// no OAuth token at all is no credential (G1b).
+    async fn oauth_credential(
+        &self,
+        cb: &UserCredentialBinding,
+    ) -> Result<Option<ResolvedCredential>, GitRepoError> {
+        let tokens = self
+            .access_tokens
+            .as_ref()
+            .ok_or(GitRepoError::NotYetImplemented(
+                "an OAuth credential for git requires the credential service's access tokens",
+            ))?;
+        match tokens.access_token_for(&cb.id).await {
+            Ok(token) => Ok(Some(ResolvedCredential::HttpsPat {
+                username: default_username_for(cb),
+                token,
+            })),
+            Err(e) => match e.downcast_ref::<CredentialError>() {
+                Some(CredentialError::OAuthExchangeFailed { error, .. })
+                    if error == "invalid_grant" =>
+                {
+                    Err(GitRepoError::CredentialNotYours)
+                }
+                Some(CredentialError::BindingNotActive { .. }) => {
+                    Err(GitRepoError::CredentialNotYours)
+                }
+                Some(CredentialError::NoAccessToken { .. }) => Ok(None),
+                _ => Err(GitRepoError::SecretResolutionFailed(e.to_string())),
+            },
         }
     }
 
@@ -1140,6 +1267,14 @@ fn ct_slice_eq(a: &[u8], b: &[u8]) -> bool {
 // ============================================================================
 
 /// Resolve the on-disk clone target for a HostPath-backed volume.
+/// The person a binding's volume belongs to, when it is a persistent one.
+fn volume_owner(volume: &Volume) -> Option<&str> {
+    match &volume.ownership {
+        VolumeOwnership::Persistent { owner } => Some(owner.as_str()),
+        _ => None,
+    }
+}
+
 fn host_path_for_volume(volume: &Volume) -> Result<PathBuf, String> {
     match &volume.backend {
         VolumeBackend::HostPath { path } => Ok(path.clone()),
