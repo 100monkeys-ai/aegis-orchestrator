@@ -52,6 +52,7 @@ pub enum ToolCategory {
     Filesystem,
     Execution,
     WebNetwork,
+    Mail,
     ToolDiscovery,
     External,
 }
@@ -343,6 +344,9 @@ impl StandardToolCatalog {
         if name.starts_with("web.") {
             return ToolCategory::WebNetwork;
         }
+        if name.starts_with("mail.") {
+            return ToolCategory::Mail;
+        }
         ToolCategory::External
     }
 
@@ -360,6 +364,7 @@ impl StandardToolCatalog {
             "fs.glob",
             "web.search",
             "web.fetch",
+            "mail.read",
         ];
         if read_only_suffixes.iter().any(|s| name.ends_with(s)) || read_only_names.contains(&name) {
             tags.push("read-only".to_string());

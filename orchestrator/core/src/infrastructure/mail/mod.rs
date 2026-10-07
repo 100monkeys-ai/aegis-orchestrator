@@ -21,6 +21,10 @@
 //! [`RustlsMailConnector`] (rustls with the Mozilla roots of `webpki-roots`),
 //! and tests use a plaintext connector against loopback stand-ins.
 //!
+//! The mail tools' sessions (`EXAMINE`, `SELECT`, `UID SEARCH`, `UID
+//! FETCH`, `UID STORE`) are [`session`], opened the same way over the same
+//! connector.
+//!
 //! **What may be reached** is the production connector's [`guard`]: the
 //! mail ports only, and public unicast addresses only, each host resolved
 //! once and connected to at the addresses that were checked. Both endpoints
@@ -29,6 +33,7 @@
 
 pub mod guard;
 pub mod imap;
+pub mod session;
 pub mod smtp;
 pub mod tls;
 mod wire;

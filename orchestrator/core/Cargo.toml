@@ -83,6 +83,8 @@ infer = "0.16"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
+# Mail bodies and header words in charsets other than UTF-8 (the mail tools).
+encoding_rs = "0.8"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 opendal = "0.58"
 vaultrs = "0.7"

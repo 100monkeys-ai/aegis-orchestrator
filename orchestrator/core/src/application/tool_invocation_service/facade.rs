@@ -98,6 +98,7 @@ impl ToolInvocationService {
             seal_gateway_ca: None,
             tool_credentials: None,
             remote_tool_servers: Vec::new(),
+            mail_tools: None,
             schema_registry: Arc::new(SchemaRegistry::build()),
             workflow_execution_control: None,
             agent_activity: None,
@@ -197,6 +198,34 @@ impl ToolInvocationService {
         source: Arc<dyn crate::application::credential_service::ToolCredentialSource>,
     ) -> Self {
         self.tool_credentials = Some(source);
+        self
+    }
+
+    /// The mail tools, resolving the acting person's mailbox through
+    /// `mailboxes` and opening their sessions with the production connector
+    /// (TLS and the address guard; AEGIS ADR-125 D4).
+    pub fn with_mail_tools(
+        self,
+        mailboxes: Arc<dyn crate::application::credential_service::ToolMailboxSource>,
+    ) -> Self {
+        self.with_mail_tools_over(
+            mailboxes,
+            Arc::new(crate::infrastructure::mail::RustlsMailConnector::new()),
+        )
+    }
+
+    /// The mail tools over another connector (tests: a plaintext one to
+    /// loopback stand-ins).
+    pub fn with_mail_tools_over(
+        mut self,
+        mailboxes: Arc<dyn crate::application::credential_service::ToolMailboxSource>,
+        connector: Arc<dyn crate::infrastructure::mail::MailConnector>,
+    ) -> Self {
+        self.mail_tools = Some(Arc::new(
+            crate::application::tools::builtin_mail::MailTools::with_connector(
+                mailboxes, connector,
+            ),
+        ));
         self
     }
 
@@ -1304,6 +1333,25 @@ impl ToolInvocationService {
             return result;
         }
 
+        // A mail tool acts for the call's person, under its run's choice
+        // and grant (AEGIS ADR-125 D4, its Update of 2026-10-07 clause 7).
+        let mail_call = if crate::application::tools::builtin_mail::is_mail_tool(&tool_name) {
+            Some(crate::application::tools::MailCall {
+                tools: self.mail_tools.as_deref(),
+                acting: self
+                    .mail_acting(
+                        *agent_id,
+                        execution_id,
+                        tenant_id,
+                        caller_identity,
+                        call_contexts,
+                    )
+                    .await,
+            })
+        } else {
+            None
+        };
+
         // Try invoking built-in tools (ADR-033, ADR-040, ADR-048)
         match crate::application::tools::try_invoke_builtin(
             &tool_name,
@@ -1313,6 +1361,7 @@ impl ToolInvocationService {
             &self.volume_registry,
             &self.web_tool_port,
             &self.schema_registry,
+            mail_call,
         )
         .await
         {
@@ -1397,6 +1446,47 @@ impl ToolInvocationService {
                 self.publish_invocation_failed(invocation_id, execution_id, *agent_id, message);
                 Err(e)
             }
+        }
+    }
+
+    /// Who a mail tool's call acts for (AEGIS ADR-125's Update of
+    /// 2026-10-07 clause 7): the call's person, the calling agent and its
+    /// workflow, the choice for `imap` (the execution record's `contexts`
+    /// when the execution has a record, else the call's `_meta.contexts`),
+    /// and whether the execution has a record.
+    async fn mail_acting(
+        &self,
+        agent_id: AgentId,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &TenantId,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+    ) -> crate::application::tools::builtin_mail::MailActing {
+        let has_execution_record = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .is_ok();
+        // The same person, workflow and choices a remote server's call
+        // carries (AEGIS ADR-132 S7, Zaru ADR-0055 D15).
+        let acting = self
+            .gateway_acting(
+                agent_id,
+                execution_id,
+                tenant_id,
+                caller_identity,
+                call_contexts,
+            )
+            .await;
+        crate::application::tools::builtin_mail::MailActing {
+            tenant_id: tenant_id.clone(),
+            user_id: acting.user_id,
+            agent_id: acting.agent_id,
+            workflow_id: acting.workflow_id,
+            choice: acting
+                .contexts
+                .choice(crate::application::tools::builtin_mail::MailActing::choice_key()),
+            has_execution_record,
         }
     }
 

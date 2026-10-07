@@ -16,6 +16,27 @@ pub async fn check(
     settings: &MailboxSettings,
     password: &SensitiveString,
 ) -> Result<(), MailboxCheckFailure> {
+    let mut wire = open(connector, admitted, settings, password).await?;
+    wire.send(b"A2 SELECT INBOX\r\n").await?;
+    expect_ok(&mut wire, "A2").await?;
+    // The check has passed; a server that answers LOGOUT badly does not
+    // undo that.
+    if wire.send(b"A3 LOGOUT\r\n").await.is_ok() {
+        let _ = tagged(&mut wire, "A3").await;
+    }
+    Ok(())
+}
+
+/// Open an authenticated IMAP session: connect, read the greeting, upgrade
+/// by `STARTTLS` when the security is `starttls`, and `LOGIN` unless the
+/// server pre-authenticated. Shared by the check and the mail tools'
+/// sessions.
+pub(super) async fn open<'p>(
+    connector: &dyn MailConnector,
+    admitted: &AdmittedTarget,
+    settings: &MailboxSettings,
+    password: &'p SensitiveString,
+) -> Result<Wire<'p>, MailboxCheckFailure> {
     let host = settings.imap_host.as_str();
     let stream = connector.connect(admitted).await.map_err(|e| {
         failure(
@@ -55,20 +76,13 @@ pub async fn check(
     if !preauth {
         login(&mut wire, &settings.username, password).await?;
     }
-    wire.send(b"A2 SELECT INBOX\r\n").await?;
-    expect_ok(&mut wire, "A2").await?;
-    // The check has passed; a server that answers LOGOUT badly does not
-    // undo that.
-    if wire.send(b"A3 LOGOUT\r\n").await.is_ok() {
-        let _ = tagged(&mut wire, "A3").await;
-    }
-    Ok(())
+    Ok(wire)
 }
 
 /// `A1 LOGIN <user> <password>`, each argument a quoted string, or a
 /// literal sent after the server's `+` continuation when it holds a byte a
 /// quoted string cannot (CR, LF, NUL or an 8-bit byte).
-async fn login(
+pub(super) async fn login(
     wire: &mut Wire<'_>,
     username: &str,
     password: &SensitiveString,
@@ -109,7 +123,7 @@ fn quotable(s: &str) -> bool {
 }
 
 /// Read to the tagged response for `tag` and require `OK`.
-async fn expect_ok(wire: &mut Wire<'_>, tag: &str) -> Result<(), MailboxCheckFailure> {
+pub(super) async fn expect_ok(wire: &mut Wire<'_>, tag: &str) -> Result<(), MailboxCheckFailure> {
     let line = tagged(wire, tag).await?;
     let status = strip_tag(&line, tag);
     if status.len() >= 2 && status[..2].eq_ignore_ascii_case("OK") {
@@ -121,7 +135,7 @@ async fn expect_ok(wire: &mut Wire<'_>, tag: &str) -> Result<(), MailboxCheckFai
 
 /// Read lines until the one tagged `tag`, skipping untagged responses and
 /// any literal they carry. A `* BYE` before it is the server's refusal.
-async fn tagged(wire: &mut Wire<'_>, tag: &str) -> Result<String, MailboxCheckFailure> {
+pub(super) async fn tagged(wire: &mut Wire<'_>, tag: &str) -> Result<String, MailboxCheckFailure> {
     loop {
         let line = wire.line().await?;
         if line.starts_with(&format!("{tag} ")) {
@@ -136,12 +150,12 @@ async fn tagged(wire: &mut Wire<'_>, tag: &str) -> Result<String, MailboxCheckFa
     }
 }
 
-fn strip_tag<'l>(line: &'l str, tag: &str) -> &'l str {
+pub(super) fn strip_tag<'l>(line: &'l str, tag: &str) -> &'l str {
     line.strip_prefix(tag).map(str::trim_start).unwrap_or(line)
 }
 
 /// The size of a `{n}` literal announced at the end of `line`.
-fn trailing_literal(line: &str) -> Option<u64> {
+pub(super) fn trailing_literal(line: &str) -> Option<u64> {
     let body = line.strip_suffix('}')?;
     let open = body.rfind('{')?;
     body[open + 1..].trim_end_matches('+').parse().ok()

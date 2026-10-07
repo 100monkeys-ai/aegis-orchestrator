@@ -18,6 +18,8 @@ mod gateway;
 mod goal_tests;
 mod goals;
 #[cfg(test)]
+mod mail_tools_tests;
+#[cfg(test)]
 mod operator_escalation_tests;
 mod runtime;
 mod storage;
@@ -146,6 +148,10 @@ pub struct ToolInvocationService {
     /// tool named `<server>.<tool>` of one of them is called with
     /// `InvokeTool` and the acting user's credential (AEGIS ADR-132 H4).
     remote_tool_servers: Vec<String>,
+    /// The mail tools (AEGIS ADR-125 D4): the acting person's mailbox and
+    /// the connector their sessions open over. `None`: every mail tool is
+    /// answered as not configured.
+    mail_tools: Option<Arc<crate::application::tools::builtin_mail::MailTools>>,
     /// Schema registry for builtin schema.get / schema.validate tools.
     schema_registry: Arc<SchemaRegistry>,
     /// Optional port for workflow execution control (cancel, signal, remove).

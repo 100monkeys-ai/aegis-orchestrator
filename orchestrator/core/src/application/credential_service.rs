@@ -714,6 +714,33 @@ pub trait ToolCredentialSource: Send + Sync {
     ) -> anyhow::Result<Option<SensitiveString>>;
 }
 
+/// A mail tool's mailbox (AEGIS ADR-125 D4 and its Update of 2026-10-07
+/// clause 7): an SMTP-with-IMAP binding of the acting person, its settings
+/// and its password, and whether it is granted to the calling agent, its
+/// workflow or all the person's agents.
+pub struct ToolMailbox {
+    pub binding_id: CredentialBindingId,
+    pub settings: crate::domain::credential::MailboxSettings,
+    pub password: SensitiveString,
+    pub granted: bool,
+}
+
+/// Answers the mailbox a mail tool's `mailbox` argument names (AEGIS
+/// ADR-125 D4, its Update of 2026-10-07 clause 7).
+#[async_trait]
+pub trait ToolMailboxSource: Send + Sync {
+    /// `binding_id` when it is the acting person's own binding, in the
+    /// tenant, of type `mailbox` and provider `imap`, Active, with mailbox
+    /// settings; `Ok(None)` for anything else, another person's binding
+    /// included. Whether the call may use it (the choice and the grant) is
+    /// the mail tools' decision, from [`ToolMailbox::granted`].
+    async fn tool_mailbox(
+        &self,
+        actor: &ToolCallActor<'_>,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<Option<ToolMailbox>>;
+}
+
 /// Whether `binding` is granted to `actor`'s agent, its workflow, or all the
 /// owner's agents. `active_grants_for` answers nothing for a binding that is
 /// not active.
@@ -768,6 +795,49 @@ impl ToolCredentialSource for StandardCredentialManagementService {
             }
         };
         self.binding_secret(binding).await
+    }
+}
+
+#[async_trait]
+impl ToolMailboxSource for StandardCredentialManagementService {
+    async fn tool_mailbox(
+        &self,
+        actor: &ToolCallActor<'_>,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<Option<ToolMailbox>> {
+        let Some(binding) = self.repo.find_by_id(binding_id).await? else {
+            return Ok(None);
+        };
+        let settings = match &binding.metadata.mailbox {
+            Some(settings)
+                if binding.owner_user_id == actor.user_id
+                    && &binding.tenant_id == actor.tenant_id
+                    && binding.credential_type == CredentialType::Mailbox
+                    && binding.provider == CredentialProvider::imap()
+                    && binding.status == CredentialStatus::Active =>
+            {
+                settings.clone()
+            }
+            _ => return Ok(None),
+        };
+        let stored = self
+            .secrets
+            .read_secret(
+                &binding.secret_path.effective_mount(),
+                &binding.secret_path.path,
+                &AccessContext::system("aegis-credential-service"),
+            )
+            .await?;
+        let password = stored
+            .get("password")
+            .cloned()
+            .ok_or_else(|| anyhow!("mailbox binding {} holds no password field", binding.id))?;
+        Ok(Some(ToolMailbox {
+            binding_id: binding.id,
+            settings,
+            password,
+            granted: granted_to(&binding, actor),
+        }))
     }
 }
 

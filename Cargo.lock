@@ -94,6 +94,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "ed25519-dalek",
+ "encoding_rs",
  "fuser",
  "futures",
  "git2",

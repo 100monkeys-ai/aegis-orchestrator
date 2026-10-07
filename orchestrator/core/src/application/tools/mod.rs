@@ -1,6 +1,7 @@
 pub mod builtin_dispatch;
 pub mod builtin_execution_file;
 pub mod builtin_fsal;
+pub mod builtin_mail;
 pub mod builtin_schema;
 pub mod builtin_web;
 
@@ -19,6 +20,14 @@ pub enum BuiltinToolResult {
     NotBuiltin,
 }
 
+/// A mail tool's call: the node's mail tools, if configured, and who the
+/// call acts for (AEGIS ADR-125 D4, its Update of 2026-10-07 clause 7).
+pub struct MailCall<'a> {
+    pub tools: Option<&'a builtin_mail::MailTools>,
+    pub acting: builtin_mail::MailActing,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn try_invoke_builtin(
     tool_name: &str,
     args: &Value,
@@ -27,7 +36,20 @@ pub async fn try_invoke_builtin(
     volume_registry: &NfsVolumeRegistry,
     web_tool_port: &Arc<dyn ExternalWebToolPort>,
     schema_registry: &Arc<SchemaRegistry>,
+    mail: Option<MailCall<'_>>,
 ) -> Result<BuiltinToolResult, SealSessionError> {
+    if builtin_mail::is_mail_tool(tool_name) {
+        if let Some(call) = mail {
+            let Some(tools) = call.tools else {
+                return Err(builtin_mail::not_configured());
+            };
+            return tools
+                .invoke(tool_name, args, &call.acting)
+                .await
+                .map(|value| BuiltinToolResult::Handled(ToolInvocationResult::Direct(value)));
+        }
+    }
+
     if tool_name == "cmd.run" {
         return builtin_dispatch::invoke_cmd_run(args, execution_id)
             .map(BuiltinToolResult::Handled);

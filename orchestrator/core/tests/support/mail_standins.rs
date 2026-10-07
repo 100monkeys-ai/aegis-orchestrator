@@ -16,6 +16,15 @@
 //!
 //! Shared by `orchestrator/core/tests/mailbox_credential_tests.rs` and the
 //! cli route tests through `#[path]`.
+//!
+//! [`imap_mailbox_standin`] is a second IMAP stand-in holding an in-memory
+//! `INBOX`, for the mail tools (AEGIS ADR-125 D4): `EXAMINE`, `SELECT`,
+//! `UID SEARCH` (ALL, SEEN, UNSEEN, FLAGGED, TEXT, FROM, SINCE, HEADER, OR,
+//! UID, CHARSET), `UID FETCH` (UID, FLAGS, INTERNALDATE, `BODY[]`,
+//! `BODY.PEEK[]`, `BODY.PEEK[HEADER.FIELDS (...)]`; a `BODY[]` without
+//! `PEEK` sets `\Seen`, as a server does) and `UID STORE` (`+FLAGS`,
+//! `-FLAGS`; a keyword its `PERMANENTFLAGS` does not keep is dropped, as a
+//! server drops it). It records every command line, as the first does.
 
 #![allow(dead_code)]
 
@@ -330,4 +339,412 @@ pub fn smtp_submitted_a_message(commands: &[String]) -> bool {
         let u = c.to_ascii_uppercase();
         u.starts_with("MAIL FROM") || u.starts_with("RCPT TO") || u == "DATA"
     })
+}
+
+// ---------------------------------------------------------------------------
+// An IMAP stand-in with a mailbox
+// ---------------------------------------------------------------------------
+
+/// The `UIDVALIDITY` the mailbox stand-in reports.
+pub const UIDVALIDITY: u32 = 7;
+
+/// One message of the stand-in's `INBOX`.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub uid: u32,
+    pub flags: Vec<String>,
+    /// As IMAP writes it: `06-Oct-2026 14:02:11 +0000`.
+    pub internal_date: String,
+    /// The whole message, CRLF line endings.
+    pub raw: String,
+}
+
+impl StoredMessage {
+    /// A message from header lines and a body, joined with CRLF.
+    pub fn new(
+        uid: u32,
+        flags: &[&str],
+        internal_date: &str,
+        headers: &[&str],
+        body: &str,
+    ) -> Self {
+        let mut raw = headers.join("\r\n");
+        raw.push_str("\r\n\r\n");
+        raw.push_str(&body.replace("\r\n", "\n").replace('\n', "\r\n"));
+        Self {
+            uid,
+            flags: flags.iter().map(|f| f.to_string()).collect(),
+            internal_date: internal_date.to_string(),
+            raw,
+        }
+    }
+}
+
+/// A running mailbox stand-in: the stand-in and its messages.
+#[derive(Clone)]
+pub struct MailboxStandIn {
+    pub standin: StandIn,
+    pub messages: Arc<Mutex<Vec<StoredMessage>>>,
+}
+
+impl MailboxStandIn {
+    pub fn port(&self) -> u16 {
+        self.standin.port()
+    }
+    pub fn commands(&self) -> Vec<String> {
+        self.standin.commands()
+    }
+    pub fn connections(&self) -> usize {
+        self.standin.connections()
+    }
+    /// The flags message `uid` holds now.
+    pub fn flags_of(&self, uid: u32) -> Vec<String> {
+        self.messages
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.uid == uid)
+            .map(|m| m.flags.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The header fields of a raw message, folded lines joined.
+fn standin_headers(raw: &str) -> Vec<(String, String)> {
+    let head = raw.split("\r\n\r\n").next().unwrap_or("");
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in head.split("\r\n") {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some((_, v)) = out.last_mut() {
+                v.push(' ');
+                v.push_str(line.trim());
+            }
+        } else if let Some((n, v)) = line.split_once(':') {
+            out.push((n.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    out
+}
+
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    hay.to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+fn header_contains(m: &StoredMessage, name: &str, needle: &str) -> bool {
+    standin_headers(&m.raw)
+        .iter()
+        .any(|(n, v)| n.eq_ignore_ascii_case(name) && contains_ci(v, needle))
+}
+
+fn has_flag_ci(flags: &[String], flag: &str) -> bool {
+    flags.iter().any(|f| f.eq_ignore_ascii_case(flag))
+}
+
+/// `1-Oct-2026` or `06-Oct-2026 ...` as (year, month, day).
+fn imap_date(s: &str) -> Option<(i32, u32, u32)> {
+    let date = s.split_whitespace().next()?;
+    let mut parts = date.split('-');
+    let day: u32 = parts.next()?.trim().parse().ok()?;
+    let month = match parts.next()?.to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let year: i32 = parts.next()?.parse().ok()?;
+    Some((year, month, day))
+}
+
+fn uid_set(set: &str) -> Vec<u32> {
+    set.split(',')
+        .filter_map(|u| u.trim().parse().ok())
+        .collect()
+}
+
+/// One search key at `at` (and its arguments), for `m`.
+fn search_key(tokens: &[String], at: &mut usize, m: &StoredMessage) -> bool {
+    let Some(key) = tokens.get(*at).map(|k| k.to_ascii_uppercase()) else {
+        return true;
+    };
+    *at += 1;
+    let mut arg = || {
+        let a = tokens.get(*at).cloned().unwrap_or_default();
+        *at += 1;
+        a
+    };
+    match key.as_str() {
+        "ALL" => true,
+        "SEEN" => has_flag_ci(&m.flags, "\\Seen"),
+        "UNSEEN" => !has_flag_ci(&m.flags, "\\Seen"),
+        "FLAGGED" => has_flag_ci(&m.flags, "\\Flagged"),
+        "CHARSET" => {
+            arg();
+            true
+        }
+        "TEXT" => contains_ci(&m.raw, &arg()),
+        "FROM" => header_contains(m, "From", &arg()),
+        "SINCE" => {
+            let since = imap_date(&arg());
+            since.is_some() && imap_date(&m.internal_date) >= since
+        }
+        "HEADER" => {
+            let name = arg();
+            let needle = arg();
+            header_contains(m, &name, &needle)
+        }
+        "UID" => uid_set(&arg()).contains(&m.uid),
+        "OR" => {
+            let a = search_key(tokens, at, m);
+            let b = search_key(tokens, at, m);
+            a || b
+        }
+        _ => false,
+    }
+}
+
+/// The header block of `raw` holding only `fields`, as `HEADER.FIELDS`
+/// answers it.
+fn header_fields(raw: &str, fields: &[String]) -> String {
+    let mut out = String::new();
+    for (n, v) in standin_headers(raw) {
+        if fields.iter().any(|f| f.eq_ignore_ascii_case(&n)) {
+            out.push_str(&format!("{n}: {v}\r\n"));
+        }
+    }
+    out.push_str("\r\n");
+    out
+}
+
+/// An IMAP stand-in accepting `user`/`password`, holding `messages` in
+/// `INBOX` and reporting `PERMANENTFLAGS (<permanent_flags>)`.
+pub async fn imap_mailbox_standin(
+    user: &str,
+    password: &str,
+    messages: Vec<StoredMessage>,
+    permanent_flags: &str,
+) -> MailboxStandIn {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind imap");
+    let addr = listener.local_addr().unwrap();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(Mutex::new(messages));
+    let (seen, count, mailbox) = (commands.clone(), accepted.clone(), store.clone());
+    let (user, password, permanent) = (
+        user.to_string(),
+        password.to_string(),
+        permanent_flags.to_string(),
+    );
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (read, mut write) = socket.into_split();
+            let mut reader = BufReader::new(read);
+            let seen = seen.clone();
+            let mailbox = mailbox.clone();
+            let (user, password, permanent) = (user.clone(), password.clone(), permanent.clone());
+            tokio::spawn(async move {
+                let _ = write
+                    .write_all(b"* OK IMAP4rev1 mailbox stand-in ready\r\n")
+                    .await;
+                let mut logged_in = false;
+                while let Some(cmd) = read_imap_command(&mut reader, &mut write).await {
+                    seen.lock().unwrap().push(cmd.clone());
+                    let mut parts = cmd.splitn(3, ' ');
+                    let tag = parts.next().unwrap_or("*").to_string();
+                    let verb = parts.next().unwrap_or("").to_ascii_uppercase();
+                    let rest = parts.next().unwrap_or("").to_string();
+                    let mut reply: Vec<u8> = Vec::new();
+                    match verb.as_str() {
+                        "LOGIN" => {
+                            let args = imap_args(&rest);
+                            if args.len() == 2 && args[0] == user && args[1] == password {
+                                logged_in = true;
+                                reply.extend(format!("{tag} OK LOGIN completed\r\n").bytes());
+                            } else {
+                                reply.extend(format!("{tag} {IMAP_REFUSAL}\r\n").bytes());
+                            }
+                        }
+                        "LOGOUT" => {
+                            let _ = write
+                                .write_all(format!("* BYE logging out\r\n{tag} OK\r\n").as_bytes())
+                                .await;
+                            break;
+                        }
+                        _ if !logged_in => {
+                            reply.extend(format!("{tag} BAD not authenticated\r\n").bytes());
+                        }
+                        "SELECT" | "EXAMINE" => {
+                            let n = mailbox.lock().unwrap().len();
+                            let mode = if verb == "SELECT" {
+                                "READ-WRITE"
+                            } else {
+                                "READ-ONLY"
+                            };
+                            reply.extend(
+                                format!(
+                                    "* {n} EXISTS\r\n* OK [UIDVALIDITY {UIDVALIDITY}] UIDs valid\r\n* OK [PERMANENTFLAGS ({permanent})] flags kept\r\n{tag} OK [{mode}] {verb} completed\r\n"
+                                )
+                                .bytes(),
+                            );
+                        }
+                        "UID" => {
+                            let (sub, args) = rest.split_once(' ').unwrap_or((rest.as_str(), ""));
+                            match sub.to_ascii_uppercase().as_str() {
+                                "SEARCH" => {
+                                    let tokens = imap_args(args);
+                                    let messages = mailbox.lock().unwrap().clone();
+                                    let mut found = Vec::new();
+                                    for m in &messages {
+                                        let mut at = 0;
+                                        let mut all = true;
+                                        while at < tokens.len() {
+                                            all &= search_key(&tokens, &mut at, m);
+                                        }
+                                        if all {
+                                            found.push(m.uid.to_string());
+                                        }
+                                    }
+                                    reply.extend(
+                                        format!(
+                                            "* SEARCH {}\r\n{tag} OK SEARCH completed\r\n",
+                                            found.join(" ")
+                                        )
+                                        .bytes(),
+                                    );
+                                }
+                                "FETCH" => {
+                                    let (set, items) = args.split_once(' ').unwrap_or((args, ""));
+                                    let wanted = uid_set(set);
+                                    let upper = items.to_ascii_uppercase();
+                                    let mut messages = mailbox.lock().unwrap();
+                                    for (i, m) in messages.iter_mut().enumerate() {
+                                        if !wanted.contains(&m.uid) {
+                                            continue;
+                                        }
+                                        let whole_unpeeked = upper.contains("BODY[]")
+                                            && !upper.contains("BODY.PEEK[]");
+                                        if whole_unpeeked && !has_flag_ci(&m.flags, "\\Seen") {
+                                            m.flags.push("\\Seen".to_string());
+                                        }
+                                        reply.extend(
+                                            format!("* {} FETCH (UID {}", i + 1, m.uid).bytes(),
+                                        );
+                                        if upper.contains("FLAGS") {
+                                            reply.extend(
+                                                format!(" FLAGS ({})", m.flags.join(" ")).bytes(),
+                                            );
+                                        }
+                                        if upper.contains("INTERNALDATE") {
+                                            reply.extend(
+                                                format!(" INTERNALDATE \"{}\"", m.internal_date)
+                                                    .bytes(),
+                                            );
+                                        }
+                                        if upper.contains("BODY.PEEK[]") || whole_unpeeked {
+                                            reply.extend(
+                                                format!(" BODY[] {{{}}}\r\n", m.raw.len()).bytes(),
+                                            );
+                                            reply.extend(m.raw.bytes());
+                                        }
+                                        if let Some(at) = upper.find("HEADER.FIELDS (") {
+                                            let from = at + "HEADER.FIELDS (".len();
+                                            let to = upper[from..]
+                                                .find(')')
+                                                .map(|t| from + t)
+                                                .unwrap_or(upper.len());
+                                            let fields: Vec<String> = items[from..to]
+                                                .split_whitespace()
+                                                .map(str::to_string)
+                                                .collect();
+                                            let block = header_fields(&m.raw, &fields);
+                                            reply.extend(
+                                                format!(
+                                                    " BODY[HEADER.FIELDS ({})] {{{}}}\r\n",
+                                                    fields.join(" "),
+                                                    block.len()
+                                                )
+                                                .bytes(),
+                                            );
+                                            reply.extend(block.bytes());
+                                        }
+                                        reply.extend(b")\r\n");
+                                    }
+                                    reply.extend(format!("{tag} OK FETCH completed\r\n").bytes());
+                                }
+                                "STORE" => {
+                                    let mut words = args.splitn(3, ' ');
+                                    let set = uid_set(words.next().unwrap_or(""));
+                                    let op = words.next().unwrap_or("").to_ascii_uppercase();
+                                    let list = words.next().unwrap_or("");
+                                    let flags: Vec<String> = list
+                                        .trim()
+                                        .trim_start_matches('(')
+                                        .trim_end_matches(')')
+                                        .split_whitespace()
+                                        .map(str::to_string)
+                                        .collect();
+                                    let keeps_any =
+                                        permanent.split_whitespace().any(|f| f == "\\*");
+                                    let mut messages = mailbox.lock().unwrap();
+                                    for (i, m) in messages.iter_mut().enumerate() {
+                                        if !set.contains(&m.uid) {
+                                            continue;
+                                        }
+                                        for f in &flags {
+                                            let kept = f.starts_with('\\')
+                                                || keeps_any
+                                                || permanent
+                                                    .split_whitespace()
+                                                    .any(|p| p.eq_ignore_ascii_case(f));
+                                            if op.starts_with('+') {
+                                                if kept && !has_flag_ci(&m.flags, f) {
+                                                    m.flags.push(f.clone());
+                                                }
+                                            } else if op.starts_with('-') {
+                                                m.flags.retain(|x| !x.eq_ignore_ascii_case(f));
+                                            }
+                                        }
+                                        reply.extend(
+                                            format!(
+                                                "* {} FETCH (UID {} FLAGS ({}))\r\n",
+                                                i + 1,
+                                                m.uid,
+                                                m.flags.join(" ")
+                                            )
+                                            .bytes(),
+                                        );
+                                    }
+                                    reply.extend(format!("{tag} OK STORE completed\r\n").bytes());
+                                }
+                                _ => reply
+                                    .extend(format!("{tag} BAD unknown UID command\r\n").bytes()),
+                            }
+                        }
+                        _ => reply.extend(format!("{tag} BAD unknown command\r\n").bytes()),
+                    }
+                    if write.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    MailboxStandIn {
+        standin: StandIn {
+            addr,
+            commands,
+            accepted,
+        },
+        messages: store,
+    }
 }

@@ -139,6 +139,9 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("fs.glob", "Recursively matches files against a glob pattern.").skip_judge(),
     BuiltinToolDefinition::new("web.search", "Performs an internet search query.").skip_judge(),
     BuiltinToolDefinition::new("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown. Returns at most 50,000 characters of the page per call: a longer page comes back cut, with truncated, total_chars, next_offset and a notice, and the offset argument reads on.").skip_judge(),
+    BuiltinToolDefinition::new("mail.list", "Lists threads in a connected mailbox's inbox that match a query, newest first: each thread's id, subject, participants, latest date, message count, unread count, flag and labels. Marks nothing as read.").skip_judge(),
+    BuiltinToolDefinition::new("mail.read", "Reads one thread of a connected mailbox: every message's headers, flags, labels and plain-text body, oldest first. Marks nothing as read.").skip_judge(),
+    BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox, and flags or unflags it."),
     BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
@@ -325,6 +328,9 @@ impl ToolRouter {
             "fs.glob" => Self::schema_fs_glob(),
             "web.search" => Self::schema_web_search(),
             "web.fetch" => Self::schema_web_fetch(),
+            "mail.list" => Self::schema_mail_list(),
+            "mail.read" => Self::schema_mail_read(),
+            "mail.label" => Self::schema_mail_label(),
             "aegis.schema.get" => Self::schema_aegis_schema_get(),
             "aegis.schema.validate" => Self::schema_aegis_schema_validate(),
             "aegis.agent.create" => Self::schema_aegis_agent_create(),
@@ -603,6 +609,96 @@ impl ToolRouter {
                 }
             },
             "required": ["url"]
+        })
+    }
+
+    /// JSON schema for the `mail.list` builtin tool.
+    fn schema_mail_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mailbox": {
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Words a message's headers or body contain."
+                },
+                "from": {
+                    "type": "string",
+                    "description": "Part of the sender's name or address."
+                },
+                "unread_only": {
+                    "type": "boolean",
+                    "description": "Only threads with an unread message matching (default false)."
+                },
+                "flagged_only": {
+                    "type": "boolean",
+                    "description": "Only flagged messages (default false)."
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Only messages received on or after this date, written YYYY-MM-DD."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "The most threads to answer (default 20). The 200 newest matching messages are grouped into threads; truncated says when there were more."
+                }
+            },
+            "required": ["mailbox"]
+        })
+    }
+
+    /// JSON schema for the `mail.read` builtin tool.
+    fn schema_mail_read() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mailbox": {
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "A thread id mail.list answered."
+                }
+            },
+            "required": ["mailbox", "thread_id"]
+        })
+    }
+
+    /// JSON schema for the `mail.label` builtin tool.
+    fn schema_mail_label() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mailbox": {
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "A thread id mail.list answered."
+                },
+                "add": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Labels to add to every message of the thread, such as zaru/triaged: up to 64 characters, no spaces."
+                },
+                "remove": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Labels to remove from every message of the thread."
+                },
+                "flagged": {
+                    "type": "boolean",
+                    "description": "true flags every message of the thread, false unflags it; leave it out to keep the flag as it is."
+                }
+            },
+            "required": ["mailbox", "thread_id"]
         })
     }
 
@@ -2091,6 +2187,8 @@ mod tests {
         "fs.glob",
         "web.search",
         "web.fetch",
+        "mail.list",
+        "mail.read",
         "aegis.schema.get",
         "aegis.schema.validate",
         "aegis.agent.create",

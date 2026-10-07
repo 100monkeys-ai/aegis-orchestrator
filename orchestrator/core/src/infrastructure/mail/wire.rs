@@ -84,6 +84,28 @@ impl<'a> Wire<'a> {
         Ok(())
     }
 
+    /// Read the `n` bytes of an IMAP literal the server sent, refusing one
+    /// larger than `max`.
+    pub(super) async fn literal(
+        &mut self,
+        n: u64,
+        max: u64,
+    ) -> Result<Vec<u8>, MailboxCheckFailure> {
+        if n > max {
+            return Err(self.fail(format!("the server sent a literal larger than {max} bytes")));
+        }
+        let mut buf = Vec::with_capacity(n as usize);
+        let read = (&mut self.reader)
+            .take(n)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| self.fail(format!("read failed: {e}")))?;
+        if read as u64 != n {
+            return Err(self.fail("the server closed the connection"));
+        }
+        Ok(buf)
+    }
+
     /// The stream back, for a STARTTLS upgrade. Refused when the server sent
     /// bytes after accepting STARTTLS and before the handshake, which would
     /// otherwise be read as if they had come over TLS (response injection).
