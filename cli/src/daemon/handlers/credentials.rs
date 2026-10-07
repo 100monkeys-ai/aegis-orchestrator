@@ -2546,6 +2546,7 @@ mod reach_route_tests {
         CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialProvider,
         GrantTarget, OAuthPendingState, UserCredentialBinding,
     };
+    use aegis_orchestrator_core::domain::node_config::RemoteServer;
     use aegis_orchestrator_core::domain::secrets::SensitiveString;
     use aegis_orchestrator_core::domain::tenant::TenantId;
     use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
@@ -2634,6 +2635,7 @@ mod reach_route_tests {
             _tenant_id: &TenantId,
             _user_id: &str,
             _server: &str,
+            _tool: &str,
             token: &SensitiveString,
         ) -> Result<Value, GroundingRefusal> {
             self.tokens.lock().unwrap().push(token.expose().to_string());
@@ -2673,7 +2675,10 @@ mod reach_route_tests {
         });
         let weak: Weak<Grounding> = Arc::downgrade(&grounding);
         let weak: Weak<dyn RemoteServerGrounding> = weak;
-        assert!(service.set_remote_grounding(weak, vec![SERVER.to_string()]));
+        assert!(service.set_remote_grounding(
+            weak,
+            vec![RemoteServer::grounded_with(SERVER, "cortex.ground")]
+        ));
         let service = Arc::new(service) as Arc<dyn CredentialManagementService>;
         let store_service = service.clone();
         let router = credentials_by_id_router(CredentialsByIdState {

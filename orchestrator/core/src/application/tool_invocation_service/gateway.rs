@@ -1470,8 +1470,10 @@ spec:
 }
 
 impl ToolInvocationService {
-    /// `cortex.ground` on the remote server `server` with `token`, a token a
-    /// person is storing, rotating or introspecting (AEGIS ADR-132 (7a) S2):
+    /// The grounding tool `tool` (`cortex.ground`, `get_me`, as
+    /// `seal_gateway.remote_servers` names it, AEGIS ADR-136 G14) on the
+    /// remote server `server` with `token`, a token a person is storing,
+    /// rotating or introspecting (AEGIS ADR-132 (7a) S2):
     /// the gateway's `InvokeTool` with arguments `{}`, the token as the
     /// call's credential and the binding's owner as the acting identity. The
     /// orchestrator makes no connection of its own to the server (H2). The
@@ -1489,9 +1491,10 @@ impl ToolInvocationService {
         tenant_id: &TenantId,
         user_id: &str,
         server: &str,
+        tool: &str,
         token: &SensitiveString,
     ) -> Result<serde_json::Value, GroundingRefusal> {
-        let tool_name = format!("{server}.cortex.ground");
+        let tool_name = format!("{server}.{tool}");
         let unreachable = |code: &str, detail: String| GroundingRefusal::Unreachable {
             code: code.to_string(),
             detail,
@@ -1521,7 +1524,7 @@ impl ToolInvocationService {
                 workflow_id: String::new(),
             }),
             server: server.to_string(),
-            tool: "cortex.ground".to_string(),
+            tool: tool.to_string(),
             arguments_json: "{}".to_string(),
             credential: Some(ResolvedCredential {
                 kind: CredentialKind::BearerToken as i32,
@@ -1601,9 +1604,10 @@ impl RemoteServerGrounding for ToolInvocationService {
         tenant_id: &TenantId,
         user_id: &str,
         server: &str,
+        tool: &str,
         token: &SensitiveString,
     ) -> Result<serde_json::Value, GroundingRefusal> {
-        self.ground_remote_token(tenant_id, user_id, server, token)
+        self.ground_remote_token(tenant_id, user_id, server, tool, token)
             .await
     }
 }

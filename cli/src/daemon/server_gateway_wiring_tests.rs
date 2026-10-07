@@ -592,3 +592,203 @@ async fn a_seal_gateway_the_daemon_cannot_use_stops_it_with_the_reason() {
         assert!(text.contains(reason), "{reason}: {text}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The daemon grounds each remote server with its own tool (AEGIS ADR-136
+// G14, G14a to G14c)
+// ---------------------------------------------------------------------------
+
+mod remote_grounding {
+    use super::super::daemon_remote_grounding;
+    use aegis_orchestrator_core::application::credential_service::{
+        CredentialManagementService, GroundingRefusal, OAuthProviderRegistry,
+        RemoteServerGrounding, StandardCredentialManagementService, StoreApiKeyCommand,
+    };
+    use aegis_orchestrator_core::domain::credential::{
+        CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialProvider,
+        CredentialScope, CredentialType, GrantTarget, OAuthPendingState, UserCredentialBinding,
+    };
+    use aegis_orchestrator_core::domain::node_config::SealGatewayConfig;
+    use aegis_orchestrator_core::domain::secrets::SensitiveString;
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::secrets_manager::{
+        SecretsManager, TestSecretStore,
+    };
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, Weak};
+    use tokio::sync::RwLock;
+
+    const OWNER: &str = "daemon-grounding-owner";
+
+    #[derive(Default)]
+    struct Bindings(RwLock<HashMap<CredentialBindingId, UserCredentialBinding>>);
+
+    #[async_trait]
+    impl CredentialBindingRepository for Bindings {
+        async fn save(&self, binding: &UserCredentialBinding) -> anyhow::Result<()> {
+            self.0.write().await.insert(binding.id, binding.clone());
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            id: &CredentialBindingId,
+        ) -> anyhow::Result<Option<UserCredentialBinding>> {
+            Ok(self.0.read().await.get(id).cloned())
+        }
+        async fn find_by_owner(
+            &self,
+            _: &TenantId,
+            _: &str,
+        ) -> anyhow::Result<Vec<UserCredentialBinding>> {
+            Ok(self.0.read().await.values().cloned().collect())
+        }
+        async fn find_active_grants_for_target(
+            &self,
+            _: &TenantId,
+            _: &str,
+            _: &CredentialProvider,
+            _: &GrantTarget,
+        ) -> anyhow::Result<Vec<CredentialGrant>> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, id: &CredentialBindingId) -> anyhow::Result<()> {
+            self.0.write().await.remove(id);
+            Ok(())
+        }
+        async fn save_oauth_state(
+            &self,
+            _: &str,
+            _: &CredentialBindingId,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_oauth_state(&self, _: &str) -> anyhow::Result<Option<OAuthPendingState>> {
+            Ok(None)
+        }
+        async fn delete_oauth_state(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_expired_oauth_states(&self, _: DateTime<Utc>) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Records the (server, tool) of each grounding and answers an instance
+    /// payload.
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<(String, String)>>);
+
+    #[async_trait]
+    impl RemoteServerGrounding for Recorded {
+        async fn ground_token(
+            &self,
+            _: &TenantId,
+            _: &str,
+            server: &str,
+            tool: &str,
+            _: &SensitiveString,
+        ) -> Result<Value, GroundingRefusal> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((server.to_string(), tool.to_string()));
+            Ok(json!({"you": {"instances": [{"id": "inst-id", "slug": "play2"}]}}))
+        }
+    }
+
+    fn config(entries: &str) -> SealGatewayConfig {
+        serde_yaml::from_str(&format!(
+            "url: https://aegis-seal-gateway:50055\nremote_servers:\n{entries}"
+        ))
+        .expect("the configuration parses")
+    }
+
+    fn service(bindings: Arc<Bindings>) -> StandardCredentialManagementService {
+        let event_bus = Arc::new(EventBus::new(64));
+        let secrets = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            event_bus.clone(),
+        ));
+        StandardCredentialManagementService::new(
+            bindings,
+            secrets,
+            event_bus,
+            Arc::new(OAuthProviderRegistry::new()),
+        )
+    }
+
+    fn store(provider: &str) -> StoreApiKeyCommand {
+        StoreApiKeyCommand {
+            owner_user_id: OWNER.to_string(),
+            tenant_id: TenantId::for_consumer_user(OWNER).unwrap(),
+            provider: CredentialProvider::new(provider),
+            label: "Work".to_string(),
+            scope: CredentialScope::Personal,
+            api_key_value: SensitiveString::new("daemon-grounding-token"),
+            credential_type: CredentialType::Secret,
+        }
+    }
+
+    /// G14, G14c: the daemon hands the credential service each remote
+    /// server with its own grounding tool: `nuclear-notes`, named with
+    /// `grounding_tool: cortex.ground`, is grounded with it; `github`,
+    /// named bare, is never called and its binding is stored with no reach.
+    #[tokio::test]
+    async fn the_daemon_grounds_each_remote_server_with_its_own_tool() {
+        let bindings = Arc::new(Bindings::default());
+        let credentials = service(bindings.clone());
+        let recorded = Arc::new(Recorded::default());
+        let weak: Weak<Recorded> = Arc::downgrade(&recorded);
+        let weak: Weak<dyn RemoteServerGrounding> = weak;
+        daemon_remote_grounding(
+            &credentials,
+            &config("  - name: nuclear-notes\n    grounding_tool: cortex.ground\n  - github\n"),
+            weak,
+        )
+        .expect("the daemon starts");
+
+        let notes = credentials.store_api_key(store("nuclear-notes")).await;
+        let github = credentials.store_api_key(store("github")).await;
+        let asked = recorded.0.lock().unwrap().clone();
+        println!("grounding calls {asked:?}");
+        assert_eq!(
+            asked,
+            vec![("nuclear-notes".to_string(), "cortex.ground".to_string())],
+            "the daemon did not ground each server with its own tool"
+        );
+        let notes = notes.expect("stored");
+        let github = github.expect("stored");
+        let rows = bindings.0.read().await;
+        assert!(rows[&notes].metadata.reach.is_some());
+        assert_eq!(rows[&github].metadata.reach, None);
+    }
+
+    /// G14a: a grounding tool the rule refuses stops the daemon with the
+    /// reason.
+    #[tokio::test]
+    async fn a_grounding_tool_the_rule_refuses_stops_the_daemon() {
+        let credentials = service(Arc::new(Bindings::default()));
+        let recorded = Arc::new(Recorded::default());
+        let weak: Weak<Recorded> = Arc::downgrade(&recorded);
+        let weak: Weak<dyn RemoteServerGrounding> = weak;
+        let error = daemon_remote_grounding(
+            &credentials,
+            &config("  - name: github\n    grounding_tool: get me\n"),
+            weak,
+        )
+        .expect_err("the daemon does not start");
+        let text = format!("{error:#}");
+        println!("refusal {text}");
+        assert!(
+            text.contains("seal_gateway configuration")
+                && text.contains("names the grounding tool 'get me'"),
+            "{text}"
+        );
+    }
+}

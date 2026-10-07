@@ -117,6 +117,7 @@ async fn migration_042_keeps_existing_rows_and_stores_a_bindings_reach() {
         instance_slug: Some("play2".to_string()),
         instance_id: Some("inst-play2-id".to_string()),
         workspace_id: None,
+        login: None,
         grounded_at: now.trunc_subsecs(6),
     };
     let binding = UserCredentialBinding {
@@ -155,6 +156,7 @@ async fn migration_042_keeps_existing_rows_and_stores_a_bindings_reach() {
         instance_slug: None,
         instance_id: None,
         workspace_id: None,
+        login: None,
         grounded_at: now.trunc_subsecs(6),
     });
     repo.save(&apex).await.expect("rewrite");

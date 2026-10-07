@@ -294,9 +294,10 @@ pub struct CredentialMetadata {
     pub reach: Option<BindingReach>,
 }
 
-/// Whether a remote server's token reaches one instance or several (AEGIS
-/// ADR-132 (7a) S2): read from the instances its grounding reports the
-/// token reaching.
+/// What kind of reach a remote server's grounding reports for a token:
+/// one instance or several (AEGIS ADR-132 (7a) S2, read from the instances
+/// a `cortex.ground` reports), or the account the token belongs to (AEGIS
+/// ADR-136 G14b, read from the `login` any other grounding tool reports).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReachKind {
@@ -304,6 +305,8 @@ pub enum ReachKind {
     Apex,
     /// The grounding reports exactly one instance.
     Instance,
+    /// The grounding reports the account the token belongs to, by `login`.
+    Account,
 }
 
 /// What a binding's token reaches, as the remote server's grounding of it
@@ -321,6 +324,9 @@ pub struct BindingReach {
     /// never written today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// The account's login for `account`; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
     /// When the server grounded the token.
     pub grounded_at: DateTime<Utc>,
 }

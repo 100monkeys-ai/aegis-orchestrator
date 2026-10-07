@@ -31,7 +31,7 @@ use crate::domain::credential::{
     GrantTarget, MailboxSettings, OAuthPendingState, ReachKind, UserCredentialBinding,
 };
 use crate::domain::events::CredentialEvent;
-use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry};
+use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry, RemoteServer};
 use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, SensitiveUrl};
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
@@ -367,9 +367,15 @@ pub enum CredentialError {
         server: String,
         code: String,
     },
-    /// The grounding answered without `you.instances`.
-    #[error("{prefix}: the grounding '{server}' answered did not say which instances the token reaches.", prefix = .stage.prefix())]
-    ReachNotReported { stage: ReachStage, server: String },
+    /// The grounding answered without what its tool's reader reads:
+    /// `you.instances` for `cortex.ground`, the top-level `login` for any
+    /// other grounding tool (AEGIS ADR-136 G14b). `missing` says which.
+    #[error("{prefix}: the grounding '{server}' answered did not say {missing}.", prefix = .stage.prefix(), missing = .missing.sentence())]
+    ReachNotReported {
+        stage: ReachStage,
+        server: String,
+        missing: ReachSubject,
+    },
     /// The grounding answered an empty `you.instances`.
     #[error("{prefix}: the grounding '{server}' answered says the token reaches no instance.", prefix = .stage.prefix())]
     ReachesNoInstance { stage: ReachStage, server: String },
@@ -380,6 +386,25 @@ pub enum CredentialError {
         binding_id: String,
         provider: String,
     },
+}
+
+/// What a grounding answered without (AEGIS ADR-136 G14b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachSubject {
+    /// `cortex.ground`'s `you.instances`.
+    Instances,
+    /// Any other grounding tool's `login`.
+    Account,
+}
+
+impl ReachSubject {
+    /// The end of the refusal sentence.
+    pub fn sentence(&self) -> &'static str {
+        match self {
+            Self::Instances => "which instances the token reaches",
+            Self::Account => "which account the token belongs to",
+        }
+    }
 }
 
 /// Which act a remote server's grounding of a token serves: a store (or a
@@ -801,7 +826,8 @@ pub struct ContextBinding {
 
 impl ContextBinding {
     /// What the binding reaches, as a `_context` description says it
-    /// (S11j): the instance's slug, "every instance", or "unknown".
+    /// (S11j): the instance's slug, "every instance", the account's login
+    /// (AEGIS ADR-136 G14b), or "unknown".
     pub fn reach_text(&self) -> String {
         match &self.reach {
             Some(reach) => match reach.kind {
@@ -810,6 +836,9 @@ impl ContextBinding {
                     .instance_slug
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
+                crate::domain::credential::ReachKind::Account => {
+                    reach.login.clone().unwrap_or_else(|| "unknown".to_string())
+                }
             },
             None => "unknown".to_string(),
         }
@@ -1157,19 +1186,22 @@ pub enum GroundingRefusal {
     Unreachable { code: String, detail: String },
 }
 
-/// Grounds a token at a remote tool server: `cortex.ground` through the
-/// SEAL gateway's `InvokeTool`, the token as the call's credential and the
-/// binding's owner as the acting identity (AEGIS ADR-132 (7a) S2; H2: the
-/// orchestrator makes no connection of its own to a remote server).
+/// Grounds a token at a remote tool server: the server's grounding tool
+/// (`cortex.ground`, `get_me`, as `seal_gateway.remote_servers` names it)
+/// through the SEAL gateway's `InvokeTool`, the token as the call's
+/// credential and the binding's owner as the acting identity (AEGIS ADR-132
+/// (7a) S2, ADR-136 G14; H2: the orchestrator makes no connection of its
+/// own to a remote server).
 #[async_trait]
 pub trait RemoteServerGrounding: Send + Sync {
-    /// The grounding payload `server` answers for `token`, acting for
-    /// `user_id` in `tenant_id`.
+    /// The grounding payload `server`'s tool `tool` answers for `token`,
+    /// acting for `user_id` in `tenant_id`.
     async fn ground_token(
         &self,
         tenant_id: &TenantId,
         user_id: &str,
         server: &str,
+        tool: &str,
         token: &SensitiveString,
     ) -> Result<serde_json::Value, GroundingRefusal>;
 }
@@ -1181,6 +1213,50 @@ pub enum ReachReading {
     NotReported,
     /// `you.instances` is empty.
     NoInstance,
+    /// No top-level `login` that is a non-empty string.
+    NoLogin,
+}
+
+/// The grounding tool whose payload reports instances (AEGIS ADR-132 (7a)
+/// S2); every other grounding tool reports an account (ADR-136 G14b).
+pub const INSTANCE_GROUNDING_TOOL: &str = "cortex.ground";
+
+/// The reach a grounding payload of the tool `tool` reports, the reader
+/// chosen by the tool, never by the server (AEGIS ADR-136 G14b):
+/// `cortex.ground`'s by [`reach_from_grounding`]; any other tool's by
+/// [`account_reach_from_grounding`].
+pub fn reach_from_tool(
+    tool: &str,
+    payload: &serde_json::Value,
+    grounded_at: chrono::DateTime<Utc>,
+) -> Result<BindingReach, ReachReading> {
+    if tool == INSTANCE_GROUNDING_TOOL {
+        reach_from_grounding(payload, grounded_at)
+    } else {
+        account_reach_from_grounding(payload, grounded_at)
+    }
+}
+
+/// The account reach a grounding payload reports (AEGIS ADR-136 G14b): its
+/// top-level `login`, a non-empty string, as `{kind: account, login,
+/// grounded_at}`.
+pub fn account_reach_from_grounding(
+    payload: &serde_json::Value,
+    grounded_at: chrono::DateTime<Utc>,
+) -> Result<BindingReach, ReachReading> {
+    let login = payload
+        .get("login")
+        .and_then(serde_json::Value::as_str)
+        .filter(|login| !login.is_empty())
+        .ok_or(ReachReading::NoLogin)?;
+    Ok(BindingReach {
+        kind: ReachKind::Account,
+        instance_slug: None,
+        instance_id: None,
+        workspace_id: None,
+        login: Some(login.to_string()),
+        grounded_at,
+    })
 }
 
 /// The reach a grounding payload reports (AEGIS ADR-132 (7a) S2, the
@@ -1216,6 +1292,7 @@ pub fn reach_from_grounding(
             instance_slug: Some(slug.clone()),
             instance_id: Some(id.clone()),
             workspace_id: None,
+            login: None,
             grounded_at,
         }),
         _ => Ok(BindingReach {
@@ -1223,6 +1300,7 @@ pub fn reach_from_grounding(
             instance_slug: None,
             instance_id: None,
             workspace_id: None,
+            login: None,
             grounded_at,
         }),
     }
@@ -1233,7 +1311,7 @@ pub fn reach_from_grounding(
 /// built (the two are built in that order and each refers to the other).
 struct RemoteGroundingHandle {
     grounding: std::sync::Weak<dyn RemoteServerGrounding>,
-    servers: Vec<String>,
+    servers: Vec<RemoteServer>,
 }
 
 // ============================================================================
@@ -1365,15 +1443,17 @@ impl StandardCredentialManagementService {
     }
 
     /// Hand the service the grounding of remote servers' tokens and the
-    /// names of the remote servers (`seal_gateway.remote_servers`): a
-    /// binding whose provider is one of them is grounded when it is stored,
-    /// rotated or introspected (AEGIS ADR-132 (7a) S2). Set once; a second
-    /// call changes nothing and answers `false`. The handle is weak: the
-    /// tool invocation service that implements it holds this service.
+    /// remote servers (`seal_gateway.remote_servers`), each with its
+    /// grounding tool: a binding whose provider is one with a grounding
+    /// tool is grounded with that tool when it is stored, rotated or
+    /// introspected (AEGIS ADR-132 (7a) S2, ADR-136 G14); one whose server
+    /// has none is never grounded (G14c). Set once; a second call changes
+    /// nothing and answers `false`. The handle is weak: the tool invocation
+    /// service that implements it holds this service.
     pub fn set_remote_grounding(
         &self,
         grounding: std::sync::Weak<dyn RemoteServerGrounding>,
-        servers: Vec<String>,
+        servers: Vec<RemoteServer>,
     ) -> bool {
         self.remote_grounding
             .set(RemoteGroundingHandle { grounding, servers })
@@ -1384,12 +1464,24 @@ impl StandardCredentialManagementService {
     fn is_remote_server(&self, provider: &CredentialProvider) -> bool {
         self.remote_grounding
             .get()
-            .is_some_and(|handle| handle.servers.iter().any(|s| s == provider.as_str()))
+            .is_some_and(|handle| handle.servers.iter().any(|s| s.name == provider.as_str()))
+    }
+
+    /// Whether `provider` names a remote server of this node that has a
+    /// grounding tool (AEGIS ADR-136 G14).
+    fn has_grounding_tool(&self, provider: &CredentialProvider) -> bool {
+        self.remote_grounding.get().is_some_and(|handle| {
+            handle
+                .servers
+                .iter()
+                .any(|s| s.name == provider.as_str() && s.grounding_tool.is_some())
+        })
     }
 
     /// What `token` reaches on the remote server `provider` names, or
-    /// `None` when `provider` is no remote server of this node (AEGIS
-    /// ADR-132 (7a) S2). A grounding that gives no reach is the refusal of
+    /// `None` when `provider` is no remote server of this node or one with
+    /// no grounding tool, which is then never called (AEGIS ADR-132 (7a)
+    /// S2, ADR-136 G14c). A grounding that gives no reach is the refusal of
     /// `stage`, and nothing is grounded twice.
     async fn ground_reach(
         &self,
@@ -1403,9 +1495,14 @@ impl StandardCredentialManagementService {
             return Ok(None);
         };
         let server = provider.as_str();
-        if !handle.servers.iter().any(|s| s == server) {
+        let Some(tool) = handle
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.grounding_tool.as_deref())
+        else {
             return Ok(None);
-        }
+        };
         let Some(grounding) = handle.grounding.upgrade() else {
             tracing::error!(
                 server,
@@ -1419,7 +1516,7 @@ impl StandardCredentialManagementService {
             .into());
         };
         let payload = match grounding
-            .ground_token(tenant_id, owner_user_id, server, token)
+            .ground_token(tenant_id, owner_user_id, server, tool, token)
             .await
         {
             Ok(payload) => payload,
@@ -1442,11 +1539,18 @@ impl StandardCredentialManagementService {
                 .into());
             }
         };
-        match reach_from_grounding(&payload, Utc::now()) {
+        match reach_from_tool(tool, &payload, Utc::now()) {
             Ok(reach) => Ok(Some(reach)),
             Err(ReachReading::NotReported) => Err(CredentialError::ReachNotReported {
                 stage,
                 server: server.to_string(),
+                missing: ReachSubject::Instances,
+            }
+            .into()),
+            Err(ReachReading::NoLogin) => Err(CredentialError::ReachNotReported {
+                stage,
+                server: server.to_string(),
+                missing: ReachSubject::Account,
             }
             .into()),
             Err(ReachReading::NoInstance) => Err(CredentialError::ReachesNoInstance {
@@ -2549,6 +2653,11 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 provider: binding.provider.to_string(),
             }
             .into());
+        }
+        // A server with no grounding tool is never called: the binding is
+        // answered as it is (AEGIS ADR-136 G14c).
+        if !self.has_grounding_tool(&binding.provider) {
+            return Ok(binding);
         }
         if binding.status != CredentialStatus::Active {
             return Err(CredentialError::BindingNotActive {

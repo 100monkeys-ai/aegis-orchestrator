@@ -6,17 +6,24 @@
 //! `StandardCredentialManagementService` over in-memory bindings and
 //! secrets, with a fake `RemoteServerGrounding` standing where the SEAL
 //! gateway's `InvokeTool` of `cortex.ground` stands in the daemon.
+//!
+//! Each remote server names its own grounding tool (AEGIS ADR-136 G14,
+//! G14a to G14c): `nuclear-notes` keeps `cortex.ground` and its instance
+//! reach; `github` names `get_me` and its binding records the account's
+//! `login`; a server with no grounding tool is never called and its
+//! binding has no reach.
 
 use aegis_orchestrator_core::application::credential_service::{
-    CredentialActor, CredentialError, CredentialManagementService, GroundingRefusal,
-    OAuthProviderRegistry, RemoteServerGrounding, StandardCredentialManagementService,
-    StoreApiKeyCommand,
+    ContextBinding, CredentialActor, CredentialError, CredentialManagementService,
+    GroundingRefusal, OAuthProviderRegistry, RemoteServerGrounding,
+    StandardCredentialManagementService, StoreApiKeyCommand,
 };
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialProvider,
     CredentialScope, CredentialType, GrantTarget, OAuthPendingState, ReachKind,
     UserCredentialBinding,
 };
+use aegis_orchestrator_core::domain::node_config::RemoteServer;
 use aegis_orchestrator_core::domain::secrets::{
     AccessContext, DomainDynamicSecret, SecretStore, SecretsError, SensitiveString,
 };
@@ -33,6 +40,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 const SERVER: &str = "nuclear-notes";
+const GITHUB: &str = "github";
+const GITHUB_TOKEN: &str = "github_pat_reach-test-token";
 const OWNER: &str = "reach-owner-sub";
 const TOKEN: &str = "Mk11-nn_mcp-instance-token";
 const ROTATED: &str = "Mk11-nn_mcp-rotated-token";
@@ -185,18 +194,29 @@ struct Grounded {
     token: String,
 }
 
-/// Answers every grounding with `answer`, recording each call.
+/// Answers every grounding with `answer`, recording each call and the
+/// (server, tool) it asked. A call whose tool is not the one `tools` names
+/// for its server is refused `WRONG_GROUNDING_TOOL`, so every test holds
+/// each server to its own grounding tool.
 struct FakeGrounding {
     answer: Mutex<Result<Value, GroundingRefusal>>,
     calls: Mutex<Vec<Grounded>>,
+    asked: Mutex<Vec<(String, String)>>,
+    tools: Vec<RemoteServer>,
 }
 
 impl FakeGrounding {
-    fn answering(answer: Result<Value, GroundingRefusal>) -> Arc<Self> {
+    fn answering(answer: Result<Value, GroundingRefusal>, tools: Vec<RemoteServer>) -> Arc<Self> {
         Arc::new(Self {
             answer: Mutex::new(answer),
             calls: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+            tools,
         })
+    }
+    /// The (server, tool) of every grounding call, in order.
+    fn asked(&self) -> Vec<(String, String)> {
+        self.asked.lock().unwrap().clone()
     }
     fn answer(&self, answer: Result<Value, GroundingRefusal>) {
         *self.answer.lock().unwrap() = answer;
@@ -213,6 +233,7 @@ impl RemoteServerGrounding for FakeGrounding {
         tenant_id: &TenantId,
         user_id: &str,
         server: &str,
+        tool: &str,
         token: &SensitiveString,
     ) -> Result<Value, GroundingRefusal> {
         self.calls.lock().unwrap().push(Grounded {
@@ -221,6 +242,21 @@ impl RemoteServerGrounding for FakeGrounding {
             server: server.to_string(),
             token: token.expose().to_string(),
         });
+        self.asked
+            .lock()
+            .unwrap()
+            .push((server.to_string(), tool.to_string()));
+        let expected = self
+            .tools
+            .iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.grounding_tool.as_deref());
+        if expected != Some(tool) {
+            return Err(GroundingRefusal::Refused {
+                code: "WRONG_GROUNDING_TOOL".to_string(),
+                message: format!("'{server}' was grounded with '{tool}', not {expected:?}"),
+            });
+        }
         self.answer.lock().unwrap().clone()
     }
 }
@@ -249,7 +285,17 @@ struct Vault {
     tenant: TenantId,
 }
 
+/// The vault with `nuclear-notes` grounded by `cortex.ground`, as the
+/// deployment names it (AEGIS ADR-136 G14).
 fn vault(answer: Result<Value, GroundingRefusal>) -> Vault {
+    vault_with(
+        vec![RemoteServer::grounded_with(SERVER, "cortex.ground")],
+        answer,
+    )
+}
+
+/// The vault with `servers` as `seal_gateway.remote_servers` names them.
+fn vault_with(servers: Vec<RemoteServer>, answer: Result<Value, GroundingRefusal>) -> Vault {
     let bindings = Arc::new(Bindings::default());
     let store = Arc::new(CountedStore::default());
     let event_bus = Arc::new(EventBus::new(64));
@@ -260,10 +306,10 @@ fn vault(answer: Result<Value, GroundingRefusal>) -> Vault {
         event_bus,
         Arc::new(OAuthProviderRegistry::new()),
     );
-    let grounding = FakeGrounding::answering(answer);
+    let grounding = FakeGrounding::answering(answer, servers.clone());
     let weak: Weak<FakeGrounding> = Arc::downgrade(&grounding);
     let weak: Weak<dyn RemoteServerGrounding> = weak;
-    assert!(service.set_remote_grounding(weak, vec![SERVER.to_string()]));
+    assert!(service.set_remote_grounding(weak, servers));
     Vault {
         service,
         bindings,
@@ -557,4 +603,184 @@ async fn a_rotated_token_is_grounded_before_its_secret_is_written() {
         .await
         .unwrap();
     assert_eq!(stored.get("value").map(|s| s.expose()), Some(ROTATED));
+}
+
+// ---------------------------------------------------------------------------
+// Each server's own grounding tool (AEGIS ADR-136 G14, G14a to G14c)
+// ---------------------------------------------------------------------------
+
+/// `nuclear-notes` by `cortex.ground` and `github` by `get_me`, as the
+/// deployment's object form names them.
+fn both_grounded() -> Vec<RemoteServer> {
+    vec![
+        RemoteServer::grounded_with(SERVER, "cortex.ground"),
+        RemoteServer::grounded_with(GITHUB, "get_me"),
+    ]
+}
+
+/// What GitHub's `get_me` answers for a token: the account, `login` at the
+/// top level.
+fn get_me(login: &str) -> Value {
+    json!({"login": login, "id": 4242, "profile_url": format!("https://github.com/{login}")})
+}
+
+/// G14, G14b: a `github` token is grounded with `get_me`, never
+/// `cortex.ground`, and its binding records `{kind: account, login,
+/// grounded_at}` and nothing else.
+#[tokio::test]
+async fn a_github_tokens_binding_records_the_account_it_belongs_to() {
+    let v = vault_with(both_grounded(), Ok(get_me("octo-person")));
+    let stored = v.store(GITHUB, GITHUB_TOKEN).await;
+
+    assert_eq!(
+        v.grounding.asked(),
+        vec![(GITHUB.to_string(), "get_me".to_string())],
+        "the github token was not grounded with its own tool, get_me"
+    );
+    let id = stored.expect("stored");
+    let reach = v
+        .binding(id)
+        .await
+        .metadata
+        .reach
+        .expect("the binding records what the token reaches");
+    let answered = serde_json::to_value(&reach).unwrap();
+    println!("reach {answered}");
+    assert_eq!(
+        reach.kind,
+        ReachKind::Account,
+        "the github reach is not an account"
+    );
+    assert_eq!(reach.login.as_deref(), Some("octo-person"));
+    let mut keys: Vec<&str> = answered
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["grounded_at", "kind", "login"]);
+    assert_eq!(answered["kind"], "account");
+    assert_eq!(answered["login"], "octo-person");
+    assert_eq!(v.grounding.calls()[0].token, GITHUB_TOKEN);
+}
+
+/// G14b: a `get_me` result with no `login` that is a non-empty string
+/// refuses the store with its own sentence; nothing is stored or written.
+#[tokio::test]
+async fn a_get_me_result_without_a_login_is_refused() {
+    let v = vault_with(both_grounded(), Ok(json!({"id": 4242})));
+    for answer in [
+        json!({"id": 4242}),
+        json!({"login": ""}),
+        json!({"login": 4242}),
+        Value::Null,
+    ] {
+        v.grounding.answer(Ok(answer.clone()));
+        let err = v.store(GITHUB, GITHUB_TOKEN).await.expect_err("refused");
+        println!("{answer}: refusal {err}");
+        assert_eq!(
+            err.to_string(),
+            "The token was not stored: the grounding 'github' answered did not say which \
+             account the token belongs to.",
+            "{answer}"
+        );
+        assert!(matches!(
+            credential_error(&err),
+            CredentialError::ReachNotReported { .. }
+        ));
+    }
+    assert!(v.bindings.0.read().await.is_empty(), "a binding was stored");
+    assert_eq!(v.writes(), 0, "a secret was written");
+}
+
+/// G14c: a server named with no grounding tool is never called: its token
+/// is stored with no reach, a rotation leaves the reach as it is, and an
+/// introspection answers the binding unchanged.
+#[tokio::test]
+async fn a_server_with_no_grounding_tool_stores_no_reach_and_is_never_called() {
+    let v = vault_with(
+        vec![
+            RemoteServer::grounded_with(SERVER, "cortex.ground"),
+            RemoteServer::named(GITHUB),
+        ],
+        Ok(get_me("octo-person")),
+    );
+    let stored = v.store(GITHUB, GITHUB_TOKEN).await;
+    assert_eq!(
+        v.grounding.asked(),
+        Vec::<(String, String)>::new(),
+        "a server with no grounding tool was called to ground a token"
+    );
+    let id = stored.expect("stored");
+    let binding = v.binding(id).await;
+    assert_eq!(binding.metadata.reach, None);
+    assert!(serde_json::to_value(&binding).unwrap()["metadata"]
+        .get("reach")
+        .is_none());
+
+    v.service
+        .rotate_credential(&v.owner(), &id, SensitiveString::new("github_pat_rotated"))
+        .await
+        .expect("rotated");
+    let introspected = v
+        .service
+        .introspect_binding(&v.owner(), &id)
+        .await
+        .expect("introspection answers the binding");
+    assert_eq!(introspected.metadata.reach, None);
+    assert_eq!(introspected.updated_at, v.binding(id).await.updated_at);
+    println!("grounding calls {}", v.grounding.asked().len());
+    assert!(
+        v.grounding.asked().is_empty(),
+        "a rotation or an introspection called a server with no grounding tool"
+    );
+}
+
+/// G14b: a rotation and an introspection of a `github` binding ground the
+/// token with `get_me` again and rewrite the account reach.
+#[tokio::test]
+async fn rotation_and_introspection_rewrite_an_account_reach() {
+    let v = vault_with(both_grounded(), Ok(get_me("octo-person")));
+    let id = v.store(GITHUB, GITHUB_TOKEN).await.expect("stored");
+
+    v.grounding.answer(Ok(get_me("octo-rotated")));
+    v.service
+        .rotate_credential(&v.owner(), &id, SensitiveString::new("github_pat_rotated"))
+        .await
+        .expect("rotated");
+    let reach = v.binding(id).await.metadata.reach.expect("reach");
+    assert_eq!(reach.login.as_deref(), Some("octo-rotated"));
+
+    v.grounding.answer(Ok(get_me("octo-introspected")));
+    let introspected = v
+        .service
+        .introspect_binding(&v.owner(), &id)
+        .await
+        .expect("introspected");
+    let reach = introspected.metadata.reach.expect("reach");
+    println!("reach {}", serde_json::to_value(&reach).unwrap());
+    assert_eq!(
+        (reach.kind, reach.login.as_deref()),
+        (ReachKind::Account, Some("octo-introspected"))
+    );
+    assert_eq!(
+        v.grounding.asked(),
+        vec![(GITHUB.to_string(), "get_me".to_string()); 3]
+    );
+}
+
+/// S11j with G14b: a context name's reach renders an account reach as its
+/// login.
+#[tokio::test]
+async fn a_context_name_renders_an_account_reach_as_its_login() {
+    let v = vault_with(both_grounded(), Ok(get_me("octo-person")));
+    let id = v.store(GITHUB, GITHUB_TOKEN).await.expect("stored");
+    let context = ContextBinding {
+        id,
+        name: "Work GitHub".to_string(),
+        reach: v.binding(id).await.metadata.reach,
+    };
+    println!("reach text {}", context.reach_text());
+    assert_eq!(context.reach_text(), "octo-person");
 }

@@ -2428,9 +2428,13 @@ fn grounded_by(vault: &Vault, service: &Arc<ToolInvocationService>) {
     let weak = Arc::downgrade(service);
     let weak: std::sync::Weak<dyn crate::application::credential_service::RemoteServerGrounding> =
         weak;
-    assert!(vault
-        .service
-        .set_remote_grounding(weak, vec![SERVER.to_string()]));
+    assert!(vault.service.set_remote_grounding(
+        weak,
+        vec![crate::domain::node_config::RemoteServer::grounded_with(
+            SERVER,
+            "cortex.ground"
+        )]
+    ));
 }
 
 fn store_command(tenant: &TenantId) -> crate::application::credential_service::StoreApiKeyCommand {
@@ -2540,6 +2544,77 @@ async fn a_gateway_refusal_of_the_grounding_stores_nothing() {
     assert_eq!(stub.received.lock().unwrap().tools.len(), 1);
 }
 
+/// AEGIS ADR-136 G14, G14b: a `github` token being stored is grounded by
+/// the gateway's `InvokeTool` of the server's own grounding tool, `get_me`
+/// (arguments `{}`, the token as the credential, its owner as the acting
+/// identity, over TLS), never `cortex.ground`; the `login` in the result's
+/// text gives the binding its account reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_github_token_is_grounded_with_get_me_and_its_account_recorded() {
+    use crate::application::credential_service::CredentialManagementService;
+    use crate::domain::node_config::RemoteServer;
+    const GITHUB: &str = "github";
+    let get_me = json!({"login": "octo-person", "id": 4242});
+    let stub = StubGateway::new(
+        vec![],
+        Answer::Result(
+            json!({"content": [{"type": "text", "text": get_me.to_string()}]}).to_string(),
+        ),
+    );
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let tenant = h.tenant.clone();
+    let service = Arc::new(h.service);
+    let weak = Arc::downgrade(&service);
+    let weak: std::sync::Weak<dyn crate::application::credential_service::RemoteServerGrounding> =
+        weak;
+    assert!(vault.service.set_remote_grounding(
+        weak,
+        vec![
+            RemoteServer::grounded_with(SERVER, "cortex.ground"),
+            RemoteServer::grounded_with(GITHUB, "get_me"),
+        ]
+    ));
+
+    let stored = vault
+        .service
+        .store_api_key(crate::application::credential_service::StoreApiKeyCommand {
+            provider: CredentialProvider::new(GITHUB),
+            label: "Work GitHub".to_string(),
+            ..store_command(&tenant)
+        })
+        .await;
+
+    {
+        let received = stub.received.lock().unwrap();
+        let asked: Vec<(&str, &str)> = received
+            .tools
+            .iter()
+            .map(|call| (call.server.as_str(), call.tool.as_str()))
+            .collect();
+        println!("grounding calls {asked:?}");
+        assert_eq!(
+            asked,
+            vec![(GITHUB, "get_me")],
+            "the github token was not grounded with get_me"
+        );
+        let call = &received.tools[0];
+        assert_eq!(call.arguments_json, "{}");
+        assert_eq!(call.tenant_id, tenant.as_str());
+        assert_eq!(call.acting.as_ref().map(|a| a.user_id.as_str()), Some(USER));
+        let credential = call.credential.as_ref().expect("credential");
+        assert_eq!(credential.kind, CredentialKind::BearerToken as i32);
+        assert_eq!(credential.value, MARKER);
+    }
+    let id = stored.expect("stored");
+    let binding = vault.bindings.find_by_id(&id).await.unwrap().unwrap();
+    let reach = binding.metadata.reach.expect("reach recorded");
+    println!("reach {}", serde_json::to_value(&reach).unwrap());
+    assert_eq!(reach.kind, crate::domain::credential::ReachKind::Account);
+    assert_eq!(reach.login.as_deref(), Some("octo-person"));
+}
+
 /// H8: over a plaintext gateway address the token is never sent to be
 /// grounded; the grounding answers the channel's code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2554,7 +2629,13 @@ async fn a_plaintext_gateway_address_never_carries_a_token_to_be_grounded() {
 
     let refusal = h
         .service
-        .ground_remote_token(&h.tenant, USER, SERVER, &SensitiveString::new(MARKER))
+        .ground_remote_token(
+            &h.tenant,
+            USER,
+            SERVER,
+            "cortex.ground",
+            &SensitiveString::new(MARKER),
+        )
         .await
         .expect_err("refused");
     assert!(matches!(
@@ -3442,6 +3523,7 @@ fn instance_reach(slug: &str) -> Option<crate::domain::credential::BindingReach>
         instance_slug: Some(slug.to_string()),
         instance_id: Some(format!("inst-{slug}")),
         workspace_id: None,
+        login: None,
         grounded_at: chrono::Utc::now(),
     })
 }
@@ -3482,6 +3564,7 @@ impl ThreeBindings {
                     instance_slug: None,
                     instance_id: None,
                     workspace_id: None,
+                    login: None,
                     grounded_at: chrono::Utc::now(),
                 }),
             )

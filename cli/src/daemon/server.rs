@@ -500,6 +500,26 @@ pub(crate) fn daemon_seal_gateway_wiring(
         .context("seal_gateway configuration")
 }
 
+/// Hand the credential service the grounding of remote servers' tokens and
+/// `seal_gateway.remote_servers` with each server's grounding tool (AEGIS
+/// ADR-132 (7a) S2, ADR-136 G14): a server named with `grounding_tool` has
+/// its tokens grounded with that tool; a bare name has none, and its
+/// bindings are stored with no reach. A grounding tool the rule refuses
+/// stops the daemon with the reason.
+pub(crate) fn daemon_remote_grounding(
+    credentials: &StandardCredentialManagementService,
+    gateway: &aegis_orchestrator_core::domain::node_config::SealGatewayConfig,
+    grounding: std::sync::Weak<dyn RemoteServerGrounding>,
+) -> Result<()> {
+    credentials.set_remote_grounding(
+        grounding,
+        gateway
+            .remote_server_entries()
+            .context("seal_gateway configuration")?,
+    );
+    Ok(())
+}
+
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     // Write PID file
     let pid = std::process::id();
@@ -2183,12 +2203,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     {
         let service = Arc::downgrade(&tool_invocation_service);
         let grounding: std::sync::Weak<dyn RemoteServerGrounding> = service;
-        credentials.set_remote_grounding(
-            grounding,
-            gateway
-                .remote_server_names()
-                .context("seal_gateway configuration")?,
-        );
+        daemon_remote_grounding(credentials, gateway, grounding)?;
     }
 
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");

@@ -1882,8 +1882,139 @@ pub struct SealGatewayConfig {
     /// workflow or all their agents (AEGIS ADR-132 H1, H4). A name is checked
     /// by the gateway's own rule ([`Self::remote_server_names`]). Empty: no
     /// remote server, and no person's credential is ever resolved.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remote_servers: Vec<String>,
+    ///
+    /// Each entry is a bare name or `{name, grounding_tool?}` (AEGIS ADR-136
+    /// G14, G14a): `grounding_tool` names the server's tool a person's token
+    /// is grounded with when it is stored, rotated or introspected; a bare
+    /// name, or an entry without it, means the server has none.
+    #[serde(default, skip_serializing_if = "RemoteServers::is_empty")]
+    pub remote_servers: RemoteServers,
+}
+
+/// One remote server as `seal_gateway.remote_servers` names it (AEGIS
+/// ADR-136 G14): its name and, if it has one, the tool a person's token is
+/// grounded with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteServer {
+    /// The name the gateway registers the server under.
+    pub name: String,
+    /// The server's tool a token is grounded with (`cortex.ground` for
+    /// Nuclear Notes, `get_me` for GitHub); `None`: no grounding, and a
+    /// binding to the server is stored with no reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_tool: Option<String>,
+}
+
+impl RemoteServer {
+    /// A server with no grounding tool.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            grounding_tool: None,
+        }
+    }
+
+    /// A server whose tokens are grounded with `tool`.
+    pub fn grounded_with(name: impl Into<String>, tool: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            grounding_tool: Some(tool.into()),
+        }
+    }
+}
+
+/// An entry of `seal_gateway.remote_servers` as written: a bare name or
+/// the object form.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RemoteServerEntry {
+    Name(String),
+    Entry(RemoteServer),
+}
+
+/// `seal_gateway.remote_servers` (AEGIS ADR-136 G14a): the remote servers in
+/// the order given, each a bare name or `{name, grounding_tool?}`. It
+/// dereferences to the servers' names, which is all that the acceptance
+/// rule, the start check and the call routing read; the grounding tools are
+/// read by [`RemoteServers::entries`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteServers {
+    names: Vec<String>,
+    grounding_tools: Vec<Option<String>>,
+}
+
+impl RemoteServers {
+    /// Whether no remote server is named.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// The servers, each with its grounding tool, in the order given.
+    pub fn entries(&self) -> Vec<RemoteServer> {
+        self.names
+            .iter()
+            .zip(&self.grounding_tools)
+            .map(|(name, tool)| RemoteServer {
+                name: name.clone(),
+                grounding_tool: tool.clone(),
+            })
+            .collect()
+    }
+}
+
+impl std::ops::Deref for RemoteServers {
+    type Target = [String];
+
+    fn deref(&self) -> &[String] {
+        &self.names
+    }
+}
+
+/// Bare names: servers with no grounding tool.
+impl FromIterator<String> for RemoteServers {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        iter.into_iter().map(RemoteServer::named).collect()
+    }
+}
+
+impl FromIterator<RemoteServer> for RemoteServers {
+    fn from_iter<I: IntoIterator<Item = RemoteServer>>(iter: I) -> Self {
+        let mut servers = Self::default();
+        for server in iter {
+            servers.names.push(server.name);
+            servers.grounding_tools.push(server.grounding_tool);
+        }
+        servers
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteServers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let entries = Vec::<RemoteServerEntry>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| match entry {
+                RemoteServerEntry::Name(name) => RemoteServer::named(name),
+                RemoteServerEntry::Entry(server) => server,
+            })
+            .collect())
+    }
+}
+
+/// A server with no grounding tool is written as its bare name.
+impl Serialize for RemoteServers {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.names.len()))?;
+        for server in self.entries() {
+            match server.grounding_tool {
+                None => seq.serialize_element(&server.name)?,
+                Some(_) => seq.serialize_element(&server)?,
+            }
+        }
+        seq.end()
+    }
 }
 
 impl SealGatewayConfig {
@@ -1896,7 +2027,7 @@ impl SealGatewayConfig {
     /// its tools as missing at the first call.
     pub fn remote_server_names(&self) -> anyhow::Result<Vec<String>> {
         let mut names: Vec<String> = Vec::with_capacity(self.remote_servers.len());
-        for name in &self.remote_servers {
+        for name in self.remote_servers.iter() {
             let valid = !name.is_empty()
                 && name
                     .chars()
@@ -1913,6 +2044,31 @@ impl SealGatewayConfig {
             names.push(name.clone());
         }
         Ok(names)
+    }
+
+    /// `remote_servers` with each server's grounding tool, the names checked
+    /// as [`Self::remote_server_names`] checks them and each grounding tool
+    /// by its rule (AEGIS ADR-136 G14a): not empty, letters, digits, '.',
+    /// '_' and '-' only.
+    pub fn remote_server_entries(&self) -> anyhow::Result<Vec<RemoteServer>> {
+        self.remote_server_names()?;
+        let entries = self.remote_servers.entries();
+        for entry in &entries {
+            if let Some(tool) = &entry.grounding_tool {
+                let valid = !tool.is_empty()
+                    && tool
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if !valid {
+                    anyhow::bail!(
+                        "seal_gateway.remote_servers: '{}' names the grounding tool '{tool}', \
+                         which must be letters, digits, '.', '_' and '-'",
+                        entry.name
+                    );
+                }
+            }
+        }
+        Ok(entries)
     }
 }
 
@@ -3877,6 +4033,94 @@ goals:
             serde_yaml::from_str("url: https://aegis-seal-gateway:50055\n").unwrap();
         assert!(without.remote_servers.is_empty());
         assert!(without.remote_server_names().unwrap().is_empty());
+    }
+
+    /// AEGIS ADR-136 G14, G14a: an entry is a bare name (no grounding tool)
+    /// or `{name, grounding_tool?}`, in one list; the list dereferences to
+    /// the names alone, and a bare name is written back as a bare name.
+    #[test]
+    fn seal_gateway_remote_servers_read_bare_names_and_the_object_form() {
+        let parsed = serde_yaml::from_str::<SealGatewayConfig>(
+            "url: https://aegis-seal-gateway:50055\nremote_servers:\n  - name: nuclear-notes\n    grounding_tool: cortex.ground\n  - name: github\n    grounding_tool: get_me\n  - notes-2\n  - name: notes-3\n",
+        );
+        assert!(
+            parsed.is_ok(),
+            "the object form of seal_gateway.remote_servers is refused: {:?}",
+            parsed.as_ref().err()
+        );
+        let config = parsed.unwrap();
+        assert_eq!(
+            config.remote_server_entries().unwrap(),
+            vec![
+                RemoteServer::grounded_with("nuclear-notes", "cortex.ground"),
+                RemoteServer::grounded_with("github", "get_me"),
+                RemoteServer::named("notes-2"),
+                RemoteServer::named("notes-3"),
+            ]
+        );
+        assert_eq!(
+            config.remote_server_names().unwrap(),
+            vec!["nuclear-notes", "github", "notes-2", "notes-3"]
+        );
+        assert_eq!(
+            config.remote_servers.join(", "),
+            "nuclear-notes, github, notes-2, notes-3"
+        );
+        let written = serde_json::to_value(&config.remote_servers).unwrap();
+        println!("written back {written}");
+        assert_eq!(
+            written,
+            serde_json::json!([
+                {"name": "nuclear-notes", "grounding_tool": "cortex.ground"},
+                {"name": "github", "grounding_tool": "get_me"},
+                "notes-2",
+                "notes-3"
+            ])
+        );
+    }
+
+    /// AEGIS ADR-136 G14a: an entry's unknown key, a grounding tool its rule
+    /// refuses, and a name given twice across the two forms are refused with
+    /// the reason.
+    #[test]
+    fn a_remote_server_entry_the_rule_refuses_is_refused() {
+        let unknown = serde_yaml::from_str::<SealGatewayConfig>(
+            "url: https://aegis-seal-gateway:50055\nremote_servers:\n  - name: github\n    tool: get_me\n",
+        );
+        println!("unknown key: {:?}", unknown.as_ref().err());
+        assert!(
+            unknown.is_err(),
+            "an entry with the unknown key 'tool' was read: {:?}",
+            unknown.ok().map(|c| c.remote_servers.entries())
+        );
+        for (yaml, reason) in [
+            (
+                "  - name: github\n    grounding_tool: ''\n",
+                "names the grounding tool ''",
+            ),
+            (
+                "  - name: github\n    grounding_tool: get me\n",
+                "names the grounding tool 'get me'",
+            ),
+            (
+                "  - github\n  - name: github\n    grounding_tool: get_me\n",
+                "'github' is named twice",
+            ),
+        ] {
+            let config: SealGatewayConfig = serde_yaml::from_str(&format!(
+                "url: https://aegis-seal-gateway:50055\nremote_servers:\n{yaml}"
+            ))
+            .expect("the entries parse");
+            let error = match config.remote_server_entries() {
+                Ok(entries) => panic!("{yaml}: read as {entries:?}, not refused"),
+                Err(error) => error.to_string(),
+            };
+            println!("{reason}: {error}");
+            assert!(
+                error.contains("seal_gateway.remote_servers") && error.contains(reason),
+                "{yaml}: {error}"
+            );
+        }
     }
 
     /// A name the gateway could not register (its rule: lowercase letters,
