@@ -137,6 +137,11 @@ pub struct StandardStartWorkflowExecutionUseCase {
     rate_limit_enforcer: Option<Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>>,
     /// Optional rate limit policy resolver (ADR-072).
     rate_limit_resolver: Option<Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>>,
+    /// Where a workflow run's repositories are prepared (AEGIS ADR-136 G3
+    /// to G5). Set once at the composition root via `set_repositories()`;
+    /// unset, a start that names repositories is refused.
+    run_repositories:
+        std::sync::OnceLock<Arc<dyn crate::application::git_repo_service::RunRepositories>>,
 }
 
 impl StandardStartWorkflowExecutionUseCase {
@@ -162,7 +167,71 @@ impl StandardStartWorkflowExecutionUseCase {
             event_bus,
             rate_limit_enforcer: None,
             rate_limit_resolver: None,
+            run_repositories: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Prepare a workflow run's repositories through `repositories` (AEGIS
+    /// ADR-136 G3 to G5). Wired once at startup, after the git repository
+    /// service exists.
+    pub fn set_repositories(
+        &self,
+        repositories: Arc<dyn crate::application::git_repo_service::RunRepositories>,
+    ) {
+        // OnceLock silently ignores a second set; the service is wired once at startup.
+        let _ = self.run_repositories.set(repositories);
+    }
+
+    /// AEGIS ADR-136 G3 to G5: a workflow execution is its run. Before
+    /// anything is recorded or started, its repositories are checked, held
+    /// and their work branches checked out, and each entry's branch is
+    /// written back into `input` for the agent states to inherit. Answers
+    /// the guard that releases them should the start not complete.
+    async fn prepare_repositories(
+        &self,
+        tenant_id: &TenantId,
+        identity: Option<&UserIdentity>,
+        run: ExecutionId,
+        input: &mut serde_json::Value,
+    ) -> Result<crate::application::git_repo_service::RunHoldGuard> {
+        use crate::application::git_repo_service::{RunHoldGuard, RunRepositoryError};
+        use crate::domain::execution::ExecutionError;
+        use crate::domain::git_repo::{parse_run_repositories, REPOSITORIES_INPUT_KEY};
+        let entries = match input.get(REPOSITORIES_INPUT_KEY) {
+            None => return Ok(RunHoldGuard::new(None, run.0)),
+            Some(value) => parse_run_repositories(value).map_err(|sentence| {
+                anyhow::Error::new(ExecutionError::Refused(sentence.to_string()))
+            })?,
+        };
+        if entries.is_empty() {
+            return Ok(RunHoldGuard::new(None, run.0));
+        }
+        let Some(repositories) = self.run_repositories.get() else {
+            return Err(ExecutionError::Refused(
+                "this node has no git repository service, so a run cannot be given repositories"
+                    .to_string(),
+            )
+            .into());
+        };
+        let person = crate::application::execution::person_sub(identity);
+        let filled = repositories
+            .prepare_for_run(tenant_id, person.as_deref(), run.0, &entries)
+            .await
+            .map_err(|e| match e {
+                RunRepositoryError::Refused(sentence) => {
+                    anyhow::Error::new(ExecutionError::Refused(sentence))
+                }
+                RunRepositoryError::Failed(e) => {
+                    anyhow::anyhow!("preparing the run's repositories failed: {e}")
+                }
+            })?;
+        if let serde_json::Value::Object(map) = input {
+            map.insert(
+                REPOSITORIES_INPUT_KEY.to_string(),
+                serde_json::to_value(&filled)?,
+            );
+        }
+        Ok(RunHoldGuard::new(Some(repositories.clone()), run.0))
     }
 
     /// Attach rate limiting enforcement for workflow execution quotas (ADR-072).
@@ -343,12 +412,15 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         // The dispatch's binding choices (Zaru ADR-0055 D14) are the
         // platform's: the workflow's schema and its Temporal input never see
         // them; the persisted execution keeps them for its agent states.
+        // So are the run's repositories (AEGIS ADR-136 G3).
         let input_without_contexts = match &request.input {
             serde_json::Value::Object(map)
-                if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY) =>
+                if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
+                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
+                map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
                 serde_json::Value::Object(map)
             }
             other => other.clone(),
@@ -381,8 +453,12 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
 
         // Step 2: Create workflow execution aggregate
         let execution_id = ExecutionId(uuid::Uuid::new_v4());
+        let mut persisted_input = request.input.clone();
+        let hold = self
+            .prepare_repositories(tenant_id, identity, execution_id, &mut persisted_input)
+            .await?;
         let mut workflow_execution =
-            WorkflowExecution::new(&workflow, execution_id, request.input.clone());
+            WorkflowExecution::new(&workflow, execution_id, persisted_input);
         // The person who started it, never a service account: the agents its
         // states run act for this person (AEGIS ADR-132's Update, G2).
         workflow_execution.initiating_user_sub =
@@ -465,6 +541,9 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 anyhow::Error::new(error)
             })
             .context("Failed to persist Temporal linkage for workflow execution")?;
+
+        // The workflow has started: its end releases its repositories.
+        hold.disarm();
 
         // Step 7: Publish domain event
         self.event_bus.publish_workflow_event(

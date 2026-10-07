@@ -51,6 +51,44 @@ pub(crate) struct ExecuteRequest {
     /// unchanged into the execution input's reserved key `contexts`.
     #[serde(default)]
     contexts: Option<serde_json::Value>,
+    /// The run's repositories, `[{"binding_id": "<git repository binding
+    /// id>", "branch": "<work branch>"?}]` (AEGIS ADR-136 G3), carried
+    /// unchanged into the execution input's reserved key `repositories`; the
+    /// start refuses any other shape.
+    #[serde(default)]
+    repositories: Option<serde_json::Value>,
+}
+
+/// The execution input the execute route builds: the caller's input, its
+/// overrides and the tenant, with `contexts` and `repositories` carried
+/// unchanged into their reserved keys.
+fn execute_input_value(
+    input: serde_json::Value,
+    context_overrides: Option<serde_json::Value>,
+    tenant_id: &TenantId,
+    contexts: Option<serde_json::Value>,
+    repositories: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "input": input,
+        "context_overrides": context_overrides,
+        "tenant_id": tenant_id.to_string(),
+    });
+    if let Some(map) = value.as_object_mut() {
+        if let Some(contexts) = contexts {
+            map.insert(
+                aegis_orchestrator_core::domain::execution::CONTEXTS_INPUT_KEY.to_string(),
+                contexts,
+            );
+        }
+        if let Some(repositories) = repositories {
+            map.insert(
+                aegis_orchestrator_core::domain::git_repo::REPOSITORIES_INPUT_KEY.to_string(),
+                repositories,
+            );
+        }
+    }
+    value
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -148,20 +186,13 @@ pub(crate) async fn execute_agent_handler(
 
     let input = ExecutionInput {
         intent: request.intent,
-        input: {
-            let mut input = serde_json::json!({
-                "input": request.input,
-                "context_overrides": request.context_overrides,
-                "tenant_id": tenant_id.to_string(),
-            });
-            if let (Some(contexts), Some(map)) = (request.contexts, input.as_object_mut()) {
-                map.insert(
-                    aegis_orchestrator_core::domain::execution::CONTEXTS_INPUT_KEY.to_string(),
-                    contexts,
-                );
-            }
-            input
-        },
+        input: execute_input_value(
+            request.input,
+            request.context_overrides,
+            &tenant_id,
+            request.contexts,
+            request.repositories,
+        ),
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
@@ -824,6 +855,32 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 serde_json::json!({ "error": format!("Execution refused: {sentence}") })
             )
+        );
+    }
+
+    /// AEGIS ADR-136 G3: the execute route keeps the caller's `repositories`
+    /// in the execution input's reserved key, beside `contexts`.
+    #[test]
+    fn execute_route_keeps_repositories_in_the_reserved_key() {
+        let repositories = serde_json::json!([
+            { "binding_id": "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e", "branch": "fix/x" }
+        ]);
+        let request: ExecuteRequest = serde_json::from_value(serde_json::json!({
+            "input": "fix the bug",
+            "repositories": repositories,
+        }))
+        .unwrap();
+        let input = execute_input_value(
+            request.input,
+            request.context_overrides,
+            &TenantId::consumer(),
+            request.contexts,
+            request.repositories,
+        );
+        assert_eq!(
+            input.get("repositories"),
+            Some(&repositories),
+            "the execute route dropped the caller's repositories"
         );
     }
 

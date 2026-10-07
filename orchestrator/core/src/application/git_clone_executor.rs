@@ -247,6 +247,53 @@ impl EphemeralCliEngine {
         head_sha(&result, &secrets)
     }
 
+    /// Check out the run's work branch `branch` in the tree on `volume`
+    /// (AEGIS ADR-136 G5, G5a): `origin` pointed at the binding's URL, the
+    /// binding's ref fetched; the remote's copy of `branch` checked out when
+    /// the remote has one, else `branch` created from the ref; untracked
+    /// files removed. Returns the commit the run starts from and whether the
+    /// branch was created.
+    async fn check_out_work_branch_in_volume(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        branch: &str,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<(String, bool), CloneError> {
+        let (url, credential) = clone_credential(binding.repo_url.expose(), credential);
+        let secrets = credential_secrets(credential.as_ref());
+        let host_keys = host_keys_for(&url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
+        let step = work_branch_step(
+            &self.paths,
+            &binding.git_ref,
+            branch,
+            &url,
+            credential.as_ref(),
+            host_keys.as_deref(),
+        )?;
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-branch-{}", binding.id),
+                "branch",
+                "GIT_BRANCH",
+                step,
+                &secrets,
+            )
+            .await?;
+        let sha = head_sha(&result, &secrets)?;
+        let created = match result.stdout.lines().rev().nth(1).map(str::trim) {
+            Some("created") => true,
+            Some("existing") => false,
+            _ => {
+                return Err(CloneError::Git(
+                    "ephemeral-cli branch step printed neither created nor existing".to_string(),
+                ))
+            }
+        };
+        Ok((sha, created))
+    }
+
     /// Stage every change of the tree on `volume` and commit it on HEAD
     /// with `author_name` and `author_email` as author and committer.
     /// `None` when there is nothing to commit.
@@ -698,6 +745,71 @@ fn fetch_step(
     Ok(GitStep { script: s, stdin })
 }
 
+/// Build the work-branch step (AEGIS ADR-136 G5a): `origin` pointed at
+/// `url` and `git_ref` fetched as the fetch step does; then the remote's copy
+/// of `branch` checked out when `ls-remote` finds it, else `branch` created
+/// from the ref, both with `checkout --force -B`; untracked files removed.
+/// Prints `created` or `existing`, then the HEAD SHA.
+fn work_branch_step(
+    paths: &EphemeralCliPaths,
+    git_ref: &GitRef,
+    branch: &str,
+    url: &str,
+    credential: Option<&ResolvedCredential>,
+    host_keys: Option<&[SshHostKey]>,
+) -> Result<GitStep, CloneError> {
+    let (mut s, stdin, git_options) = step_prelude(paths, url, credential, host_keys)?;
+    s.push_str(&format!("cd {}\n", tree_path(paths)));
+    s.push_str(&point_origin_script(url));
+    match git_ref {
+        GitRef::Branch(name) => {
+            s.push_str(&format!(
+                "g{git_options} fetch origin {}\n",
+                shell_escape(&format!("+refs/heads/{name}:refs/remotes/origin/{name}"))
+            ));
+            s.push_str(&format!(
+                "target=$(g rev-parse --verify {})\n",
+                shell_escape(&format!("refs/remotes/origin/{name}^{{commit}}"))
+            ));
+        }
+        GitRef::Tag(name) => {
+            s.push_str(&format!(
+                "g{git_options} fetch origin {}\n",
+                shell_escape(&format!("+refs/tags/{name}:refs/tags/{name}"))
+            ));
+            s.push_str(&format!(
+                "target=$(g rev-parse --verify {})\n",
+                shell_escape(&format!("refs/tags/{name}^{{commit}}"))
+            ));
+        }
+        GitRef::Commit(sha) => {
+            let commit = shell_escape(&format!("{sha}^{{commit}}"));
+            s.push_str(&format!(
+                "if ! g cat-file -e {commit} 2>/dev/null; then \
+                 g{git_options} fetch origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'; fi\n"
+            ));
+            s.push_str(&format!("target=$(g rev-parse --verify {commit})\n"));
+        }
+    }
+    s.push_str(&format!("branch={}\n", shell_escape(branch)));
+    s.push_str(&format!(
+        "if g{git_options} ls-remote --exit-code --heads origin \"refs/heads/$branch\" >/dev/null; then\n\
+         g{git_options} fetch origin \"+refs/heads/$branch:refs/remotes/origin/$branch\"\n\
+         g checkout --quiet --force -B \"$branch\" \"refs/remotes/origin/$branch\"\n\
+         made=existing\n\
+         else\n\
+         rc=$?\n\
+         if [ \"$rc\" -ne 2 ]; then exit \"$rc\"; fi\n\
+         g checkout --quiet --force -B \"$branch\" \"$target\"\n\
+         made=created\n\
+         fi\n\
+         g clean -ffdq\n\
+         printf '%s\\n' \"$made\"\n\
+         g rev-parse HEAD\n"
+    ));
+    Ok(GitStep { script: s, stdin })
+}
+
 /// Build the commit step: every change staged, then committed on HEAD with
 /// one identity as author and committer. A tree with nothing to commit
 /// exits [`NOTHING_TO_COMMIT_EXIT`]. It is handed no credential.
@@ -1131,6 +1243,22 @@ impl GitCloneExecutor {
     ) -> Result<String, CloneError> {
         self.engine()?
             .fetch_and_checkout_in_volume(binding, volume, credential)
+            .await
+    }
+
+    /// Check out the run's work branch in the tree on a non-HostPath
+    /// `volume`, through a git step (AEGIS ADR-136 G5a). Returns the commit
+    /// the run starts from and whether the branch was created.
+    #[instrument(skip(self, volume, credential), fields(binding_id = %binding.id, volume_id = %volume.id))]
+    pub async fn work_branch_ephemeral(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        branch: &str,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<(String, bool), CloneError> {
+        self.engine()?
+            .check_out_work_branch_in_volume(binding, volume, branch, credential)
             .await
     }
 

@@ -2322,6 +2322,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         };
         Arc::new(service)
     });
+    // A run's repositories are prepared, mounted and released by the git
+    // repository service (AEGIS ADR-136 G3 to G5).
+    if let Some(service) = git_repo_service.as_ref() {
+        execution_service.set_repositories(service.clone());
+        start_workflow_execution_use_case.set_repositories(service.clone());
+        service.clone().release_runs_on_end();
+    }
 
     // Initialize the Script persistence service (ADR-110 §D7). Enabled
     // when a Postgres pool is configured and migration 021 has been

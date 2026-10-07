@@ -148,6 +148,7 @@ impl ToolInvocationService {
         // Zaru ADR-0055 D14: the dispatch's binding choices ride at the top
         // of the pipeline's input, in the reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut input)?;
+        super::repository_args::carry_repositories(args, &mut input)?;
 
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,

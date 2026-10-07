@@ -157,6 +157,7 @@ impl ToolInvocationService {
         // Zaru ADR-0055 D14: the dispatch's binding choices ride in the
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut input)?;
+        super::repository_args::carry_repositories(args, &mut input)?;
         let blackboard = args.get("blackboard").cloned();
         let intent = args
             .get("intent")
@@ -599,6 +600,7 @@ impl ToolInvocationService {
         // Zaru ADR-0055 D14: the dispatch's binding choices ride in the
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut payload)?;
+        super::repository_args::carry_repositories(args, &mut payload)?;
 
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,

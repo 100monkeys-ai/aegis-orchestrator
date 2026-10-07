@@ -256,6 +256,7 @@ impl ToolInvocationService {
         // Zaru ADR-0055 D14: the dispatch's binding choices ride in the
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut payload)?;
+        super::repository_args::carry_repositories(args, &mut payload)?;
         if let Some(map) = payload.as_object_mut() {
             map.entry("tenant_id")
                 .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));

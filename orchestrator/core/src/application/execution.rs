@@ -512,6 +512,12 @@ pub struct StandardExecutionService {
     /// time only.
     context_bindings:
         std::sync::OnceLock<Arc<dyn crate::application::credential_service::ToolCredentialSource>>,
+    /// Where a run's repositories are prepared, mounted and released (AEGIS
+    /// ADR-136 G3 to G5). Set once at the composition root via
+    /// `set_repositories()`; unset, a start that names repositories is
+    /// refused.
+    run_repositories:
+        std::sync::OnceLock<Arc<dyn crate::application::git_repo_service::RunRepositories>>,
     /// Optional ToolRouter used to validate that an agent's requested tools actually exist
     /// before spawning the container (Safety & Polish).
     tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
@@ -851,6 +857,7 @@ impl StandardExecutionService {
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             child_executor: std::sync::OnceLock::new(),
             context_bindings: std::sync::OnceLock::new(),
+            run_repositories: std::sync::OnceLock::new(),
             tool_router: None,
             cortex_client: None,
             rate_limit_enforcer: None,
@@ -997,6 +1004,17 @@ impl StandardExecutionService {
     ) {
         // OnceLock silently ignores a second set; the source is wired once at startup.
         let _ = self.context_bindings.set(source);
+    }
+
+    /// Prepare, mount and release a run's repositories through `repositories`
+    /// (AEGIS ADR-136 G3 to G5). Wired once at startup, after the git
+    /// repository service exists.
+    pub fn set_repositories(
+        &self,
+        repositories: Arc<dyn crate::application::git_repo_service::RunRepositories>,
+    ) {
+        // OnceLock silently ignores a second set; the service is wired once at startup.
+        let _ = self.run_repositories.set(repositories);
     }
 
     /// Attach a StandardRuntime registry for validated language+version → image resolution (ADR-043).
@@ -4817,6 +4835,586 @@ mod tests {
 
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+
+    // ── AEGIS ADR-136 G3 to G5: a run's repositories ────────────────────────
+
+    const REPOSITORY_BINDING: &str = "7d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
+    /// What the start paths asked of a run's repositories, answered as G4a
+    /// and G5a describe: the default branch filled in, one tree mounted at
+    /// `/workspace/app`.
+    struct RecordingRunRepositories {
+        refuse: Option<String>,
+        volume: VolumeId,
+        prepared: Mutex<Vec<(Option<String>, uuid::Uuid)>>,
+        mounted: Mutex<Vec<(Option<String>, uuid::Uuid, serde_json::Value)>>,
+        released: Mutex<Vec<uuid::Uuid>>,
+    }
+
+    impl RecordingRunRepositories {
+        fn new(refuse: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                refuse: refuse.map(str::to_string),
+                volume: VolumeId::new(),
+                prepared: Mutex::new(Vec::new()),
+                mounted: Mutex::new(Vec::new()),
+                released: Mutex::new(Vec::new()),
+            })
+        }
+
+        async fn wait_for_release(&self, run: uuid::Uuid) -> bool {
+            for _ in 0..100 {
+                if self.released.lock().unwrap().contains(&run) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        }
+    }
+
+    #[async_trait]
+    impl crate::application::git_repo_service::RunRepositories for RecordingRunRepositories {
+        async fn prepare_for_run(
+            &self,
+            _tenant_id: &TenantId,
+            person: Option<&str>,
+            run: uuid::Uuid,
+            entries: &[crate::domain::git_repo::RunRepository],
+        ) -> std::result::Result<
+            Vec<crate::domain::git_repo::RunRepository>,
+            crate::application::git_repo_service::RunRepositoryError,
+        > {
+            self.prepared
+                .lock()
+                .unwrap()
+                .push((person.map(str::to_string), run));
+            if let Some(sentence) = &self.refuse {
+                return Err(
+                    crate::application::git_repo_service::RunRepositoryError::Refused(
+                        sentence.clone(),
+                    ),
+                );
+            }
+            Ok(entries
+                .iter()
+                .map(|entry| crate::domain::git_repo::RunRepository {
+                    binding_id: entry.binding_id,
+                    branch: Some(
+                        entry
+                            .branch
+                            .clone()
+                            .unwrap_or_else(|| crate::domain::git_repo::default_work_branch(run)),
+                    ),
+                })
+                .collect())
+        }
+
+        async fn mounts_for_run(
+            &self,
+            _tenant_id: &TenantId,
+            person: Option<&str>,
+            run: uuid::Uuid,
+            entries: &[crate::domain::git_repo::RunRepository],
+        ) -> std::result::Result<
+            Vec<crate::application::git_repo_service::RunMount>,
+            crate::application::git_repo_service::RunRepositoryError,
+        > {
+            self.mounted.lock().unwrap().push((
+                person.map(str::to_string),
+                run,
+                serde_json::to_value(entries).unwrap(),
+            ));
+            Ok(vec![crate::application::git_repo_service::RunMount {
+                label: "app".to_string(),
+                mount: VolumeMount::new(
+                    self.volume,
+                    PathBuf::from("/workspace/app"),
+                    AccessMode::ReadWrite,
+                    FilerEndpoint::new("http://filer:8888").unwrap(),
+                    "/aegis/seaweedfs/app/repo".to_string(),
+                ),
+            }])
+        }
+
+        fn release_run(&self, run: uuid::Uuid) {
+            self.released.lock().unwrap().push(run);
+        }
+    }
+
+    /// A volume service that records every volume it is asked to delete.
+    struct DeleteRecordingVolumeService {
+        inner: TestVolumeService,
+        deleted: Mutex<Vec<VolumeId>>,
+    }
+
+    #[async_trait]
+    impl VolumeService for DeleteRecordingVolumeService {
+        async fn create_volume(
+            &self,
+            name: String,
+            tenant_id: TenantId,
+            storage_class: StorageClass,
+            size_limit_mb: u64,
+            ownership: VolumeOwnership,
+        ) -> Result<VolumeId> {
+            self.inner
+                .create_volume(name, tenant_id, storage_class, size_limit_mb, ownership)
+                .await
+        }
+        async fn get_volume(&self, id: VolumeId) -> Result<Volume> {
+            self.inner.get_volume(id).await
+        }
+        async fn list_volumes_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<Volume>> {
+            self.inner.list_volumes_by_tenant(tenant_id).await
+        }
+        async fn list_volumes_by_ownership(
+            &self,
+            ownership: &VolumeOwnership,
+        ) -> Result<Vec<Volume>> {
+            self.inner.list_volumes_by_ownership(ownership).await
+        }
+        async fn attach_volume(
+            &self,
+            volume_id: VolumeId,
+            instance_id: crate::domain::runtime::InstanceId,
+            mount_point: PathBuf,
+            access_mode: AccessMode,
+        ) -> Result<VolumeMount> {
+            self.inner
+                .attach_volume(volume_id, instance_id, mount_point, access_mode)
+                .await
+        }
+        async fn detach_volume(
+            &self,
+            volume_id: VolumeId,
+            instance_id: crate::domain::runtime::InstanceId,
+        ) -> Result<()> {
+            self.inner.detach_volume(volume_id, instance_id).await
+        }
+        async fn delete_volume(&self, volume_id: VolumeId) -> Result<()> {
+            self.deleted.lock().unwrap().push(volume_id);
+            Ok(())
+        }
+        async fn get_volume_usage(&self, volume_id: VolumeId) -> Result<u64> {
+            self.inner.get_volume_usage(volume_id).await
+        }
+        async fn cleanup_expired_volumes(&self) -> Result<usize> {
+            self.inner.cleanup_expired_volumes().await
+        }
+        async fn create_volumes_for_execution(
+            &self,
+            execution_id: ExecutionId,
+            tenant_id: TenantId,
+            volume_specs: &[VolumeSpec],
+            storage_mode: &str,
+        ) -> Result<Vec<Volume>> {
+            self.inner
+                .create_volumes_for_execution(execution_id, tenant_id, volume_specs, storage_mode)
+                .await
+        }
+        async fn persist_external_volume(
+            &self,
+            volume_id: VolumeId,
+            name: String,
+            tenant_id: TenantId,
+            remote_path: String,
+            size_limit_bytes: u64,
+            ownership: VolumeOwnership,
+        ) -> Result<()> {
+            self.inner
+                .persist_external_volume(
+                    volume_id,
+                    name,
+                    tenant_id,
+                    remote_path,
+                    size_limit_bytes,
+                    ownership,
+                )
+                .await
+        }
+    }
+
+    fn repository_person() -> UserIdentity {
+        caller(
+            "u-person",
+            crate::domain::iam::IdentityKind::ConsumerUser {
+                zaru_tier: crate::domain::iam::ZaruTier::Free,
+                tenant_id: CoreTenantId::consumer(),
+            },
+        )
+    }
+
+    fn repositories_input() -> ExecutionInput {
+        input_with(serde_json::json!({
+            "tenant_id": "zaru-consumer",
+            "task": "fix the bug",
+            "repositories": [{ "binding_id": REPOSITORY_BINDING }],
+        }))
+    }
+
+    /// G4, G5a: a root execution prepares its run's repositories (its own
+    /// id is the run), mounts the tree at `/workspace/<label>` in its
+    /// container, keeps the run's default branch in its persisted input,
+    /// deletes no volume of the binding, and releases the run when it ends.
+    #[tokio::test]
+    async fn a_runs_repository_is_mounted_at_workspace_label_and_released_when_it_ends() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("fixer", None, None);
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &agent)
+            .await
+            .unwrap();
+        let runtime = Arc::new(TestRuntime::default());
+        let volumes = Arc::new(DeleteRecordingVolumeService {
+            inner: TestVolumeService {
+                volumes: HashMap::new(),
+            },
+            deleted: Mutex::new(Vec::new()),
+        });
+        let service = StandardExecutionService::new(
+            agent_repo,
+            volumes.clone(),
+            Arc::new(Supervisor::new(runtime.clone())),
+            Arc::new(InMemoryExecutionRepository::new()),
+            Arc::new(EventBus::with_default_capacity()),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+        let repositories = RecordingRunRepositories::new(None);
+        service.set_repositories(repositories.clone());
+
+        let id = service
+            .start_execution(
+                agent.id,
+                repositories_input(),
+                "test-ctx".to_string(),
+                Some(&repository_person()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the run with a repository did not start: {e}"));
+
+        let mut complaints = Vec::new();
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        match spawned
+            .volumes
+            .iter()
+            .find(|m| m.volume_id == repositories.volume)
+        {
+            Some(mount) => {
+                if mount.mount_point != PathBuf::from("/workspace/app")
+                    || mount.access_mode != AccessMode::ReadWrite
+                    || mount.remote_path != "/aegis/seaweedfs/app/repo"
+                {
+                    complaints.push(format!(
+                        "the repository is not the tree at /workspace/app, read-write: {mount:?}"
+                    ));
+                }
+            }
+            None => complaints.push(format!(
+                "the container mounts no repository: {:?}",
+                spawned.volumes
+            )),
+        }
+        if repositories.prepared.lock().unwrap().as_slice()
+            != [(Some("u-person".to_string()), id.0)]
+        {
+            complaints.push(format!(
+                "the run was not prepared once, for its person, as itself: {:?}",
+                repositories.prepared.lock().unwrap()
+            ));
+        }
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        let expected = serde_json::json!([{
+            "binding_id": REPOSITORY_BINDING,
+            "branch": crate::domain::git_repo::default_work_branch(id.0),
+        }]);
+        if execution.input.input.get("repositories") != Some(&expected) {
+            complaints.push(format!(
+                "the persisted input does not keep the run's default branch: {:?}",
+                execution.input.input.get("repositories")
+            ));
+        }
+        if !repositories.wait_for_release(id.0).await {
+            complaints.push("the run's repositories were not released when it ended".to_string());
+        }
+        if !volumes.deleted.lock().unwrap().is_empty() {
+            complaints.push(format!(
+                "the run deleted volumes: {:?}",
+                volumes.deleted.lock().unwrap()
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// G4: a run whose start fails after its repositories were prepared
+    /// releases them (here, no image can be resolved for the agent).
+    #[tokio::test]
+    async fn the_hold_is_released_when_the_run_fails() {
+        let tenant_id = CoreTenantId::consumer();
+        let mut agent = make_agent("fixer", None, None);
+        agent.manifest.spec.runtime.image = None;
+        agent.manifest.spec.runtime.language = Some("python".to_string());
+        agent.manifest.spec.runtime.version = Some("3.11".to_string());
+        let (service, runtime, _execution_repo, _event_bus) =
+            refusal_service(&tenant_id, &[&agent], &[]).await;
+        let repositories = RecordingRunRepositories::new(None);
+        service.set_repositories(repositories.clone());
+
+        let started = service
+            .start_execution(
+                agent.id,
+                repositories_input(),
+                "test-ctx".to_string(),
+                Some(&repository_person()),
+            )
+            .await;
+        assert!(
+            started.is_err(),
+            "the run started with no image: {started:?}"
+        );
+        let prepared: Vec<uuid::Uuid> = repositories
+            .prepared
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, run)| *run)
+            .collect();
+        assert_eq!(prepared.len(), 1, "the run was not prepared: {prepared:?}");
+        assert!(
+            repositories.released.lock().unwrap().contains(&prepared[0]),
+            "the failed run's repositories were not released"
+        );
+        assert_eq!(runtime.spawned.lock().unwrap().len(), 0);
+    }
+
+    /// G3: a refusal of the run's repositories refuses the start in its own
+    /// words, and nothing is saved, started or spawned.
+    #[tokio::test]
+    async fn a_refused_repository_refuses_the_start_and_nothing_starts() {
+        const SENTENCE: &str = "repository '7d1c2b3a' is not one of yours";
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("fixer", None, None);
+        let (service, runtime, execution_repo, event_bus) =
+            refusal_service(&tenant_id, &[&agent], &[]).await;
+        service.set_repositories(RecordingRunRepositories::new(Some(SENTENCE)));
+        let mut events = event_bus.subscribe();
+
+        let mut complaints = Vec::new();
+        match service
+            .start_execution(
+                agent.id,
+                repositories_input(),
+                "test-ctx".to_string(),
+                Some(&repository_person()),
+            )
+            .await
+        {
+            Ok(id) => complaints.push(format!("the run started as {id}")),
+            Err(e) => {
+                if e.to_string() != format!("Execution refused: {SENTENCE}") {
+                    complaints.push(format!("the start answered \"{e}\""));
+                }
+            }
+        }
+        complaints.extend(
+            left_behind(
+                &tenant_id,
+                agent.id,
+                &execution_repo,
+                &mut events,
+                runtime.as_ref(),
+            )
+            .await,
+        );
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// G3: a reserved `repositories` of any other shape is refused at both
+    /// starts with the sentence.
+    #[tokio::test]
+    async fn a_malformed_repositories_is_refused_at_both_starts() {
+        const REFUSAL: &str = "Execution refused: 'repositories' must be a list of objects naming a binding_id and, optionally, a branch";
+        let tenant = CoreTenantId::consumer();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("fixer", None, None);
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "zaru-consumer");
+        let (service, _execution_repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+        service.set_repositories(RecordingRunRepositories::new(None));
+        let malformed = serde_json::json!({ "tenant_id": "zaru-consumer", "task": "fix", "repositories": "app" });
+
+        let mut complaints = Vec::new();
+        match service
+            .start_execution(
+                child_agent.id,
+                input_with(malformed.clone()),
+                "test-ctx".to_string(),
+                Some(&repository_person()),
+            )
+            .await
+        {
+            Err(e) if e.to_string() == REFUSAL => {}
+            other => complaints.push(format!("the root start answered {other:?}")),
+        }
+        match service
+            .start_child_execution(child_agent.id, input_with(malformed), parent_execution.id)
+            .await
+        {
+            Err(e) if e.to_string() == REFUSAL => {}
+            other => complaints.push(format!("the child start answered {other:?}")),
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// G3, G4a: an agent state with no repositories of its own takes its
+    /// workflow execution's and mounts them under the workflow's run,
+    /// without preparing them again.
+    #[tokio::test]
+    async fn an_agent_state_takes_its_workflow_executions_repositories() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("fixer", None, None);
+        let workflow_execution_id = uuid::Uuid::new_v4();
+        let workflows = Arc::new(
+            crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new(),
+        );
+        let now = Utc::now();
+        let repositories_value = serde_json::json!([{
+            "binding_id": REPOSITORY_BINDING,
+            "branch": crate::domain::git_repo::default_work_branch(workflow_execution_id),
+        }]);
+        crate::domain::repository::WorkflowExecutionRepository::save_for_tenant(
+            workflows.as_ref(),
+            &tenant_id,
+            &crate::domain::workflow::WorkflowExecution {
+                id: crate::domain::execution::ExecutionId(workflow_execution_id),
+                workflow_id: crate::domain::workflow::WorkflowId::new(),
+                tenant_id: tenant_id.clone(),
+                status: crate::domain::execution::ExecutionStatus::Running,
+                current_state: crate::domain::workflow::StateName::new("START").unwrap(),
+                blackboard: crate::domain::workflow::Blackboard::new(),
+                input: serde_json::json!({ "topic": "fix", "repositories": repositories_value }),
+                state_outputs: HashMap::new(),
+                final_output: None,
+                started_at: now,
+                last_transition_at: now,
+                initiating_user_sub: Some("u-starter".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let (service, runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        let service = service.with_workflow_executions(workflows);
+        let repositories = RecordingRunRepositories::new(None);
+        service.set_repositories(repositories.clone());
+
+        let id = service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), workflow_execution_id),
+                "test-ctx".to_string(),
+                Some(&temporal_worker()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the state did not take its workflow's repositories: {e}"));
+
+        let mut complaints = Vec::new();
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        if execution.input.input.get("repositories") != Some(&repositories_value) {
+            complaints.push(format!(
+                "the state's persisted input lacks its workflow's repositories: {:?}",
+                execution.input.input.get("repositories")
+            ));
+        }
+        if !repositories.prepared.lock().unwrap().is_empty() {
+            complaints.push("the state prepared the run's repositories again".to_string());
+        }
+        let mounted = repositories.mounted.lock().unwrap().clone();
+        if mounted
+            != vec![(
+                Some("u-starter".to_string()),
+                workflow_execution_id,
+                repositories_value.clone(),
+            )]
+        {
+            complaints.push(format!(
+                "the state did not mount under its workflow's run: {mounted:?}"
+            ));
+        }
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        if !spawned
+            .volumes
+            .iter()
+            .any(|m| m.mount_point == PathBuf::from("/workspace/app"))
+        {
+            complaints.push(format!(
+                "the state's container has no repository: {:?}",
+                spawned.volumes
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// G3, G4a: a child with no repositories of its own takes its parent's
+    /// and mounts them under its parent's run.
+    #[tokio::test]
+    async fn a_child_execution_takes_its_parents_repositories() {
+        let tenant = CoreTenantId::from_string("u-abc123").unwrap();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("fixer", None, None);
+        let repositories_value = serde_json::json!([{
+            "binding_id": REPOSITORY_BINDING,
+            "branch": "fix/the-bug",
+        }]);
+        let mut parent_execution = make_parent_execution_with_tenant(parent_agent.id, "u-abc123");
+        parent_execution.input.input["repositories"] = repositories_value.clone();
+        parent_execution.initiating_user_sub = Some("u-abc123".to_string());
+        let (service, execution_repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+        let repositories = RecordingRunRepositories::new(None);
+        service.set_repositories(repositories.clone());
+
+        let child_id = service
+            .start_child_execution(
+                child_agent.id,
+                input_with(serde_json::json!({ "task": "fix" })),
+                parent_execution.id,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the child did not take its parent's repositories: {e}"));
+
+        let mut complaints = Vec::new();
+        let child = execution_repo
+            .find_by_id_for_tenant(&tenant, child_id)
+            .await
+            .unwrap()
+            .expect("the child was persisted");
+        if child.input.input.get("repositories") != Some(&repositories_value) {
+            complaints.push(format!(
+                "the child's persisted input lacks its parent's repositories: {:?}",
+                child.input.input.get("repositories")
+            ));
+        }
+        let mounted = repositories.mounted.lock().unwrap().clone();
+        if mounted
+            != vec![(
+                Some("u-abc123".to_string()),
+                parent_execution.id.0,
+                repositories_value.clone(),
+            )]
+        {
+            complaints.push(format!(
+                "the child did not mount under its parent's run: {mounted:?}"
+            ));
+        }
+        if !repositories.prepared.lock().unwrap().is_empty() {
+            complaints.push("the child prepared the run's repositories again".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 }
 
 struct ExecutionMonitor {
@@ -5358,26 +5956,31 @@ impl StandardExecutionService {
         match payload {
             JsonValue::Object(map)
                 if map.contains_key("outputs")
-                    || map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
+                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove("outputs");
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
+                map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
                 std::borrow::Cow::Owned(JsonValue::Object(map))
             }
             _ => std::borrow::Cow::Borrowed(payload),
         }
     }
 
-    /// The input without the reserved `contexts` (Zaru ADR-0055 D14): the
-    /// rendered prompt never carries the dispatch's binding choices.
+    /// The input without the reserved `contexts` (Zaru ADR-0055 D14) and
+    /// `repositories` (AEGIS ADR-136 G3): the rendered prompt never carries
+    /// the dispatch's binding choices or the run's repositories.
     fn without_contexts(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
         match payload {
             JsonValue::Object(map)
-                if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY) =>
+                if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
+                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
+                map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
                 std::borrow::Cow::Owned(JsonValue::Object(map))
             }
             _ => std::borrow::Cow::Borrowed(payload),
@@ -5704,6 +6307,121 @@ impl StandardExecutionService {
         }
     }
 
+    /// Keep `from`'s repositories on `input` when it carries none of its own
+    /// (AEGIS ADR-136 G3): an agent state takes its workflow execution's, a
+    /// child its parent's, as each takes its contexts.
+    fn inherit_repositories(input: &mut ExecutionInput, from: Option<&JsonValue>) {
+        let key = crate::domain::git_repo::REPOSITORIES_INPUT_KEY;
+        let Some(repositories) = from.and_then(|from| from.get(key)) else {
+            return;
+        };
+        if let JsonValue::Object(map) = &mut input.input {
+            map.entry(key.to_string())
+                .or_insert_with(|| repositories.clone());
+        }
+    }
+
+    /// AEGIS ADR-136 G3: a reserved `repositories` of any other shape
+    /// refuses the start, on every path, the HTTP execute route's (which
+    /// inserts the value unchecked) included.
+    fn refuse_malformed_repositories(input: &ExecutionInput) -> Result<()> {
+        Self::run_repository_entries(input).map(|_| ())
+    }
+
+    /// The run's repositories an input carries, read as G3 admits them.
+    fn run_repository_entries(
+        input: &ExecutionInput,
+    ) -> Result<Vec<crate::domain::git_repo::RunRepository>> {
+        match input
+            .input
+            .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+        {
+            None => Ok(Vec::new()),
+            Some(value) => crate::domain::git_repo::parse_run_repositories(value)
+                .map_err(|sentence| ExecutionError::Refused(sentence.to_string()).into()),
+        }
+    }
+
+    /// The run an execution belongs to (AEGIS ADR-136 G4a): its root's
+    /// workflow execution, or its root agent execution.
+    async fn run_of(&self, execution: &Execution) -> Result<uuid::Uuid> {
+        let root_id = execution
+            .hierarchy
+            .path
+            .first()
+            .copied()
+            .unwrap_or(execution.id);
+        let root = if root_id == execution.id {
+            None
+        } else {
+            self.repository.find_by_id_unscoped(root_id).await?
+        };
+        let root = root.as_ref().unwrap_or(execution);
+        Ok(root.input.workflow_execution_id.unwrap_or(root.id.0))
+    }
+
+    /// The mounts of a run's repositories in one of its agent executions
+    /// (AEGIS ADR-136 G3, G4, G5). With `prepare`, the run starts here: its
+    /// entries are checked, held and their work branches checked out first,
+    /// and each entry's branch is written back into `input`, so every state
+    /// and child reads the same one (G5a). Every refusal is G3's words.
+    async fn run_repository_mounts(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        prepare: bool,
+        input: &mut ExecutionInput,
+    ) -> Result<Vec<VolumeMount>> {
+        use crate::application::git_repo_service::RunRepositoryError;
+        let entries = Self::run_repository_entries(input)?;
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(repositories) = self.run_repositories.get() else {
+            return Err(ExecutionError::Refused(
+                "this node has no git repository service, so a run cannot be given repositories"
+                    .to_string(),
+            )
+            .into());
+        };
+        let refused = |e: RunRepositoryError| -> anyhow::Error {
+            match e {
+                RunRepositoryError::Refused(sentence) => ExecutionError::Refused(sentence).into(),
+                RunRepositoryError::Failed(e) => {
+                    anyhow!("preparing the run's repositories failed: {e}")
+                }
+            }
+        };
+        let entries = if prepare {
+            let filled = repositories
+                .prepare_for_run(tenant_id, person, run, &entries)
+                .await
+                .map_err(refused)?;
+            if let JsonValue::Object(map) = &mut input.input {
+                map.insert(
+                    crate::domain::git_repo::REPOSITORIES_INPUT_KEY.to_string(),
+                    serde_json::to_value(&filled)?,
+                );
+            }
+            filled
+        } else {
+            entries
+        };
+        match repositories
+            .mounts_for_run(tenant_id, person, run, &entries)
+            .await
+        {
+            Ok(mounts) => Ok(mounts.into_iter().map(|m| m.mount).collect()),
+            Err(e) => {
+                if prepare {
+                    repositories.release_run(run);
+                }
+                Err(refused(e))
+            }
+        }
+    }
+
     /// The input of the workflow execution an agent state runs in, read in
     /// the state's tenant, when the state carries a `workflow_execution_id`.
     async fn workflow_execution_input(
@@ -5890,18 +6608,26 @@ impl StandardExecutionService {
         // Zaru ADR-0055 D14: an agent state with no binding choices of its
         // own takes its workflow execution's; then D16: a required context
         // left unfilled refuses the start.
+        // AEGIS ADR-136 G3: so does it take its workflow execution's
+        // repositories.
         let mut input = input;
         if input
             .input
             .get(crate::domain::execution::CONTEXTS_INPUT_KEY)
             .is_none()
+            || input
+                .input
+                .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+                .is_none()
         {
             let workflow_input = self
                 .workflow_execution_input(&tenant_id, input.workflow_execution_id)
                 .await?;
             Self::inherit_contexts(&mut input, workflow_input.as_ref());
+            Self::inherit_repositories(&mut input, workflow_input.as_ref());
         }
         Self::refuse_malformed_contexts(&input)?;
+        Self::refuse_malformed_repositories(&input)?;
         Self::refuse_unfilled_context(&agent, &input)?;
 
         // ADR-102: Use manifest-declared security_context if present; otherwise use caller's context.
@@ -6026,6 +6752,32 @@ impl StandardExecutionService {
             &persisted_input,
         )
         .await?;
+
+        // AEGIS ADR-136 G3 to G5: the run's repositories, before any record
+        // or container. A root agent execution is its own run and prepares
+        // them (checked, held, each work branch checked out); a workflow's
+        // agent state mounts under its workflow execution's run.
+        let run = workflow_execution_id.unwrap_or(execution_id.0);
+        let prepares_run = workflow_execution_id.is_none();
+        let person = execution.initiating_user_sub.clone();
+        let repository_mounts = self
+            .run_repository_mounts(
+                &tenant_id,
+                person.as_deref(),
+                run,
+                prepares_run,
+                &mut execution.input,
+            )
+            .await?;
+        // Until the supervisor's task owns it, an early return releases the
+        // run's repositories (G4: however the run ends).
+        let release_guard = crate::application::git_repo_service::RunHoldGuard::new(
+            self.run_repositories
+                .get()
+                .filter(|_| prepares_run && !repository_mounts.is_empty())
+                .cloned(),
+            run,
+        );
 
         // 3. Save initial state
         self.repository
@@ -6280,7 +7032,7 @@ impl StandardExecutionService {
             "Checking for volumes in agent manifest: {} volume(s) specified",
             agent.manifest.spec.volumes.len()
         );
-        let volume_mounts = if !manifest_volume_specs.is_empty() {
+        let mut volume_mounts = if !manifest_volume_specs.is_empty() {
             tracing::info!("Creating volumes for execution {}", execution_id.0);
 
             // Get storage config from node config
@@ -6327,6 +7079,10 @@ impl StandardExecutionService {
         } else {
             Vec::new()
         };
+
+        // AEGIS ADR-136 G4: each of the run's repositories at
+        // `/workspace/<label>`, beside the manifest's own volumes.
+        volume_mounts.extend(repository_mounts);
 
         // Mount policy: all mount points must live under /workspace, and must not overlap.
         if !volume_mounts.is_empty() || workflow_workspace.is_some() {
@@ -6585,6 +7341,9 @@ impl StandardExecutionService {
         let intent_for_handler = persisted_input.intent.clone();
 
         tokio::spawn(async move {
+            // The run's repositories are released when this task ends,
+            // however the execution ends (AEGIS ADR-136 G4).
+            let _release_guard = release_guard;
             let result = supervisor
                 .run_loop(
                     runtime_config,
@@ -6973,6 +7732,20 @@ impl ExecutionService for StandardExecutionService {
         // person, and every binding it chose or took is checked as theirs.
         self.refuse_unusable_contexts(&tenant_id, parent.initiating_user_sub.as_deref(), &input)
             .await?;
+        // AEGIS ADR-136 G3, G4: a child takes its parent's repositories and
+        // mounts them under its run's hold, without checking out again.
+        Self::inherit_repositories(&mut input, Some(&parent.input.input));
+        Self::refuse_malformed_repositories(&input)?;
+        let run = self.run_of(&parent).await?;
+        let repository_mounts = self
+            .run_repository_mounts(
+                &tenant_id,
+                parent.initiating_user_sub.as_deref(),
+                run,
+                false,
+                &mut input,
+            )
+            .await?;
         // 3. Prepare input (render judge's prompt template). The persisted
         // copy preserves the caller's intent; the runtime copy carries the
         // rendered prompt for the supervisor.
@@ -7113,7 +7886,7 @@ impl ExecutionService for StandardExecutionService {
         };
 
         // Provision the judge's own declared volumes from its manifest (mirrors start_execution logic).
-        let own_volume_mounts = if !agent.manifest.spec.volumes.is_empty() {
+        let mut own_volume_mounts = if !agent.manifest.spec.volumes.is_empty() {
             tracing::info!(
                 "Creating volumes for child execution {}",
                 child_execution_id.0
@@ -7163,6 +7936,10 @@ impl ExecutionService for StandardExecutionService {
         } else {
             Vec::new()
         };
+
+        // AEGIS ADR-136 G4: the run's repositories at `/workspace/<label>`,
+        // checked with the child's own volumes.
+        own_volume_mounts.extend(repository_mounts);
 
         // Validate own volume mount paths (must be under /workspace, no overlaps with each other
         // or with inherited mounts).

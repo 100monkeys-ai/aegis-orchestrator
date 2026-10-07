@@ -159,6 +159,8 @@ impl IntoRefusal for GitRepoError {
                 CallerAnswer::InvalidArguments(format!("Invalid tool arguments: {self}"))
             }
             GitRepoError::CredentialNotYours => CallerAnswer::InvalidArguments(self.to_string()),
+            // AEGIS ADR-136 G4a: a binding a run holds, in the run's words.
+            GitRepoError::HeldByRun { .. } => CallerAnswer::Conflict(self.to_string()),
             GitRepoError::NothingToCommit
             | GitRepoError::BindingBusy(_)
             | GitRepoError::NoHeadBranch => CallerAnswer::Conflict(format!("Conflict: {self}.")),

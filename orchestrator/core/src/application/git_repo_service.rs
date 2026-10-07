@@ -60,15 +60,16 @@ use crate::domain::credential::{
 };
 use crate::domain::git_host_keys::{host_keys_for, ssh_remote, SshHostKey};
 use crate::domain::git_repo::{
-    validate_repo_url, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
-    GitRepoBindingRepository, GitRepoEvent, GitRepoStatus,
+    default_work_branch, is_mountable_label, validate_repo_url, CloneStrategy, GitRef,
+    GitRepoBinding, GitRepoBindingId, GitRepoBindingRepository, GitRepoEvent, GitRepoStatus,
+    RunRepository,
 };
 use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
 use crate::domain::iam::ZaruTier;
 use crate::domain::repository::RepositoryError;
 use crate::domain::secrets::{AccessContext, SensitiveString, SensitiveUrl};
 use crate::domain::shared_kernel::TenantId;
-use crate::domain::volume::{Volume, VolumeBackend, VolumeOwnership};
+use crate::domain::volume::{AccessMode, Volume, VolumeBackend, VolumeMount, VolumeOwnership};
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::secrets_manager::SecretsManager;
 
@@ -236,6 +237,12 @@ pub enum GitRepoError {
     /// class as [`Self::CloneFailed`]).
     #[error("git operation failed: {0}")]
     GitFailed(String),
+
+    /// The binding is mounted in a run, which holds it until the run ends;
+    /// refresh, delete, commit and push from outside that run are refused
+    /// (AEGIS ADR-136 G4, G4a). Maps to HTTP `409 Conflict`.
+    #[error("repository '{label}' is in use by a run; try again when it has ended")]
+    HeldByRun { label: String },
 }
 
 impl From<UserVolumeError> for GitRepoError {
@@ -316,6 +323,10 @@ pub struct GitRepoService {
     event_bus: Arc<EventBus>,
     /// Orchestrator identifier used in [`AccessContext`] audit rows.
     orchestrator_id: String,
+    /// The run each held binding is mounted in (AEGIS ADR-136 G4a): the
+    /// workflow execution, or the root agent execution. Kept in memory, as
+    /// the per-volume step locks are: a restart clears it.
+    run_holds: std::sync::Mutex<std::collections::HashMap<GitRepoBindingId, uuid::Uuid>>,
 }
 
 impl GitRepoService {
@@ -335,6 +346,7 @@ impl GitRepoService {
             access_tokens: None,
             event_bus,
             orchestrator_id: "git-repo-service".to_string(),
+            run_holds: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -589,6 +601,7 @@ impl GitRepoService {
     /// Invoked by the webhook handler once the HMAC signature has been
     /// verified.
     async fn do_refresh(&self, binding: &mut GitRepoBinding) -> Result<(), GitRepoError> {
+        self.refuse_if_held(binding)?;
         let old_sha = binding
             .last_commit_sha
             .clone()
@@ -731,6 +744,7 @@ impl GitRepoService {
         owner: &str,
     ) -> Result<(), GitRepoError> {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
+        self.refuse_if_held(&binding)?;
         let volume_id = binding.volume_id;
         let _ = self.volume_service.delete_volume(&volume_id, owner).await;
         binding.mark_deleted();
@@ -767,6 +781,7 @@ impl GitRepoService {
     ) -> Result<String, GitRepoError> {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
         ensure_binding_ready(&binding)?;
+        self.refuse_if_held(&binding)?;
         // A commit reads no credential, but a binding naming one that is not
         // the caller's active credential is refused here too (AEGIS ADR-136
         // G2).
@@ -832,6 +847,7 @@ impl GitRepoService {
     ) -> Result<(), GitRepoError> {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
         ensure_binding_ready(&binding)?;
+        self.refuse_if_held(&binding)?;
 
         let tree = self.resolve_tree(&binding).await?;
         // A push from a volume goes only where the binding's credential
@@ -1206,6 +1222,236 @@ impl GitRepoService {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // A run's repositories (AEGIS ADR-136 G3, G4, G5; G3a, G4a, G5a)
+    // -----------------------------------------------------------------------
+
+    /// Refuse an act on a binding a run holds, from outside that run (G4a).
+    fn refuse_if_held(&self, binding: &GitRepoBinding) -> Result<(), GitRepoError> {
+        let holds = self.run_holds.lock().expect("run holds lock");
+        if holds.contains_key(&binding.id) {
+            return Err(GitRepoError::HeldByRun {
+                label: binding.label.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The run holding `id`, if any.
+    pub fn run_holding(&self, id: &GitRepoBindingId) -> Option<uuid::Uuid> {
+        self.run_holds
+            .lock()
+            .expect("run holds lock")
+            .get(id)
+            .copied()
+    }
+
+    /// Hold `binding` for `run`, or refuse when another run holds it.
+    /// Answers whether this call took the hold.
+    fn hold_for_run(&self, binding: &GitRepoBinding, run: uuid::Uuid) -> Result<bool, String> {
+        let mut holds = self.run_holds.lock().expect("run holds lock");
+        match holds.get(&binding.id) {
+            Some(holder) if *holder == run => Ok(false),
+            Some(_) => Err(format!(
+                "repository '{}' is in use by another run",
+                binding.label
+            )),
+            None => {
+                holds.insert(binding.id, run);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Release every binding `run` holds.
+    pub fn release_run(&self, run: uuid::Uuid) {
+        let mut holds = self.run_holds.lock().expect("run holds lock");
+        let before = holds.len();
+        holds.retain(|_, holder| *holder != run);
+        if holds.len() != before {
+            info!(run = %run, released = before - holds.len(), "a run's repositories released");
+        }
+    }
+
+    /// Release a run's repositories when it ends, however it ends: a root
+    /// agent execution's end events and a workflow execution's (AEGIS
+    /// ADR-136 G4). A run that is neither holds nothing, and its release is
+    /// a no-op.
+    pub fn release_runs_on_end(self: Arc<Self>) {
+        let mut events = self.event_bus.subscribe();
+        tokio::spawn(async move {
+            use crate::domain::events::{ExecutionEvent, WorkflowEvent};
+            use crate::infrastructure::event_bus::{DomainEvent, EventBusError};
+            loop {
+                let run = match events.recv().await {
+                    Ok(DomainEvent::Execution(
+                        ExecutionEvent::ExecutionCompleted { execution_id, .. }
+                        | ExecutionEvent::ExecutionFailed { execution_id, .. }
+                        | ExecutionEvent::ExecutionCancelled { execution_id, .. }
+                        | ExecutionEvent::ExecutionTimedOut { execution_id, .. },
+                    )) => execution_id.0,
+                    Ok(DomainEvent::Workflow(
+                        WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. }
+                        | WorkflowEvent::WorkflowExecutionFailed { execution_id, .. }
+                        | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. },
+                    )) => execution_id.0,
+                    Ok(_) => continue,
+                    Err(EventBusError::Lagged(n)) => {
+                        warn!(skipped = n, "repository release listener lagged");
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                self.release_run(run);
+            }
+        });
+    }
+
+    /// The binding a run names, read for `person` in `tenant_id`, with its
+    /// label checked as a directory name; another person's binding is named
+    /// by the first eight hex digits of its id (G3a).
+    async fn run_binding(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        entry: &RunRepository,
+    ) -> Result<GitRepoBinding, RunRepositoryError> {
+        let not_yours = || {
+            RunRepositoryError::Refused(format!(
+                "repository '{}' is not one of yours",
+                &entry.binding_id.0.to_string()[..8]
+            ))
+        };
+        let Some(person) = person else {
+            return Err(not_yours());
+        };
+        let binding = match self.get_binding(&entry.binding_id, tenant_id, person).await {
+            Ok(binding) => binding,
+            Err(GitRepoError::BindingNotFound | GitRepoError::NotOwned) => return Err(not_yours()),
+            Err(e) => return Err(RunRepositoryError::Failed(e)),
+        };
+        if !is_mountable_label(&binding.label) {
+            return Err(RunRepositoryError::Refused(format!(
+                "repository '{}' cannot be mounted: its label must be letters, digits, '.', '_' or '-'",
+                binding.label
+            )));
+        }
+        if binding.status != GitRepoStatus::Ready {
+            return Err(RunRepositoryError::Refused(format!(
+                "repository '{}' is not ready (it is {}); start the run when its clone has finished",
+                binding.label,
+                status_word(&binding.status)
+            )));
+        }
+        Ok(binding)
+    }
+
+    /// Fetch the binding's ref and check out `branch` in its tree (G5,
+    /// G5a): the remote's copy when the remote has the branch, else the
+    /// branch created from the ref. Answers the commit the run starts from
+    /// and whether the branch was created.
+    async fn check_out_work_branch(
+        &self,
+        binding: &GitRepoBinding,
+        owner: &str,
+        branch: &str,
+    ) -> Result<(String, bool), GitRepoError> {
+        let credential = self.resolve_credential(binding, Some(owner)).await?;
+        match self.resolve_tree(binding).await? {
+            Tree::Host(target_dir) => {
+                let repo_url = binding.repo_url.clone();
+                let git_ref = binding.git_ref.clone();
+                let ssh_host_keys = binding.ssh_host_keys.clone();
+                let branch = branch.to_string();
+                tokio::task::spawn_blocking(move || {
+                    work_branch_in_dir(
+                        &target_dir,
+                        &repo_url,
+                        &git_ref,
+                        &branch,
+                        credential,
+                        &ssh_host_keys,
+                    )
+                })
+                .await
+                .map_err(|e| GitRepoError::GitFailed(format!("branch task panicked: {e}")))?
+            }
+            Tree::Volume(volume) => self
+                .clone_executor
+                .work_branch_ephemeral(binding, &volume, branch, credential)
+                .await
+                .map_err(step_error),
+        }
+    }
+
+    /// The mount of a binding's working tree at `/workspace/<label>` (G3a):
+    /// a host directory's root, or the `repo` directory of any other volume.
+    async fn tree_mount(&self, binding: &GitRepoBinding) -> Result<VolumeMount, GitRepoError> {
+        let mount_point = PathBuf::from(format!("/workspace/{}", binding.label));
+        Ok(match self.resolve_tree(binding).await? {
+            Tree::Host(_) => {
+                let volume = self
+                    .volume_service
+                    .volume_repo
+                    .find_by_id(binding.volume_id)
+                    .await
+                    .map_err(|e| GitRepoError::VolumeProvisioningFailed(e.to_string()))?
+                    .ok_or_else(|| {
+                        GitRepoError::VolumeProvisioningFailed(format!(
+                            "volume {} not found for binding {}",
+                            binding.volume_id, binding.id
+                        ))
+                    })?;
+                volume.to_mount(mount_point, AccessMode::ReadWrite)
+            }
+            Tree::Volume(volume) => {
+                let mut mount = volume.to_mount(mount_point, AccessMode::ReadWrite);
+                mount.remote_path = format!("{}/repo", mount.remote_path.trim_end_matches('/'));
+                mount
+            }
+        })
+    }
+
+    /// Every check of G3 and G3a on a run's entries, before anything is
+    /// held: each binding the person's, Ready, with a mountable label named
+    /// once, its work branch (the run's default when none is given, G5a)
+    /// not the binding's ref.
+    async fn checked_entries(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        entries: &[RunRepository],
+    ) -> Result<Vec<(GitRepoBinding, String)>, RunRepositoryError> {
+        let mut checked: Vec<(GitRepoBinding, String)> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let binding = self.run_binding(tenant_id, person, entry).await?;
+            if checked
+                .iter()
+                .any(|(other, _)| other.label == binding.label)
+            {
+                return Err(RunRepositoryError::Refused(format!(
+                    "repository '{}' is named twice",
+                    binding.label
+                )));
+            }
+            let branch = entry
+                .branch
+                .clone()
+                .unwrap_or_else(|| default_work_branch(run));
+            let ref_name = match &binding.git_ref {
+                GitRef::Branch(name) | GitRef::Tag(name) | GitRef::Commit(name) => name,
+            };
+            if &branch == ref_name {
+                return Err(RunRepositoryError::Refused(format!(
+                    "a run works on its own branch, not on '{ref_name}'"
+                )));
+            }
+            checked.push((binding, branch));
+        }
+        Ok(checked)
+    }
+
     fn drain_and_publish(&self, binding: &mut GitRepoBinding) {
         for event in binding.take_events() {
             self.event_bus.publish_git_repo_event(event);
@@ -1306,6 +1552,335 @@ enum Tree {
     Host(PathBuf),
     /// Any other volume, worked by a git step that mounts it.
     Volume(Box<Volume>),
+}
+
+// ============================================================================
+// A run's repositories (AEGIS ADR-136 G3, G4, G5)
+// ============================================================================
+
+/// Why a run's repositories could not be prepared or mounted: a refusal of
+/// G3 or G3a, answered to the caller in its own words, or a failure of the
+/// git path.
+#[derive(Debug, Error)]
+pub enum RunRepositoryError {
+    #[error("{0}")]
+    Refused(String),
+    #[error(transparent)]
+    Failed(#[from] GitRepoError),
+}
+
+/// One repository mounted in a run's container.
+#[derive(Debug, Clone)]
+pub struct RunMount {
+    pub label: String,
+    pub mount: VolumeMount,
+}
+
+/// What a run needs of its repositories: prepared once when the run starts
+/// (checked, held, the work branch checked out), mounted in each of its
+/// agent executions, released when it ends (AEGIS ADR-136 G3 to G5).
+#[async_trait]
+pub trait RunRepositories: Send + Sync {
+    /// At a run's start, before any container: every entry checked (G3,
+    /// G3a), every binding held for `run` (G4a), each work branch checked
+    /// out (G5, G5a). Answers the entries with each branch filled in, the
+    /// run's default where none was given. Nothing stays held on a refusal.
+    async fn prepare_for_run(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        entries: &[RunRepository],
+    ) -> Result<Vec<RunRepository>, RunRepositoryError>;
+
+    /// For each agent execution of `run` (its root, a workflow state, a
+    /// child): the entries checked again and the mount of each tree at
+    /// `/workspace/<label>`. A binding no run holds is held for `run` again
+    /// (after a restart, G4a); one another run holds is refused.
+    async fn mounts_for_run(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        entries: &[RunRepository],
+    ) -> Result<Vec<RunMount>, RunRepositoryError>;
+
+    /// Release every binding `run` holds.
+    fn release_run(&self, run: uuid::Uuid);
+}
+
+#[async_trait]
+impl RunRepositories for GitRepoService {
+    async fn prepare_for_run(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        entries: &[RunRepository],
+    ) -> Result<Vec<RunRepository>, RunRepositoryError> {
+        let checked = self
+            .checked_entries(tenant_id, person, run, entries)
+            .await?;
+        let mut taken = Vec::new();
+        for (binding, _) in &checked {
+            match self.hold_for_run(binding, run) {
+                Ok(true) => taken.push(binding.id),
+                Ok(false) => {}
+                Err(sentence) => {
+                    self.release_ids(run, &taken);
+                    return Err(RunRepositoryError::Refused(sentence));
+                }
+            }
+        }
+        let owner = person.unwrap_or_default();
+        let mut prepared = Vec::with_capacity(checked.len());
+        for (binding, branch) in checked {
+            match self.check_out_work_branch(&binding, owner, &branch).await {
+                Ok((started_from, created)) => {
+                    // The narrative row is G5b's; until then the preparation is logged.
+                    info!(
+                        run = %run,
+                        repository = %binding.label,
+                        branch = %branch,
+                        started_from = %started_from,
+                        created,
+                        "a run's repository is prepared"
+                    );
+                    prepared.push(RunRepository {
+                        binding_id: binding.id,
+                        branch: Some(branch),
+                    });
+                }
+                Err(e) => {
+                    self.release_ids(run, &taken);
+                    return Err(RunRepositoryError::Failed(e));
+                }
+            }
+        }
+        Ok(prepared)
+    }
+
+    async fn mounts_for_run(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        entries: &[RunRepository],
+    ) -> Result<Vec<RunMount>, RunRepositoryError> {
+        let checked = self
+            .checked_entries(tenant_id, person, run, entries)
+            .await?;
+        let mut mounts = Vec::with_capacity(checked.len());
+        for (binding, _) in &checked {
+            self.hold_for_run(binding, run)
+                .map_err(RunRepositoryError::Refused)?;
+            mounts.push(RunMount {
+                label: binding.label.clone(),
+                mount: self.tree_mount(binding).await?,
+            });
+        }
+        Ok(mounts)
+    }
+
+    fn release_run(&self, run: uuid::Uuid) {
+        GitRepoService::release_run(self, run);
+    }
+}
+
+/// Releases a run's repositories when dropped, unless it was given none or
+/// was disarmed (AEGIS ADR-136 G4): every early return of a start after the
+/// run was prepared, and the end of the task that runs it, drop it.
+pub struct RunHoldGuard {
+    repositories: Option<Arc<dyn RunRepositories>>,
+    run: uuid::Uuid,
+}
+
+impl RunHoldGuard {
+    pub fn new(repositories: Option<Arc<dyn RunRepositories>>, run: uuid::Uuid) -> Self {
+        Self { repositories, run }
+    }
+
+    /// Keep the hold: the run has started and its end releases it.
+    pub fn disarm(mut self) {
+        self.repositories = None;
+    }
+}
+
+impl Drop for RunHoldGuard {
+    fn drop(&mut self) {
+        if let Some(repositories) = self.repositories.take() {
+            repositories.release_run(self.run);
+        }
+    }
+}
+
+impl GitRepoService {
+    /// Release the holds `run` took in a call that is now refused.
+    fn release_ids(&self, run: uuid::Uuid, ids: &[GitRepoBindingId]) {
+        let mut holds = self.run_holds.lock().expect("run holds lock");
+        for id in ids {
+            if holds.get(id) == Some(&run) {
+                holds.remove(id);
+            }
+        }
+    }
+}
+
+/// The word a refusal uses for a binding's status (G3).
+fn status_word(status: &GitRepoStatus) -> &'static str {
+    match status {
+        GitRepoStatus::Pending => "pending",
+        GitRepoStatus::Cloning => "cloning",
+        GitRepoStatus::Ready => "ready",
+        GitRepoStatus::Refreshing => "refreshing",
+        GitRepoStatus::Failed { .. } => "failed",
+        GitRepoStatus::Deleted => "deleted",
+    }
+}
+
+/// Attach `credential` to `callbacks`, as a push does. The guard of an SSH
+/// key must outlive the git call.
+fn attach_credential(
+    callbacks: &mut git2::RemoteCallbacks<'_>,
+    credential: Option<&ResolvedCredential>,
+) -> Result<Option<crate::application::git_ssh_key::SshKeyTempFile>, GitRepoError> {
+    match credential {
+        None => Ok(None),
+        Some(ResolvedCredential::HttpsPat { username, token }) => {
+            let username = username.clone();
+            let token = token.clone();
+            callbacks.credentials(move |_url, _user_from_url, _allowed| {
+                git2::Cred::userpass_plaintext(&username, token.expose())
+            });
+            Ok(None)
+        }
+        Some(ResolvedCredential::SshKey {
+            private_key_pem,
+            passphrase,
+        }) => attach_ssh_credentials(
+            callbacks,
+            private_key_pem.expose(),
+            passphrase.as_ref().map(|p| p.expose()),
+        )
+        .map(Some)
+        .map_err(|e| GitRepoError::GitFailed(e.to_string())),
+    }
+}
+
+/// The work-branch checkout on a host directory, by libgit2 (AEGIS ADR-136
+/// G5a): `origin` pointed at the binding's URL, the ref fetched; the
+/// remote's copy of `branch` checked out when the remote lists it, else
+/// `branch` created from the ref; untracked files that are not ignored
+/// removed. An error's text holds no part of the credential.
+fn work_branch_in_dir(
+    target_dir: &std::path::Path,
+    repo_url: &SensitiveUrl,
+    git_ref: &GitRef,
+    branch: &str,
+    credential: Option<ResolvedCredential>,
+    ssh_host_keys: &[crate::domain::git_host_keys::SshHostKey],
+) -> Result<(String, bool), GitRepoError> {
+    let (url, credential) = clone_credential(repo_url.expose(), credential);
+    let secrets = credential_secrets(credential.as_ref());
+    let git = |e: git2::Error| GitRepoError::GitFailed(redact_git_output(e.message(), &secrets));
+    let keys = host_keys_for(&url, ssh_host_keys).map_err(GitRepoError::GitFailed)?;
+    let callbacks = || -> Result<_, GitRepoError> {
+        let mut callbacks = git2::RemoteCallbacks::new();
+        if let Some(keys) = keys.clone() {
+            check_ssh_host_key(&mut callbacks, keys);
+        }
+        let guard = attach_credential(&mut callbacks, credential.as_ref())?;
+        Ok((callbacks, guard))
+    };
+
+    let repo = git2::Repository::open(target_dir).map_err(git)?;
+    if repo.find_remote("origin").is_ok() {
+        repo.remote_set_url("origin", &url).map_err(git)?;
+    } else {
+        repo.remote("origin", &url).map_err(git)?;
+    }
+    let mut remote = repo.find_remote("origin").map_err(git)?;
+
+    // Does the remote have the branch? (`ls-remote`)
+    let branch_ref = format!("refs/heads/{branch}");
+    let on_remote = {
+        let (cbs, _guard) = callbacks()?;
+        let connection = remote
+            .connect_auth(git2::Direction::Fetch, Some(cbs), None)
+            .map_err(git)?;
+        let listed = connection.list().map_err(git)?;
+        listed.iter().any(|head| head.name() == branch_ref)
+    };
+
+    let mut refspecs: Vec<String> = match git_ref {
+        GitRef::Branch(name) => vec![format!("+refs/heads/{name}:refs/remotes/origin/{name}")],
+        GitRef::Tag(name) => vec![format!("+refs/tags/{name}:refs/tags/{name}")],
+        GitRef::Commit(_) => vec![
+            "+refs/heads/*:refs/remotes/origin/*".to_string(),
+            "+refs/tags/*:refs/tags/*".to_string(),
+        ],
+    };
+    if on_remote {
+        refspecs.push(format!("+{branch_ref}:refs/remotes/origin/{branch}"));
+    }
+    {
+        let (cbs, _guard) = callbacks()?;
+        let mut fetch_opts = git2::FetchOptions::new();
+        fetch_opts.remote_callbacks(cbs);
+        let specs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
+        remote
+            .fetch(&specs, Some(&mut fetch_opts), None)
+            .map_err(git)?;
+    }
+
+    let start = if on_remote {
+        repo.find_reference(&format!("refs/remotes/origin/{branch}"))
+            .and_then(|r| r.peel_to_commit())
+            .map_err(git)?
+    } else {
+        match git_ref {
+            GitRef::Branch(name) => repo
+                .find_reference(&format!("refs/remotes/origin/{name}"))
+                .and_then(|r| r.peel_to_commit()),
+            GitRef::Tag(name) => repo
+                .find_reference(&format!("refs/tags/{name}"))
+                .and_then(|r| r.peel_to_commit()),
+            GitRef::Commit(sha) => git2::Oid::from_str(sha).and_then(|oid| repo.find_commit(oid)),
+        }
+        .map_err(git)?
+    };
+
+    // `checkout --force -B <branch> <start>`: HEAD leaves the branch first,
+    // since libgit2 will not move the branch HEAD is on.
+    repo.set_head_detached(start.id()).map_err(git)?;
+    repo.branch(branch, &start, true).map_err(git)?;
+    repo.set_head(&branch_ref).map_err(git)?;
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .map_err(git)?;
+
+    // `clean -ffd`: untracked files and directories that are not ignored.
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false);
+    let untracked: Vec<PathBuf> = repo
+        .statuses(Some(&mut options))
+        .map_err(git)?
+        .iter()
+        .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
+        .filter_map(|entry| entry.path().ok().map(|p| target_dir.join(p)))
+        .collect();
+    for path in untracked {
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| GitRepoError::GitFailed(format!("clean: {e}")))?;
+    }
+
+    Ok((start.id().to_string(), !on_remote))
 }
 
 /// A git step's failure as the commit, push and diff calls answer it.

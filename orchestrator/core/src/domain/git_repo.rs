@@ -521,6 +521,94 @@ pub trait GitRepoBindingRepository: Send + Sync {
 }
 
 // ============================================================================
+// A run's repositories (AEGIS ADR-136 G3, G3a, G5a)
+// ============================================================================
+
+/// The reserved key of an execution's `input` that carries the run's
+/// repositories, `[{"binding_id": "<git repository binding id>", "branch":
+/// "<work branch>"?}]` (AEGIS ADR-136 G3). Like `contexts`, it is the
+/// platform's and never the agent's: the input schema and the rendered prompt
+/// never see it, and an agent state or a child takes its run's.
+pub const REPOSITORIES_INPUT_KEY: &str = "repositories";
+
+/// The refusal of a `repositories` value of any other shape (AEGIS ADR-136
+/// G3).
+pub const REPOSITORIES_SHAPE: &str =
+    "'repositories' must be a list of objects naming a binding_id and, optionally, a branch";
+
+/// One repository a run is given: the binding, and the work branch the run
+/// works on. A start with no `branch` fills in the run's default once
+/// (G5a), so every state and child of the run reads the same branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRepository {
+    pub binding_id: GitRepoBindingId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Read a `repositories` value as G3 admits it: a list of objects whose only
+/// keys are `binding_id` (a UUID) and, optionally, `branch` (a name git
+/// accepts for a branch). Anything else answers [`REPOSITORIES_SHAPE`].
+pub fn parse_run_repositories(
+    value: &serde_json::Value,
+) -> Result<Vec<RunRepository>, &'static str> {
+    let serde_json::Value::Array(items) = value else {
+        return Err(REPOSITORIES_SHAPE);
+    };
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let serde_json::Value::Object(map) = item else {
+            return Err(REPOSITORIES_SHAPE);
+        };
+        if map.keys().any(|key| key != "binding_id" && key != "branch") {
+            return Err(REPOSITORIES_SHAPE);
+        }
+        let binding_id = match map.get("binding_id") {
+            Some(serde_json::Value::String(id)) => {
+                Uuid::parse_str(id).map_err(|_| REPOSITORIES_SHAPE)?
+            }
+            _ => return Err(REPOSITORIES_SHAPE),
+        };
+        let branch = match map.get("branch") {
+            None => None,
+            Some(serde_json::Value::String(branch)) if is_branch_name(branch) => {
+                Some(branch.clone())
+            }
+            Some(_) => return Err(REPOSITORIES_SHAPE),
+        };
+        entries.push(RunRepository {
+            binding_id: GitRepoBindingId(binding_id),
+            branch,
+        });
+    }
+    Ok(entries)
+}
+
+/// Whether `name` is a name git accepts for a branch (`refs/heads/<name>`).
+pub fn is_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && git2::Reference::is_valid_name(&format!("refs/heads/{name}"))
+}
+
+/// Whether `label` can name the directory `/workspace/<label>` (AEGIS
+/// ADR-136 G3a): letters, digits, '.', '_' or '-', and not `.` or `..`.
+pub fn is_mountable_label(label: &str) -> bool {
+    !label.is_empty()
+        && label != "."
+        && label != ".."
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The run's default work branch (AEGIS ADR-136 G5, G5a): `aegis/` and the
+/// first eight characters of the run's execution id.
+pub fn default_work_branch(run: Uuid) -> String {
+    format!("aegis/{}", &run.to_string()[..8])
+}
+
+// ============================================================================
 // URL Validation (ADR-081 §Security Considerations)
 // ============================================================================
 

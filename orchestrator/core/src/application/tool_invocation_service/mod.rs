@@ -21,6 +21,7 @@ mod goals;
 mod mail_tools_tests;
 #[cfg(test)]
 mod operator_escalation_tests;
+mod repository_args;
 mod runtime;
 mod storage;
 mod summary;

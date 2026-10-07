@@ -56,6 +56,7 @@ impl ToolInvocationService {
         // Zaru ADR-0055 D14: the dispatch's binding choices ride in the
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut input)?;
+        super::repository_args::carry_repositories(args, &mut input)?;
 
         // Resolve and inject the caller's tenant_id into the payload so that
         // start_execution (and any cluster forwarding) picks up the correct tenant.
