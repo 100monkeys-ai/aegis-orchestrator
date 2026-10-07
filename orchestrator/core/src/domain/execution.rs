@@ -240,14 +240,21 @@ pub struct ExecutionInput {
 }
 
 /// The reserved key of an execution's `input` that carries the person's
-/// choice of a credential binding for each remote tool server, as
-/// `{"<server>": "<binding id>" | null}` (Zaru ADR-0055 D9, D14). Like the
-/// caller's `outputs`, it is the platform's and never the agent's: the input
-/// schema and the rendered prompt never see it.
+/// choice of credential bindings for each remote tool server, as
+/// `{"<server>": "<binding id>" | ["<binding id>", ...] | null}` (Zaru
+/// ADR-0055 D9, D14; AEGIS ADR-132 Update (13) S11a). Like the caller's
+/// `outputs`, it is the platform's and never the agent's: the input schema
+/// and the rendered prompt never see it.
 pub const CONTEXTS_INPUT_KEY: &str = "contexts";
 
-/// What an execution's dispatch chose for one remote server's credential
-/// (Zaru ADR-0055 D2, D9, D15).
+/// The refusal of a `contexts` value of any shape but S11a's, before
+/// anything starts or is called (AEGIS ADR-132 Update (13) S11a).
+pub const CONTEXTS_SHAPE: &str = "'contexts' must be an object naming, for each server, a binding id, a list of binding ids, or null";
+
+/// What a call's dispatch chose for one remote server's credential (Zaru
+/// ADR-0055 D2, D9, D15): the one binding a call carries, after the call
+/// picked it from its server's chosen set (AEGIS ADR-132 Update (13) S11b,
+/// S11e).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextChoice {
     /// The dispatch named nothing for the server: the per-agent grant path
@@ -262,49 +269,120 @@ pub enum ContextChoice {
     Binding(crate::domain::credential::CredentialBindingId),
 }
 
+/// What an execution's dispatch chose for one server (AEGIS ADR-132 Update
+/// (13) S11b): nothing, none, or a non-empty set of the person's bindings in
+/// the order the person chose them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerChoice {
+    /// The dispatch named nothing for the server: the grant path stands.
+    NotGiven,
+    /// The dispatch named `null`, or a value that cannot be read: no
+    /// credential for the server, whatever is granted.
+    None,
+    /// The bindings chosen, distinct, at least one, in the person's order.
+    Bindings(Vec<crate::domain::credential::CredentialBindingId>),
+}
+
+impl ServerChoice {
+    /// The one binding a call carries when the set holds exactly one, or
+    /// the choice of nothing or none as it stands; `None` for a set of two
+    /// or more, where the call must say which (S11e).
+    pub fn single(&self) -> Option<ContextChoice> {
+        match self {
+            ServerChoice::NotGiven => Some(ContextChoice::NotGiven),
+            ServerChoice::None => Some(ContextChoice::None),
+            ServerChoice::Bindings(ids) if ids.len() == 1 => Some(ContextChoice::Binding(ids[0])),
+            ServerChoice::Bindings(_) => None,
+        }
+    }
+}
+
+/// One server's value in `contexts` read as S11a admits it: `null` is none,
+/// a binding id is a set of one, a non-empty list of distinct binding ids is
+/// that set; anything else is `None` (unreadable).
+fn read_server_value(value: &serde_json::Value) -> Option<ServerChoice> {
+    let binding = |value: &serde_json::Value| match value {
+        serde_json::Value::String(id) => uuid::Uuid::parse_str(id)
+            .ok()
+            .map(crate::domain::credential::CredentialBindingId),
+        _ => None,
+    };
+    match value {
+        serde_json::Value::Null => Some(ServerChoice::None),
+        serde_json::Value::String(_) => binding(value).map(|id| ServerChoice::Bindings(vec![id])),
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            let mut ids = Vec::with_capacity(items.len());
+            for item in items {
+                let id = binding(item)?;
+                if ids.contains(&id) {
+                    return None;
+                }
+                ids.push(id);
+            }
+            Some(ServerChoice::Bindings(ids))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `value` is a `contexts` S11a admits: an object whose every value
+/// is `null`, a binding id, or a non-empty list of distinct binding ids.
+/// Anything else answers [`CONTEXTS_SHAPE`].
+pub fn check_contexts_shape(value: &serde_json::Value) -> Result<(), &'static str> {
+    match value {
+        serde_json::Value::Object(map) if map.values().all(|v| read_server_value(v).is_some()) => {
+            Ok(())
+        }
+        _ => Err(CONTEXTS_SHAPE),
+    }
+}
+
 /// An execution's choices, server by server, read from its input's
 /// reserved key [`CONTEXTS_INPUT_KEY`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecutionContexts {
-    choices: std::collections::BTreeMap<String, ContextChoice>,
+    choices: std::collections::BTreeMap<String, ServerChoice>,
 }
 
 impl ExecutionContexts {
-    /// Read the choices from a `contexts` value: a binding id string is a
-    /// choice of that binding, `null` is none; anything else is no choice
-    /// (the starting tools refuse such a value before anything starts).
+    /// Read the choices from a `contexts` value (S11b): `null` is none, a
+    /// binding id a set of one, a list of binding ids that set; a value
+    /// that cannot be read makes its server `None`, never `NotGiven`, so an
+    /// unreadable choice never opens the grant path. A value that is not an
+    /// object chooses nothing (the starts refuse it, S11a).
     pub fn from_value(value: Option<&serde_json::Value>) -> Self {
         let mut choices = std::collections::BTreeMap::new();
         if let Some(serde_json::Value::Object(map)) = value {
             for (server, choice) in map {
-                let choice = match choice {
-                    serde_json::Value::Null => ContextChoice::None,
-                    serde_json::Value::String(id) => match uuid::Uuid::parse_str(id) {
-                        Ok(id) => ContextChoice::Binding(
-                            crate::domain::credential::CredentialBindingId(id),
-                        ),
-                        Err(_) => continue,
-                    },
-                    _ => continue,
-                };
-                choices.insert(server.clone(), choice);
+                choices.insert(
+                    server.clone(),
+                    read_server_value(choice).unwrap_or(ServerChoice::None),
+                );
             }
         }
         Self { choices }
     }
 
     /// The choice for `server`.
-    pub fn choice(&self, server: &str) -> ContextChoice {
+    pub fn server(&self, server: &str) -> ServerChoice {
         self.choices
             .get(server)
-            .copied()
-            .unwrap_or(ContextChoice::NotGiven)
+            .cloned()
+            .unwrap_or(ServerChoice::NotGiven)
     }
 
-    /// Whether the dispatch chose a binding for `server` (a declared context
-    /// is filled only then, Zaru ADR-0055 D16).
+    /// Every server named, with its choice.
+    pub fn servers(&self) -> impl Iterator<Item = (&str, &ServerChoice)> {
+        self.choices
+            .iter()
+            .map(|(server, choice)| (server.as_str(), choice))
+    }
+
+    /// Whether the dispatch chose at least one binding for `server` (a
+    /// declared context is filled only then, Zaru ADR-0055 D16, AEGIS
+    /// ADR-132 Update (13) S11).
     pub fn is_filled(&self, server: &str) -> bool {
-        matches!(self.choice(server), ContextChoice::Binding(_))
+        matches!(self.server(server), ServerChoice::Bindings(_))
     }
 }
 
@@ -953,6 +1031,55 @@ impl From<Execution> for ExecutionInfo {
 mod tests {
     use super::*;
     use crate::domain::agent::AgentId;
+
+    /// AEGIS ADR-132 Update (13) S11b: a list is a set in the person's
+    /// order, a bare id a set of one, `null` none, a server not named
+    /// nothing; every value that cannot be read is none, never nothing.
+    #[test]
+    fn contexts_read_a_list_as_a_set_and_an_unreadable_value_as_none() {
+        use crate::domain::credential::CredentialBindingId;
+        let a = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+        let b = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+        let id = |s: &str| CredentialBindingId(uuid::Uuid::parse_str(s).unwrap());
+        let contexts = ExecutionContexts::from_value(Some(&serde_json::json!({
+            "list": [b, a],
+            "bare": a,
+            "none": null,
+            "empty": [],
+            "repeated": [a, a],
+            "bad-id": "not-a-uuid",
+            "bad-item": [a, 7],
+            "number": 7
+        })));
+        let mut complaints = Vec::new();
+        for (server, expected) in [
+            ("list", ServerChoice::Bindings(vec![id(b), id(a)])),
+            ("bare", ServerChoice::Bindings(vec![id(a)])),
+            ("none", ServerChoice::None),
+            ("empty", ServerChoice::None),
+            ("repeated", ServerChoice::None),
+            ("bad-id", ServerChoice::None),
+            ("bad-item", ServerChoice::None),
+            ("number", ServerChoice::None),
+            ("absent", ServerChoice::NotGiven),
+        ] {
+            let read = contexts.server(server);
+            if read != expected {
+                complaints.push(format!("{server}: read {read:?}, expected {expected:?}"));
+            }
+        }
+        for (server, filled) in [
+            ("list", true),
+            ("bare", true),
+            ("none", false),
+            ("empty", false),
+        ] {
+            if contexts.is_filled(server) != filled {
+                complaints.push(format!("{server}: is_filled is not {filled}"));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 
     fn make_input(intent: &str) -> ExecutionInput {
         ExecutionInput {

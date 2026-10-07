@@ -75,6 +75,10 @@ struct StubGateway {
     /// none, as a gateway answers when the server's `initialize` carried no
     /// `_grounding`).
     grounding_json: String,
+    /// Further tools a bound server lists when the listing carries the
+    /// credential named by the key (AEGIS ADR-132 Update (13) S11d: two
+    /// bindings' listings that differ).
+    tools_for_credential: HashMap<String, Vec<String>>,
     received: Arc<StdMutex<Received>>,
 }
 
@@ -84,8 +88,19 @@ impl StubGateway {
             tools,
             answer,
             grounding_json: String::new(),
+            tools_for_credential: HashMap::new(),
             received: Arc::new(StdMutex::new(Received::default())),
         }
+    }
+
+    /// The same stub, listing `tools` (each `<tool>`, under the bound
+    /// server's name) as well when a bound server carries `credential`.
+    fn with_tools_for(mut self, credential: &str, tools: &[&str]) -> Self {
+        self.tools_for_credential.insert(
+            credential.to_string(),
+            tools.iter().map(|t| t.to_string()).collect(),
+        );
+        self
     }
 
     /// The same stub, writing `grounding_json` beside every `InvokeTool`
@@ -149,8 +164,16 @@ impl GrpcGatewayInvocationService for StubGateway {
         let mut tools = self.tools.clone();
         // As the gateway does: each bound server's tools, under its name.
         for bound in &listing.bound_servers {
-            if bound.credential.is_some() {
+            if let Some(credential) = &bound.credential {
                 tools.push(listed(&format!("{}.lookup", bound.server), "mcp"));
+                for tool in self
+                    .tools_for_credential
+                    .get(&credential.value)
+                    .into_iter()
+                    .flatten()
+                {
+                    tools.push(listed(&format!("{}.{tool}", bound.server), "mcp"));
+                }
             }
         }
         self.received.lock().unwrap().lists.push(listing);
@@ -3215,7 +3238,7 @@ async fn a_malformed_meta_contexts_is_refused_before_anything_runs() {
         (refusal.code, refusal.message.as_str()),
         (
             "INVALID_ARGUMENTS",
-            "Invalid tool arguments: 'contexts' must be an object naming a binding id or null for each server"
+            "Invalid tool arguments: 'contexts' must be an object naming, for each server, a binding id, a list of binding ids, or null"
         )
     );
     assert!(stub.received.lock().unwrap().tools.is_empty());
@@ -3367,4 +3390,540 @@ async fn a_replayed_context_tools_listing_is_refused() {
         matches!(err, SealSessionError::ReplayProtectionFailed(_)),
         "the replayed listing was answered {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-132 Update (13) S11 to S11l: several bindings of one server, and
+// ADR-125's Update of 2026-10-07 (2): several mailboxes
+// ---------------------------------------------------------------------------
+
+const WORK: &str = "Mk13-work-binding-token";
+const BLANK: &str = "Mk13-blank-label-binding-token";
+const ARCHIVE: &str = "Mk13-archive-binding-token";
+
+/// The first eight hex digits of `id`, as S11c names a binding by.
+fn hex8(id: CredentialBindingId) -> String {
+    id.0.simple().to_string()[..8].to_string()
+}
+
+impl Vault {
+    /// Store an active binding of `USER` to `server` holding `value`,
+    /// granted to nothing, with `label` and `reach`.
+    async fn bind_labelled(
+        &self,
+        tenant: &TenantId,
+        server: &str,
+        value: &str,
+        label: &str,
+        reach: Option<crate::domain::credential::BindingReach>,
+    ) -> CredentialBindingId {
+        let id = self
+            .bind(
+                tenant,
+                USER,
+                server,
+                CredentialType::Secret,
+                &[("value", value)],
+                &[],
+            )
+            .await;
+        let mut binding = self.bindings.find_by_id(&id).await.unwrap().unwrap();
+        binding.metadata.label = label.to_string();
+        binding.metadata.reach = reach;
+        self.bindings.save(&binding).await.unwrap();
+        id
+    }
+}
+
+/// A reach of one instance, `slug`.
+fn instance_reach(slug: &str) -> Option<crate::domain::credential::BindingReach> {
+    Some(crate::domain::credential::BindingReach {
+        kind: crate::domain::credential::ReachKind::Instance,
+        instance_slug: Some(slug.to_string()),
+        instance_id: Some(format!("inst-{slug}")),
+        workspace_id: None,
+        grounded_at: chrono::Utc::now(),
+    })
+}
+
+/// Three bindings of `USER` to `SERVER`: "Work notes" reaching `work`
+/// (chosen), "work notes " with no reach (not chosen, so the first is named
+/// with its digits), and an empty label reaching every instance (chosen).
+/// The gateway lists `notes-1.write` for the first only.
+struct ThreeBindings {
+    work: CredentialBindingId,
+    archive: CredentialBindingId,
+    blank: CredentialBindingId,
+}
+
+impl ThreeBindings {
+    async fn bind(vault: &Vault) -> Self {
+        let tenant = TenantId::for_consumer_user(USER).unwrap();
+        let work = vault
+            .bind_labelled(
+                &tenant,
+                SERVER,
+                WORK,
+                "  Work notes ",
+                instance_reach("work"),
+            )
+            .await;
+        let archive = vault
+            .bind_labelled(&tenant, SERVER, ARCHIVE, "work notes", None)
+            .await;
+        let blank = vault
+            .bind_labelled(
+                &tenant,
+                SERVER,
+                BLANK,
+                "",
+                Some(crate::domain::credential::BindingReach {
+                    kind: crate::domain::credential::ReachKind::Apex,
+                    instance_slug: None,
+                    instance_id: None,
+                    workspace_id: None,
+                    grounded_at: chrono::Utc::now(),
+                }),
+            )
+            .await;
+        Self {
+            work,
+            archive,
+            blank,
+        }
+    }
+
+    fn work_name(&self) -> String {
+        format!("Work notes ({})", hex8(self.work))
+    }
+
+    fn blank_name(&self) -> String {
+        hex8(self.blank)
+    }
+
+    /// The set chosen: the blank one first, then "Work notes".
+    fn chosen(&self) -> Value {
+        json!([self.blank.0.to_string(), self.work.0.to_string()])
+    }
+}
+
+/// The `_context` property of `tool` in `tools`, and whether it is required.
+fn context_property(
+    tools: &[crate::infrastructure::tool_router::ToolMetadata],
+    tool: &str,
+) -> Option<(Value, bool)> {
+    let tool = tools.iter().find(|t| t.name == tool)?;
+    let property = tool.input_schema["properties"]["_context"].clone();
+    let required = tool.input_schema["required"]
+        .as_array()
+        .is_some_and(|r| r.iter().any(|v| v == "_context"));
+    (!property.is_null()).then_some((property, required))
+}
+
+/// S11c, S11d, S11k: a run whose dispatch chose two bindings of one server
+/// lists each of the server's tools once; each takes a required `_context`
+/// whose `enum` names, in the set's order, the bindings whose own listing
+/// carried the tool, with what each reaches; each binding is listed by its
+/// own request carrying exactly one bound server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_bindings_of_one_server_list_each_tool_once_with_context_naming_them() {
+    let stub = StubGateway::new(vec![], remote_result()).with_tools_for(WORK, &["write"]);
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let three = ThreeBindings::bind(&vault).await;
+    let h = harness(Setup {
+        agent_contexts: vec![(SERVER, true)],
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        contexts: Some(choosing(three.chosen())),
+        ..Setup::gateway(&url)
+    })
+    .await;
+
+    let listed = h
+        .service
+        .get_available_tools_for_agent_run(&h.tenant, h.agent_id, h.execution, CONTEXT)
+        .await
+        .unwrap();
+    let mut complaints = Vec::new();
+    if names(&listed) != vec!["notes-1.lookup", "notes-1.write"] {
+        complaints.push(format!("listed {:?}", names(&listed)));
+    }
+    let both = format!(
+        "Which of your {SERVER} contexts this call uses: {} (every instance); {} (work)",
+        three.blank_name(),
+        three.work_name()
+    );
+    let only_work = format!(
+        "Which of your {SERVER} contexts this call uses: {} (work)",
+        three.work_name()
+    );
+    for (tool, expected_enum, expected_description) in [
+        (
+            "notes-1.lookup",
+            json!([three.blank_name(), three.work_name()]),
+            both,
+        ),
+        ("notes-1.write", json!([three.work_name()]), only_work),
+    ] {
+        match context_property(&listed, tool) {
+            None => complaints.push(format!("{tool} takes no _context")),
+            Some((property, required)) => {
+                if property["enum"] != expected_enum {
+                    complaints.push(format!("{tool}: _context enum {}", property["enum"]));
+                }
+                if property["description"] != json!(expected_description) {
+                    complaints.push(format!(
+                        "{tool}: _context description {}",
+                        property["description"]
+                    ));
+                }
+                if property["type"] != json!("string") {
+                    complaints.push(format!("{tool}: _context type {}", property["type"]));
+                }
+                if !required {
+                    complaints.push(format!("{tool}: _context is not required"));
+                }
+            }
+        }
+    }
+    let received = stub.received.lock().unwrap();
+    let per_binding: Vec<Vec<String>> = received
+        .lists
+        .iter()
+        .filter(|l| !l.bound_servers.is_empty())
+        .map(|l| {
+            l.bound_servers
+                .iter()
+                .map(|b| b.credential.as_ref().unwrap().value.clone())
+                .collect()
+        })
+        .collect();
+    if per_binding != vec![vec![BLANK.to_string()], vec![WORK.to_string()]] {
+        complaints.push(format!(
+            "the listings carried {per_binding:?}, not one per chosen binding in order"
+        ));
+    }
+    if per_binding.iter().flatten().any(|v| v == ARCHIVE) {
+        complaints.push("a binding the dispatch did not choose was listed".to_string());
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    let _ = three.archive;
+}
+
+/// S11d, S11k: a set of one binding lists the gateway's schema unchanged,
+/// with no `_context`, in the shared listing request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_of_one_binding_lists_the_gateways_schema_unchanged() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let three = ThreeBindings::bind(&vault).await;
+    let h = harness(Setup {
+        agent_contexts: vec![(SERVER, true)],
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        contexts: Some(choosing(json!([three.work.0.to_string()]))),
+        ..Setup::gateway(&url)
+    })
+    .await;
+    let listed = h
+        .service
+        .get_available_tools_for_agent_run(&h.tenant, h.agent_id, h.execution, CONTEXT)
+        .await
+        .unwrap();
+    assert_eq!(names(&listed), vec!["notes-1.lookup"]);
+    assert_eq!(
+        listed[0].input_schema,
+        json!({"type": "object"}),
+        "a one-binding set changed the gateway's schema"
+    );
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received.lists.len(), 1, "one shared listing request");
+    assert_eq!(
+        received.lists[0].bound_servers[0]
+            .credential
+            .as_ref()
+            .unwrap()
+            .value,
+        WORK
+    );
+}
+
+impl Harness {
+    /// One internal call of `tool` with `args`.
+    async fn call_with(
+        &self,
+        execution: ExecutionId,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, SealSessionError> {
+        match self
+            .service
+            .invoke_tool_internal(
+                &self.agent_id,
+                execution,
+                self.tenant.clone(),
+                0,
+                Vec::new(),
+                tool.to_string(),
+                args,
+            )
+            .await?
+        {
+            ToolInvocationResult::Direct(value) => Ok(value),
+            ToolInvocationResult::DispatchRequired(action) => {
+                panic!("unexpected dispatch: {action:?}")
+            }
+        }
+    }
+}
+
+/// S11e: a call whose `_context` names one of two chosen bindings carries
+/// that binding's credential; `_context` is in the narrative's requested
+/// line and never reaches the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_calls_context_picks_the_binding_and_is_removed_before_the_gateway() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let three = ThreeBindings::bind(&vault).await;
+    let h = harness(Setup {
+        agent_tools: vec!["notes-1.pages.read"],
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        contexts: Some(choosing(three.chosen())),
+        ..Setup::gateway(&url)
+    })
+    .await;
+    let mut events = h.service.event_bus.subscribe();
+
+    let mut complaints = Vec::new();
+    for (name, credential) in [(three.work_name(), WORK), (three.blank_name(), BLANK)] {
+        let args = json!({"query": "q", "_context": name});
+        if let Err(e) = h
+            .call_with(h.execution, &format!("{SERVER}.pages.read"), args.clone())
+            .await
+        {
+            complaints.push(format!("{name}: refused {e:?}"));
+            continue;
+        }
+        let received = stub.received.lock().unwrap();
+        let call = received.tools.last().unwrap();
+        if call.credential.as_ref().unwrap().value != credential {
+            complaints.push(format!("{name}: the call carried another binding's secret"));
+        }
+        let sent: Value = serde_json::from_str(&call.arguments_json).unwrap();
+        if sent != json!({"query": "q"}) {
+            complaints.push(format!("{name}: the gateway received {sent}"));
+        }
+        let mut requested = None;
+        while let Ok(event) = events.try_recv() {
+            if let DomainEvent::MCP(crate::domain::events::MCPToolEvent::InvocationRequested {
+                arguments,
+                ..
+            }) = event
+            {
+                requested = Some(arguments);
+            }
+        }
+        if requested != Some(args) {
+            complaints.push(format!(
+                "{name}: the narrative's requested line read {requested:?}"
+            ));
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// S11e: with two chosen bindings, a call with no `_context`, and one whose
+/// `_context` names no chosen binding (shown without control characters, cut
+/// at 64), are refused with the binding-required code and their sentences,
+/// and nothing reaches the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_without_a_context_or_naming_another_is_refused_before_the_gateway() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let three = ThreeBindings::bind(&vault).await;
+    let h = harness(Setup {
+        agent_tools: vec!["notes-1.pages.read"],
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![SERVER.to_string()],
+        contexts: Some(choosing(three.chosen())),
+        ..Setup::gateway(&url)
+    })
+    .await;
+    let names = format!("{}, {}", three.blank_name(), three.work_name());
+    let long = format!("work\u{7}{}", "x".repeat(80));
+    let shown: String = long.chars().filter(|c| !c.is_control()).take(64).collect();
+    let mut complaints = Vec::new();
+    for (case, args, expected) in [
+        (
+            "no _context",
+            json!({"query": "q"}),
+            format!(
+                "This tool reaches several of your '{SERVER}' contexts; say which in '_context': {names}."
+            ),
+        ),
+        (
+            "an unchosen binding's name",
+            json!({"query": "q", "_context": "work notes"}),
+            format!(
+                "'work notes' is not one of the '{SERVER}' contexts chosen for this run; choose one of: {names}."
+            ),
+        ),
+        (
+            "a long value with a control character",
+            json!({"query": "q", "_context": long}),
+            format!(
+                "'{shown}' is not one of the '{SERVER}' contexts chosen for this run; choose one of: {names}."
+            ),
+        ),
+    ] {
+        match h
+            .call_with(h.execution, &format!("{SERVER}.pages.read"), args)
+            .await
+        {
+            Ok(value) => complaints.push(format!("{case}: the call was made: {value}")),
+            Err(err) => {
+                let refusal = err.refusal();
+                if refusal.code != "CREDENTIAL_BINDING_REQUIRED" {
+                    complaints.push(format!("{case}: refused {}", refusal.code));
+                }
+                if refusal.message != expected {
+                    complaints.push(format!("{case}: the sentence was \"{}\"", refusal.message));
+                }
+            }
+        }
+    }
+    if !stub.received.lock().unwrap().tools.is_empty() {
+        complaints.push("a call reached the gateway".to_string());
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// S8 with S11a, S11d: a conversation's listing with two bindings chosen in
+/// `_meta.contexts` lists each tool once with `_context`, and its call picks
+/// the binding `_context` names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversation_with_two_bindings_lists_once_and_its_call_picks_by_context() {
+    let stub = StubGateway::new(vec![], remote_result()).with_tools_for(WORK, &["write"]);
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let three = ThreeBindings::bind(&vault).await;
+    let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+    let meta = || Some(meta_choosing(three.chosen()));
+
+    let listed = h
+        .list_with_meta(&token, meta(), "listing-1")
+        .await
+        .expect("the listing is answered");
+    let mut complaints = Vec::new();
+    if names(&listed) != vec!["notes-1.lookup", "notes-1.write"] {
+        complaints.push(format!("listed {:?}", names(&listed)));
+    }
+    match context_property(&listed, "notes-1.lookup") {
+        Some((property, true))
+            if property["enum"] == json!([three.blank_name(), three.work_name()]) => {}
+        other => complaints.push(format!("notes-1.lookup's _context: {other:?}")),
+    }
+    if let Err(e) = h
+        .service
+        .invoke_tool_with_meta(
+            &RouteEnvelope {
+                token: token.clone().into(),
+                tool: format!("{SERVER}.pages.read"),
+                args: json!({"query": "q", "_context": three.work_name()}),
+                nonce: uuid::Uuid::new_v4().to_string(),
+            },
+            meta().as_ref(),
+        )
+        .await
+    {
+        complaints.push(format!("the call was refused: {e:?}"));
+    }
+    let received = stub.received.lock().unwrap();
+    match received.tools.last() {
+        Some(call) => {
+            if call.credential.as_ref().unwrap().value != WORK {
+                complaints.push("the call carried another binding's secret".to_string());
+            }
+            if serde_json::from_str::<Value>(&call.arguments_json).unwrap() != json!({"query": "q"})
+            {
+                complaints.push(format!("the gateway received {}", call.arguments_json));
+            }
+        }
+        None => complaints.push("no call reached the gateway".to_string()),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// ADR-125's Update of 2026-10-07 (2) clause 2, S11i: a run with a filled
+/// `imap` set lists the mail tools with `mailbox` an `enum` of the chosen
+/// mailboxes' names and the description naming them; with nothing chosen
+/// the schema stays as the router gives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_with_chosen_mailboxes_lists_mailbox_as_their_names() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    let inbox = vault
+        .bind_labelled(&tenant, "imap", "pw-1", "Inbox", None)
+        .await;
+    let sales = vault
+        .bind_labelled(&tenant, "imap", "pw-2", "Sales", None)
+        .await;
+    let mut complaints = Vec::new();
+    for (case, contexts, expected) in [
+        (
+            "two chosen",
+            Some(json!({"imap": [sales.0.to_string(), inbox.0.to_string()]})),
+            Some(json!({
+                "type": "string",
+                "enum": ["Sales", "Inbox"],
+                "description": "Which of your mailboxes this call uses: Sales; Inbox"
+            })),
+        ),
+        ("nothing chosen", None, None),
+    ] {
+        let h = harness(Setup {
+            agent_tools: vec!["mail.list", "mail.read", "mail.label"],
+            ca: Some(tls.ca_path.clone()),
+            credentials: Some(vault.service.clone()),
+            remote_servers: vec![SERVER.to_string()],
+            contexts,
+            ..Setup::gateway(&url)
+        })
+        .await;
+        let listed = h
+            .service
+            .get_available_tools_for_agent_run(&h.tenant, h.agent_id, h.execution, CONTEXT)
+            .await
+            .unwrap();
+        if names(&listed) != vec!["mail.label", "mail.list", "mail.read"] {
+            complaints.push(format!("{case}: listed {:?}", names(&listed)));
+        }
+        for tool in &listed {
+            let mailbox = &tool.input_schema["properties"]["mailbox"];
+            let expected = expected.clone().unwrap_or_else(|| {
+                json!({
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                })
+            });
+            if mailbox != &expected {
+                complaints.push(format!("{case}: {}'s mailbox is {mailbox}", tool.name));
+            }
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

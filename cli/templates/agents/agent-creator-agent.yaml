@@ -59,7 +59,9 @@ spec:
          names a remote server's tool without that entry is refused. If `aegis.agent.create`
          refuses a `<server>.<tool>` name as not registered, the server is not one of this node's
          remote servers: its refusal names this node's remote servers; drop the tool or use one of
-         those servers, and do not search for it.
+         those servers, and do not search for it. A run whose person chose several contexts of
+         one server lists that server's tools once, each taking '_context' to say which context a
+         call uses.
       3a. DISPATCH INPUT FIELDS — every agent dispatch carries three peer fields, and the
           generated agent's `spec.input_schema` and `spec.task.instruction` must handle each
           one consistently. The fields are NOT special cases of one another; they are

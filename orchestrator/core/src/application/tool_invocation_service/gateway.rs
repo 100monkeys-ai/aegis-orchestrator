@@ -1,7 +1,8 @@
 use super::*;
 use crate::application::credential_service::{
-    GroundingRefusal, RemoteServerGrounding, ToolCallActor,
+    binding_digits, ContextBinding, GroundingRefusal, RemoteServerGrounding, ToolCallActor,
 };
+use crate::domain::execution::{ContextChoice, ServerChoice};
 use crate::domain::seal_session::{CallerAnswer, InternalFailure};
 use crate::domain::secrets::{SensitiveString, SensitiveUrl};
 use crate::infrastructure::seal_gateway_proto::{
@@ -36,6 +37,22 @@ impl GatewayActing {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// The argument by which a call of a remote server's tool says which of
+/// several chosen contexts it uses (AEGIS ADR-132 Update (13) S11d, S11e).
+/// The name is the platform's, as `_meta` and `_grounding` are; it never
+/// leaves the orchestrator.
+pub(crate) const CONTEXT_ARGUMENT: &str = "_context";
+
+/// The longest a `_context` value a refusal shows may be (S11e).
+const CONTEXT_SHOWN_MAX_CHARS: usize = 64;
+
+/// The refusal `CREDENTIAL_BINDING_REQUIRED` with `message` (AEGIS ADR-132
+/// H3, Zaru ADR-0055 D15, ADR-132 Update (13) S11e).
+fn binding_required(message: String) -> SealSessionError {
+    SealSessionError::NotFound(message.clone())
+        .answered(CallerAnswer::CredentialBindingRequired { message })
 }
 
 /// Connect timeout for SEAL Tooling Gateway gRPC connections.
@@ -242,6 +259,7 @@ impl ToolInvocationService {
             .as_ref()
             .map(|execution| execution.input.contexts())
             .unwrap_or_default();
+        let contexts_of_run = contexts.clone();
         // Zaru ADR-0055 D16: a declared context the dispatch filled with a
         // binding brings its server's tools; an undeclared one brings none.
         let filled_contexts: Vec<String> = agent
@@ -294,8 +312,9 @@ impl ToolInvocationService {
                     "SEAL gateway tool enumeration for an agent's run failed; proceeding with built-in tools only"
                 ),
             }
+            tools.extend(self.listed_per_binding(tenant_id, &acting).await);
         }
-        Ok(tools
+        let mut tools: Vec<_> = tools
             .into_iter()
             .filter(|tool| {
                 let declared = declared_tools.iter().any(|name| name == &tool.name)
@@ -304,23 +323,244 @@ impl ToolInvocationService {
                     });
                 declared && security_context.permits_tool_name(&tool.name)
             })
-            .collect())
+            .collect();
+        let person = execution
+            .as_ref()
+            .and_then(|execution| execution.initiating_user_sub.as_deref());
+        self.name_chosen_mailboxes(tenant_id, person, &contexts_of_run, &mut tools)
+            .await;
+        Ok(tools)
+    }
+
+    /// AEGIS ADR-125's Update of 2026-10-07 (2) clause 2, ADR-132 Update
+    /// (13) S11i: with the run's `imap` set filled, each mail tool's
+    /// `mailbox` is an `enum` of the chosen mailboxes' names, described as
+    /// "Which of your mailboxes this call uses: " and the names joined by
+    /// "; ", so no id reaches a model. With nothing chosen the router's
+    /// schema stands.
+    async fn name_chosen_mailboxes(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        contexts: &crate::domain::execution::ExecutionContexts,
+        tools: &mut [crate::infrastructure::tool_router::ToolMetadata],
+    ) {
+        let ServerChoice::Bindings(chosen) =
+            contexts.server(crate::application::tools::builtin_mail::MailActing::choice_key())
+        else {
+            return;
+        };
+        let (Some(person), Some(source)) = (person, &self.tool_credentials) else {
+            return;
+        };
+        let named = match source
+            .context_bindings(
+                tenant_id,
+                person,
+                crate::application::tools::builtin_mail::MailActing::choice_key(),
+            )
+            .await
+        {
+            Ok(named) => named,
+            Err(e) => {
+                tracing::warn!(error = %e, "the run's chosen mailboxes could not be named; the mail tools keep their schema");
+                return;
+            }
+        };
+        let names: Vec<String> = chosen
+            .iter()
+            .filter_map(|id| named.iter().find(|b| &b.id == id))
+            .map(|b| b.name.clone())
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let property = serde_json::json!({
+            "type": "string",
+            "enum": names,
+            "description": format!("Which of your mailboxes this call uses: {}", names.join("; ")),
+        });
+        for tool in tools
+            .iter_mut()
+            .filter(|tool| crate::application::tools::builtin_mail::is_mail_tool(&tool.name))
+        {
+            if let Some(properties) = tool
+                .input_schema
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                properties.insert("mailbox".to_string(), property.clone());
+            }
+        }
+    }
+
+    /// The tools of each remote server whose chosen set holds two or more
+    /// bindings (AEGIS ADR-132 Update (13) S11d, S11k): one gateway
+    /// `ListTools` per binding, each carrying exactly that binding's
+    /// credential (the gateway lists every bound server under
+    /// `<server>.<tool>`, so two credentials in one request would list the
+    /// same names with nothing saying which answered). Each tool is listed
+    /// once, with a required `_context` naming the bindings whose own
+    /// listing carried it, in the set's order. A binding that is not the
+    /// person's own active one for the server is not listed.
+    async fn listed_per_binding(
+        &self,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+    ) -> Vec<crate::infrastructure::tool_router::ToolMetadata> {
+        let (Some(user_id), Some(source)) = (acting.user_id.as_deref(), &self.tool_credentials)
+        else {
+            return Vec::new();
+        };
+        if !self.gateway_channel_is_confidential() {
+            return Vec::new();
+        }
+        let mut tools = Vec::new();
+        for server in &self.remote_tool_servers {
+            let ServerChoice::Bindings(chosen) = acting.contexts.server(server) else {
+                continue;
+            };
+            if chosen.len() < 2 {
+                continue;
+            }
+            let named = match source.context_bindings(tenant_id, user_id, server).await {
+                Ok(named) => named,
+                Err(e) => {
+                    tracing::warn!(server = %server, error = %e, "the chosen contexts of a remote server could not be named; its tools are not listed");
+                    continue;
+                }
+            };
+            let mut by_tool: Vec<(ToolSummary, Vec<ContextBinding>)> = Vec::new();
+            for id in &chosen {
+                let Some(binding) = named.iter().find(|b| &b.id == id) else {
+                    tracing::warn!(server = %server, binding = %binding_digits(id), "a chosen binding is not an active credential of the person's for the server; its tools are not listed");
+                    continue;
+                };
+                let Some(bound) = self
+                    .bound_server(
+                        tenant_id,
+                        user_id,
+                        acting,
+                        server,
+                        ContextChoice::Binding(*id),
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                let listing = ListToolsRequest {
+                    tenant_id: tenant_id.as_str().to_string(),
+                    acting: Some(acting.to_proto()),
+                    bound_servers: vec![bound],
+                };
+                let listed = match self
+                    .list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
+                    .await
+                {
+                    Ok(listed) => listed,
+                    Err(e) => {
+                        tracing::warn!(server = %server, error = %e, "SEAL gateway tool enumeration for one chosen context failed; its tools are not listed");
+                        continue;
+                    }
+                };
+                for item in listed {
+                    if self
+                        .remote_tool_of(&item.name)
+                        .is_none_or(|(of, _)| of != server)
+                    {
+                        continue;
+                    }
+                    match by_tool.iter_mut().find(|(seen, _)| seen.name == item.name) {
+                        Some((_, bindings)) => bindings.push(binding.clone()),
+                        None => by_tool.push((item, vec![binding.clone()])),
+                    }
+                }
+            }
+            for (summary, bindings) in by_tool {
+                if let Some(tool) = Self::with_context_property(
+                    Self::gateway_tool_metadata(summary),
+                    server,
+                    &bindings,
+                ) {
+                    tools.push(tool);
+                }
+            }
+        }
+        tools
+    }
+
+    /// `tool` with S11d's required `_context`: a string whose `enum` is the
+    /// names of `bindings`, described as
+    /// `"Which of your <server> contexts this call uses: "` and each name
+    /// with what it reaches, joined by `"; "`.
+    /// `None`, and the operator's log says so, when the tool's own schema
+    /// already declares `_context`.
+    fn with_context_property(
+        mut tool: crate::infrastructure::tool_router::ToolMetadata,
+        server: &str,
+        bindings: &[ContextBinding],
+    ) -> Option<crate::infrastructure::tool_router::ToolMetadata> {
+        if !tool.input_schema.is_object() {
+            tool.input_schema = serde_json::json!({ "type": "object" });
+        }
+        let schema = tool.input_schema.as_object_mut()?;
+        let properties = schema
+            .entry("properties")
+            .or_insert_with(|| serde_json::json!({}));
+        if !properties.is_object() {
+            *properties = serde_json::json!({});
+        }
+        let properties = properties.as_object_mut()?;
+        if properties.contains_key(CONTEXT_ARGUMENT) {
+            tracing::warn!(
+                tool = %tool.name,
+                "a remote tool declares the platform's '_context' argument itself; it is not listed while several contexts of its server are chosen"
+            );
+            return None;
+        }
+        let described: Vec<String> = bindings
+            .iter()
+            .map(|b| format!("{} ({})", b.name, b.reach_text()))
+            .collect();
+        properties.insert(
+            CONTEXT_ARGUMENT.to_string(),
+            serde_json::json!({
+                "type": "string",
+                "enum": bindings.iter().map(|b| b.name.clone()).collect::<Vec<_>>(),
+                "description": format!(
+                    "Which of your {server} contexts this call uses: {}",
+                    described.join("; ")
+                ),
+            }),
+        );
+        let required = schema
+            .entry("required")
+            .or_insert_with(|| serde_json::json!([]));
+        if !required.is_array() {
+            *required = serde_json::json!([]);
+        }
+        if let Some(required) = required.as_array_mut() {
+            required.push(serde_json::Value::String(CONTEXT_ARGUMENT.to_string()));
+        }
+        Some(tool)
     }
 
     /// Each remote server the acting person holds a binding to granted to
     /// the acting agent or its workflow, with that person's credential, for
     /// the gateway to list its tools (AEGIS ADR-132 H4); for a server the
-    /// execution's dispatch chose a binding or none for, that choice instead
-    /// (Zaru ADR-0055 D15). None for a run with
-    /// no person, and none over a plaintext channel (H8): a credential is
-    /// never sent there, and the reason is logged.
+    /// execution's dispatch chose one binding or none for, that choice
+    /// instead (Zaru ADR-0055 D15). A server whose chosen set holds two or
+    /// more bindings is not here: each of its bindings is listed by its own
+    /// request (ADR-132 Update (13) S11d, S11k,
+    /// [`Self::listed_per_binding`]). None for a run with no person, and
+    /// none over a plaintext channel (H8): a credential is never sent there,
+    /// and the reason is logged.
     async fn bound_servers(
         &self,
         tenant_id: &TenantId,
         acting: &GatewayActing,
     ) -> Vec<crate::infrastructure::seal_gateway_proto::BoundServer> {
-        let (Some(user_id), Some(source)) = (acting.user_id.as_deref(), &self.tool_credentials)
-        else {
+        let (Some(user_id), Some(_)) = (acting.user_id.as_deref(), &self.tool_credentials) else {
             return Vec::new();
         };
         if self.remote_tool_servers.is_empty() {
@@ -336,32 +576,56 @@ impl ToolInvocationService {
         }
         let mut bound = Vec::new();
         for server in &self.remote_tool_servers {
-            let actor = ToolCallActor {
-                tenant_id,
-                user_id,
-                agent_id: acting.agent_id,
-                workflow_id: acting.workflow_id,
-                context: acting.contexts.choice(server),
+            let Some(context) = acting.contexts.server(server).single() else {
+                continue;
             };
-            match source.tool_server_credential(&actor, server).await {
-                Ok(Some(credential)) => {
-                    bound.push(crate::infrastructure::seal_gateway_proto::BoundServer {
-                        server: server.clone(),
-                        credential: Some(ResolvedCredential {
-                            kind: CredentialKind::BearerToken as i32,
-                            value: credential.expose().to_string(),
-                        }),
-                    })
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    server = %server,
-                    error = %e,
-                    "the acting user's credential for a remote tool server could not be resolved; its tools are not listed"
-                ),
+            if let Some(server) = self
+                .bound_server(tenant_id, user_id, acting, server, context)
+                .await
+            {
+                bound.push(server);
             }
         }
         bound
+    }
+
+    /// `server` bound with the acting person's credential as `context`
+    /// selects it, or `None` when it resolves none (the reason logged when
+    /// it is a failure).
+    async fn bound_server(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        acting: &GatewayActing,
+        server: &str,
+        context: ContextChoice,
+    ) -> Option<crate::infrastructure::seal_gateway_proto::BoundServer> {
+        let source = self.tool_credentials.as_ref()?;
+        let actor = ToolCallActor {
+            tenant_id,
+            user_id,
+            agent_id: acting.agent_id,
+            workflow_id: acting.workflow_id,
+            context,
+        };
+        match source.tool_server_credential(&actor, server).await {
+            Ok(Some(credential)) => Some(crate::infrastructure::seal_gateway_proto::BoundServer {
+                server: server.to_string(),
+                credential: Some(ResolvedCredential {
+                    kind: CredentialKind::BearerToken as i32,
+                    value: credential.expose().to_string(),
+                }),
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    server = %server,
+                    error = %e,
+                    "the acting user's credential for a remote tool server could not be resolved; its tools are not listed"
+                );
+                None
+            }
+        }
     }
 
     pub async fn get_available_tools_for_context(
@@ -627,11 +891,11 @@ impl ToolInvocationService {
             )
             .answered(CallerAnswer::ExecutionBoundSession));
         }
-        // Every server the node knows: the binding the call chose, else none.
+        // Every server the node knows: the bindings the call chose, else none.
         let mut every_server = serde_json::Map::new();
         for server in &self.remote_tool_servers {
             let choice = match choices.get(server) {
-                Some(Value::String(id)) => Value::String(id.clone()),
+                Some(chosen @ (Value::String(_) | Value::Array(_))) => chosen.clone(),
                 _ => Value::Null,
             };
             every_server.insert(server.clone(), choice);
@@ -655,20 +919,23 @@ impl ToolInvocationService {
             contexts,
         };
         let bound_servers = self.bound_servers(&session.tenant_id, &acting).await;
-        if bound_servers.is_empty() {
-            return Ok(Vec::new());
+        let mut listed = Vec::new();
+        if !bound_servers.is_empty() {
+            let listing = ListToolsRequest {
+                tenant_id: session.tenant_id.as_str().to_string(),
+                acting: Some(acting.to_proto()),
+                bound_servers,
+            };
+            listed.extend(
+                self.list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
+                    .await?
+                    .into_iter()
+                    .map(Self::gateway_tool_metadata),
+            );
         }
-        let listing = ListToolsRequest {
-            tenant_id: session.tenant_id.as_str().to_string(),
-            acting: Some(acting.to_proto()),
-            bound_servers,
-        };
-        let listed = self
-            .list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
-            .await?;
+        listed.extend(self.listed_per_binding(&session.tenant_id, &acting).await);
         Ok(listed
             .into_iter()
-            .map(Self::gateway_tool_metadata)
             .filter(|tool| {
                 self.remote_tool_of(&tool.name)
                     .is_some_and(|(server, _)| chosen.contains(&server))
@@ -714,18 +981,16 @@ impl ToolInvocationService {
     /// recorded person, saying so; for a user with no binding to the server
     /// granted to this agent or its workflow; for an execution whose dispatch
     /// chose none for the server, or chose a binding that is not the user's
-    /// own active one for it (Zaru ADR-0055 D15). No other credential path
-    /// is tried.
+    /// own active one for it (Zaru ADR-0055 D15). With a chosen set, the
+    /// call's `_context` picks the binding (ADR-132 Update (13) S11e). No
+    /// other credential path is tried.
     async fn credential_for(
         &self,
         tenant_id: &TenantId,
         acting: &GatewayActing,
         server: &str,
+        context_argument: Option<&Value>,
     ) -> Result<SensitiveString, SealSessionError> {
-        let binding_required = |message: String| {
-            SealSessionError::NotFound(message.clone())
-                .answered(CallerAnswer::CredentialBindingRequired { message })
-        };
         let Some(user_id) = acting.user_id.as_deref() else {
             return Err(binding_required(format!(
                 "This tool needs your own credential for '{server}', and no person is recorded for this run."
@@ -737,7 +1002,14 @@ impl ToolInvocationService {
             ))
             .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
         })?;
-        let context = acting.contexts.choice(server);
+        let context = match acting.contexts.server(server) {
+            ServerChoice::NotGiven => ContextChoice::NotGiven,
+            ServerChoice::None => ContextChoice::None,
+            ServerChoice::Bindings(chosen) => {
+                self.pick_binding(tenant_id, user_id, server, &chosen, context_argument)
+                    .await?
+            }
+        };
         let actor = ToolCallActor {
             tenant_id,
             user_id,
@@ -748,19 +1020,86 @@ impl ToolInvocationService {
         match source.tool_server_credential(&actor, server).await {
             Ok(Some(credential)) => Ok(credential),
             Ok(None) => Err(binding_required(match context {
-                crate::domain::execution::ContextChoice::None => format!(
+                ContextChoice::None => format!(
                     "This tool needs your own credential for '{server}', and none was chosen for this run."
                 ),
-                crate::domain::execution::ContextChoice::Binding(_) => format!(
+                ContextChoice::Binding(_) => format!(
                     "This tool needs your own credential for '{server}', and the one chosen for this run is not an active credential of yours for it."
                 ),
-                crate::domain::execution::ContextChoice::NotGiven => format!(
+                ContextChoice::NotGiven => format!(
                     "This tool needs your own credential for '{server}', granted to this agent."
                 ),
             })),
             Err(e) => Err(SealSessionError::InternalError(format!(
                 "resolving the credential for the remote tool server '{server}' failed: {e}"
             ))),
+        }
+    }
+
+    /// The binding of `chosen` a call of `server`'s tool uses (AEGIS ADR-132
+    /// Update (13) S11e): with one, that one, unless `_context` names
+    /// another; with several, the one whose name `_context` gives. A
+    /// chosen binding that resolves no name is named by its first eight hex
+    /// digits. Refused with the binding-required code otherwise.
+    async fn pick_binding(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        server: &str,
+        chosen: &[crate::domain::credential::CredentialBindingId],
+        context_argument: Option<&Value>,
+    ) -> Result<ContextChoice, SealSessionError> {
+        if let ([only], None) = (chosen, context_argument) {
+            return Ok(ContextChoice::Binding(*only));
+        }
+        let named = match &self.tool_credentials {
+            Some(source) => source
+                .context_bindings(tenant_id, user_id, server)
+                .await
+                .map_err(|e| {
+                    SealSessionError::InternalError(format!(
+                        "naming the chosen contexts of the remote tool server '{server}' failed: {e}"
+                    ))
+                })?,
+            None => Vec::new(),
+        };
+        let names: Vec<(crate::domain::credential::CredentialBindingId, String)> = chosen
+            .iter()
+            .map(|id| {
+                let name = named
+                    .iter()
+                    .find(|b| &b.id == id)
+                    .map(|b| b.name.clone())
+                    .unwrap_or_else(|| binding_digits(id));
+                (*id, name)
+            })
+            .collect();
+        let listed = names
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Some(given) = context_argument else {
+            return Err(binding_required(format!(
+                "This tool reaches several of your '{server}' contexts; say which in '{CONTEXT_ARGUMENT}': {listed}."
+            )));
+        };
+        let given = match given {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        match names.iter().find(|(_, name)| *name == given) {
+            Some((id, _)) => Ok(ContextChoice::Binding(*id)),
+            None => {
+                let shown: String = given
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(CONTEXT_SHOWN_MAX_CHARS)
+                    .collect();
+                Err(binding_required(format!(
+                    "'{shown}' is not one of the '{server}' contexts chosen for this run; choose one of: {listed}."
+                )))
+            }
         }
     }
 
@@ -779,6 +1118,7 @@ impl ToolInvocationService {
     /// for this call only. The server's `tools/call` result passes back
     /// unchanged. Nothing is sent when there is no credential to send, or
     /// when the gateway's address is plaintext.
+    #[allow(clippy::too_many_arguments)]
     async fn invoke_remote_tool(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
@@ -787,9 +1127,12 @@ impl ToolInvocationService {
         server: &str,
         tool: &str,
         args: serde_json::Value,
+        context_argument: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, SealSessionError> {
         let tool_name = format!("{server}.{tool}");
-        let credential = self.credential_for(tenant_id, acting, server).await?;
+        let credential = self
+            .credential_for(tenant_id, acting, server, context_argument.as_ref())
+            .await?;
         if !self.gateway_channel_is_confidential() {
             tracing::error!(
                 server = %server,
@@ -848,8 +1191,23 @@ impl ToolInvocationService {
         acting: &GatewayActing,
     ) -> Result<serde_json::Value, SealSessionError> {
         if let Some((server, tool)) = self.remote_tool_of(tool_name) {
+            // AEGIS ADR-132 Update (13) S11e: `_context` says which chosen
+            // binding the call uses; it is taken out here, after the
+            // narrative's requested line, and never reaches the gateway.
+            let mut args = args;
+            let context_argument = args
+                .as_object_mut()
+                .and_then(|arguments| arguments.remove(CONTEXT_ARGUMENT));
             return self
-                .invoke_remote_tool(execution_id, tenant_id, acting, server, tool, args)
+                .invoke_remote_tool(
+                    execution_id,
+                    tenant_id,
+                    acting,
+                    server,
+                    tool,
+                    args,
+                    context_argument,
+                )
                 .await;
         }
         let listing = ListToolsRequest {

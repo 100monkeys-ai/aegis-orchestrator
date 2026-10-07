@@ -2409,7 +2409,8 @@ spec:
         }
 
         /// R8: the creator's step 3 teaches the remote servers' tools, their
-        /// context, and that the search does not show them.
+        /// context, that the search does not show them, and (S11g) that
+        /// several contexts of one server are told apart by `_context`.
         #[test]
         fn the_creator_template_teaches_the_remote_servers() {
             let manifest: serde_yaml::Value =
@@ -2424,6 +2425,8 @@ spec:
                 "declare a `spec.contexts` entry for the server: `contexts: [{service: <server>}]`",
                 "They do not appear in the `aegis.tools.search` results",
                 "its refusal names this node's remote servers",
+                // AEGIS ADR-132 Update (13) S11g.
+                "A run whose person chose several contexts of one server lists that server's tools once, each taking '_context' to say which context a call uses.",
             ] {
                 if !flat.contains(sentence) {
                     complaints.push(format!("step 3 does not say: {sentence}"));

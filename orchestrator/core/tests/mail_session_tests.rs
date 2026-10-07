@@ -29,7 +29,7 @@ use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, MailSecurity, MailboxSettings,
 };
-use aegis_orchestrator_core::domain::execution::ContextChoice;
+use aegis_orchestrator_core::domain::execution::ServerChoice;
 use aegis_orchestrator_core::domain::seal_session::{CallerAnswer, SealSessionError};
 use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use aegis_orchestrator_core::domain::tenant::TenantId;
@@ -168,7 +168,7 @@ fn conversation() -> MailActing {
         user_id: Some(USER.to_string()),
         agent_id: AgentId::new(),
         workflow_id: None,
-        choice: ContextChoice::NotGiven,
+        choice: ServerChoice::NotGiven,
         has_execution_record: false,
     }
 }
@@ -504,7 +504,7 @@ async fn a_mailbox_that_is_not_the_persons_own_is_refused() {
 async fn a_chosen_mailbox_other_than_the_argument_or_none_is_refused() {
     let f = fixture("\\*", true).await;
     let chosen_other = MailActing {
-        choice: ContextChoice::Binding(CredentialBindingId::new()),
+        choice: ServerChoice::Bindings(vec![CredentialBindingId::new()]),
         ..conversation()
     };
     let error = call(&f, "mail.list", json!({}), &chosen_other)
@@ -512,7 +512,7 @@ async fn a_chosen_mailbox_other_than_the_argument_or_none_is_refused() {
         .unwrap_err();
     assert_eq!(sentence(&error), CHOSEN_DIFFERENT, "{error:?}");
     let chosen_none = MailActing {
-        choice: ContextChoice::None,
+        choice: ServerChoice::None,
         ..agent_run()
     };
     let error = call(&f, "mail.list", json!({}), &chosen_none)
@@ -523,12 +523,12 @@ async fn a_chosen_mailbox_other_than_the_argument_or_none_is_refused() {
 
     // The chosen mailbox itself is admitted, no grant needed.
     let chosen = MailActing {
-        choice: ContextChoice::Binding(f.id),
+        choice: ServerChoice::Bindings(vec![f.id]),
         ..agent_run()
     };
     let f = fixture("\\*", false).await;
     let chosen = MailActing {
-        choice: ContextChoice::Binding(f.id),
+        choice: ServerChoice::Bindings(vec![f.id]),
         ..chosen
     };
     call(&f, "mail.list", json!({}), &chosen).await.unwrap();

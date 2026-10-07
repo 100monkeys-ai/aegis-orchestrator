@@ -1453,7 +1453,8 @@ impl ToolInvocationService {
     /// 2026-10-07 clause 7): the call's person, the calling agent and its
     /// workflow, the choice for `imap` (the execution record's `contexts`
     /// when the execution has a record, else the call's `_meta.contexts`),
-    /// and whether the execution has a record.
+    /// a set of any number of mailboxes (its Update of 2026-10-07 (2)), and
+    /// whether the execution has a record.
     async fn mail_acting(
         &self,
         agent_id: AgentId,
@@ -1485,7 +1486,7 @@ impl ToolInvocationService {
             workflow_id: acting.workflow_id,
             choice: acting
                 .contexts
-                .choice(crate::application::tools::builtin_mail::MailActing::choice_key()),
+                .server(crate::application::tools::builtin_mail::MailActing::choice_key()),
             has_execution_record,
         }
     }

@@ -6328,7 +6328,7 @@ async fn a_starting_tool_refuses_contexts_of_another_shape_and_starts_nothing() 
     {
         Err(SealSessionError::InvalidArguments(message)) => assert_eq!(
             message,
-            "'contexts' must be an object naming a binding id or null for each server"
+            "'contexts' must be an object naming, for each server, a binding id, a list of binding ids, or null"
         ),
         other => panic!("contexts of another shape were not refused: {other:?}"),
     }

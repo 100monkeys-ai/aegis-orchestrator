@@ -1,47 +1,40 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! The `contexts` argument of the starting tools (Zaru ADR-0055 D9, D14).
+//! The `contexts` argument of the starting tools (Zaru ADR-0055 D9, D14;
+//! AEGIS ADR-132 Update (13) S11a).
 //!
 //! `aegis.task.execute`, `aegis.agent.generate`, `aegis.execute.intent`,
 //! `aegis.workflow.generate` and `aegis.workflow.run` each take a top-level
-//! `contexts: {"<server>": "<binding id>" | null}` beside `attachments`: the
-//! person's choice of a credential binding for each remote tool server. It
-//! is kept in the execution input's reserved key
-//! [`CONTEXTS_INPUT_KEY`], as
+//! `contexts: {"<server>": "<binding id>" | ["<binding id>", ...] | null}`
+//! beside `attachments`: the person's choice of credential bindings for each
+//! remote tool server, any number per server. It is kept in the execution
+//! input's reserved key [`CONTEXTS_INPUT_KEY`], as
 //! a caller's `outputs` is, where the starts read it, an agent state or a
 //! child inherits it, and the credential path selects by it. The tools'
 //! model-facing schemas do not list it: a model never picks a binding (D10).
 
 use serde_json::{Map, Value};
 
-use crate::domain::execution::CONTEXTS_INPUT_KEY;
+use crate::domain::execution::{check_contexts_shape, CONTEXTS_INPUT_KEY};
 use crate::domain::seal_session::SealSessionError;
 
-/// The refusal of a `contexts` argument of any other shape.
-const CONTEXTS_SHAPE: &str =
-    "'contexts' must be an object naming a binding id or null for each server";
-
-/// Parse the `contexts` argument of a starting tool's call.
+/// Parse the `contexts` argument of a starting tool's call, or a call's
+/// `_meta.contexts`.
 ///
-/// `Ok(None)` when it is absent. An object whose every value is a binding
-/// id (a UUID) or `null` is answered as given; a server the node does not
-/// know is kept and does nothing. Anything else is refused with
-/// `InvalidArguments` before anything starts.
+/// `Ok(None)` when it is absent. An object whose every value is `null`, a
+/// binding id (a UUID) or a non-empty list of distinct binding ids is
+/// answered as given; a server the node does not know is kept and does
+/// nothing. Anything else is refused with `InvalidArguments` before
+/// anything starts.
 pub(super) fn parse_contexts(args: &Value) -> Result<Option<Map<String, Value>>, SealSessionError> {
     let Some(raw) = args.get(CONTEXTS_INPUT_KEY) else {
         return Ok(None);
     };
-    let refused = || SealSessionError::InvalidArguments(CONTEXTS_SHAPE.to_string());
+    let refused = |sentence: &str| SealSessionError::InvalidArguments(sentence.to_string());
+    check_contexts_shape(raw).map_err(refused)?;
     let Value::Object(map) = raw else {
-        return Err(refused());
+        return Err(refused(crate::domain::execution::CONTEXTS_SHAPE));
     };
-    for choice in map.values() {
-        match choice {
-            Value::Null => {}
-            Value::String(id) if uuid::Uuid::parse_str(id).is_ok() => {}
-            _ => return Err(refused()),
-        }
-    }
     Ok(Some(map.clone()))
 }
 
@@ -115,8 +108,37 @@ mod tests {
         );
     }
 
+    const SECOND: &str = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+
+    /// AEGIS ADR-132 Update (13) S11a: the refusal's words.
+    const SENTENCE: &str =
+        "'contexts' must be an object naming, for each server, a binding id, a list of binding ids, or null";
+
+    /// S11a: a non-empty list of distinct binding ids is kept as given, in
+    /// the person's order, beside a bare id and `null`.
+    #[test]
+    fn a_list_of_binding_ids_is_kept_as_given() {
+        let args = json!({ "contexts": {
+            "nuclear-notes": [SECOND, BINDING],
+            "imap": [BINDING],
+            "github": null,
+            "elsewhere": BINDING
+        } });
+        let mut input = json!({ "topic": "x" });
+        match carry_contexts(&args, &mut input) {
+            Ok(()) => assert_eq!(
+                input["contexts"], args["contexts"],
+                "the list was not kept as given"
+            ),
+            Err(e) => panic!("a list of binding ids was refused: {e:?}"),
+        }
+    }
+
+    /// S11a: every other shape, an empty list and a repeated id included, is
+    /// refused with the sentence; a top-level list stays refused.
     #[test]
     fn every_other_shape_is_refused_with_the_sentence() {
+        let mut complaints = Vec::new();
         for bad in [
             json!({ "contexts": "nuclear-notes" }),
             json!({ "contexts": [BINDING] }),
@@ -124,14 +146,20 @@ mod tests {
             json!({ "contexts": { "nuclear-notes": "not-a-uuid" } }),
             json!({ "contexts": { "nuclear-notes": 7 } }),
             json!({ "contexts": { "nuclear-notes": { "id": BINDING } } }),
+            json!({ "contexts": { "nuclear-notes": [] } }),
+            json!({ "contexts": { "nuclear-notes": [BINDING, BINDING] } }),
+            json!({ "contexts": { "nuclear-notes": [BINDING, "not-a-uuid"] } }),
+            json!({ "contexts": { "nuclear-notes": [BINDING, null] } }),
+            json!({ "contexts": { "nuclear-notes": [[BINDING]] } }),
         ] {
             match parse_contexts(&bad) {
-                Err(SealSessionError::InvalidArguments(message)) => assert_eq!(
-                    message, CONTEXTS_SHAPE,
-                    "{bad} was refused with another sentence"
-                ),
-                other => panic!("{bad} was not refused: {other:?}"),
+                Err(SealSessionError::InvalidArguments(message)) if message == SENTENCE => {}
+                Err(SealSessionError::InvalidArguments(message)) => {
+                    complaints.push(format!("{bad} was refused with \"{message}\""))
+                }
+                other => complaints.push(format!("{bad} was not refused: {other:?}")),
             }
         }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

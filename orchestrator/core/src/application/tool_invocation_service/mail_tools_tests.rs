@@ -650,6 +650,124 @@ async fn the_dispatch_hands_a_mail_tool_the_runs_person_and_its_choice() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The refusal of a mailbox outside several chosen ones (AEGIS ADR-125's
+/// Update of 2026-10-07 (2) clause 1).
+const NOT_AMONG: &str =
+    "This tool needs your own mailbox, and the one named is not among those chosen for this run.";
+
+/// `mail.list` on `mailbox` as given (an id or a name).
+async fn list_naming(
+    service: &ToolInvocationService,
+    agent_id: AgentId,
+    execution: ExecutionId,
+    mailbox: &str,
+) -> Result<ToolInvocationResult, SealSessionError> {
+    service
+        .invoke_tool_internal(
+            &agent_id,
+            execution,
+            TenantId::default(),
+            0,
+            Vec::new(),
+            "mail.list".to_string(),
+            json!({ "mailbox": mailbox }),
+        )
+        .await
+}
+
+/// ADR-125's Update of 2026-10-07 (2) clauses 1 and 2: with two mailboxes
+/// chosen, a call naming either (by id or by its context name) reaches the
+/// mail server, no grant needed; the person's third mailbox is refused as
+/// not among those chosen, and named by a label that is no chosen
+/// mailbox's name it is not one of the person's; with one chosen, another
+/// is refused as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn several_chosen_mailboxes_are_each_admitted_and_another_is_refused() {
+    let vault = Vault::new();
+    let tenant = TenantId::default();
+    let mut ids = Vec::new();
+    for label in ["Inbox", "Sales", "Archive"] {
+        let id = vault
+            .bind(
+                &tenant,
+                USER,
+                CredentialType::Mailbox,
+                "imap",
+                CredentialStatus::Active,
+                Some(settings()),
+                &[],
+            )
+            .await;
+        let mut binding = vault.bindings.find_by_id(&id).await.unwrap().unwrap();
+        binding.metadata.label = label.to_string();
+        vault.bindings.save(&binding).await.unwrap();
+        ids.push(id);
+    }
+    let (inbox, sales, archive) = (ids[0], ids[1], ids[2]);
+    let (service, agent_id, runs) = service_with(
+        Some(vault.service.clone()),
+        &[
+            (
+                Some(USER),
+                Some(json!({ "imap": [inbox.0.to_string(), sales.0.to_string()] })),
+            ),
+            (Some(USER), Some(json!({ "imap": [inbox.0.to_string()] }))),
+        ],
+    )
+    .await;
+    let mut wrong = Vec::new();
+    for (case, run, mailbox, expected) in [
+        (
+            "the first by id",
+            runs[0],
+            inbox.0.to_string(),
+            REACHED.to_string(),
+        ),
+        (
+            "the second by id",
+            runs[0],
+            sales.0.to_string(),
+            REACHED.to_string(),
+        ),
+        (
+            "the second by name",
+            runs[0],
+            "Sales".to_string(),
+            REACHED.to_string(),
+        ),
+        (
+            "the first by name",
+            runs[0],
+            "Inbox".to_string(),
+            REACHED.to_string(),
+        ),
+        (
+            "a third by id",
+            runs[0],
+            archive.0.to_string(),
+            NOT_AMONG.to_string(),
+        ),
+        (
+            "a third by name",
+            runs[0],
+            "Archive".to_string(),
+            "'Archive' is not an active mailbox connection of yours.".to_string(),
+        ),
+        (
+            "another with one chosen",
+            runs[1],
+            sales.0.to_string(),
+            CHOSEN_DIFFERENT.to_string(),
+        ),
+    ] {
+        let told = told(&list_naming(&service, agent_id, run, &mailbox).await);
+        if !told.contains(&expected) {
+            wrong.push(format!("{case}: told \"{told}\""));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mail_tool_on_a_node_without_mail_tools_is_not_configured() {
     let (service, agent_id, runs) = service_with(None, &[(Some(USER), None)]).await;

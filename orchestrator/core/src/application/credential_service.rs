@@ -712,6 +712,21 @@ pub trait ToolCredentialSource: Send + Sync {
         actor: &ToolCallActor<'_>,
         server: &str,
     ) -> anyhow::Result<Option<SensitiveString>>;
+
+    /// The acting person's own Active bindings of the provider `server` in
+    /// the tenant, each with its context name (AEGIS ADR-132 Update (13)
+    /// S11c) and what it reaches: what a run's listing, a call's
+    /// `_context` and the start's check read a chosen binding by. The
+    /// default answers none, so no chosen binding resolves through a source
+    /// that does not override it.
+    async fn context_bindings(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: &str,
+        _server: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        Ok(Vec::new())
+    }
 }
 
 /// A mail tool's mailbox (AEGIS ADR-125 D4 and its Update of 2026-10-07
@@ -739,6 +754,82 @@ pub trait ToolMailboxSource: Send + Sync {
         actor: &ToolCallActor<'_>,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<Option<ToolMailbox>>;
+
+    /// The acting person's own Active `imap` bindings in the tenant, each
+    /// with its context name (AEGIS ADR-125's Update of 2026-10-07 (2)
+    /// clause 2, ADR-132 Update (13) S11c), so a mail tool's `mailbox` may
+    /// name a chosen mailbox by name. The default answers none.
+    async fn mailbox_contexts(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        Ok(Vec::new())
+    }
+}
+
+/// One of the acting person's bindings as a context: its id, its name (AEGIS
+/// ADR-132 Update (13) S11c) and what its token reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBinding {
+    pub id: CredentialBindingId,
+    pub name: String,
+    pub reach: Option<crate::domain::credential::BindingReach>,
+}
+
+impl ContextBinding {
+    /// What the binding reaches, as a `_context` description says it
+    /// (S11j): the instance's slug, "every instance", or "unknown".
+    pub fn reach_text(&self) -> String {
+        match &self.reach {
+            Some(reach) => match reach.kind {
+                crate::domain::credential::ReachKind::Apex => "every instance".to_string(),
+                crate::domain::credential::ReachKind::Instance => reach
+                    .instance_slug
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            },
+            None => "unknown".to_string(),
+        }
+    }
+}
+
+/// The first eight hex digits of a binding's id, by which a binding with no
+/// label, two with one label, and a binding that resolves no name are told
+/// apart (AEGIS ADR-132 Update (13) S11c, S11f).
+pub fn binding_digits(id: &CredentialBindingId) -> String {
+    id.0.simple().to_string()[..8].to_string()
+}
+
+/// The context names of a person's active bindings of one server, in the
+/// order given (AEGIS ADR-132 Update (13) S11c): each label with
+/// surrounding space removed; a label equal to another's ignoring case is
+/// followed by `" (<first eight hex digits>)"`; an empty label is the eight
+/// digits alone.
+pub fn context_names(bindings: &[(CredentialBindingId, &str)]) -> Vec<String> {
+    let folded: Vec<String> = bindings
+        .iter()
+        .map(|(_, label)| label.trim().to_lowercase())
+        .collect();
+    bindings
+        .iter()
+        .enumerate()
+        .map(|(i, (id, label))| {
+            let label = label.trim();
+            if label.is_empty() {
+                return binding_digits(id);
+            }
+            let shared = folded
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && *other == folded[i]);
+            if shared {
+                format!("{label} ({})", binding_digits(id))
+            } else {
+                label.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Whether `binding` is granted to `actor`'s agent, its workflow, or all the
@@ -796,6 +887,16 @@ impl ToolCredentialSource for StandardCredentialManagementService {
         };
         self.binding_secret(binding).await
     }
+
+    async fn context_bindings(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        server: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        self.active_context_bindings(tenant_id, user_id, &CredentialProvider::new(server))
+            .await
+    }
 }
 
 #[async_trait]
@@ -839,9 +940,55 @@ impl ToolMailboxSource for StandardCredentialManagementService {
             granted: granted_to(&binding, actor),
         }))
     }
+
+    async fn mailbox_contexts(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        self.active_context_bindings(tenant_id, user_id, &CredentialProvider::imap())
+            .await
+    }
 }
 
 impl StandardCredentialManagementService {
+    /// The person's own Active bindings of `provider` in the tenant, oldest
+    /// first, named as contexts (AEGIS ADR-132 Update (13) S11c).
+    async fn active_context_bindings(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        provider: &CredentialProvider,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        let mut active: Vec<UserCredentialBinding> = self
+            .repo
+            .find_by_owner(tenant_id, user_id)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                &binding.provider == provider
+                    && binding.owner_user_id == user_id
+                    && &binding.tenant_id == tenant_id
+                    && binding.status == CredentialStatus::Active
+            })
+            .collect();
+        active.sort_by_key(|binding| (binding.created_at, binding.id.0));
+        let labelled: Vec<(CredentialBindingId, &str)> = active
+            .iter()
+            .map(|binding| (binding.id, binding.metadata.label.as_str()))
+            .collect();
+        let names = context_names(&labelled);
+        Ok(active
+            .iter()
+            .zip(names)
+            .map(|(binding, name)| ContextBinding {
+                id: binding.id,
+                name,
+                reach: binding.metadata.reach.clone(),
+            })
+            .collect())
+    }
+
     /// The acting person's newest active binding for `provider` granted to
     /// the calling agent, its workflow or all their agents (AEGIS ADR-132
     /// H1, S6).
@@ -2349,6 +2496,44 @@ mod debug_tests {
         assert!(
             printed.contains("evil.example"),
             "the error lost the host it refused: {printed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_name_tests {
+    use super::*;
+
+    /// AEGIS ADR-132 Update (13) S11c: a label with surrounding space
+    /// removed; two labels equal, or equal ignoring case, each followed by
+    /// its first eight hex digits; an empty label the digits alone.
+    #[test]
+    fn context_names_tell_equal_labels_and_an_empty_label_apart() {
+        let id = |s: &str| CredentialBindingId(uuid::Uuid::parse_str(s).unwrap());
+        let a = id("aaaaaaaa-0000-4000-8000-000000000001");
+        let b = id("bbbbbbbb-0000-4000-8000-000000000002");
+        let c = id("cccccccc-0000-4000-8000-000000000003");
+        let d = id("dddddddd-0000-4000-8000-000000000004");
+        let e = id("eeeeeeee-0000-4000-8000-000000000005");
+        let f = id("ffffffff-0000-4000-8000-000000000006");
+        let names = context_names(&[
+            (a, " Play2 "),
+            (b, "Play2"),
+            (c, "Work notes"),
+            (d, "work NOTES"),
+            (e, "   "),
+            (f, "Solo"),
+        ]);
+        assert_eq!(
+            names,
+            vec![
+                "Play2 (aaaaaaaa)",
+                "Play2 (bbbbbbbb)",
+                "Work notes (cccccccc)",
+                "work NOTES (dddddddd)",
+                "eeeeeeee",
+                "Solo",
+            ]
         );
     }
 }

@@ -8,12 +8,14 @@
 //! password never reaches an agent. They work on `INBOX` only and by UID;
 //! bodies are read with `BODY.PEEK`, so no tool marks a message read.
 //!
-//! **Who may use a mailbox** (clause 7). The tool acts as the call's person
-//! (none for a service account: refused). The `mailbox` argument must name
-//! the person's own active `mailbox` binding. The choice for the key `imap`
-//! (the execution record's `contexts` when the execution has a record, else
-//! the call's `_meta.contexts`) must, when given, be that binding; a choice
-//! of none refuses. With nothing chosen, an execution with a record needs
+//! **Who may use a mailbox** (clause 7, and the Update of 2026-10-07 (2)).
+//! The tool acts as the call's person (none for a service account:
+//! refused). The `mailbox` argument must name the person's own active
+//! `mailbox` binding, by id, or by its context name when mailboxes are
+//! chosen. The choice for the key `imap` (the execution record's `contexts`
+//! when the execution has a record, else the call's `_meta.contexts`) is a
+//! set of any number of mailboxes, which must, when given, hold that
+//! binding; a choice of none refuses. With nothing chosen, an execution with a record needs
 //! the binding granted to the calling agent, its workflow or all agents; a
 //! call with no execution record (a conversation, or an MCP client acting
 //! as the person) is admitted on the ownership check alone, since its agent
@@ -28,7 +30,7 @@
 use crate::application::credential_service::{ToolCallActor, ToolMailbox, ToolMailboxSource};
 use crate::domain::agent::AgentId;
 use crate::domain::credential::{CredentialBindingId, CredentialProvider};
-use crate::domain::execution::ContextChoice;
+use crate::domain::execution::{ContextChoice, ServerChoice};
 use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::mail::session::{
@@ -68,6 +70,10 @@ pub const NO_PERSON: &str =
 /// The refusal for a chosen binding other than the `mailbox` argument.
 pub const CHOSEN_DIFFERENT: &str =
     "This tool needs your own mailbox, and the one chosen for this run is a different one.";
+/// The refusal for a mailbox outside several chosen ones (the Update of
+/// 2026-10-07 (2) clause 1).
+pub const NOT_AMONG_CHOSEN: &str =
+    "This tool needs your own mailbox, and the one named is not among those chosen for this run.";
 /// The refusal for a choice of none.
 pub const NONE_CHOSEN: &str = "This tool needs your own mailbox, and none was chosen for this run.";
 /// The refusal for an agent's run whose agent holds no grant.
@@ -86,8 +92,8 @@ pub struct MailActing {
     pub user_id: Option<String>,
     pub agent_id: AgentId,
     pub workflow_id: Option<uuid::Uuid>,
-    /// The choice for the key `imap`.
-    pub choice: ContextChoice,
+    /// The choice for the key `imap`: nothing, none, or a set of mailboxes.
+    pub choice: ServerChoice,
     /// Whether the call's execution has a record (an agent's run), as
     /// opposed to a conversation's session.
     pub has_execution_record: bool,
@@ -164,15 +170,38 @@ impl MailTools {
                 "'{shown}' is not an active mailbox connection of yours."
             ))
         };
-        let id = uuid::Uuid::parse_str(raw)
-            .map(CredentialBindingId)
-            .map_err(|_| not_yours())?;
+        let id = match uuid::Uuid::parse_str(raw) {
+            Ok(id) => CredentialBindingId(id),
+            // The Update of 2026-10-07 (2) clause 2: a chosen mailbox by its
+            // context name, resolved within the set.
+            Err(_) => match &acting.choice {
+                ServerChoice::Bindings(chosen) => self
+                    .mailboxes
+                    .mailbox_contexts(&acting.tenant_id, user_id)
+                    .await
+                    .map_err(|e| {
+                        SealSessionError::InternalError(format!("mailbox lookup failed: {e}"))
+                            .answered(CallerAnswer::Internal(InternalFailure::Server))
+                    })?
+                    .into_iter()
+                    .find(|mailbox| mailbox.name == raw && chosen.contains(&mailbox.id))
+                    .map(|mailbox| mailbox.id)
+                    .ok_or_else(not_yours)?,
+                _ => return Err(not_yours()),
+            },
+        };
         let actor = ToolCallActor {
             tenant_id: &acting.tenant_id,
             user_id,
             agent_id: acting.agent_id,
             workflow_id: acting.workflow_id,
-            context: acting.choice,
+            context: match &acting.choice {
+                ServerChoice::NotGiven => ContextChoice::NotGiven,
+                ServerChoice::Bindings(chosen) if chosen.contains(&id) => {
+                    ContextChoice::Binding(id)
+                }
+                ServerChoice::None | ServerChoice::Bindings(_) => ContextChoice::None,
+            },
         };
         let mailbox = self
             .mailboxes
@@ -183,16 +212,19 @@ impl MailTools {
                     .answered(CallerAnswer::Internal(InternalFailure::Server))
             })?
             .ok_or_else(not_yours)?;
-        match acting.choice {
-            ContextChoice::Binding(chosen) if chosen == id => {}
-            ContextChoice::Binding(_) => {
+        match &acting.choice {
+            ServerChoice::Bindings(chosen) if chosen.contains(&id) => {}
+            ServerChoice::Bindings(chosen) if chosen.len() == 1 => {
                 return Err(binding_required(CHOSEN_DIFFERENT.to_string()))
             }
-            ContextChoice::None => return Err(binding_required(NONE_CHOSEN.to_string())),
-            ContextChoice::NotGiven if acting.has_execution_record && !mailbox.granted => {
+            ServerChoice::Bindings(_) => {
+                return Err(binding_required(NOT_AMONG_CHOSEN.to_string()))
+            }
+            ServerChoice::None => return Err(binding_required(NONE_CHOSEN.to_string())),
+            ServerChoice::NotGiven if acting.has_execution_record && !mailbox.granted => {
                 return Err(binding_required(NOT_GRANTED.to_string()))
             }
-            ContextChoice::NotGiven => {}
+            ServerChoice::NotGiven => {}
         }
         Ok(mailbox)
     }

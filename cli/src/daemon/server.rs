@@ -1804,6 +1804,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Some(service as Arc<dyn CredentialManagementService>)
         }
     };
+    // A start checks every binding its dispatch chose against the same store
+    // (AEGIS ADR-132 Update (13) S11f).
+    if let Some(source) = &tool_credentials {
+        execution_service.set_context_bindings(source.clone());
+    }
 
     // ─── Container Step Runner (ADR-050) ──────────────────────────────────────
     // Dedicated Docker client + image manager + step runner for CI/CD container

@@ -506,6 +506,12 @@ pub struct StandardExecutionService {
     /// Self-reference used by judge validators to spawn child executions (ADR-016, ADR-039).
     /// Set once at composition root via `set_child_execution_service()`.
     child_executor: std::sync::OnceLock<Arc<dyn ExecutionService>>,
+    /// Where a start checks each binding its dispatch chose (AEGIS ADR-132
+    /// Update (13) S11f, S11l). Set once at the composition root via
+    /// `set_context_bindings()`; unset, chosen bindings are checked at call
+    /// time only.
+    context_bindings:
+        std::sync::OnceLock<Arc<dyn crate::application::credential_service::ToolCredentialSource>>,
     /// Optional ToolRouter used to validate that an agent's requested tools actually exist
     /// before spawning the container (Safety & Polish).
     tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
@@ -844,6 +850,7 @@ impl StandardExecutionService {
             runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             child_executor: std::sync::OnceLock::new(),
+            context_bindings: std::sync::OnceLock::new(),
             tool_router: None,
             cortex_client: None,
             rate_limit_enforcer: None,
@@ -978,6 +985,18 @@ impl StandardExecutionService {
     pub fn set_child_execution_service(&self, svc: Arc<dyn ExecutionService>) {
         // OnceLock silently ignores a second set; the service is wired once at startup.
         let _ = self.child_executor.set(svc);
+    }
+
+    /// Check every binding a start's dispatch chose against `source` (AEGIS
+    /// ADR-132 Update (13) S11f, S11l): the person's own, in the tenant, of
+    /// the provider its key names, Active. Wired once at startup, after the
+    /// credential service exists.
+    pub fn set_context_bindings(
+        &self,
+        source: Arc<dyn crate::application::credential_service::ToolCredentialSource>,
+    ) {
+        // OnceLock silently ignores a second set; the source is wired once at startup.
+        let _ = self.context_bindings.set(source);
     }
 
     /// Attach a StandardRuntime registry for validated language+version → image resolution (ADR-043).
@@ -4269,6 +4288,256 @@ mod tests {
         );
     }
 
+    const SECOND_BINDING: &str = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+
+    /// AEGIS ADR-132 Update (13) S11a: the refusal of a malformed `contexts`.
+    const CONTEXTS_SHAPE_REFUSAL: &str = "Execution refused: 'contexts' must be an object naming, for each server, a binding id, a list of binding ids, or null";
+
+    /// S11a, S11b, S11f: a required context filled with a list of bindings
+    /// starts, and the persisted input keeps the list as given.
+    #[tokio::test]
+    async fn a_required_context_filled_with_a_list_of_bindings_starts() {
+        let tenant_id = CoreTenantId::consumer();
+        let required = nuclear_notes_reader(true);
+        let (service, _runtime, _repo, _bus) = refusal_service(&tenant_id, &[&required], &[]).await;
+        let chosen = serde_json::json!([SECOND_BINDING, CONTEXT_BINDING]);
+        let id = service
+            .start_execution(
+                required.id,
+                input_with(serde_json::json!({
+                    "tenant_id": tenant_id.as_str(),
+                    "contexts": { "nuclear-notes": chosen.clone() }
+                })),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a required context filled with a list was refused: {e}"));
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert_eq!(
+            execution.input.input["contexts"]["nuclear-notes"], chosen,
+            "the persisted input did not keep the list as given"
+        );
+        assert!(
+            execution.input.contexts().is_filled("nuclear-notes"),
+            "a list of bindings did not fill the context"
+        );
+    }
+
+    /// S11a, S11l: a malformed reserved `contexts` refuses the start on both
+    /// paths (the root start, which the HTTP execute route reaches with the
+    /// value unchecked, and a child's), and nothing starts.
+    #[tokio::test]
+    async fn a_malformed_contexts_is_refused_at_both_starts() {
+        let tenant = CoreTenantId::consumer();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("child-worker", None, None);
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "zaru-consumer");
+        let (service, _repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+
+        let mut complaints = Vec::new();
+        for (case, contexts) in [
+            ("an empty list", serde_json::json!({ "nuclear-notes": [] })),
+            (
+                "a repeated id",
+                serde_json::json!({ "nuclear-notes": [CONTEXT_BINDING, CONTEXT_BINDING] }),
+            ),
+            ("a number", serde_json::json!({ "nuclear-notes": 7 })),
+            ("not an object", serde_json::json!([CONTEXT_BINDING])),
+        ] {
+            let input = input_with(serde_json::json!({
+                "tenant_id": "zaru-consumer",
+                "contexts": contexts
+            }));
+            for (path, started) in [
+                (
+                    "root",
+                    service
+                        .start_execution(
+                            child_agent.id,
+                            input.clone(),
+                            "test-ctx".to_string(),
+                            None,
+                        )
+                        .await,
+                ),
+                (
+                    "child",
+                    service
+                        .start_child_execution(child_agent.id, input.clone(), parent_execution.id)
+                        .await,
+                ),
+            ] {
+                match started {
+                    Ok(id) => complaints.push(format!("{case}, {path}: started as {id}")),
+                    Err(e) if e.to_string() == CONTEXTS_SHAPE_REFUSAL => {}
+                    Err(e) => complaints.push(format!("{case}, {path}: answered \"{e}\"")),
+                }
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// A credential source answering, for `PERSON`, the bindings it holds of
+    /// each service, as the credential service names them (S11c).
+    struct PersonsBindings(Vec<(&'static str, crate::domain::credential::CredentialBindingId)>);
+
+    const PERSON: &str = "u-context-person";
+
+    #[async_trait::async_trait]
+    impl crate::application::credential_service::ToolCredentialSource for PersonsBindings {
+        async fn tool_server_credential(
+            &self,
+            _: &crate::application::credential_service::ToolCallActor<'_>,
+            _: &str,
+        ) -> anyhow::Result<Option<crate::domain::secrets::SensitiveString>> {
+            Ok(None)
+        }
+        async fn context_bindings(
+            &self,
+            _: &CoreTenantId,
+            user_id: &str,
+            server: &str,
+        ) -> anyhow::Result<Vec<crate::application::credential_service::ContextBinding>> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|(service, _)| user_id == PERSON && *service == server)
+                .map(
+                    |(_, id)| crate::application::credential_service::ContextBinding {
+                        id: *id,
+                        name: format!("binding {}", id.0),
+                        reach: None,
+                    },
+                )
+                .collect())
+        }
+    }
+
+    fn the_person(tenant_id: &CoreTenantId) -> UserIdentity {
+        UserIdentity {
+            sub: PERSON.to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind: crate::domain::iam::IdentityKind::ConsumerUser {
+                zaru_tier: crate::domain::iam::ZaruTier::Free,
+                tenant_id: tenant_id.clone(),
+            },
+        }
+    }
+
+    /// S11f, S11l: every binding of every chosen set is the person's own
+    /// active one of the provider its key names before anything starts: a
+    /// set holding another person's binding, and an id under a server the
+    /// node does not know, refuse the start with the sentence naming the
+    /// binding by its first eight hex digits, and nothing starts; the
+    /// person's own two start; a child is checked as its parent's person.
+    #[tokio::test]
+    async fn a_chosen_binding_not_the_persons_refuses_the_start() {
+        use crate::domain::credential::CredentialBindingId;
+        let tenant_id = CoreTenantId::consumer();
+        let agent = nuclear_notes_reader(true);
+        let (own_a, own_b, others) = (
+            CredentialBindingId::new(),
+            CredentialBindingId::new(),
+            CredentialBindingId::new(),
+        );
+        let digits = |id: CredentialBindingId| id.0.simple().to_string()[..8].to_string();
+        let source = Arc::new(PersonsBindings(vec![
+            ("nuclear-notes", own_a),
+            ("nuclear-notes", own_b),
+        ]));
+        let mut parent = make_parent_execution_with_tenant(AgentId::new(), "zaru-consumer");
+        parent.initiating_user_sub = Some(PERSON.to_string());
+        parent.input.input["contexts"] =
+            serde_json::json!({ "nuclear-notes": [own_a.0.to_string(), others.0.to_string()] });
+        let (service, runtime, execution_repo, event_bus) =
+            refusal_service(&tenant_id, &[&agent], &[&parent]).await;
+        service.set_context_bindings(source);
+        let mut events = event_bus.subscribe();
+
+        let mut complaints = Vec::new();
+        let refused_for = |service: &str, id: CredentialBindingId| {
+            format!(
+                "Execution refused: context '{}' chosen for {service} is not an active credential of yours for it",
+                digits(id)
+            )
+        };
+        for (case, contexts, expected) in [
+            (
+                "another person's binding in the set",
+                serde_json::json!({ "nuclear-notes": [own_a.0.to_string(), others.0.to_string()] }),
+                refused_for("nuclear-notes", others),
+            ),
+            (
+                "an id under a server the node does not know",
+                serde_json::json!({
+                    "nuclear-notes": [own_a.0.to_string()],
+                    "elsewhere": own_b.0.to_string()
+                }),
+                refused_for("elsewhere", own_b),
+            ),
+        ] {
+            match service
+                .start_execution(
+                    agent.id,
+                    input_with(serde_json::json!({
+                        "tenant_id": tenant_id.as_str(),
+                        "contexts": contexts
+                    })),
+                    "test-ctx".to_string(),
+                    Some(&the_person(&tenant_id)),
+                )
+                .await
+            {
+                Ok(id) => complaints.push(format!("{case}: started as {id}")),
+                Err(e) if e.to_string() == expected => {}
+                Err(e) => complaints.push(format!("{case}: answered \"{e}\"")),
+            }
+        }
+        match service
+            .start_child_execution(
+                agent.id,
+                input_with(serde_json::json!({ "task": "read" })),
+                parent.id,
+            )
+            .await
+        {
+            Ok(id) => complaints.push(format!("a child taking its parent's set: started as {id}")),
+            Err(e) if e.to_string() == refused_for("nuclear-notes", others) => {}
+            Err(e) => complaints.push(format!("a child taking its parent's set: answered \"{e}\"")),
+        }
+        complaints.extend(
+            left_behind(
+                &tenant_id,
+                agent.id,
+                &execution_repo,
+                &mut events,
+                runtime.as_ref(),
+            )
+            .await,
+        );
+        if let Err(e) = service
+            .start_execution(
+                agent.id,
+                input_with(serde_json::json!({
+                    "tenant_id": tenant_id.as_str(),
+                    "contexts": { "nuclear-notes": [own_b.0.to_string(), own_a.0.to_string()] }
+                })),
+                "test-ctx".to_string(),
+                Some(&the_person(&tenant_id)),
+            )
+            .await
+        {
+            complaints.push(format!("the person's own two bindings were refused: {e}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
     /// D14: the agent's input schema and its rendered prompt never see the
     /// reserved `contexts`; the persisted input keeps it.
     #[tokio::test]
@@ -5365,6 +5634,62 @@ impl StandardExecutionService {
         Ok(())
     }
 
+    /// AEGIS ADR-132 Update (13) S11a, S11l: a reserved `contexts` of any
+    /// shape but S11a's refuses the start, on every path, the HTTP execute
+    /// route's (which inserts the value unchecked) included.
+    fn refuse_malformed_contexts(input: &ExecutionInput) -> Result<()> {
+        if let Some(contexts) = input
+            .input
+            .get(crate::domain::execution::CONTEXTS_INPUT_KEY)
+        {
+            crate::domain::execution::check_contexts_shape(contexts)
+                .map_err(|sentence| ExecutionError::Refused(sentence.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// AEGIS ADR-132 Update (13) S11f, S11l: before any record or
+    /// container, every binding of every chosen set is checked once as Zaru
+    /// ADR-0055 D15 checks a chosen binding (the person's own, in the
+    /// tenant, of the provider its key names, Active); the first that fails
+    /// refuses the start, named by its first eight hex digits (a binding
+    /// that fails is never among the person's active ones, so it has no
+    /// other name). A key the node does not know is checked the same. With
+    /// no source wired, the call-time check alone stands.
+    async fn refuse_unusable_contexts(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        input: &ExecutionInput,
+    ) -> Result<()> {
+        let Some(source) = self.context_bindings.get() else {
+            return Ok(());
+        };
+        for (service, choice) in input.contexts().servers() {
+            let crate::domain::execution::ServerChoice::Bindings(chosen) = choice else {
+                continue;
+            };
+            let usable = match person {
+                Some(person) => source
+                    .context_bindings(tenant_id, person, service)
+                    .await
+                    .context("reading the bindings a start's dispatch chose")?,
+                None => Vec::new(),
+            };
+            if let Some(unusable) = chosen
+                .iter()
+                .find(|id| !usable.iter().any(|binding| &binding.id == *id))
+            {
+                return Err(ExecutionError::Refused(format!(
+                    "context '{}' chosen for {service} is not an active credential of yours for it",
+                    crate::application::credential_service::binding_digits(unusable)
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     /// Keep `from`'s dispatch choices on `input` when it carries none of its
     /// own (Zaru ADR-0055 D14): an agent state takes its workflow
     /// execution's, a child its parent's, as each takes its person.
@@ -5576,6 +5901,7 @@ impl StandardExecutionService {
                 .await?;
             Self::inherit_contexts(&mut input, workflow_input.as_ref());
         }
+        Self::refuse_malformed_contexts(&input)?;
         Self::refuse_unfilled_context(&agent, &input)?;
 
         // ADR-102: Use manifest-declared security_context if present; otherwise use caller's context.
@@ -5692,6 +6018,14 @@ impl StandardExecutionService {
         execution.initiating_user_sub = self
             .acting_user_sub(identity, &tenant_id, persisted_input.workflow_execution_id)
             .await?;
+        // AEGIS ADR-132 Update (13) S11f: every chosen binding is the
+        // person's own active one before anything is recorded.
+        self.refuse_unusable_contexts(
+            &tenant_id,
+            execution.initiating_user_sub.as_deref(),
+            &persisted_input,
+        )
+        .await?;
 
         // 3. Save initial state
         self.repository
@@ -6633,7 +6967,12 @@ impl ExecutionService for StandardExecutionService {
         // Zaru ADR-0055 D14: a child with no binding choices of its own takes
         // its parent's; D16: a required context left unfilled refuses it.
         Self::inherit_contexts(&mut input, Some(&parent.input.input));
+        Self::refuse_malformed_contexts(&input)?;
         Self::refuse_unfilled_context(&agent, &input)?;
+        // AEGIS ADR-132 Update (13) S11f: a child acts for its parent's
+        // person, and every binding it chose or took is checked as theirs.
+        self.refuse_unusable_contexts(&tenant_id, parent.initiating_user_sub.as_deref(), &input)
+            .await?;
         // 3. Prepare input (render judge's prompt template). The persisted
         // copy preserves the caller's intent; the runtime copy carries the
         // rendered prompt for the supervisor.
