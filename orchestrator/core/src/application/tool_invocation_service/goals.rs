@@ -404,6 +404,7 @@ fn run_dispatches(exec: &Execution) -> (usize, Vec<DispatchFact>) {
                     iteration: iteration.number,
                     tool: step.tool_name.clone(),
                     status: step.status.clone(),
+                    sentence: DispatchFact::sentence_of(step),
                 })
         })
         .collect();

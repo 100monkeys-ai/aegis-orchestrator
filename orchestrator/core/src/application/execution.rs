@@ -293,6 +293,14 @@ pub trait ExecutionService: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Publish an event of an execution on its stream, where the execution
+    /// events are persisted and `aegis.task.logs` reads them: the inner
+    /// loop's tool dispatches and model generations (AEGIS ADR-131 U34e).
+    ///
+    /// The default publishes nothing; `StandardExecutionService` publishes on
+    /// its event bus.
+    async fn record_execution_event(&self, _event: ExecutionEvent) {}
 }
 
 /// End, as failed, every execution an earlier orchestrator process left
@@ -7186,6 +7194,10 @@ impl ExecutionService for StandardExecutionService {
             }
         }
         Ok(())
+    }
+
+    async fn record_execution_event(&self, event: ExecutionEvent) {
+        self.event_bus.publish_execution_event(event);
     }
 }
 

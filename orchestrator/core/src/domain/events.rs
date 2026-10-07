@@ -460,6 +460,56 @@ pub enum ExecutionEvent {
         fallback_attempted: bool,
         timestamp: DateTime<Utc>,
     },
+    /// One tool call of a try, as the orchestrator decided it (AEGIS ADR-131
+    /// U34): published when its result is known, or, for a `cmd.run` handed
+    /// to the agent's container, with status `dispatched` when it is handed
+    /// over; its end is then a [`ExecutionEvent::ToolDispatchEnded`].
+    ToolDispatched {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        iteration_number: u8,
+        /// The call's place in the try's trajectory, from 0.
+        call_index: u32,
+        tool_call_id: String,
+        tool: String,
+        /// The arguments as the model wrote them; a `cmd.run`'s without its
+        /// standard input's text, which `stdin_given` stands for (U34c).
+        arguments: serde_json::Value,
+        /// `cmd.run` only: whether standard input was given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin_given: Option<bool>,
+        /// `succeeded`, `failed`, `fatal`, `refused` or `dispatched`.
+        status: String,
+        /// The sentence the call ended with: its refusal, its error.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sentence: Option<String>,
+        /// For a refused call, the layer that refused it (U34a).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused_by: Option<RefusalLayer>,
+        /// For a `cmd.run` handed to the container, the dispatch it went as.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_id: Option<DispatchId>,
+        dispatched_at: DateTime<Utc>,
+    },
+    /// A `cmd.run` handed to the agent's container came back (U34).
+    ToolDispatchEnded {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        iteration_number: u8,
+        call_index: u32,
+        dispatch_id: DispatchId,
+        tool_call_id: String,
+        tool: String,
+        /// `succeeded` or `failed`.
+        status: String,
+        exit_code: i32,
+        /// For a failed command, its exit code and its error output's last
+        /// line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sentence: Option<String>,
+        duration_ms: u64,
+        ended_at: DateTime<Utc>,
+    },
     InstanceSpawned {
         execution_id: ExecutionId,
         agent_id: AgentId,
@@ -551,6 +601,16 @@ impl From<&crate::domain::llm::LLMError> for LlmErrorClass {
             LLMError::Provider(_) => LlmErrorClass::Provider,
         }
     }
+}
+
+/// The layer that refused a tool call (AEGIS ADR-131 U34a): the execution's
+/// security context, or the try's time limit (a command asked for with too
+/// little of the try left to run it and read its result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalLayer {
+    SecurityContext,
+    TryTimeLimit,
 }
 
 /// Workflow FSM lifecycle events (BC-3 Workflow Orchestration Context).

@@ -183,6 +183,8 @@ impl DomainEvent {
                 | ExecutionEvent::ConsoleOutput { execution_id, .. }
                 | ExecutionEvent::LlmInteraction { execution_id, .. }
                 | ExecutionEvent::LlmCallFailed { execution_id, .. }
+                | ExecutionEvent::ToolDispatched { execution_id, .. }
+                | ExecutionEvent::ToolDispatchEnded { execution_id, .. }
                 | ExecutionEvent::InstanceSpawned { execution_id, .. }
                 | ExecutionEvent::InstanceTerminated { execution_id, .. }
                 | ExecutionEvent::ChildExecutionSpawned { execution_id, .. }
@@ -346,6 +348,8 @@ impl DomainEvent {
                 | ExecutionEvent::ConsoleOutput { agent_id, .. }
                 | ExecutionEvent::LlmInteraction { agent_id, .. }
                 | ExecutionEvent::LlmCallFailed { agent_id, .. }
+                | ExecutionEvent::ToolDispatched { agent_id, .. }
+                | ExecutionEvent::ToolDispatchEnded { agent_id, .. }
                 | ExecutionEvent::InstanceSpawned { agent_id, .. }
                 | ExecutionEvent::InstanceTerminated { agent_id, .. }
                 | ExecutionEvent::ChildExecutionSpawned { agent_id, .. }
@@ -435,6 +439,8 @@ impl DomainEvent {
                 ExecutionEvent::ConsoleOutput { timestamp, .. } => *timestamp,
                 ExecutionEvent::LlmInteraction { timestamp, .. } => *timestamp,
                 ExecutionEvent::LlmCallFailed { timestamp, .. } => *timestamp,
+                ExecutionEvent::ToolDispatched { dispatched_at, .. } => *dispatched_at,
+                ExecutionEvent::ToolDispatchEnded { ended_at, .. } => *ended_at,
                 ExecutionEvent::InstanceSpawned { spawned_at, .. } => *spawned_at,
                 ExecutionEvent::InstanceTerminated { terminated_at, .. } => *terminated_at,
                 ExecutionEvent::ChildExecutionSpawned { spawned_at, .. } => *spawned_at,
@@ -686,6 +692,8 @@ impl DomainEvent {
                 ExecutionEvent::ConsoleOutput { .. } => "console_output",
                 ExecutionEvent::LlmInteraction { .. } => "llm_interaction",
                 ExecutionEvent::LlmCallFailed { .. } => "llm_call_failed",
+                ExecutionEvent::ToolDispatched { .. } => "tool_dispatched",
+                ExecutionEvent::ToolDispatchEnded { .. } => "tool_dispatch_ended",
                 ExecutionEvent::InstanceSpawned { .. } => "instance_spawned",
                 ExecutionEvent::InstanceTerminated { .. } => "instance_terminated",
                 ExecutionEvent::ChildExecutionSpawned { .. } => "child_execution_spawned",
@@ -971,6 +979,12 @@ impl DomainEvent {
                 | ExecutionEvent::LlmCallFailed {
                     iteration_number, ..
                 }
+                | ExecutionEvent::ToolDispatched {
+                    iteration_number, ..
+                }
+                | ExecutionEvent::ToolDispatchEnded {
+                    iteration_number, ..
+                }
                 | ExecutionEvent::InstanceSpawned {
                     iteration_number, ..
                 }
@@ -1029,6 +1043,8 @@ impl DomainEvent {
                 ExecutionEvent::ConsoleOutput { .. } => "console",
                 ExecutionEvent::LlmInteraction { .. } => "llm",
                 ExecutionEvent::LlmCallFailed { .. } => "llm",
+                ExecutionEvent::ToolDispatched { .. }
+                | ExecutionEvent::ToolDispatchEnded { .. } => "tool",
                 ExecutionEvent::InstanceSpawned { .. }
                 | ExecutionEvent::InstanceTerminated { .. } => "runtime",
                 ExecutionEvent::ChildExecutionSpawned { .. }
@@ -1409,6 +1425,10 @@ impl ExecutionEventReceiver {
             ExecutionEvent::LlmCallFailed { execution_id, .. } => {
                 execution_id == &self.execution_id
             }
+            ExecutionEvent::ToolDispatched { execution_id, .. }
+            | ExecutionEvent::ToolDispatchEnded { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
             ExecutionEvent::InstanceSpawned { execution_id, .. } => {
                 execution_id == &self.execution_id
             }
@@ -1543,6 +1563,8 @@ impl AgentEventReceiver {
                 ExecutionEvent::ConsoleOutput { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::LlmInteraction { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::LlmCallFailed { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::ToolDispatched { agent_id, .. }
+                | ExecutionEvent::ToolDispatchEnded { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceSpawned { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::ExecutionTimedOut { agent_id, .. } => agent_id == &self.agent_id,

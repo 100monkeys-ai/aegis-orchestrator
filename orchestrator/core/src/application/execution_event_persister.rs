@@ -217,6 +217,8 @@ fn execution_id_for(event: &ExecutionEvent) -> ExecutionId {
         | ExecutionEvent::ConsoleOutput { execution_id, .. }
         | ExecutionEvent::LlmInteraction { execution_id, .. }
         | ExecutionEvent::LlmCallFailed { execution_id, .. }
+        | ExecutionEvent::ToolDispatched { execution_id, .. }
+        | ExecutionEvent::ToolDispatchEnded { execution_id, .. }
         | ExecutionEvent::InstanceSpawned { execution_id, .. }
         | ExecutionEvent::InstanceTerminated { execution_id, .. } => *execution_id,
         // Variants not enumerated above use serde to extract the field. This
@@ -261,6 +263,12 @@ fn iteration_number_for(event: &ExecutionEvent) -> Option<u8> {
         | ExecutionEvent::LlmCallFailed {
             iteration_number, ..
         }
+        | ExecutionEvent::ToolDispatched {
+            iteration_number, ..
+        }
+        | ExecutionEvent::ToolDispatchEnded {
+            iteration_number, ..
+        }
         | ExecutionEvent::InstanceSpawned {
             iteration_number, ..
         }
@@ -285,6 +293,8 @@ fn event_type_str(event: &ExecutionEvent) -> &'static str {
         ExecutionEvent::ConsoleOutput { .. } => "ConsoleOutput",
         ExecutionEvent::LlmInteraction { .. } => "LlmInteraction",
         ExecutionEvent::LlmCallFailed { .. } => "LlmCallFailed",
+        ExecutionEvent::ToolDispatched { .. } => "ToolDispatched",
+        ExecutionEvent::ToolDispatchEnded { .. } => "ToolDispatchEnded",
         ExecutionEvent::InstanceSpawned { .. } => "InstanceSpawned",
         ExecutionEvent::InstanceTerminated { .. } => "InstanceTerminated",
         _ => "ExecutionEvent",
@@ -726,5 +736,78 @@ mod tests {
         );
         assert_eq!(events[0].0, exec_id);
         assert_eq!(events[0].2, "IterationStarted");
+    }
+
+    /// The two dispatch events of AEGIS ADR-131 U34.
+    fn tool_dispatched(execution_id: ExecutionId) -> ExecutionEvent {
+        ExecutionEvent::ToolDispatched {
+            execution_id,
+            agent_id: AgentId::new(),
+            iteration_number: 2,
+            call_index: 0,
+            tool_call_id: "call-1".to_string(),
+            tool: "cmd.run".to_string(),
+            arguments: serde_json::json!({"command": "pip install fpdf2"}),
+            stdin_given: Some(false),
+            status: "dispatched".to_string(),
+            sentence: None,
+            refused_by: None,
+            dispatch_id: Some(crate::domain::shared_kernel::DispatchId::new()),
+            dispatched_at: chrono::Utc::now(),
+        }
+    }
+
+    fn tool_dispatch_ended(execution_id: ExecutionId) -> ExecutionEvent {
+        ExecutionEvent::ToolDispatchEnded {
+            execution_id,
+            agent_id: AgentId::new(),
+            iteration_number: 2,
+            call_index: 0,
+            dispatch_id: crate::domain::shared_kernel::DispatchId::new(),
+            tool_call_id: "call-1".to_string(),
+            tool: "cmd.run".to_string(),
+            status: "failed".to_string(),
+            exit_code: 1,
+            sentence: Some("exited with code 1: no network".to_string()),
+            duration_ms: 12,
+            ended_at: chrono::Utc::now(),
+        }
+    }
+
+    /// AEGIS ADR-131 U34: a tool dispatch and its end are stored under their
+    /// own event types, with the try they belong to, so `aegis.task.logs`
+    /// shows them as what they are.
+    #[tokio::test]
+    async fn tool_dispatch_events_are_stored_with_their_type_and_try() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repo = Arc::new(RecordingRepo::new());
+        let persister = Arc::new(ExecutionEventPersister::new(
+            repo.clone(),
+            event_bus.clone(),
+        ));
+        let _h = persister.start();
+        let exec_id = ExecutionId::new();
+        event_bus.publish_execution_event(tool_dispatched(exec_id));
+        event_bus.publish_execution_event(tool_dispatch_ended(exec_id));
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        while repo.events.read().await.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+        let stored: Vec<(ExecutionId, String, Option<u8>)> = repo
+            .events
+            .read()
+            .await
+            .iter()
+            .map(|(id, _, event_type, _, iteration)| (*id, event_type.clone(), *iteration))
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                (exec_id, "ToolDispatched".to_string(), Some(2)),
+                (exec_id, "ToolDispatchEnded".to_string(), Some(2)),
+            ],
+            "the dispatch events were stored as {stored:?}"
+        );
     }
 }

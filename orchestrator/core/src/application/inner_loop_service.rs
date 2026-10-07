@@ -17,6 +17,7 @@ use crate::domain::agent::{AgentId, ToolCallRequirement};
 use crate::domain::dispatch::{
     AgentMessage, ConversationMessage, DispatchAction, DispatchId, OrchestratorMessage, ToolCall,
 };
+use crate::domain::events::{ExecutionEvent, RefusalLayer};
 use crate::domain::execution::{ExecutionId, Iteration, TrajectoryStep};
 use crate::domain::goal::{judge_context_or_default, JudgeContextSource};
 use crate::domain::iam::UserIdentity;
@@ -103,6 +104,10 @@ struct ExecutionContext {
     tool_call_requirement: ToolCallRequirement,
     /// Whether a text answer was already sent back once for that requirement.
     tool_call_reminded: bool,
+    /// How many messages of `conversation` an earlier generation's
+    /// `LlmInteraction` already showed (AEGIS ADR-131 U34d): the next one's
+    /// prompt is the messages after them.
+    conversation_shown: usize,
 }
 
 /// The sentence a try fails with when the model answers text where it had to
@@ -150,6 +155,44 @@ fn command_line_of(arguments_json: &str) -> Option<String> {
 
 fn single_spaced(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The sentence a failed command ended with (AEGIS ADR-131 U34): its exit
+/// code and the last line of its error output, where it wrote one. A
+/// command the bootstrap ended at its timeout has the bootstrap's timeout
+/// line there.
+pub(crate) fn command_failure_sentence(exit_code: i64, stderr: &str) -> String {
+    match stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+        Some(line) => format!("exited with code {exit_code}: {line}"),
+        None => format!("exited with code {exit_code}"),
+    }
+}
+
+/// A call's arguments as the model wrote them, for its event (AEGIS ADR-131
+/// U34c): a `cmd.run`'s without its standard input's text, and whether it
+/// gave one; any other tool's whole, with `None`.
+fn event_arguments(tool: &str, arguments: &Value) -> (Value, Option<bool>) {
+    if tool != "cmd.run" {
+        return (arguments.clone(), None);
+    }
+    let mut shown = arguments.clone();
+    let given = shown
+        .as_object_mut()
+        .and_then(|map| map.remove("stdin"))
+        .is_some_and(|stdin| !stdin.is_null());
+    (shown, Some(given))
+}
+
+/// The call was refused by the execution's security context (AEGIS ADR-131
+/// U34a, U34b): in the inner loop's path only its policy check answers a
+/// policy violation.
+fn refused_by_security_context(e: &crate::domain::seal_session::SealSessionError) -> bool {
+    use crate::domain::seal_session::SealSessionError;
+    match e {
+        SealSessionError::PolicyViolation(_) => true,
+        SealSessionError::Answered { shown, .. } => refused_by_security_context(shown),
+        _ => false,
+    }
 }
 
 /// Whether the try's tool calls so far meet `requirement`.
@@ -264,6 +307,89 @@ impl InnerLoopService {
                 "Failed to persist inner-loop trajectory"
             );
         }
+    }
+
+    /// Publish one generation of the try as an `LlmInteraction` (AEGIS
+    /// ADR-131 U34d): its prompt is the try's prompt for the first
+    /// generation and the messages added since the previous one for the
+    /// next; its response is the model's text, or the calls it made. Called
+    /// before the generation's answer joins the conversation.
+    async fn publish_generation(
+        &self,
+        execution_id_str: &str,
+        ctx: &mut ExecutionContext,
+        response: String,
+    ) {
+        let prompt = if ctx.conversation_shown == 0 {
+            ctx.conversation
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default()
+        } else {
+            ctx.conversation
+                .iter()
+                .skip(ctx.conversation_shown)
+                .map(|m| format!("{}: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        // The generation's own answer is the next message.
+        ctx.conversation_shown = ctx.conversation.len() + 1;
+        let Ok(uuid) = uuid::Uuid::parse_str(execution_id_str) else {
+            return;
+        };
+        self.execution_service
+            .record_execution_event(ExecutionEvent::LlmInteraction {
+                execution_id: ExecutionId(uuid),
+                agent_id: ctx.agent_id,
+                iteration_number: ctx.iteration_number,
+                provider: "orchestrator".to_string(),
+                model: ctx.model_alias.clone(),
+                input_tokens: None,
+                output_tokens: None,
+                prompt,
+                response,
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
+    }
+
+    /// Publish one tool call of the try as it was decided (AEGIS ADR-131
+    /// U34): `call_index` is its step's place in the trajectory.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_dispatch(
+        &self,
+        execution_id_str: &str,
+        ctx: &ExecutionContext,
+        call_index: usize,
+        tool_call: &ToolCall,
+        status: &str,
+        sentence: Option<String>,
+        refused_by: Option<RefusalLayer>,
+        dispatch_id: Option<DispatchId>,
+    ) {
+        let Ok(uuid) = uuid::Uuid::parse_str(execution_id_str) else {
+            return;
+        };
+        let (arguments, stdin_given) = event_arguments(&tool_call.name, &tool_call.arguments);
+        self.execution_service
+            .record_execution_event(ExecutionEvent::ToolDispatched {
+                execution_id: ExecutionId(uuid),
+                agent_id: ctx.agent_id,
+                iteration_number: ctx.iteration_number,
+                call_index: u32::try_from(call_index).unwrap_or(u32::MAX),
+                tool_call_id: tool_call.id.clone(),
+                tool: tool_call.name.clone(),
+                arguments,
+                stdin_given,
+                status: status.to_string(),
+                sentence,
+                refused_by,
+                dispatch_id,
+                dispatched_at: chrono::Utc::now(),
+            })
+            .await;
     }
 
     /// Attach rate limiting enforcement for LLM call and token quotas (ADR-072).
@@ -447,6 +573,7 @@ impl InnerLoopService {
                         pending_command: None,
                         tool_call_requirement,
                         tool_call_reminded: false,
+                        conversation_shown: 0,
                     },
                 );
 
@@ -489,7 +616,6 @@ impl InnerLoopService {
                     &result_json,
                     self.conversation_output_bound(&ctx.model_alias),
                 );
-                let _ = duration_ms; // used by future CommandExecutionCompleted event emission
 
                 if let Some(step) = ctx.trajectory.last_mut() {
                     step.status = if exit_code == 0 {
@@ -501,6 +627,30 @@ impl InnerLoopService {
                     if exit_code != 0 {
                         step.error = Some(stderr.clone());
                     }
+                }
+
+                // The command's end, as an event of the execution's log
+                // (AEGIS ADR-131 U34).
+                if let (Ok(uuid), Some(step)) =
+                    (uuid::Uuid::parse_str(&execution_id), ctx.trajectory.last())
+                {
+                    self.execution_service
+                        .record_execution_event(ExecutionEvent::ToolDispatchEnded {
+                            execution_id: ExecutionId(uuid),
+                            agent_id: ctx.agent_id,
+                            iteration_number: ctx.iteration_number,
+                            call_index: u32::try_from(ctx.trajectory.len() - 1).unwrap_or(u32::MAX),
+                            dispatch_id,
+                            tool_call_id: tool_call_id.clone(),
+                            tool: step.tool_name.clone(),
+                            status: step.status.clone(),
+                            exit_code,
+                            sentence: (exit_code != 0)
+                                .then(|| command_failure_sentence(i64::from(exit_code), &stderr)),
+                            duration_ms,
+                            ended_at: chrono::Utc::now(),
+                        })
+                        .await;
                 }
 
                 ctx.conversation.push(ConversationMessage {
@@ -592,6 +742,8 @@ impl InnerLoopService {
 
             match llm_output {
                 LlmOutput::FinalText(text) => {
+                    self.publish_generation(execution_id_str, &mut ctx, text.clone())
+                        .await;
                     // AEGIS ADR-135 D5, ADR-005 O7e: a text answer completes the
                     // try only once the call it had to make was made.
                     if !tool_call_requirement_met(
@@ -656,6 +808,16 @@ impl InnerLoopService {
                 }
                 LlmOutput::ToolCalls(tool_calls) => {
                     ctx.iterations += 1;
+                    let calls: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|c| serde_json::json!({"id": c.id, "name": c.name}))
+                        .collect();
+                    self.publish_generation(
+                        execution_id_str,
+                        &mut ctx,
+                        Value::Array(calls).to_string(),
+                    )
+                    .await;
 
                     tracing::debug!(
                         execution_id = %execution_id_str,
@@ -739,10 +901,22 @@ impl InnerLoopService {
                                     .unwrap_or(None)
                                 {
                                     if next_ctx.active_dispatch_count >= max {
-                                        anyhow::bail!(
+                                        let sentence = format!(
                                             "PolicyViolation: ConcurrentExecLimitExceeded (limit={max}, active={})",
                                             next_ctx.active_dispatch_count
                                         );
+                                        self.publish_dispatch(
+                                            execution_id_str,
+                                            &next_ctx,
+                                            next_ctx.trajectory.len(),
+                                            &tool_call,
+                                            "fatal",
+                                            Some(sentence.clone()),
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                        anyhow::bail!(sentence);
                                     }
                                 }
 
@@ -756,19 +930,30 @@ impl InnerLoopService {
                                 ) {
                                     Ok(fitted) => fitted,
                                     Err(refusal) => {
+                                        // AEGIS ADR-131 U37: the try clock's
+                                        // refusal ends the try, failed with
+                                        // its sentence; the model is not
+                                        // called again in a try with no time
+                                        // left for a command.
+                                        let call_index = next_ctx.trajectory.len();
                                         let mut step = step;
                                         step.status = "refused".to_string();
                                         step.error = Some(refusal.clone());
                                         next_ctx.trajectory.push(step);
-                                        next_ctx.conversation.push(ConversationMessage {
-                                            role: "tool".to_string(),
-                                            content: refusal,
-                                            tool_call_id: Some(tool_call.id.clone()),
-                                            tool_calls: None,
-                                        });
+                                        self.publish_dispatch(
+                                            execution_id_str,
+                                            &next_ctx,
+                                            call_index,
+                                            &tool_call,
+                                            "refused",
+                                            Some(refusal.clone()),
+                                            Some(RefusalLayer::TryTimeLimit),
+                                            None,
+                                        )
+                                        .await;
                                         self.persist_trajectory(execution_id_str, &next_ctx).await;
-                                        self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
-                                        continue;
+                                        self.active_executions.write().await.remove(execution_id_str);
+                                        anyhow::bail!(refusal);
                                     }
                                 };
 
@@ -783,7 +968,19 @@ impl InnerLoopService {
                                     })
                                     .to_string(),
                                 );
+                                let call_index = next_ctx.trajectory.len();
                                 next_ctx.trajectory.push(step);
+                                self.publish_dispatch(
+                                    execution_id_str,
+                                    &next_ctx,
+                                    call_index,
+                                    &tool_call,
+                                    "dispatched",
+                                    None,
+                                    None,
+                                    Some(dispatch_id),
+                                )
+                                .await;
                                 next_ctx.pending_dispatch_id = Some(dispatch_id);
                                 next_ctx.pending_tool_call_id = Some(tool_call.id.clone());
                                 next_ctx.pending_command = Some(pending);
@@ -813,10 +1010,22 @@ impl InnerLoopService {
                                             "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
+                                let call_index = next_ctx.trajectory.len();
                                 let mut step = step;
                                 step.status = "succeeded".to_string();
                                 step.result_json = Some(tool_result.clone());
                                 next_ctx.trajectory.push(step);
+                                self.publish_dispatch(
+                                    execution_id_str,
+                                    &next_ctx,
+                                    call_index,
+                                    &tool_call,
+                                    "succeeded",
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await;
                                 next_ctx.conversation.push(ConversationMessage {
                                     role: "tool".to_string(),
                                     content: tool_result,
@@ -842,10 +1051,22 @@ impl InnerLoopService {
                                         .await
                                         .remove(execution_id_str)
                                     {
+                                        let call_index = failed_ctx.trajectory.len();
                                         let mut step = step;
                                         step.status = "fatal".to_string();
                                         step.error = Some(e.to_string());
                                         failed_ctx.trajectory.push(step);
+                                        self.publish_dispatch(
+                                            execution_id_str,
+                                            &failed_ctx,
+                                            call_index,
+                                            &tool_call,
+                                            "fatal",
+                                            Some(e.to_string()),
+                                            None,
+                                            None,
+                                        )
+                                        .await;
                                         self.persist_trajectory(execution_id_str, &failed_ctx).await;
                                     }
                                     anyhow::bail!(
@@ -888,10 +1109,26 @@ impl InnerLoopService {
                                             "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
+                                // AEGIS ADR-131 U34b: a call the security
+                                // context refused did not run: `refused`.
+                                let refused = refused_by_security_context(&e);
+                                let status = if refused { "refused" } else { "failed" };
+                                let call_index = next_ctx.trajectory.len();
                                 let mut step = step;
-                                step.status = "failed".to_string();
+                                step.status = status.to_string();
                                 step.error = Some(e.to_string());
                                 next_ctx.trajectory.push(step);
+                                self.publish_dispatch(
+                                    execution_id_str,
+                                    &next_ctx,
+                                    call_index,
+                                    &tool_call,
+                                    status,
+                                    Some(e.to_string()),
+                                    refused.then_some(RefusalLayer::SecurityContext),
+                                    None,
+                                )
+                                .await;
                                 next_ctx.conversation.push(ConversationMessage {
                                     role: "tool".to_string(),
                                     content: tool_result,
@@ -1401,8 +1638,8 @@ fn fit_command_to_try(
         if room < 1 {
             return Err(format!(
                 "[AEGIS] cmd.run was not run: this try has {} s left, and the last {margin_secs} s \
-                 of a try are kept after a command for you to read its result and act on it. \
-                 Answer with what you have.",
+                 of a try are kept after a command for its result to be read and acted on. The \
+                 try ends here.",
                 left.max(0)
             ));
         }

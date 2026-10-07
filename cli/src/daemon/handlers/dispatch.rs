@@ -126,28 +126,13 @@ pub(crate) async fn dispatch_gateway_handler(
             trajectory,
             ..
         }) => {
-            // Publish LlmInteraction event for observability
+            // Every generation's `LlmInteraction` event is published by the
+            // inner loop as it is made (AEGIS ADR-131 U34d); the final one is
+            // also kept on the iteration's record here.
             if agent_id.0 != Uuid::nil() {
                 if let (Some(exec_id), Some(prompt), Some(model_alias)) =
                     (exec_id_opt, prompt_opt, model_opt)
                 {
-                    let event =
-                        aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction {
-                            execution_id: aegis_orchestrator_core::domain::execution::ExecutionId(
-                                exec_id,
-                            ),
-                            agent_id,
-                            iteration_number,
-                            provider: "orchestrator".to_string(),
-                            model: model_alias.clone(),
-                            input_tokens: None,
-                            output_tokens: None,
-                            prompt: prompt.clone(),
-                            response: content.clone(),
-                            timestamp: chrono::Utc::now(),
-                        };
-                    state.event_bus.publish_execution_event(event);
-
                     let interaction = aegis_orchestrator_core::domain::execution::LlmInteraction {
                         provider: "orchestrator".to_string(),
                         model: model_alias.clone(),

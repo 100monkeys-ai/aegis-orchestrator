@@ -376,4 +376,8 @@ impl ExecutionService for ClusterAwareExecutionService {
             .store_iteration_trajectory(execution_id, iteration, trajectory)
             .await
     }
+
+    async fn record_execution_event(&self, event: crate::domain::events::ExecutionEvent) {
+        self.inner.record_execution_event(event).await
+    }
 }

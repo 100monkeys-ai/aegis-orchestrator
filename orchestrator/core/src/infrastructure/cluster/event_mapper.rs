@@ -219,6 +219,8 @@ pub fn domain_to_proto(event: DomainEvent) -> Option<ExecutionEvent> {
 
         DomainEvent::InstanceSpawned { .. }
         | DomainEvent::InstanceTerminated { .. }
+        | DomainEvent::ToolDispatched { .. }
+        | DomainEvent::ToolDispatchEnded { .. }
         | DomainEvent::ChildExecutionSpawned { .. }
         | DomainEvent::ChildExecutionCompleted { .. }
         | DomainEvent::Validation(_)

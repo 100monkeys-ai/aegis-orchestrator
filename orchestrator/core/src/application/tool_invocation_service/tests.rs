@@ -1895,6 +1895,150 @@ async fn task_logs_tool_returns_paginated_execution_events() {
     assert_eq!(payload["events"][0]["sequence"], 2);
 }
 
+/// AEGIS ADR-131 U34: the events the inner loop publishes for an
+/// execution's generations and dispatches reach `aegis.task.logs` through the
+/// execution event persister, in the order they were published, each under
+/// its own type and with its try.
+#[tokio::test]
+async fn task_logs_returns_an_executions_dispatch_events_in_sequence() {
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
+    let agent_id = AgentId::new();
+    let mut execution = Execution::new(
+        agent_id,
+        ExecutionInput {
+            intent: None,
+            input: serde_json::json!({"task": "demo"}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        },
+        3,
+        "aegis-system-operator".to_string(),
+    );
+    execution.status = ExecutionStatus::Running;
+    let workflow_execution_repo = Arc::new(StubWorkflowExecutionRepository::with_events(
+        execution.id,
+        Vec::new(),
+    ));
+    let event_bus = Arc::new(crate::infrastructure::event_bus::EventBus::new(1024));
+    let persister = Arc::new(
+        crate::application::execution_event_persister::ExecutionEventPersister::new(
+            workflow_execution_repo.clone(),
+            event_bus.clone(),
+        ),
+    );
+    let _persisting = persister.start();
+    let now = chrono::Utc::now();
+    let dispatch_id = crate::domain::shared_kernel::DispatchId::new();
+    event_bus.publish_execution_event(ExecutionEvent::LlmInteraction {
+        execution_id: execution.id,
+        agent_id,
+        iteration_number: 1,
+        provider: "orchestrator".to_string(),
+        model: "default".to_string(),
+        input_tokens: None,
+        output_tokens: None,
+        prompt: "make the pdf".to_string(),
+        response: "[{\"id\":\"call-1\",\"name\":\"cmd.run\"}]".to_string(),
+        timestamp: now,
+    });
+    event_bus.publish_execution_event(ExecutionEvent::ToolDispatched {
+        execution_id: execution.id,
+        agent_id,
+        iteration_number: 1,
+        call_index: 0,
+        tool_call_id: "call-1".to_string(),
+        tool: "cmd.run".to_string(),
+        arguments: serde_json::json!({"command": "pip install fpdf2"}),
+        stdin_given: Some(false),
+        status: "refused".to_string(),
+        sentence: Some("[AEGIS] cmd.run was not run: this try has 90 s left".to_string()),
+        refused_by: Some(crate::domain::events::RefusalLayer::TryTimeLimit),
+        dispatch_id: None,
+        dispatched_at: now,
+    });
+    event_bus.publish_execution_event(ExecutionEvent::ToolDispatchEnded {
+        execution_id: execution.id,
+        agent_id,
+        iteration_number: 1,
+        call_index: 1,
+        dispatch_id,
+        tool_call_id: "call-2".to_string(),
+        tool: "cmd.run".to_string(),
+        status: "failed".to_string(),
+        exit_code: 1,
+        sentence: Some("exited with code 1: no network".to_string()),
+        duration_ms: 40,
+        ended_at: now,
+    });
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    loop {
+        let stored = workflow_execution_repo
+            .find_events_by_execution(execution.id, 10, 0)
+            .await
+            .unwrap()
+            .len();
+        if stored >= 3 || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+    }
+
+    let service = ToolInvocationService::new(
+        Arc::new(InMemorySealSessionRepository::new()),
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new()),
+        Arc::new(SealMiddleware::new()),
+        Arc::new(ToolRouter::new(vec![])),
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(LogsTestExecutionService {
+            execution: execution.clone(),
+        }),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        event_bus.clone(),
+        None,
+    )
+    .with_workflow_execution_repo(workflow_execution_repo);
+    let mut logs_args = serde_json::json!({"execution_id": execution.id.to_string()});
+    let ToolInvocationResult::Direct(payload) = service
+        .invoke_aegis_task_logs_tool(&mut logs_args, &test_tenant_scope())
+        .await
+        .expect("task logs answers")
+    else {
+        panic!("expected a direct task logs payload");
+    };
+    let rows: Vec<(String, serde_json::Value)> = payload["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|e| {
+            (
+                e["event_type"].as_str().unwrap_or_default().to_string(),
+                e["iteration_number"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("LlmInteraction".to_string(), serde_json::json!(1)),
+            ("ToolDispatched".to_string(), serde_json::json!(1)),
+            ("ToolDispatchEnded".to_string(), serde_json::json!(1)),
+        ],
+        "aegis.task.logs answered {payload}"
+    );
+    let refused = &payload["events"][1]["payload"]["ToolDispatched"];
+    assert_eq!(refused["refused_by"], "try_time_limit", "{payload}");
+    assert_eq!(
+        refused["sentence"], "[AEGIS] cmd.run was not run: this try has 90 s left",
+        "{payload}"
+    );
+}
+
 #[tokio::test]
 async fn task_logs_tool_returns_execution_fetch_error() {
     let router = Arc::new(ToolRouter::new(vec![]));

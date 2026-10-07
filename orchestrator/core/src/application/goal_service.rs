@@ -188,12 +188,52 @@ pub struct DispatchFact {
     pub iteration: u8,
     pub tool: String,
     pub status: String,
+    /// For a refused, failed or fatal call, the sentence it ended with, cut
+    /// to [`DISPATCH_SENTENCE_CHARS`] characters (AEGIS ADR-131 U34f); not
+    /// written for any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentence: Option<String>,
 }
+
+/// The most characters of a dispatch's sentence the judge is given (U34f).
+pub const DISPATCH_SENTENCE_CHARS: usize = 300;
 
 impl DispatchFact {
     /// The call ran: it was neither refused before running nor left pending.
     pub fn executed(&self) -> bool {
         !matches!(self.status.as_str(), "refused" | "pending")
+    }
+
+    /// The sentence a refused, failed or fatal call of a stored trajectory
+    /// ended with, as the judge is given it (U34f); `None` for any other.
+    pub fn sentence_of(step: &crate::domain::execution::TrajectoryStep) -> Option<String> {
+        if !matches!(step.status.as_str(), "refused" | "failed" | "fatal") {
+            return None;
+        }
+        let exit_code = if step.tool_name == "cmd.run" && step.status == "failed" {
+            step.result_json
+                .as_deref()
+                .and_then(|r| serde_json::from_str::<Value>(r).ok())
+                .and_then(|r| r.get("exit_code").and_then(Value::as_i64))
+        } else {
+            None
+        };
+        let error = step.error.as_deref().unwrap_or_default();
+        let sentence = match exit_code {
+            Some(code) => {
+                crate::application::inner_loop_service::command_failure_sentence(code, error)
+            }
+            None => error.trim().to_string(),
+        };
+        if sentence.is_empty() {
+            return None;
+        }
+        if sentence.chars().count() <= DISPATCH_SENTENCE_CHARS {
+            return Some(sentence);
+        }
+        let mut cut: String = sentence.chars().take(DISPATCH_SENTENCE_CHARS - 1).collect();
+        cut.push('…');
+        Some(cut)
     }
 }
 
@@ -4122,5 +4162,102 @@ mod tests {
             .unwrap()
             .iter()
             .all(|e| !e.is_running()));
+    }
+
+    /// AEGIS ADR-131 U34f: a refused, failed or fatal dispatch reaches the
+    /// judge with the sentence it ended with, the first 299 characters and
+    /// "…" when it is longer than 300; a succeeded or dispatched one with
+    /// none, and no `sentence` written.
+    #[test]
+    fn a_refused_failed_or_fatal_dispatch_carries_its_sentence_cut_at_300_characters() {
+        use crate::domain::execution::TrajectoryStep;
+        let step =
+            |tool: &str, status: &str, error: Option<&str>, result: Option<Value>| TrajectoryStep {
+                tool_name: tool.to_string(),
+                arguments_json: "{}".to_string(),
+                status: status.to_string(),
+                result_json: result.map(|r| r.to_string()),
+                error: error.map(str::to_string),
+            };
+        let long = "é".repeat(400);
+        let cut = format!("{}…", "é".repeat(299));
+        let cases: Vec<(&str, TrajectoryStep, Option<String>)> = vec![
+            (
+                "a long refusal",
+                step("cmd.run", "refused", Some(&long), None),
+                Some(cut),
+            ),
+            (
+                "a fatal call",
+                step(
+                    "fs.read",
+                    "fatal",
+                    Some("Signature verification failed"),
+                    None,
+                ),
+                Some("Signature verification failed".to_string()),
+            ),
+            (
+                "a security context's refusal",
+                step(
+                    "cmd.run",
+                    "refused",
+                    Some("Policy violation: tool 'cmd.run' is explicitly denied"),
+                    None,
+                ),
+                Some("Policy violation: tool 'cmd.run' is explicitly denied".to_string()),
+            ),
+            (
+                "a failed command",
+                step(
+                    "cmd.run",
+                    "failed",
+                    Some("warning: slow\nbad thing happened\n"),
+                    Some(
+                        json!({"exit_code": 3, "stdout": "", "stderr": "warning: slow\nbad thing happened\n"}),
+                    ),
+                ),
+                Some("exited with code 3: bad thing happened".to_string()),
+            ),
+            (
+                "a failed command with no error output",
+                step(
+                    "cmd.run",
+                    "failed",
+                    Some(""),
+                    Some(json!({"exit_code": 2, "stdout": "", "stderr": ""})),
+                ),
+                Some("exited with code 2".to_string()),
+            ),
+            (
+                "a succeeded call",
+                step("fs.write", "succeeded", None, Some(json!({"ok": true}))),
+                None,
+            ),
+            (
+                "a dispatched command",
+                step("cmd.run", "dispatched", None, None),
+                None,
+            ),
+        ];
+        let mut complaints = Vec::new();
+        for (name, step, expected) in cases {
+            let got = DispatchFact::sentence_of(&step);
+            if got != expected {
+                complaints.push(format!("{name}: {got:?}, not {expected:?}"));
+            }
+        }
+        let fact = DispatchFact {
+            execution_id: None,
+            iteration: 1,
+            tool: "fs.write".to_string(),
+            status: "succeeded".to_string(),
+            sentence: None,
+        };
+        let written = serde_json::to_value(&fact).unwrap();
+        if written.get("sentence").is_some() {
+            complaints.push(format!("a call with no sentence is written {written}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

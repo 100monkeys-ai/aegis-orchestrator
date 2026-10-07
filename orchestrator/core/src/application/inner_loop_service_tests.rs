@@ -55,9 +55,13 @@ const BOUND: usize = 15_000;
 // ---------------------------------------------------------------------------
 
 /// The executions, as the execution service holds them: the trajectory the
-/// inner loop stores lands on the iteration it names.
+/// inner loop stores lands on the iteration it names; and the execution
+/// events the inner loop publishes, in the order it published them.
 #[derive(Default)]
-struct Records(StdMutex<HashMap<ExecutionId, Execution>>);
+struct Records(
+    StdMutex<HashMap<ExecutionId, Execution>>,
+    StdMutex<Vec<ExecutionEvent>>,
+);
 
 impl Records {
     fn get(&self, id: ExecutionId) -> Execution {
@@ -66,6 +70,31 @@ impl Records {
     fn update(&self, id: ExecutionId, f: impl FnOnce(&mut Execution)) {
         let mut map = self.0.lock().unwrap();
         f(map.get_mut(&id).expect("execution"));
+    }
+    /// Each published event as its variant's name and its fields, in order.
+    fn events(&self) -> Vec<(String, Value)> {
+        self.1
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                let value = serde_json::to_value(event).expect("an event serialises");
+                let (name, fields) = value
+                    .as_object()
+                    .and_then(|o| o.iter().next())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .expect("an externally tagged event");
+                (name, fields)
+            })
+            .collect()
+    }
+    /// The published events of one variant, in order.
+    fn events_named(&self, name: &str) -> Vec<Value> {
+        self.events()
+            .into_iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, fields)| fields)
+            .collect()
     }
 }
 
@@ -186,6 +215,9 @@ impl ExecutionService for Records {
             let _ = exec.store_refinement(iteration, refinement);
         }
         Ok(())
+    }
+    async fn record_execution_event(&self, event: ExecutionEvent) {
+        self.1.lock().unwrap().push(event);
     }
 }
 
@@ -523,6 +555,18 @@ fn run_command(args: serde_json::Value) -> Turn {
     })
 }
 
+/// The model calls `tool` with `args`.
+fn call_tool(tool: &str, args: serde_json::Value) -> Turn {
+    let tool = tool.to_string();
+    Box::new(move |_| {
+        Ok(ChatResponse::ToolCalls(vec![ChatToolCall {
+            id: format!("call-{}", uuid::Uuid::new_v4()),
+            name: tool.clone(),
+            arguments: args.clone(),
+        }]))
+    })
+}
+
 fn answer(text: &str) -> Turn {
     let text = text.to_string();
     Box::new(move |_| {
@@ -725,11 +769,27 @@ struct World {
 }
 
 async fn world(agent: Agent, turns: Vec<Turn>) -> World {
-    world_with_silent_calls(agent, turns, Vec::new()).await
+    world_full(agent, turns, Vec::new(), every_tool_context()).await
 }
 
 /// [`world`], with the model silent on the calls `silent` names.
 async fn world_with_silent_calls(agent: Agent, turns: Vec<Turn>, silent: Vec<usize>) -> World {
+    world_full(agent, turns, silent, every_tool_context()).await
+}
+
+/// A world whose execution runs under `context`.
+async fn world_in(agent: Agent, turns: Vec<Turn>, context: SecurityContext) -> World {
+    world_full(agent, turns, Vec::new(), context).await
+}
+
+/// A world with the model silent on the calls `silent` names, whose
+/// execution runs under `context`.
+async fn world_full(
+    agent: Agent,
+    turns: Vec<Turn>,
+    silent: Vec<usize>,
+    context: SecurityContext,
+) -> World {
     let records = Arc::new(Records::default());
     let mut execution = Execution::new_with_id(
         ExecutionId::new(),
@@ -752,7 +812,7 @@ async fn world_with_silent_calls(agent: Agent, turns: Vec<Turn>, silent: Vec<usi
 
     let contexts =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
-    contexts.save(every_tool_context()).await.unwrap();
+    contexts.save(context).await.unwrap();
     let storage_root =
         std::env::temp_dir().join(format!("aegis-inner-loop-tests-{}", uuid::Uuid::new_v4()));
     let fsal = Arc::new(crate::domain::fsal::AegisFSAL::new(
@@ -1016,42 +1076,355 @@ async fn a_large_output_enters_the_conversation_as_head_and_tail_and_is_kept_who
     assert!(stored.get("context_notice").is_none());
 }
 
-/// A command asked for when the try has less time left than it keeps for
-/// the model's next call is not run; the model is told why.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_command_asked_for_with_no_time_left_is_not_run_and_the_model_is_told_why() {
-    let w = world(
-        agent("8s", 30),
-        vec![
-            run_command(json!({"command": "echo never", "cwd": "/tmp"})),
-            answer("as far as I got"),
-        ],
-    )
-    .await;
-    // The try started 6 s ago: 2 s left, under the 4 s kept for the model.
+/// A world whose try started 6 s ago under an 8 s bound: 2 s left, under
+/// the 4 s a try keeps after a command for the model, so the try clock
+/// refuses the command the model asks for.
+async fn a_try_with_no_time_left(turns: Vec<Turn>) -> World {
+    let w = world(agent("8s", 30), turns).await;
     w.records.update(w.execution_id, |e| {
         e.start_iteration("count the ticks".to_string()).unwrap();
         e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(6);
     });
-    let answer = w
-        .inner_loop
-        .handle_agent_message(AgentMessage::Generate {
-            agent_id: w.agent.id.to_string(),
-            execution_id: w.execution_id.to_string(),
-            iteration_number: 1,
-            prompt: "count the ticks".to_string(),
-            messages: Vec::new(),
-            model_alias: ALIAS.to_string(),
+    w
+}
+
+impl World {
+    /// The try's first generate request, as the bootstrap sends it.
+    async fn generate(&self) -> anyhow::Result<OrchestratorMessage> {
+        self.inner_loop
+            .handle_agent_message(AgentMessage::Generate {
+                agent_id: self.agent.id.to_string(),
+                execution_id: self.execution_id.to_string(),
+                iteration_number: 1,
+                prompt: "count the ticks".to_string(),
+                messages: Vec::new(),
+                model_alias: ALIAS.to_string(),
+            })
+            .await
+    }
+}
+
+/// AEGIS ADR-131 U37: a command the try clock refuses is not run and ends
+/// the try, failed with the refusal's sentence; no model call follows it (in
+/// `da416e80` the refusal went back to the model, which asked again 24 times
+/// until the execution's time ran out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_try_clock_refusal_ends_the_try_and_the_model_is_not_called_again() {
+    let w = a_try_with_no_time_left(vec![
+        run_command(json!({"command": "echo never", "cwd": "/tmp"})),
+        answer("as far as I got"),
+    ])
+    .await;
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 1 {
+        complaints.push(format!(
+            "the model was called again after the try clock refused its command: {calls} calls"
+        ));
+    }
+    match &outcome {
+        Err(e) if e.to_string().contains("cmd.run was not run") => {}
+        other => complaints.push(format!(
+            "the try did not end with the refusal's sentence: {other:?}"
+        )),
+    }
+    let record = w.records.get(w.execution_id);
+    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
+    if steps.len() != 1 || steps[0].status != "refused" {
+        complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-131 U34, U34a: the try clock's refusal is an event of the
+/// execution's log carrying its sentence, its layer, the try and the
+/// arguments as the model wrote them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_try_clock_refusal_is_an_event_with_its_sentence_and_layer() {
+    let w = a_try_with_no_time_left(vec![
+        run_command(json!({"command": "echo never", "cwd": "/tmp"})),
+        answer("as far as I got"),
+    ])
+    .await;
+    let _ = w.generate().await;
+    let dispatched = w.records.events_named("ToolDispatched");
+    let mut complaints = Vec::new();
+    match dispatched.as_slice() {
+        [event] => {
+            if event["status"] != "refused" {
+                complaints.push(format!("status {}", event["status"]));
+            }
+            if event["refused_by"] != "try_time_limit" {
+                complaints.push(format!("refused_by {}", event["refused_by"]));
+            }
+            let sentence = event["sentence"].as_str().unwrap_or_default();
+            if !(sentence.contains("cmd.run was not run") && sentence.contains("s left")) {
+                complaints.push(format!("sentence {:?}", event["sentence"]));
+            }
+            if event["tool"] != "cmd.run" || event["iteration_number"] != 1 {
+                complaints.push(format!(
+                    "tool {} in try {}",
+                    event["tool"], event["iteration_number"]
+                ));
+            }
+            if event["arguments"] != json!({"command": "echo never", "cwd": "/tmp"}) {
+                complaints.push(format!("arguments {}", event["arguments"]));
+            }
+            if event["stdin_given"] != false {
+                complaints.push(format!("stdin_given {}", event["stdin_given"]));
+            }
+        }
+        other => complaints.push(format!(
+            "the refused command is {} ToolDispatched events: {other:?}",
+            other.len()
+        )),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-131 U34, U34a, U34b: a call the execution's security context
+/// refuses is a `refused` event with the security context's sentence and
+/// layer, and a `refused` step of the trajectory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_security_context_refusal_is_a_refused_event_and_a_refused_step() {
+    let mut context = every_tool_context();
+    context.deny_list = vec!["cmd.run".to_string()];
+    let w = world_in(
+        agent("60s", 30),
+        vec![
+            run_command(json!({"command": "rm -rf /tmp/x", "cwd": "/tmp"})),
+            answer("I could not run it"),
+        ],
+        context,
+    )
+    .await;
+    w.records.update(w.execution_id, |e| {
+        e.start_iteration("count the ticks".to_string()).unwrap();
+    });
+    let answered = w.generate().await;
+    let mut complaints = Vec::new();
+    if !matches!(answered, Ok(OrchestratorMessage::Final { .. })) {
+        complaints.push(format!("the try answered {answered:?}"));
+    }
+    let dispatched = w.records.events_named("ToolDispatched");
+    match dispatched.as_slice() {
+        [event] => {
+            if event["status"] != "refused" || event["refused_by"] != "security_context" {
+                complaints.push(format!(
+                    "status {} refused_by {}",
+                    event["status"], event["refused_by"]
+                ));
+            }
+            let sentence = event["sentence"].as_str().unwrap_or_default();
+            if !sentence.contains("explicitly denied") {
+                complaints.push(format!("sentence {:?}", event["sentence"]));
+            }
+            if event["arguments"] != json!({"command": "rm -rf /tmp/x", "cwd": "/tmp"}) {
+                complaints.push(format!("arguments {}", event["arguments"]));
+            }
+        }
+        other => complaints.push(format!(
+            "the refused call is {} ToolDispatched events: {other:?}",
+            other.len()
+        )),
+    }
+    let record = w.records.get(w.execution_id);
+    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
+    if steps.first().map(|s| s.status.as_str()) != Some("refused") {
+        complaints.push(format!("the trajectory's step is {steps:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-131 U34: each dispatch of a try is an event, in order, with the
+/// arguments as the model wrote them (a relative `fs.write` path, before the
+/// orchestrator makes it absolute); a command handed to the container is
+/// `dispatched`, then ends `failed` with its exit code and its error output's
+/// last line, or `succeeded`; every generation before them is an
+/// `LlmInteraction`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_dispatch_is_an_event_in_order_with_the_models_arguments() {
+    let w = world(
+        agent("60s", 30),
+        vec![
+            call_tool(
+                "fs.write",
+                json!({"path": "notes.txt", "content": "seven and a half"}),
+            ),
+            run_command(json!({"command": "echo out; echo bad >&2; exit 3", "cwd": "/tmp"})),
+            run_command(json!({"command": "printf ok", "cwd": "/tmp"})),
+            answer("done"),
+        ],
+    )
+    .await;
+    let _ = w.run(None).await;
+    let events = w.records.events();
+    let kinds: Vec<String> = events
+        .iter()
+        .map(|(name, fields)| match name.as_str() {
+            "ToolDispatched" => format!(
+                "ToolDispatched {} {}",
+                fields["tool"].as_str().unwrap_or_default(),
+                fields["status"].as_str().unwrap_or_default()
+            ),
+            "ToolDispatchEnded" => format!(
+                "ToolDispatchEnded {}",
+                fields["status"].as_str().unwrap_or_default()
+            ),
+            other => other.to_string(),
         })
-        .await
-        .expect("the try answers");
-    assert!(
-        matches!(answer, OrchestratorMessage::Final { .. }),
-        "no command was dispatched: {answer:?}"
-    );
-    let seen = last_tool_message(&w.model.conversation(1));
-    assert!(seen.contains("was not run"), "{seen}");
-    assert!(seen.contains("s left"), "{seen}");
+        .collect();
+    let fs_write_status = events
+        .iter()
+        .find(|(n, f)| n == "ToolDispatched" && f["tool"] == "fs.write")
+        .and_then(|(_, f)| f["status"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "none".to_string());
+    let expected: Vec<String> = [
+        "LlmInteraction".to_string(),
+        format!("ToolDispatched fs.write {fs_write_status}"),
+        "LlmInteraction".to_string(),
+        "ToolDispatched cmd.run dispatched".to_string(),
+        "ToolDispatchEnded failed".to_string(),
+        "LlmInteraction".to_string(),
+        "ToolDispatched cmd.run dispatched".to_string(),
+        "ToolDispatchEnded succeeded".to_string(),
+        "LlmInteraction".to_string(),
+    ]
+    .to_vec();
+    let mut complaints = Vec::new();
+    if kinds != expected {
+        complaints.push(format!(
+            "the events are {kinds:?}, not in the order of the try's dispatches {expected:?}"
+        ));
+    }
+    let dispatched = w.records.events_named("ToolDispatched");
+    let arguments: Vec<Value> = dispatched.iter().map(|e| e["arguments"].clone()).collect();
+    let written = vec![
+        json!({"path": "notes.txt", "content": "seven and a half"}),
+        json!({"command": "echo out; echo bad >&2; exit 3", "cwd": "/tmp"}),
+        json!({"command": "printf ok", "cwd": "/tmp"}),
+    ];
+    if arguments != written {
+        complaints.push(format!(
+            "the arguments are {arguments:?}, not as the model wrote them"
+        ));
+    }
+    let indexes: Vec<Value> = dispatched.iter().map(|e| e["call_index"].clone()).collect();
+    if indexes != vec![json!(0), json!(1), json!(2)] {
+        complaints.push(format!("the call indexes are {indexes:?}"));
+    }
+    let ended = w.records.events_named("ToolDispatchEnded");
+    match ended.as_slice() {
+        [failed, succeeded] => {
+            if failed["exit_code"] != 3
+                || failed["sentence"] != "exited with code 3: bad"
+                || failed["call_index"] != 1
+            {
+                complaints.push(format!("the failed command ended {failed}"));
+            }
+            if succeeded["exit_code"] != 0
+                || succeeded.get("sentence").is_some()
+                || succeeded["call_index"] != 2
+            {
+                complaints.push(format!("the succeeded command ended {succeeded}"));
+            }
+            if failed["dispatch_id"]
+                != dispatched
+                    .get(1)
+                    .map(|d| d["dispatch_id"].clone())
+                    .unwrap_or_default()
+            {
+                complaints.push("the failed command's end names another dispatch".to_string());
+            }
+        }
+        other => complaints.push(format!("the commands ended as {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-131 U34c: a `cmd.run`'s standard input is named given, and its
+/// text is kept out of the event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commands_stdin_is_named_given_and_its_text_kept_out() {
+    let w = world(
+        agent("60s", 30),
+        vec![
+            // `wc -c` reads its input and writes only its length, so no
+            // output carries the text either.
+            run_command(json!({"command": "wc -c", "cwd": "/tmp", "stdin": "the secret words"})),
+            answer("done"),
+        ],
+    )
+    .await;
+    let _ = w.run(None).await;
+    let dispatched = w.records.events_named("ToolDispatched");
+    let mut complaints = Vec::new();
+    match dispatched.as_slice() {
+        [event] => {
+            if event["stdin_given"] != true {
+                complaints.push(format!("stdin_given {}", event["stdin_given"]));
+            }
+            if event["arguments"] != json!({"command": "wc -c", "cwd": "/tmp"}) {
+                complaints.push(format!("arguments {}", event["arguments"]));
+            }
+        }
+        other => complaints.push(format!("the command is {} events: {other:?}", other.len())),
+    }
+    let all = serde_json::to_string(&w.records.events()).unwrap();
+    if all.contains("the secret words") {
+        complaints.push("an event carries the standard input's text".to_string());
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-131 U34, U34d: every generation of a try is an `LlmInteraction`
+/// with its text: the first with the try's prompt and the calls it made, the
+/// next with the results it was given and its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_generation_is_an_llm_interaction_with_its_text() {
+    let w = world(
+        agent("60s", 30),
+        vec![
+            run_command(json!({"command": "printf seventeen", "cwd": "/tmp"})),
+            answer("all done: seventeen"),
+        ],
+    )
+    .await;
+    let _ = w.run(None).await;
+    let generations = w.records.events_named("LlmInteraction");
+    let mut complaints = Vec::new();
+    match generations.as_slice() {
+        [first, second] => {
+            let prompt = first["prompt"].as_str().unwrap_or_default();
+            if !prompt.contains("count the ticks") {
+                complaints.push(format!("the first prompt is {prompt:?}"));
+            }
+            let calls: Value = serde_json::from_str(first["response"].as_str().unwrap_or_default())
+                .unwrap_or(Value::Null);
+            if calls[0]["name"] != "cmd.run" || calls[0]["id"].as_str().is_none() {
+                complaints.push(format!("the first response is {}", first["response"]));
+            }
+            if !second["prompt"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("seventeen")
+            {
+                complaints.push(format!("the second prompt is {}", second["prompt"]));
+            }
+            if second["response"] != "all done: seventeen" {
+                complaints.push(format!("the second response is {}", second["response"]));
+            }
+            if first["iteration_number"] != 1 || second["iteration_number"] != 1 {
+                complaints.push("a generation names another try".to_string());
+            }
+        }
+        other => complaints.push(format!(
+            "the try's two generations are {} LlmInteraction events: {other:?}",
+            other.len()
+        )),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
 
 /// A command still running when its try was cut off is named in the next

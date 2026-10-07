@@ -27,8 +27,9 @@ spec:
         recorded it: execution_id, kind (agent, workflow or intent), agent_or_workflow, status,
         started_at, ended_at, iterations, last_output, last_error, approval_pending (the ids
         of tool calls waiting for the user's approval), tool_calls_executed (how many tool calls
-        the execution ran), dispatches (each tool call in order: its iteration, the tool's name
-        and its result status: succeeded, failed, fatal, refused, dispatched or pending), and
+        the execution ran), dispatches (each tool call in order: its iteration, the tool's name,
+        its result status: succeeded, failed, fatal, refused, dispatched or pending, and for a
+        refused, failed or fatal call the sentence it ended with, cut to 300 characters), and
         produced_files (each file the orchestrator itself read in the execution's volume when it
         completed, for the outputs the execution declared: path, size_bytes, content_type). For a
         workflow or intent execution those three are its step executions' facts:
