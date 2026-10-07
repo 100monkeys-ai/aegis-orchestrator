@@ -29,15 +29,16 @@ ARG TYPST_VERSION=0.15.1
 ARG TYPST_SHA256=a6d077d0a95eed5a2eba715b2dae06be954f624ccbf85758a03f389ded33118c
 ADD https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-amd64.tar.gz /tmp/pandoc.tar.gz
 ADD https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz /tmp/typst.tar.xz
-# The slim base has no xz, so the typst archive is unpacked with Python's
-# tarfile.
+# Each binary is read out of its archive as a file's contents and given its
+# mode here, so nothing changes an owner or a mode of a directory or symlink
+# (the CI runner's build refuses that); the slim base has no xz, so typst's is
+# read with Python's tarfile.
 RUN echo "${PANDOC_SHA256}  /tmp/pandoc.tar.gz" | sha256sum -c - \
     && echo "${TYPST_SHA256}  /tmp/typst.tar.xz" | sha256sum -c - \
     && mkdir /out \
-    && tar -xzf /tmp/pandoc.tar.gz -C /tmp \
-    && install -m 0755 /tmp/pandoc-${PANDOC_VERSION}/bin/pandoc /out/pandoc \
-    && python3 -c "import tarfile; tarfile.open('/tmp/typst.tar.xz').extractall('/tmp', filter='data')" \
-    && install -m 0755 /tmp/typst-x86_64-unknown-linux-musl/typst /out/typst
+    && tar -xzOf /tmp/pandoc.tar.gz pandoc-${PANDOC_VERSION}/bin/pandoc > /out/pandoc \
+    && python3 -c "import shutil, tarfile; src = tarfile.open('/tmp/typst.tar.xz').extractfile('typst-x86_64-unknown-linux-musl/typst'); dst = open('/out/typst', 'wb'); shutil.copyfileobj(src, dst); dst.close()" \
+    && chmod 0755 /out/pandoc /out/typst
 
 FROM ${PYTHON_IMAGE}
 RUN apt-get update \
