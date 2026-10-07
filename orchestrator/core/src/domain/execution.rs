@@ -710,6 +710,26 @@ impl Execution {
         }
     }
 
+    /// Record on iteration `iteration_number` the refinement the next try is
+    /// given (its `code_changes`): the sentence the model reads before that
+    /// try, which `RefinementApplied` and the execution's narrative carry.
+    pub fn store_refinement(
+        &mut self,
+        iteration_number: u8,
+        refinement: CodeDiff,
+    ) -> Result<(), ExecutionError> {
+        if let Some(iter) = self
+            .iterations
+            .iter_mut()
+            .find(|i| i.number == iteration_number)
+        {
+            iter.code_changes = Some(refinement);
+            Ok(())
+        } else {
+            Err(ExecutionError::IterationNotFound(iteration_number))
+        }
+    }
+
     pub fn store_iteration_trajectory(
         &mut self,
         iteration_number: u8,

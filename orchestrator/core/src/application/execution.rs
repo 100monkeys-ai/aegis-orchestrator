@@ -278,6 +278,21 @@ pub trait ExecutionService: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Record on an iteration the refinement the next try is given (its
+    /// `code_changes`): the sentence the inner loop writes when the provider
+    /// ended the iteration's model call at its time limit.
+    ///
+    /// The default implementation is a no-op; `StandardExecutionService`
+    /// persists the refinement and `ClusterAwareExecutionService` delegates.
+    async fn record_refinement(
+        &self,
+        _execution_id: ExecutionId,
+        _iteration: u8,
+        _refinement: crate::domain::execution::CodeDiff,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// End, as failed, every execution an earlier orchestrator process left
@@ -1293,6 +1308,68 @@ mod tests {
             1,
             "aegis-system-operator".to_string(),
         )
+    }
+
+    /// `RefinementApplied` carries the refinement recorded on the failed
+    /// iteration (its `code_changes`) where there is one, and the empty diff
+    /// as before where there is none.
+    #[tokio::test]
+    async fn refinement_applied_carries_the_iterations_refinement() {
+        use crate::domain::supervisor::SupervisorObserver;
+        use crate::infrastructure::event_bus::DomainEvent;
+
+        const SENTENCE: &str = "Your previous answer exceeded the model provider's time limit: \
+             the provider ended it after 120.5 s, before it finished, so none of it was kept. \
+             Answer this time with a tool call that runs a program to compute the result; do \
+             not write the computed result in your text.";
+        let repo: Arc<InMemoryExecutionRepository> = Arc::new(InMemoryExecutionRepository::new());
+        let bus = Arc::new(EventBus::new(64));
+        let agent_id = AgentId::new();
+
+        for (refinement, expected) in [(Some(SENTENCE), SENTENCE), (None, "")] {
+            let mut exec = make_parent_execution(agent_id);
+            exec.start_iteration("try".to_string()).unwrap();
+            if let Some(sentence) = refinement {
+                exec.store_refinement(
+                    1,
+                    crate::domain::execution::CodeDiff {
+                        file_path: String::new(),
+                        diff: sentence.to_string(),
+                    },
+                )
+                .unwrap();
+            }
+            let tenant_id = exec.tenant_id.clone();
+            repo.save_for_tenant(&tenant_id, &exec).await.unwrap();
+            let monitor = ExecutionMonitor {
+                execution_id: exec.id,
+                agent_id,
+                tenant_id,
+                repository: repo.clone(),
+                event_bus: bus.clone(),
+            };
+            let mut receiver = bus.subscribe();
+            monitor
+                .on_iteration_fail(1, "Execution failed: the model call failed")
+                .await;
+            let diff = loop {
+                match receiver.recv().await.unwrap() {
+                    DomainEvent::Execution(ExecutionEvent::RefinementApplied {
+                        code_diff,
+                        iteration_number,
+                        ..
+                    }) => {
+                        assert_eq!(iteration_number, 1);
+                        break code_diff.diff;
+                    }
+                    _ => continue,
+                }
+            };
+            assert_eq!(
+                diff, expected,
+                "RefinementApplied must carry the iteration's refinement where set and the empty diff otherwise"
+            );
+        }
     }
 
     async fn wait_for_spawn(runtime: &TestRuntime) -> WorkerRuntimeConfig {
@@ -4638,12 +4715,21 @@ impl SupervisorObserver for ExecutionMonitor {
             details: None,
         };
 
+        // The refinement the next try is given, where the iteration has one
+        // (its `code_changes`, recorded by the inner loop before the try
+        // failed); otherwise the empty diff.
+        let mut refinement = None;
         if let Ok(Some(mut exec)) = self
             .repository
             .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
             .await
         {
             exec.fail_iteration(iter_error.clone());
+            refinement = exec
+                .iterations()
+                .iter()
+                .find(|i| i.number == iteration)
+                .and_then(|i| i.code_changes.clone());
             let _ = self
                 .repository
                 .save_for_tenant(&self.tenant_id, &exec)
@@ -4660,17 +4746,17 @@ impl SupervisorObserver for ExecutionMonitor {
             });
 
         // Emit RefinementApplied to signal that a retry/refinement cycle is about to begin.
-        // code_diff is empty until the orchestrator tracks per-iteration diffs; Cortex fields
+        // code_diff is the iteration's refinement where it has one, else empty; Cortex fields
         // will be populated once the Cortex gRPC interface returns pattern metadata.
         self.event_bus
             .publish_execution_event(ExecutionEvent::RefinementApplied {
                 execution_id: self.execution_id,
                 agent_id: self.agent_id,
                 iteration_number: iteration,
-                code_diff: crate::domain::execution::CodeDiff {
+                code_diff: refinement.unwrap_or(crate::domain::execution::CodeDiff {
                     file_path: String::new(),
                     diff: String::new(),
-                },
+                }),
                 applied_at: now,
                 cortex_pattern_id: None,
                 cortex_pattern_category: None,
@@ -7076,6 +7162,28 @@ impl ExecutionService for StandardExecutionService {
             let tenant_id = exec.tenant_id.clone();
             exec.add_policy_violation(tool_name);
             self.repository.save_for_tenant(&tenant_id, &exec).await?;
+        }
+        Ok(())
+    }
+
+    async fn record_refinement(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        refinement: crate::domain::execution::CodeDiff,
+    ) -> Result<()> {
+        if let Some(mut exec) = self.repository.find_by_id_unscoped(execution_id).await? {
+            let tenant_id = exec.tenant_id.clone();
+            if let Err(e) = exec.store_refinement(iteration, refinement) {
+                tracing::warn!(
+                    "Failed to record the refinement for execution {} iteration {}: {}",
+                    execution_id.0,
+                    iteration,
+                    e
+                );
+            } else {
+                self.repository.save_for_tenant(&tenant_id, &exec).await?;
+            }
         }
         Ok(())
     }

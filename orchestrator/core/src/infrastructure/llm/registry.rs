@@ -254,7 +254,24 @@ fn plain_failure(e: &LLMError) -> &'static str {
     }
 }
 
+/// The provider's time limit, as a failed model call met it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProviderTimeLimit {
+    /// The seconds the provider took before it ended the generation, where
+    /// its error states them.
+    pub seconds: Option<f64>,
+}
+
 impl ModelCallFailure {
+    /// `Some` when the provider ended the model's generation at its time
+    /// limit (Workers AI's 408 with code 3046), whatever became of a fallback
+    /// tried after it. A call the agent's own `llm_timeout_seconds` ended is
+    /// not the provider's limit and answers `None`, as every other failure.
+    pub fn provider_time_limit(&self) -> Option<ProviderTimeLimit> {
+        super::openai::provider_time_limit_seconds(&self.error)
+            .map(|seconds| ProviderTimeLimit { seconds })
+    }
+
     fn unreported(error: LLMError) -> Self {
         Self {
             error,

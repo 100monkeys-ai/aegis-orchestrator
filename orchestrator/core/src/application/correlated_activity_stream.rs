@@ -589,8 +589,19 @@ fn event_message(event: &DomainEvent) -> String {
             ..
         }) => format!("Iteration {iteration_number} failed: {}", error.message),
         DomainEvent::Execution(ExecutionEvent::RefinementApplied {
-            iteration_number, ..
-        }) => format!("Applied refinement after iteration {iteration_number}"),
+            iteration_number,
+            code_diff,
+            ..
+        }) => {
+            if code_diff.diff.is_empty() {
+                format!("Applied refinement after iteration {iteration_number}")
+            } else {
+                format!(
+                    "Applied refinement after iteration {iteration_number}: {}",
+                    code_diff.diff
+                )
+            }
+        }
         DomainEvent::Execution(ExecutionEvent::ExecutionCompleted {
             total_iterations, ..
         }) => format!("Execution completed after {total_iterations} iterations"),
@@ -1387,5 +1398,42 @@ mod tests {
         assert_eq!(refinement_event.event_type, "refinement_applied");
         assert_eq!(refinement_event.iteration, Some(2));
         assert!(refinement_event.message.contains("refinement"));
+    }
+
+    /// The narrative's line for a refinement reads the refinement itself
+    /// when it carries one, and as before when its diff is empty.
+    #[test]
+    fn refinement_line_carries_the_refinement() {
+        let refinement = |diff: &str| {
+            normalize_domain_event(
+                &DomainEvent::Execution(ExecutionEvent::RefinementApplied {
+                    execution_id: ExecutionId::new(),
+                    agent_id: AgentId::new(),
+                    iteration_number: 1,
+                    code_diff: CodeDiff {
+                        file_path: String::new(),
+                        diff: diff.to_string(),
+                    },
+                    applied_at: Utc::now(),
+                    cortex_pattern_id: None,
+                    cortex_pattern_category: None,
+                    cortex_success_score: None,
+                    cortex_solution_approach: None,
+                }),
+                None,
+            )
+            .message
+        };
+        let sentence = "Your previous answer exceeded the model provider's time limit: the provider ended it after 120.5 s, before it finished, so none of it was kept. Answer this time with a tool call that runs a program to compute the result; do not write the computed result in your text.";
+        assert_eq!(
+            refinement(sentence),
+            format!("Applied refinement after iteration 1: {sentence}"),
+            "the narrative must name the refinement"
+        );
+        assert_eq!(
+            refinement(""),
+            "Applied refinement after iteration 1",
+            "an empty refinement reads as before"
+        );
     }
 }

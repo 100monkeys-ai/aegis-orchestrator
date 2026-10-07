@@ -175,6 +175,18 @@ impl ExecutionService for Records {
         }
         Ok(())
     }
+    async fn record_refinement(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        refinement: crate::domain::execution::CodeDiff,
+    ) -> anyhow::Result<()> {
+        let mut map = self.0.lock().unwrap();
+        if let Some(exec) = map.get_mut(&execution_id) {
+            let _ = exec.store_refinement(iteration, refinement);
+        }
+        Ok(())
+    }
 }
 
 /// The same records as the execution repository the daemon gives the
@@ -457,6 +469,8 @@ type Turn = Box<dyn Fn(&[ChatMessage]) -> Result<ChatResponse, LLMError> + Send 
 struct ScriptedModel {
     turns: Vec<Turn>,
     calls: StdMutex<Vec<Vec<ChatMessage>>>,
+    /// The calls (by index) that never answer, as a silent model does.
+    silent: Vec<usize>,
 }
 
 impl ScriptedModel {
@@ -485,6 +499,9 @@ impl LLMProvider for ScriptedModel {
             calls.push(messages.to_vec());
             calls.len() - 1
         };
+        if self.silent.contains(&n) {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
         let turn = self
             .turns
             .get(n)
@@ -522,6 +539,21 @@ fn answer(text: &str) -> Turn {
 fn fails(text: &str) -> Turn {
     let text = text.to_string();
     Box::new(move |_| Err(LLMError::Network(text.clone())))
+}
+
+/// The provider ends the generation at its time limit after 120.5 s, as
+/// Workers AI did in execution eea195cd (HTTP 408, code 3046), in the error
+/// the adapter builds for it.
+fn ended_at_the_time_limit() -> Turn {
+    Box::new(|_| {
+        Err(
+            crate::infrastructure::llm::openai::provider_time_limit_error(
+                "test-model",
+                120_500,
+                r#"{"errors":[{"message":"AiError: AiError: Request timeout","code":3046}]}"#,
+            ),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +725,11 @@ struct World {
 }
 
 async fn world(agent: Agent, turns: Vec<Turn>) -> World {
+    world_with_silent_calls(agent, turns, Vec::new()).await
+}
+
+/// [`world`], with the model silent on the calls `silent` names.
+async fn world_with_silent_calls(agent: Agent, turns: Vec<Turn>, silent: Vec<usize>) -> World {
     let records = Arc::new(Records::default());
     let mut execution = Execution::new_with_id(
         ExecutionId::new(),
@@ -746,6 +783,7 @@ async fn world(agent: Agent, turns: Vec<Turn>) -> World {
     let model = Arc::new(ScriptedModel {
         turns,
         calls: StdMutex::new(Vec::new()),
+        silent,
     });
     let registry = ProviderRegistry::new_for_test(model.clone(), None, 1, 0, 600);
     let inner_loop = Arc::new(
@@ -1219,4 +1257,127 @@ async fn an_executor_that_must_call_a_tool_fails_on_text_and_completes_after_a_c
     )
     .await;
     assert_eq!(w.run(None).await.expect("the try completes"), "ok");
+}
+
+// ---------------------------------------------------------------------------
+// The provider's time limit refines the next try's prompt
+// ---------------------------------------------------------------------------
+
+/// The refinement after a time limit of 120.5 s, word for word.
+const REFINEMENT_AFTER_120_5_S: &str = "Your previous answer exceeded the model provider's time \
+     limit: the provider ended it after 120.5 s, before it finished, so none of it was kept. \
+     Answer this time with a tool call that runs a program to compute the result; do not write \
+     the computed result in your text.";
+
+/// The header paragraph of the previous-tries section, as it ends.
+const SECTION_HEADER_END: &str = "do not repeat what failed in the same way.\n\n";
+
+/// The reproduction of execution eea195cd: the provider ends try 1's model
+/// call at its time limit; the next try is not sent the same request with
+/// the raw error alone. Its prompt carries the refinement naming the limit,
+/// right after the previous-tries section's header and before `## Try 1`,
+/// and try 1's record carries the same refinement for `RefinementApplied`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provider_time_limit_refines_the_next_try_with_the_limit() {
+    let w = world(
+        agent("60s", 30),
+        vec![ended_at_the_time_limit(), answer("solved by the program")],
+    )
+    .await;
+    let outcome = w.run(None).await;
+    assert_eq!(
+        outcome.expect("the second try answers"),
+        "solved by the program"
+    );
+
+    let told = first_user_message(&w.model.conversation(1));
+    assert!(
+        told.contains(&format!(
+            "{SECTION_HEADER_END}{REFINEMENT_AFTER_120_5_S}\n\n## Try 1"
+        )),
+        "try 2's prompt must carry the refinement naming the limit after the section's header and before ## Try 1: {told}"
+    );
+    let try_one = w.records.get(w.execution_id).iterations[0].clone();
+    let refinement = try_one
+        .code_changes
+        .expect("try 1's record must carry the refinement it was given");
+    assert_eq!(
+        refinement.diff, REFINEMENT_AFTER_120_5_S,
+        "try 1's refinement must be the sentence try 2 was sent"
+    );
+}
+
+/// Another provider error keeps today's path: no refinement on the record
+/// and the previous-tries section as it was, the header then `## Try 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_provider_error_leaves_the_refinement_as_today() {
+    let w = world(
+        agent("60s", 30),
+        vec![
+            Box::new(|_| Err(LLMError::Provider("HTTP 500: upstream boom".to_string()))),
+            answer("done"),
+        ],
+    )
+    .await;
+    assert_eq!(w.run(None).await.expect("the second try answers"), "done");
+
+    let told = first_user_message(&w.model.conversation(1));
+    assert!(
+        told.contains(&format!("{SECTION_HEADER_END}## Try 1")),
+        "the section must read as today, the header then ## Try 1: {told}"
+    );
+    assert!(
+        told.contains("HTTP 500: upstream boom"),
+        "how it ended: {told}"
+    );
+    assert!(
+        !told.contains("exceeded the model provider's time limit"),
+        "another provider error must not be told the time limit: {told}"
+    );
+    let try_one = w.records.get(w.execution_id).iterations[0].clone();
+    assert!(
+        try_one.code_changes.is_none(),
+        "another provider error must leave no refinement, got {:?}",
+        try_one.code_changes
+    );
+}
+
+/// A model silent until the agent's own `llm_timeout_seconds` is not the
+/// provider's time limit: no refinement, and the next try is not told one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_primary_is_not_the_providers_time_limit() {
+    let w = world_with_silent_calls(
+        agent("60s", 1),
+        vec![answer("never sent"), answer("done")],
+        vec![0],
+    )
+    .await;
+    assert_eq!(w.run(None).await.expect("the second try answers"), "done");
+
+    let told = first_user_message(&w.model.conversation(1));
+    assert!(told.contains("llm_timeout_seconds"), "how it ended: {told}");
+    assert!(
+        !told.contains("exceeded the model provider's time limit"),
+        "a silent primary must not be told the provider's limit: {told}"
+    );
+    let try_one = w.records.get(w.execution_id).iterations[0].clone();
+    assert!(
+        try_one.code_changes.is_none(),
+        "a silent primary must leave no refinement, got {:?}",
+        try_one.code_changes
+    );
+}
+
+/// The refinement's sentence without the seconds, where the provider's
+/// error states none.
+#[test]
+fn the_refinement_without_seconds_says_the_provider_ended_it() {
+    assert_eq!(
+        time_limit_refinement(crate::infrastructure::llm::registry::ProviderTimeLimit {
+            seconds: None
+        }),
+        "Your previous answer exceeded the model provider's time limit: the provider ended it \
+         before it finished, so none of it was kept. Answer this time with a tool call that \
+         runs a program to compute the result; do not write the computed result in your text."
+    );
 }

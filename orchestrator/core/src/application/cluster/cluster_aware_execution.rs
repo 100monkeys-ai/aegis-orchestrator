@@ -355,6 +355,17 @@ impl ExecutionService for ClusterAwareExecutionService {
             .await
     }
 
+    async fn record_refinement(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        refinement: crate::domain::execution::CodeDiff,
+    ) -> Result<()> {
+        self.inner
+            .record_refinement(execution_id, iteration, refinement)
+            .await
+    }
+
     async fn store_iteration_trajectory(
         &self,
         execution_id: ExecutionId,

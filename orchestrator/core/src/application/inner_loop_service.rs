@@ -110,6 +110,24 @@ struct ExecutionContext {
 pub(crate) const TEXT_WHERE_A_TOOL_CALL_WAS_REQUIRED: &str =
     "The agent answered with text where it had to call a tool.";
 
+/// The refinement the next try is given when the provider ended this try's
+/// model call at its time limit: the limit, and that the answer is a tool
+/// call running a program, not a result computed in text. The same prompt
+/// would meet the same limit again.
+pub(crate) fn time_limit_refinement(
+    limit: crate::infrastructure::llm::registry::ProviderTimeLimit,
+) -> String {
+    let ended = match limit.seconds {
+        Some(seconds) => format!("the provider ended it after {seconds:.1} s, before it finished"),
+        None => "the provider ended it before it finished".to_string(),
+    };
+    format!(
+        "Your previous answer exceeded the model provider's time limit: {ended}, so none of \
+         it was kept. Answer this time with a tool call that runs a program to compute the \
+         result; do not write the computed result in your text."
+    )
+}
+
 /// The command line a `cmd.run` call ran: its `command`, then each of its
 /// `args`, with runs of whitespace made single spaces.
 fn command_line_of(arguments_json: &str) -> Option<String> {
@@ -552,7 +570,7 @@ impl InnerLoopService {
                 })
                 .collect();
 
-            let llm_output = self
+            let llm_output = match self
                 .call_llm(
                     &ctx.model_alias,
                     &ctx.conversation,
@@ -562,7 +580,15 @@ impl InnerLoopService {
                     ctx.llm_timeout_seconds,
                     ctx.deadline,
                 )
-                .await?;
+                .await
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    self.record_time_limit_refinement(execution_id_str, ctx.iteration_number, &e)
+                        .await;
+                    return Err(e);
+                }
+            };
 
             match llm_output {
                 LlmOutput::FinalText(text) => {
@@ -879,6 +905,48 @@ impl InnerLoopService {
                     }
                 }
             }
+        }
+    }
+
+    /// When the provider ended this try's model call at its time limit,
+    /// record on the iteration the refinement the next try is given
+    /// ([`time_limit_refinement`]), before the gateway answers and the try
+    /// fails. Any other failure, the agent's own `llm_timeout_seconds`
+    /// among them, records none.
+    async fn record_time_limit_refinement(
+        &self,
+        execution_id_str: &str,
+        iteration: u8,
+        e: &anyhow::Error,
+    ) {
+        use crate::infrastructure::llm::registry::ModelCallFailure;
+        let Some(limit) = e
+            .downcast_ref::<ModelCallFailure>()
+            .and_then(ModelCallFailure::provider_time_limit)
+        else {
+            return;
+        };
+        let Ok(id) = uuid::Uuid::parse_str(execution_id_str) else {
+            return;
+        };
+        if let Err(err) = self
+            .execution_service
+            .record_refinement(
+                ExecutionId(id),
+                iteration,
+                crate::domain::execution::CodeDiff {
+                    file_path: String::new(),
+                    diff: time_limit_refinement(limit),
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution_id_str,
+                iteration,
+                error = %err,
+                "Failed to record the time-limit refinement"
+            );
         }
     }
 
@@ -1621,6 +1689,17 @@ pub(crate) fn previous_tries_section(
          of this task. Each result is shown as the model saw it then. Build on what worked and \
          do not repeat what failed in the same way.\n\n",
     );
+    // The refinement the latest earlier try left (its `code_changes`), as
+    // its own paragraph before the tries, where no cut reaches it.
+    if let Some(refinement) = iterations
+        .iter()
+        .filter(|i| i.number < current)
+        .filter_map(|i| i.code_changes.as_ref())
+        .rfind(|diff| !diff.diff.is_empty())
+    {
+        section.push_str(&refinement.diff);
+        section.push_str("\n\n");
+    }
     if left_out > 0 {
         section.push_str(&format!(
             "({left_out} earlier parts of this account are not shown: they are kept in the \

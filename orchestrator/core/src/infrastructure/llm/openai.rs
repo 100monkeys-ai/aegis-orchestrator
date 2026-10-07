@@ -106,6 +106,40 @@ pub(super) fn is_provider_timeout(e: &LLMError) -> bool {
     matches!(e, LLMError::Provider(msg) if msg.starts_with(PROVIDER_TIMEOUT_PREFIX))
 }
 
+/// The words before the seconds in a time-limit error's message.
+const TIME_LIMIT_SECONDS_BEFORE: &str = "at its time limit after ";
+/// The words after the seconds in a time-limit error's message.
+const TIME_LIMIT_SECONDS_AFTER: &str = " s (HTTP 408";
+
+/// The error a provider's time limit becomes: the model, the seconds the
+/// provider took before it ended the generation, and the provider's answer.
+/// The one place it is built; [`provider_time_limit_seconds`] reads it back.
+pub(crate) fn provider_time_limit_error(model: &str, elapsed_ms: u64, excerpt: &str) -> LLMError {
+    LLMError::Provider(format!(
+        "{PROVIDER_TIMEOUT_PREFIX}model '{model}' was ended by the provider {TIME_LIMIT_SECONDS_BEFORE}{:.1}{TIME_LIMIT_SECONDS_AFTER}, code {WORKERS_AI_TIME_LIMIT_CODE}); the identical request is not sent again: {excerpt}",
+        elapsed_ms as f64 / 1000.0,
+    ))
+}
+
+/// `Some` when `e` is the error a provider's time limit becomes (Workers
+/// AI's 408 with code 3046, [`provider_time_limit_error`]), with the alias or
+/// a fallback's failure added to it or not; inside, the seconds the provider
+/// took where the message states them. Any other error, an agent's own
+/// `llm_timeout_seconds` among them, is `None`.
+pub(crate) fn provider_time_limit_seconds(e: &LLMError) -> Option<Option<f64>> {
+    let LLMError::Provider(msg) = e else {
+        return None;
+    };
+    if !is_provider_timeout(e) {
+        return None;
+    }
+    Some(
+        msg.split_once(TIME_LIMIT_SECONDS_BEFORE)
+            .and_then(|(_, rest)| rest.split_once(TIME_LIMIT_SECONDS_AFTER))
+            .and_then(|(seconds, _)| seconds.parse::<f64>().ok()),
+    )
+}
+
 pub struct OpenAIAdapter {
     client: reqwest::Client,
     endpoint: String,
@@ -351,11 +385,7 @@ impl LLMProvider for OpenAIAdapter {
                 "LLM upstream non-2xx"
             );
             return Err(if is_workers_ai_time_limit(status.as_u16(), &error_text) {
-                LLMError::Provider(format!(
-                    "{PROVIDER_TIMEOUT_PREFIX}model '{}' was ended by the provider at its time limit after {:.1} s (HTTP 408, code {WORKERS_AI_TIME_LIMIT_CODE}); the identical request is not sent again: {excerpt}",
-                    self.model,
-                    http_elapsed_ms as f64 / 1000.0,
-                ))
+                provider_time_limit_error(&self.model, http_elapsed_ms, &excerpt)
             } else if status == 401 || status == 403 {
                 LLMError::Authentication(error_text)
             } else if status == 429 {
@@ -572,6 +602,55 @@ mod tests {
             "another code"
         );
         assert!(!is_workers_ai_time_limit(408, "request timeout"), "no JSON");
+    }
+
+    /// The seconds a provider's time limit took go into its error and come
+    /// back out of it, with the alias and a fallback's failure added after
+    /// them as the registry adds them; any other error has no time limit.
+    #[test]
+    fn provider_time_limit_error_round_trips_its_seconds() {
+        let e = provider_time_limit_error("@cf/nvidia/nemotron-3-120b-a12b", 120_500, "{}");
+        assert_eq!(
+            provider_time_limit_seconds(&e),
+            Some(Some(120.5)),
+            "the time-limit error must give back its 120.5 s: {e}"
+        );
+        let LLMError::Provider(msg) = &e else {
+            panic!("a time limit is a provider error, got {e:?}");
+        };
+        assert_eq!(
+            msg,
+            "provider timeout: model '@cf/nvidia/nemotron-3-120b-a12b' was ended by the provider at its time limit after 120.5 s (HTTP 408, code 3046); the identical request is not sent again: {}",
+            "the error's text is as it was"
+        );
+        let with_alias_and_fallback = LLMError::Provider(format!(
+            "{PROVIDER_TIMEOUT_PREFIX}alias 'smart': {}; the fallback model 'm' was tried once and failed: x after 9.0 s (HTTP 408",
+            &msg[PROVIDER_TIMEOUT_PREFIX.len()..]
+        ));
+        assert_eq!(
+            provider_time_limit_seconds(&with_alias_and_fallback),
+            Some(Some(120.5)),
+            "the alias and a fallback's failure must not move the seconds"
+        );
+        assert_eq!(
+            provider_time_limit_seconds(&LLMError::Provider(format!(
+                "{PROVIDER_TIMEOUT_PREFIX}model 'm' gave no seconds"
+            ))),
+            Some(None),
+            "a time limit whose message states no seconds is still a time limit"
+        );
+        assert_eq!(
+            provider_time_limit_seconds(&LLMError::Provider("HTTP 500: boom".to_string())),
+            None,
+            "another provider error is no time limit"
+        );
+        assert_eq!(
+            provider_time_limit_seconds(&LLMError::Network(
+                "model call on alias 'smart' gave no answer within the agent's llm_timeout_seconds (120 s)".to_string()
+            )),
+            None,
+            "the agent's own timeout is not the provider's limit"
+        );
     }
 
     #[test]
