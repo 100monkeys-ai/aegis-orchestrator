@@ -681,8 +681,17 @@ pub(crate) fn no_program_sentence(name: &str) -> String {
     )
 }
 
-/// AEGIS ADR-005 O7d: a manifest the generator creates or updates that
-/// declares `cmd.run` and carries no program is refused with O7's sentence.
+/// The output declaration's sentence for a file an agent writes and does not
+/// declare.
+pub(crate) fn undeclared_output_sentence(name: &str, path: &str) -> String {
+    format!("agent '{name}' writes {path} but does not declare it in spec.execution.outputs")
+}
+
+/// AEGIS ADR-005 O7d and O8: a manifest the generator creates or updates is
+/// refused when it declares `cmd.run` and carries no program (O7's
+/// sentence), and for each `/workspace` file its instruction or prompt
+/// template names that `spec.execution.outputs` does not list. Every
+/// sentence is reported, joined with "; ".
 pub(crate) fn generator_floor(
     calling_agent: Option<&str>,
     manifest: &crate::domain::agent::AgentManifest,
@@ -690,11 +699,47 @@ pub(crate) fn generator_floor(
     if calling_agent != Some(AGENT_GENERATOR_NAME) {
         return None;
     }
+    let name = &manifest.metadata.name;
+    let mut sentences: Vec<String> = Vec::new();
     let runs_commands = manifest.spec.tools.iter().any(|tool| tool == "cmd.run");
     if runs_commands && manifest.spec.program.is_none() {
-        return Some(no_program_sentence(&manifest.metadata.name));
+        sentences.push(no_program_sentence(name));
     }
-    None
+    let declared: Vec<&str> = manifest
+        .spec
+        .execution
+        .as_ref()
+        .map(|execution| {
+            execution
+                .outputs
+                .iter()
+                .map(|output| output.path.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut written: Vec<&str> = Vec::new();
+    if let Some(task) = &manifest.spec.task {
+        for text in [&task.instruction, &task.prompt_template]
+            .into_iter()
+            .flatten()
+        {
+            for file in crate::domain::tool_requirement::workspace_files_named(text) {
+                if !written.contains(&file) {
+                    written.push(file);
+                }
+            }
+        }
+    }
+    for file in written {
+        if !declared.contains(&file) {
+            sentences.push(undeclared_output_sentence(name, file));
+        }
+    }
+    if sentences.is_empty() {
+        None
+    } else {
+        Some(sentences.join("; "))
+    }
 }
 
 fn head_chars(text: &str, max: usize) -> String {
@@ -1557,6 +1602,16 @@ spec:
         model to write or compute the solution on each run; the agent must carry its program and \
         run it";
 
+    /// The output declaration's sentence for the fixture's itinerary.
+    const O8_SENTENCE: &str = "agent 'vrp-solver-agent' writes /workspace/itinerary.md but does \
+        not declare it in spec.execution.outputs";
+
+    /// `vrp-solver-agent` 1.0.1 meets both floors: every clause is reported,
+    /// joined with "; ".
+    fn vrp_refusal() -> String {
+        format!("{O7_SENTENCE}; {O8_SENTENCE}")
+    }
+
     /// A program runner that answers as it is told and keeps what it was given.
     struct ScriptedRunner {
         answer: std::sync::Mutex<
@@ -1692,7 +1747,8 @@ spec:
     }
 
     /// T1, O7d: the generator's `aegis.agent.create` and `aegis.agent.update`
-    /// of `vrp-solver-agent` 1.0.1 are refused with O7's sentence and nothing
+    /// of `vrp-solver-agent` 1.0.1 are refused with O7's sentence (joined to
+    /// the output declaration's, which it also meets) and nothing
     /// is deployed; the same manifest from another caller meets no floor.
     #[tokio::test]
     async fn the_generator_cannot_deploy_vrp_solver_agent_without_a_program() {
@@ -1700,7 +1756,7 @@ spec:
         let mut complaints = Vec::new();
 
         let answer = create(&h.service, VRP_SOLVER, Some(AGENT_GENERATOR_NAME)).await;
-        if errors(&answer) != vec![O7_SENTENCE.to_string()] {
+        if errors(&answer) != vec![vrp_refusal()] {
             complaints.push(format!("the generator's create answered {answer}"));
         }
         if answer.get("deployed") != Some(&Value::Bool(false)) {
@@ -1719,7 +1775,7 @@ spec:
         }
         let raised = VRP_SOLVER.replace("version: 1.0.1", "version: 1.0.2");
         let answer = update(&h.service, &raised, Some(AGENT_GENERATOR_NAME)).await;
-        if errors(&answer) != vec![O7_SENTENCE.to_string()] {
+        if errors(&answer) != vec![vrp_refusal()] {
             complaints.push(format!("the generator's update answered {answer}"));
         }
         if answer.get("updated") != Some(&Value::Bool(false)) {
@@ -1891,5 +1947,139 @@ spec:
             !deployed(&h, "sum-agent").await,
             "deployed unchecked: {answer}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The generator's floor: an agent that writes a file declares it
+    // -----------------------------------------------------------------------
+
+    /// A manifest carrying a program whose instruction (or prompt template)
+    /// writes `/workspace/itinerary.md`, declaring `outputs`.
+    fn writing_yaml(name: &str, version: &str, in_template: bool, outputs: &[&str]) -> String {
+        let mut yaml = program_yaml(name, version);
+        let write = "Write the itinerary to /workspace/itinerary.md.";
+        if in_template {
+            yaml = yaml.replace(
+                "  program:\n",
+                &format!("    prompt_template: \"{{{{input}}}} {write}\"\n  program:\n"),
+            );
+        } else {
+            yaml = yaml.replace(
+                "present its output.\n",
+                &format!("present its output. {write}\n"),
+            );
+        }
+        if !outputs.is_empty() {
+            let listed: String = outputs
+                .iter()
+                .map(|path| format!("      - path: {path}\n"))
+                .collect();
+            yaml.push_str(&format!("  execution:\n    outputs:\n{listed}"));
+        }
+        yaml
+    }
+
+    fn o8_sentence(name: &str) -> String {
+        format!(
+            "agent '{name}' writes /workspace/itinerary.md but does not declare it in \
+             spec.execution.outputs"
+        )
+    }
+
+    /// T3: the generator's `aegis.agent.create` of an agent whose instruction,
+    /// or prompt template, writes a `/workspace` file its outputs do not list
+    /// is refused with the sentence, and nothing is deployed.
+    #[tokio::test]
+    async fn the_generator_refuses_an_agent_that_writes_an_undeclared_file() {
+        let h = harness().await;
+        let mut complaints = Vec::new();
+        for (name, in_template) in [("route-agent", false), ("route-template-agent", true)] {
+            let yaml = writing_yaml(name, "1.0.0", in_template, &[]);
+            let answer = create(&h.service, &yaml, Some(AGENT_GENERATOR_NAME)).await;
+            println!("{name}: the generator's create answered {answer}");
+            if errors(&answer) != vec![o8_sentence(name)] {
+                complaints.push(format!(
+                    "{name} writing an undeclared file was not refused with the sentence: {answer}"
+                ));
+            }
+            if deployed(&h, name).await {
+                complaints.push(format!("{name} was deployed by the generator"));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T4: the floor passes an agent whose outputs list the file it writes,
+    /// and does not judge an agent another caller deploys.
+    #[test]
+    fn a_declared_file_and_another_callers_agent_meet_no_floor() {
+        let mut complaints = Vec::new();
+        let declared = AgentManifestParser::parse_yaml(&writing_yaml(
+            "route-agent",
+            "1.0.0",
+            false,
+            &["/workspace/itinerary.md"],
+        ))
+        .expect("the declared manifest parses");
+        let floor = generator_floor(Some(AGENT_GENERATOR_NAME), &declared);
+        println!("declared manifest: the floor answered {floor:?}");
+        if floor.is_some() {
+            complaints.push(format!(
+                "an agent declaring the file it writes was refused: {floor:?}"
+            ));
+        }
+        let undeclared =
+            AgentManifestParser::parse_yaml(&writing_yaml("route-agent", "1.0.0", false, &[]))
+                .expect("the undeclared manifest parses");
+        if let Some(sentence) = generator_floor(None, &undeclared) {
+            complaints.push(format!("another caller's agent met the floor: {sentence}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T5: `vrp-solver-agent` 1.0.1 meets both floors, and both sentences
+    /// are reported, joined with "; ".
+    #[test]
+    fn the_vrp_fixture_is_refused_with_both_sentences() {
+        let manifest = AgentManifestParser::parse_yaml(VRP_SOLVER).expect("the fixture parses");
+        let floor = generator_floor(Some(AGENT_GENERATOR_NAME), &manifest);
+        println!("vrp-solver-agent 1.0.1: the floor answered {floor:?}");
+        assert_eq!(
+            floor,
+            Some(vrp_refusal()),
+            "the fixture was not refused with both sentences"
+        );
+    }
+
+    /// T6: the generator's `aegis.agent.update` of an agent that writes an
+    /// undeclared file is refused with the sentence; with the file declared
+    /// the floor lets it through.
+    #[tokio::test]
+    async fn the_generators_update_refuses_an_agent_that_writes_an_undeclared_file() {
+        let h = harness().await;
+        let mut complaints = Vec::new();
+        let service =
+            h.service
+                .with_program_runner(ScriptedRunner::exits(0, "{\"total\": 7.5}", ""));
+        let by_person = create(&service, &program_yaml("route-agent", "1.0.0"), None).await;
+        println!("a person's create answered {by_person}");
+        if by_person.get("deployed") != Some(&Value::Bool(true)) {
+            complaints.push(format!("a person's create was refused: {by_person}"));
+        }
+        // A runner that answers again, so the update reaches the floor or
+        // passes it on the floor's word alone.
+        let service = service.with_program_runner(ScriptedRunner::exits(0, "{\"total\": 7.5}", ""));
+        let yaml = writing_yaml("route-agent", "1.0.1", false, &[]);
+        let answer = update(&service, &yaml, Some(AGENT_GENERATOR_NAME)).await;
+        println!("the generator's update answered {answer}");
+        if errors(&answer) != vec![o8_sentence("route-agent")] {
+            complaints.push(format!(
+                "the generator's update of an undeclared file was not refused with the sentence: {answer}"
+            ));
+        }
+        if answer.get("updated") != Some(&Value::Bool(false)) {
+            complaints.push(format!("the update did not say updated false: {answer}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

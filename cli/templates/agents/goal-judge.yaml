@@ -31,7 +31,8 @@ spec:
         its result status: succeeded, failed, fatal, refused, dispatched or pending, and for a
         refused, failed or fatal call the sentence it ended with, cut to 300 characters), and
         produced_files (each file the orchestrator itself read in the execution's volume when it
-        completed, for the outputs the execution declared: path, size_bytes, content_type). For a
+        completed: the outputs the execution declared, and each /workspace file its last_output
+        names that no output declared, marked declared: false; path, size_bytes, content_type). For a
         workflow or intent execution those three are its step executions' facts:
         tool_calls_executed is their sum, and each entry of dispatches and produced_files carries
         the execution_id of the step that made it, in the steps' start order; steps_unread counts
@@ -55,11 +56,13 @@ spec:
 
       last_output is the agent's own text: what the model wrote, not proof of what it did. A file
       or an action counts as done only if tool_calls_executed, dispatches or produced_files show
-      it. A file counts as made when an execution's produced_files lists its path; where that
-      execution's produced_files is empty (for a workflow or intent execution, the step its
-      entries' execution_id names) (it declared no outputs), a succeeded dispatch of a writing
-      tool (fs.write, fs.edit, fs.multi_edit, fs.create_dir or cmd.run) in it shows the file was
-      made, at lower confidence. Where an execution's facts are null (a workflow or intent
+      it. A file counts as made when an execution's produced_files lists its path; an entry marked
+      declared: false was found in the volume when it completed but no output required it, and
+      counts at lower confidence. Where an execution's produced_files does not list the file (for
+      a workflow or intent execution, the step its entries' execution_id names), a succeeded
+      dispatch of a writing tool (fs.write, fs.edit, fs.multi_edit, fs.create_dir or cmd.run) in
+      it shows the file was made, at lower confidence. Where an execution's facts are null (a
+      workflow or intent
       execution with no step executions), or for the steps steps_unread counts, they are
       unknown: say so in reasoning, judge its files from the companion_answer and last_output,
       and lower your confidence rather than scoring 0 for a missing produced_files.

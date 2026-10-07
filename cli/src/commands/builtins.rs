@@ -1626,6 +1626,102 @@ mod tests {
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 
+    /// A template's instruction, its whitespace folded to single spaces.
+    fn folded_instruction(template: &str) -> String {
+        let manifest: serde_yaml::Value =
+            serde_yaml::from_str(template).expect("the template parses");
+        manifest["spec"]["task"]["instruction"]
+            .as_str()
+            .expect("the template's instruction")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// T1: the generator teaches that an agent declares every file it
+    /// writes, and its example `execution.outputs` block, added to the
+    /// generator's own example, passes the manifest's checks.
+    #[test]
+    fn the_generator_teaches_an_agent_to_declare_the_files_it_writes() {
+        let mut complaints = Vec::new();
+        let rule = "AN AGENT WHOSE TASK WRITES A FILE DECLARES IT.";
+        let lines: Vec<&str> = AGENT_GENERATOR_AGENT_TEMPLATE.lines().collect();
+        let Some(start) = lines.iter().position(|l| l.contains(rule)) else {
+            panic!("the generator states no output declaration rule: \"{rule}\" is not in it");
+        };
+        let Some(at) = lines[start..]
+            .iter()
+            .position(|l| l.trim() == "execution:")
+            .map(|i| start + i)
+        else {
+            panic!("the generator's output rule has no execution example");
+        };
+        let indent = lines[at].len() - lines[at].trim_start().len();
+        let block: Vec<&str> = lines[at..]
+            .iter()
+            .take_while(|l| l.len() - l.trim_start().len() >= indent && !l.trim().is_empty())
+            .map(|l| &l[indent..])
+            .collect();
+        println!("the generator's output example:\n{}", block.join("\n"));
+        let execution: serde_yaml::Value =
+            serde_yaml::from_str(&block.join("\n")).expect("the output example parses");
+        let path = execution["execution"]["outputs"][0]["path"].as_str();
+        if path != Some("/workspace/itinerary.md") {
+            complaints.push(format!("the example declares {path:?}"));
+        }
+        let Some(mut example) = generator_example() else {
+            panic!("the generator has no example manifest to add the outputs to");
+        };
+        let strategy: aegis_orchestrator_core::domain::agent::ExecutionStrategy =
+            serde_yaml::from_value(execution["execution"].clone())
+                .expect("the output example is an execution block");
+        example.spec.execution = Some(strategy);
+        if let Err(e) = example.validate() {
+            complaints.push(format!("validate refused the declared output: {e}"));
+        }
+        let instruction = folded_instruction(AGENT_GENERATOR_AGENT_TEMPLATE);
+        if !instruction.contains("Every file the instruction tells the model to write under /workspace is listed, at that exact path, in `spec.execution.outputs`") {
+            complaints.push("the rule does not say every written file is listed".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T2: the generator judge's output declaration audit carries the
+    /// floor's sentence word for word.
+    #[test]
+    fn the_generator_judge_audits_the_declared_outputs_with_the_floors_sentence() {
+        let instruction = folded_instruction(AGENT_GENERATOR_JUDGE_TEMPLATE);
+        let mut complaints = Vec::new();
+        for needed in [
+            "OUTPUT DECLARATION AUDIT — an agent that writes a file declares it:",
+            "and `spec.execution.outputs` does not list that path, set `deployability` to 0.0",
+            "note exactly: \"agent '<name>' writes <path> but does not declare it in spec.execution.outputs\"",
+        ] {
+            if !instruction.contains(needed) {
+                complaints.push(format!("the judge lacks \"{needed}\""));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T12: the goal judge is told that `produced_files` also holds the
+    /// undeclared files a run's answer named, marked `declared: false`, and
+    /// that such a file counts at lower confidence.
+    #[test]
+    fn the_goal_judge_reads_undeclared_produced_files_at_lower_confidence() {
+        let instruction = folded_instruction(GOAL_JUDGE_TEMPLATE);
+        let mut complaints = Vec::new();
+        for needed in [
+            "the outputs the execution declared, and each /workspace file its last_output names that no output declared, marked declared: false",
+            "an entry marked declared: false was found in the volume when it completed but no output required it, and counts at lower confidence",
+        ] {
+            if !instruction.contains(needed) {
+                complaints.push(format!("the goal judge lacks \"{needed}\""));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
     /// T7, AEGIS ADR-135 D5: each executor must call a tool before a text
     /// answer completes it, and none forbids a package the image holds.
     #[test]

@@ -44,6 +44,17 @@ static WORKSPACE_FILE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("the workspace file pattern compiles")
 });
 
+/// The `/workspace` files a text names, in order, each once.
+pub(crate) fn workspace_files_named(text: &str) -> Vec<&str> {
+    let mut files: Vec<&str> = Vec::new();
+    for m in WORKSPACE_FILE.find_iter(text) {
+        if !files.contains(&m.as_str()) {
+            files.push(m.as_str());
+        }
+    }
+    files
+}
+
 /// A manifest refused by this rule. Its `Display` is the refusal sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRequirementRefusal {

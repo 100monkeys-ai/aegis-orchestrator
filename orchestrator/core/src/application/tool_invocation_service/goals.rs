@@ -1126,6 +1126,7 @@ mod step_facts_tests {
                     content_type: "application/pdf".to_string(),
                     volume_id: None,
                     path_in_volume: None,
+                    declared: true,
                 })
                 .collect(),
         )

@@ -89,6 +89,12 @@ spec:
       - An agent that only routes, writes prose or calls services needs no program; do not
         penalise its absence there.
 
+      OUTPUT DECLARATION AUDIT — an agent that writes a file declares it:
+      - If the instruction tells the model to write a file under /workspace and
+        `spec.execution.outputs` does not list that path, set `deployability` to 0.0 and the
+        overall `score` to at most 0.3, and note exactly: "agent '<name>' writes <path> but does
+        not declare it in spec.execution.outputs".
+
       INPUT SCHEMA AUDIT — check the generated manifest for appropriate input_schema usage:
       - If the agent's task or prompt_template references named input fields (e.g., `{{input.repo_url}}`,
         `{{input.language}}`) but no `spec.input_schema` is declared, reduce the `completeness`

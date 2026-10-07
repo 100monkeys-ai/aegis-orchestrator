@@ -220,6 +220,14 @@ spec:
            code or compute the result itself. The platform runs the program on `sample_input` when
            the agent is created or updated and refuses the agent if it exits non-zero or prints
            nothing.
+         - AN AGENT WHOSE TASK WRITES A FILE DECLARES IT. Every file the instruction tells the
+           model to write under /workspace is listed, at that exact path, in
+           `spec.execution.outputs`:
+             execution:
+               outputs:
+                 - path: /workspace/itinerary.md
+           A run that does not leave a declared file fails and is tried again; a run that leaves
+           it records the file, and the person can download it. Name each file at a fixed path.
          - When composing `spec.tools`, select the full relevant tool suite for the agent's capability.
            Do NOT give a code-writing or code-execution agent only `fs.write` + `cmd.run` and rely on
            instruction text to prevent `cmd.run` misuse — give it the correct tools instead.

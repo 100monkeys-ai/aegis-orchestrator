@@ -3783,6 +3783,7 @@ mod tests {
                     content_type: "application/pdf".to_string(),
                     volume_id: Some(workspace.id),
                     path_in_volume: Some("/x.pdf".to_string()),
+                    declared: true,
                 }];
                 if execution.produced_files() != expected.as_slice() {
                     complaints.push(format!(

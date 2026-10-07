@@ -181,6 +181,7 @@ fn produced(path: &str, size: u64, volume: VolumeId, in_volume: &str) -> Produce
         content_type: "application/pdf".to_string(),
         volume_id: Some(volume),
         path_in_volume: Some(in_volume.to_string()),
+        declared: true,
     }
 }
 

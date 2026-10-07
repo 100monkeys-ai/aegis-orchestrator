@@ -293,6 +293,7 @@ pub async fn check_declared_outputs(
                         // this file and no other (ADR-005 I8).
                         volume_id: Some(location.volume_id),
                         path_in_volume: Some(location.path_in_volume.clone()),
+                        declared: true,
                     });
                 }
             }
@@ -303,6 +304,41 @@ pub async fn check_declared_outputs(
     } else {
         Err(failures.join("; "))
     }
+}
+
+/// Read every `/workspace` file `text` names that no output in `outputs`
+/// declares, from the execution's volumes: each one found is a produced file
+/// marked undeclared. One that is not there, or cannot be read, is left out
+/// and fails nothing; a node with no reader reads none.
+pub async fn read_named_files(
+    text: &str,
+    outputs: &[DeclaredOutput],
+    config: &RuntimeConfig,
+    reader: Option<&dyn DeclaredOutputReader>,
+) -> Vec<ProducedFile> {
+    let Some(reader) = reader else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for path in crate::domain::tool_requirement::workspace_files_named(text) {
+        if outputs.iter().any(|output| output.path == path) {
+            continue;
+        }
+        let Some(location) = output_location(config, path) else {
+            continue;
+        };
+        if let Ok(Some(head)) = reader.read_head(&location, 0).await {
+            found.push(ProducedFile {
+                path: path.to_string(),
+                size_bytes: head.size_bytes,
+                content_type: head.content_type,
+                volume_id: Some(location.volume_id),
+                path_in_volume: Some(location.path_in_volume.clone()),
+                declared: false,
+            });
+        }
+    }
+    found
 }
 
 #[derive(Clone)]
@@ -650,41 +686,56 @@ impl Supervisor {
 
             // Before the iteration counts as completed, its declared outputs
             // must be in the volume (ADR-005, Update of 2026-10-06, O2), with
-            // or without a validation pipeline.
+            // or without a validation pipeline. A file the answer names that
+            // no output declares is read too, and recorded undeclared when it
+            // is there; its absence fails nothing (ADR-005 O8a).
             let declared_outputs = &runtime_config.execution.outputs;
-            if !declared_outputs.is_empty() {
-                match check_declared_outputs(
+            let declared_check = if declared_outputs.is_empty() {
+                Ok(Vec::new())
+            } else {
+                check_declared_outputs(
                     declared_outputs,
                     &runtime_config,
                     self.output_reader.as_deref(),
                 )
                 .await
-                {
-                    Ok(produced) => {
+            };
+            match declared_check {
+                Ok(mut produced) => {
+                    produced.extend(
+                        read_named_files(
+                            &stdout,
+                            declared_outputs,
+                            &runtime_config,
+                            self.output_reader.as_deref(),
+                        )
+                        .await,
+                    );
+                    if !produced.is_empty() {
                         observer
                             .on_outputs_verified(attempts as u8, &produced)
                             .await;
                     }
-                    Err(reason) => {
-                        warn!(
-                            iteration = attempts,
-                            reason = %reason,
-                            "Declared outputs missing — failing the iteration"
-                        );
-                        observer
-                            .on_outputs_missing(attempts as u8, &stdout, &reason)
-                            .await;
-                        iteration_history.push(serde_json::json!({
-                            "iteration": attempts,
-                            "output": stdout,
-                            "exit_code": output.exit_code,
-                            "validation_failed": true,
-                            "validation_reason": reason,
-                            "feedback": reason
-                        }));
-                        outputs_failure = Some(reason);
-                        continue;
-                    }
+                }
+                Err(reason) => {
+                    warn!(
+                        iteration = attempts,
+                        reason = %reason,
+                        "Declared outputs missing — failing the iteration"
+                    );
+                    observer
+                        .on_outputs_missing(attempts as u8, &stdout, &reason)
+                        .await;
+                    iteration_history.push(serde_json::json!({
+                        "iteration": attempts,
+                        "output": stdout,
+                        "exit_code": output.exit_code,
+                        "validation_failed": true,
+                        "validation_reason": reason,
+                        "feedback": reason
+                    }));
+                    outputs_failure = Some(reason);
+                    continue;
                 }
             }
 
@@ -1811,6 +1862,7 @@ mod tests {
                 content_type: "application/pdf".to_string(),
                 volume_id: reads.first().map(|read| read.volume_id),
                 path_in_volume: Some("/x.pdf".to_string()),
+                declared: true,
             }],
         )];
         if verified != expected {
@@ -1820,6 +1872,150 @@ mod tests {
             complaints.push(format!("the volume was read at {reads:?}"));
         }
         println!("declared output present: execution {result:?}; produced_files {verified:?}");
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// The model answers `answer` once; nothing else differs from
+    /// [`run_declaring`].
+    async fn run_answering(
+        outputs: Vec<DeclaredOutput>,
+        answer: &str,
+        reader: Arc<dyn DeclaredOutputReader>,
+    ) -> (Arc<TestObserver>, Result<String, RuntimeError>) {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(1)
+                .with_execute_success(vec![answer.to_string()]),
+        );
+        let observer = Arc::new(TestObserver::default());
+        let supervisor = Supervisor::new(runtime).with_output_reader(reader);
+        let result = supervisor
+            .run_loop(
+                config_declaring(outputs),
+                create_test_input(),
+                1,
+                observer.clone(),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        (observer, result)
+    }
+
+    /// T7: an agent that declares no outputs answers the path of a file it
+    /// wrote; the file is in its volume, so it is recorded as produced,
+    /// marked undeclared, with where it was read.
+    #[tokio::test]
+    async fn a_file_the_answer_names_and_no_output_declares_is_recorded_undeclared() {
+        let volume = VolumeDouble::holding(&[("/itinerary.md", b"# Van 1\n08:00 depot")]);
+        let answer = "The itinerary is written to /workspace/itinerary.md.";
+        let (observer, result) = run_answering(Vec::new(), answer, volume.clone()).await;
+        let mut complaints: Vec<String> = Vec::new();
+        if !matches!(&result, Ok(out) if out == answer) {
+            complaints.push(format!("the execution ended {result:?}"));
+        }
+        let verified = observer.verified.lock().await.clone();
+        let reads = volume.reads.lock().unwrap().clone();
+        let expected = vec![(
+            1u8,
+            vec![ProducedFile {
+                path: "/workspace/itinerary.md".to_string(),
+                size_bytes: 19,
+                content_type: "application/pdf".to_string(),
+                volume_id: reads.first().map(|read| read.volume_id),
+                path_in_volume: Some("/itinerary.md".to_string()),
+                declared: false,
+            }],
+        )];
+        println!("no declarations: recorded files {verified:?}");
+        if verified != expected {
+            complaints.push(format!(
+                "the file the answer named was not recorded undeclared: the recorded files were {verified:?}"
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T8: the named file is not in the volume: the volume is asked, nothing
+    /// is recorded, and the iteration completes; an undeclared file fails
+    /// nothing.
+    #[tokio::test]
+    async fn a_named_file_that_is_absent_fails_nothing() {
+        let volume = VolumeDouble::holding(&[]);
+        let answer = "I wrote /workspace/itinerary.md";
+        let (observer, result) = run_answering(Vec::new(), answer, volume.clone()).await;
+        let mut complaints: Vec<String> = Vec::new();
+        if !matches!(&result, Ok(out) if out == answer) {
+            complaints.push(format!("the execution ended {result:?}"));
+        }
+        let fails = observer.fail_reasons.lock().await.clone();
+        if !fails.is_empty() {
+            complaints.push(format!("the iteration failed with {fails:?}"));
+        }
+        let completes = observer.iteration_completes.lock().await.clone();
+        if completes != vec![1] {
+            complaints.push(format!("the iterations completed were {completes:?}"));
+        }
+        let verified = observer.verified.lock().await.clone();
+        if !verified.is_empty() {
+            complaints.push(format!("an absent file was recorded: {verified:?}"));
+        }
+        let reads: Vec<String> = volume
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|read| read.path_in_volume.clone())
+            .collect();
+        println!("absent named file: execution {result:?}; volume read at {reads:?}");
+        if reads != vec!["/itinerary.md".to_string()] {
+            complaints.push(format!(
+                "the volume was not asked for the named file: it was read at {reads:?}"
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T9: a declared output and an undeclared file the answer names are
+    /// recorded together, each once: the declared one marked declared and
+    /// read once, though the answer names it too.
+    #[tokio::test]
+    async fn declared_and_undeclared_files_are_recorded_together_once_each() {
+        let volume = VolumeDouble::holding(&[
+            ("/x.pdf", b"%PDF-1.7 a real document"),
+            ("/notes.md", b"notes"),
+        ]);
+        let answer = "Wrote /workspace/x.pdf and /workspace/notes.md, then /workspace/x.pdf again.";
+        let (observer, result) = run_answering(vec![pdf_output()], answer, volume.clone()).await;
+        let mut complaints: Vec<String> = Vec::new();
+        if !matches!(&result, Ok(out) if out == answer) {
+            complaints.push(format!("the execution ended {result:?}"));
+        }
+        let verified = observer.verified.lock().await.clone();
+        let recorded: Vec<(String, bool)> = verified
+            .iter()
+            .flat_map(|(_, files)| files.iter().map(|f| (f.path.clone(), f.declared)))
+            .collect();
+        println!("declared and undeclared: recorded {recorded:?}");
+        let expected = vec![
+            ("/workspace/x.pdf".to_string(), true),
+            ("/workspace/notes.md".to_string(), false),
+        ];
+        if verified.len() != 1 || recorded != expected {
+            complaints.push(format!(
+                "the declared and the undeclared file were not recorded once each: {verified:?}"
+            ));
+        }
+        let pdf_reads = volume
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|read| read.path_in_volume == "/x.pdf")
+            .count();
+        if pdf_reads != 1 {
+            complaints.push(format!("the declared output was read {pdf_reads} times"));
+        }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 

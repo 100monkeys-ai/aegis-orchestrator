@@ -401,7 +401,9 @@ pub struct Iteration {
     /// as the supervisor read them before the iteration counted as completed
     /// (AEGIS ADR-005, Update of 2026-10-06, O3). Stored in the `iterations`
     /// column; an iteration stored before it carries none. Stored with each
-    /// file's volume and path in it (AEGIS ADR-005 I8, P1).
+    /// file's volume and path in it (AEGIS ADR-005 I8, P1). Also the files its
+    /// answer named that no output declared, found in the volume, marked
+    /// undeclared (O8a).
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -423,6 +425,8 @@ struct StoredProducedFile<'a> {
     volume_id: Option<crate::domain::shared_kernel::VolumeId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path_in_volume: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_declared")]
+    declared: bool,
 }
 
 fn stored_produced_files<S: serde::Serializer>(
@@ -435,6 +439,7 @@ fn stored_produced_files<S: serde::Serializer>(
         content_type: &file.content_type,
         volume_id: file.volume_id,
         path_in_volume: file.path_in_volume.as_deref(),
+        declared: file.declared,
     }))
 }
 
@@ -456,6 +461,21 @@ pub struct ProducedFile {
     /// Its path inside that volume, rooted at `/` (I8, P1). Stored form only.
     #[serde(default, skip_serializing)]
     pub path_in_volume: Option<String>,
+    /// False for a file the execution's final output named under /workspace
+    /// that no output declared: found in its volume when the iteration ended,
+    /// never required. Written only when false.
+    #[serde(default = "declared_by_default", skip_serializing_if = "is_declared")]
+    pub declared: bool,
+}
+
+/// A produced file recorded without the `declared` key was declared: every
+/// record before undeclared files were read.
+fn declared_by_default() -> bool {
+    true
+}
+
+fn is_declared(declared: &bool) -> bool {
+    *declared
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1363,6 +1383,7 @@ mod tests {
             content_type: "application/pdf".to_string(),
             volume_id: Some(crate::domain::shared_kernel::VolumeId::new()),
             path_in_volume: Some("/x.pdf".to_string()),
+            declared: true,
         }];
         if let Err(e) = exec.store_produced_files(1, produced.clone()) {
             complaints.push(format!("store_produced_files refused iteration 1: {e}"));
@@ -1400,6 +1421,7 @@ mod tests {
             content_type: "application/pdf".to_string(),
             volume_id: Some(volume_id),
             path_in_volume: Some("/x.pdf".to_string()),
+            declared: true,
         };
 
         let answer = serde_json::to_value(std::slice::from_ref(&file)).unwrap();
@@ -1464,6 +1486,87 @@ mod tests {
             }
             other => complaints.push(format!(
                 "a record serialised without the new fields did not read: {other:?}"
+            )),
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// T10: an undeclared produced file is written `declared: false` in the
+    /// answer and the stored form, and reads back so; a declared one writes
+    /// no `declared` key; a record stored without the key reads as declared.
+    /// Every clause is reported.
+    #[test]
+    fn an_undeclared_file_is_written_declared_false_and_a_declared_one_omits_it() {
+        let mut complaints: Vec<String> = Vec::new();
+        let undeclared = ProducedFile {
+            path: "/workspace/itinerary.md".to_string(),
+            size_bytes: 19,
+            content_type: "text/markdown".to_string(),
+            volume_id: Some(crate::domain::shared_kernel::VolumeId::new()),
+            path_in_volume: Some("/itinerary.md".to_string()),
+            declared: false,
+        };
+        let declared = ProducedFile {
+            declared: true,
+            ..undeclared.clone()
+        };
+
+        let answer = serde_json::to_value([&undeclared, &declared]).unwrap();
+        println!("answer form: {answer}");
+        if answer[0].get("declared") != Some(&serde_json::Value::Bool(false)) {
+            complaints.push(format!(
+                "declared: false was not written in the answer form: {}",
+                answer[0]
+            ));
+        }
+        if answer[1].get("declared").is_some() {
+            complaints.push(format!(
+                "a declared file wrote a declared key: {}",
+                answer[1]
+            ));
+        }
+
+        let mut exec = Execution::new(
+            AgentId::new(),
+            make_input("plan the vans"),
+            3,
+            "ctx".to_string(),
+        );
+        exec.start();
+        exec.start_iteration("act".to_string()).unwrap();
+        exec.complete_iteration("/workspace/itinerary.md".to_string());
+        exec.store_produced_files(1, vec![undeclared.clone(), declared.clone()])
+            .unwrap();
+        exec.complete();
+        let stored = serde_json::to_value(exec.iterations()).unwrap();
+        println!("stored form: {}", stored[0]["produced_files"]);
+        if stored[0]["produced_files"][0].get("declared") != Some(&serde_json::Value::Bool(false)) {
+            complaints.push(format!(
+                "declared: false was not written in the stored form: {}",
+                stored[0]["produced_files"][0]
+            ));
+        }
+        if stored[0]["produced_files"][1].get("declared").is_some() {
+            complaints.push(format!(
+                "a declared file wrote a declared key in the stored form: {}",
+                stored[0]["produced_files"][1]
+            ));
+        }
+        let read_back: Vec<Iteration> = serde_json::from_value(stored).unwrap();
+        if read_back[0].produced_files != vec![undeclared.clone(), declared.clone()] {
+            complaints.push(format!(
+                "the stored form did not read back with its declared marks: {:?}",
+                read_back[0].produced_files
+            ));
+        }
+
+        let old_row = serde_json::json!(
+            {"path": "/workspace/x.pdf", "size_bytes": 21, "content_type": "application/pdf"}
+        );
+        match serde_json::from_value::<ProducedFile>(old_row) {
+            Ok(old) if old.declared => {}
+            other => complaints.push(format!(
+                "a record stored without the declared key did not read as declared: {other:?}"
             )),
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));

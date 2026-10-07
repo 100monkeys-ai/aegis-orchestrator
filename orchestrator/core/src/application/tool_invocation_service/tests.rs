@@ -5417,6 +5417,60 @@ async fn aegis_task_status_rejects_cross_tenant_execution_id() {
     );
 }
 
+/// T11: `aegis.task.status` answers an undeclared produced file with
+/// `declared: false`, beside a declared one answered without the key.
+#[tokio::test]
+async fn aegis_task_status_answers_an_undeclared_produced_file() {
+    let tenant = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let mut exec = make_execution_with_tenant(tenant.clone());
+    exec.start();
+    exec.start_iteration("act".to_string()).unwrap();
+    exec.complete_iteration("The itinerary is in /workspace/itinerary.md.".to_string());
+    let file = |path: &str, declared: bool| crate::domain::execution::ProducedFile {
+        path: path.to_string(),
+        size_bytes: 19,
+        content_type: "text/markdown".to_string(),
+        volume_id: Some(crate::domain::shared_kernel::VolumeId::new()),
+        path_in_volume: Some(path.trim_start_matches("/workspace").to_string()),
+        declared,
+    };
+    let last = exec.iterations().last().map(|i| i.number).unwrap();
+    exec.store_produced_files(
+        last,
+        vec![
+            file("/workspace/report.md", true),
+            file("/workspace/itinerary.md", false),
+        ],
+    )
+    .unwrap();
+    exec.complete();
+    let exec_id = exec.id;
+    let svc = Arc::new(TenantScopedTaskExecutionService::new(tenant.clone(), exec));
+    let service = build_task_service_with(svc);
+
+    let scope = consumer_tenant_scope(tenant);
+    let mut args = serde_json::json!({ "execution_id": exec_id.0.to_string() });
+    let result = service
+        .invoke_aegis_task_status_tool(&mut args, &scope)
+        .await
+        .expect("status tool returns a Direct payload");
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    println!(
+        "aegis.task.status produced_files {}",
+        payload["produced_files"]
+    );
+    let expected = serde_json::json!([
+        {"path": "/workspace/report.md", "size_bytes": 19, "content_type": "text/markdown"},
+        {"path": "/workspace/itinerary.md", "size_bytes": 19, "content_type": "text/markdown", "declared": false}
+    ]);
+    assert_eq!(
+        payload["produced_files"], expected,
+        "aegis.task.status did not answer the undeclared file with declared: false"
+    );
+}
+
 /// Bug 2 — `aegis.task.wait` regression: same as task.status, but for the
 /// blocking-poll handler. The first poll must short-circuit on the
 /// tenant-scoped lookup failure rather than entering the wait loop.
@@ -5912,6 +5966,7 @@ async fn workflow_with_three_steps(
         content_type: "application/pdf".to_string(),
         volume_id: Some(crate::domain::shared_kernel::VolumeId::new()),
         path_in_volume: Some(path.trim_start_matches("/workspace").to_string()),
+        declared: true,
     };
     let steps: Vec<(Vec<crate::domain::execution::ProducedFile>, bool)> = vec![
         (vec![file("/workspace/draft.pdf", 11)], true),
