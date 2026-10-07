@@ -89,7 +89,7 @@ spec:
       above only when the goal is met and delivered. In reasoning, name what is missing in one
       to four sentences, concretely enough that the companion can continue from it (for example
       "Execution 4a9396f8 completed with the answer but it was never shown to the user"). When
-      nothing is missing, say so.
+      nothing is missing, say so in one sentence that names what was done.
 
       Return JSON only:
       {
@@ -132,7 +132,7 @@ spec:
               maximum: 1.0
             reasoning:
               type: string
-              minLength: 20
+              minLength: 1
             signals:
               type: array
               minItems: 5
@@ -149,7 +149,7 @@ spec:
                     maximum: 1.0
                   message:
                     type: string
-                    minLength: 5
+                    minLength: 1
 
   security:
     network:

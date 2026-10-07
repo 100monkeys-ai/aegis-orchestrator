@@ -1754,4 +1754,190 @@ mod tests {
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+
+    /// The built-in judges whose verdict a `json_schema` step validates, with
+    /// the signal categories each one's instruction asks for.
+    fn schema_judges() -> [(&'static str, &'static str, [&'static str; 5]); 5] {
+        [
+            (
+                GOAL_JUDGE_NAME,
+                GOAL_JUDGE_TEMPLATE,
+                ["delivered", "evidence", "chain", "feasibility", "alignment"],
+            ),
+            (
+                AGENT_GENERATOR_JUDGE_NAME,
+                AGENT_GENERATOR_JUDGE_TEMPLATE,
+                [
+                    "correctness",
+                    "completeness",
+                    "safety",
+                    "deployability",
+                    "alignment",
+                ],
+            ),
+            (
+                WORKFLOW_GENERATOR_JUDGE_NAME,
+                WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+                [
+                    "correctness",
+                    "transition_safety",
+                    "completeness",
+                    "deployability",
+                    "alignment",
+                ],
+            ),
+            (
+                "code-quality-judge",
+                CODE_QUALITY_JUDGE_TEMPLATE,
+                [
+                    "correctness",
+                    "security",
+                    "maintainability",
+                    "performance",
+                    "robustness",
+                ],
+            ),
+            (
+                "tool-call-policy-judge",
+                TOOL_CALL_POLICY_JUDGE_TEMPLATE,
+                [
+                    "policy_adherence",
+                    "tool_specificity",
+                    "parameter_validity",
+                    "intent_alignment",
+                    "execution_safety",
+                ],
+            ),
+        ]
+    }
+
+    /// The `json_schema` step of a judge template, as the validation pipeline
+    /// builds it: the output validator on format `json` with that schema.
+    fn schema_validator_of(
+        template: &str,
+    ) -> aegis_orchestrator_core::domain::validation::OutputGradientValidator {
+        let doc: serde_json::Value = serde_yaml::from_str(template).unwrap();
+        let schema = doc["spec"]["execution"]["validation"]
+            .as_array()
+            .and_then(|steps| steps.iter().find(|s| s["type"] == "json_schema"))
+            .map(|step| step["schema"].clone())
+            .expect("the judge validates its verdict with a json_schema step");
+        aegis_orchestrator_core::domain::validation::OutputGradientValidator::new(
+            "json".to_string(),
+            Some(schema),
+            None,
+        )
+    }
+
+    fn verdict_of(categories: &[&str], reasoning: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "score": 1.0,
+            "confidence": 1.0,
+            "reasoning": reasoning,
+            "signals": categories
+                .iter()
+                .map(|c| serde_json::json!({"category": c, "score": 1.0, "message": message}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The score a judge template's `json_schema` step gives `output`, and why.
+    async fn schema_score(template: &str, output: String) -> (f64, String) {
+        use aegis_orchestrator_core::domain::validation::{GradientValidator, ValidationContext};
+        let result = schema_validator_of(template)
+            .validate(&ValidationContext {
+                task: "judge".to_string(),
+                output,
+                exit_code: 0,
+                stderr: String::new(),
+                worker_mounts: vec![],
+                policy_violations: vec![],
+                tool_trajectory: vec![],
+            })
+            .await
+            .expect("the schema compiles");
+        (result.score, result.reasoning)
+    }
+
+    /// A judge's complete verdict in its shortest honest form, "Nothing is
+    /// missing." with one-word notes, fenced or bare, passes the judge's own
+    /// schema: a schema that refused it would send a finished verdict round
+    /// the refine loop to its cap.
+    #[tokio::test]
+    async fn every_judge_schema_accepts_its_complete_short_verdict_fenced_or_bare() {
+        let mut complaints = Vec::new();
+        for (name, template, categories) in schema_judges() {
+            let verdict = verdict_of(&categories, "Nothing is missing.", "Met.");
+            for (form, output) in [
+                ("bare", verdict.to_string()),
+                (
+                    "fenced",
+                    format!(
+                        "```json\n{}\n```",
+                        serde_json::to_string_pretty(&verdict).unwrap()
+                    ),
+                ),
+            ] {
+                let (score, why) = schema_score(template, output).await;
+                if score < 1.0 {
+                    complaints.push(format!(
+                        "{name} refuses its own complete short verdict ({form}): {why}"
+                    ));
+                }
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// A verdict that is not one still fails every judge's schema: not JSON,
+    /// an empty reasoning, an empty note, a missing signal.
+    #[tokio::test]
+    async fn every_judge_schema_still_refuses_a_malformed_verdict() {
+        let mut complaints = Vec::new();
+        for (name, template, categories) in schema_judges() {
+            let mut missing_signal = verdict_of(&categories, "Nothing is missing.", "Met.");
+            missing_signal["signals"].as_array_mut().unwrap().pop();
+            for (what, output) in [
+                ("prose", "The goal is met.".to_string()),
+                (
+                    "an empty reasoning",
+                    verdict_of(&categories, "", "Met.").to_string(),
+                ),
+                (
+                    "an empty note",
+                    verdict_of(&categories, "Nothing is missing.", "").to_string(),
+                ),
+                ("four signals", missing_signal.to_string()),
+            ] {
+                let (score, _) = schema_score(template, output).await;
+                if score > 0.0 {
+                    complaints.push(format!("{name} passes a verdict with {what}"));
+                }
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// The goal judge's sentence for a goal with no gap asks for one sentence
+    /// naming what was done, not a bare "say so".
+    #[test]
+    fn goal_judge_says_a_met_goal_in_one_sentence_naming_what_was_done() {
+        let doc: serde_yaml::Value = serde_yaml::from_str(GOAL_JUDGE_TEMPLATE).unwrap();
+        let instruction = doc["spec"]["task"]["instruction"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let no_gap = instruction
+            .split(". ")
+            .find(|sentence| sentence.contains("When nothing is missing"))
+            .unwrap_or("none");
+        assert!(
+            instruction.contains(
+                "When nothing is missing, say so in one sentence that names what was done."
+            ),
+            "the goal judge's no-gap sentence does not ask for what was done: {no_gap:?}"
+        );
+    }
 }

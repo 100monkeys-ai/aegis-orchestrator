@@ -138,7 +138,7 @@ spec:
               maximum: 1.0
             reasoning:
               type: string
-              minLength: 20
+              minLength: 1
             signals:
               type: array
               minItems: 5
@@ -155,7 +155,7 @@ spec:
                     maximum: 1.0
                   message:
                     type: string
-                    minLength: 5
+                    minLength: 1
 
   security:
     network:

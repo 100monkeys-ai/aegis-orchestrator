@@ -125,7 +125,7 @@ spec:
               description: "Confidence in the assigned score"
             reasoning:
               type: string
-              minLength: 20
+              minLength: 1
               description: "2–4 sentence explanation of the verdict"
             signals:
               type: array
@@ -150,7 +150,7 @@ spec:
                     maximum: 1.0
                   message:
                     type: string
-                    minLength: 10
+                    minLength: 1
 
   security:
     network:
