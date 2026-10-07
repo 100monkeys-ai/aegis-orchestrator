@@ -10,6 +10,7 @@ mod attachments;
 mod audit;
 mod context_args;
 mod discovery;
+mod documents;
 mod execute;
 mod facade;
 mod gateway;

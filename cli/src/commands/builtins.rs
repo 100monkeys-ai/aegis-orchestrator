@@ -74,6 +74,10 @@ pub const AEGIS_BASH_EXECUTOR_AGENT_NAME: &str = "aegis-bash-executor-agent";
 pub const AEGIS_BASH_EXECUTOR_AGENT_TEMPLATE: &str =
     include_str!("../../templates/agents/aegis-bash-executor-agent.yaml");
 
+pub const AEGIS_DOCUMENT_RENDERER_AGENT_NAME: &str = "aegis-document-renderer-agent";
+pub const AEGIS_DOCUMENT_RENDERER_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/aegis-document-renderer-agent.yaml");
+
 // ─── Canonical Registries ───────────────────────────────────────────────────
 
 struct BuiltinTemplateSpec {
@@ -119,6 +123,10 @@ pub const BUILTIN_AGENTS: &[(&str, &str)] = &[
     (
         AEGIS_BASH_EXECUTOR_AGENT_NAME,
         AEGIS_BASH_EXECUTOR_AGENT_TEMPLATE,
+    ),
+    (
+        AEGIS_DOCUMENT_RENDERER_AGENT_NAME,
+        AEGIS_DOCUMENT_RENDERER_AGENT_TEMPLATE,
     ),
 ];
 
@@ -1939,5 +1947,71 @@ mod tests {
             ),
             "the goal judge's no-gap sentence does not ask for what was done: {no_gap:?}"
         );
+    }
+
+    /// The document renderer is a built-in agent whose program is fixed: it is
+    /// listed, it is the template on disk, it validates, it runs its one
+    /// program with `cmd.run`, and the document never reaches the model (its
+    /// prompt carries no `{{input}}`).
+    #[test]
+    fn document_renderer_is_a_builtin_agent_with_a_fixed_program() {
+        let mut complaints: Vec<String> = Vec::new();
+        let on_disk = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("templates/agents/aegis-document-renderer-agent.yaml"),
+        )
+        .unwrap_or_default();
+        match BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "aegis-document-renderer-agent")
+        {
+            None => complaints
+                .push("aegis-document-renderer-agent is not in BUILTIN_AGENTS".to_string()),
+            Some((_, yaml)) => {
+                if *yaml != on_disk {
+                    complaints.push(
+                        "the listed template is not cli/templates/agents/aegis-document-renderer-agent.yaml"
+                            .to_string(),
+                    );
+                }
+                match serde_yaml::from_str::<aegis_orchestrator_sdk::AgentManifest>(yaml) {
+                    Err(e) => complaints.push(format!("the template does not parse: {e}")),
+                    Ok(manifest) => {
+                        if let Err(e) = manifest.validate() {
+                            complaints.push(format!("the template does not validate: {e}"));
+                        }
+                    }
+                }
+                let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap_or_default();
+                let spec = &doc["spec"];
+                let run = spec["program"]["run"].as_str().unwrap_or("");
+                if run != "python /opt/aegis/program/render.py" {
+                    complaints.push(format!("its program runs {run:?}"));
+                }
+                let tools: Vec<&str> = spec["tools"]
+                    .as_sequence()
+                    .map(|t| t.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if tools != ["cmd.run"] {
+                    complaints.push(format!("its tools are {tools:?}"));
+                }
+                if spec["execution"]["max_iterations"].as_u64() != Some(1) {
+                    complaints.push("its max_iterations is not 1".to_string());
+                }
+                let template = spec["task"]["prompt_template"].as_str().unwrap_or("");
+                if template.contains("{{input}}") {
+                    complaints.push("its prompt carries {{input}}".to_string());
+                }
+                if spec["program"]["sample_input"].is_null() {
+                    complaints.push("its program has no sample_input".to_string());
+                }
+                if spec["runtime"]["language"].as_str() != Some("document")
+                    || spec["runtime"]["version"].as_str() != Some("1")
+                {
+                    complaints.push("its runtime is not document 1".to_string());
+                }
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

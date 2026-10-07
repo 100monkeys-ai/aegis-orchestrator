@@ -293,6 +293,30 @@ jobs:
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}
 
+      # The document renderer's runtime image (docker/Dockerfile.document-renderer),
+      # the image the built-in aegis-document-renderer-agent runs in. Its version
+      # tag is read from the Dockerfile's PANDOC_VERSION and TYPST_VERSION, the
+      # tag the StandardRuntime registry names for document "1".
+      - name: Build and push document renderer image
+        env:
+          RENDERER_IMAGE: ${{ env.REGISTRY }}/100monkeys-ai/aegis-document-renderer
+        run: |
+          dockerfile=aegis-orchestrator/docker/Dockerfile.document-renderer
+          pandoc_version="$(sed -n 's/^ARG PANDOC_VERSION=//p' "$dockerfile")"
+          typst_version="$(sed -n 's/^ARG TYPST_VERSION=//p' "$dockerfile")"
+          if [ -z "$pandoc_version" ] || [ -z "$typst_version" ]; then
+            echo "::error::$dockerfile names no PANDOC_VERSION or TYPST_VERSION"
+            exit 1
+          fi
+          version_tag="pandoc-${pandoc_version}-typst-${typst_version}"
+          podman build \
+            -f "$dockerfile" \
+            -t "${RENDERER_IMAGE}:${version_tag}" \
+            -t "${RENDERER_IMAGE}:sha-${GITHUB_SHA::7}" \
+            .
+          podman push "${RENDERER_IMAGE}:${version_tag}"
+          podman push "${RENDERER_IMAGE}:sha-${GITHUB_SHA::7}"
+
       # Semver tags for release pushes
       - name: Tag and push semver (release only)
         if: startsWith(github.ref, 'refs/tags/')

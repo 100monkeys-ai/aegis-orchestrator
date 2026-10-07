@@ -1,0 +1,189 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: aegis-document-renderer-agent
+  version: "1.0.0"
+  description: >-
+    Built-in document renderer. Renders Markdown or plain text to a PDF, DOCX,
+    HTML or Markdown file in its workspace with one fixed program, and answers
+    the file's path, size and format.
+  labels:
+    role: worker
+    category: platform
+    builtin: "true"
+spec:
+  security_context: aegis-system-agent-runtime
+
+  runtime:
+    language: document
+    version: "1"
+    model: smart
+    isolation: inherit
+    temperature: 0.1
+
+  # The document reaches the program in /opt/aegis/program/input.json, never
+  # through the model: the prompt carries the instruction alone.
+  task:
+    instruction: |
+      You run this agent's document renderer, a fixed program. You write no
+      code, and you neither read nor change the document: the program reads
+      it from its own input.
+
+      Call cmd.run exactly once, with command "python" and args
+      ["/opt/aegis/program/render.py"]. Then answer with the JSON object the
+      program printed, exactly as it printed it, and nothing else. If the
+      program printed an error, answer that object as it is.
+    prompt_template: |
+      {{instruction}}
+
+  input_schema:
+    type: object
+    required: [content, format]
+    properties:
+      content:
+        type: string
+        description: The document's text, in Markdown or plain text.
+      format:
+        type: string
+        enum: [pdf, docx, html, md]
+        description: The file format to render.
+      title:
+        type: string
+        description: The document's title.
+      filename:
+        type: string
+        description: The file's name, without a directory; the format's extension is added.
+      created_at:
+        type: integer
+        description: The time the document is dated, in Unix seconds, so the same input renders the same bytes.
+
+  program:
+    files:
+      - path: render.py
+        content: |
+          """Render a document with pandoc: Markdown or plain text in, one file out.
+
+          Reads the execution's input from /opt/aegis/program/input.json
+          (content, format, title, filename, created_at), writes the file under
+          /workspace and prints one JSON object naming its path, size and
+          format. A refusal prints {"error": ...} and exits 1.
+          """
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+
+          INPUT = "/opt/aegis/program/input.json"
+          OUT_DIR = "/workspace"
+          EXTENSIONS = {"pdf": ".pdf", "docx": ".docx", "html": ".html", "md": ".md"}
+          PANDOC_ARGS = {
+              "pdf": ["--pdf-engine=typst"],
+              "docx": ["--to=docx"],
+              "html": ["--to=html5", "--standalone", "--embed-resources"],
+              "md": ["--to=gfm", "--standalone"],
+          }
+
+
+          def refuse(sentence):
+              print(json.dumps({"error": sentence}))
+              sys.exit(1)
+
+
+          def stem_of(filename, title):
+              # The orchestrator's tool names the file by the same rule.
+              name = (filename or title or "").replace("\\", "/").rsplit("/", 1)[-1]
+              for extension in EXTENSIONS.values():
+                  if name.lower().endswith(extension):
+                      name = name[: -len(extension)]
+                      break
+              name = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-")[:100].strip("-")
+              return name or "document"
+
+
+          def main():
+              with open(INPUT, encoding="utf-8") as f:
+                  data = json.load(f)
+              if not isinstance(data, dict):
+                  refuse("the input must be an object with content and format")
+              content = data.get("content")
+              fmt = data.get("format")
+              title = data.get("title")
+              if not isinstance(content, str) or not content.strip():
+                  refuse("content is empty")
+              if fmt not in EXTENSIONS:
+                  refuse(f"format must be one of pdf, docx, html, md; got {fmt!r}")
+              if title is not None and not isinstance(title, str):
+                  refuse("title must be text")
+
+              # pandoc and typst write temporary files in their working
+              # directory and under HOME; neither / nor the program's directory
+              # is writable by the agent's user, so both run in a directory of
+              # their own.
+              work = tempfile.mkdtemp(prefix="render-")
+              env = dict(os.environ, HOME=work, TMPDIR=work)
+              created_at = data.get("created_at")
+              if isinstance(created_at, int) and not isinstance(created_at, bool) and created_at >= 0:
+                  env["SOURCE_DATE_EPOCH"] = str(created_at)
+
+              # The workspace is where the execution's files are read from; a
+              # run with no workspace (the check of the sample input when the
+              # agent is created) writes in its own directory.
+              out_dir = OUT_DIR if os.path.isdir(OUT_DIR) else work
+              path = os.path.join(out_dir, stem_of(data.get("filename"), title) + EXTENSIONS[fmt])
+
+              args = ["pandoc", "--from=markdown", "--output", path] + PANDOC_ARGS[fmt]
+              if title:
+                  args += ["--metadata", "title=" + title]
+              try:
+                  run = subprocess.run(
+                      args, input=content, text=True, capture_output=True,
+                      timeout=110, cwd=work, env=env,
+                  )
+              except subprocess.TimeoutExpired:
+                  refuse("pandoc did not finish within 110 s")
+              if run.returncode != 0:
+                  refuse(f"pandoc exited {run.returncode}: {run.stderr.strip()[-500:]}")
+              print(json.dumps({"path": path, "size_bytes": os.path.getsize(path), "format": fmt}))
+
+
+          main()
+    run: python /opt/aegis/program/render.py
+    sample_input:
+      content: "# Sample\n\nA short document."
+      format: md
+      title: Sample
+      created_at: 0
+
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+      mount_path: "/workspace"
+      access_mode: "read-write"
+      size_limit: "1Gi"
+      ttl_hours: 1
+
+  execution:
+    mode: iterative
+    max_iterations: 1
+    llm_timeout_seconds: 60
+
+  tools:
+    - cmd.run
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read:
+        - /workspace
+      write:
+        - /workspace
+    resources:
+      cpu: 1000
+      memory: 1Gi
+      timeout: 300s

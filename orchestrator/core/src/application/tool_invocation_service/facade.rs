@@ -1637,6 +1637,12 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.runtime.list" => Some(self.invoke_aegis_runtime_list_tool(args).await),
+            // AEGIS ADR-135 D6: a document rendered by the renderer's fixed
+            // program, answered as the file it produced.
+            "aegis.document.render" => Some(
+                self.invoke_aegis_document_render_tool(args, caller_identity, tenant_scope)
+                    .await,
+            ),
 
             // ── File operations (aegis.file.*) ─────────────────────────
             "aegis.file.list" => Some(

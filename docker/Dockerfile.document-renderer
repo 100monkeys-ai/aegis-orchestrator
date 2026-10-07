@@ -1,0 +1,47 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+#
+# The document renderer's runtime image: the image the built-in agent
+# aegis-document-renderer-agent runs in (cli/templates/agents/), resolved by
+# the StandardRuntime registry as language "document", version "1".
+#
+# It carries pandoc (GPL-2.0-or-later) and typst (Apache-2.0, pandoc's PDF
+# engine), each the project's static release binary checked by sha256, and the
+# Noto CJK fonts so a document in Chinese, Japanese or Korean keeps its text in
+# a PDF. The base is the agents' Python image, which carries `python` for the
+# bootstrap; like the other runtimes it sets no USER.
+#
+# Published by pipeline.yml as ghcr.io/100monkeys-ai/aegis-document-renderer,
+# tagged pandoc-<PANDOC_VERSION>-typst-<TYPST_VERSION> and sha-<commit>. A
+# change of either version changes that tag, and the registry entries that
+# name it change with it.
+#
+# Build (from the directory holding aegis-orchestrator, as CI does; the image
+# needs nothing from the context):
+#   podman build -f aegis-orchestrator/docker/Dockerfile.document-renderer .
+
+ARG PYTHON_IMAGE=docker.io/library/python:3.11-slim@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce
+
+FROM ${PYTHON_IMAGE} AS fetch
+ARG PANDOC_VERSION=3.12
+ARG PANDOC_SHA256=67d7d011fed8c8543306022b985b9b2499ab9b74818df91d8727c7e9ebc5ba06
+ARG TYPST_VERSION=0.15.1
+ARG TYPST_SHA256=a6d077d0a95eed5a2eba715b2dae06be954f624ccbf85758a03f389ded33118c
+ADD https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-amd64.tar.gz /tmp/pandoc.tar.gz
+ADD https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz /tmp/typst.tar.xz
+# The slim base has no xz, so the typst archive is unpacked with Python's
+# tarfile.
+RUN echo "${PANDOC_SHA256}  /tmp/pandoc.tar.gz" | sha256sum -c - \
+    && echo "${TYPST_SHA256}  /tmp/typst.tar.xz" | sha256sum -c - \
+    && mkdir /out \
+    && tar -xzf /tmp/pandoc.tar.gz -C /tmp \
+    && install -m 0755 /tmp/pandoc-${PANDOC_VERSION}/bin/pandoc /out/pandoc \
+    && python3 -c "import tarfile; tarfile.open('/tmp/typst.tar.xz').extractall('/tmp', filter='data')" \
+    && install -m 0755 /tmp/typst-x86_64-unknown-linux-musl/typst /out/typst
+
+FROM ${PYTHON_IMAGE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk=1:20240730+repack1-1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=fetch /out/pandoc /out/typst /usr/local/bin/
+RUN pandoc --version | head -n 1 && typst --version

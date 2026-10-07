@@ -57,3 +57,50 @@ fn every_builtin_agent_runtime_resolves_in_the_template_registry() {
     }
     assert!(checked > 0, "no built-in agent template was read");
 }
+
+/// The document renderer's runtime: the built-in agent
+/// `aegis-document-renderer-agent` names `document` `"1"`, which resolves to
+/// the image `pipeline.yml` publishes from `docker/Dockerfile.document-renderer`,
+/// by its version tag.
+#[test]
+fn template_registry_resolves_document_1_to_the_renderer_image() {
+    let resolved = registry()
+        .resolve("document", "1")
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        resolved,
+        Ok("ghcr.io/100monkeys-ai/aegis-document-renderer:pandoc-3.12-typst-0.15.1".to_string()),
+        "the stack template's registry does not give document 1 the renderer image"
+    );
+}
+
+/// The registry's tag for the renderer is the one `docker/Dockerfile.document-renderer`'s
+/// versions give, `pandoc-<PANDOC_VERSION>-typst-<TYPST_VERSION>`, which
+/// `pipeline.yml` reads from the same lines, so a version change moves both.
+#[test]
+fn renderer_tag_is_the_dockerfiles_versions() {
+    let dockerfile = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/Dockerfile.document-renderer"),
+    )
+    .unwrap_or_default();
+    let arg = |name: &str| {
+        dockerfile
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("ARG {name}=")))
+            .unwrap_or("<missing>")
+            .to_string()
+    };
+    let tag = format!(
+        "ghcr.io/100monkeys-ai/aegis-document-renderer:pandoc-{}-typst-{}",
+        arg("PANDOC_VERSION"),
+        arg("TYPST_VERSION")
+    );
+    let resolved = registry()
+        .resolve("document", "1")
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        resolved,
+        Ok(tag),
+        "the registry's renderer image is not the tag the Dockerfile's versions give"
+    );
+}

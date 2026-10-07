@@ -6334,3 +6334,414 @@ async fn a_starting_tool_refuses_contexts_of_another_shape_and_starts_nothing() 
     }
     assert!(captured.lock().unwrap().is_none(), "an execution started");
 }
+
+// =============================================================================
+// aegis.document.render: a document rendered by the built-in renderer agent's
+// fixed program, answered as the file it produced.
+// =============================================================================
+
+const RENDERER_AGENT: &str = "aegis-document-renderer-agent";
+
+/// The renderer agent by name, and the calling agent by id.
+struct RenderLifecycle {
+    caller: Agent,
+    renderer: AgentId,
+}
+
+#[async_trait]
+impl AgentLifecycleService for RenderLifecycle {
+    async fn deploy_agent_for_tenant(
+        &self,
+        _: &TenantId,
+        _: AgentManifest,
+        _: bool,
+        _: crate::domain::agent::AgentScope,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<AgentId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_agent_for_tenant(&self, _: &TenantId, id: AgentId) -> Result<Agent> {
+        if id == self.caller.id {
+            Ok(self.caller.clone())
+        } else {
+            anyhow::bail!("agent not found")
+        }
+    }
+    async fn update_agent_for_tenant(
+        &self,
+        _: &TenantId,
+        _: AgentId,
+        _: AgentManifest,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn delete_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_agents_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+        Ok(vec![self.caller.clone()])
+    }
+    async fn lookup_agent_for_tenant(&self, _: &TenantId, name: &str) -> Result<Option<AgentId>> {
+        Ok((name == RENDERER_AGENT).then_some(self.renderer))
+    }
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent_for_tenant(tenant_id, name).await
+    }
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        _: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent_for_tenant(tenant_id, name).await
+    }
+    async fn list_agents_visible_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+        Ok(vec![])
+    }
+    async fn list_versions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: AgentId,
+    ) -> Result<Vec<AgentVersion>> {
+        Ok(vec![])
+    }
+}
+
+/// Serves the calling execution, and runs each started execution to
+/// completion at once with `produced` as its last iteration's files, as the
+/// supervisor records them; keeps what each start was given.
+struct RenderExecutionService {
+    caller: Execution,
+    produced: Vec<crate::domain::execution::ProducedFile>,
+    rendered: std::sync::Mutex<Option<Execution>>,
+    started: std::sync::Mutex<Vec<(AgentId, ExecutionInput, String)>>,
+}
+
+#[async_trait]
+impl ExecutionService for RenderExecutionService {
+    async fn start_execution(
+        &self,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        self.started
+            .lock()
+            .unwrap()
+            .push((agent_id, input.clone(), security_context_name.clone()));
+        let mut execution = Execution::new(agent_id, input, 1, security_context_name);
+        execution.tenant_id = self.caller.tenant_id.clone();
+        execution.start();
+        execution.start_iteration("render".to_string()).unwrap();
+        execution.complete_iteration("{}".to_string());
+        execution
+            .store_produced_files(1, self.produced.clone())
+            .unwrap();
+        execution.complete();
+        let id = execution.id;
+        *self.rendered.lock().unwrap() = Some(execution);
+        Ok(id)
+    }
+    async fn start_execution_with_id(
+        &self,
+        _: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_for_tenant(&self, _: &TenantId, id: ExecutionId) -> Result<Execution> {
+        match self.rendered.lock().unwrap().as_ref() {
+            Some(execution) if execution.id == id => Ok(execution.clone()),
+            _ => anyhow::bail!("execution not found"),
+        }
+    }
+    async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
+        if id == self.caller.id {
+            Ok(self.caller.clone())
+        } else {
+            anyhow::bail!("execution not found")
+        }
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_executions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: Option<AgentId>,
+        _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
+        Ok(vec![])
+    }
+    async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+}
+
+/// Calls `aegis.document.render` as a calling agent's tool call, through the
+/// facade's dispatch, with `produced` as the files the render leaves; answers
+/// the call's result and what each start was given.
+async fn call_render(
+    args: Value,
+    produced: Vec<crate::domain::execution::ProducedFile>,
+) -> (
+    Result<ToolInvocationResult, SealSessionError>,
+    Vec<(AgentId, ExecutionInput, String)>,
+    AgentId,
+) {
+    let caller = test_agent_with_tools(&["aegis.document.render"]);
+    let caller_id = caller.id;
+    let renderer = AgentId::new();
+    let context = SecurityContext {
+        name: "zaru-free".to_string(),
+        description: "Free tier".to_string(),
+        capabilities: vec![crate::domain::security_context::Capability {
+            tool_pattern: "aegis.document.render".to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        }],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    security_context_repo.save(context).await.unwrap();
+    let mut caller_execution = make_execution_with_tenant(TenantId::consumer());
+    caller_execution.agent_id = caller_id;
+    caller_execution.security_context_name = "zaru-free".to_string();
+    let caller_execution_id = caller_execution.id;
+    let executions = Arc::new(RenderExecutionService {
+        caller: caller_execution,
+        produced,
+        rendered: std::sync::Mutex::new(None),
+        started: std::sync::Mutex::new(Vec::new()),
+    });
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        Arc::new(InMemorySealSessionRepository::new()),
+        security_context_repo,
+        Arc::new(SealMiddleware::new()),
+        Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers())),
+        fsal,
+        volume_registry,
+        Arc::new(RenderLifecycle { caller, renderer }),
+        executions.clone(),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+    let result = service
+        .invoke_tool_internal(
+            &caller_id,
+            caller_execution_id,
+            TenantId::consumer(),
+            1,
+            vec![],
+            "aegis.document.render".to_string(),
+            args,
+        )
+        .await;
+    let started = executions.started.lock().unwrap().clone();
+    (result, started, renderer)
+}
+
+/// The call's direct answer, or a sentence saying what came back instead.
+fn direct_answer(result: &Result<ToolInvocationResult, SealSessionError>) -> Result<Value, String> {
+    match result {
+        Ok(ToolInvocationResult::Direct(value)) => Ok(value.clone()),
+        other => Err(format!(
+            "aegis.document.render did not answer directly: {other:?}"
+        )),
+    }
+}
+
+#[tokio::test]
+async fn the_render_tool_is_listed_with_content_and_format_required_and_four_formats() {
+    let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+    let tools = router.list_tools().await.unwrap();
+    let Some(render) = tools.iter().find(|t| t.name == "aegis.document.render") else {
+        panic!("aegis.document.render is not listed");
+    };
+    let schema = &render.input_schema;
+    let mut complaints = Vec::new();
+    if schema["required"] != serde_json::json!(["content", "format"]) {
+        complaints.push(format!("its schema requires {}", schema["required"]));
+    }
+    if schema["properties"]["format"]["enum"] != serde_json::json!(["pdf", "docx", "html", "md"]) {
+        complaints.push(format!(
+            "its schema's formats are {}",
+            schema["properties"]["format"]["enum"]
+        ));
+    }
+    for optional in ["title", "filename"] {
+        if schema["properties"][optional]["type"] != "string" {
+            complaints.push(format!("its schema has no {optional} string"));
+        }
+    }
+    if router.is_skip_judge("aegis.document.render").await
+        != router.is_skip_judge("aegis.task.wait").await
+    {
+        complaints.push("its judge choice is not aegis.task.wait's".to_string());
+    }
+    let required = crate::domain::mcp::ToolInputContract::required_fields("aegis.document.render");
+    if required != ["content", "format"] {
+        complaints.push(format!("its input contract requires {required:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+#[tokio::test]
+async fn the_render_tool_refuses_a_format_outside_the_four_and_starts_nothing() {
+    let (result, started, _) = call_render(
+        serde_json::json!({ "content": "# Notes", "format": "odt" }),
+        vec![],
+    )
+    .await;
+    let answer = direct_answer(&result).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        answer["error"], "format must be one of pdf, docx, html, md; got 'odt'",
+        "the refusal is not the program's sentence: {answer}"
+    );
+    assert!(started.is_empty(), "an execution started for format odt");
+}
+
+#[tokio::test]
+async fn the_render_tool_answers_the_produced_files_path_size_format_and_execution() {
+    let produced = vec![crate::domain::execution::ProducedFile {
+        path: "/workspace/Quarterly-report.pdf".to_string(),
+        size_bytes: 25211,
+        content_type: "application/pdf".to_string(),
+        volume_id: None,
+        path_in_volume: None,
+        declared: true,
+    }];
+    let (result, started, renderer) = call_render(
+        serde_json::json!({
+            "content": "# Quarterly report\n\n日本語の文書です。",
+            "format": "pdf",
+            "title": "Quarterly report",
+        }),
+        produced,
+    )
+    .await;
+    let answer = direct_answer(&result).unwrap_or_else(|e| panic!("{e}"));
+    let mut complaints = Vec::new();
+    match started.as_slice() {
+        [(agent, input, context)] => {
+            if *agent != renderer {
+                complaints.push("the execution is not the renderer agent's".to_string());
+            }
+            if context != "aegis-system-agent-runtime" {
+                complaints.push(format!("the execution runs in {context}"));
+            }
+            let given = &input.input;
+            if given["content"] != "# Quarterly report\n\n日本語の文書です。"
+                || given["format"] != "pdf"
+                || given["title"] != "Quarterly report"
+            {
+                complaints.push(format!("the renderer was not given the document: {given}"));
+            }
+            if !given["created_at"].is_u64() {
+                complaints.push(format!("the renderer was given no created_at: {given}"));
+            }
+            if given["outputs"]
+                != serde_json::json!([{
+                    "path": "/workspace/Quarterly-report.pdf",
+                    "min_bytes": 1,
+                    "magic": "%PDF"
+                }])
+            {
+                complaints.push(format!(
+                    "the execution does not declare the file it writes: {}",
+                    given["outputs"]
+                ));
+            }
+        }
+        other => complaints.push(format!("{} executions started", other.len())),
+    }
+    let execution_id = started
+        .first()
+        .map(|_| answer["execution_id"].clone())
+        .unwrap_or(Value::Null);
+    if !execution_id.is_string() {
+        complaints.push(format!("the answer names no execution: {answer}"));
+    }
+    for (key, expected) in [
+        ("path", serde_json::json!("/workspace/Quarterly-report.pdf")),
+        ("size_bytes", serde_json::json!(25211)),
+        ("format", serde_json::json!("pdf")),
+    ] {
+        if answer[key] != expected {
+            complaints.push(format!(
+                "the answer's {key} is {}, not {expected}",
+                answer[key]
+            ));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "{}\nanswer: {answer}",
+        complaints.join("\n")
+    );
+}

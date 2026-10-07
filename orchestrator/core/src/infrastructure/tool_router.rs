@@ -194,6 +194,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.goal.evaluate", "Judge the goal after an execution turn with the built-in judge agent goal-judge, and answer whether a round is granted. Blocks at most 45 s, answering judging until the verdict is in. Called by the turn, never by a model.").skip_judge(),
     BuiltinToolDefinition::new("aegis.goal.status", "The goal, its bound executions with their states, and every verdict. Read-only.").skip_judge(),
     BuiltinToolDefinition::new("aegis.goal.cancel", "Stop the person's goal: no further round, every execution still running for it cancelled, and the goal closed cancelled with the reason given. Call it when the person asks to stop.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.document.render", "Render a document from Markdown or plain text into a file the person downloads: pdf, docx, html or md. Answers the file's path, size_bytes and format, and the execution_id that holds it; give that id to aegis.execution.file to read the file.").skip_judge(),
 ];
 
 impl ToolRouter {
@@ -377,6 +378,7 @@ impl ToolRouter {
             "aegis.goal.evaluate" => Self::schema_aegis_goal_evaluate(),
             "aegis.goal.status" => Self::schema_aegis_goal_status(),
             "aegis.goal.cancel" => Self::schema_aegis_goal_cancel(),
+            "aegis.document.render" => Self::schema_aegis_document_render(),
             _ => json!({ "type": "object" }),
         }
     }
@@ -1289,6 +1291,34 @@ impl ToolRouter {
         })
     }
 
+    /// JSON schema for the `aegis.document.render` builtin tool (ADR-135 D6):
+    /// the document's text and its format; a title and a file name optional.
+    fn schema_aegis_document_render() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The document's text, in Markdown or plain text."
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["pdf", "docx", "html", "md"],
+                    "description": "The file format to render: pdf, docx, html or md."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "The document's title, shown at its head; it names the file when no filename is given."
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "The file's name, without a directory; the format's extension is added."
+                }
+            },
+            "required": ["content", "format"]
+        })
+    }
+
     /// JSON schema for the `aegis.task.status` builtin tool.
     fn schema_aegis_task_status() -> Value {
         json!({
@@ -2112,6 +2142,9 @@ mod tests {
         // model or the person's page, never by an agent's inner loop (no
         // agent context admits it), added deliberately.
         "aegis.goal.cancel",
+        // AEGIS ADR-135 D1f: the renderer's tool takes the judge choice
+        // aegis.task.wait has, added deliberately.
+        "aegis.document.render",
     ];
 
     /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).
