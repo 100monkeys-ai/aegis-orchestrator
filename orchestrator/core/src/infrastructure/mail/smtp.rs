@@ -3,7 +3,9 @@
 //! The SMTP half of the mailbox check (RFC 5321, RFC 3207, RFC 4954):
 //! greeting, `EHLO`, optional `STARTTLS` and `EHLO` again, `AUTH` (`PLAIN`
 //! or `LOGIN` with a password, `XOAUTH2` with an OAuth token), `QUIT`.
-//! No `MAIL FROM`, `RCPT TO` or `DATA` is sent.
+//! The check sends no `MAIL FROM`, `RCPT TO` or `DATA`; the authenticated
+//! session it opens (`open`) is also the submission's
+//! ([`super::submission`]).
 
 use super::imap::decode_challenge;
 use super::wire::{failure, Wire};
@@ -22,6 +24,23 @@ pub async fn check(
     settings: &MailboxSettings,
     auth: &MailAuth,
 ) -> Result<(), MailboxCheckFailure> {
+    let mut wire = open(connector, admitted, settings, auth).await?;
+    // Authenticated: the check has passed whatever QUIT answers.
+    quit(&mut wire).await;
+    Ok(())
+}
+
+/// Open an authenticated SMTP session: connect, read the greeting, `EHLO`,
+/// upgrade by `STARTTLS` and `EHLO` again when the security is `starttls`,
+/// and authenticate: `AUTH XOAUTH2` with an OAuth token, otherwise `AUTH
+/// PLAIN`, or `AUTH LOGIN` when PLAIN is not offered. Shared by the check
+/// and the submission ([`super::submission`]).
+pub(super) async fn open(
+    connector: &dyn MailConnector,
+    admitted: &AdmittedTarget,
+    settings: &MailboxSettings,
+    auth: &MailAuth,
+) -> Result<Wire, MailboxCheckFailure> {
     let host = settings.smtp_host.as_str();
     let secrets = auth.secret_forms(&settings.username);
     let stream = connector.connect(admitted).await.map_err(|e| {
@@ -79,10 +98,7 @@ pub async fn check(
                 .xoauth2_response(username)
                 .expect("an XOAUTH2 auth has a response");
             authenticate_xoauth2(&mut wire, &mechanisms, response.expose()).await?;
-            if wire.send(b"QUIT\r\n").await.is_ok() {
-                let _ = reply(&mut wire).await;
-            }
-            return Ok(());
+            return Ok(wire);
         }
     };
     if mechanisms.iter().any(|m| m == "PLAIN") {
@@ -109,12 +125,14 @@ pub async fn check(
             }
         )));
     }
+    Ok(wire)
+}
 
-    // Authenticated: the check has passed whatever QUIT answers.
+/// `QUIT`; whatever the server answers changes nothing.
+pub(super) async fn quit(wire: &mut Wire) {
     if wire.send(b"QUIT\r\n").await.is_ok() {
-        let _ = reply(&mut wire).await;
+        let _ = reply(wire).await;
     }
-    Ok(())
 }
 
 /// `AUTH XOAUTH2 <base64>` (Google's XOAUTH2 protocol over RFC 4954). A
@@ -164,7 +182,7 @@ async fn ehlo(wire: &mut Wire) -> Result<Vec<String>, MailboxCheckFailure> {
 }
 
 /// Read one reply and require `code`.
-async fn expect(wire: &mut Wire, code: u16) -> Result<(), MailboxCheckFailure> {
+pub(super) async fn expect(wire: &mut Wire, code: u16) -> Result<(), MailboxCheckFailure> {
     let (got, lines) = reply(wire).await?;
     if got == code {
         Ok(())
@@ -175,7 +193,7 @@ async fn expect(wire: &mut Wire, code: u16) -> Result<(), MailboxCheckFailure> {
 
 /// One reply, possibly multi-line (`250-…` then `250 …`): its code and the
 /// text of each line.
-async fn reply(wire: &mut Wire) -> Result<(u16, Vec<String>), MailboxCheckFailure> {
+pub(super) async fn reply(wire: &mut Wire) -> Result<(u16, Vec<String>), MailboxCheckFailure> {
     let mut lines = Vec::new();
     loop {
         let line = wire.line().await?;
@@ -194,6 +212,6 @@ async fn reply(wire: &mut Wire) -> Result<(u16, Vec<String>), MailboxCheckFailur
     }
 }
 
-fn render(code: u16, lines: &[String]) -> String {
+pub(super) fn render(code: u16, lines: &[String]) -> String {
     format!("{code} {}", lines.join(" / "))
 }

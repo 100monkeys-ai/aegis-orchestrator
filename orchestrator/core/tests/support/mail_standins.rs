@@ -37,6 +37,13 @@
 //! [`RedirectConnector`] records every endpoint it is asked to admit and
 //! connects IMAP and SMTP to two stand-ins, so a session whose settings
 //! name Google's hosts reaches loopback.
+//!
+//! For the outbound tools (AEGIS ADR-125 D4, its Update of 2026-10-07 (3)
+//! clause 16): the mailbox stand-in takes folders beside `INBOX`
+//! ([`StandInFolder`]), answers `LIST` with their `\Sent` and `\Drafts`
+//! attributes and stores an `APPEND`ed literal; [`smtp_submission_standin`]
+//! accepts `MAIL FROM`, `RCPT TO`, `RSET` and `DATA` after `AUTH PLAIN`,
+//! `AUTH LOGIN` or `AUTH XOAUTH2`, recording the envelope and the message.
 
 #![allow(dead_code)]
 
@@ -598,14 +605,54 @@ impl StoredMessage {
     }
 }
 
-/// A running mailbox stand-in: the stand-in and its messages.
+/// A folder of the mailbox stand-in beside `INBOX`, with the attributes
+/// `LIST` answers for it (`\Sent`, `\Drafts`, or none).
+#[derive(Debug, Clone)]
+pub struct StandInFolder {
+    pub name: String,
+    pub attributes: String,
+    pub messages: Vec<StoredMessage>,
+}
+
+impl StandInFolder {
+    pub fn new(name: &str, attributes: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            attributes: attributes.to_string(),
+            messages: Vec::new(),
+        }
+    }
+
+    pub fn holding(mut self, messages: Vec<StoredMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+}
+
+/// A running mailbox stand-in: the stand-in, its `INBOX` and its other
+/// folders.
 #[derive(Clone)]
 pub struct MailboxStandIn {
     pub standin: StandIn,
     pub messages: Arc<Mutex<Vec<StoredMessage>>>,
+    pub folders: Arc<Mutex<Vec<StandInFolder>>>,
 }
 
 impl MailboxStandIn {
+    /// The messages folder `name` holds now (`INBOX` included).
+    pub fn folder_messages(&self, name: &str) -> Vec<StoredMessage> {
+        if name.eq_ignore_ascii_case("INBOX") {
+            return self.messages.lock().unwrap().clone();
+        }
+        self.folders
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.messages.clone())
+            .unwrap_or_default()
+    }
+
     pub fn port(&self) -> u16 {
         self.standin.port()
     }
@@ -758,6 +805,7 @@ pub async fn imap_mailbox_standin(
         },
         messages,
         permanent_flags,
+        Vec::new(),
     )
     .await
 }
@@ -777,14 +825,72 @@ pub async fn imap_xoauth2_standin(
         },
         messages,
         permanent_flags,
+        Vec::new(),
     )
     .await
+}
+
+/// [`imap_mailbox_standin`] with `folders` beside `INBOX`, which `LIST`
+/// answers and `SELECT`, `EXAMINE`, `UID SEARCH` and `APPEND` reach.
+pub async fn imap_mailbox_standin_with_folders(
+    user: &str,
+    password: &str,
+    messages: Vec<StoredMessage>,
+    folders: Vec<StandInFolder>,
+) -> MailboxStandIn {
+    mailbox_standin(
+        StandInAuth::Login {
+            user: user.to_string(),
+            password: password.to_string(),
+        },
+        messages,
+        "\\*",
+        folders,
+    )
+    .await
+}
+
+/// [`imap_xoauth2_standin`] with `folders` beside `INBOX`.
+pub async fn imap_xoauth2_standin_with_folders(
+    user: &str,
+    token: &str,
+    messages: Vec<StoredMessage>,
+    folders: Vec<StandInFolder>,
+) -> MailboxStandIn {
+    mailbox_standin(
+        StandInAuth::XOAuth2 {
+            user: user.to_string(),
+            token: token.to_string(),
+        },
+        messages,
+        "\\*",
+        folders,
+    )
+    .await
+}
+
+/// Run `f` over the messages of the selected folder.
+fn with_folder<R>(
+    inbox: &Arc<Mutex<Vec<StoredMessage>>>,
+    folders: &Arc<Mutex<Vec<StandInFolder>>>,
+    selected: &str,
+    f: impl FnOnce(&mut Vec<StoredMessage>) -> R,
+) -> R {
+    if selected.eq_ignore_ascii_case("INBOX") {
+        return f(&mut inbox.lock().unwrap());
+    }
+    let mut folders = folders.lock().unwrap();
+    match folders.iter_mut().find(|folder| folder.name == selected) {
+        Some(folder) => f(&mut folder.messages),
+        None => f(&mut Vec::new()),
+    }
 }
 
 async fn mailbox_standin(
     auth: StandInAuth,
     messages: Vec<StoredMessage>,
     permanent_flags: &str,
+    folders: Vec<StandInFolder>,
 ) -> MailboxStandIn {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind imap");
     let addr = listener.local_addr().unwrap();
@@ -792,7 +898,9 @@ async fn mailbox_standin(
     let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let standin = StandIn::new(addr, commands.clone(), accepted.clone());
     let store = Arc::new(Mutex::new(messages));
+    let folder_store = Arc::new(Mutex::new(folders));
     let (seen, count, mailbox) = (commands.clone(), accepted.clone(), store.clone());
+    let others = folder_store.clone();
     let permanent = permanent_flags.to_string();
     let shared = standin.clone();
     tokio::spawn(async move {
@@ -802,12 +910,14 @@ async fn mailbox_standin(
             let mut reader = BufReader::new(read);
             let seen = seen.clone();
             let mailbox = mailbox.clone();
+            let others = others.clone();
             let (auth, permanent, standin) = (auth.clone(), permanent.clone(), shared.clone());
             tokio::spawn(async move {
                 let _ = write
                     .write_all(b"* OK IMAP4rev1 mailbox stand-in ready\r\n")
                     .await;
                 let mut logged_in = false;
+                let mut selected = "INBOX".to_string();
                 while let Some(cmd) = read_imap_command(&mut reader, &mut write).await {
                     seen.lock().unwrap().push(cmd.clone());
                     let mut parts = cmd.splitn(3, ' ');
@@ -879,25 +989,96 @@ async fn mailbox_standin(
                             reply.extend(format!("{tag} BAD not authenticated\r\n").bytes());
                         }
                         "SELECT" | "EXAMINE" => {
-                            let n = mailbox.lock().unwrap().len();
-                            let mode = if verb == "SELECT" {
-                                "READ-WRITE"
+                            let name = imap_args(&rest).into_iter().next().unwrap_or_default();
+                            let exists = name.eq_ignore_ascii_case("INBOX")
+                                || others.lock().unwrap().iter().any(|f| f.name == name);
+                            if !exists {
+                                reply.extend(
+                                    format!("{tag} NO [NONEXISTENT] no folder {name}\r\n").bytes(),
+                                );
                             } else {
-                                "READ-ONLY"
-                            };
-                            reply.extend(
-                                format!(
-                                    "* {n} EXISTS\r\n* OK [UIDVALIDITY {UIDVALIDITY}] UIDs valid\r\n* OK [PERMANENTFLAGS ({permanent})] flags kept\r\n{tag} OK [{mode}] {verb} completed\r\n"
-                                )
-                                .bytes(),
-                            );
+                                selected = if name.eq_ignore_ascii_case("INBOX") {
+                                    "INBOX".to_string()
+                                } else {
+                                    name
+                                };
+                                let n = with_folder(&mailbox, &others, &selected, |m| m.len());
+                                let mode = if verb == "SELECT" {
+                                    "READ-WRITE"
+                                } else {
+                                    "READ-ONLY"
+                                };
+                                reply.extend(
+                                    format!(
+                                        "* {n} EXISTS\r\n* OK [UIDVALIDITY {UIDVALIDITY}] UIDs valid\r\n* OK [PERMANENTFLAGS ({permanent})] flags kept\r\n{tag} OK [{mode}] {verb} completed\r\n"
+                                    )
+                                    .bytes(),
+                                );
+                            }
+                        }
+                        "LIST" => {
+                            reply.extend(b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n");
+                            for folder in others.lock().unwrap().iter() {
+                                reply.extend(
+                                    format!(
+                                        "* LIST (\\HasNoChildren{}{}) \"/\" \"{}\"\r\n",
+                                        if folder.attributes.is_empty() {
+                                            ""
+                                        } else {
+                                            " "
+                                        },
+                                        folder.attributes,
+                                        folder.name
+                                    )
+                                    .bytes(),
+                                );
+                            }
+                            reply.extend(format!("{tag} OK LIST completed\r\n").bytes());
+                        }
+                        "APPEND" => {
+                            // `<folder> (<flags>) <message>`: the message's
+                            // literal arrives spliced in as a quoted string.
+                            let args = imap_args(&rest);
+                            let folder = args.first().cloned().unwrap_or_default();
+                            let message = args.last().cloned().unwrap_or_default();
+                            let flags: Vec<String> = args
+                                .iter()
+                                .skip(1)
+                                .take(args.len().saturating_sub(2))
+                                .map(|f| f.trim_matches(|c| c == '(' || c == ')').to_string())
+                                .filter(|f| !f.is_empty())
+                                .collect();
+                            let mut folders = others.lock().unwrap();
+                            match folders.iter_mut().find(|f| f.name == folder) {
+                                Some(target) => {
+                                    let uid =
+                                        target.messages.iter().map(|m| m.uid).max().unwrap_or(0)
+                                            + 1;
+                                    target.messages.push(StoredMessage {
+                                        uid,
+                                        flags,
+                                        internal_date: "07-Oct-2026 22:00:00 +0000".to_string(),
+                                        raw: message,
+                                    });
+                                    reply.extend(
+                                        format!(
+                                            "{tag} OK [APPENDUID {UIDVALIDITY} {uid}] APPEND completed\r\n"
+                                        )
+                                        .bytes(),
+                                    );
+                                }
+                                None => reply.extend(
+                                    format!("{tag} NO [TRYCREATE] no folder {folder}\r\n").bytes(),
+                                ),
+                            }
                         }
                         "UID" => {
                             let (sub, args) = rest.split_once(' ').unwrap_or((rest.as_str(), ""));
                             match sub.to_ascii_uppercase().as_str() {
                                 "SEARCH" => {
                                     let tokens = imap_args(args);
-                                    let messages = mailbox.lock().unwrap().clone();
+                                    let messages =
+                                        with_folder(&mailbox, &others, &selected, |m| m.clone());
                                     let mut found = Vec::new();
                                     for m in &messages {
                                         let mut at = 0;
@@ -921,7 +1102,8 @@ async fn mailbox_standin(
                                     let (set, items) = args.split_once(' ').unwrap_or((args, ""));
                                     let wanted = uid_set(set);
                                     let upper = items.to_ascii_uppercase();
-                                    let mut messages = mailbox.lock().unwrap();
+                                    let mut messages =
+                                        with_folder(&mailbox, &others, &selected, |m| m.clone());
                                     for (i, m) in messages.iter_mut().enumerate() {
                                         if !wanted.contains(&m.uid) {
                                             continue;
@@ -974,6 +1156,9 @@ async fn mailbox_standin(
                                         }
                                         reply.extend(b")\r\n");
                                     }
+                                    with_folder(&mailbox, &others, &selected, |m| {
+                                        *m = messages.clone()
+                                    });
                                     reply.extend(format!("{tag} OK FETCH completed\r\n").bytes());
                                 }
                                 "STORE" => {
@@ -990,7 +1175,8 @@ async fn mailbox_standin(
                                         .collect();
                                     let keeps_any =
                                         permanent.split_whitespace().any(|f| f == "\\*");
-                                    let mut messages = mailbox.lock().unwrap();
+                                    let mut messages =
+                                        with_folder(&mailbox, &others, &selected, |m| m.clone());
                                     for (i, m) in messages.iter_mut().enumerate() {
                                         if !set.contains(&m.uid) {
                                             continue;
@@ -1019,6 +1205,9 @@ async fn mailbox_standin(
                                             .bytes(),
                                         );
                                     }
+                                    with_folder(&mailbox, &others, &selected, |m| {
+                                        *m = messages.clone()
+                                    });
                                     reply.extend(format!("{tag} OK STORE completed\r\n").bytes());
                                 }
                                 _ => reply
@@ -1037,5 +1226,318 @@ async fn mailbox_standin(
     MailboxStandIn {
         standin,
         messages: store,
+        folders: folder_store,
     }
+}
+
+// ---------------------------------------------------------------------------
+// SMTP submission (AEGIS ADR-125 D4, its Update of 2026-10-07 (3) clause 16)
+// ---------------------------------------------------------------------------
+
+/// How the submission stand-in authenticates its client, and which `AUTH`
+/// mechanisms its `EHLO` offers.
+#[derive(Clone)]
+pub enum SubmitAuth {
+    /// `AUTH PLAIN LOGIN` offered; either accepts `user`/`password`.
+    Plain { user: String, password: String },
+    /// Only `AUTH LOGIN` offered.
+    LoginOnly { user: String, password: String },
+    /// Only `AUTH XOAUTH2` offered, as `user` with `token`.
+    XOAuth2 { user: String, token: String },
+}
+
+/// One message the submission stand-in accepted: its envelope and its
+/// `DATA`, dot-stuffing undone, CRLF line endings.
+#[derive(Debug, Clone)]
+pub struct Submitted {
+    pub from: String,
+    pub recipients: Vec<String>,
+    pub data: String,
+}
+
+/// A running submission stand-in: the stand-in (every command line, `AUTH`
+/// lines recorded as the mechanism alone), the mechanism each successful
+/// `AUTH` used, and every message accepted.
+#[derive(Clone)]
+pub struct SmtpSubmission {
+    pub standin: StandIn,
+    pub mechanisms: Arc<Mutex<Vec<String>>>,
+    pub submitted: Arc<Mutex<Vec<Submitted>>>,
+}
+
+impl SmtpSubmission {
+    pub fn port(&self) -> u16 {
+        self.standin.port()
+    }
+    pub fn commands(&self) -> Vec<String> {
+        self.standin.commands()
+    }
+    pub fn mechanisms(&self) -> Vec<String> {
+        self.mechanisms.lock().unwrap().clone()
+    }
+    pub fn submitted(&self) -> Vec<Submitted> {
+        self.submitted.lock().unwrap().clone()
+    }
+}
+
+/// The reply the submission stand-in gives to `RCPT TO` for `refused`.
+pub const RCPT_REFUSAL: &str = "550 5.1.1 Recipient address rejected (smtp stand-in)";
+
+/// An SMTP submission stand-in: `EHLO`, `STARTTLS` (the identity),
+/// `AUTH` as `auth` says, `MAIL FROM`, `RCPT TO` (refusing `refused` with
+/// [`RCPT_REFUSAL`]), `RSET`, `DATA` and `QUIT`. A `MAIL FROM` before
+/// authentication is refused.
+pub async fn smtp_submission_standin(auth: SubmitAuth, refused: Option<&str>) -> SmtpSubmission {
+    submission_standin(auth, refused, None).await
+}
+
+/// [`smtp_submission_standin`] that also files each accepted message, with
+/// `\Seen`, into `folder` of the mailbox stand-in `mailbox`, as a provider
+/// that keeps its own copy of what it sends does.
+pub async fn smtp_submission_standin_filing(
+    auth: SubmitAuth,
+    mailbox: &MailboxStandIn,
+    folder: &str,
+) -> SmtpSubmission {
+    submission_standin(
+        auth,
+        None,
+        Some((mailbox.folders.clone(), folder.to_string())),
+    )
+    .await
+}
+
+async fn submission_standin(
+    auth: SubmitAuth,
+    refused: Option<&str>,
+    filing: Option<(Arc<Mutex<Vec<StandInFolder>>>, String)>,
+) -> SmtpSubmission {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind smtp");
+    let addr = listener.local_addr().unwrap();
+    let standin = StandIn::new(
+        addr,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let submission = SmtpSubmission {
+        standin: standin.clone(),
+        mechanisms: Arc::new(Mutex::new(Vec::new())),
+        submitted: Arc::new(Mutex::new(Vec::new())),
+    };
+    let shared = submission.clone();
+    let refused = refused.map(str::to_string);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            shared
+                .standin
+                .accepted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (read, mut write) = socket.into_split();
+            let mut reader = BufReader::new(read);
+            let (shared, auth, refused) = (shared.clone(), auth.clone(), refused.clone());
+            let filing = filing.clone();
+            tokio::spawn(async move {
+                let _ = write.write_all(b"220 smtp.stand-in ESMTP ready\r\n").await;
+                let decode = |s: &str| {
+                    STANDARD
+                        .decode(s.trim())
+                        .ok()
+                        .map(|b| String::from_utf8_lossy(&b).to_string())
+                };
+                let mut authenticated = false;
+                let mut from: Option<String> = None;
+                let mut recipients: Vec<String> = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let line = line.trim_end_matches(['\r', '\n']).to_string();
+                    let upper = line.to_ascii_uppercase();
+                    let record = if upper.starts_with("AUTH ") {
+                        upper
+                            .split_whitespace()
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        line.clone()
+                    };
+                    shared.standin.commands.lock().unwrap().push(record);
+                    let accepted = "235 2.7.0 Authentication successful\r\n".to_string();
+                    let refusal = format!("{SMTP_REFUSAL}\r\n");
+                    let reply = if upper.starts_with("EHLO") {
+                        let offered = match &auth {
+                            SubmitAuth::Plain { .. } => "AUTH PLAIN LOGIN",
+                            SubmitAuth::LoginOnly { .. } => "AUTH LOGIN",
+                            SubmitAuth::XOAuth2 { .. } => "AUTH XOAUTH2",
+                        };
+                        format!("250-smtp.stand-in\r\n250-STARTTLS\r\n250 {offered}\r\n")
+                    } else if upper == "STARTTLS" {
+                        "220 2.0.0 ready to start TLS\r\n".to_string()
+                    } else if let Some(raw) = upper
+                        .starts_with("AUTH PLAIN ")
+                        .then(|| line["AUTH PLAIN ".len()..].to_string())
+                    {
+                        let ok = match &auth {
+                            SubmitAuth::Plain { user, password } => decode(&raw)
+                                .map(|s| {
+                                    let mut p = s.split('\0');
+                                    let _authz = p.next();
+                                    p.next() == Some(user.as_str())
+                                        && p.next() == Some(password.as_str())
+                                })
+                                .unwrap_or(false),
+                            _ => false,
+                        };
+                        if ok {
+                            authenticated = true;
+                            shared.mechanisms.lock().unwrap().push("PLAIN".to_string());
+                            accepted
+                        } else {
+                            refusal
+                        }
+                    } else if upper == "AUTH LOGIN" {
+                        let (user, password) = match &auth {
+                            SubmitAuth::Plain { user, password }
+                            | SubmitAuth::LoginOnly { user, password } => {
+                                (user.clone(), password.clone())
+                            }
+                            SubmitAuth::XOAuth2 { .. } => (String::new(), String::new()),
+                        };
+                        let _ = write.write_all(b"334 VXNlcm5hbWU6\r\n").await;
+                        let mut u = String::new();
+                        let _ = reader.read_line(&mut u).await;
+                        let _ = write.write_all(b"334 UGFzc3dvcmQ6\r\n").await;
+                        let mut p = String::new();
+                        let _ = reader.read_line(&mut p).await;
+                        if !user.is_empty()
+                            && decode(&u).as_deref() == Some(user.as_str())
+                            && decode(&p).as_deref() == Some(password.as_str())
+                        {
+                            authenticated = true;
+                            shared.mechanisms.lock().unwrap().push("LOGIN".to_string());
+                            accepted
+                        } else {
+                            refusal
+                        }
+                    } else if let Some(raw) = upper
+                        .starts_with("AUTH XOAUTH2 ")
+                        .then(|| line["AUTH XOAUTH2 ".len()..].to_string())
+                    {
+                        match &auth {
+                            SubmitAuth::XOAuth2 { user, token } => {
+                                let expected = xoauth2_string(user, token);
+                                match xoauth2_exchange(
+                                    &mut reader,
+                                    &mut write,
+                                    &raw,
+                                    &expected,
+                                    &shared.standin,
+                                    "334 ",
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        authenticated = true;
+                                        shared
+                                            .mechanisms
+                                            .lock()
+                                            .unwrap()
+                                            .push("XOAUTH2".to_string());
+                                        "235 2.7.0 Accepted\r\n".to_string()
+                                    }
+                                    Err(echo) => format!("{XOAUTH2_SMTP_REFUSAL} {echo}\r\n"),
+                                }
+                            }
+                            _ => refusal,
+                        }
+                    } else if upper.starts_with("AUTH ") {
+                        refusal
+                    } else if upper.starts_with("MAIL FROM:") {
+                        if authenticated {
+                            let rest = &line["MAIL FROM:".len()..];
+                            from = Some(rest.trim().trim_matches(['<', '>']).to_string());
+                            recipients.clear();
+                            "250 2.1.0 Ok\r\n".to_string()
+                        } else {
+                            "530 5.7.0 Authentication required\r\n".to_string()
+                        }
+                    } else if upper.starts_with("RCPT TO:") {
+                        let address = line["RCPT TO:".len()..]
+                            .trim()
+                            .trim_matches(['<', '>'])
+                            .to_string();
+                        if from.is_none() {
+                            "503 5.5.1 MAIL first\r\n".to_string()
+                        } else if refused.as_deref() == Some(address.as_str()) {
+                            format!("{RCPT_REFUSAL}\r\n")
+                        } else {
+                            recipients.push(address);
+                            "250 2.1.5 Ok\r\n".to_string()
+                        }
+                    } else if upper == "RSET" {
+                        from = None;
+                        recipients.clear();
+                        "250 2.0.0 Ok\r\n".to_string()
+                    } else if upper == "DATA" {
+                        if from.is_none() || recipients.is_empty() {
+                            "503 5.5.1 RCPT first\r\n".to_string()
+                        } else {
+                            let _ = write
+                                .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                                .await;
+                            let mut data = String::new();
+                            loop {
+                                let mut l = String::new();
+                                if reader.read_line(&mut l).await.unwrap_or(0) == 0 {
+                                    break;
+                                }
+                                let l = l.trim_end_matches(['\r', '\n']);
+                                if l == "." {
+                                    break;
+                                }
+                                let l = l
+                                    .strip_prefix('.')
+                                    .filter(|_| l.starts_with(".."))
+                                    .unwrap_or(l);
+                                data.push_str(l);
+                                data.push_str("\r\n");
+                            }
+                            if let Some((folders, name)) = &filing {
+                                let mut folders = folders.lock().unwrap();
+                                if let Some(target) = folders.iter_mut().find(|f| &f.name == name) {
+                                    let uid =
+                                        target.messages.iter().map(|m| m.uid).max().unwrap_or(0)
+                                            + 1;
+                                    target.messages.push(StoredMessage {
+                                        uid,
+                                        flags: vec!["\\Seen".to_string()],
+                                        internal_date: "07-Oct-2026 22:00:00 +0000".to_string(),
+                                        raw: data.clone(),
+                                    });
+                                }
+                            }
+                            shared.submitted.lock().unwrap().push(Submitted {
+                                from: from.take().unwrap_or_default(),
+                                recipients: std::mem::take(&mut recipients),
+                                data,
+                            });
+                            "250 2.0.0 Ok: queued\r\n".to_string()
+                        }
+                    } else if upper == "QUIT" {
+                        let _ = write.write_all(b"221 2.0.0 bye\r\n").await;
+                        break;
+                    } else {
+                        "502 5.5.2 command not implemented by the stand-in\r\n".to_string()
+                    };
+                    if write.write_all(reply.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    submission
 }

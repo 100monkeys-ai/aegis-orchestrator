@@ -288,10 +288,24 @@ pub struct ApprovalDeclaration {
     pub approval_summary: Option<&'static [&'static str]>,
 }
 
-/// The built-in tools' declarations to the approval gate. No built-in tool
-/// acts through a credential binding today; a gateway or MCP tool declares
-/// the same keys on its capability entry in the node configuration.
-pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[];
+/// The built-in tools' declarations to the approval gate: `mail.send` and
+/// `mail.reply` act through the mailbox their `mailbox` argument names, and
+/// a person reads the mailbox, the recipients, the subject and the body
+/// before answering (AEGIS ADR-125's Update of 2026-10-07 clause 3 and its
+/// Update of 2026-10-07 (3) clause 12). A gateway or MCP tool declares the
+/// same keys on its capability entry in the node configuration.
+pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
+    ApprovalDeclaration {
+        tool: "mail.send",
+        binding_argument: Some("mailbox"),
+        approval_summary: Some(&["mailbox", "to", "cc", "subject", "body"]),
+    },
+    ApprovalDeclaration {
+        tool: "mail.reply",
+        binding_argument: Some("mailbox"),
+        approval_summary: Some(&["mailbox", "to", "cc", "subject", "body"]),
+    },
+];
 
 impl ToolInputContract {
     /// Returns the required parameter names for `tool_name`, or an empty slice
@@ -331,6 +345,9 @@ impl ToolInputContract {
             "web.fetch" => &["url"],
             "mail.list" => &["mailbox"],
             "mail.read" | "mail.label" => &["mailbox", "thread_id"],
+            "mail.draft" => &["mailbox", "body"],
+            "mail.send" => &["mailbox", "to", "subject", "body"],
+            "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],
             "aegis.tools.list" | "aegis.tools.search" => &[],
             _ => &[],
         }
@@ -339,8 +356,8 @@ impl ToolInputContract {
     /// What `tool_name`'s input contract declares to the approval gate: the
     /// argument naming the binding the call acts through, and the arguments
     /// its summary lists (AEGIS ADR-126, Update of 2026-10-04, clause 1).
-    /// A tool declares them in [`APPROVAL_DECLARATIONS`]; none does today,
-    /// and an undeclared tool gets the empty contract (the gate's fallback).
+    /// A tool declares them in [`APPROVAL_DECLARATIONS`]; an undeclared tool
+    /// gets the empty contract (the gate's fallback).
     pub fn approval_contract(tool_name: &str) -> crate::domain::tool_approval::ApprovalContract {
         APPROVAL_DECLARATIONS
             .iter()

@@ -1,9 +1,10 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 //! An IMAP session for the mail tools (AEGIS ADR-125 D4, its Update of
-//! 2026-10-07 clauses 1, 2 and 7): `EXAMINE` or `SELECT`, `UID SEARCH`,
-//! `UID FETCH` and `UID STORE` over the same wire, TLS and guard as the
-//! mailbox check.
+//! 2026-10-07 clauses 1, 2 and 7, and its Update of 2026-10-07 (3) clause
+//! 15): `EXAMINE` or `SELECT`, `UID SEARCH`, `UID FETCH`, `UID STORE`,
+//! `LIST` and `APPEND` over the same wire, TLS and guard as the mailbox
+//! check.
 //!
 //! The session is opened as the check opens it ([`super::imap`]): the
 //! endpoint is admitted by the connector (the production connector applies
@@ -46,12 +47,33 @@ impl FolderStatus {
     }
 }
 
-/// One argument of a command: an atom written as is, or a string sent as a
-/// quoted string or, when it holds a byte a quoted string cannot, a literal.
+/// One argument of a command: an atom written as is, a string sent as a
+/// quoted string or, when it holds a byte a quoted string cannot, a
+/// literal, or bytes always sent as a literal (a message `APPEND` stores).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arg {
     Atom(String),
     Str(String),
+    Literal(Vec<u8>),
+}
+
+/// One folder as `LIST` answered it: its name as the server writes it, its
+/// attributes (`\Sent`, `\Drafts`, `\HasNoChildren`, ...) and its hierarchy
+/// delimiter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedFolder {
+    pub name: String,
+    pub attributes: Vec<String>,
+    pub delimiter: Option<String>,
+}
+
+impl ListedFolder {
+    /// Whether `LIST` marked the folder with `attribute` (RFC 6154).
+    pub fn has_attribute(&self, attribute: &str) -> bool {
+        self.attributes
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(attribute))
+    }
 }
 
 impl Arg {
@@ -237,6 +259,32 @@ impl ImapSession {
         Ok(())
     }
 
+    /// `LIST "" "*"`: every folder of the mailbox.
+    pub async fn list_folders(&mut self) -> Result<Vec<ListedFolder>, MailboxCheckFailure> {
+        let responses = self
+            .command(&[Arg::atom("LIST"), Arg::string(""), Arg::string("*")])
+            .await?;
+        Ok(responses.iter().filter_map(parse_list).collect())
+    }
+
+    /// `APPEND <folder> (<flags>) {n}`: store `message` in `folder` with
+    /// `flags`, the message sent as a literal after the server's `+`.
+    pub async fn append(
+        &mut self,
+        folder: &str,
+        flags: &[&str],
+        message: &[u8],
+    ) -> Result<(), MailboxCheckFailure> {
+        self.command(&[
+            Arg::atom("APPEND"),
+            Arg::string(folder),
+            Arg::atom(format!("({})", flags.join(" "))),
+            Arg::Literal(message.to_vec()),
+        ])
+        .await?;
+        Ok(())
+    }
+
     /// `LOGOUT`; a server that answers it badly changes nothing.
     pub async fn logout(mut self) {
         let tag = self.tag();
@@ -275,16 +323,8 @@ impl ImapSession {
                     }
                     pending.push(b'"');
                 }
-                Arg::Str(s) => {
-                    pending.extend_from_slice(format!("{{{}}}\r\n", s.len()).as_bytes());
-                    self.wire.send(&pending).await?;
-                    pending.clear();
-                    let next = self.wire.line().await?;
-                    if !next.starts_with('+') {
-                        return Err(self.wire.fail(strip_tag(&next, &tag)));
-                    }
-                    pending.extend_from_slice(s.as_bytes());
-                }
+                Arg::Str(s) => self.literal(&mut pending, &tag, s.as_bytes()).await?,
+                Arg::Literal(bytes) => self.literal(&mut pending, &tag, bytes).await?,
             }
         }
         pending.extend_from_slice(b"\r\n");
@@ -306,6 +346,26 @@ impl ImapSession {
             }
             responses.push(response);
         }
+    }
+
+    /// Announce `bytes` as a synchronising literal at the end of `pending`,
+    /// send what is pending, wait for the server's `+` and leave `bytes`
+    /// pending.
+    async fn literal(
+        &mut self,
+        pending: &mut Vec<u8>,
+        tag: &str,
+        bytes: &[u8],
+    ) -> Result<(), MailboxCheckFailure> {
+        pending.extend_from_slice(format!("{{{}}}\r\n", bytes.len()).as_bytes());
+        self.wire.send(pending).await?;
+        pending.clear();
+        let next = self.wire.line().await?;
+        if !next.starts_with('+') {
+            return Err(self.wire.fail(strip_tag(&next, tag)));
+        }
+        pending.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// One response: a line, and each literal it announces with the rest
@@ -485,6 +545,41 @@ fn parse_item(tokens: &[Token], at: &mut usize) -> Option<Item> {
         Token::Atom(a) => Item::Atom(a),
         Token::Quoted(s) => Item::Str(s),
         Token::Literal(b) => Item::Bytes(b),
+    })
+}
+
+/// A `* LIST (<attributes>) <delimiter> <name>` response, or `None` for any
+/// other.
+fn parse_list(response: &Response) -> Option<ListedFolder> {
+    let tokens = tokens(response);
+    match (tokens.first(), tokens.get(1)) {
+        (Some(Token::Atom(star)), Some(Token::Atom(list)))
+            if star == "*" && list.eq_ignore_ascii_case("LIST") => {}
+        _ => return None,
+    }
+    let mut at = 2;
+    let Item::List(attributes) = parse_item(&tokens, &mut at)? else {
+        return None;
+    };
+    let delimiter = match parse_item(&tokens, &mut at)? {
+        Item::Str(d) => Some(d),
+        _ => None,
+    };
+    let name = match parse_item(&tokens, &mut at)? {
+        Item::Str(n) | Item::Atom(n) => n,
+        Item::Bytes(b) => String::from_utf8_lossy(&b).to_string(),
+        Item::List(_) => return None,
+    };
+    Some(ListedFolder {
+        name,
+        attributes: attributes
+            .into_iter()
+            .filter_map(|a| match a {
+                Item::Atom(a) => Some(a),
+                _ => None,
+            })
+            .collect(),
+        delimiter,
     })
 }
 
@@ -939,6 +1034,27 @@ mod tests {
             Some("06-Oct-2026 14:02:11 +0000")
         );
         assert_eq!(f.header.as_deref(), Some(&b"From: a@b\r\n\r\n"[..]));
+    }
+
+    #[test]
+    fn a_list_response_is_read_with_its_attributes_delimiter_and_name() {
+        let response = Response {
+            segments: vec![Segment::Text(
+                r#"* LIST (\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail""#.to_string(),
+            )],
+        };
+        assert_eq!(
+            parse_list(&response),
+            Some(ListedFolder {
+                name: "[Gmail]/Sent Mail".to_string(),
+                attributes: vec!["\\HasNoChildren".to_string(), "\\Sent".to_string()],
+                delimiter: Some("/".to_string()),
+            })
+        );
+        let atom = Response {
+            segments: vec![Segment::Text("* LIST () NIL INBOX".to_string())],
+        };
+        assert_eq!(parse_list(&atom).map(|f| f.name), Some("INBOX".to_string()));
     }
 
     #[test]

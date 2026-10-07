@@ -1,7 +1,9 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! The mail read tools: `mail.list`, `mail.read` and `mail.label` (AEGIS
-//! ADR-125 D4; its Update of 2026-10-07 clauses 1, 2 and 7).
+//! The mail tools: `mail.list`, `mail.read` and `mail.label` (AEGIS
+//! ADR-125 D4; its Update of 2026-10-07 clauses 1, 2 and 7), and the
+//! outbound `mail.draft`, `mail.send` and `mail.reply` (its Update of
+//! 2026-10-07 (3), clauses 11 to 15).
 //!
 //! They speak IMAP only, over a mailbox of the acting person (ADR-125's
 //! Update of 2026-10-04 clause 3), inside the orchestrator: an `imap`
@@ -24,6 +26,20 @@
 //! as the person) is admitted on the ownership check alone, since its agent
 //! id is the session's own and no grant can name it.
 //!
+//! **The outbound tools.** A message is given in full: `to` (1 to 50
+//! addresses), an optional `cc` (at most 50 recipients in all), `subject`
+//! (one line) and a plain-text `body`; no `bcc`, and no draft id, since
+//! the approval summary is built from the call's arguments. The
+//! orchestrator mints its `Message-ID` and writes it to the result.
+//! `mail.draft` appends it to the Drafts folder with `\Draft \Seen`.
+//! `mail.send` submits it over SMTP, then appends it to the Sent folder
+//! with `\Seen` unless that folder already holds its `Message-ID` (a server
+//! that files its own copy); a failure to append after a send is reported
+//! in the result, never as an error, so no retry sends twice. `mail.reply`
+//! answers a thread's newest `INBOX` message, threading by `In-Reply-To`
+//! and `References`. `mail.send` and `mail.reply` are gated by the
+//! approval gate; their mailbox is admitted before it ([`MailTools::admit_mailbox`]).
+//!
 //! **Threads.** A thread's id is the root `Message-ID` of its messages (the
 //! first `References` entry, else `In-Reply-To`, else the message's own); a
 //! message with no `Message-ID` is its own thread `uid:<UIDVALIDITY>:<uid>`.
@@ -36,9 +52,12 @@ use crate::domain::credential::{CredentialBindingId, CredentialProvider};
 use crate::domain::execution::{ContextChoice, ServerChoice};
 use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
 use crate::domain::tenant::TenantId;
+use crate::infrastructure::mail::message::{is_address, mint_message_id, OutgoingMessage};
 use crate::infrastructure::mail::session::{
-    parse_headers, parse_message, Arg, Fetched, FolderStatus, Headers, ImapSession, StoreOp,
+    parse_headers, parse_message, Arg, Fetched, FolderStatus, Headers, ImapSession, ListedFolder,
+    StoreOp,
 };
+use crate::infrastructure::mail::submission;
 use crate::infrastructure::mail::{
     CheckFailureKind, MailConnector, MailboxCheckFailure, RustlsMailConnector,
 };
@@ -81,10 +100,33 @@ pub const NOT_AMONG_CHOSEN: &str =
 pub const NONE_CHOSEN: &str = "This tool needs your own mailbox, and none was chosen for this run.";
 /// The refusal for an agent's run whose agent holds no grant.
 pub const NOT_GRANTED: &str = "This tool needs your own mailbox, granted to this agent.";
+/// The refusal of `mail.draft` for a mailbox with no Drafts folder.
+pub const NO_DRAFTS: &str = "This mailbox has no Drafts folder; nothing was saved.";
+/// What a send's result says when the mailbox has no Sent folder.
+pub const NO_SENT: &str = "This mailbox has no Sent folder.";
+
+/// The most recipients one message has, `to` and `cc` together.
+pub const MAX_RECIPIENTS: usize = 50;
+/// The longest a subject may be, in characters.
+pub const SUBJECT_MAX_CHARS: usize = 998;
+/// The longest an outbound body may be, in characters.
+pub const SEND_BODY_MAX_CHARS: usize = 100_000;
+
+/// The refusal for a message with more than [`MAX_RECIPIENTS`] recipients.
+pub const TOO_MANY_RECIPIENTS: &str = "A message has at most 50 recipients.";
+/// The refusal for a subject that is not one line of at most
+/// [`SUBJECT_MAX_CHARS`] characters.
+pub const BAD_SUBJECT: &str = "'subject' must be one line of at most 998 characters.";
+/// The refusal for a body that is not plain text of at most
+/// [`SEND_BODY_MAX_CHARS`] characters.
+pub const BAD_BODY: &str = "'body' must be plain text of at most 100000 characters.";
 
 /// Whether `tool_name` is one of the mail tools this module serves.
 pub fn is_mail_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "mail.list" | "mail.read" | "mail.label")
+    matches!(
+        tool_name,
+        "mail.list" | "mail.read" | "mail.label" | "mail.draft" | "mail.send" | "mail.reply"
+    )
 }
 
 /// Who a mail tool's call acts for, and what its run chose for `imap`.
@@ -151,6 +193,23 @@ impl MailTools {
                 CALL_TIMEOUT.as_secs()
             ))),
         }
+    }
+
+    /// Admit a call before the approval gate (the Update of 2026-10-07 (3)
+    /// clause 11): its arguments are well formed and its `mailbox`, by id or
+    /// by context name, is one the call may use, by the same resolution the
+    /// call itself makes. Answers the binding's id, which the caller writes
+    /// back into `mailbox` so the stored call and any standing choice name
+    /// the binding by id; a refusal is the call's own sentence.
+    pub async fn admit_mailbox(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        acting: &MailActing,
+    ) -> Result<CredentialBindingId, SealSessionError> {
+        let mailbox = self.mailbox_for(args, acting).await?;
+        Request::parse(tool_name, args)?;
+        Ok(mailbox.binding_id)
     }
 
     /// The mailbox the call may use, or its refusal.
@@ -285,6 +344,93 @@ enum Request {
         remove: Vec<String>,
         flagged: Option<bool>,
     },
+    Draft {
+        message: Outbound,
+        thread_id: Option<String>,
+    },
+    Send {
+        message: Outbound,
+    },
+    Reply {
+        message: Outbound,
+        thread_id: String,
+    },
+}
+
+/// What an outbound call gives: the recipients, subject and body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Outbound {
+    to: Vec<String>,
+    cc: Vec<String>,
+    subject: String,
+    body: String,
+}
+
+impl Outbound {
+    /// Parse an outbound call's message. `to` and `subject` are required
+    /// unless `drafting`; the body always is.
+    fn parse(args: &Value, drafting: bool) -> Result<Self, SealSessionError> {
+        let to = addresses(args, "to")?;
+        let cc = addresses(args, "cc")?;
+        if to.is_empty() && !drafting {
+            return Err(invalid("'to' must list at least one email address."));
+        }
+        if to.len() + cc.len() > MAX_RECIPIENTS {
+            return Err(invalid(TOO_MANY_RECIPIENTS));
+        }
+        let subject = match args.get("subject") {
+            None | Some(Value::Null) if drafting => String::new(),
+            Some(Value::String(s))
+                if !s.contains(['\r', '\n']) && s.chars().count() <= SUBJECT_MAX_CHARS =>
+            {
+                s.clone()
+            }
+            _ => return Err(invalid(BAD_SUBJECT)),
+        };
+        let body = match args.get("body") {
+            Some(Value::String(b)) if b.chars().count() <= SEND_BODY_MAX_CHARS => b.clone(),
+            _ => return Err(invalid(BAD_BODY)),
+        };
+        Ok(Self {
+            to,
+            cc,
+            subject,
+            body,
+        })
+    }
+}
+
+/// The addresses of the list argument `name`: absent is none.
+fn addresses(args: &Value, name: &str) -> Result<Vec<String>, SealSessionError> {
+    let list = match args.get(name) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => {
+            return Err(invalid(format!(
+                "'{name}' must be a list of email addresses."
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    for item in list {
+        let Some(address) = item.as_str() else {
+            return Err(invalid(format!(
+                "'{name}' must be a list of email addresses."
+            )));
+        };
+        if !is_address(address) {
+            let shown: String = address
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(80)
+                .collect();
+            return Err(invalid(format!(
+                "'{shown}' is not an email address this tool can send to."
+            )));
+        }
+        out.push(address.to_string());
+    }
+    Ok(out)
 }
 
 fn optional_string(args: &Value, name: &str) -> Result<Option<String>, SealSessionError> {
@@ -402,6 +548,17 @@ impl Request {
                 }
                 Ok(request)
             }
+            "mail.draft" => Ok(Request::Draft {
+                message: Outbound::parse(args, true)?,
+                thread_id: optional_string(args, "thread_id")?,
+            }),
+            "mail.send" => Ok(Request::Send {
+                message: Outbound::parse(args, false)?,
+            }),
+            "mail.reply" => Ok(Request::Reply {
+                thread_id: thread_id(args)?,
+                message: Outbound::parse(args, false)?,
+            }),
             other => Err(invalid(format!("'{other}' is not a mail tool."))),
         }
     }
@@ -416,6 +573,16 @@ async fn run(
     mailbox: &ToolMailbox,
     request: &Request,
 ) -> Result<Value, SealSessionError> {
+    match request {
+        Request::Draft { message, thread_id } => {
+            return draft(connector, mailbox, message, thread_id.as_deref()).await
+        }
+        Request::Send { message } => return send(connector, mailbox, message, None).await,
+        Request::Reply { message, thread_id } => {
+            return send(connector, mailbox, message, Some(thread_id.as_str())).await
+        }
+        Request::List { .. } | Request::Read { .. } | Request::Label { .. } => {}
+    }
     let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
         .await
         .map_err(session_error)?;
@@ -428,9 +595,246 @@ async fn run(
             remove,
             flagged,
         } => label(&mut session, mailbox, thread_id, add, remove, *flagged).await,
+        Request::Draft { .. } | Request::Send { .. } | Request::Reply { .. } => {
+            unreachable!("an outbound request is run before the session opens")
+        }
     };
     session.logout().await;
     answer
+}
+
+// ---------------------------------------------------------------------------
+// The outbound tools (the Update of 2026-10-07 (3), clauses 13 to 15)
+// ---------------------------------------------------------------------------
+
+/// How a reply threads: the parent's `Message-ID` and the `References` it
+/// carries on.
+#[derive(Debug, Clone, Default)]
+struct Threading {
+    in_reply_to: Option<String>,
+    references: Vec<String>,
+}
+
+/// The threading of a reply to `thread_id`'s newest `INBOX` message:
+/// `In-Reply-To` its `Message-ID`, `References` its `References` (or its
+/// `In-Reply-To`) followed by its `Message-ID`.
+async fn threading_of(
+    session: &mut ImapSession,
+    thread_id: &str,
+) -> Result<Threading, SealSessionError> {
+    let status = session.examine(FOLDER).await.map_err(session_error)?;
+    let messages = thread_messages(
+        session,
+        &status,
+        thread_id,
+        "UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]",
+    )
+    .await?;
+    let newest = messages.last().expect("a thread has a message");
+    let headers = parse_headers(newest.header.as_deref().unwrap_or_default());
+    let parent = headers.ids("Message-ID").into_iter().next();
+    let mut references = headers.ids("References");
+    if references.is_empty() {
+        references = headers.ids("In-Reply-To");
+    }
+    if let Some(parent) = &parent {
+        if !references.contains(parent) {
+            references.push(parent.clone());
+        }
+    }
+    Ok(Threading {
+        in_reply_to: parent,
+        references,
+    })
+}
+
+/// The folder `LIST` marks with `attribute` (RFC 6154), else the one named
+/// `name` (case-insensitive) at the top level or directly under `INBOX`.
+fn special_folder(folders: &[ListedFolder], attribute: &str, name: &str) -> Option<String> {
+    if let Some(marked) = folders.iter().find(|f| f.has_attribute(attribute)) {
+        return Some(marked.name.clone());
+    }
+    folders
+        .iter()
+        .find(|f| {
+            f.name.eq_ignore_ascii_case(name)
+                || f.delimiter
+                    .as_deref()
+                    .is_some_and(|d| f.name.eq_ignore_ascii_case(&format!("{FOLDER}{d}{name}")))
+        })
+        .map(|f| f.name.clone())
+}
+
+/// The message `given` from `mailbox`, with `message_id` and `threading`.
+fn compose(
+    mailbox: &ToolMailbox,
+    given: &Outbound,
+    message_id: &str,
+    threading: &Threading,
+) -> OutgoingMessage {
+    OutgoingMessage {
+        from_address: mailbox.settings.address.clone(),
+        from_name: mailbox.settings.display_name.clone(),
+        to: given.to.clone(),
+        cc: given.cc.clone(),
+        subject: given.subject.clone(),
+        body: given.body.clone(),
+        message_id: message_id.to_string(),
+        in_reply_to: threading.in_reply_to.clone(),
+        references: threading.references.clone(),
+        date: chrono::Utc::now(),
+    }
+}
+
+/// `mail.draft`: the message appended to the Drafts folder with `\Draft
+/// \Seen`; refused when the mailbox has no Drafts folder.
+async fn draft(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    given: &Outbound,
+    thread_id: Option<&str>,
+) -> Result<Value, SealSessionError> {
+    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
+        .await
+        .map_err(session_error)?;
+    let answer = async {
+        let threading = match thread_id {
+            Some(thread_id) => threading_of(&mut session, thread_id).await?,
+            None => Threading::default(),
+        };
+        let folders = session.list_folders().await.map_err(session_error)?;
+        let Some(drafts) = special_folder(&folders, "\\Drafts", "Drafts") else {
+            return Err(invalid(NO_DRAFTS));
+        };
+        let message_id = mint_message_id(&mailbox.settings.address);
+        let raw = compose(mailbox, given, &message_id, &threading).render();
+        session
+            .append(&drafts, &["\\Draft", "\\Seen"], &raw)
+            .await
+            .map_err(session_error)?;
+        Ok(json!({
+            "mailbox": mailbox.binding_id.0.to_string(),
+            "folder": drafts,
+            "message_id": message_id,
+            "to": given.to,
+            "cc": given.cc,
+            "subject": given.subject,
+            "thread_id": thread_id,
+            "in_reply_to": threading.in_reply_to,
+            "saved": true,
+        }))
+    }
+    .await;
+    session.logout().await;
+    answer
+}
+
+/// Where a sent message's copy went.
+enum SentCopy {
+    /// In `folder`: appended, or already filed there by the server.
+    Saved { folder: String },
+    /// The mailbox has no Sent folder.
+    NoFolder,
+    /// Saving failed with the server's reply.
+    Failed { reply: String },
+}
+
+/// `mail.send` and `mail.reply`: the message submitted over SMTP, then its
+/// copy saved to the Sent folder. A failure to save after the send is in
+/// the result, never an error.
+async fn send(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    given: &Outbound,
+    thread_id: Option<&str>,
+) -> Result<Value, SealSessionError> {
+    let threading = match thread_id {
+        Some(thread_id) => {
+            let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
+                .await
+                .map_err(session_error)?;
+            let threading = threading_of(&mut session, thread_id).await;
+            session.logout().await;
+            threading?
+        }
+        None => Threading::default(),
+    };
+    let message_id = mint_message_id(&mailbox.settings.address);
+    let raw = compose(mailbox, given, &message_id, &threading).render();
+    let recipients: Vec<String> = given.to.iter().chain(given.cc.iter()).cloned().collect();
+    submission::submit(
+        connector,
+        &mailbox.settings,
+        &mailbox.auth,
+        &mailbox.settings.address,
+        &recipients,
+        &raw,
+    )
+    .await
+    .map_err(session_error)?;
+    let (saved, folder, reply) = match save_to_sent(connector, mailbox, &message_id, &raw).await {
+        SentCopy::Saved { folder } => (true, Some(folder), None),
+        SentCopy::NoFolder => (false, None, Some(NO_SENT.to_string())),
+        SentCopy::Failed { reply } => (false, None, Some(reply)),
+    };
+    let mut answer = json!({
+        "mailbox": mailbox.binding_id.0.to_string(),
+        "message_id": message_id,
+        "to": given.to,
+        "cc": given.cc,
+        "subject": given.subject,
+        "saved_to_sent": saved,
+        "sent_folder": folder,
+        "sent_folder_reply": reply,
+    });
+    if let Some(thread_id) = thread_id {
+        answer["thread_id"] = json!(thread_id);
+        answer["in_reply_to"] = json!(threading.in_reply_to);
+    }
+    Ok(answer)
+}
+
+/// Save a sent message's copy: find the Sent folder, search it for the
+/// message's `Message-ID` and append the message with `\Seen` only when it
+/// is not there (a server that files its own copy is matched by what it
+/// does, never by its name).
+async fn save_to_sent(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    message_id: &str,
+    raw: &[u8],
+) -> SentCopy {
+    let mut session = match ImapSession::open(connector, &mailbox.settings, &mailbox.auth).await {
+        Ok(session) => session,
+        Err(failure) => {
+            return SentCopy::Failed {
+                reply: failure.reply,
+            }
+        }
+    };
+    let copy: Result<SentCopy, MailboxCheckFailure> = async {
+        let folders = session.list_folders().await?;
+        let Some(sent) = special_folder(&folders, "\\Sent", "Sent") else {
+            return Ok(SentCopy::NoFolder);
+        };
+        session.examine(&sent).await?;
+        let filed = session
+            .uid_search(&[
+                Arg::atom("HEADER"),
+                Arg::atom("Message-ID"),
+                Arg::string(message_id.to_string()),
+            ])
+            .await?;
+        if filed.is_empty() {
+            session.append(&sent, &["\\Seen"], raw).await?;
+        }
+        Ok(SentCopy::Saved { folder: sent })
+    }
+    .await;
+    session.logout().await;
+    copy.unwrap_or_else(|failure| SentCopy::Failed {
+        reply: failure.reply,
+    })
 }
 
 /// The root `Message-ID` of a message: its thread's id.

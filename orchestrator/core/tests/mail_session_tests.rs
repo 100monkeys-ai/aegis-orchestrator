@@ -17,6 +17,15 @@
 //!   base64 response reaches the error (AEGIS ADR-125's Update of
 //!   2026-10-07 clauses 8 and 10).
 //!
+//! - The outbound tools (its Update of 2026-10-07 (3), clauses 13 to 15):
+//!   `mail.draft` appends to Drafts with `\Draft \Seen`; `mail.send`
+//!   submits over SMTP (`AUTH XOAUTH2` for an OAuth mailbox, else `AUTH
+//!   PLAIN`, or `AUTH LOGIN` when only LOGIN is offered) with a
+//!   `Message-ID` the orchestrator minted, then appends to Sent unless the
+//!   Sent folder already holds it; `mail.reply` threads by `In-Reply-To`
+//!   and `References`; a refused recipient sends nothing; malformed
+//!   arguments are refused before any connection.
+//!
 //! The mailbox source here answers one mailbox for its owner; the real
 //! source's ownership checks are tested beside it in the crate
 //! (`tool_invocation_service/mail_tools_tests.rs`).
@@ -42,8 +51,10 @@ use aegis_orchestrator_core::infrastructure::mail::MailAuth;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mail_standins::{
-    imap_mailbox_standin, imap_xoauth2_standin, xoauth2_string, MailboxStandIn, PlainConnector,
-    StoredMessage, XOAUTH2_CHALLENGE, XOAUTH2_IMAP_REFUSAL,
+    imap_mailbox_standin, imap_mailbox_standin_with_folders, imap_xoauth2_standin,
+    imap_xoauth2_standin_with_folders, smtp_submission_standin, xoauth2_string, MailboxStandIn,
+    PlainConnector, SmtpSubmission, StandInFolder, StoredMessage, SubmitAuth, RCPT_REFUSAL,
+    XOAUTH2_CHALLENGE, XOAUTH2_IMAP_REFUSAL,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -726,4 +737,555 @@ async fn a_refused_token_answers_the_session_failure_with_the_decoded_challenge_
         ),
         "the refusal is not the session failure with the decoded challenge"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The outbound tools (ADR-125's Update of 2026-10-07 (3), clauses 13 to 15)
+// ---------------------------------------------------------------------------
+
+const ANN: &str = "ann@example.test";
+const ACCOUNTS: &str = "accounts@example.test";
+
+/// Answers one mailbox to its owner: its IMAP and SMTP stand-ins' ports,
+/// its address, and how it authenticates.
+struct SendMailbox {
+    id: CredentialBindingId,
+    imap_port: u16,
+    smtp_port: u16,
+    address: String,
+    auth: MailAuth,
+}
+
+#[async_trait]
+impl ToolMailboxSource for SendMailbox {
+    async fn tool_mailbox(
+        &self,
+        actor: &ToolCallActor<'_>,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<Option<ToolMailbox>> {
+        if *binding_id != self.id || actor.user_id != USER {
+            return Ok(None);
+        }
+        Ok(Some(ToolMailbox {
+            binding_id: self.id,
+            settings: MailboxSettings {
+                address: self.address.clone(),
+                display_name: Some("Mailbox Owner".to_string()),
+                imap_host: "127.0.0.1".to_string(),
+                imap_port: self.imap_port,
+                imap_security: MailSecurity::Tls,
+                smtp_host: "127.0.0.1".to_string(),
+                smtp_port: self.smtp_port,
+                smtp_security: MailSecurity::Starttls,
+                username: self.address.clone(),
+            },
+            auth: self.auth.clone(),
+            granted: false,
+        }))
+    }
+}
+
+/// Sent and Drafts, marked as RFC 6154 marks them.
+fn sent_and_drafts() -> Vec<StandInFolder> {
+    vec![
+        StandInFolder::new("Sent Items", "\\Sent"),
+        StandInFolder::new("Drafts", "\\Drafts"),
+    ]
+}
+
+struct Outbound {
+    mailbox: MailboxStandIn,
+    smtp: SmtpSubmission,
+    tools: MailTools,
+    id: CredentialBindingId,
+}
+
+/// A password mailbox with `folders`, its SMTP stand-in offering `offered`.
+async fn outbound(
+    offered: fn(String, String) -> SubmitAuth,
+    folders: Vec<StandInFolder>,
+    refused: Option<&str>,
+) -> Outbound {
+    let mailbox = imap_mailbox_standin_with_folders(LOGIN, PASSWORD, inbox(), folders).await;
+    let smtp =
+        smtp_submission_standin(offered(LOGIN.to_string(), PASSWORD.to_string()), refused).await;
+    outbound_over(
+        mailbox,
+        smtp,
+        LOGIN,
+        MailAuth::Password(SensitiveString::new(PASSWORD)),
+    )
+}
+
+fn outbound_over(
+    mailbox: MailboxStandIn,
+    smtp: SmtpSubmission,
+    address: &str,
+    auth: MailAuth,
+) -> Outbound {
+    let id = CredentialBindingId::new();
+    let source = Arc::new(SendMailbox {
+        id,
+        imap_port: mailbox.port(),
+        smtp_port: smtp.port(),
+        address: address.to_string(),
+        auth,
+    });
+    Outbound {
+        tools: MailTools::with_connector(source, Arc::new(PlainConnector)),
+        mailbox,
+        smtp,
+        id,
+    }
+}
+
+fn plain(user: String, password: String) -> SubmitAuth {
+    SubmitAuth::Plain { user, password }
+}
+
+fn login_only(user: String, password: String) -> SubmitAuth {
+    SubmitAuth::LoginOnly { user, password }
+}
+
+async fn send(o: &Outbound, tool: &str, mut args: Value) -> Result<Value, SealSessionError> {
+    args["mailbox"] = json!(o.id.0.to_string());
+    o.tools.invoke(tool, &args, &conversation()).await
+}
+
+/// A header's value in a raw message, folded lines joined.
+fn header_of(raw: &str, name: &str) -> Option<String> {
+    let head = raw.split("\r\n\r\n").next().unwrap_or("");
+    let mut found: Option<String> = None;
+    for line in head.split("\r\n") {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(v) = found.as_mut() {
+                v.push(' ');
+                v.push_str(line.trim());
+            }
+            continue;
+        }
+        if found.is_some() {
+            break;
+        }
+        if let Some((n, v)) = line.split_once(':') {
+            if n.trim().eq_ignore_ascii_case(name) {
+                found = Some(v.trim().to_string());
+            }
+        }
+    }
+    found
+}
+
+/// The decoded text of a message whose body is base64.
+fn body_of(raw: &str) -> String {
+    let body: String = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    String::from_utf8(STANDARD.decode(body).unwrap_or_default()).unwrap_or_default()
+}
+
+/// A `Message-ID` the orchestrator minted for `address`: `<uuid@domain>`.
+fn minted_for(message_id: &str, address: &str) -> bool {
+    let domain = address.rsplit('@').next().unwrap_or_default();
+    message_id
+        .strip_prefix('<')
+        .and_then(|m| m.strip_suffix('>'))
+        .and_then(|m| m.split_once('@'))
+        .is_some_and(|(local, d)| {
+            d.eq_ignore_ascii_case(domain) && uuid::Uuid::parse_str(local).is_ok()
+        })
+}
+
+#[tokio::test]
+async fn mail_draft_appends_to_drafts_with_draft_and_seen() {
+    let o = outbound(plain, sent_and_drafts(), None).await;
+    let answer = send(
+        &o,
+        "mail.draft",
+        json!({"to": [ANN], "subject": "Quarterly numbers", "body": "Draft text."}),
+    )
+    .await;
+    let mut wrong = Vec::new();
+    match &answer {
+        Ok(_) => {}
+        Err(e) => wrong.push(format!("mail.draft did not save a draft: {}", sentence(e))),
+    }
+    let drafts = o.mailbox.folder_messages("Drafts");
+    if drafts.len() != 1 {
+        wrong.push(format!("Drafts holds {} messages, not 1", drafts.len()));
+    }
+    if let (Some(draft), Ok(answer)) = (drafts.first(), &answer) {
+        if draft.flags != vec!["\\Draft".to_string(), "\\Seen".to_string()] {
+            wrong.push(format!("the draft's flags are {:?}", draft.flags));
+        }
+        let id = answer["message_id"].as_str().unwrap_or_default();
+        if header_of(&draft.raw, "Message-ID").as_deref() != Some(id) || !minted_for(id, LOGIN) {
+            wrong.push(format!(
+                "the draft's Message-ID is not the minted {id}: {}",
+                draft.raw
+            ));
+        }
+        if header_of(&draft.raw, "Subject").as_deref() != Some("Quarterly numbers")
+            || header_of(&draft.raw, "To").as_deref() != Some(ANN)
+            || body_of(&draft.raw) != "Draft text."
+        {
+            wrong.push(format!("the draft is not the message given: {}", draft.raw));
+        }
+        if answer["folder"] != "Drafts" {
+            wrong.push(format!("the answer does not name Drafts: {answer}"));
+        }
+    }
+    if o.smtp.standin.connections() != 0 {
+        wrong.push("a draft opened an SMTP session".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_draft_without_a_drafts_folder_saves_nothing() {
+    let o = outbound(plain, vec![StandInFolder::new("Sent", "\\Sent")], None).await;
+    let error = send(&o, "mail.draft", json!({"body": "Draft text."}))
+        .await
+        .expect_err("a mailbox without Drafts refuses");
+    assert_eq!(
+        sentence(&error),
+        "This mailbox has no Drafts folder; nothing was saved."
+    );
+}
+
+#[tokio::test]
+async fn mail_send_submits_with_auth_plain_then_appends_to_sent_with_its_message_id() {
+    let o = outbound(plain, sent_and_drafts(), None).await;
+    let answer = send(
+        &o,
+        "mail.send",
+        json!({"to": [ANN], "cc": [ACCOUNTS], "subject": "Invoice paid", "body": "Paid today.\n.\nThanks."}),
+    )
+    .await;
+    let mut wrong = Vec::new();
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(e) => panic!("mail.send did not send: {}", sentence(&e)),
+    };
+    let id = answer["message_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if !minted_for(&id, LOGIN) {
+        wrong.push(format!(
+            "the answer's message_id is not one the orchestrator minted: {answer}"
+        ));
+    }
+    if o.smtp.mechanisms() != vec!["PLAIN".to_string()] {
+        wrong.push(format!(
+            "authenticated by {:?}, not AUTH PLAIN",
+            o.smtp.mechanisms()
+        ));
+    }
+    let submitted = o.smtp.submitted();
+    match submitted.as_slice() {
+        [message] => {
+            if message.from != LOGIN
+                || message.recipients != vec![ANN.to_string(), ACCOUNTS.to_string()]
+            {
+                wrong.push(format!(
+                    "the envelope is {} -> {:?}",
+                    message.from, message.recipients
+                ));
+            }
+            if header_of(&message.data, "Message-ID").as_deref() != Some(id.as_str()) {
+                wrong.push(format!(
+                    "the message's Message-ID is not {id}: {}",
+                    message.data
+                ));
+            }
+            if body_of(&message.data) != "Paid today.\r\n.\r\nThanks." {
+                wrong.push(format!("the body arrived as {:?}", body_of(&message.data)));
+            }
+            if header_of(&message.data, "Cc").as_deref() != Some(ACCOUNTS)
+                || header_of(&message.data, "From").as_deref()
+                    != Some(&*format!("Mailbox Owner <{LOGIN}>"))
+            {
+                wrong.push(format!("the headers are not the call's: {}", message.data));
+            }
+        }
+        other => wrong.push(format!("{} messages were submitted, not 1", other.len())),
+    }
+    let sent = o.mailbox.folder_messages("Sent Items");
+    match sent.as_slice() {
+        [copy] => {
+            if copy.flags != vec!["\\Seen".to_string()]
+                || header_of(&copy.raw, "Message-ID").as_deref() != Some(id.as_str())
+            {
+                wrong.push(format!("the Sent copy is {:?} {}", copy.flags, copy.raw));
+            }
+        }
+        other => wrong.push(format!("Sent holds {} messages, not 1", other.len())),
+    }
+    if answer["saved_to_sent"] != true || answer["sent_folder"] != "Sent Items" {
+        wrong.push(format!(
+            "the answer does not say the copy was saved: {answer}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_send_uses_auth_login_when_only_login_is_offered() {
+    let o = outbound(login_only, sent_and_drafts(), None).await;
+    let answer = send(
+        &o,
+        "mail.send",
+        json!({"to": [ANN], "subject": "Hello", "body": "Hi."}),
+    )
+    .await;
+    assert!(answer.is_ok(), "mail.send did not send: {answer:?}");
+    assert_eq!(o.smtp.mechanisms(), vec!["LOGIN".to_string()]);
+    assert_eq!(o.smtp.submitted().len(), 1);
+}
+
+#[tokio::test]
+async fn mail_send_on_an_oauth_mailbox_uses_xoauth2_and_no_token_reaches_the_result() {
+    let mailbox =
+        imap_xoauth2_standin_with_folders(OAUTH_ADDRESS, TOKEN, inbox(), sent_and_drafts()).await;
+    let smtp = smtp_submission_standin(
+        SubmitAuth::XOAuth2 {
+            user: OAUTH_ADDRESS.to_string(),
+            token: TOKEN.to_string(),
+        },
+        None,
+    )
+    .await;
+    let o = outbound_over(
+        mailbox,
+        smtp,
+        OAUTH_ADDRESS,
+        MailAuth::XOAuth2(SensitiveString::new(TOKEN)),
+    );
+    let answer = send(
+        &o,
+        "mail.send",
+        json!({"to": [ANN], "subject": "Hello", "body": "Hi."}),
+    )
+    .await;
+    let mut wrong = Vec::new();
+    let text = format!("{answer:?}");
+    match &answer {
+        Ok(answer)
+            if minted_for(
+                answer["message_id"].as_str().unwrap_or_default(),
+                OAUTH_ADDRESS,
+            ) => {}
+        other => wrong.push(format!("mail.send did not send over XOAUTH2: {other:?}")),
+    }
+    if o.smtp.mechanisms() != vec!["XOAUTH2".to_string()] {
+        wrong.push(format!(
+            "authenticated by {:?}, not AUTH XOAUTH2",
+            o.smtp.mechanisms()
+        ));
+    }
+    if o.smtp.standin.sasl() != vec![xoauth2_string(OAUTH_ADDRESS, TOKEN)] {
+        wrong.push(format!(
+            "the SMTP stand-in received {:?}",
+            o.smtp.standin.sasl()
+        ));
+    }
+    let base64_response = STANDARD.encode(xoauth2_string(OAUTH_ADDRESS, TOKEN));
+    if text.contains(TOKEN) || text.contains(&base64_response) {
+        wrong.push(format!("the token reached the result: {text}"));
+    }
+    if o.mailbox.folder_messages("Sent Items").len() != 1 {
+        wrong.push("the sent message was not appended to Sent".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_send_appends_nothing_when_the_sent_folder_already_holds_its_message() {
+    let mailbox =
+        imap_mailbox_standin_with_folders(LOGIN, PASSWORD, inbox(), sent_and_drafts()).await;
+    let smtp = mail_standins::smtp_submission_standin_filing(
+        plain(LOGIN.to_string(), PASSWORD.to_string()),
+        &mailbox,
+        "Sent Items",
+    )
+    .await;
+    let o = outbound_over(
+        mailbox,
+        smtp,
+        LOGIN,
+        MailAuth::Password(SensitiveString::new(PASSWORD)),
+    );
+    let answer = send(
+        &o,
+        "mail.send",
+        json!({"to": [ANN], "subject": "Hello", "body": "Hi."}),
+    )
+    .await;
+    assert!(answer.is_ok(), "mail.send did not send: {answer:?}");
+    let appended: Vec<String> = o
+        .mailbox
+        .commands()
+        .into_iter()
+        .filter(|c| {
+            c.split_whitespace()
+                .nth(1)
+                .is_some_and(|v| v.eq_ignore_ascii_case("APPEND"))
+        })
+        .collect();
+    assert!(
+        appended.is_empty() && o.mailbox.folder_messages("Sent Items").len() == 1,
+        "a copy the server had filed was appended again: {} in Sent, {appended:?}",
+        o.mailbox.folder_messages("Sent Items").len()
+    );
+    assert_eq!(answer.unwrap()["saved_to_sent"], true);
+}
+
+#[tokio::test]
+async fn mail_send_without_a_sent_folder_sends_and_says_so() {
+    let o = outbound(plain, vec![StandInFolder::new("Drafts", "\\Drafts")], None).await;
+    let answer = send(
+        &o,
+        "mail.send",
+        json!({"to": [ANN], "subject": "Hello", "body": "Hi."}),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("mail.send did not send: {}", sentence(&e)));
+    assert_eq!(o.smtp.submitted().len(), 1);
+    assert_eq!(answer["saved_to_sent"], false, "{answer}");
+    assert!(answer["sent_folder"].is_null(), "{answer}");
+}
+
+#[tokio::test]
+async fn a_sent_folder_named_sent_is_found_without_its_attribute() {
+    let o = outbound(plain, vec![StandInFolder::new("sent", "")], None).await;
+    let answer = send(
+        &o,
+        "mail.send",
+        json!({"to": [ANN], "subject": "Hello", "body": "Hi."}),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("mail.send did not send: {}", sentence(&e)));
+    assert_eq!(answer["sent_folder"], "sent", "{answer}");
+    assert_eq!(o.mailbox.folder_messages("sent").len(), 1);
+}
+
+#[tokio::test]
+async fn mail_reply_carries_in_reply_to_and_references_from_the_threads_newest_message() {
+    let o = outbound(plain, sent_and_drafts(), None).await;
+    let answer = send(
+        &o,
+        "mail.reply",
+        json!({"thread_id": "<a1@x>", "to": [ANN], "subject": "Re: Invoice", "body": "Received."}),
+    )
+    .await;
+    let mut wrong = Vec::new();
+    if let Err(e) = &answer {
+        wrong.push(format!("mail.reply did not send: {}", sentence(e)));
+    }
+    match o.smtp.submitted().as_slice() {
+        [message] => {
+            if header_of(&message.data, "In-Reply-To").as_deref() != Some("<a2@x>") {
+                wrong.push(format!(
+                    "In-Reply-To is {:?}, not the newest message <a2@x>",
+                    header_of(&message.data, "In-Reply-To")
+                ));
+            }
+            if header_of(&message.data, "References").as_deref() != Some("<a1@x> <a2@x>") {
+                wrong.push(format!(
+                    "References is {:?}, not <a1@x> <a2@x>",
+                    header_of(&message.data, "References")
+                ));
+            }
+        }
+        other => wrong.push(format!("{} messages were submitted, not 1", other.len())),
+    }
+    if let Ok(answer) = &answer {
+        if answer["in_reply_to"] != "<a2@x>" || answer["thread_id"] != "<a1@x>" {
+            wrong.push(format!("the answer does not name the thread: {answer}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn a_refused_recipient_sends_nothing() {
+    let o = outbound(plain, sent_and_drafts(), Some("nobody@example.test")).await;
+    let error = send(
+        &o,
+        "mail.send",
+        json!({"to": [ANN, "nobody@example.test"], "subject": "Hello", "body": "Hi."}),
+    )
+    .await
+    .expect_err("a refused recipient fails the send");
+    let said = sentence(&error);
+    let commands = o.smtp.commands();
+    let mut wrong = Vec::new();
+    if !said.contains("nobody@example.test") || !said.contains(RCPT_REFUSAL) {
+        wrong.push(format!("the refusal does not name the address: {said}"));
+    }
+    if !o.smtp.submitted().is_empty() || commands.iter().any(|c| c.eq_ignore_ascii_case("DATA")) {
+        wrong.push(format!("a message was submitted: {commands:?}"));
+    }
+    if !commands.iter().any(|c| c.eq_ignore_ascii_case("RSET")) {
+        wrong.push(format!("the envelope was not reset: {commands:?}"));
+    }
+    if !o.mailbox.folder_messages("Sent Items").is_empty() {
+        wrong.push("a refused send was appended to Sent".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn malformed_outbound_arguments_are_refused_before_any_connection() {
+    let o = outbound(plain, sent_and_drafts(), None).await;
+    let many: Vec<String> = (0..51).map(|i| format!("r{i}@example.test")).collect();
+    let mut wrong = Vec::new();
+    for (case, tool, args, expected) in [
+        (
+            "an address with a line break",
+            "mail.send",
+            json!({"to": ["ann@example.test\r\nBcc: x@y.test"], "subject": "s", "body": "b"}),
+            "'ann@example.testBcc: x@y.test' is not an email address this tool can send to.",
+        ),
+        (
+            "an address without @",
+            "mail.draft",
+            json!({"to": ["ann"], "body": "b"}),
+            "'ann' is not an email address this tool can send to.",
+        ),
+        (
+            "51 recipients",
+            "mail.send",
+            json!({"to": many, "subject": "s", "body": "b"}),
+            "A message has at most 50 recipients.",
+        ),
+        (
+            "a subject with a line break",
+            "mail.reply",
+            json!({"thread_id": "<a1@x>", "to": [ANN], "subject": "a\nBcc: x@y.test", "body": "b"}),
+            "'subject' must be one line of at most 998 characters.",
+        ),
+        (
+            "a body over 100000 characters",
+            "mail.send",
+            json!({"to": [ANN], "subject": "s", "body": "x".repeat(100_001)}),
+            "'body' must be plain text of at most 100000 characters.",
+        ),
+    ] {
+        match send(&o, tool, args).await {
+            Ok(answer) => wrong.push(format!("{case}: {tool} was not refused: {answer}")),
+            Err(e) if sentence(&e) != expected => {
+                wrong.push(format!("{case}: refused with {:?}", sentence(&e)))
+            }
+            Err(_) => {}
+        }
+    }
+    if o.smtp.standin.connections() != 0 || o.mailbox.connections() != 0 {
+        wrong.push("a malformed call opened a session".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

@@ -73,7 +73,8 @@ pub struct ToolRouter {
 /// `requires_approval`: AEGIS ADR-126 D1 outbound tools: an agent's call
 /// waits for its user's answer at the approval gate. A node configuration's
 /// capability entry may gate further tools; it cannot clear this mark.
-/// No tool carries it yet.
+/// `mail.send` and `mail.reply` carry it (AEGIS ADR-125's Update of
+/// 2026-10-07 (3) clause 12).
 struct BuiltinToolDefinition {
     name: &'static str,
     description: &'static str,
@@ -111,7 +112,6 @@ impl BuiltinToolDefinition {
     }
 
     /// Mark an outbound tool for the approval gate (AEGIS ADR-126 D1).
-    #[allow(dead_code)] // no built-in tool carries it yet
     const fn requires_approval(mut self) -> Self {
         self.requires_approval = true;
         self
@@ -139,6 +139,9 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("fs.glob", "Recursively matches files against a glob pattern.").skip_judge(),
     BuiltinToolDefinition::new("web.search", "Performs an internet search query.").skip_judge(),
     BuiltinToolDefinition::new("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown. Returns at most 50,000 characters of the page per call: a longer page comes back cut, with truncated, total_chars, next_offset and a notice, and the offset argument reads on.").skip_judge(),
+    BuiltinToolDefinition::new("mail.draft", "Saves a plain-text message as a draft in a connected mailbox's Drafts folder, optionally as a reply in a thread. Sends nothing."),
+    BuiltinToolDefinition::new("mail.send", "Sends a plain-text message from a connected mailbox to the addresses in to and cc, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
+    BuiltinToolDefinition::new("mail.reply", "Replies in a thread of a connected mailbox: sends a plain-text message to the addresses in to and cc, threaded to the thread's newest message, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
     BuiltinToolDefinition::new("mail.list", "Lists threads in a connected mailbox's inbox that match a query, newest first: each thread's id, subject, participants, latest date, message count, unread count, flag and labels. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.read", "Reads one thread of a connected mailbox: every message's headers, flags, labels and plain-text body, oldest first. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox, and flags or unflags it."),
@@ -332,6 +335,9 @@ impl ToolRouter {
             "fs.glob" => Self::schema_fs_glob(),
             "web.search" => Self::schema_web_search(),
             "web.fetch" => Self::schema_web_fetch(),
+            "mail.draft" => Self::schema_mail_outbound(OutboundShape::Draft),
+            "mail.send" => Self::schema_mail_outbound(OutboundShape::Send),
+            "mail.reply" => Self::schema_mail_outbound(OutboundShape::Reply),
             "mail.list" => Self::schema_mail_list(),
             "mail.read" => Self::schema_mail_read(),
             "mail.label" => Self::schema_mail_label(),
@@ -695,6 +701,72 @@ impl ToolRouter {
             },
             "required": ["url"]
         })
+    }
+
+    /// JSON schema for the outbound mail tools (AEGIS ADR-125's Update of
+    /// 2026-10-07 (3) clause 13): a message given in full, `to` and `cc`
+    /// lists of addresses (no `bcc`), a one-line `subject` and a plain-text
+    /// `body`; `mail.reply` and an optional `mail.draft` name a thread.
+    fn schema_mail_outbound(shape: OutboundShape) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "mailbox".to_string(),
+            json!({"type": "string", "description": "The id of one of your mailbox connections."}),
+        );
+        if shape != OutboundShape::Send {
+            let description = if shape == OutboundShape::Reply {
+                "A thread id mail.list answered; the reply goes to its newest message."
+            } else {
+                "A thread id mail.list answered, to save the draft as a reply to its newest message."
+            };
+            properties.insert(
+                "thread_id".to_string(),
+                json!({"type": "string", "description": description}),
+            );
+        }
+        let min_to = if shape == OutboundShape::Draft { 0 } else { 1 };
+        properties.insert(
+            "to".to_string(),
+            json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": min_to,
+                "maxItems": 50,
+                "description": "The recipients' email addresses, such as ann@example.com; to and cc together hold at most 50."
+            }),
+        );
+        properties.insert(
+            "cc".to_string(),
+            json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 50,
+                "description": "Further recipients' email addresses, copied; to and cc together hold at most 50."
+            }),
+        );
+        let subject = if shape == OutboundShape::Reply {
+            "One line of at most 998 characters, usually the thread's subject with Re: before it."
+        } else {
+            "One line of at most 998 characters."
+        };
+        properties.insert(
+            "subject".to_string(),
+            json!({"type": "string", "maxLength": 998, "description": subject}),
+        );
+        properties.insert(
+            "body".to_string(),
+            json!({
+                "type": "string",
+                "maxLength": 100000,
+                "description": "The message as plain text, at most 100000 characters."
+            }),
+        );
+        let required: Vec<&str> = match shape {
+            OutboundShape::Draft => vec!["mailbox", "body"],
+            OutboundShape::Send => vec!["mailbox", "to", "subject", "body"],
+            OutboundShape::Reply => vec!["mailbox", "thread_id", "to", "subject", "body"],
+        };
+        json!({"type": "object", "properties": properties, "required": required})
     }
 
     /// JSON schema for the `mail.list` builtin tool.
@@ -1955,6 +2027,14 @@ impl ToolRouter {
     }
 }
 
+/// Which outbound mail tool a schema is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundShape {
+    Draft,
+    Send,
+    Reply,
+}
+
 // =============================================================================
 // ToolMetadata — Tool discovery metadata
 // =============================================================================
@@ -2630,16 +2710,21 @@ mod tests {
 
     /// AEGIS ADR-126 D1: a capability entry of the node configuration gates
     /// its tool, a builtin dispatcher's or a `spec.tool_capabilities` entry
-    /// whose pattern matches; no catalogue entry is marked yet, so with no
-    /// entry nothing is gated, and an entry without the flag does not gate.
+    /// whose pattern matches; with no entry only the catalogue's marked
+    /// tools, `mail.send` and `mail.reply` (AEGIS ADR-125's Update of
+    /// 2026-10-07 (3) clause 12), are gated, and an entry without the flag
+    /// does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
         let plain = ToolRouter::new(ToolRouter::builtin_dispatchers());
         for def in BUILTIN_TOOL_DEFINITIONS {
-            assert!(
-                !plain.requires_approval(def.name),
-                "{} is gated with no capability entry marking it",
-                def.name
+            let marked = matches!(def.name, "mail.send" | "mail.reply");
+            assert_eq!(
+                plain.requires_approval(def.name),
+                marked,
+                "{} is gated: {}, with no capability entry",
+                def.name,
+                plain.requires_approval(def.name)
             );
         }
 
@@ -2724,6 +2809,19 @@ mod tests {
             }
         );
         assert!(router.approval_contract("fs.write").is_empty());
-        assert!(router.approval_contract("mail.send").is_empty());
+        // ADR-125's Update of 2026-10-07 (3) clause 12: the input contract's
+        // declaration, whatever the capability entries say.
+        assert_eq!(
+            router.approval_contract("mail.send"),
+            ApprovalContract {
+                binding_argument: Some("mailbox".to_string()),
+                approval_summary: Some(
+                    ["mailbox", "to", "cc", "subject", "body"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                ),
+            }
+        );
     }
 }

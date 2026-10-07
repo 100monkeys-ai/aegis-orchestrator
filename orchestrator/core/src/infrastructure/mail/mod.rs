@@ -31,8 +31,11 @@
 //! and tests use a plaintext connector against loopback stand-ins.
 //!
 //! The mail tools' sessions (`EXAMINE`, `SELECT`, `UID SEARCH`, `UID
-//! FETCH`, `UID STORE`) are [`session`], opened the same way over the same
-//! connector.
+//! FETCH`, `UID STORE`, `LIST`, `APPEND`) are [`session`], opened the same
+//! way over the same connector. The outbound tools' SMTP submission is
+//! [`submission`], over the check's authenticated session, and the message
+//! it carries is [`message`] (AEGIS ADR-125's Update of 2026-10-07 (3)
+//! clauses 13 to 15).
 //!
 //! **What may be reached** is the production connector's [`guard`]: the
 //! mail ports only, and public unicast addresses only, each host resolved
@@ -42,8 +45,10 @@
 
 pub mod guard;
 pub mod imap;
+pub mod message;
 pub mod session;
 pub mod smtp;
+pub mod submission;
 pub mod tls;
 mod wire;
 

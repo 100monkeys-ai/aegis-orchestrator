@@ -890,6 +890,40 @@ impl ToolInvocationService {
             return Err(SealSessionError::PolicyViolation(violation));
         }
 
+        // --- A gated mail tool's mailbox, admitted before the gate (AEGIS
+        // ADR-125's Update of 2026-10-07 (3) clause 11) ---
+        // A person is never asked about a call its mailbox or its arguments
+        // would refuse, and the stored call and any standing choice name the
+        // binding by id, never by a context name: an approved call is run
+        // again with no call choices to resolve a name in.
+        if crate::application::tools::builtin_mail::is_mail_tool(&tool_name)
+            && self.tool_router.requires_approval(&tool_name)
+        {
+            if let Some(tools) = self.mail_tools.as_deref() {
+                let acting = self
+                    .mail_acting(
+                        *agent_id,
+                        execution_id,
+                        tenant_id,
+                        caller_identity,
+                        call_contexts,
+                    )
+                    .await;
+                match tools.admit_mailbox(&tool_name, &args, &acting).await {
+                    Ok(binding) => args["mailbox"] = Value::String(binding.0.to_string()),
+                    Err(e) => {
+                        self.publish_invocation_failed(
+                            invocation_id,
+                            execution_id,
+                            *agent_id,
+                            e.to_string(),
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         // --- Approval gate (ADR-126 D2) ---
         // After the security context allowed the call and before the
         // inner-loop judge: a call the policy forbids never reaches a person,
