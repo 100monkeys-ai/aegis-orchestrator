@@ -7,9 +7,11 @@
 //!
 //! The session is opened as the check opens it ([`super::imap`]): the
 //! endpoint is admitted by the connector (the production connector applies
-//! the [`super::guard`]), then greeting, `STARTTLS` when asked, `LOGIN`. A
-//! failure is a [`MailboxCheckFailure`]: the server's reply, the password
-//! redacted, control characters removed, at most 512 characters.
+//! the [`super::guard`]), then greeting, `STARTTLS` when asked, and `LOGIN`
+//! with a password or `AUTHENTICATE XOAUTH2` with an OAuth token
+//! ([`MailAuth`]). A failure is a [`MailboxCheckFailure`]: the server's
+//! reply, the secret redacted in every form, control characters removed, at
+//! most 512 characters.
 //!
 //! Message bodies are always fetched with `BODY.PEEK`, so no session of
 //! this module sets `\Seen`. The module also reads what a fetch answers: a
@@ -18,9 +20,8 @@
 
 use super::imap::{self, strip_tag, trailing_literal};
 use super::wire::{failure_of, Wire};
-use super::{MailConnector, MailProtocol, MailTarget, MailboxCheckFailure};
+use super::{MailAuth, MailConnector, MailProtocol, MailTarget, MailboxCheckFailure};
 use crate::domain::credential::MailboxSettings;
-use crate::domain::secrets::SensitiveString;
 use base64::Engine as _;
 
 /// The largest literal a session reads: one message, attachments included.
@@ -82,18 +83,18 @@ pub enum StoreOp {
 }
 
 /// An authenticated IMAP session.
-pub struct ImapSession<'p> {
-    wire: Wire<'p>,
+pub struct ImapSession {
+    wire: Wire,
     next_tag: u32,
 }
 
-impl<'p> ImapSession<'p> {
+impl ImapSession {
     /// Admit the mailbox's IMAP endpoint and open an authenticated session.
     pub async fn open(
         connector: &dyn MailConnector,
         settings: &MailboxSettings,
-        password: &'p SensitiveString,
-    ) -> Result<ImapSession<'p>, MailboxCheckFailure> {
+        auth: &MailAuth,
+    ) -> Result<ImapSession, MailboxCheckFailure> {
         let admitted = connector
             .admit(MailTarget {
                 protocol: MailProtocol::Imap,
@@ -102,8 +103,14 @@ impl<'p> ImapSession<'p> {
                 security: settings.imap_security.clone(),
             })
             .await
-            .map_err(|e| failure_of(MailProtocol::Imap, e, password))?;
-        let wire = imap::open(connector, &admitted, settings, password).await?;
+            .map_err(|e| {
+                failure_of(
+                    MailProtocol::Imap,
+                    e,
+                    &auth.secret_forms(&settings.username),
+                )
+            })?;
+        let wire = imap::open(connector, &admitted, settings, auth).await?;
         Ok(Self { wire, next_tag: 1 })
     }
 

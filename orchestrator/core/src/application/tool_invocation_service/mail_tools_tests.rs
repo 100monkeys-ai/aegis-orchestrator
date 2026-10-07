@@ -27,7 +27,7 @@ use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString};
 use crate::domain::security_context::SecurityContext;
 use crate::infrastructure::event_bus::DomainEvent;
 use crate::infrastructure::mail::{
-    AdmissionError, AdmittedTarget, BoxedMailStream, MailConnector, MailTarget,
+    AdmissionError, AdmittedTarget, BoxedMailStream, MailAuth, MailConnector, MailTarget,
 };
 use crate::infrastructure::repositories::InMemoryVolumeRepository;
 use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
@@ -361,7 +361,10 @@ async fn the_credential_service_answers_only_the_persons_own_active_mailbox() {
         .await
         .expect("the person's own mailbox is answered");
     assert_eq!(mailbox.settings, settings());
-    assert_eq!(mailbox.password.expose(), "Mk5-mail-password");
+    assert!(
+        matches!(&mailbox.auth, MailAuth::Password(p) if p.expose() == "Mk5-mail-password"),
+        "the mailbox's password was not answered"
+    );
     assert!(mailbox.granted, "a grant to the calling agent was not seen");
     let ungranted = answer(own_ungranted)
         .await
@@ -410,7 +413,7 @@ impl ToolMailboxSource for RecordingMailbox {
         Ok(Some(ToolMailbox {
             binding_id: self.id,
             settings: settings(),
-            password: SensitiveString::new("Mk5-mail-password"),
+            auth: MailAuth::Password(SensitiveString::new("Mk5-mail-password")),
             granted: false,
         }))
     }

@@ -17,6 +17,15 @@
 //! never logged, never put in an error, and redacted from any reply that
 //! repeats it.
 //!
+//! **How a session authenticates** is a [`MailAuth`]: an SMTP-with-IMAP
+//! mailbox logs in with its password (`LOGIN`, `AUTH PLAIN` or `AUTH
+//! LOGIN`); a mailbox connected by OAuth authenticates with SASL `XOAUTH2`
+//! (`AUTHENTICATE XOAUTH2`, `AUTH XOAUTH2`), the string
+//! `user=<address>\x01auth=Bearer <token>\x01\x01` in base64 (AEGIS ADR-125's
+//! Update of 2026-10-07 clauses 8 and 10). Google's mail hosts are fixed
+//! here, keyed by the granted scope [`XOAUTH2_MAIL_SCOPE`], never by a
+//! provider name ([`oauth_mailbox_settings`]).
+//!
 //! The sessions run over a [`MailConnector`]: production uses
 //! [`RustlsMailConnector`] (rustls with the Mozilla roots of `webpki-roots`),
 //! and tests use a plaintext connector against loopback stand-ins.
@@ -41,12 +50,91 @@ mod wire;
 use crate::domain::credential::{MailSecurity, MailboxSettings};
 use crate::domain::secrets::SensitiveString;
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub use tls::{RustlsMailConnector, SystemResolver, TcpDialer};
+
+/// How a mail session authenticates as the mailbox's `username`.
+#[derive(Debug, Clone)]
+pub enum MailAuth {
+    /// The mailbox's password: `LOGIN`, `AUTH PLAIN` or `AUTH LOGIN`.
+    Password(SensitiveString),
+    /// An OAuth access token: SASL `XOAUTH2` (`AUTHENTICATE XOAUTH2`, `AUTH
+    /// XOAUTH2`).
+    XOAuth2(SensitiveString),
+}
+
+impl MailAuth {
+    /// The SASL `XOAUTH2` initial response for `user`, in base64:
+    /// `user=<user>\x01auth=Bearer <token>\x01\x01`. `None` for a password.
+    pub fn xoauth2_response(&self, user: &str) -> Option<SensitiveString> {
+        match self {
+            MailAuth::Password(_) => None,
+            MailAuth::XOAuth2(token) => Some(SensitiveString::new(STANDARD.encode(format!(
+                "user={user}\x01auth=Bearer {}\x01\x01",
+                token.expose()
+            )))),
+        }
+    }
+
+    /// Every form of the secret a server's reply could repeat, longest
+    /// first: the password, or the token and the base64 response carrying
+    /// it. A failure's text has each replaced by `[REDACTED]`.
+    pub(crate) fn secret_forms(&self, user: &str) -> Vec<String> {
+        let mut forms = match self {
+            MailAuth::Password(password) => vec![password.expose().to_string()],
+            MailAuth::XOAuth2(token) => vec![
+                token.expose().to_string(),
+                self.xoauth2_response(user)
+                    .map(|r| r.expose().to_string())
+                    .unwrap_or_default(),
+            ],
+        };
+        forms.retain(|f| !f.is_empty());
+        forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+        forms
+    }
+}
+
+/// The scope Google grants for IMAP, POP and SMTP access ("The scope for
+/// IMAP, POP, and SMTP access", Google's Gmail API scopes page): an OAuth
+/// binding granted it is a mailbox reached over IMAP and SMTP with XOAUTH2
+/// (AEGIS ADR-125's Update of 2026-10-07 clause 10, 8a).
+pub const XOAUTH2_MAIL_SCOPE: &str = "https://mail.google.com/";
+
+/// Whether an OAuth binding's granted scopes make it a mailbox: they hold
+/// [`XOAUTH2_MAIL_SCOPE`] (clause 10, 8a). The one rule the callback and
+/// [`oauth_mailbox_settings`] both read.
+pub fn grants_mail_scope(granted_scopes: &[String]) -> bool {
+    granted_scopes.iter().any(|s| s == XOAUTH2_MAIL_SCOPE)
+}
+
+/// The mailbox settings of an OAuth binding whose granted scopes hold
+/// [`XOAUTH2_MAIL_SCOPE`]: Google's IMAP (`imap.gmail.com:993`, TLS) and
+/// SMTP (`smtp.gmail.com:465`, TLS) servers, the account's `address` as the
+/// address and the user both servers authenticate. `None` when the scope
+/// was not granted. The rule is keyed by the scope, never by a provider
+/// name (ADR-125's Update of 2026-10-04 clause 1; clause 10, 8a).
+pub fn oauth_mailbox_settings(granted_scopes: &[String], address: &str) -> Option<MailboxSettings> {
+    if !grants_mail_scope(granted_scopes) {
+        return None;
+    }
+    Some(MailboxSettings {
+        address: address.to_string(),
+        display_name: None,
+        imap_host: "imap.gmail.com".to_string(),
+        imap_port: 993,
+        imap_security: MailSecurity::Tls,
+        smtp_host: "smtp.gmail.com".to_string(),
+        smtp_port: 465,
+        smtp_security: MailSecurity::Tls,
+        username: address.to_string(),
+    })
+}
 
 /// A byte stream a mail session runs over: TCP, or TLS over TCP.
 pub trait MailStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -155,7 +243,8 @@ pub struct MailboxCheckFailure {
     pub kind: CheckFailureKind,
 }
 
-/// The check the credential service runs before storing an `imap` mailbox.
+/// The check the credential service runs before storing a mailbox: an
+/// `imap` mailbox with its password, or an OAuth mailbox with its token.
 #[async_trait]
 pub trait MailboxProbe: Send + Sync {
     /// Open an IMAP session and then an SMTP session with `settings` and
@@ -165,6 +254,15 @@ pub trait MailboxProbe: Send + Sync {
         &self,
         settings: &MailboxSettings,
         password: &SensitiveString,
+    ) -> Result<(), MailboxCheckFailure>;
+
+    /// The same two sessions authenticating with SASL `XOAUTH2` and the
+    /// OAuth access token `token` as `settings.username` (AEGIS ADR-125's
+    /// Update of 2026-10-07 clause 10, 8a).
+    async fn check_xoauth2(
+        &self,
+        settings: &MailboxSettings,
+        token: &SensitiveString,
     ) -> Result<(), MailboxCheckFailure>;
 }
 
@@ -213,6 +311,27 @@ impl MailboxProbe for SessionMailboxProbe {
         settings: &MailboxSettings,
         password: &SensitiveString,
     ) -> Result<(), MailboxCheckFailure> {
+        self.run(settings, &MailAuth::Password(password.clone()))
+            .await
+    }
+
+    async fn check_xoauth2(
+        &self,
+        settings: &MailboxSettings,
+        token: &SensitiveString,
+    ) -> Result<(), MailboxCheckFailure> {
+        self.run(settings, &MailAuth::XOAuth2(token.clone())).await
+    }
+}
+
+impl SessionMailboxProbe {
+    /// Both sessions, each endpoint admitted first, authenticating by `auth`.
+    async fn run(
+        &self,
+        settings: &MailboxSettings,
+        auth: &MailAuth,
+    ) -> Result<(), MailboxCheckFailure> {
+        let secrets = auth.secret_forms(&settings.username);
         let timed_out = |protocol| MailboxCheckFailure {
             protocol,
             reply: format!("no answer within {} seconds", self.timeout.as_secs()),
@@ -228,7 +347,7 @@ impl MailboxProbe for SessionMailboxProbe {
                 security: settings.imap_security.clone(),
             })
             .await
-            .map_err(|e| wire::failure_of(MailProtocol::Imap, e, password))?;
+            .map_err(|e| wire::failure_of(MailProtocol::Imap, e, &secrets))?;
         let smtp_target = self
             .admit(MailTarget {
                 protocol: MailProtocol::Smtp,
@@ -237,16 +356,16 @@ impl MailboxProbe for SessionMailboxProbe {
                 security: settings.smtp_security.clone(),
             })
             .await
-            .map_err(|e| wire::failure_of(MailProtocol::Smtp, e, password))?;
+            .map_err(|e| wire::failure_of(MailProtocol::Smtp, e, &secrets))?;
         tokio::time::timeout(
             self.timeout,
-            imap::check(self.connector.as_ref(), &imap_target, settings, password),
+            imap::check(self.connector.as_ref(), &imap_target, settings, auth),
         )
         .await
         .map_err(|_| timed_out(MailProtocol::Imap))??;
         tokio::time::timeout(
             self.timeout,
-            smtp::check(self.connector.as_ref(), &smtp_target, settings, password),
+            smtp::check(self.connector.as_ref(), &smtp_target, settings, auth),
         )
         .await
         .map_err(|_| timed_out(MailProtocol::Smtp))??;

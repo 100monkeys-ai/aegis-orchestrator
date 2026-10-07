@@ -11,6 +11,11 @@
 //! - Who may use a mailbox: the person, the mailbox's owner, the run's
 //!   choice for `imap` and the grant.
 //! - The production connector's guard refuses a loopback mail server.
+//! - An OAuth mailbox authenticates with SASL `XOAUTH2` and the token its
+//!   source answers, never `LOGIN`; a refused token answers the session
+//!   failure with the decoded challenge, and neither the token nor its
+//!   base64 response reaches the error (AEGIS ADR-125's Update of
+//!   2026-10-07 clauses 8 and 10).
 //!
 //! The mailbox source here answers one mailbox for its owner; the real
 //! source's ownership checks are tested beside it in the crate
@@ -33,8 +38,13 @@ use aegis_orchestrator_core::domain::execution::ServerChoice;
 use aegis_orchestrator_core::domain::seal_session::{CallerAnswer, SealSessionError};
 use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::infrastructure::mail::MailAuth;
 use async_trait::async_trait;
-use mail_standins::{imap_mailbox_standin, MailboxStandIn, PlainConnector, StoredMessage};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use mail_standins::{
+    imap_mailbox_standin, imap_xoauth2_standin, xoauth2_string, MailboxStandIn, PlainConnector,
+    StoredMessage, XOAUTH2_CHALLENGE, XOAUTH2_IMAP_REFUSAL,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -73,7 +83,7 @@ impl ToolMailboxSource for OneMailbox {
                 smtp_security: MailSecurity::Tls,
                 username: LOGIN.to_string(),
             },
-            password: SensitiveString::new(PASSWORD),
+            auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
             granted: self.granted,
         }))
     }
@@ -582,4 +592,138 @@ async fn the_production_connector_refuses_a_loopback_mail_server() {
         "the guard did not refuse a loopback server: {error:?}"
     );
     assert_eq!(mailbox.connections(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// An OAuth mailbox: SASL XOAUTH2 (ADR-125's Update of 2026-10-07 clauses 8, 10)
+// ---------------------------------------------------------------------------
+
+const OAUTH_ADDRESS: &str = "jeshua@workspace.example.test";
+const TOKEN: &str = "ya29.Mk7-xoauth2-access-token";
+
+/// Answers one OAuth mailbox to its owner, authenticating by XOAUTH2 with
+/// `token`, and records each binding it was asked for.
+struct OAuthMailbox {
+    id: CredentialBindingId,
+    port: u16,
+    token: String,
+    asked: std::sync::Mutex<Vec<CredentialBindingId>>,
+}
+
+#[async_trait]
+impl ToolMailboxSource for OAuthMailbox {
+    async fn tool_mailbox(
+        &self,
+        actor: &ToolCallActor<'_>,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<Option<ToolMailbox>> {
+        self.asked.lock().unwrap().push(*binding_id);
+        if *binding_id != self.id || actor.user_id != USER {
+            return Ok(None);
+        }
+        Ok(Some(ToolMailbox {
+            binding_id: self.id,
+            settings: MailboxSettings {
+                address: OAUTH_ADDRESS.to_string(),
+                display_name: None,
+                imap_host: "127.0.0.1".to_string(),
+                imap_port: self.port,
+                imap_security: MailSecurity::Tls,
+                smtp_host: "127.0.0.1".to_string(),
+                smtp_port: 465,
+                smtp_security: MailSecurity::Tls,
+                username: OAUTH_ADDRESS.to_string(),
+            },
+            auth: MailAuth::XOAuth2(SensitiveString::new(self.token.clone())),
+            granted: false,
+        }))
+    }
+}
+
+/// The XOAUTH2 stand-in holding the inbox, and tools whose source answers
+/// `token` for it.
+async fn oauth_fixture(
+    token: &str,
+) -> (
+    MailboxStandIn,
+    MailTools,
+    CredentialBindingId,
+    Arc<OAuthMailbox>,
+) {
+    let mailbox = imap_xoauth2_standin(OAUTH_ADDRESS, TOKEN, inbox(), "\\*").await;
+    let id = CredentialBindingId::new();
+    let source = Arc::new(OAuthMailbox {
+        id,
+        port: mailbox.port(),
+        token: token.to_string(),
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    let tools = MailTools::with_connector(source.clone(), Arc::new(PlainConnector));
+    (mailbox, tools, id, source)
+}
+
+#[tokio::test]
+async fn an_oauth_mailbox_authenticates_with_xoauth2_and_never_logs_in() {
+    let (mailbox, tools, id, source) = oauth_fixture(TOKEN).await;
+    let answer = tools
+        .invoke(
+            "mail.list",
+            &json!({"mailbox": id.0.to_string()}),
+            &conversation(),
+        )
+        .await;
+    let commands = mailbox.commands();
+    assert!(
+        !commands.iter().any(|c| c
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|v| v.eq_ignore_ascii_case("LOGIN"))),
+        "a LOGIN was sent to an OAuth mailbox: {commands:?}"
+    );
+    assert!(
+        commands.iter().any(|c| c == "A1 AUTHENTICATE XOAUTH2"),
+        "no AUTHENTICATE XOAUTH2 was sent: {commands:?}"
+    );
+    assert_eq!(
+        mailbox.standin.sasl(),
+        vec![xoauth2_string(OAUTH_ADDRESS, TOKEN)],
+        "the stand-in did not receive exactly the SASL string"
+    );
+    let answer = answer.expect("mail.list over XOAUTH2");
+    assert_eq!(answer["threads"].as_array().map(Vec::len), Some(3));
+    assert_eq!(source.asked.lock().unwrap().clone(), vec![id]);
+}
+
+#[tokio::test]
+async fn a_refused_token_answers_the_session_failure_with_the_decoded_challenge_and_never_the_token(
+) {
+    let stale = "ya29.Mk7-refused-access-token";
+    let (mailbox, tools, id, _) = oauth_fixture(stale).await;
+    let error = tools
+        .invoke(
+            "mail.list",
+            &json!({"mailbox": id.0.to_string()}),
+            &conversation(),
+        )
+        .await
+        .expect_err("the stand-in refuses the token");
+    let said = sentence(&error);
+    let base64_response = STANDARD.encode(xoauth2_string(OAUTH_ADDRESS, stale));
+    assert_eq!(
+        mailbox.standin.after_challenge(),
+        vec![String::new()],
+        "the client did not answer the challenge with an empty line"
+    );
+    assert!(!said.contains(stale), "the token reached the error: {said}");
+    assert!(
+        !said.contains(&base64_response),
+        "the base64 response reached the error: {said}"
+    );
+    assert_eq!(
+        said,
+        format!(
+            "The mail server did not complete the request: {XOAUTH2_IMAP_REFUSAL} for [REDACTED] = user={OAUTH_ADDRESS}auth=Bearer [REDACTED] {XOAUTH2_CHALLENGE}"
+        ),
+        "the refusal is not the session failure with the decoded challenge"
+    );
 }

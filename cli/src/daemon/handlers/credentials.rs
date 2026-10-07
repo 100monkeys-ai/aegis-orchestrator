@@ -1212,27 +1212,56 @@ pub(crate) async fn oauth_callback_handler(
         }
     };
 
-    match svc
-        .complete_oauth_connection(&query.state, &query.code)
-        .await
-    {
+    oauth_callback_answer(
+        svc.complete_oauth_connection(&query.state, &query.code)
+            .await,
+    )
+}
+
+/// The callback's answer for what `complete_oauth_connection` returned.
+fn oauth_callback_answer(result: anyhow::Result<CredentialBindingId>) -> Response {
+    match result {
         Ok(binding_id) => (
             StatusCode::OK,
             Json(json!({"id": binding_id.to_string(), "status": "active"})),
         )
             .into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("invalid or expired") || msg.contains("not found") {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": msg})),
-                )
-                    .into_response()
+        Err(e) => match e.downcast_ref::<CredentialError>() {
+            // AEGIS ADR-125's Update of 2026-10-07 clause 10, 8a: a connect
+            // granted Google's mail scope whose IMAP or SMTP check refused
+            // its token stored nothing, answered as the mailbox route
+            // answers.
+            Some(CredentialError::MailboxUnreachable { protocol, reply }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "mailbox_unreachable",
+                    "protocol": protocol,
+                    "reply": reply,
+                })),
+            )
+                .into_response(),
+            Some(CredentialError::MailboxHostNotAllowed { field, reason }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "mailbox_host_not_allowed",
+                    "field": field,
+                    "message": reason,
+                })),
+            )
+                .into_response(),
+            _ => {
+                let msg = e.to_string();
+                if msg.contains("invalid or expired") || msg.contains("not found") {
+                    (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": msg})),
+                    )
+                        .into_response()
+                }
             }
-        }
+        },
     }
 }
 
@@ -2885,5 +2914,53 @@ mod reach_route_tests {
             answer["credential"]["metadata"]["reach"]["instance_slug"],
             "100monkeys-ai"
         );
+    }
+}
+
+#[cfg(test)]
+mod oauth_callback_answer_tests {
+    //! The OAuth callback's answer when a connect granted Google's mail
+    //! scope fails its IMAP or SMTP check (AEGIS ADR-125's Update of
+    //! 2026-10-07 clause 10, 8a): 422, as the mailbox route answers.
+
+    use super::oauth_callback_answer;
+    use aegis_orchestrator_core::application::credential_service::CredentialError;
+    use axum::http::StatusCode;
+
+    async fn answered(error: CredentialError) -> (StatusCode, serde_json::Value) {
+        let response = oauth_callback_answer(Err(error.into()));
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    #[tokio::test]
+    async fn a_refused_mailbox_check_at_the_callback_answers_422_mailbox_unreachable() {
+        let (status, body) = answered(CredentialError::MailboxUnreachable {
+            protocol: "imap".to_string(),
+            reply: "NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)".to_string(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "mailbox_unreachable");
+        assert_eq!(body["protocol"], "imap");
+        assert_eq!(
+            body["reply"],
+            "NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mail_host_the_guard_refuses_at_the_callback_answers_422_mailbox_host_not_allowed() {
+        let (status, body) = answered(CredentialError::MailboxHostNotAllowed {
+            field: "imap_host".to_string(),
+            reason: "imap_host resolves to a private address".to_string(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "mailbox_host_not_allowed");
+        assert_eq!(body["field"], "imap_host");
     }
 }

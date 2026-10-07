@@ -264,6 +264,13 @@ impl MailboxProbe for AcceptingProbe {
     ) -> Result<(), MailboxCheckFailure> {
         Ok(())
     }
+    async fn check_xoauth2(
+        &self,
+        _settings: &MailboxSettings,
+        _token: &SensitiveString,
+    ) -> Result<(), MailboxCheckFailure> {
+        Ok(())
+    }
 }
 
 struct Harness {

@@ -19,26 +19,31 @@ mod mail_standins;
 use aegis_orchestrator_core::application::credential_service::{
     oauth_provider_registry_from_config, CreateImapMailboxCommand, CredentialError,
     CredentialManagementService, OAuthProviderConfig, OAuthProviderRegistry,
-    StandardCredentialManagementService,
+    StandardCredentialManagementService, ToolCallActor, ToolCredentialSource, ToolMailboxSource,
 };
+use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialProvider,
     CredentialScope, CredentialStatus, CredentialType, GrantTarget, MailSecurity, MailboxSettings,
     OAuthPendingState, UserCredentialBinding,
 };
 use aegis_orchestrator_core::domain::events::CredentialEvent;
+use aegis_orchestrator_core::domain::execution::ContextChoice;
 use aegis_orchestrator_core::domain::node_config::{NodeConfigManifest, OAuthProviderEntry};
 use aegis_orchestrator_core::domain::secrets::{AccessContext, SensitiveString};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
-use aegis_orchestrator_core::infrastructure::mail::SessionMailboxProbe;
+use aegis_orchestrator_core::infrastructure::mail::{
+    MailAuth, MailProtocol, MailTarget, SessionMailboxProbe,
+};
 use aegis_orchestrator_core::infrastructure::secrets_manager::{SecretsManager, TestSecretStore};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use mail_standins::{
-    imap_standin, smtp_standin, smtp_submitted_a_message, PlainConnector, IMAP_REFUSAL,
-    SMTP_REFUSAL,
+    imap_standin, imap_xoauth2_standin, smtp_standin, smtp_submitted_a_message,
+    smtp_xoauth2_standin, xoauth2_string, MailboxStandIn, PlainConnector, RedirectConnector,
+    StandIn, IMAP_REFUSAL, SMTP_REFUSAL, XOAUTH2_CHALLENGE, XOAUTH2_IMAP_REFUSAL,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -850,4 +855,484 @@ async fn invalid_grant_on_refresh_sets_the_binding_expired_and_publishes_the_eve
     // An expired binding answers without another request.
     let err = h.service.access_token_for(&id).await.expect_err("expired");
     assert!(err.to_string().contains("not active"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// A Google mailbox by OAuth (ADR-125's Update of 2026-10-07 clauses 8, 10)
+// ---------------------------------------------------------------------------
+
+const MAIL_SCOPE: &str = "https://mail.google.com/";
+const GOOGLE_ADDRESS: &str = "jeshua@workspace.example.test";
+const GOOGLE_TOKEN: &str = "ya29.Mk7-google-mail-access-token";
+
+/// The registry entry `google` as production configures it: the mail
+/// scope and `email`.
+fn google_mail_registry(token_url: String) -> OAuthProviderRegistry {
+    let mut registry = google_registry(token_url);
+    registry
+        .get_mut(&CredentialProvider::new("google"))
+        .expect("google")
+        .scopes = vec![MAIL_SCOPE.to_string(), "email".to_string()];
+    registry
+}
+
+/// What a connect left behind: the harness, the pending binding's id, both
+/// stand-ins, the connector that saw the endpoints, and the outcome.
+struct GoogleConnect {
+    h: Harness,
+    binding: CredentialBindingId,
+    imap: MailboxStandIn,
+    smtp: StandIn,
+    connector: Arc<RedirectConnector>,
+    outcome: anyhow::Result<CredentialBindingId>,
+}
+
+/// Initiate and call back a `google` connect whose token endpoint answers
+/// `token_body`, against XOAUTH2 stand-ins accepting `accepted_token`, with
+/// the userinfo at `userinfo` when given.
+async fn google_connect(
+    server: &mut mockito::ServerGuard,
+    token_body: serde_json::Value,
+    accepted_token: &str,
+    userinfo: Option<String>,
+) -> GoogleConnect {
+    let _exchange = server
+        .mock("POST", "/token")
+        .match_body(mockito::Matcher::UrlEncoded(
+            "grant_type".into(),
+            "authorization_code".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(token_body.to_string())
+        .create_async()
+        .await;
+    let imap = imap_xoauth2_standin(GOOGLE_ADDRESS, accepted_token, Vec::new(), "\\*").await;
+    let smtp = smtp_xoauth2_standin(GOOGLE_ADDRESS, accepted_token).await;
+    let connector = Arc::new(RedirectConnector::new(imap.standin.addr, smtp.addr));
+    let mut h = harness(google_mail_registry(format!("{}/token", server.url())));
+    h.service = h
+        .service
+        .with_mailbox_probe(Arc::new(SessionMailboxProbe::new(connector.clone())));
+    if let Some(url) = userinfo {
+        h.service = h.service.with_mail_userinfo_url(url);
+    }
+    let init = h
+        .service
+        .initiate_oauth_connection(
+            USER,
+            &tenant(),
+            CredentialProvider::new("google"),
+            REDIRECT.to_string(),
+        )
+        .await
+        .unwrap();
+    let binding = h.repo.pending.read().await[&init.state].binding_id;
+    let outcome = h
+        .service
+        .complete_oauth_connection(&init.state, "auth-code")
+        .await;
+    GoogleConnect {
+        h,
+        binding,
+        imap,
+        smtp,
+        connector,
+        outcome,
+    }
+}
+
+fn google_token_body(id_token_email: Option<&str>, expires_in: i64) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "access_token": GOOGLE_TOKEN,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+        "refresh_token": "1//google-refresh-token",
+        "scope": format!("{MAIL_SCOPE} https://www.googleapis.com/auth/userinfo.email"),
+    });
+    if let Some(email) = id_token_email {
+        body["id_token"] = serde_json::json!(id_token(email));
+    }
+    body
+}
+
+fn google_settings(address: &str) -> MailboxSettings {
+    MailboxSettings {
+        address: address.to_string(),
+        display_name: None,
+        imap_host: "imap.gmail.com".to_string(),
+        imap_port: 993,
+        imap_security: MailSecurity::Tls,
+        smtp_host: "smtp.gmail.com".to_string(),
+        smtp_port: 465,
+        smtp_security: MailSecurity::Tls,
+        username: address.to_string(),
+    }
+}
+
+/// Whether a secret holding a token was written for `binding`.
+async fn token_written(h: &Harness, binding: &CredentialBindingId) -> bool {
+    let b = h.repo.find_by_id(binding).await.unwrap().unwrap();
+    h.secrets
+        .read_secret(
+            &b.secret_path.effective_mount(),
+            &b.secret_path.path,
+            &AccessContext::system("test"),
+        )
+        .await
+        .map(|stored| stored.contains_key("access_token"))
+        .unwrap_or(false)
+}
+
+fn actor(tenant: &TenantId) -> ToolCallActor<'_> {
+    ToolCallActor {
+        tenant_id: tenant,
+        user_id: USER,
+        agent_id: AgentId::new(),
+        workflow_id: None,
+        context: ContextChoice::NotGiven,
+    }
+}
+
+#[tokio::test]
+async fn a_callback_granted_the_mail_scope_stores_googles_settings_after_both_servers_accept_xoauth2(
+) {
+    let mut server = mockito::Server::new_async().await;
+    let c = google_connect(
+        &mut server,
+        google_token_body(Some(GOOGLE_ADDRESS), 3600),
+        GOOGLE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(
+        c.connector.admitted(),
+        vec![
+            MailTarget {
+                protocol: MailProtocol::Imap,
+                host: "imap.gmail.com".to_string(),
+                port: 993,
+                security: MailSecurity::Tls,
+            },
+            MailTarget {
+                protocol: MailProtocol::Smtp,
+                host: "smtp.gmail.com".to_string(),
+                port: 465,
+                security: MailSecurity::Tls,
+            },
+        ],
+        "the check did not reach Google's IMAP and SMTP endpoints"
+    );
+    let sasl = xoauth2_string(GOOGLE_ADDRESS, GOOGLE_TOKEN);
+    assert_eq!(
+        c.imap.standin.sasl(),
+        vec![sasl.clone()],
+        "IMAP did not see XOAUTH2"
+    );
+    assert_eq!(c.smtp.sasl(), vec![sasl], "SMTP did not see XOAUTH2");
+    let id = c
+        .outcome
+        .unwrap_or_else(|e| panic!("the connect did not complete: {e:#}"));
+    let b = c.h.repo.find_by_id(&id).await.unwrap().unwrap();
+    assert_eq!(b.status, CredentialStatus::Active);
+    assert_eq!(b.credential_type, CredentialType::OAuth2);
+    assert_eq!(
+        b.metadata.mailbox,
+        Some(google_settings(GOOGLE_ADDRESS)),
+        "the binding does not carry Google's mail settings with the id_token's address"
+    );
+    assert_eq!(b.metadata.label, GOOGLE_ADDRESS);
+    assert!(
+        c.imap.commands().iter().any(|l| l == "A2 SELECT INBOX"),
+        "the check did not select the inbox"
+    );
+    assert!(!smtp_submitted_a_message(&c.smtp.commands()));
+    assert!(token_written(&c.h, &id).await);
+}
+
+#[tokio::test]
+async fn without_an_id_token_the_mailbox_address_comes_from_the_userinfo() {
+    let mut server = mockito::Server::new_async().await;
+    let userinfo = server
+        .mock("GET", "/userinfo")
+        .match_header("authorization", format!("Bearer {GOOGLE_TOKEN}").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({"sub": "1", "email": GOOGLE_ADDRESS, "email_verified": true})
+                .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let url = format!("{}/userinfo", server.url());
+    let c = google_connect(
+        &mut server,
+        google_token_body(None, 3600),
+        GOOGLE_TOKEN,
+        Some(url),
+    )
+    .await;
+    let id = c
+        .outcome
+        .unwrap_or_else(|e| panic!("the userinfo's address was not taken: {e:#}"));
+    userinfo.assert_async().await;
+    let b = c.h.repo.find_by_id(&id).await.unwrap().unwrap();
+    assert_eq!(
+        b.metadata.mailbox,
+        Some(google_settings(GOOGLE_ADDRESS)),
+        "the userinfo's address was not taken"
+    );
+    assert_eq!(
+        b.metadata.external_account_id.as_deref(),
+        Some(GOOGLE_ADDRESS)
+    );
+}
+
+#[tokio::test]
+async fn with_neither_an_id_token_nor_a_userinfo_email_the_connect_is_refused_and_nothing_stored() {
+    let mut server = mockito::Server::new_async().await;
+    let _userinfo = server
+        .mock("GET", "/userinfo")
+        .with_status(401)
+        .create_async()
+        .await;
+    let url = format!("{}/userinfo", server.url());
+    let c = google_connect(
+        &mut server,
+        google_token_body(None, 3600),
+        GOOGLE_TOKEN,
+        Some(url),
+    )
+    .await;
+    let err = c
+        .outcome
+        .expect_err("a connect whose address no source names was not refused");
+    assert!(
+        err.to_string()
+            .contains("the mailbox's address could not be read"),
+        "the refusal does not say the mailbox's address could not be read: {err}"
+    );
+    let b = c.h.repo.find_by_id(&c.binding).await.unwrap().unwrap();
+    assert_eq!(b.status, CredentialStatus::PendingOAuth);
+    assert!(b.metadata.mailbox.is_none());
+    assert!(!token_written(&c.h, &c.binding).await, "a token was stored");
+    assert!(
+        c.h.repo.pending.read().await.is_empty(),
+        "the state was kept"
+    );
+    assert_eq!(
+        c.imap.connections(),
+        0,
+        "a session was opened without an address"
+    );
+}
+
+#[tokio::test]
+async fn a_mail_server_refusing_the_token_at_the_callback_answers_mailbox_unreachable_and_stores_nothing(
+) {
+    let mut server = mockito::Server::new_async().await;
+    let c = google_connect(
+        &mut server,
+        google_token_body(Some(GOOGLE_ADDRESS), 3600),
+        "ya29.Mk7-another-token",
+        None,
+    )
+    .await;
+    assert!(
+        !token_written(&c.h, &c.binding).await,
+        "a refused connect stored its token"
+    );
+    let err = c
+        .outcome
+        .expect_err("a token the mail server refused did not refuse the connect");
+    match credential_error(&err) {
+        CredentialError::MailboxUnreachable { protocol, reply } => {
+            assert_eq!(protocol, "imap");
+            assert!(reply.starts_with(XOAUTH2_IMAP_REFUSAL), "{reply}");
+            assert!(reply.ends_with(XOAUTH2_CHALLENGE), "{reply}");
+            assert!(
+                !reply.contains(GOOGLE_TOKEN),
+                "the token reached the reply: {reply}"
+            );
+        }
+        other => panic!("not mailbox_unreachable: {other:?}"),
+    }
+    assert_eq!(c.imap.standin.after_challenge(), vec![String::new()]);
+    let b = c.h.repo.find_by_id(&c.binding).await.unwrap().unwrap();
+    assert_eq!(
+        b.status,
+        CredentialStatus::PendingOAuth,
+        "a refused connect did not leave the binding pending"
+    );
+    assert!(b.metadata.mailbox.is_none());
+}
+
+#[tokio::test]
+async fn an_oauth_mailbox_answers_its_access_token_for_xoauth2_never_the_value_field() {
+    let mut server = mockito::Server::new_async().await;
+    let c = google_connect(
+        &mut server,
+        google_token_body(Some(GOOGLE_ADDRESS), 3600),
+        GOOGLE_TOKEN,
+        None,
+    )
+    .await;
+    let id = c.outcome.expect("connected");
+    // A `value` field planted beside the token: the mailbox never uses it.
+    let b = c.h.repo.find_by_id(&id).await.unwrap().unwrap();
+    let ctx = AccessContext::system("test");
+    let mount = b.secret_path.effective_mount();
+    let mut stored =
+        c.h.secrets
+            .read_secret(&mount, &b.secret_path.path, &ctx)
+            .await
+            .unwrap();
+    stored.insert(
+        "value".to_string(),
+        SensitiveString::new("Mk7-planted-value-field"),
+    );
+    c.h.secrets
+        .write_secret(&mount, &b.secret_path.path, stored, &ctx)
+        .await
+        .unwrap();
+
+    let tenant = tenant();
+    let mailbox =
+        c.h.service
+            .tool_mailbox(&actor(&tenant), &id)
+            .await
+            .unwrap()
+            .expect("the OAuth mailbox is answered");
+    assert_eq!(mailbox.settings, google_settings(GOOGLE_ADDRESS));
+    match &mailbox.auth {
+        MailAuth::XOAuth2(token) => assert_eq!(
+            token.expose(),
+            GOOGLE_TOKEN,
+            "the mailbox did not answer the access token"
+        ),
+        MailAuth::Password(_) => panic!("an OAuth mailbox answered a password"),
+    }
+}
+
+#[tokio::test]
+async fn an_oauth_mailbox_inside_the_margin_answers_a_refreshed_token() {
+    let mut server = mockito::Server::new_async().await;
+    let c = google_connect(
+        &mut server,
+        google_token_body(Some(GOOGLE_ADDRESS), 30),
+        GOOGLE_TOKEN,
+        None,
+    )
+    .await;
+    let id = c.outcome.expect("connected");
+    let refresh = server
+        .mock("POST", "/token")
+        .match_body(mockito::Matcher::UrlEncoded(
+            "grant_type".into(),
+            "refresh_token".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"access_token":"ya29.Mk7-refreshed-token","token_type":"Bearer","expires_in":3599}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let tenant = tenant();
+    let mailbox =
+        c.h.service
+            .tool_mailbox(&actor(&tenant), &id)
+            .await
+            .unwrap()
+            .expect("answered");
+    assert!(
+        matches!(&mailbox.auth, MailAuth::XOAuth2(t) if t.expose() == "ya29.Mk7-refreshed-token"),
+        "the mailbox did not answer the refreshed token"
+    );
+    refresh.assert_async().await;
+}
+
+#[tokio::test]
+async fn a_google_binding_without_the_mail_scope_is_not_a_mailbox() {
+    let mut server = mockito::Server::new_async().await;
+    // Granted gmail.modify and email, not `https://mail.google.com/`.
+    let mut body = google_token_body(Some(GOOGLE_ADDRESS), 3600);
+    body["scope"] = serde_json::json!(
+        "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/userinfo.email"
+    );
+    let c = google_connect(&mut server, body, GOOGLE_TOKEN, None).await;
+    let id = c.outcome.expect("connected");
+    let b = c.h.repo.find_by_id(&id).await.unwrap().unwrap();
+    assert!(
+        b.metadata.mailbox.is_none(),
+        "a binding without the mail scope was given mailbox settings"
+    );
+    assert_eq!(
+        c.imap.connections(),
+        0,
+        "a binding without the mail scope was checked"
+    );
+    let tenant = tenant();
+    assert!(
+        c.h.service
+            .tool_mailbox(&actor(&tenant), &id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a binding without the mail scope was answered as a mailbox"
+    );
+    assert!(
+        c.h.service
+            .context_bindings(&tenant, USER, "imap")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the imap key lists a binding without the mail scope"
+    );
+}
+
+#[tokio::test]
+async fn the_imap_key_lists_an_oauth_mailbox_beside_an_imap_one_named_by_its_address() {
+    let mut server = mockito::Server::new_async().await;
+    let c = google_connect(
+        &mut server,
+        google_token_body(Some(GOOGLE_ADDRESS), 3600),
+        GOOGLE_TOKEN,
+        None,
+    )
+    .await;
+    let oauth = c.outcome.expect("connected");
+    let imap = imap_standin(MAILBOX_USER, MAILBOX_PASSWORD).await;
+    let smtp = smtp_standin(MAILBOX_USER, MAILBOX_PASSWORD).await;
+    // The imap mailbox goes into the same store as the OAuth one.
+    let mut c_h = c.h;
+    c_h.service = c_h
+        .service
+        .with_mailbox_probe(Arc::new(SessionMailboxProbe::new(Arc::new(PlainConnector))));
+    let imap_binding = c_h
+        .service
+        .create_imap_mailbox(command(
+            settings(imap.port(), smtp.port(), MailSecurity::Starttls),
+            MAILBOX_PASSWORD,
+        ))
+        .await
+        .expect("imap mailbox stored");
+    let tenant = tenant();
+    let listed = c_h
+        .service
+        .context_bindings(&tenant, USER, "imap")
+        .await
+        .unwrap();
+    let by_id: Vec<(CredentialBindingId, String)> =
+        listed.iter().map(|b| (b.id, b.name.clone())).collect();
+    assert!(
+        by_id.contains(&(oauth, GOOGLE_ADDRESS.to_string())),
+        "the imap key does not list the OAuth mailbox by its address: {by_id:?}"
+    );
+    assert!(
+        by_id.iter().any(|(id, _)| *id == imap_binding.id),
+        "{by_id:?}"
+    );
+    let contexts = c_h.service.mailbox_contexts(&tenant, USER).await.unwrap();
+    assert_eq!(contexts, listed, "the tools' pool and the imap key differ");
 }

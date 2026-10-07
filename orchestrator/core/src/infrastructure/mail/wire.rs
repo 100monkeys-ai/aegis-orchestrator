@@ -3,7 +3,6 @@
 //! Line reading and reply sanitising shared by the IMAP and SMTP sessions.
 
 use super::{AdmissionError, BoxedMailStream, CheckFailureKind, MailProtocol, MailboxCheckFailure};
-use crate::domain::secrets::SensitiveString;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// The longest line either session reads; a server sending more is refused.
@@ -11,30 +10,31 @@ const MAX_LINE: u64 = 16 * 1024;
 /// The longest reply text kept for the user, in characters.
 pub(super) const MAX_REPLY: usize = 512;
 
-/// One session's buffered stream, with the protocol it speaks and the
-/// password to redact from anything the server says.
-pub(super) struct Wire<'a> {
+/// One session's buffered stream, with the protocol it speaks and every
+/// form of the secret to redact from anything the server says
+/// ([`super::MailAuth::secret_forms`]).
+pub(super) struct Wire {
     reader: BufReader<BoxedMailStream>,
     protocol: MailProtocol,
-    password: &'a SensitiveString,
+    secrets: Vec<String>,
 }
 
-impl<'a> Wire<'a> {
+impl Wire {
     pub(super) fn new(
         stream: BoxedMailStream,
         protocol: MailProtocol,
-        password: &'a SensitiveString,
+        secrets: Vec<String>,
     ) -> Self {
         Self {
             reader: BufReader::new(stream),
             protocol,
-            password,
+            secrets,
         }
     }
 
     /// A failure of this session carrying `reply`, sanitised.
     pub(super) fn fail(&self, reply: impl AsRef<str>) -> MailboxCheckFailure {
-        failure(self.protocol, reply.as_ref(), self.password)
+        failure(self.protocol, reply.as_ref(), &self.secrets)
     }
 
     /// Write `bytes` and flush.
@@ -43,11 +43,11 @@ impl<'a> Wire<'a> {
         stream
             .write_all(bytes)
             .await
-            .map_err(|e| failure(self.protocol, &format!("write failed: {e}"), self.password))?;
+            .map_err(|e| failure(self.protocol, &format!("write failed: {e}"), &self.secrets))?;
         stream
             .flush()
             .await
-            .map_err(|e| failure(self.protocol, &format!("write failed: {e}"), self.password))
+            .map_err(|e| failure(self.protocol, &format!("write failed: {e}"), &self.secrets))
     }
 
     /// Read one line, without its line ending. A closed connection or an
@@ -114,23 +114,23 @@ impl<'a> Wire<'a> {
             return Err(failure(
                 self.protocol,
                 "the server sent data after accepting STARTTLS and before the TLS handshake",
-                self.password,
+                &self.secrets,
             ));
         }
         Ok(self.reader.into_inner())
     }
 }
 
-/// A sanitised failure: control characters removed, the password redacted,
-/// at most [`MAX_REPLY`] characters.
+/// A sanitised failure: control characters removed, every form of the
+/// secret redacted, at most [`MAX_REPLY`] characters.
 pub(super) fn failure(
     protocol: MailProtocol,
     reply: &str,
-    password: &SensitiveString,
+    secrets: &[String],
 ) -> MailboxCheckFailure {
     MailboxCheckFailure {
         protocol,
-        reply: sanitise(reply, password),
+        reply: sanitise(reply, secrets),
         kind: CheckFailureKind::Unreachable,
     }
 }
@@ -139,22 +139,22 @@ pub(super) fn failure(
 pub(super) fn failure_of(
     protocol: MailProtocol,
     error: AdmissionError,
-    password: &SensitiveString,
+    secrets: &[String],
 ) -> MailboxCheckFailure {
     match error {
         AdmissionError::NotAllowed { field, reason } => MailboxCheckFailure {
             protocol,
-            reply: sanitise(&reason, password),
+            reply: sanitise(&reason, secrets),
             kind: CheckFailureKind::HostNotAllowed { field },
         },
-        AdmissionError::Unresolvable(reason) => failure(protocol, &reason, password),
+        AdmissionError::Unresolvable(reason) => failure(protocol, &reason, secrets),
     }
 }
 
-fn sanitise(reply: &str, password: &SensitiveString) -> String {
+fn sanitise(reply: &str, secrets: &[String]) -> String {
     let mut text: String = reply.chars().filter(|c| !c.is_control()).collect();
-    if !password.is_empty() {
-        text = text.replace(password.expose(), "[REDACTED]");
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        text = text.replace(secret.as_str(), "[REDACTED]");
     }
     text.trim().chars().take(MAX_REPLY).collect()
 }

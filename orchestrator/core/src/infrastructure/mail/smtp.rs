@@ -1,35 +1,37 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 //! The SMTP half of the mailbox check (RFC 5321, RFC 3207, RFC 4954):
-//! greeting, `EHLO`, optional `STARTTLS` and `EHLO` again, `AUTH`, `QUIT`.
+//! greeting, `EHLO`, optional `STARTTLS` and `EHLO` again, `AUTH` (`PLAIN`
+//! or `LOGIN` with a password, `XOAUTH2` with an OAuth token), `QUIT`.
 //! No `MAIL FROM`, `RCPT TO` or `DATA` is sent.
 
+use super::imap::decode_challenge;
 use super::wire::{failure, Wire};
-use super::{AdmittedTarget, MailConnector, MailProtocol, MailboxCheckFailure};
+use super::{AdmittedTarget, MailAuth, MailConnector, MailProtocol, MailboxCheckFailure};
 use crate::domain::credential::{MailSecurity, MailboxSettings};
-use crate::domain::secrets::SensitiveString;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 /// The name the client gives in `EHLO`.
 const EHLO_NAME: &str = "localhost";
 
-/// Run the SMTP session with `settings` and `password`, over the
-/// endpoint the connector admitted.
+/// Run the SMTP session with `settings`, authenticating by `auth`, over
+/// the endpoint the connector admitted.
 pub async fn check(
     connector: &dyn MailConnector,
     admitted: &AdmittedTarget,
     settings: &MailboxSettings,
-    password: &SensitiveString,
+    auth: &MailAuth,
 ) -> Result<(), MailboxCheckFailure> {
     let host = settings.smtp_host.as_str();
+    let secrets = auth.secret_forms(&settings.username);
     let stream = connector.connect(admitted).await.map_err(|e| {
         failure(
             MailProtocol::Smtp,
             &format!("connect to {host}:{} failed: {e}", settings.smtp_port),
-            password,
+            &secrets,
         )
     })?;
-    let mut wire = Wire::new(stream, MailProtocol::Smtp, password);
+    let mut wire = Wire::new(stream, MailProtocol::Smtp, secrets.clone());
 
     expect(&mut wire, 220).await?;
     let mut capabilities = ehlo(&mut wire).await?;
@@ -48,10 +50,10 @@ pub async fn check(
             failure(
                 MailProtocol::Smtp,
                 &format!("TLS handshake with {host} failed: {e}"),
-                password,
+                &secrets,
             )
         })?;
-        wire = Wire::new(stream, MailProtocol::Smtp, password);
+        wire = Wire::new(stream, MailProtocol::Smtp, secrets);
         capabilities = ehlo(&mut wire).await?;
     }
 
@@ -70,6 +72,19 @@ pub async fn check(
         .collect();
 
     let username = settings.username.as_str();
+    let password = match auth {
+        MailAuth::Password(password) => password,
+        MailAuth::XOAuth2(_) => {
+            let response = auth
+                .xoauth2_response(username)
+                .expect("an XOAUTH2 auth has a response");
+            authenticate_xoauth2(&mut wire, &mechanisms, response.expose()).await?;
+            if wire.send(b"QUIT\r\n").await.is_ok() {
+                let _ = reply(&mut wire).await;
+            }
+            return Ok(());
+        }
+    };
     if mechanisms.iter().any(|m| m == "PLAIN") {
         let token = STANDARD.encode(format!("\0{username}\0{}", password.expose()));
         wire.send(format!("AUTH PLAIN {token}\r\n").as_bytes())
@@ -102,8 +117,43 @@ pub async fn check(
     Ok(())
 }
 
+/// `AUTH XOAUTH2 <base64>` (Google's XOAUTH2 protocol over RFC 4954). A
+/// server that refuses the token answers `334` with a base64 JSON status;
+/// the client answers it with an empty line and the server ends with its
+/// refusal, which the failure carries with the decoded challenge (AEGIS
+/// ADR-125's Update of 2026-10-07 clause 10, 8c).
+async fn authenticate_xoauth2(
+    wire: &mut Wire,
+    mechanisms: &[String],
+    response: &str,
+) -> Result<(), MailboxCheckFailure> {
+    if !mechanisms.iter().any(|m| m == "XOAUTH2") {
+        return Err(wire.fail(format!(
+            "the server does not offer AUTH XOAUTH2 (offered: {})",
+            if mechanisms.is_empty() {
+                "none".to_string()
+            } else {
+                mechanisms.join(" ")
+            }
+        )));
+    }
+    wire.send(format!("AUTH XOAUTH2 {response}\r\n").as_bytes())
+        .await?;
+    let (code, lines) = reply(wire).await?;
+    match code {
+        235 => Ok(()),
+        334 => {
+            let challenge = decode_challenge(lines.join("").trim());
+            wire.send(b"\r\n").await?;
+            let (code, lines) = reply(wire).await?;
+            Err(wire.fail(format!("{} {challenge}", render(code, &lines))))
+        }
+        _ => Err(wire.fail(render(code, &lines))),
+    }
+}
+
 /// `EHLO`, answering the capability lines after the first.
-async fn ehlo(wire: &mut Wire<'_>) -> Result<Vec<String>, MailboxCheckFailure> {
+async fn ehlo(wire: &mut Wire) -> Result<Vec<String>, MailboxCheckFailure> {
     wire.send(format!("EHLO {EHLO_NAME}\r\n").as_bytes())
         .await?;
     let (code, lines) = reply(wire).await?;
@@ -114,7 +164,7 @@ async fn ehlo(wire: &mut Wire<'_>) -> Result<Vec<String>, MailboxCheckFailure> {
 }
 
 /// Read one reply and require `code`.
-async fn expect(wire: &mut Wire<'_>, code: u16) -> Result<(), MailboxCheckFailure> {
+async fn expect(wire: &mut Wire, code: u16) -> Result<(), MailboxCheckFailure> {
     let (got, lines) = reply(wire).await?;
     if got == code {
         Ok(())
@@ -125,7 +175,7 @@ async fn expect(wire: &mut Wire<'_>, code: u16) -> Result<(), MailboxCheckFailur
 
 /// One reply, possibly multi-line (`250-…` then `250 …`): its code and the
 /// text of each line.
-async fn reply(wire: &mut Wire<'_>) -> Result<(u16, Vec<String>), MailboxCheckFailure> {
+async fn reply(wire: &mut Wire) -> Result<(u16, Vec<String>), MailboxCheckFailure> {
     let mut lines = Vec::new();
     loop {
         let line = wire.line().await?;

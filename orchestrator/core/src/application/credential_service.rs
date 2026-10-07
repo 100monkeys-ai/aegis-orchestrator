@@ -36,7 +36,10 @@ use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, Sensiti
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::mail::{CheckFailureKind, MailboxProbe, SessionMailboxProbe};
+use crate::infrastructure::mail::{
+    grants_mail_scope, oauth_mailbox_settings, CheckFailureKind, MailAuth, MailboxCheckFailure,
+    MailboxProbe, SessionMailboxProbe,
+};
 use crate::infrastructure::secrets_manager::SecretsManager;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -730,33 +733,52 @@ pub trait ToolCredentialSource: Send + Sync {
 }
 
 /// A mail tool's mailbox (AEGIS ADR-125 D4 and its Update of 2026-10-07
-/// clause 7): an SMTP-with-IMAP binding of the acting person, its settings
-/// and its password, and whether it is granted to the calling agent, its
-/// workflow or all the person's agents.
+/// clauses 7, 8 and 10): a mailbox binding of the acting person, its
+/// settings and how its sessions authenticate (an `imap` binding's
+/// password, or an OAuth binding's access token for XOAUTH2), and whether
+/// it is granted to the calling agent, its workflow or all the person's
+/// agents.
 pub struct ToolMailbox {
     pub binding_id: CredentialBindingId,
     pub settings: crate::domain::credential::MailboxSettings,
-    pub password: SensitiveString,
+    pub auth: MailAuth,
     pub granted: bool,
+}
+
+/// Whether `binding` is a mailbox (AEGIS ADR-125's Update of 2026-10-07
+/// clause 10, 8b): it carries mailbox settings, and it is either an `imap`
+/// `mailbox` binding (D1) or an OAuth binding whose callback found Google's
+/// mail scope granted and gave it Google's settings (8a).
+pub fn is_mailbox_binding(binding: &UserCredentialBinding) -> bool {
+    binding.metadata.mailbox.is_some()
+        && match binding.credential_type {
+            CredentialType::Mailbox => binding.provider == CredentialProvider::imap(),
+            CredentialType::OAuth2 => true,
+            _ => false,
+        }
 }
 
 /// Answers the mailbox a mail tool's `mailbox` argument names (AEGIS
 /// ADR-125 D4, its Update of 2026-10-07 clause 7).
 #[async_trait]
 pub trait ToolMailboxSource: Send + Sync {
-    /// `binding_id` when it is the acting person's own binding, in the
-    /// tenant, of type `mailbox` and provider `imap`, Active, with mailbox
-    /// settings; `Ok(None)` for anything else, another person's binding
-    /// included. Whether the call may use it (the choice and the grant) is
-    /// the mail tools' decision, from [`ToolMailbox::granted`].
+    /// `binding_id` when it is the acting person's own Active mailbox in the
+    /// tenant ([`is_mailbox_binding`]: an `imap` binding with its password,
+    /// or an OAuth binding with mailbox settings and the access token
+    /// `access_token_for` answers, refreshed within 60 seconds of expiry);
+    /// `Ok(None)` for anything else, another person's binding and an OAuth
+    /// binding whose token can no longer be refreshed included. Whether the
+    /// call may use it (the choice and the grant) is the mail tools'
+    /// decision, from [`ToolMailbox::granted`].
     async fn tool_mailbox(
         &self,
         actor: &ToolCallActor<'_>,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<Option<ToolMailbox>>;
 
-    /// The acting person's own Active `imap` bindings in the tenant, each
-    /// with its context name (AEGIS ADR-125's Update of 2026-10-07 (2)
+    /// The acting person's own Active mailboxes in the tenant (`imap`
+    /// bindings and OAuth mailboxes together, ADR-125's Update of
+    /// 2026-10-07 clause 10, 8b), each with its context name (AEGIS ADR-125's Update of 2026-10-07 (2)
     /// clause 2, ADR-132 Update (13) S11c), so a mail tool's `mailbox` may
     /// name a chosen mailbox by name. The default answers none.
     async fn mailbox_contexts(
@@ -894,6 +916,12 @@ impl ToolCredentialSource for StandardCredentialManagementService {
         user_id: &str,
         server: &str,
     ) -> anyhow::Result<Vec<ContextBinding>> {
+        // The key `imap` chooses mailboxes of either form (ADR-125's Update
+        // of 2026-10-07 clause 10, 8b): the start check and the run's
+        // mailbox names read the same pool as the mail tools.
+        if server == CredentialProvider::IMAP {
+            return self.active_mailbox_bindings(tenant_id, user_id).await;
+        }
         self.active_context_bindings(tenant_id, user_id, &CredentialProvider::new(server))
             .await
     }
@@ -913,14 +941,30 @@ impl ToolMailboxSource for StandardCredentialManagementService {
             Some(settings)
                 if binding.owner_user_id == actor.user_id
                     && &binding.tenant_id == actor.tenant_id
-                    && binding.credential_type == CredentialType::Mailbox
-                    && binding.provider == CredentialProvider::imap()
+                    && is_mailbox_binding(&binding)
                     && binding.status == CredentialStatus::Active =>
             {
                 settings.clone()
             }
             _ => return Ok(None),
         };
+        let granted = granted_to(&binding, actor);
+        if binding.credential_type == CredentialType::OAuth2 {
+            // XOAUTH2 with the access token (clause 10, 8b): read from
+            // `access_token`, refreshed inside the margin; never `value`. A
+            // token that can no longer be refreshed has set the binding
+            // Expired, and the mailbox is not an active one.
+            let binding_id = binding.id;
+            return Ok(self
+                .binding_secret(binding)
+                .await?
+                .map(|token| ToolMailbox {
+                    binding_id,
+                    settings,
+                    auth: MailAuth::XOAuth2(token),
+                    granted,
+                }));
+        }
         let stored = self
             .secrets
             .read_secret(
@@ -936,8 +980,8 @@ impl ToolMailboxSource for StandardCredentialManagementService {
         Ok(Some(ToolMailbox {
             binding_id: binding.id,
             settings,
-            password,
-            granted: granted_to(&binding, actor),
+            auth: MailAuth::Password(password),
+            granted,
         }))
     }
 
@@ -946,12 +990,59 @@ impl ToolMailboxSource for StandardCredentialManagementService {
         tenant_id: &TenantId,
         user_id: &str,
     ) -> anyhow::Result<Vec<ContextBinding>> {
-        self.active_context_bindings(tenant_id, user_id, &CredentialProvider::imap())
-            .await
+        self.active_mailbox_bindings(tenant_id, user_id).await
     }
 }
 
 impl StandardCredentialManagementService {
+    /// The person's own Active mailboxes in the tenant, of either form (the
+    /// `imap` bindings and the OAuth bindings with mailbox settings), oldest
+    /// first, named as contexts in one pool
+    /// (AEGIS ADR-125's Update of 2026-10-07 clause 10, 8b; ADR-132 Update
+    /// (13) S11c).
+    async fn active_mailbox_bindings(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        let mut active: Vec<UserCredentialBinding> = self
+            .repo
+            .find_by_owner(tenant_id, user_id)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                // Every `imap` binding, as the key chose before; and every
+                // OAuth binding the callback gave mailbox settings.
+                (binding.provider == CredentialProvider::imap()
+                    || (binding.credential_type == CredentialType::OAuth2
+                        && binding.metadata.mailbox.is_some()))
+                    && binding.owner_user_id == user_id
+                    && &binding.tenant_id == tenant_id
+                    && binding.status == CredentialStatus::Active
+            })
+            .collect();
+        Ok(Self::named_contexts(&mut active))
+    }
+
+    /// `bindings` oldest first, each with its S11c name.
+    fn named_contexts(bindings: &mut [UserCredentialBinding]) -> Vec<ContextBinding> {
+        bindings.sort_by_key(|binding| (binding.created_at, binding.id.0));
+        let labelled: Vec<(CredentialBindingId, &str)> = bindings
+            .iter()
+            .map(|binding| (binding.id, binding.metadata.label.as_str()))
+            .collect();
+        let names = context_names(&labelled);
+        bindings
+            .iter()
+            .zip(names)
+            .map(|(binding, name)| ContextBinding {
+                id: binding.id,
+                name,
+                reach: binding.metadata.reach.clone(),
+            })
+            .collect()
+    }
+
     /// The person's own Active bindings of `provider` in the tenant, oldest
     /// first, named as contexts (AEGIS ADR-132 Update (13) S11c).
     async fn active_context_bindings(
@@ -972,21 +1063,7 @@ impl StandardCredentialManagementService {
                     && binding.status == CredentialStatus::Active
             })
             .collect();
-        active.sort_by_key(|binding| (binding.created_at, binding.id.0));
-        let labelled: Vec<(CredentialBindingId, &str)> = active
-            .iter()
-            .map(|binding| (binding.id, binding.metadata.label.as_str()))
-            .collect();
-        let names = context_names(&labelled);
-        Ok(active
-            .iter()
-            .zip(names)
-            .map(|(binding, name)| ContextBinding {
-                id: binding.id,
-                name,
-                reach: binding.metadata.reach.clone(),
-            })
-            .collect())
+        Ok(Self::named_contexts(&mut active))
     }
 
     /// The acting person's newest active binding for `provider` granted to
@@ -1200,8 +1277,12 @@ pub struct StandardCredentialManagementService {
     /// `team:<uuid>` binding is scoped to". `None` denies every team-scope
     /// reach, leaving owner and operator access.
     membership_repo: Option<Arc<dyn MembershipRepository>>,
-    /// The live IMAP and SMTP check run before an `imap` mailbox is stored.
+    /// The live IMAP and SMTP check run before a mailbox is stored: an
+    /// `imap` mailbox, or an OAuth binding granted Google's mail scope.
     mailbox_probe: Arc<dyn MailboxProbe>,
+    /// Where an OAuth mailbox's address is read when its token response
+    /// carries no id_token naming one ([`MAIL_USERINFO_URL`]).
+    mail_userinfo_url: String,
     /// Grounds a remote server's token (AEGIS ADR-132 (7a) S2); set once,
     /// late, by [`Self::set_remote_grounding`]. Unset: no provider is a
     /// remote server and nothing is grounded.
@@ -1235,6 +1316,7 @@ impl StandardCredentialManagementService {
             oauth_providers,
             membership_repo: None,
             mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
+            mail_userinfo_url: MAIL_USERINFO_URL.to_string(),
             remote_grounding: std::sync::OnceLock::new(),
         }
     }
@@ -1257,6 +1339,7 @@ impl StandardCredentialManagementService {
             oauth_providers,
             membership_repo: None,
             mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
+            mail_userinfo_url: MAIL_USERINFO_URL.to_string(),
             remote_grounding: std::sync::OnceLock::new(),
         }
     }
@@ -1264,6 +1347,13 @@ impl StandardCredentialManagementService {
     /// Replace the mailbox check (tests point it at loopback stand-ins).
     pub fn with_mailbox_probe(mut self, probe: Arc<dyn MailboxProbe>) -> Self {
         self.mailbox_probe = probe;
+        self
+    }
+
+    /// Read an OAuth mailbox's address from another userinfo endpoint
+    /// (tests point it at a loopback stand-in).
+    pub fn with_mail_userinfo_url(mut self, url: impl Into<String>) -> Self {
+        self.mail_userinfo_url = url.into();
         self
     }
 
@@ -1555,6 +1645,47 @@ impl StandardCredentialManagementService {
         }
     }
 
+    /// The verified email address the provider's userinfo answers for
+    /// `access_token` (OpenID Connect Core §5.3), for an OAuth mailbox whose
+    /// token response named none. Logs the outcome, never the token.
+    async fn userinfo_email(
+        &self,
+        access_token: &SensitiveString,
+    ) -> Result<String, CredentialError> {
+        ensure_secure_token_url(&self.mail_userinfo_url)?;
+        let resp = self
+            .http
+            .get(&self.mail_userinfo_url)
+            .bearer_auth(access_token.expose())
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| CredentialError::HttpError(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(CredentialError::InvalidResponse(format!(
+                "the provider's userinfo answered {status}"
+            )));
+        }
+        let claims: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CredentialError::InvalidResponse(format!("userinfo: {e}")))?;
+        if claims.get("email_verified") == Some(&serde_json::Value::Bool(false)) {
+            return Err(CredentialError::InvalidResponse(
+                "the userinfo's email is not verified".to_string(),
+            ));
+        }
+        claims
+            .get("email")
+            .and_then(|e| e.as_str())
+            .filter(|e| e.contains('@'))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                CredentialError::InvalidResponse("the userinfo carries no email".to_string())
+            })
+    }
+
     /// Mark `binding` `Expired` and publish [`CredentialEvent::CredentialExpired`].
     async fn expire(&self, mut binding: UserCredentialBinding) -> anyhow::Result<()> {
         binding.status = CredentialStatus::Expired;
@@ -1571,6 +1702,41 @@ impl StandardCredentialManagementService {
                 tenant_id: binding.tenant_id,
             });
         Ok(())
+    }
+}
+
+/// Google's OpenID Connect userinfo endpoint, where an OAuth mailbox's
+/// address is read when its token response carries no id_token naming one
+/// (AEGIS ADR-125's Update of 2026-10-07 clauses 8 and 10, 8a). Like
+/// [`crate::infrastructure::mail::XOAUTH2_MAIL_SCOPE`]'s hosts it belongs to the scope that made the
+/// binding a mailbox, not to a provider name.
+pub const MAIL_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+
+/// The error a mailbox check's refusal answers: `mailbox_host_not_allowed`
+/// for an endpoint the guard refused, else `mailbox_unreachable` with the
+/// server's reply (ADR-125 D1; its Update of 2026-10-07 clause 10, 8a).
+fn mailbox_check_refusal(failure: MailboxCheckFailure, address: &str) -> CredentialError {
+    if let CheckFailureKind::HostNotAllowed { field } = failure.kind {
+        tracing::warn!(
+            address = %address,
+            field,
+            reason = %failure.reply,
+            "Mailbox check refused an endpoint outside the rule; no connection made"
+        );
+        return CredentialError::MailboxHostNotAllowed {
+            field: field.to_string(),
+            reason: failure.reply,
+        };
+    }
+    tracing::info!(
+        address = %address,
+        protocol = %failure.protocol,
+        reply = %failure.reply,
+        "Mailbox check failed; no binding stored"
+    );
+    CredentialError::MailboxUnreachable {
+        protocol: failure.protocol.to_string(),
+        reply: failure.reply,
     }
 }
 
@@ -1712,30 +1878,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
 
         // The live check, before anything is stored.
         if let Err(failure) = self.mailbox_probe.check(&settings, &password).await {
-            if let CheckFailureKind::HostNotAllowed { field } = failure.kind {
-                tracing::warn!(
-                    address = %settings.address,
-                    field,
-                    reason = %failure.reply,
-                    "Mailbox check refused an endpoint outside the rule; no connection made"
-                );
-                return Err(CredentialError::MailboxHostNotAllowed {
-                    field: field.to_string(),
-                    reason: failure.reply,
-                }
-                .into());
-            }
-            tracing::info!(
-                address = %settings.address,
-                protocol = %failure.protocol,
-                reply = %failure.reply,
-                "Mailbox check failed; no binding stored"
-            );
-            return Err(CredentialError::MailboxUnreachable {
-                protocol: failure.protocol.to_string(),
-                reply: failure.reply,
-            }
-            .into());
+            return Err(mailbox_check_refusal(failure, &settings.address).into());
         }
 
         let binding_id = CredentialBindingId::new();
@@ -2096,6 +2239,42 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 .and_then(|t| email_from_id_token(t).ok())
             {
                 binding.metadata.external_account_id = Some(address);
+            }
+
+            // ADR-125's Update of 2026-10-07 clause 10, 8a: a binding granted
+            // Google's mail scope is a mailbox. Its address is the id_token's
+            // email, else the userinfo's; it takes Google's settings and its
+            // address as label; and IMAP and SMTP must accept its token by
+            // XOAUTH2 before anything is stored. A refusal stores nothing and
+            // leaves the binding pending.
+            let granted = binding.metadata.oauth_scopes.clone().unwrap_or_default();
+            if grants_mail_scope(&granted) {
+                let address = match binding.metadata.external_account_id.clone() {
+                    Some(address) => address,
+                    None => match self.userinfo_email(&token_response.access_token).await {
+                        Ok(address) => address,
+                        Err(e) => {
+                            self.repo.delete_oauth_state(state).await?;
+                            return Err(CredentialError::InvalidResponse(format!(
+                                "the mailbox's address could not be read: the token response names no email and the provider's userinfo did not either ({e})"
+                            ))
+                            .into());
+                        }
+                    },
+                };
+                let settings =
+                    oauth_mailbox_settings(&granted, &address).expect("the mail scope was granted");
+                if let Err(failure) = self
+                    .mailbox_probe
+                    .check_xoauth2(&settings, &token_response.access_token)
+                    .await
+                {
+                    self.repo.delete_oauth_state(state).await?;
+                    return Err(mailbox_check_refusal(failure, &address).into());
+                }
+                binding.metadata.label = address.clone();
+                binding.metadata.external_account_id = Some(address);
+                binding.metadata.mailbox = Some(settings);
             }
         }
         if binding.credential_type == CredentialType::Mailbox {

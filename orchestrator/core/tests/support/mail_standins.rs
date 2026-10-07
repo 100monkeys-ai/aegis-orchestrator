@@ -25,11 +25,23 @@
 //! `PEEK` sets `\Seen`, as a server does) and `UID STORE` (`+FLAGS`,
 //! `-FLAGS`; a keyword its `PERMANENTFLAGS` does not keep is dropped, as a
 //! server drops it). It records every command line, as the first does.
+//!
+//! [`imap_xoauth2_standin`] is that mailbox stand-in demanding SASL
+//! `XOAUTH2` (AEGIS ADR-125's Update of 2026-10-07 clauses 8 and 10): it
+//! refuses `LOGIN`, answers `AUTHENTICATE XOAUTH2` with `+`, and records the
+//! decoded SASL string it receives; a wrong token gets Google's shape of
+//! refusal, a `+` challenge holding a base64 JSON status, then, after the
+//! client's line, a tagged `NO`. Its refusal repeats what it received, raw
+//! and decoded, so a test can show the client redacts both.
+//! [`smtp_xoauth2_standin`] does the same over `AUTH XOAUTH2`.
+//! [`RedirectConnector`] records every endpoint it is asked to admit and
+//! connects IMAP and SMTP to two stand-ins, so a session whose settings
+//! name Google's hosts reaches loopback.
 
 #![allow(dead_code)]
 
 use aegis_orchestrator_core::infrastructure::mail::{
-    AdmissionError, AdmittedTarget, BoxedMailStream, MailConnector, MailTarget,
+    AdmissionError, AdmittedTarget, BoxedMailStream, MailConnector, MailProtocol, MailTarget,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -43,6 +55,17 @@ pub const IMAP_REFUSAL: &str = "NO [AUTHENTICATIONFAILED] Invalid credentials (i
 /// The reply the SMTP stand-in gives to an AUTH with the wrong password.
 pub const SMTP_REFUSAL: &str = "535 5.7.8 Authentication credentials invalid (smtp stand-in)";
 
+/// The JSON status Google's servers send, base64, as an XOAUTH2 challenge
+/// when they refuse a token.
+pub const XOAUTH2_CHALLENGE: &str =
+    r#"{"status":"401","schemes":"Bearer","scope":"https://mail.google.com/"}"#;
+/// The tagged refusal the XOAUTH2 IMAP stand-in ends a refused exchange
+/// with, before the echo of what it received.
+pub const XOAUTH2_IMAP_REFUSAL: &str = "NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)";
+/// The reply the XOAUTH2 SMTP stand-in ends a refused exchange with, before
+/// the echo of what it received.
+pub const XOAUTH2_SMTP_REFUSAL: &str = "535 5.7.8 Username and Password not accepted";
+
 /// A running stand-in: its address and every command line it received.
 #[derive(Clone)]
 pub struct StandIn {
@@ -50,9 +73,32 @@ pub struct StandIn {
     pub commands: Arc<Mutex<Vec<String>>>,
     /// Every connection accepted, whether or not it sent a command.
     pub accepted: Arc<std::sync::atomic::AtomicUsize>,
+    /// Each SASL `XOAUTH2` response received, decoded.
+    pub sasl: Arc<Mutex<Vec<String>>>,
+    /// Each line the client sent in answer to a refusal's challenge.
+    pub after_challenge: Arc<Mutex<Vec<String>>>,
 }
 
 impl StandIn {
+    fn new(
+        addr: SocketAddr,
+        commands: Arc<Mutex<Vec<String>>>,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            addr,
+            commands,
+            accepted,
+            sasl: Arc::new(Mutex::new(Vec::new())),
+            after_challenge: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+    pub fn sasl(&self) -> Vec<String> {
+        self.sasl.lock().unwrap().clone()
+    }
+    pub fn after_challenge(&self) -> Vec<String> {
+        self.after_challenge.lock().unwrap().clone()
+    }
     pub fn port(&self) -> u16 {
         self.addr.port()
     }
@@ -229,11 +275,7 @@ pub async fn imap_standin(user: &str, password: &str) -> StandIn {
             });
         }
     });
-    StandIn {
-        addr,
-        commands,
-        accepted,
-    }
+    StandIn::new(addr, commands, accepted)
 }
 
 /// An SMTP stand-in accepting `user`/`password` on AUTH PLAIN or LOGIN.
@@ -326,10 +368,186 @@ pub async fn smtp_standin(user: &str, password: &str) -> StandIn {
             });
         }
     });
-    StandIn {
+    StandIn::new(addr, commands, accepted)
+}
+
+/// The SASL `XOAUTH2` string a client sends as `user` with `token`.
+pub fn xoauth2_string(user: &str, token: &str) -> String {
+    format!("user={user}\x01auth=Bearer {token}\x01\x01")
+}
+
+/// How the mailbox stand-in authenticates its client.
+#[derive(Clone)]
+enum StandInAuth {
+    Login { user: String, password: String },
+    XOAuth2 { user: String, token: String },
+}
+
+/// The answer to one `XOAUTH2` response line `raw`: `Ok(())` when it
+/// carries `user` and `token`; otherwise the challenge has been sent, the
+/// client's answer read and recorded, and the refusal's echo is returned.
+async fn xoauth2_exchange<R, W>(
+    reader: &mut BufReader<R>,
+    write: &mut W,
+    raw: &str,
+    expected: &str,
+    standin: &StandIn,
+    challenge_prefix: &str,
+) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let decoded = STANDARD
+        .decode(raw.trim())
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+    standin.sasl.lock().unwrap().push(decoded.clone());
+    if decoded == expected {
+        return Ok(());
+    }
+    let _ = write
+        .write_all(
+            format!(
+                "{challenge_prefix}{}\r\n",
+                STANDARD.encode(XOAUTH2_CHALLENGE)
+            )
+            .as_bytes(),
+        )
+        .await;
+    let mut answer = String::new();
+    let _ = reader.read_line(&mut answer).await;
+    standin
+        .after_challenge
+        .lock()
+        .unwrap()
+        .push(answer.trim_end_matches(['\r', '\n']).to_string());
+    Err(format!("for {} = {decoded}", raw.trim()))
+}
+
+/// An SMTP stand-in demanding `AUTH XOAUTH2` as `user` with `token`; `AUTH
+/// PLAIN` and `AUTH LOGIN` are refused.
+pub async fn smtp_xoauth2_standin(user: &str, token: &str) -> StandIn {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind smtp");
+    let addr = listener.local_addr().unwrap();
+    let standin = StandIn::new(
         addr,
-        commands,
-        accepted,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let shared = standin.clone();
+    let expected = xoauth2_string(user, token);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            shared
+                .accepted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (read, mut write) = socket.into_split();
+            let mut reader = BufReader::new(read);
+            let standin = shared.clone();
+            let expected = expected.clone();
+            tokio::spawn(async move {
+                let _ = write.write_all(b"220 smtp.stand-in ESMTP ready\r\n").await;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let line = line.trim_end_matches(['\r', '\n']).to_string();
+                    let upper = line.to_ascii_uppercase();
+                    let reply = if let Some(raw) = upper
+                        .starts_with("AUTH XOAUTH2 ")
+                        .then(|| line["AUTH XOAUTH2 ".len()..].to_string())
+                    {
+                        standin
+                            .commands
+                            .lock()
+                            .unwrap()
+                            .push("AUTH XOAUTH2".to_string());
+                        match xoauth2_exchange(
+                            &mut reader,
+                            &mut write,
+                            &raw,
+                            &expected,
+                            &standin,
+                            "334 ",
+                        )
+                        .await
+                        {
+                            Ok(()) => "235 2.7.0 Accepted\r\n".to_string(),
+                            Err(echo) => format!("{XOAUTH2_SMTP_REFUSAL} {echo}\r\n"),
+                        }
+                    } else {
+                        standin.commands.lock().unwrap().push(line.clone());
+                        if upper.starts_with("EHLO") {
+                            "250-smtp.stand-in\r\n250 AUTH XOAUTH2 PLAIN LOGIN\r\n".to_string()
+                        } else if upper.starts_with("AUTH ") {
+                            format!("{SMTP_REFUSAL}\r\n")
+                        } else if upper == "QUIT" {
+                            let _ = write.write_all(b"221 2.0.0 bye\r\n").await;
+                            break;
+                        } else {
+                            "502 5.5.2 command not implemented by the stand-in\r\n".to_string()
+                        }
+                    };
+                    if write.write_all(reply.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    standin
+}
+
+/// A connector that records every endpoint it is asked to admit and
+/// connects IMAP to `imap` and SMTP to `smtp` in plaintext, whatever host
+/// and port the settings name; `STARTTLS` is the identity.
+pub struct RedirectConnector {
+    pub imap: SocketAddr,
+    pub smtp: SocketAddr,
+    pub admitted: Arc<Mutex<Vec<MailTarget>>>,
+}
+
+impl RedirectConnector {
+    pub fn new(imap: SocketAddr, smtp: SocketAddr) -> Self {
+        Self {
+            imap,
+            smtp,
+            admitted: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+    pub fn admitted(&self) -> Vec<MailTarget> {
+        self.admitted.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MailConnector for RedirectConnector {
+    async fn admit(&self, target: MailTarget) -> Result<AdmittedTarget, AdmissionError> {
+        self.admitted.lock().unwrap().push(target.clone());
+        let addr = match target.protocol {
+            MailProtocol::Imap => self.imap,
+            MailProtocol::Smtp => self.smtp,
+        };
+        Ok(AdmittedTarget {
+            target,
+            addrs: vec![addr],
+        })
+    }
+
+    async fn connect(&self, admitted: &AdmittedTarget) -> std::io::Result<BoxedMailStream> {
+        let stream = TcpStream::connect(admitted.addrs[0]).await?;
+        Ok(Box::new(stream))
+    }
+
+    async fn start_tls(
+        &self,
+        stream: BoxedMailStream,
+        _host: &str,
+    ) -> std::io::Result<BoxedMailStream> {
+        Ok(stream)
     }
 }
 
@@ -533,17 +751,50 @@ pub async fn imap_mailbox_standin(
     messages: Vec<StoredMessage>,
     permanent_flags: &str,
 ) -> MailboxStandIn {
+    mailbox_standin(
+        StandInAuth::Login {
+            user: user.to_string(),
+            password: password.to_string(),
+        },
+        messages,
+        permanent_flags,
+    )
+    .await
+}
+
+/// The mailbox stand-in demanding SASL `XOAUTH2` as `user` with `token`:
+/// `LOGIN` is refused.
+pub async fn imap_xoauth2_standin(
+    user: &str,
+    token: &str,
+    messages: Vec<StoredMessage>,
+    permanent_flags: &str,
+) -> MailboxStandIn {
+    mailbox_standin(
+        StandInAuth::XOAuth2 {
+            user: user.to_string(),
+            token: token.to_string(),
+        },
+        messages,
+        permanent_flags,
+    )
+    .await
+}
+
+async fn mailbox_standin(
+    auth: StandInAuth,
+    messages: Vec<StoredMessage>,
+    permanent_flags: &str,
+) -> MailboxStandIn {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind imap");
     let addr = listener.local_addr().unwrap();
     let commands = Arc::new(Mutex::new(Vec::new()));
     let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let standin = StandIn::new(addr, commands.clone(), accepted.clone());
     let store = Arc::new(Mutex::new(messages));
     let (seen, count, mailbox) = (commands.clone(), accepted.clone(), store.clone());
-    let (user, password, permanent) = (
-        user.to_string(),
-        password.to_string(),
-        permanent_flags.to_string(),
-    );
+    let permanent = permanent_flags.to_string();
+    let shared = standin.clone();
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -551,7 +802,7 @@ pub async fn imap_mailbox_standin(
             let mut reader = BufReader::new(read);
             let seen = seen.clone();
             let mailbox = mailbox.clone();
-            let (user, password, permanent) = (user.clone(), password.clone(), permanent.clone());
+            let (auth, permanent, standin) = (auth.clone(), permanent.clone(), shared.clone());
             tokio::spawn(async move {
                 let _ = write
                     .write_all(b"* OK IMAP4rev1 mailbox stand-in ready\r\n")
@@ -567,13 +818,57 @@ pub async fn imap_mailbox_standin(
                     match verb.as_str() {
                         "LOGIN" => {
                             let args = imap_args(&rest);
-                            if args.len() == 2 && args[0] == user && args[1] == password {
-                                logged_in = true;
-                                reply.extend(format!("{tag} OK LOGIN completed\r\n").bytes());
-                            } else {
-                                reply.extend(format!("{tag} {IMAP_REFUSAL}\r\n").bytes());
+                            match &auth {
+                                StandInAuth::Login { user, password }
+                                    if args.len() == 2
+                                        && &args[0] == user
+                                        && &args[1] == password =>
+                                {
+                                    logged_in = true;
+                                    reply.extend(format!("{tag} OK LOGIN completed\r\n").bytes());
+                                }
+                                StandInAuth::Login { .. } => {
+                                    reply.extend(format!("{tag} {IMAP_REFUSAL}\r\n").bytes());
+                                }
+                                StandInAuth::XOAuth2 { .. } => reply.extend(
+                                    format!("{tag} NO [ALERT] LOGIN is disabled: use XOAUTH2\r\n")
+                                        .bytes(),
+                                ),
                             }
                         }
+                        "AUTHENTICATE" if rest.eq_ignore_ascii_case("XOAUTH2") => match &auth {
+                            StandInAuth::XOAuth2 { user, token } => {
+                                let _ = write.write_all(b"+ \r\n").await;
+                                let mut raw = String::new();
+                                if reader.read_line(&mut raw).await.unwrap_or(0) == 0 {
+                                    break;
+                                }
+                                let expected = xoauth2_string(user, token);
+                                match xoauth2_exchange(
+                                    &mut reader,
+                                    &mut write,
+                                    &raw,
+                                    &expected,
+                                    &standin,
+                                    "+ ",
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        logged_in = true;
+                                        reply.extend(
+                                            format!("{tag} OK AUTHENTICATE completed\r\n").bytes(),
+                                        );
+                                    }
+                                    Err(echo) => reply.extend(
+                                        format!("{tag} {XOAUTH2_IMAP_REFUSAL} {echo}\r\n").bytes(),
+                                    ),
+                                }
+                            }
+                            StandInAuth::Login { .. } => {
+                                reply.extend(format!("{tag} NO XOAUTH2 is not offered\r\n").bytes())
+                            }
+                        },
                         "LOGOUT" => {
                             let _ = write
                                 .write_all(format!("* BYE logging out\r\n{tag} OK\r\n").as_bytes())
@@ -740,11 +1035,7 @@ pub async fn imap_mailbox_standin(
         }
     });
     MailboxStandIn {
-        standin: StandIn {
-            addr,
-            commands,
-            accepted,
-        },
+        standin,
         messages: store,
     }
 }

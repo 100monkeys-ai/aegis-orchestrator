@@ -3,9 +3,12 @@
 //! The mail read tools: `mail.list`, `mail.read` and `mail.label` (AEGIS
 //! ADR-125 D4; its Update of 2026-10-07 clauses 1, 2 and 7).
 //!
-//! They speak IMAP only, over a `mailbox` binding of the acting person
-//! (ADR-125's Update of 2026-10-04 clause 3), inside the orchestrator: the
-//! password never reaches an agent. They work on `INBOX` only and by UID;
+//! They speak IMAP only, over a mailbox of the acting person (ADR-125's
+//! Update of 2026-10-04 clause 3), inside the orchestrator: an `imap`
+//! `mailbox` binding logs in with its password, and an OAuth binding
+//! granted Google's mail scope authenticates with XOAUTH2 and the token
+//! `access_token_for` answers (its Update of 2026-10-07 clauses 8 and 10);
+//! neither secret reaches an agent. They work on `INBOX` only and by UID;
 //! bodies are read with `BODY.PEEK`, so no tool marks a message read.
 //!
 //! **Who may use a mailbox** (clause 7, and the Update of 2026-10-07 (2)).
@@ -413,7 +416,7 @@ async fn run(
     mailbox: &ToolMailbox,
     request: &Request,
 ) -> Result<Value, SealSessionError> {
-    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.password)
+    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
         .await
         .map_err(session_error)?;
     let answer = match request {
@@ -474,7 +477,7 @@ fn date_of(headers: &Headers, fetched: &Fetched) -> Option<String> {
 }
 
 async fn list(
-    session: &mut ImapSession<'_>,
+    session: &mut ImapSession,
     mailbox: &ToolMailbox,
     request: &Request,
 ) -> Result<Value, SealSessionError> {
@@ -592,7 +595,7 @@ async fn list(
 /// The UIDs of the messages whose thread is `thread_id`, ascending, and the
 /// fetch of each that `items` asked for.
 async fn thread_messages(
-    session: &mut ImapSession<'_>,
+    session: &mut ImapSession,
     status: &FolderStatus,
     thread_id: &str,
     items: &str,
@@ -657,7 +660,7 @@ async fn thread_messages(
 }
 
 async fn read(
-    session: &mut ImapSession<'_>,
+    session: &mut ImapSession,
     mailbox: &ToolMailbox,
     thread_id: &str,
 ) -> Result<Value, SealSessionError> {
@@ -716,7 +719,7 @@ async fn read(
 }
 
 async fn label(
-    session: &mut ImapSession<'_>,
+    session: &mut ImapSession,
     mailbox: &ToolMailbox,
     thread_id: &str,
     add: &[String],
