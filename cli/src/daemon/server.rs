@@ -801,6 +801,27 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         });
 
+    // The network git steps run on, never the agents' one (AEGIS ADR-136
+    // G12; supports env:VAR_NAME). Absent or empty, they run on the step
+    // runner's default network; the engine logs so when it is built.
+    let git_step_network = config
+        .spec
+        .storage
+        .as_ref()
+        .and_then(|s| s.git.as_ref())
+        .and_then(|g| g.step_network.as_ref())
+        .and_then(|nm| match resolve_env_value(nm) {
+            Ok(resolved) if !resolved.is_empty() => Some(resolved),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to resolve spec.storage.git.step_network: {}. Git steps use the default network.",
+                    e
+                );
+                None
+            }
+        });
+
     // ─── FUSE FSAL Daemon (ADR-107) ─────────────────────────────────────────────
     // Create a shared FUSE daemon that will be injected into both ContainerRuntime
     // and ContainerStepRunner. Uses the same FSAL instance as the NFS gateway.
@@ -2262,7 +2283,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             aegis_orchestrator_core::application::git_clone_executor::EphemeralCliEngine::new(
                 container_step_runner.clone(),
                 Arc::new(nfs_gateway.volume_registry().clone()),
-            ),
+            )
+            .with_step_network(git_step_network.clone()),
         );
 
         let clone_executor = Arc::new(

@@ -16,11 +16,15 @@
 //! | [`GitRepoService::list_bindings`] | A2 — implemented |
 //! | [`GitRepoService::get_binding`] | A2 — implemented |
 //! | [`GitRepoService::delete_binding`] | A2 — implemented |
-//! | [`GitRepoService::refresh_repo`] | A3 — implemented (fetch + checkout pin) |
+//! | [`GitRepoService::refresh_repo`] | A3 — implemented (fetch + checkout pin; a git step on non-HostPath volumes) |
 //! | [`GitRepoService::handle_webhook`] | A3 — implemented (HMAC validated) |
-//! | [`GitRepoService::commit`] | **B2 — implemented** (Canvas git-write) |
-//! | [`GitRepoService::push`] | **B2 — implemented** (Canvas git-write) |
-//! | [`GitRepoService::diff`] | **B2 — implemented** (Canvas git-write) |
+//! | [`GitRepoService::commit`] | **B2 — implemented** (Canvas git-write; a git step on non-HostPath volumes) |
+//! | [`GitRepoService::push`] | **B2 — implemented** (Canvas git-write; a git step on non-HostPath volumes) |
+//! | [`GitRepoService::diff`] | **B2 — implemented** (Canvas git-write; a git step on non-HostPath volumes) |
+//!
+//! On a `HostPath` volume the tree is worked in process by libgit2; on any
+//! other volume (SeaweedFS, OpenDAL, SEAL) by a git step, a container with
+//! the volume mounted through the FUSE gateway (AEGIS ADR-136 G11).
 //!
 //! ## Keymaster Pattern
 //!
@@ -45,7 +49,7 @@ use chrono::Utc;
 use crate::application::credential_service::{CredentialError, CredentialManagementService};
 use crate::application::git_clone_executor::{
     clone_credential, credential_secrets, redact_git_output, strip_remote_user_info, CloneError,
-    GitCloneExecutor, ResolvedCredential,
+    GitCloneExecutor, ResolvedCredential, PUSH_FROM_A_VOLUME_GOES_TO_ORIGIN,
 };
 use crate::application::git_ssh_key::{attach_ssh_credentials, check_ssh_host_key};
 use crate::application::user_volume_service::{UserVolumeError, UserVolumeService};
@@ -623,27 +627,22 @@ impl GitRepoService {
             }
         };
 
-        let target_dir = match host_path_for_volume(&volume) {
-            Ok(p) => p,
-            Err(e) => {
-                // SeaweedFS / OpenDAL / SEAL refresh is currently only
-                // supported through a fresh ephemeral clone. For Phase 3
-                // we mark this as NotYetImplemented rather than silently
-                // dropping to a different code path.
-                let msg = format!("refresh via ephemeral CLI not yet implemented: {e}");
-                self.fail_refresh(binding, msg.clone()).await;
-                return Err(GitRepoError::NotYetImplemented(
-                    "refresh for non-HostPath volumes requires an ephemeral-cli re-clone, not implemented yet",
-                ));
+        let started = std::time::Instant::now();
+        // A HostPath tree is fetched in process; any other volume's by a git
+        // step (AEGIS ADR-136 G11).
+        let fetched = match &volume.backend {
+            VolumeBackend::HostPath { path } => {
+                self.clone_executor
+                    .fetch_and_checkout(binding, path, credential)
+                    .await
+            }
+            _ => {
+                self.clone_executor
+                    .fetch_ephemeral(binding, &volume, credential)
+                    .await
             }
         };
-
-        let started = std::time::Instant::now();
-        match self
-            .clone_executor
-            .fetch_and_checkout(binding, &target_dir, credential)
-            .await
-        {
+        match fetched {
             Ok(new_sha) => {
                 let duration_ms = started.elapsed().as_millis() as u64;
                 binding.complete_refresh(old_sha, new_sha.clone(), duration_ms);
@@ -776,19 +775,27 @@ impl GitRepoService {
                 .await?;
         }
 
-        let target_dir = self.resolve_workdir(&binding).await?;
+        let commit_sha = match self.resolve_tree(&binding).await? {
+            Tree::Host(target_dir) => {
+                let message = message.to_string();
+                let author_name = author_name.to_string();
+                let author_email = author_email.to_string();
 
-        let message = message.to_string();
-        let author_name = author_name.to_string();
-        let author_email = author_email.to_string();
-
-        // libgit2 is blocking — off-load to the pool so we never stall
-        // the tokio reactor.
-        let commit_sha = tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
-            blocking_commit(&target_dir, &message, &author_name, &author_email)
-        })
-        .await
-        .map_err(|e| GitRepoError::GitFailed(format!("commit task panicked: {e}")))??;
+                // libgit2 is blocking — off-load to the pool so we never stall
+                // the tokio reactor.
+                tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
+                    blocking_commit(&target_dir, &message, &author_name, &author_email)
+                })
+                .await
+                .map_err(|e| GitRepoError::GitFailed(format!("commit task panicked: {e}")))??
+            }
+            Tree::Volume(volume) => self
+                .clone_executor
+                .commit_ephemeral(&volume, message, author_name, author_email)
+                .await
+                .map_err(step_error)?
+                .ok_or(GitRepoError::NothingToCommit)?,
+        };
 
         binding.domain_events.push(GitRepoEvent::CommitMade {
             id: binding.id,
@@ -826,26 +833,43 @@ impl GitRepoService {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
         ensure_binding_ready(&binding)?;
 
-        let target_dir = self.resolve_workdir(&binding).await?;
+        let tree = self.resolve_tree(&binding).await?;
+        // A push from a volume goes only where the binding's credential
+        // belongs: origin, pointed at the binding's URL (AEGIS ADR-136
+        // G11a).
+        if matches!(tree, Tree::Volume(_)) && remote.is_some_and(|r| r != "origin") {
+            return Err(GitRepoError::GitFailed(
+                PUSH_FROM_A_VOLUME_GOES_TO_ORIGIN.to_string(),
+            ));
+        }
         let credential = self.resolve_credential(&binding, Some(owner)).await?;
 
-        let remote_name = remote.unwrap_or("origin").to_string();
-        let explicit_ref = ref_name.map(str::to_string);
-        let repo_url = binding.repo_url.clone();
-        let ssh_host_keys = binding.ssh_host_keys.clone();
+        let resolved_ref = match tree {
+            Tree::Host(target_dir) => {
+                let remote_name = remote.unwrap_or("origin").to_string();
+                let explicit_ref = ref_name.map(str::to_string);
+                let repo_url = binding.repo_url.clone();
+                let ssh_host_keys = binding.ssh_host_keys.clone();
 
-        let resolved_ref = tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
-            push_to_remote(
-                &target_dir,
-                &repo_url,
-                &remote_name,
-                explicit_ref,
-                credential,
-                &ssh_host_keys,
-            )
-        })
-        .await
-        .map_err(|e| GitRepoError::GitFailed(format!("push task panicked: {e}")))??;
+                tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
+                    push_to_remote(
+                        &target_dir,
+                        &repo_url,
+                        &remote_name,
+                        explicit_ref,
+                        credential,
+                        &ssh_host_keys,
+                    )
+                })
+                .await
+                .map_err(|e| GitRepoError::GitFailed(format!("push task panicked: {e}")))??
+            }
+            Tree::Volume(volume) => self
+                .clone_executor
+                .push_ephemeral(&binding, &volume, ref_name, credential)
+                .await
+                .map_err(step_error)?,
+        };
 
         binding.domain_events.push(GitRepoEvent::PushCompleted {
             id: binding.id,
@@ -879,21 +903,28 @@ impl GitRepoService {
         let binding = self.get_binding(id, tenant_id, owner).await?;
         ensure_binding_ready(&binding)?;
 
-        let target_dir = self.resolve_workdir(&binding).await?;
-
-        let diff_text = tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
-            blocking_diff(&target_dir, staged)
-        })
-        .await
-        .map_err(|e| GitRepoError::GitFailed(format!("diff task panicked: {e}")))??;
+        let diff_text = match self.resolve_tree(&binding).await? {
+            Tree::Host(target_dir) => {
+                tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
+                    blocking_diff(&target_dir, staged)
+                })
+                .await
+                .map_err(|e| GitRepoError::GitFailed(format!("diff task panicked: {e}")))??
+            }
+            Tree::Volume(volume) => self
+                .clone_executor
+                .diff_ephemeral(&volume, staged)
+                .await
+                .map_err(step_error)?,
+        };
 
         Ok(diff_text)
     }
 
-    /// Resolve the on-disk working tree for a binding. Shared by
-    /// [`Self::commit`], [`Self::push`], and [`Self::diff`] — mirrors
-    /// the A2 `clone_repo` pattern.
-    async fn resolve_workdir(&self, binding: &GitRepoBinding) -> Result<PathBuf, GitRepoError> {
+    /// Where a binding's working tree is: a host directory libgit2 works in,
+    /// or a volume a git step mounts. Shared by [`Self::commit`],
+    /// [`Self::push`], and [`Self::diff`].
+    async fn resolve_tree(&self, binding: &GitRepoBinding) -> Result<Tree, GitRepoError> {
         let volume = self
             .volume_service
             .volume_repo
@@ -906,7 +937,10 @@ impl GitRepoService {
                     binding.volume_id, binding.id
                 ))
             })?;
-        host_path_for_volume(&volume).map_err(GitRepoError::VolumeProvisioningFailed)
+        Ok(match &volume.backend {
+            VolumeBackend::HostPath { path } => Tree::Host(path.clone()),
+            _ => Tree::Volume(Box::new(volume)),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1265,6 +1299,22 @@ fn ct_slice_eq(a: &[u8], b: &[u8]) -> bool {
 // ============================================================================
 // Module-private helpers
 // ============================================================================
+
+/// Where a binding's working tree is (see `GitRepoService::resolve_tree`).
+enum Tree {
+    /// A HostPath volume's directory, worked in process by libgit2.
+    Host(PathBuf),
+    /// Any other volume, worked by a git step that mounts it.
+    Volume(Box<Volume>),
+}
+
+/// A git step's failure as the commit, push and diff calls answer it.
+fn step_error(e: CloneError) -> GitRepoError {
+    match e {
+        CloneError::Git(m) | CloneError::Io(m) => GitRepoError::GitFailed(m),
+        CloneError::NotYetImplemented(m) => GitRepoError::NotYetImplemented(m),
+    }
+}
 
 /// Resolve the on-disk clone target for a HostPath-backed volume.
 /// The person a binding's volume belongs to, when it is a persistent one.

@@ -37,8 +37,9 @@
 //! - Sparse checkout — applied post-clone by writing
 //!   `.git/info/sparse-checkout` and re-running `checkout_head`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use git2::{Cred, FetchOptions, Oid, RemoteCallbacks, Repository};
 use thiserror::Error;
@@ -51,7 +52,8 @@ use crate::domain::fsal::{AegisFSAL, FsalAccessPolicy};
 use crate::domain::git_host_keys::{host_keys_for, known_hosts_file, SshHostKey};
 use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
 use crate::domain::runtime::{
-    ContainerStepConfig, ContainerStepError, ContainerStepRunner, ContainerVolumeMount,
+    ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
+    ContainerVolumeMount,
 };
 use crate::domain::secrets::{SensitiveBytes, SensitiveString};
 use crate::domain::shared_kernel::ImagePullPolicy;
@@ -78,7 +80,37 @@ pub struct EphemeralCliEngine {
     volume_registry: Arc<NfsVolumeRegistry>,
     image: String,
     paths: EphemeralCliPaths,
+    /// The network every git step runs on (`spec.storage.git.step_network`);
+    /// absent, the step runner's default network.
+    step_network: Option<String>,
+    /// One git step per volume at a time: the volume registry holds one
+    /// registration per volume, and the first step to end would otherwise
+    /// deregister a second one still running (AEGIS ADR-136 G11b).
+    volume_locks: Mutex<HashMap<VolumeId, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// What the daemon logs at start when no network is configured for git
+/// steps: they then run on the runner's default network, the agents' one,
+/// which reaches no git host.
+pub const GIT_STEPS_ON_AGENT_NETWORK: &str =
+    "git steps run on the agents' network and cannot reach a git host";
+
+/// The refusal of a push from a volume to a remote other than `origin`
+/// (AEGIS ADR-136 G11a).
+pub const PUSH_FROM_A_VOLUME_GOES_TO_ORIGIN: &str =
+    "a push from a volume goes to the repository's own remote, origin";
+
+/// The refusal of a diff whose output reaches the step runner's cap
+/// (AEGIS ADR-136 G11c).
+pub const DIFF_TOO_LARGE: &str =
+    "the diff is larger than 1 MiB; commit or narrow the change and ask again";
+
+/// The most a step's standard output carries: the container step runner
+/// keeps 1 MiB of each stream and drops the rest without saying so.
+const STEP_OUTPUT_CAP: usize = 1024 * 1024;
+
+/// The exit status the commit step uses for a tree with nothing to commit.
+const NOTHING_TO_COMMIT_EXIT: i32 = 3;
 
 /// Where the clone step works inside its container.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,13 +146,27 @@ impl EphemeralCliEngine {
             volume_registry,
             image: Self::DEFAULT_IMAGE.to_string(),
             paths: EphemeralCliPaths::default(),
+            step_network: None,
+            volume_locks: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Run the step with other paths. Tests use it to run the step's script
-    /// in directories of their own.
-    #[cfg(test)]
-    pub(crate) fn with_paths(mut self, paths: EphemeralCliPaths) -> Self {
+    /// Run every git step on `network` (`spec.storage.git.step_network`).
+    /// Absent or empty, a step runs on the step runner's default network,
+    /// and this logs [`GIT_STEPS_ON_AGENT_NETWORK`] (AEGIS ADR-136 G12,
+    /// G12a). The daemon calls it once, at start.
+    pub fn with_step_network(mut self, network: Option<String>) -> Self {
+        let network = network.filter(|n| !n.trim().is_empty());
+        if network.is_none() {
+            warn!("{GIT_STEPS_ON_AGENT_NETWORK}");
+        }
+        self.step_network = network;
+        self
+    }
+
+    /// Run the step with other paths. The daemon keeps the defaults; tests
+    /// use it to run the step's script in directories of their own.
+    pub fn with_paths(mut self, paths: EphemeralCliPaths) -> Self {
         self.paths = paths;
         self
     }
@@ -141,54 +187,6 @@ impl EphemeralCliEngine {
         credential: Option<ResolvedCredential>,
         shallow: bool,
     ) -> Result<String, CloneError> {
-        let remote_path = match &volume.backend {
-            VolumeBackend::SeaweedFS { remote_path, .. } => remote_path.clone(),
-            VolumeBackend::OpenDal { .. } => {
-                format!("/aegis/opendal/volumes/{}/{}", volume.tenant_id, volume.id)
-            }
-            VolumeBackend::Seal {
-                node_id,
-                remote_volume_id,
-            } => format!("/aegis/seal/{node_id}/{remote_volume_id}"),
-            VolumeBackend::HostPath { .. } => {
-                return Err(CloneError::Io(
-                    "EphemeralCliEngine is for non-HostPath backends only".into(),
-                ));
-            }
-        };
-
-        // Register with NFS gateway so FUSE mount is authorised for the
-        // ephemeral container's scope.
-        let mount_point = PathBuf::from(&self.paths.workspace);
-        let ephemeral_exec = ExecutionId::new();
-        self.volume_registry.register(VolumeRegistration {
-            volume_id: volume.id,
-            execution_id: ephemeral_exec,
-            workflow_execution_id: None,
-            container_uid: 0,
-            container_gid: 0,
-            policy: FsalAccessPolicy::default(),
-            mount_point: mount_point.clone(),
-            remote_path,
-        });
-
-        let res = self
-            .run_clone_container(binding, volume.id, credential, shallow, ephemeral_exec)
-            .await;
-
-        // Always deregister, even on error.
-        self.volume_registry.deregister(volume.id);
-        res
-    }
-
-    async fn run_clone_container(
-        &self,
-        binding: &GitRepoBinding,
-        volume_id: VolumeId,
-        credential: Option<ResolvedCredential>,
-        shallow: bool,
-        execution_id: ExecutionId,
-    ) -> Result<String, CloneError> {
         let (clone_url, credential) = clone_credential(binding.repo_url.expose(), credential);
         let secrets = credential_secrets(credential.as_ref());
         // Refused here, before a container starts, when an SSH host has no
@@ -203,9 +201,195 @@ impl EphemeralCliEngine {
             shallow,
             host_keys.as_deref(),
         )?;
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-clone-{}", binding.id),
+                "clone",
+                "GIT_CLONE",
+                step,
+                &secrets,
+            )
+            .await?;
+        head_sha(&result, &secrets)
+    }
+
+    /// Fetch the binding's ref into the tree on `volume` and check it out,
+    /// as [`GitCloneExecutor::fetch_and_checkout`] does for a host
+    /// directory: `origin` is pointed at the binding's URL first. Returns
+    /// the HEAD SHA.
+    async fn fetch_and_checkout_in_volume(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<String, CloneError> {
+        let (url, credential) = clone_credential(binding.repo_url.expose(), credential);
+        let secrets = credential_secrets(credential.as_ref());
+        let host_keys = host_keys_for(&url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
+        let step = fetch_step(
+            &self.paths,
+            &binding.git_ref,
+            &url,
+            credential.as_ref(),
+            host_keys.as_deref(),
+        )?;
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-fetch-{}", binding.id),
+                "fetch",
+                "GIT_FETCH",
+                step,
+                &secrets,
+            )
+            .await?;
+        head_sha(&result, &secrets)
+    }
+
+    /// Stage every change of the tree on `volume` and commit it on HEAD
+    /// with `author_name` and `author_email` as author and committer.
+    /// `None` when there is nothing to commit.
+    async fn commit_in_volume(
+        &self,
+        volume: &Volume,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<Option<String>, CloneError> {
+        let step = commit_step(&self.paths, message, author_name, author_email);
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-commit-{}", volume.id),
+                "commit",
+                "GIT_COMMIT",
+                step,
+                &[],
+            )
+            .await?;
+        if result.exit_code == NOTHING_TO_COMMIT_EXIT {
+            return Ok(None);
+        }
+        head_sha(&result, &[]).map(Some)
+    }
+
+    /// Push the tree on `volume` to `origin`, pointed at the binding's URL
+    /// first: `ref_name`, or the branch HEAD is on. Never with force.
+    /// Returns the ref pushed.
+    async fn push_in_volume(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        ref_name: Option<&str>,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<String, CloneError> {
+        let (url, credential) = clone_credential(binding.repo_url.expose(), credential);
+        let secrets = credential_secrets(credential.as_ref());
+        let host_keys = host_keys_for(&url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
+        let step = push_step(
+            &self.paths,
+            &url,
+            ref_name,
+            credential.as_ref(),
+            host_keys.as_deref(),
+        )?;
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-push-{}", binding.id),
+                "push",
+                "GIT_PUSH",
+                step,
+                &secrets,
+            )
+            .await?;
+        if result.exit_code != 0 {
+            return Err(step_failed(&result, &secrets));
+        }
+        let pushed = result
+            .stdout
+            .lines()
+            .last()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if pushed.is_empty() {
+            return Err(CloneError::Git(
+                "ephemeral-cli push printed no ref name".to_string(),
+            ));
+        }
+        Ok(pushed)
+    }
+
+    /// The unified diff of the tree on `volume`: index to working tree, or
+    /// HEAD to index when `staged`. A diff whose output reaches the step's
+    /// output cap is refused rather than answered cut off.
+    async fn diff_in_volume(&self, volume: &Volume, staged: bool) -> Result<String, CloneError> {
+        let step = diff_step(&self.paths, staged);
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-diff-{}", volume.id),
+                "diff",
+                "GIT_DIFF",
+                step,
+                &[],
+            )
+            .await?;
+        if result.exit_code != 0 {
+            return Err(step_failed(&result, &[]));
+        }
+        if result.stdout.len() >= STEP_OUTPUT_CAP {
+            return Err(CloneError::Git(DIFF_TOO_LARGE.to_string()));
+        }
+        Ok(result.stdout)
+    }
+
+    /// The lock that keeps one git step at a time on `volume`.
+    fn volume_lock(&self, volume_id: VolumeId) -> Arc<tokio::sync::Mutex<()>> {
+        self.volume_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(volume_id)
+            .or_default()
+            .clone()
+    }
+
+    /// Run one git step with `volume` mounted at the workspace through the
+    /// FUSE gateway, on the configured step network. The volume is
+    /// registered with the gateway for the step's length, under the
+    /// volume's lock, and deregistered however the step ends. A failure to
+    /// run the step is reported with no part of `secrets` in its text.
+    async fn run_git_step(
+        &self,
+        volume: &Volume,
+        name: &str,
+        kind: &str,
+        state: &str,
+        step: GitStep,
+        secrets: &[SensitiveString],
+    ) -> Result<ContainerStepResult, CloneError> {
+        let remote_path = volume_remote_path(volume)?;
+        let lock = self.volume_lock(volume.id);
+        let _held = lock.lock().await;
+
+        // Register with NFS gateway so FUSE mount is authorised for the
+        // ephemeral container's scope.
+        let mount_point = PathBuf::from(&self.paths.workspace);
+        let execution_id = ExecutionId::new();
+        self.volume_registry.register(VolumeRegistration {
+            volume_id: volume.id,
+            execution_id,
+            workflow_execution_id: None,
+            container_uid: 0,
+            container_gid: 0,
+            policy: FsalAccessPolicy::default(),
+            mount_point,
+            remote_path,
+        });
 
         let cfg = ContainerStepConfig {
-            name: format!("git-clone-{}", binding.id),
+            name: name.to_string(),
             image: self.image.clone(),
             image_pull_policy: ImagePullPolicy::IfNotPresent,
             // The image's own entrypoint may be `git` (it is in `alpine/git`),
@@ -216,19 +400,19 @@ impl EphemeralCliEngine {
             env: std::collections::HashMap::new(),
             workdir: Some(self.paths.workspace.clone()),
             volumes: vec![ContainerVolumeMount {
-                name: volume_id.0.to_string(),
+                name: volume.id.0.to_string(),
                 mount_path: self.paths.workspace.clone(),
                 read_only: false,
             }],
             resources: None,
             registry_credentials: None,
             execution_id,
-            state_name: StateName::new("GIT_CLONE").expect("static state name is valid"),
+            state_name: StateName::new(state).expect("static state name is valid"),
             // A read-only root file system comes with a memory-backed `/tmp`,
             // where the step keeps the credential while git runs.
             read_only_root_filesystem: true,
             run_as_user: None,
-            network_mode: None,
+            network_mode: self.step_network.clone(),
             workflow_execution_id: None,
             files: Vec::new(),
         };
@@ -239,7 +423,7 @@ impl EphemeralCliEngine {
                     "ephemeral-cli image pull failed for '{image}': {error}"
                 )),
                 ContainerStepError::TimeoutExpired { timeout_secs } => CloneError::Git(format!(
-                    "ephemeral-cli clone timed out after {timeout_secs}s"
+                    "ephemeral-cli {kind} timed out after {timeout_secs}s"
                 )),
                 ContainerStepError::VolumeMountFailed { volume, error } => CloneError::Io(format!(
                     "ephemeral-cli volume mount failed for '{volume}': {error}"
@@ -249,63 +433,103 @@ impl EphemeralCliEngine {
                 }
                 ContainerStepError::DockerError(m) => CloneError::Git(format!("docker: {m}")),
             }
-            .redacted(&secrets)
-        })?;
+            .redacted(secrets)
+        });
 
-        // What git printed is redacted before it is cut, so no cut can leave
-        // part of a credential behind.
-        let stdout = redact_git_output(&result.stdout, &secrets);
-        let stderr = redact_git_output(&result.stderr, &secrets);
-        if result.exit_code != 0 {
-            return Err(CloneError::Git(format!(
-                "ephemeral-cli git exited {}: stdout={:?} stderr={:?}",
-                result.exit_code,
-                truncate(&stdout, 256),
-                truncate(&stderr, 256)
-            )));
-        }
-
-        // The last line of stdout is the HEAD SHA (from `git rev-parse HEAD`).
-        let sha = stdout
-            .lines()
-            .last()
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if sha.len() != 40 {
-            return Err(CloneError::Git(format!(
-                "ephemeral-cli could not parse HEAD sha from stdout tail: {:?}",
-                truncate(&stdout, 256)
-            )));
-        }
-        Ok(sha)
+        // Always deregister, even on error.
+        self.volume_registry.deregister(volume.id);
+        result
     }
 }
 
-/// The clone step's script and what it is handed on standard input.
-struct CloneStep {
+/// Where a volume's data lives behind the FUSE gateway.
+fn volume_remote_path(volume: &Volume) -> Result<String, CloneError> {
+    match &volume.backend {
+        VolumeBackend::SeaweedFS { remote_path, .. } => Ok(remote_path.clone()),
+        VolumeBackend::OpenDal { .. } => Ok(format!(
+            "/aegis/opendal/volumes/{}/{}",
+            volume.tenant_id, volume.id
+        )),
+        VolumeBackend::Seal {
+            node_id,
+            remote_volume_id,
+        } => Ok(format!("/aegis/seal/{node_id}/{remote_volume_id}")),
+        VolumeBackend::HostPath { .. } => Err(CloneError::Io(
+            "EphemeralCliEngine is for non-HostPath backends only".into(),
+        )),
+    }
+}
+
+/// The error of a step that exited non-zero, with what git printed,
+/// redacted before it is cut, so no cut can leave part of a credential
+/// behind.
+fn step_failed(result: &ContainerStepResult, secrets: &[SensitiveString]) -> CloneError {
+    let stdout = redact_git_output(&result.stdout, secrets);
+    let stderr = redact_git_output(&result.stderr, secrets);
+    CloneError::Git(format!(
+        "ephemeral-cli git exited {}: stdout={:?} stderr={:?}",
+        result.exit_code,
+        truncate(&stdout, 256),
+        truncate(&stderr, 256)
+    ))
+}
+
+/// The HEAD SHA a successful step printed as its last line (from
+/// `git rev-parse HEAD`).
+fn head_sha(
+    result: &ContainerStepResult,
+    secrets: &[SensitiveString],
+) -> Result<String, CloneError> {
+    if result.exit_code != 0 {
+        return Err(step_failed(result, secrets));
+    }
+    let stdout = redact_git_output(&result.stdout, secrets);
+    let sha = stdout
+        .lines()
+        .last()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if sha.len() != 40 {
+        return Err(CloneError::Git(format!(
+            "ephemeral-cli could not parse HEAD sha from stdout tail: {:?}",
+            truncate(&stdout, 256)
+        )));
+    }
+    Ok(sha)
+}
+
+/// A git step's script and what it is handed on standard input.
+struct GitStep {
     script: String,
     stdin: Option<SensitiveBytes>,
 }
 
-/// Build the clone step. The credential is never in the script: it is the
-/// step's standard input, which the script writes to a file in a directory
-/// only its user can read. git reads it from there through a credential
-/// helper, or ssh through `-i`. The directory is removed when the script
-/// ends, whether the clone succeeded or not.
+/// The opening every git step's script shares, and what it hands the step.
+///
+/// The credential is never in the script: it is the step's standard input,
+/// which the script writes to a file in a directory only its user can read.
+/// git reads it from there through a credential helper, or ssh through
+/// `-i`. The directory is removed when the script ends, whether git
+/// succeeded or not.
 ///
 /// For a remote reached over SSH, `host_keys` are the keys its host must
 /// present: ssh gets them as its only known-hosts file, checks them strictly
 /// before it authenticates, and reads no configuration of the image's or
 /// the user's that could change that.
-fn clone_step(
+///
+/// The script defines `g`, the git every step runs: it trusts the mounted
+/// tree, whose owner a FUSE mount may report as another user
+/// (`safe.directory`), and runs none of the tree's hooks or file-system
+/// monitor, which the in-process (libgit2) path never runs either.
+///
+/// Returns the script so far, the step's standard input, and the options
+/// git takes to use the credential.
+fn step_prelude(
     paths: &EphemeralCliPaths,
-    binding: &GitRepoBinding,
-    clone_url: &str,
+    url: &str,
     credential: Option<&ResolvedCredential>,
-    shallow: bool,
     host_keys: Option<&[SshHostKey]>,
-) -> Result<CloneStep, CloneError> {
-    let dest = shell_escape(&format!("{}/repo", paths.workspace));
+) -> Result<(String, Option<SensitiveBytes>, String), CloneError> {
     let mut s = String::new();
     s.push_str("set -eu\numask 077\n");
     s.push_str(&format!("scratch={}\n", shell_escape(&paths.scratch)));
@@ -317,7 +541,8 @@ fn clone_step(
          trap 'exit 130' INT\n\
          trap 'exit 143' TERM\n\
          GIT_TERMINAL_PROMPT=0\n\
-         export GIT_TERMINAL_PROMPT\n",
+         export GIT_TERMINAL_PROMPT\n\
+         g() { git -c safe.directory='*' -c core.hooksPath=/dev/null -c core.fsmonitor=false \"$@\"; }\n",
     );
 
     let mut git_options = String::new();
@@ -363,7 +588,7 @@ fn clone_step(
         None => {}
     }
     if let Some(keys) = host_keys {
-        let known_hosts = known_hosts_file(clone_url, keys).ok_or_else(|| {
+        let known_hosts = known_hosts_file(url, keys).ok_or_else(|| {
             CloneError::Git("host keys were given for a remote not reached over SSH".to_string())
         })?;
         s.push_str(&format!(
@@ -377,28 +602,170 @@ fn clone_step(
              export GIT_SSH_COMMAND\n"
         ));
     }
+    Ok((s, stdin, git_options))
+}
 
+/// The tree's place on a non-HostPath volume: `repo` under the workspace,
+/// where the clone step puts it (AEGIS ADR-136 G11d).
+fn tree_path(paths: &EphemeralCliPaths) -> String {
+    shell_escape(&format!("{}/repo", paths.workspace))
+}
+
+/// The commands that point `origin` at `url`, creating it when absent.
+fn point_origin_script(url: &str) -> String {
+    let url = shell_escape(url);
+    format!("g remote set-url origin {url} 2>/dev/null || g remote add origin {url}\n")
+}
+
+/// Build the clone step (see [`step_prelude`]).
+fn clone_step(
+    paths: &EphemeralCliPaths,
+    binding: &GitRepoBinding,
+    clone_url: &str,
+    credential: Option<&ResolvedCredential>,
+    shallow: bool,
+    host_keys: Option<&[SshHostKey]>,
+) -> Result<GitStep, CloneError> {
+    let dest = tree_path(paths);
+    let (mut s, stdin, git_options) = step_prelude(paths, clone_url, credential, host_keys)?;
     let ref_flag = match &binding.git_ref {
         GitRef::Branch(name) | GitRef::Tag(name) => format!(" --branch {}", shell_escape(name)),
         GitRef::Commit(_) => String::new(),
     };
     let depth_flag = if shallow { " --depth=1" } else { "" };
     s.push_str(&format!(
-        "git{git_options} clone{depth_flag} --filter=blob:limit=10M{ref_flag} -- {} {dest}\n",
+        "g{git_options} clone{depth_flag} --filter=blob:limit=10M{ref_flag} -- {} {dest}\n",
         shell_escape(clone_url)
     ));
     if let GitRef::Commit(sha) = &binding.git_ref {
-        s.push_str(&format!("git -C {dest} checkout {}\n", shell_escape(sha)));
+        s.push_str(&format!("g -C {dest} checkout {}\n", shell_escape(sha)));
     }
     if let Some(sparse) = &binding.sparse_paths {
         let escaped: Vec<String> = sparse.iter().map(|p| shell_escape(p)).collect();
         s.push_str(&format!(
-            "git -C {dest} sparse-checkout set --cone {}\n",
+            "g -C {dest} sparse-checkout set --cone {}\n",
             escaped.join(" ")
         ));
     }
-    s.push_str(&format!("git -C {dest} rev-parse HEAD\n"));
-    Ok(CloneStep { script: s, stdin })
+    s.push_str(&format!("g -C {dest} rev-parse HEAD\n"));
+    Ok(GitStep { script: s, stdin })
+}
+
+/// Build the fetch step: `origin` pointed at `url`, the ref fetched, and
+/// HEAD detached at it with the tree checked out, as the in-process path
+/// does (a commit already present is not fetched).
+fn fetch_step(
+    paths: &EphemeralCliPaths,
+    git_ref: &GitRef,
+    url: &str,
+    credential: Option<&ResolvedCredential>,
+    host_keys: Option<&[SshHostKey]>,
+) -> Result<GitStep, CloneError> {
+    let (mut s, stdin, git_options) = step_prelude(paths, url, credential, host_keys)?;
+    s.push_str(&format!("cd {}\n", tree_path(paths)));
+    s.push_str(&point_origin_script(url));
+    match git_ref {
+        GitRef::Branch(name) => {
+            s.push_str(&format!(
+                "g{git_options} fetch origin {}\n",
+                shell_escape(&format!("+refs/heads/{name}:refs/remotes/origin/{name}"))
+            ));
+            s.push_str(&format!(
+                "target=$(g rev-parse --verify {})\n",
+                shell_escape(&format!("refs/remotes/origin/{name}^{{commit}}"))
+            ));
+        }
+        GitRef::Tag(name) => {
+            s.push_str(&format!(
+                "g{git_options} fetch origin {}\n",
+                shell_escape(&format!("+refs/tags/{name}:refs/tags/{name}"))
+            ));
+            s.push_str(&format!(
+                "target=$(g rev-parse --verify {})\n",
+                shell_escape(&format!("refs/tags/{name}^{{commit}}"))
+            ));
+        }
+        GitRef::Commit(sha) => {
+            let commit = shell_escape(&format!("{sha}^{{commit}}"));
+            s.push_str(&format!(
+                "if ! g cat-file -e {commit} 2>/dev/null; then \
+                 g{git_options} fetch origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'; fi\n"
+            ));
+            s.push_str(&format!("target=$(g rev-parse --verify {commit})\n"));
+        }
+    }
+    s.push_str("g checkout --quiet --force --detach \"$target\"\ng rev-parse HEAD\n");
+    Ok(GitStep { script: s, stdin })
+}
+
+/// Build the commit step: every change staged, then committed on HEAD with
+/// one identity as author and committer. A tree with nothing to commit
+/// exits [`NOTHING_TO_COMMIT_EXIT`]. It is handed no credential.
+fn commit_step(
+    paths: &EphemeralCliPaths,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> GitStep {
+    let (mut s, _, _) =
+        step_prelude(paths, "", None, None).expect("a step with no credential always builds");
+    s.push_str(&format!("cd {}\n", tree_path(paths)));
+    s.push_str("g add -A\n");
+    s.push_str(&format!(
+        "if g diff --cached --quiet; then exit {NOTHING_TO_COMMIT_EXIT}; fi\n"
+    ));
+    s.push_str(&format!(
+        "g -c user.name={} -c user.email={} commit --quiet --no-verify -m {}\n",
+        shell_escape(author_name),
+        shell_escape(author_email),
+        shell_escape(message)
+    ));
+    s.push_str("g rev-parse HEAD\n");
+    GitStep {
+        script: s,
+        stdin: None,
+    }
+}
+
+/// Build the push step: `origin` pointed at `url`, then `ref_name` (or the
+/// branch HEAD is on) pushed there, never with force. Prints the ref pushed
+/// as its last line.
+fn push_step(
+    paths: &EphemeralCliPaths,
+    url: &str,
+    ref_name: Option<&str>,
+    credential: Option<&ResolvedCredential>,
+    host_keys: Option<&[SshHostKey]>,
+) -> Result<GitStep, CloneError> {
+    let (mut s, stdin, git_options) = step_prelude(paths, url, credential, host_keys)?;
+    s.push_str(&format!("cd {}\n", tree_path(paths)));
+    s.push_str(&point_origin_script(url));
+    match ref_name {
+        Some(r) => s.push_str(&format!("ref={}\n", shell_escape(r))),
+        None => s.push_str("ref=$(g rev-parse --abbrev-ref HEAD)\n"),
+    }
+    s.push_str(&format!(
+        "g{git_options} push --no-verify origin \"refs/heads/$ref:refs/heads/$ref\"\n\
+         printf '%s\\n' \"$ref\"\n"
+    ));
+    Ok(GitStep { script: s, stdin })
+}
+
+/// Build the diff step: index to working tree, or HEAD to index when
+/// `staged`, with no colour, external diff or text conversion. It is
+/// handed no credential.
+fn diff_step(paths: &EphemeralCliPaths, staged: bool) -> GitStep {
+    let (mut s, _, _) =
+        step_prelude(paths, "", None, None).expect("a step with no credential always builds");
+    s.push_str(&format!("cd {}\n", tree_path(paths)));
+    let cached = if staged { " --cached" } else { "" };
+    s.push_str(&format!(
+        "g diff --no-color --no-ext-diff --no-textconv{cached}\n"
+    ));
+    GitStep {
+        script: s,
+        stdin: None,
+    }
 }
 
 /// The URL git is given and the credential it authenticates with.
@@ -748,15 +1115,73 @@ impl GitCloneExecutor {
         credential: Option<ResolvedCredential>,
         shallow: bool,
     ) -> Result<String, CloneError> {
-        let engine = self
-            .cli_engine
-            .as_ref()
-            .ok_or(CloneError::NotYetImplemented(
-                "EphemeralCliEngine not configured; non-HostPath volume backends require it",
-            ))?;
-        engine
+        self.engine()?
             .clone_into_volume(binding, volume, credential, shallow)
             .await
+    }
+
+    /// Fetch and check out the binding's ref in its tree on a non-HostPath
+    /// `volume`, through a git step. Returns the HEAD SHA.
+    #[instrument(skip(self, volume, credential), fields(binding_id = %binding.id, volume_id = %volume.id))]
+    pub async fn fetch_ephemeral(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<String, CloneError> {
+        self.engine()?
+            .fetch_and_checkout_in_volume(binding, volume, credential)
+            .await
+    }
+
+    /// Commit every change of the tree on a non-HostPath `volume`, through
+    /// a git step. `None` when there is nothing to commit.
+    #[instrument(skip(self, volume, message), fields(volume_id = %volume.id))]
+    pub async fn commit_ephemeral(
+        &self,
+        volume: &Volume,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<Option<String>, CloneError> {
+        self.engine()?
+            .commit_in_volume(volume, message, author_name, author_email)
+            .await
+    }
+
+    /// Push the tree on a non-HostPath `volume` to `origin`, pointed at the
+    /// binding's URL, through a git step. Returns the ref pushed.
+    #[instrument(skip(self, volume, credential), fields(binding_id = %binding.id, volume_id = %volume.id))]
+    pub async fn push_ephemeral(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        ref_name: Option<&str>,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<String, CloneError> {
+        self.engine()?
+            .push_in_volume(binding, volume, ref_name, credential)
+            .await
+    }
+
+    /// The unified diff of the tree on a non-HostPath `volume`, through a
+    /// git step.
+    #[instrument(skip(self, volume), fields(volume_id = %volume.id, staged))]
+    pub async fn diff_ephemeral(
+        &self,
+        volume: &Volume,
+        staged: bool,
+    ) -> Result<String, CloneError> {
+        self.engine()?.diff_in_volume(volume, staged).await
+    }
+
+    /// The git step engine, or `NotYetImplemented` when none was injected.
+    fn engine(&self) -> Result<&EphemeralCliEngine, CloneError> {
+        self.cli_engine
+            .as_deref()
+            .ok_or(CloneError::NotYetImplemented(
+                "EphemeralCliEngine not configured; non-HostPath volume backends require it",
+            ))
     }
 
     /// Fetch the bound remote and check out the binding's [`GitRef`].
@@ -1989,6 +2414,115 @@ mod credential_tests {
             assert!(
                 holding.is_empty(),
                 "{arm}: files of the tree hold the credential after the push: {holding:?}"
+            );
+        }
+    }
+
+    /// The fetch and push steps, run with the host's shell against a git
+    /// server that demands the password, in each HTTPS arm: both
+    /// authenticate; each step's standard input carries the credential and
+    /// no step configuration, argument list or environment seen in the
+    /// process table, or file of the tree, holds any part of it; the
+    /// credential's directory is gone (AEGIS ADR-136 G11).
+    #[tokio::test]
+    async fn fetch_and_push_steps_authenticate_with_the_credential_on_standard_input_only() {
+        for arm in ["https token", "token in the URL's user info"] {
+            let secret = marker("Kq");
+            let server = GitTestServer::start(USER, &secret);
+            let (url, credential): (String, fn(&str) -> Option<ResolvedCredential>) = match arm {
+                "https token" => (server.url(), pat),
+                _ => (with_user_info(&server.url(), &secret), |_| None),
+            };
+            let dirs = tempfile::tempdir().unwrap();
+            let workspace = dirs.path().join("ws");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let scratch = dirs.path().join("scratch").join("aegis-git");
+            std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+            let runner = Arc::new(HostShellRunner::new());
+            let engine =
+                EphemeralCliEngine::new(runner.clone(), Arc::new(NfsVolumeRegistry::new()))
+                    .with_paths(EphemeralCliPaths {
+                        workspace: workspace.display().to_string(),
+                        scratch: scratch.display().to_string(),
+                    });
+            let volume = seaweed_volume();
+            let b = binding(&url, &volume, ephemeral());
+            engine
+                .clone_into_volume(&b, &volume, credential(&secret), true)
+                .await
+                .unwrap_or_else(|e| panic!("{arm}: the clone failed: {e}"));
+            let cloned_steps = runner.seen.lock().unwrap().len();
+
+            let later = server.add_commit("later.txt", "a later commit\n");
+            let watch = ProcessWatch::start(&secret);
+            let fetched = engine
+                .fetch_and_checkout_in_volume(&b, &volume, credential(&secret))
+                .await;
+            // The fetch leaves HEAD detached, as the in-process refresh does;
+            // put the tree back on its branch before committing to it.
+            let tree = workspace.join("repo");
+            let checkout = std::process::Command::new("git")
+                .args(["checkout", "--quiet", "-B", "main"])
+                .current_dir(&tree)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", &tree)
+                .status()
+                .expect("git runs");
+            assert!(checkout.success(), "{arm}: the branch checkout failed");
+            std::fs::write(tree.join("pushed.txt"), "pushed\n").unwrap();
+            let committed = engine
+                .commit_in_volume(&volume, "pushed", "Jane Person", "jane@example.invalid")
+                .await;
+            let pushed = engine
+                .push_in_volume(&b, &volume, Some("main"), credential(&secret))
+                .await;
+            let (seen_in, rounds) = watch.stop();
+
+            let fetched = fetched.unwrap_or_else(|e| panic!("{arm}: the fetch failed: {e}"));
+            assert_eq!(
+                fetched, later,
+                "{arm}: the fetch checked out the wrong commit"
+            );
+            let commit = committed
+                .unwrap_or_else(|e| panic!("{arm}: the commit failed: {e}"))
+                .expect("a change to commit");
+            let pushed = pushed.unwrap_or_else(|e| panic!("{arm}: the push failed: {e}"));
+            assert_eq!(pushed, "main");
+            assert_eq!(server.head(), commit, "{arm}: the push did not land");
+
+            let seen = runner.seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), cloned_steps + 3, "{arm}: fetch, commit, push");
+            assert!(
+                seen[cloned_steps + 1].stdin.is_none(),
+                "{arm}: the commit step was handed a credential"
+            );
+            for (step, cfg) in [
+                ("fetch", &seen[cloned_steps]),
+                ("push", &seen[cloned_steps + 2]),
+            ] {
+                let mut shown = cfg.clone();
+                shown.stdin = None;
+                assert!(
+                    !holds_any_part_of(&format!("{shown:?}"), &secret),
+                    "{arm}: the {step} step's configuration holds the credential"
+                );
+                assert!(
+                    stdin_of(cfg).contains(&secret),
+                    "{arm}: the {step} step's standard input does not carry the credential"
+                );
+            }
+            assert!(
+                seen_in.is_empty(),
+                "{arm}: the credential was in the process table at {seen_in:?} ({rounds} reads)"
+            );
+            let holding = files_holding(&workspace, &secret);
+            assert!(
+                holding.is_empty(),
+                "{arm}: files of the tree hold the credential: {holding:?}"
+            );
+            assert!(
+                !scratch.exists(),
+                "{arm}: the credential's directory is still there after the push"
             );
         }
     }

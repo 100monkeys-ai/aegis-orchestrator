@@ -924,6 +924,10 @@ pub struct StorageConfig {
     /// OpenDAL configuration (used if backend: "opendal")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opendal: Option<OpenDalConfig>,
+
+    /// Git repository bindings' steps (`spec.storage.git`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitStorageConfig>,
 }
 
 impl Default for StorageConfig {
@@ -934,8 +938,21 @@ impl Default for StorageConfig {
             seaweedfs: None,
             local_host: Some(LocalHostStorageConfig::default()),
             opendal: None,
+            git: None,
         }
     }
+}
+
+/// How the git steps of repository bindings run (`spec.storage.git`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitStorageConfig {
+    /// The container network every git step (clone, fetch, commit, push,
+    /// diff on a volume that is not a host directory) runs on, never the
+    /// agents' network. Supports `env:VAR_NAME`. Absent or empty, a git step
+    /// runs on the step runner's default network, which reaches no git host
+    /// when that is the agents' network (AEGIS ADR-136 G12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_network: Option<String>,
 }
 
 /// SeaweedFS distributed storage configuration
