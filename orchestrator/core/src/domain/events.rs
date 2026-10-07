@@ -566,6 +566,45 @@ pub enum ExecutionEvent {
         handler_type: String,
         error: String,
     },
+
+    /// A repository of the run was mounted at `/workspace/<label>` and its
+    /// work branch checked out (AEGIS ADR-136 G5b, G13a): published once per
+    /// run, by the run's first agent execution, after its start.
+    RepositoryPrepared {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        label: String,
+        branch: String,
+        /// The commit the work branch stood at when it was checked out.
+        started_from: String,
+        /// Whether the branch was created from the binding's ref (else the
+        /// remote's copy was checked out).
+        created: bool,
+        prepared_at: DateTime<Utc>,
+    },
+
+    /// A run committed on the work branch of one of its repositories (AEGIS
+    /// ADR-136 G13a).
+    RepositoryCommitted {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        label: String,
+        branch: String,
+        commit_sha: String,
+        committed_at: DateTime<Utc>,
+    },
+
+    /// A run pushed the work branch of one of its repositories to `origin`
+    /// (AEGIS ADR-136 G13a). `remote_url` and `branch_url` hold no user info.
+    RepositoryPushed {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        label: String,
+        branch: String,
+        remote_url: crate::domain::secrets::RedactedUrl,
+        branch_url: crate::domain::secrets::RedactedUrl,
+        pushed_at: DateTime<Utc>,
+    },
 }
 
 /// Structured classification of an LLM upstream failure.

@@ -197,6 +197,9 @@ impl DomainEvent {
                 ExecutionEvent::OutputHandlerStarted { execution_id, .. }
                 | ExecutionEvent::OutputHandlerCompleted { execution_id, .. }
                 | ExecutionEvent::OutputHandlerFailed { execution_id, .. } => *execution_id,
+                ExecutionEvent::RepositoryPrepared { execution_id, .. }
+                | ExecutionEvent::RepositoryCommitted { execution_id, .. }
+                | ExecutionEvent::RepositoryPushed { execution_id, .. } => *execution_id,
             }),
             DomainEvent::Workflow(event) => Some(match event {
                 WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
@@ -362,6 +365,9 @@ impl DomainEvent {
                 ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }
                 | ExecutionEvent::OutputHandlerFailed { .. } => None,
+                ExecutionEvent::RepositoryPrepared { agent_id, .. }
+                | ExecutionEvent::RepositoryCommitted { agent_id, .. }
+                | ExecutionEvent::RepositoryPushed { agent_id, .. } => Some(*agent_id),
             },
             DomainEvent::Workflow(_)
             | DomainEvent::Volume(_)
@@ -455,6 +461,9 @@ impl DomainEvent {
                 ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }
                 | ExecutionEvent::OutputHandlerFailed { .. } => Utc::now(),
+                ExecutionEvent::RepositoryPrepared { prepared_at, .. } => *prepared_at,
+                ExecutionEvent::RepositoryCommitted { committed_at, .. } => *committed_at,
+                ExecutionEvent::RepositoryPushed { pushed_at, .. } => *pushed_at,
             },
             DomainEvent::Workflow(event) => match event {
                 WorkflowEvent::WorkflowRegistered { registered_at, .. } => *registered_at,
@@ -708,6 +717,9 @@ impl DomainEvent {
                 ExecutionEvent::OutputHandlerStarted { .. } => "output_handler_started",
                 ExecutionEvent::OutputHandlerCompleted { .. } => "output_handler_completed",
                 ExecutionEvent::OutputHandlerFailed { .. } => "output_handler_failed",
+                ExecutionEvent::RepositoryPrepared { .. } => "repository_prepared",
+                ExecutionEvent::RepositoryCommitted { .. } => "repository_committed",
+                ExecutionEvent::RepositoryPushed { .. } => "repository_pushed",
             },
             DomainEvent::Workflow(event) => match event {
                 WorkflowEvent::WorkflowRegistered { .. } => "workflow_registered",
@@ -1007,7 +1019,10 @@ impl DomainEvent {
                 | ExecutionEvent::ChildExecutionCompleted { .. }
                 | ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }
-                | ExecutionEvent::OutputHandlerFailed { .. } => None,
+                | ExecutionEvent::OutputHandlerFailed { .. }
+                | ExecutionEvent::RepositoryPrepared { .. }
+                | ExecutionEvent::RepositoryCommitted { .. }
+                | ExecutionEvent::RepositoryPushed { .. } => None,
             },
             DomainEvent::Workflow(WorkflowEvent::WorkflowIterationStarted {
                 iteration_number,
@@ -1052,6 +1067,9 @@ impl DomainEvent {
                 ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }
                 | ExecutionEvent::OutputHandlerFailed { .. } => "output_handler",
+                ExecutionEvent::RepositoryPrepared { .. }
+                | ExecutionEvent::RepositoryCommitted { .. }
+                | ExecutionEvent::RepositoryPushed { .. } => "repository",
             }),
             DomainEvent::Workflow(_) => Some("workflow"),
             DomainEvent::Learning(_) => Some("learning"),
@@ -1460,6 +1478,11 @@ impl ExecutionEventReceiver {
             | ExecutionEvent::OutputHandlerFailed { execution_id, .. } => {
                 execution_id == &self.execution_id
             }
+            ExecutionEvent::RepositoryPrepared { execution_id, .. }
+            | ExecutionEvent::RepositoryCommitted { execution_id, .. }
+            | ExecutionEvent::RepositoryPushed { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
         }
     }
 }
@@ -1586,6 +1609,9 @@ impl AgentEventReceiver {
                 ExecutionEvent::OutputHandlerStarted { .. }
                 | ExecutionEvent::OutputHandlerCompleted { .. }
                 | ExecutionEvent::OutputHandlerFailed { .. } => false, // not agent-scoped
+                ExecutionEvent::RepositoryPrepared { agent_id, .. }
+                | ExecutionEvent::RepositoryCommitted { agent_id, .. }
+                | ExecutionEvent::RepositoryPushed { agent_id, .. } => agent_id == &self.agent_id,
             },
             DomainEvent::Learning(e) => match e {
                 LearningEvent::PatternDiscovered { agent_id, .. } => agent_id == &self.agent_id,

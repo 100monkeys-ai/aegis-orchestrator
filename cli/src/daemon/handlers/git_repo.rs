@@ -151,6 +151,8 @@ fn git_repo_error_response(e: GitRepoError) -> (StatusCode, Json<serde_json::Val
         GitRepoError::NoHeadBranch => (StatusCode::BAD_REQUEST, e.to_string()),
         // AEGIS ADR-136 G4a: a binding a run holds.
         GitRepoError::HeldByRun { .. } => (StatusCode::CONFLICT, e.to_string()),
+        // AEGIS ADR-136 G8a: the remote refused the push as not a fast-forward.
+        GitRepoError::RemoteAhead { .. } => (StatusCode::CONFLICT, e.to_string()),
     };
     (status, Json(json!({ "error": message })))
 }

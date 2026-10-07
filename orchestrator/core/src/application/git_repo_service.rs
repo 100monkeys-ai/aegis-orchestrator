@@ -243,6 +243,12 @@ pub enum GitRepoError {
     /// (AEGIS ADR-136 G4, G4a). Maps to HTTP `409 Conflict`.
     #[error("repository '{label}' is in use by a run; try again when it has ended")]
     HeldByRun { label: String },
+
+    /// The remote refused a push as not a fast-forward: its branch has
+    /// commits the tree does not (AEGIS ADR-136 G8, G8a). Nothing was
+    /// pushed. Maps to HTTP `409 Conflict` and the tool path's Conflict.
+    #[error("the remote branch '{branch}' has commits this run does not have; nothing was pushed")]
+    RemoteAhead { branch: String },
 }
 
 impl From<UserVolumeError> for GitRepoError {
@@ -327,6 +333,11 @@ pub struct GitRepoService {
     /// workflow execution, or the root agent execution. Kept in memory, as
     /// the per-volume step locks are: a restart clears it.
     run_holds: std::sync::Mutex<std::collections::HashMap<GitRepoBindingId, uuid::Uuid>>,
+    /// What each run's preparation did, kept until its first agent execution
+    /// publishes it as narrative rows (AEGIS ADR-136 G5b, G13a) or the run
+    /// is released.
+    run_preparations:
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Vec<PreparedRepository>>>,
 }
 
 impl GitRepoService {
@@ -347,6 +358,7 @@ impl GitRepoService {
             event_bus,
             orchestrator_id: "git-repo-service".to_string(),
             run_holds: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_preparations: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -572,6 +584,7 @@ impl GitRepoService {
                     CloneError::Git(m) => format!("git: {m}"),
                     CloneError::Io(m) => format!("io: {m}"),
                     CloneError::NotYetImplemented(m) => format!("not_yet_implemented: {m}"),
+                    CloneError::RemoteAhead(_) => format!("git: {e}"),
                 };
                 self.fail(&mut binding, msg.clone()).await;
                 Err(GitRepoError::CloneFailed(msg))
@@ -601,7 +614,7 @@ impl GitRepoService {
     /// Invoked by the webhook handler once the HMAC signature has been
     /// verified.
     async fn do_refresh(&self, binding: &mut GitRepoBinding) -> Result<(), GitRepoError> {
-        self.refuse_if_held(binding)?;
+        self.refuse_if_held(binding, None)?;
         let old_sha = binding
             .last_commit_sha
             .clone()
@@ -669,6 +682,7 @@ impl GitRepoService {
                     CloneError::Git(m) => format!("git: {m}"),
                     CloneError::Io(m) => format!("io: {m}"),
                     CloneError::NotYetImplemented(m) => format!("not_yet_implemented: {m}"),
+                    CloneError::RemoteAhead(_) => format!("git: {e}"),
                 };
                 self.fail_refresh(binding, msg.clone()).await;
                 Err(GitRepoError::CloneFailed(msg))
@@ -744,7 +758,7 @@ impl GitRepoService {
         owner: &str,
     ) -> Result<(), GitRepoError> {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
-        self.refuse_if_held(&binding)?;
+        self.refuse_if_held(&binding, None)?;
         let volume_id = binding.volume_id;
         let _ = self.volume_service.delete_volume(&volume_id, owner).await;
         binding.mark_deleted();
@@ -779,9 +793,58 @@ impl GitRepoService {
         author_name: &str,
         author_email: &str,
     ) -> Result<String, GitRepoError> {
+        self.commit_as(
+            None,
+            id,
+            tenant_id,
+            owner,
+            message,
+            author_name,
+            author_email,
+        )
+        .await
+    }
+
+    /// [`Self::commit`] from inside the run `run`, which may commit on a
+    /// binding it holds itself (AEGIS ADR-136 G7, G7b).
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, message), fields(binding_id = %id, owner = %owner, run = %run))]
+    pub async fn commit_for_run(
+        &self,
+        run: uuid::Uuid,
+        id: &GitRepoBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<String, GitRepoError> {
+        self.commit_as(
+            Some(run),
+            id,
+            tenant_id,
+            owner,
+            message,
+            author_name,
+            author_email,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_as(
+        &self,
+        acting_run: Option<uuid::Uuid>,
+        id: &GitRepoBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<String, GitRepoError> {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
         ensure_binding_ready(&binding)?;
-        self.refuse_if_held(&binding)?;
+        self.refuse_if_held(&binding, acting_run)?;
         // A commit reads no credential, but a binding naming one that is not
         // the caller's active credential is refused here too (AEGIS ADR-136
         // G2).
@@ -845,9 +908,97 @@ impl GitRepoService {
         remote: Option<&str>,
         ref_name: Option<&str>,
     ) -> Result<(), GitRepoError> {
+        self.push_as(None, id, tenant_id, owner, remote, ref_name)
+            .await
+            .map(|_| ())
+    }
+
+    /// Push the work branch `branch` of a binding the run `run` holds to
+    /// `origin`, never with force (AEGIS ADR-136 G8, G8a, G8b). Answers the
+    /// branch, the binding's URL with no user info, and the host's page of
+    /// the branch.
+    #[instrument(skip(self), fields(binding_id = %id, owner = %owner, run = %run))]
+    pub async fn push_for_run(
+        &self,
+        run: uuid::Uuid,
+        id: &GitRepoBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+        branch: &str,
+    ) -> Result<RunPush, GitRepoError> {
+        let (pushed, remote_url) = self
+            .push_as(
+                Some(run),
+                id,
+                tenant_id,
+                owner,
+                Some("origin"),
+                Some(branch),
+            )
+            .await?;
+        let branch_url = branch_url(&remote_url, &pushed);
+        Ok(RunPush {
+            branch: pushed,
+            remote_url,
+            branch_url,
+        })
+    }
+
+    /// The tree of a binding the run `run` holds: whether it holds changes,
+    /// and its HEAD, read from the tree (AEGIS ADR-136 G7c).
+    #[instrument(skip(self), fields(binding_id = %id, owner = %owner, run = %run))]
+    pub async fn status_for_run(
+        &self,
+        run: uuid::Uuid,
+        id: &GitRepoBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+    ) -> Result<RunTreeStatus, GitRepoError> {
+        let binding = self.get_binding(id, tenant_id, owner).await?;
+        ensure_binding_ready(&binding)?;
+        self.refuse_if_held(&binding, Some(run))?;
+        let (clean, head) = match self.resolve_tree(&binding).await? {
+            Tree::Host(target_dir) => {
+                tokio::task::spawn_blocking(move || blocking_head_and_status(&target_dir))
+                    .await
+                    .map_err(|e| GitRepoError::GitFailed(format!("status task panicked: {e}")))??
+            }
+            Tree::Volume(volume) => self
+                .clone_executor
+                .head_and_status_ephemeral(&volume)
+                .await
+                .map_err(step_error)?,
+        };
+        Ok(RunTreeStatus { clean, head })
+    }
+
+    /// [`Self::diff`] of a binding the run `run` holds (AEGIS ADR-136 G7).
+    pub async fn diff_for_run(
+        &self,
+        run: uuid::Uuid,
+        id: &GitRepoBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+        staged: bool,
+    ) -> Result<String, GitRepoError> {
+        let binding = self.get_binding(id, tenant_id, owner).await?;
+        self.refuse_if_held(&binding, Some(run))?;
+        self.diff(id, tenant_id, owner, staged).await
+    }
+
+    /// Answers the ref pushed and the binding's URL with no user info.
+    async fn push_as(
+        &self,
+        acting_run: Option<uuid::Uuid>,
+        id: &GitRepoBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+        remote: Option<&str>,
+        ref_name: Option<&str>,
+    ) -> Result<(String, String), GitRepoError> {
         let mut binding = self.get_binding(id, tenant_id, owner).await?;
         ensure_binding_ready(&binding)?;
-        self.refuse_if_held(&binding)?;
+        self.refuse_if_held(&binding, acting_run)?;
 
         let tree = self.resolve_tree(&binding).await?;
         // A push from a volume goes only where the binding's credential
@@ -890,14 +1041,17 @@ impl GitRepoService {
         binding.domain_events.push(GitRepoEvent::PushCompleted {
             id: binding.id,
             remote: remote.unwrap_or("origin").to_string(),
-            ref_name: resolved_ref,
+            ref_name: resolved_ref.clone(),
             pushed_at: Utc::now(),
         });
         self.repo.save(&binding).await?;
         self.drain_and_publish(&mut binding);
 
         info!("push completed on canvas git binding");
-        Ok(())
+        let remote_url = crate::domain::secrets::RedactedUrl::new(binding.repo_url.expose())
+            .as_str()
+            .to_string();
+        Ok((resolved_ref, remote_url))
     }
 
     /// Return the unified diff of the binding's working tree.
@@ -1226,10 +1380,18 @@ impl GitRepoService {
     // A run's repositories (AEGIS ADR-136 G3, G4, G5; G3a, G4a, G5a)
     // -----------------------------------------------------------------------
 
-    /// Refuse an act on a binding a run holds, from outside that run (G4a).
-    fn refuse_if_held(&self, binding: &GitRepoBinding) -> Result<(), GitRepoError> {
+    /// Refuse an act on a binding a run holds, from outside that run (G4a):
+    /// `acting_run` may act on a binding it holds itself (G7b).
+    fn refuse_if_held(
+        &self,
+        binding: &GitRepoBinding,
+        acting_run: Option<uuid::Uuid>,
+    ) -> Result<(), GitRepoError> {
         let holds = self.run_holds.lock().expect("run holds lock");
-        if holds.contains_key(&binding.id) {
+        if holds
+            .get(&binding.id)
+            .is_some_and(|holder| Some(*holder) != acting_run)
+        {
             return Err(GitRepoError::HeldByRun {
                 label: binding.label.clone(),
             });
@@ -1265,6 +1427,10 @@ impl GitRepoService {
 
     /// Release every binding `run` holds.
     pub fn release_run(&self, run: uuid::Uuid) {
+        self.run_preparations
+            .lock()
+            .expect("run preparations lock")
+            .remove(&run);
         let mut holds = self.run_holds.lock().expect("run holds lock");
         let before = holds.len();
         holds.retain(|_, holder| *holder != run);
@@ -1569,6 +1735,62 @@ pub enum RunRepositoryError {
     Failed(#[from] GitRepoError),
 }
 
+/// What a run's preparation did for one repository (AEGIS ADR-136 G5b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRepository {
+    pub label: String,
+    pub branch: String,
+    /// The commit the work branch stood at once checked out.
+    pub started_from: String,
+    /// Whether the branch was created from the binding's ref.
+    pub created: bool,
+    pub prepared_at: chrono::DateTime<Utc>,
+}
+
+/// What a run's push answers (AEGIS ADR-136 G5c, G8a, G8b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPush {
+    pub branch: String,
+    /// The binding's URL, with no user info.
+    pub remote_url: String,
+    /// The host's page of the branch.
+    pub branch_url: String,
+}
+
+/// A run's tree as `aegis.git.status` reads it (AEGIS ADR-136 G7c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunTreeStatus {
+    pub clean: bool,
+    pub head: String,
+}
+
+/// The host's page of `branch` for a repository URL that holds no user info
+/// (AEGIS ADR-136 G8b): an `http(s)` URL without `.git`, plus
+/// `/tree/<branch>`; an scp-style or `ssh://` URL becomes
+/// `https://<host>/<path>/tree/<branch>`.
+pub fn branch_url(remote_url: &str, branch: &str) -> String {
+    let url = remote_url.trim();
+    let base = if url.starts_with("https://") || url.starts_with("http://") {
+        url.to_string()
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host.split(':').next().unwrap_or(host);
+        format!("https://{host}/{path}")
+    } else if let Some((host, path)) = url
+        .split_once(':')
+        .filter(|(host, _)| !host.is_empty() && !host.contains('/'))
+    {
+        let host = host.rsplit('@').next().unwrap_or(host);
+        format!("https://{host}/{}", path.trim_start_matches('/'))
+    } else {
+        url.to_string()
+    };
+    let base = base.trim_end_matches('/');
+    let base = base.strip_suffix(".git").unwrap_or(base);
+    format!("{base}/tree/{branch}")
+}
+
 /// One repository mounted in a run's container.
 #[derive(Debug, Clone)]
 pub struct RunMount {
@@ -1607,6 +1829,10 @@ pub trait RunRepositories: Send + Sync {
 
     /// Release every binding `run` holds.
     fn release_run(&self, run: uuid::Uuid);
+
+    /// What `run`'s preparation did, once: the first agent execution of the
+    /// run takes it to publish its narrative rows (AEGIS ADR-136 G5b, G13a).
+    fn take_prepared(&self, run: uuid::Uuid) -> Vec<PreparedRepository>;
 }
 
 #[async_trait]
@@ -1634,9 +1860,17 @@ impl RunRepositories for GitRepoService {
         }
         let owner = person.unwrap_or_default();
         let mut prepared = Vec::with_capacity(checked.len());
+        let mut preparations = Vec::with_capacity(checked.len());
         for (binding, branch) in checked {
             match self.check_out_work_branch(&binding, owner, &branch).await {
                 Ok((started_from, created)) => {
+                    preparations.push(PreparedRepository {
+                        label: binding.label.clone(),
+                        branch: branch.clone(),
+                        started_from: started_from.clone(),
+                        created,
+                        prepared_at: Utc::now(),
+                    });
                     // The narrative row is G5b's; until then the preparation is logged.
                     info!(
                         run = %run,
@@ -1657,6 +1891,10 @@ impl RunRepositories for GitRepoService {
                 }
             }
         }
+        self.run_preparations
+            .lock()
+            .expect("run preparations lock")
+            .insert(run, preparations);
         Ok(prepared)
     }
 
@@ -1684,6 +1922,14 @@ impl RunRepositories for GitRepoService {
 
     fn release_run(&self, run: uuid::Uuid) {
         GitRepoService::release_run(self, run);
+    }
+
+    fn take_prepared(&self, run: uuid::Uuid) -> Vec<PreparedRepository> {
+        self.run_preparations
+            .lock()
+            .expect("run preparations lock")
+            .remove(&run)
+            .unwrap_or_default()
     }
 }
 
@@ -1888,6 +2134,7 @@ fn step_error(e: CloneError) -> GitRepoError {
     match e {
         CloneError::Git(m) | CloneError::Io(m) => GitRepoError::GitFailed(m),
         CloneError::NotYetImplemented(m) => GitRepoError::NotYetImplemented(m),
+        CloneError::RemoteAhead(branch) => GitRepoError::RemoteAhead { branch },
     }
 }
 
@@ -2131,15 +2378,64 @@ fn blocking_push(
         None
     };
 
+    // The remote's answer for the ref: a refusal arrives here, not as an
+    // error of `push` (AEGIS ADR-136 G8a).
+    let refused: std::rc::Rc<std::cell::RefCell<Option<String>>> = Default::default();
+    let refused_in_callback = refused.clone();
+    callbacks.push_update_reference(move |_refname, status| {
+        if let Some(status) = status {
+            *refused_in_callback.borrow_mut() = Some(status.to_string());
+        }
+        Ok(())
+    });
+
     let mut push_opts = PushOptions::new();
     push_opts.remote_callbacks(callbacks);
 
     let refspec = format!("refs/heads/{resolved_ref}:refs/heads/{resolved_ref}");
-    remote
-        .push(&[refspec.as_str()], Some(&mut push_opts))
-        .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+    if let Err(e) = remote.push(&[refspec.as_str()], Some(&mut push_opts)) {
+        if e.code() == git2::ErrorCode::NotFastForward {
+            return Err(GitRepoError::RemoteAhead {
+                branch: resolved_ref,
+            });
+        }
+        return Err(GitRepoError::GitFailed(e.to_string()));
+    }
+    drop(push_opts);
+    let refused = refused.borrow_mut().take();
+    if let Some(status) = refused {
+        if status.contains("non-fast-forward") || status.contains("fetch first") {
+            return Err(GitRepoError::RemoteAhead {
+                branch: resolved_ref,
+            });
+        }
+        return Err(GitRepoError::GitFailed(format!(
+            "the remote refused the push of {resolved_ref}: {status}"
+        )));
+    }
 
     Ok(resolved_ref)
+}
+
+/// Whether the tree at `target_dir` is clean (no change, staged or not, and
+/// no untracked file that is not ignored), and its HEAD (AEGIS ADR-136 G7c).
+fn blocking_head_and_status(target_dir: &std::path::Path) -> Result<(bool, String), GitRepoError> {
+    let repo =
+        git2::Repository::open(target_dir).map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).include_ignored(false);
+    let clean = repo
+        .statuses(Some(&mut options))
+        .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+        .is_empty();
+    let head = repo
+        .head()
+        .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+        .peel_to_commit()
+        .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+        .id()
+        .to_string();
+    Ok((clean, head))
 }
 
 /// Blocking libgit2 diff against `target_dir`.

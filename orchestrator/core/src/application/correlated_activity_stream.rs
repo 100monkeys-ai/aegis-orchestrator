@@ -652,6 +652,40 @@ fn event_message(event: &DomainEvent) -> String {
             "Terminated instance {:?} for iteration {iteration_number}",
             instance_id
         ),
+        // AEGIS ADR-136 G13b: every tool call has a line naming its tool.
+        DomainEvent::Execution(ExecutionEvent::ToolDispatched { tool, status, .. }) => {
+            format!("Called {tool}: {status}")
+        }
+        // AEGIS ADR-136 G13a: the run's repository steps.
+        DomainEvent::Execution(ExecutionEvent::RepositoryPrepared {
+            label,
+            branch,
+            started_from,
+            created,
+            ..
+        }) => {
+            if *created {
+                format!(
+                    "Prepared repository {label} at /workspace/{label}: branch {branch} created from {started_from}"
+                )
+            } else {
+                format!(
+                    "Prepared repository {label} at /workspace/{label}: branch {branch} checked out at {started_from}"
+                )
+            }
+        }
+        DomainEvent::Execution(ExecutionEvent::RepositoryCommitted {
+            label,
+            branch,
+            commit_sha,
+            ..
+        }) => format!("Committed {commit_sha} on branch {branch} of repository {label}"),
+        DomainEvent::Execution(ExecutionEvent::RepositoryPushed {
+            label,
+            branch,
+            branch_url,
+            ..
+        }) => format!("Pushed branch {branch} of repository {label} to {branch_url}"),
         DomainEvent::Execution(ExecutionEvent::Validation(
             ValidationEvent::GradientValidationPerformed {
                 iteration_number,
@@ -1358,6 +1392,108 @@ mod tests {
             !next.message.contains("/system/global.log"),
             "system-level (execution_id=None) event must not appear in a tenant-scoped stream"
         );
+    }
+
+    /// AEGIS ADR-136 G13a, G13b: the run's repository rows and every tool
+    /// call each have their line, type name and stage.
+    #[test]
+    fn repository_rows_and_tool_calls_have_their_lines() {
+        let execution_id = ExecutionId::new();
+        let agent_id = AgentId::new();
+        let sha = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let row = |event: ExecutionEvent| {
+            let row = normalize_domain_event(&DomainEvent::Execution(event), None);
+            (row.event_type, row.stage, row.message)
+        };
+        let prepared = |created| ExecutionEvent::RepositoryPrepared {
+            execution_id,
+            agent_id,
+            label: "app".to_string(),
+            branch: "aegis/1234abcd".to_string(),
+            started_from: sha.clone(),
+            created,
+            prepared_at: Utc::now(),
+        };
+        let repository = Some("repository".to_string());
+        let mut wrong = Vec::new();
+        for (got, want) in [
+            (
+                row(prepared(true)),
+                (
+                    "repository_prepared".to_string(),
+                    repository.clone(),
+                    format!("Prepared repository app at /workspace/app: branch aegis/1234abcd created from {sha}"),
+                ),
+            ),
+            (
+                row(prepared(false)),
+                (
+                    "repository_prepared".to_string(),
+                    repository.clone(),
+                    format!("Prepared repository app at /workspace/app: branch aegis/1234abcd checked out at {sha}"),
+                ),
+            ),
+            (
+                row(ExecutionEvent::RepositoryCommitted {
+                    execution_id,
+                    agent_id,
+                    label: "app".to_string(),
+                    branch: "aegis/1234abcd".to_string(),
+                    commit_sha: sha.clone(),
+                    committed_at: Utc::now(),
+                }),
+                (
+                    "repository_committed".to_string(),
+                    repository.clone(),
+                    format!("Committed {sha} on branch aegis/1234abcd of repository app"),
+                ),
+            ),
+            (
+                row(ExecutionEvent::RepositoryPushed {
+                    execution_id,
+                    agent_id,
+                    label: "app".to_string(),
+                    branch: "aegis/1234abcd".to_string(),
+                    remote_url: crate::domain::secrets::RedactedUrl::new("https://github.com/o/r.git"),
+                    branch_url: crate::domain::secrets::RedactedUrl::new(
+                        "https://github.com/o/r/tree/aegis/1234abcd",
+                    ),
+                    pushed_at: Utc::now(),
+                }),
+                (
+                    "repository_pushed".to_string(),
+                    repository.clone(),
+                    "Pushed branch aegis/1234abcd of repository app to https://github.com/o/r/tree/aegis/1234abcd".to_string(),
+                ),
+            ),
+            (
+                row(ExecutionEvent::ToolDispatched {
+                    execution_id,
+                    agent_id,
+                    iteration_number: 1,
+                    call_index: 0,
+                    tool_call_id: "call-1".to_string(),
+                    tool: "github.create_pull_request".to_string(),
+                    arguments: serde_json::json!({}),
+                    stdin_given: None,
+                    status: "succeeded".to_string(),
+                    sentence: None,
+                    refused_by: None,
+                    dispatch_id: None,
+                    dispatched_at: Utc::now(),
+                }),
+                (
+                    "tool_dispatched".to_string(),
+                    Some("tool".to_string()),
+                    "Called github.create_pull_request: succeeded".to_string(),
+                ),
+            ),
+        ] {
+            if got != want {
+                wrong.push(format!("got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]

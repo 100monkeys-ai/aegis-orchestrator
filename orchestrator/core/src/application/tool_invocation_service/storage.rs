@@ -59,6 +59,13 @@ fn commit_author(identity: Option<&UserIdentity>) -> (String, String) {
 
 type ToolResult = Result<ToolInvocationResult, SealSessionError>;
 
+/// A git call made inside a run (AEGIS ADR-136 G7a).
+struct RunGitCall {
+    run: uuid::Uuid,
+    agent_id: crate::domain::agent::AgentId,
+    entries: Vec<crate::domain::git_repo::RunRepository>,
+}
+
 fn ok_direct(value: Value) -> ToolResult {
     Ok(ToolInvocationResult::Direct(value))
 }
@@ -161,9 +168,14 @@ impl IntoRefusal for GitRepoError {
             GitRepoError::CredentialNotYours => CallerAnswer::InvalidArguments(self.to_string()),
             // AEGIS ADR-136 G4a: a binding a run holds, in the run's words.
             GitRepoError::HeldByRun { .. } => CallerAnswer::Conflict(self.to_string()),
-            GitRepoError::NothingToCommit
-            | GitRepoError::BindingBusy(_)
-            | GitRepoError::NoHeadBranch => CallerAnswer::Conflict(format!("Conflict: {self}.")),
+            // AEGIS ADR-136 G7c, G8a: a clean tree and a push the remote
+            // refused as not a fast-forward, each in its own sentence alone.
+            GitRepoError::NothingToCommit | GitRepoError::RemoteAhead { .. } => {
+                CallerAnswer::Conflict(self.to_string())
+            }
+            GitRepoError::BindingBusy(_) | GitRepoError::NoHeadBranch => {
+                CallerAnswer::Conflict(format!("Conflict: {self}."))
+            }
             GitRepoError::NotYetImplemented(_) => CallerAnswer::NotImplemented(self.to_string()),
             // The git library's text can carry the clone's local path: no
             // caller-facing message is built from the caller's own inputs at
@@ -588,14 +600,28 @@ impl ToolInvocationService {
         args: &mut Value,
         caller: Option<&UserIdentity>,
         _scope: &crate::domain::iam::TenantScope,
+        execution_id: crate::domain::execution::ExecutionId,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
             None => return not_configured("aegis.git.status", "git repo service"),
         };
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
-        let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
+        if let Some(run) = self.run_of_git_call(execution_id).await {
+            let (label, bid, branch) = self.run_repository(&run, args, &tenant_id, &owner).await?;
+            let tree = svc
+                .status_for_run(run.run, &bid, &tenant_id, &owner)
+                .await
+                .map_err(IntoRefusal::into_refusal)?;
+            return ok_direct(json!({
+                "repository": label,
+                "branch": branch,
+                "status": if tree.clean { "clean" } else { "changed" },
+                "last_commit_sha": tree.head,
+            }));
+        }
+        let binding_id = require_str(args, "binding_id")?;
         let bid = parse_binding_id(binding_id)?;
 
         let binding = svc
@@ -655,17 +681,45 @@ impl ToolInvocationService {
         args: &mut Value,
         caller: Option<&UserIdentity>,
         _scope: &crate::domain::iam::TenantScope,
+        execution_id: crate::domain::execution::ExecutionId,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
             None => return not_configured("aegis.git.commit", "git repo service"),
         };
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
+        let owner = user_sub(caller);
+        let (author_name, author_email) = commit_author(caller);
+        if let Some(run) = self.run_of_git_call(execution_id).await {
+            let (label, bid, branch) = self.run_repository(&run, args, &tenant_id, &owner).await?;
+            let message = require_str(args, "message")?;
+            let commit_sha = svc
+                .commit_for_run(
+                    run.run,
+                    &bid,
+                    &tenant_id,
+                    &owner,
+                    message,
+                    &author_name,
+                    &author_email,
+                )
+                .await
+                .map_err(IntoRefusal::into_refusal)?;
+            self.event_bus.publish_execution_event(
+                crate::domain::events::ExecutionEvent::RepositoryCommitted {
+                    execution_id,
+                    agent_id: run.agent_id,
+                    label,
+                    branch,
+                    commit_sha: commit_sha.clone(),
+                    committed_at: chrono::Utc::now(),
+                },
+            );
+            return ok_direct(json!({"commit_sha": commit_sha}));
+        }
         let binding_id = require_str(args, "binding_id")?;
         let message = require_str(args, "message")?;
-        let owner = user_sub(caller);
         let bid = parse_binding_id(binding_id)?;
-        let (author_name, author_email) = commit_author(caller);
 
         let commit_sha = svc
             .commit(
@@ -687,14 +741,39 @@ impl ToolInvocationService {
         args: &mut Value,
         caller: Option<&UserIdentity>,
         _scope: &crate::domain::iam::TenantScope,
+        execution_id: crate::domain::execution::ExecutionId,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
             None => return not_configured("aegis.git.push", "git repo service"),
         };
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
-        let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
+        if let Some(run) = self.run_of_git_call(execution_id).await {
+            // Only the work branch goes, to origin: no ref or remote is read
+            // (AEGIS ADR-136 G8, G7a).
+            let (label, bid, branch) = self.run_repository(&run, args, &tenant_id, &owner).await?;
+            let pushed = svc
+                .push_for_run(run.run, &bid, &tenant_id, &owner, &branch)
+                .await
+                .map_err(IntoRefusal::into_refusal)?;
+            self.event_bus.publish_execution_event(
+                crate::domain::events::ExecutionEvent::RepositoryPushed {
+                    execution_id,
+                    agent_id: run.agent_id,
+                    label,
+                    branch: pushed.branch.clone(),
+                    remote_url: crate::domain::secrets::RedactedUrl::new(&pushed.remote_url),
+                    branch_url: crate::domain::secrets::RedactedUrl::new(&pushed.branch_url),
+                    pushed_at: chrono::Utc::now(),
+                },
+            );
+            return ok_direct(json!({
+                "branch": pushed.branch,
+                "remote_url": pushed.remote_url,
+            }));
+        }
+        let binding_id = require_str(args, "binding_id")?;
         let bid = parse_binding_id(binding_id)?;
 
         let remote = args.get("remote").and_then(|v| v.as_str());
@@ -712,20 +791,28 @@ impl ToolInvocationService {
         args: &mut Value,
         caller: Option<&UserIdentity>,
         _scope: &crate::domain::iam::TenantScope,
+        execution_id: crate::domain::execution::ExecutionId,
     ) -> ToolResult {
         let svc = match &self.git_repo_service {
             Some(s) => s,
             None => return not_configured("aegis.git.diff", "git repo service"),
         };
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
-        let binding_id = require_str(args, "binding_id")?;
         let owner = user_sub(caller);
-        let bid = parse_binding_id(binding_id)?;
-
         let staged = args
             .get("staged")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if let Some(run) = self.run_of_git_call(execution_id).await {
+            let (_, bid, _) = self.run_repository(&run, args, &tenant_id, &owner).await?;
+            let diff_text = svc
+                .diff_for_run(run.run, &bid, &tenant_id, &owner, staged)
+                .await
+                .map_err(IntoRefusal::into_refusal)?;
+            return ok_direct(json!({"diff": diff_text}));
+        }
+        let binding_id = require_str(args, "binding_id")?;
+        let bid = parse_binding_id(binding_id)?;
 
         let diff_text = svc
             .diff(&bid, &tenant_id, &owner, staged)
@@ -733,6 +820,85 @@ impl ToolInvocationService {
             .map_err(IntoRefusal::into_refusal)?;
 
         ok_direct(json!({"diff": diff_text}))
+    }
+
+    /// The run a git call is made in, when its execution has a record
+    /// (AEGIS ADR-136 G7, G7a): the run (its root's workflow execution, or
+    /// its root agent execution), the calling agent, and the repositories
+    /// the run was given. A call with no execution record is the
+    /// companion's, outside any run.
+    async fn run_of_git_call(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> Option<RunGitCall> {
+        let execution = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .ok()?;
+        let root_id = execution
+            .hierarchy
+            .path
+            .first()
+            .copied()
+            .unwrap_or(execution.id);
+        let root = if root_id == execution.id {
+            None
+        } else {
+            self.execution_service
+                .get_execution_unscoped(root_id)
+                .await
+                .ok()
+        };
+        let run = {
+            let root = root.as_ref().unwrap_or(&execution);
+            root.input.workflow_execution_id.unwrap_or(root.id.0)
+        };
+        let entries = execution
+            .input
+            .input
+            .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+            .and_then(|value| crate::domain::git_repo::parse_run_repositories(value).ok())
+            .unwrap_or_default();
+        Some(RunGitCall {
+            run,
+            agent_id: execution.agent_id,
+            entries,
+        })
+    }
+
+    /// The binding the run mounted at the label `repository` names, with the
+    /// label and the run's work branch; never an id the model typed (AEGIS
+    /// ADR-136 G7, G7a).
+    async fn run_repository(
+        &self,
+        run: &RunGitCall,
+        args: &Value,
+        tenant_id: &crate::domain::tenant::TenantId,
+        owner: &str,
+    ) -> Result<(String, crate::domain::git_repo::GitRepoBindingId, String), SealSessionError> {
+        let label = args
+            .get("repository")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(svc) = &self.git_repo_service {
+            for entry in &run.entries {
+                let Ok(binding) = svc.get_binding(&entry.binding_id, tenant_id, owner).await else {
+                    continue;
+                };
+                if binding.label == label {
+                    let branch = entry
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| crate::domain::git_repo::default_work_branch(run.run));
+                    return Ok((label, binding.id, branch));
+                }
+            }
+        }
+        Err(SealSessionError::InvalidArguments(format!(
+            "repository '{label}' is not one of this run's repositories"
+        )))
     }
 
     // ========================================================================
@@ -1068,3 +1234,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run_git_tools_tests.rs"]
+mod run_git_tools_tests;

@@ -112,6 +112,11 @@ const STEP_OUTPUT_CAP: usize = 1024 * 1024;
 /// The exit status the commit step uses for a tree with nothing to commit.
 const NOTHING_TO_COMMIT_EXIT: i32 = 3;
 
+/// The exit status the push step uses when the remote refuses the push as
+/// not a fast-forward: its branch has commits the tree does not (AEGIS
+/// ADR-136 G8a).
+const PUSH_REJECTED_EXIT: i32 = 4;
+
 /// Where the clone step works inside its container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EphemeralCliPaths {
@@ -351,6 +356,15 @@ impl EphemeralCliEngine {
                 &secrets,
             )
             .await?;
+        if result.exit_code == PUSH_REJECTED_EXIT {
+            let branch = result
+                .stdout
+                .lines()
+                .last()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            return Err(CloneError::RemoteAhead(branch));
+        }
         if result.exit_code != 0 {
             return Err(step_failed(&result, &secrets));
         }
@@ -392,6 +406,36 @@ impl EphemeralCliEngine {
         Ok(result.stdout)
     }
 
+    /// Whether the tree on `volume` holds changes, and its HEAD (AEGIS
+    /// ADR-136 G7c).
+    async fn head_and_status_in_volume(
+        &self,
+        volume: &Volume,
+    ) -> Result<(bool, String), CloneError> {
+        let step = head_and_status_step(&self.paths);
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-status-{}", volume.id),
+                "status",
+                "GIT_STATUS",
+                step,
+                &[],
+            )
+            .await?;
+        let sha = head_sha(&result, &[])?;
+        let clean = match result.stdout.lines().rev().nth(1).map(str::trim) {
+            Some("clean") => true,
+            Some("changed") => false,
+            _ => {
+                return Err(CloneError::Git(
+                    "ephemeral-cli status printed neither clean nor changed".to_string(),
+                ))
+            }
+        };
+        Ok((clean, sha))
+    }
+
     /// The lock that keeps one git step at a time on `volume`.
     fn volume_lock(&self, volume_id: VolumeId) -> Arc<tokio::sync::Mutex<()>> {
         self.volume_locks
@@ -424,6 +468,10 @@ impl EphemeralCliEngine {
         // ephemeral container's scope.
         let mount_point = PathBuf::from(&self.paths.workspace);
         let execution_id = ExecutionId::new();
+        // A run that mounts this volume has its own registration, and there
+        // is one per volume: the step's replaces it for the step's length and
+        // it is put back afterwards (AEGIS ADR-136 G5e).
+        let found_on_entry = self.volume_registry.lookup(volume.id);
         self.volume_registry.register(VolumeRegistration {
             volume_id: volume.id,
             execution_id,
@@ -483,8 +531,21 @@ impl EphemeralCliEngine {
             .redacted(secrets)
         });
 
-        // Always deregister, even on error.
-        self.volume_registry.deregister(volume.id);
+        // Always put back the registration found on entry, or deregister,
+        // even on error.
+        match found_on_entry {
+            Some(context) => self.volume_registry.register(VolumeRegistration {
+                volume_id: context.volume_id,
+                execution_id: context.execution_id,
+                workflow_execution_id: context.workflow_execution_id,
+                container_uid: context.container_uid,
+                container_gid: context.container_gid,
+                policy: context.policy,
+                mount_point: context.mount_point,
+                remote_path: context.remote_path,
+            }),
+            None => self.volume_registry.deregister(volume.id),
+        }
         result
     }
 }
@@ -856,11 +917,39 @@ fn push_step(
         Some(r) => s.push_str(&format!("ref={}\n", shell_escape(r))),
         None => s.push_str("ref=$(g rev-parse --abbrev-ref HEAD)\n"),
     }
+    // A refusal as not a fast-forward exits PUSH_REJECTED_EXIT with the
+    // branch as its last line (AEGIS ADR-136 G8a); any other failure exits
+    // with git's status and what git printed on standard error.
     s.push_str(&format!(
-        "g{git_options} push --no-verify origin \"refs/heads/$ref:refs/heads/$ref\"\n\
+        "if out=$(g{git_options} push --porcelain --no-verify origin \"refs/heads/$ref:refs/heads/$ref\" 2>&1); then :; else\n\
+         rc=$?\n\
+         if printf '%s\\n' \"$out\" | grep -Eq '^!.*\\[rejected\\] \\((non-fast-forward|fetch first)\\)'; then\n\
+         printf '%s\\n' \"$ref\"\n\
+         exit {PUSH_REJECTED_EXIT}\n\
+         fi\n\
+         printf '%s\\n' \"$out\" >&2\n\
+         exit \"$rc\"\n\
+         fi\n\
          printf '%s\\n' \"$ref\"\n"
     ));
     Ok(GitStep { script: s, stdin })
+}
+
+/// Build the step that reads the tree's HEAD and whether it holds changes:
+/// its last two lines are `clean` or `changed`, then the HEAD sha (AEGIS
+/// ADR-136 G7c). It is handed no credential.
+fn head_and_status_step(paths: &EphemeralCliPaths) -> GitStep {
+    let (mut s, _, _) =
+        step_prelude(paths, "", None, None).expect("a step with no credential always builds");
+    s.push_str(&format!("cd {}\n", tree_path(paths)));
+    s.push_str(
+        "if [ -z \"$(g status --porcelain)\" ]; then printf 'clean\\n'; else printf 'changed\\n'; fi\n\
+         g rev-parse HEAD\n",
+    );
+    GitStep {
+        script: s,
+        stdin: None,
+    }
 }
 
 /// Build the diff step: index to working tree, or HEAD to index when
@@ -1044,6 +1133,11 @@ pub enum CloneError {
     /// later ADR-081 phase.
     #[error("not yet implemented: {0}")]
     NotYetImplemented(&'static str),
+
+    /// The remote refused a push of the named branch as not a fast-forward
+    /// (AEGIS ADR-136 G8a).
+    #[error("the remote branch '{0}' has commits this run does not have; nothing was pushed")]
+    RemoteAhead(String),
 }
 
 impl CloneError {
@@ -1301,6 +1395,16 @@ impl GitCloneExecutor {
         staged: bool,
     ) -> Result<String, CloneError> {
         self.engine()?.diff_in_volume(volume, staged).await
+    }
+
+    /// Whether the tree on a non-HostPath `volume` is clean, and its HEAD,
+    /// through a git step (AEGIS ADR-136 G7c).
+    #[instrument(skip(self, volume), fields(volume_id = %volume.id))]
+    pub async fn head_and_status_ephemeral(
+        &self,
+        volume: &Volume,
+    ) -> Result<(bool, String), CloneError> {
+        self.engine()?.head_and_status_in_volume(volume).await
     }
 
     /// The git step engine, or `NotYetImplemented` when none was injected.
@@ -2099,6 +2203,52 @@ mod credential_tests {
                 duration_ms: 1,
             })
         }
+    }
+
+    /// AEGIS ADR-136 G5e: a git step on a volume a run has mounted puts the
+    /// run's registration back when it ends; on a volume nobody had
+    /// registered it leaves none.
+    #[tokio::test]
+    async fn a_git_step_puts_back_the_registration_it_found() {
+        let registry = Arc::new(NfsVolumeRegistry::new());
+        let runner = Arc::new(CapturingRunner {
+            captured: Mutex::new(None),
+        });
+        let engine = EphemeralCliEngine::new(runner, registry.clone());
+        let volume = seaweed_volume();
+        let run = ExecutionId::new();
+        registry.register(VolumeRegistration {
+            volume_id: volume.id,
+            execution_id: run,
+            workflow_execution_id: None,
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: FsalAccessPolicy::default(),
+            mount_point: PathBuf::from("/workspace/app"),
+            remote_path: "/aegis/seaweedfs/app/repo".to_string(),
+        });
+        engine
+            .commit_in_volume(&volume, "m", "A", "a@example.invalid")
+            .await
+            .expect("the captured step answers");
+        match registry.lookup(volume.id) {
+            Some(context)
+                if context.execution_id == run
+                    && context.mount_point == PathBuf::from("/workspace/app")
+                    && context.remote_path == "/aegis/seaweedfs/app/repo"
+                    && context.container_uid == 1000 => {}
+            other => panic!("the run's registration was not put back after the step: {other:?}"),
+        }
+
+        let unregistered = seaweed_volume();
+        engine
+            .commit_in_volume(&unregistered, "m", "A", "a@example.invalid")
+            .await
+            .expect("the captured step answers");
+        assert!(
+            registry.lookup(unregistered.id).is_none(),
+            "a step left a registration on a volume nobody had registered"
+        );
     }
 
     /// The clone step's configuration holds no part of the credential in any

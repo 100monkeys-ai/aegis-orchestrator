@@ -4849,6 +4849,7 @@ mod tests {
         prepared: Mutex<Vec<(Option<String>, uuid::Uuid)>>,
         mounted: Mutex<Vec<(Option<String>, uuid::Uuid, serde_json::Value)>>,
         released: Mutex<Vec<uuid::Uuid>>,
+        taken: Mutex<Vec<uuid::Uuid>>,
     }
 
     impl RecordingRunRepositories {
@@ -4859,6 +4860,7 @@ mod tests {
                 prepared: Mutex::new(Vec::new()),
                 mounted: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
+                taken: Mutex::new(Vec::new()),
             })
         }
 
@@ -4939,6 +4941,31 @@ mod tests {
 
         fn release_run(&self, run: uuid::Uuid) {
             self.released.lock().unwrap().push(run);
+        }
+
+        /// One preparation for a run it prepared, answered once.
+        fn take_prepared(
+            &self,
+            run: uuid::Uuid,
+        ) -> Vec<crate::application::git_repo_service::PreparedRepository> {
+            let mut taken = self.taken.lock().unwrap();
+            let prepared = self
+                .prepared
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, prepared)| *prepared == run);
+            if !prepared || taken.contains(&run) {
+                return Vec::new();
+            }
+            taken.push(run);
+            vec![crate::application::git_repo_service::PreparedRepository {
+                label: "app".to_string(),
+                branch: crate::domain::git_repo::default_work_branch(run),
+                started_from: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                created: true,
+                prepared_at: Utc::now(),
+            }]
         }
     }
 
@@ -5051,6 +5078,86 @@ mod tests {
             "task": "fix the bug",
             "repositories": [{ "binding_id": REPOSITORY_BINDING }],
         }))
+    }
+
+    /// AEGIS ADR-136 G5b, G13a: the run's preparation is one
+    /// `RepositoryPrepared` row of its root execution, after its start, with
+    /// what the preparation did; taken once.
+    #[tokio::test]
+    async fn a_runs_preparation_is_one_row_published_after_its_start() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("fixer", None, None);
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &agent)
+            .await
+            .unwrap();
+        let runtime = Arc::new(TestRuntime::default());
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let mut events = event_bus.subscribe();
+        let service = StandardExecutionService::new(
+            agent_repo,
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(runtime.clone())),
+            Arc::new(InMemoryExecutionRepository::new()),
+            event_bus,
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+        let repositories = RecordingRunRepositories::new(None);
+        service.set_repositories(repositories.clone());
+
+        let id = service
+            .start_execution(
+                agent.id,
+                repositories_input(),
+                "test-ctx".to_string(),
+                Some(&repository_person()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the run with a repository did not start: {e}"));
+        wait_for_spawn(runtime.as_ref()).await;
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let crate::infrastructure::event_bus::DomainEvent::Execution(event) = event {
+                seen.push(event);
+            }
+        }
+        let started = seen.iter().position(|e| {
+            matches!(e, ExecutionEvent::ExecutionStarted { execution_id, .. } if *execution_id == id)
+        });
+        let prepared: Vec<(usize, &ExecutionEvent)> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, ExecutionEvent::RepositoryPrepared { .. }))
+            .collect();
+        let branch = crate::domain::git_repo::default_work_branch(id.0);
+        match (started, prepared.as_slice()) {
+            (
+                Some(started),
+                [(
+                    at,
+                    ExecutionEvent::RepositoryPrepared {
+                        execution_id,
+                        agent_id,
+                        label,
+                        branch: row_branch,
+                        created,
+                        ..
+                    },
+                )],
+            ) if *at > started
+                && *execution_id == id
+                && *agent_id == agent.id
+                && label == "app"
+                && *row_branch == branch
+                && *created => {}
+            _ => panic!(
+                "the run's preparation was not one row after its start: started at {started:?}, rows {prepared:?}"
+            ),
+        }
     }
 
     /// G4, G5a: a root execution prepares its run's repositories (its own
@@ -6791,6 +6898,25 @@ impl StandardExecutionService {
                 agent_id,
                 started_at: Utc::now(),
             });
+        // AEGIS ADR-136 G5b, G13a: the run's repository preparation, as rows
+        // of the run's first agent execution (its root, or a workflow's first
+        // agent state); later ones find nothing left to take.
+        if !repository_mounts.is_empty() {
+            if let Some(repositories) = self.run_repositories.get() {
+                for prepared in repositories.take_prepared(run) {
+                    self.event_bus
+                        .publish_execution_event(ExecutionEvent::RepositoryPrepared {
+                            execution_id,
+                            agent_id,
+                            label: prepared.label,
+                            branch: prepared.branch,
+                            started_from: prepared.started_from,
+                            created: prepared.created,
+                            prepared_at: prepared.prepared_at,
+                        });
+                }
+            }
+        }
 
         metrics::counter!("aegis_executions_total", "kind" => "root", "status" => "started")
             .increment(1);

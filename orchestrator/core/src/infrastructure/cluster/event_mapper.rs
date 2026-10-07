@@ -226,6 +226,9 @@ pub fn domain_to_proto(event: DomainEvent) -> Option<ExecutionEvent> {
         | DomainEvent::Validation(_)
         | DomainEvent::OutputHandlerStarted { .. }
         | DomainEvent::OutputHandlerCompleted { .. }
-        | DomainEvent::OutputHandlerFailed { .. } => None,
+        | DomainEvent::OutputHandlerFailed { .. }
+        | DomainEvent::RepositoryPrepared { .. }
+        | DomainEvent::RepositoryCommitted { .. }
+        | DomainEvent::RepositoryPushed { .. } => None,
     }
 }

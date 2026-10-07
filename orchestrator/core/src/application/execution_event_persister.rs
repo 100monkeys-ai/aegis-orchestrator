@@ -297,6 +297,10 @@ fn event_type_str(event: &ExecutionEvent) -> &'static str {
         ExecutionEvent::ToolDispatchEnded { .. } => "ToolDispatchEnded",
         ExecutionEvent::InstanceSpawned { .. } => "InstanceSpawned",
         ExecutionEvent::InstanceTerminated { .. } => "InstanceTerminated",
+        // AEGIS ADR-136 G13a: a run's repository rows, typed by name.
+        ExecutionEvent::RepositoryPrepared { .. } => "repository_prepared",
+        ExecutionEvent::RepositoryCommitted { .. } => "repository_committed",
+        ExecutionEvent::RepositoryPushed { .. } => "repository_pushed",
         _ => "ExecutionEvent",
     }
 }

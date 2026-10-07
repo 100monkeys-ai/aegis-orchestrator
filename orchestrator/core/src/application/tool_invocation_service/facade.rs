@@ -1780,7 +1780,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.git.commit" => Some(
-                self.invoke_aegis_git_commit(args, caller_identity, tenant_scope)
+                self.invoke_aegis_git_commit(args, caller_identity, tenant_scope, execution_id)
                     .await,
             ),
             "aegis.git.delete" => Some(
@@ -1788,7 +1788,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.git.diff" => Some(
-                self.invoke_aegis_git_diff(args, caller_identity, tenant_scope)
+                self.invoke_aegis_git_diff(args, caller_identity, tenant_scope, execution_id)
                     .await,
             ),
             "aegis.git.list" => Some(
@@ -1796,7 +1796,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.git.push" => Some(
-                self.invoke_aegis_git_push(args, caller_identity, tenant_scope)
+                self.invoke_aegis_git_push(args, caller_identity, tenant_scope, execution_id)
                     .await,
             ),
             "aegis.git.refresh" => Some(
@@ -1804,7 +1804,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.git.status" => Some(
-                self.invoke_aegis_git_status(args, caller_identity, tenant_scope)
+                self.invoke_aegis_git_status(args, caller_identity, tenant_scope, execution_id)
                     .await,
             ),
 

@@ -142,6 +142,10 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.list", "Lists threads in a connected mailbox's inbox that match a query, newest first: each thread's id, subject, participants, latest date, message count, unread count, flag and labels. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.read", "Reads one thread of a connected mailbox: every message's headers, flags, labels and plain-text body, oldest first. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox, and flags or unflags it."),
+    BuiltinToolDefinition::new("aegis.git.status", "Shows one of your run's repositories: its work branch, whether the tree is clean or changed, and the commit HEAD is on.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.git.diff", "Shows the changes in one of your run's repositories as a unified diff: unstaged by default, or what is staged.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
+    BuiltinToolDefinition::new("aegis.git.push", "Pushes the run's work branch of one of your run's repositories to its origin, never with force. Only that branch is pushed."),
     BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
@@ -331,6 +335,10 @@ impl ToolRouter {
             "mail.list" => Self::schema_mail_list(),
             "mail.read" => Self::schema_mail_read(),
             "mail.label" => Self::schema_mail_label(),
+            "aegis.git.status" => Self::schema_aegis_git(false, false),
+            "aegis.git.diff" => Self::schema_aegis_git(false, true),
+            "aegis.git.commit" => Self::schema_aegis_git(true, false),
+            "aegis.git.push" => Self::schema_aegis_git(false, false),
             "aegis.schema.get" => Self::schema_aegis_schema_get(),
             "aegis.schema.validate" => Self::schema_aegis_schema_validate(),
             "aegis.agent.create" => Self::schema_aegis_agent_create(),
@@ -776,6 +784,51 @@ impl ToolRouter {
                 }
             },
             "required": ["mailbox", "thread_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.git.*` builtin tools (AEGIS ADR-136 G7,
+    /// G7a): inside a run, `repository` names one of the run's repositories
+    /// by its label; outside a run, `binding_id` names one of your git
+    /// repository bindings. Neither is required, since each caller has one.
+    /// `aegis.git.commit` adds `message`, `aegis.git.diff` adds `staged`.
+    fn schema_aegis_git(message: bool, staged: bool) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "repository".to_string(),
+            json!({
+                "type": "string",
+                "description": "Inside a run: the label of one of the run's repositories, mounted at /workspace/<label>."
+            }),
+        );
+        properties.insert(
+            "binding_id".to_string(),
+            json!({
+                "type": "string",
+                "description": "Outside a run: the id of one of your git repository bindings."
+            }),
+        );
+        let mut required = Vec::new();
+        if message {
+            properties.insert(
+                "message".to_string(),
+                json!({"type": "string", "description": "The commit message."}),
+            );
+            required.push("message");
+        }
+        if staged {
+            properties.insert(
+                "staged".to_string(),
+                json!({
+                    "type": "boolean",
+                    "description": "true shows what is staged; leave it out for the changes not yet staged."
+                }),
+            );
+        }
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required
         })
     }
 
@@ -2320,6 +2373,10 @@ mod tests {
         // AEGIS ADR-135 D1f: the renderer's tool takes the judge choice
         // aegis.task.wait has, added deliberately.
         "aegis.document.render",
+        // AEGIS ADR-136 G7: a run's read-only git tools, added
+        // deliberately; commit and push stay judged.
+        "aegis.git.status",
+        "aegis.git.diff",
     ];
 
     /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).
