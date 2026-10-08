@@ -232,7 +232,10 @@ pub enum CallerAnswer {
 pub enum InternalFailure {
     /// 500 `INTERNAL_ERROR`: a database, repository or platform-state failure.
     Server,
-    /// 502 `UPSTREAM_UNAVAILABLE`: a service the tool depends on did not answer.
+    /// 503 `UPSTREAM_UNAVAILABLE`: a service the tool depends on did not
+    /// answer. 503, not 502, because the edge in front of the route replaces
+    /// an origin 502's body with its own page; the route adds `Retry-After`
+    /// (AEGIS ADR-035, Update of 2026-10-08 (U1)).
     Upstream,
     /// 503 `SERVICE_UNAVAILABLE`: the tool is not configured or not available on this node.
     Unavailable,
@@ -306,7 +309,7 @@ impl SealRefusal {
         let (http_status, code, message) = match class {
             InternalFailure::Server => (500, "INTERNAL_ERROR", INTERNAL_ERROR_MESSAGE),
             InternalFailure::Upstream => {
-                (502, "UPSTREAM_UNAVAILABLE", UPSTREAM_UNAVAILABLE_MESSAGE)
+                (503, "UPSTREAM_UNAVAILABLE", UPSTREAM_UNAVAILABLE_MESSAGE)
             }
             InternalFailure::Unavailable => {
                 (503, "SERVICE_UNAVAILABLE", SERVICE_UNAVAILABLE_MESSAGE)
@@ -992,7 +995,7 @@ mod tests {
             ),
             (
                 SealSessionError::UpstreamUnavailable("Brave API returned 429".into()),
-                502,
+                503,
                 "UPSTREAM_UNAVAILABLE",
                 "error",
             ),
@@ -1070,7 +1073,7 @@ mod tests {
             ),
             (
                 answered(CallerAnswer::Internal(InternalFailure::Upstream)),
-                502,
+                503,
                 "UPSTREAM_UNAVAILABLE",
                 "error",
             ),

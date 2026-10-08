@@ -778,13 +778,13 @@ async fn a_gateway_refusal_reaches_the_caller_by_its_code() {
         (
             Code::Unavailable,
             "UPSTREAM_UNAVAILABLE",
-            502,
+            503,
             "UpstreamUnavailable",
         ),
         (
             Code::ResourceExhausted,
             "RATE_LIMIT_EXCEEDED",
-            502,
+            503,
             "UpstreamUnavailable",
         ),
         (

@@ -1065,20 +1065,89 @@ async fn the_escalation_check_failure_is_500_and_its_key_is_only_in_the_log() {
 }
 
 /// I3: upstream and gateway transport text (`web_tools.rs`, `gateway.rs`).
+/// An upstream failure is 503 `UPSTREAM_UNAVAILABLE` with `Retry-After: 5`
+/// and its fixed message, so an edge in front of the route that replaces a
+/// 502's body passes it through; `SERVICE_UNAVAILABLE` and `INTERNAL_ERROR`
+/// keep their status and carry no `Retry-After`. Every row is checked before
+/// the test fails, so one run names each wrong one.
 #[tokio::test]
-async fn an_upstream_failure_is_502_and_its_text_is_only_in_the_log() {
-    let error = SealSessionError::UpstreamUnavailable(
-        "web.search Brave API returned 429: Mk7-upstream-body".into(),
+async fn an_upstream_failure_is_503_with_retry_after_and_its_text_is_only_in_the_log() {
+    let upstream = answer(
+        &SealSessionError::UpstreamUnavailable(
+            "web.search Brave API returned 429: Mk7-upstream-body".into(),
+        ),
+        "web.search",
+    )
+    .await;
+    let unavailable = answer(
+        &SealSessionError::ConfigurationError("seal_gateway.url is not configured".into()),
+        "some.tool",
+    )
+    .await;
+    let gateway = answer(
+        &SealSessionError::InternalError(
+            "seal tooling gateway connect failed (http://10.9.8.7:50055): Mk7-transport".into(),
+        ),
+        "some.tool",
+    )
+    .await;
+    let mut wrong = Vec::new();
+    for (row, a, status, code, retry_after) in [
+        (
+            "an upstream failure",
+            &upstream,
+            503,
+            "UPSTREAM_UNAVAILABLE",
+            Some("5"),
+        ),
+        (
+            "an unconfigured tool",
+            &unavailable,
+            503,
+            "SERVICE_UNAVAILABLE",
+            None,
+        ),
+        (
+            "a gateway transport failure",
+            &gateway,
+            500,
+            "INTERNAL_ERROR",
+            None,
+        ),
+    ] {
+        let seen = (
+            a.status,
+            a.body["error"]["code"].as_str().unwrap_or("").to_string(),
+            a.headers
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap_or("<not text>").to_string()),
+        );
+        let expected = (status, code.to_string(), retry_after.map(str::to_string));
+        if seen != expected {
+            wrong.push(format!(
+                "{row} was answered (status, code, Retry-After) {seen:?}, expected {expected:?}"
+            ));
+        }
+    }
+    if upstream.message()
+        != aegis_orchestrator_core::domain::seal_session::UPSTREAM_UNAVAILABLE_MESSAGE
+    {
+        wrong.push(format!(
+            "an upstream failure's message changed: {}",
+            upstream.message()
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "the route answered an R5 row wrongly:\n{}",
+        wrong.join("\n")
     );
-    let a = answer(&error, "web.search").await;
-    a.assert_shape(502, "UPSTREAM_UNAVAILABLE", "error");
-    a.assert_detail_only_in_log(&["Brave", "Mk7-upstream-body"]);
-    let gateway = SealSessionError::InternalError(
-        "seal tooling gateway connect failed (http://10.9.8.7:50055): Mk7-transport".into(),
-    );
-    let a = answer(&gateway, "some.tool").await;
-    a.assert_shape(500, "INTERNAL_ERROR", "error");
-    a.assert_detail_only_in_log(&["10.9.8.7", "Mk7-transport"]);
+    upstream.assert_shape(503, "UPSTREAM_UNAVAILABLE", "error");
+    upstream.assert_detail_only_in_log(&["Brave", "Mk7-upstream-body"]);
+    unavailable.assert_shape(503, "SERVICE_UNAVAILABLE", "error");
+    unavailable.assert_detail_only_in_log(&["seal_gateway.url"]);
+    gateway.assert_shape(500, "INTERNAL_ERROR", "error");
+    gateway.assert_detail_only_in_log(&["10.9.8.7", "Mk7-transport"]);
 }
 
 /// I4: platform state and internal ids (`audit.rs` 381, `facade.rs` 563).

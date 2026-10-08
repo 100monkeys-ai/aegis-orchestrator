@@ -727,6 +727,10 @@ pub(crate) async fn context_tools_seal_handler(
     }
 }
 
+/// The seconds an upstream failure's answer asks the caller to wait
+/// (`Retry-After`; AEGIS ADR-035, Update of 2026-10-08 (U1)).
+const UPSTREAM_RETRY_AFTER_SECONDS: u64 = 5;
+
 /// The answer of `POST /v1/seal/invoke` to a refusal (AEGIS ADR-035, Update
 /// of 2026-10-04, R1 to R4): ADR-035's own error shape,
 /// `{"protocol","request_id","status","error":{"code","message","context","tool"}}`,
@@ -783,6 +787,14 @@ pub(crate) fn invoke_refusal_response(
         },
     }));
     let mut headers = HeaderMap::new();
+    if refusal.code == "UPSTREAM_UNAVAILABLE" {
+        // AEGIS ADR-035, Update of 2026-10-08 (U1): an upstream failure is
+        // 503 with `Retry-After`, so the caller waits before it tries again.
+        headers.insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from(UPSTREAM_RETRY_AFTER_SECONDS),
+        );
+    }
     if let Some(limit) = refusal.rate_limit {
         // AEGIS ADR-072 §9: a 429 carries Retry-After and the X-RateLimit-* headers.
         let reset = chrono::Utc::now().timestamp() + limit.retry_after_seconds as i64;
