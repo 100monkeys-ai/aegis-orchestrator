@@ -1,33 +1,47 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Schedules (AEGIS ADR-139 N1 to N5)
+//! # Schedules (AEGIS ADR-139 N1 to N8)
 //!
 //! The schedule service against a Temporal schedule stand-in that records
-//! every call and can be made to fail, over the in-memory store; and,
+//! every call and can be made to fail, over the in-memory store; the run
+//! starter against recording start services; and,
 //! when `AEGIS_TEST_POSTGRES_URL` names a database, migration 048 applied
 //! twice and the Postgres store.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use aegis_orchestrator_core::application::agent::AgentLifecycleService;
+use aegis_orchestrator_core::application::execution::ExecutionService;
 use aegis_orchestrator_core::application::ports::{
     ScheduleEnginePort, TemporalScheduleDescription, TemporalScheduleSpec,
 };
 use aegis_orchestrator_core::application::schedule_service::{
-    ScheduleError, ScheduleReader, ScheduleService,
+    ScheduleError, ScheduleReader, ScheduleService, ScheduledRunPort, ServiceRunStarter,
 };
-use aegis_orchestrator_core::domain::execution::ExecutionId;
+use aegis_orchestrator_core::application::start_workflow_execution::{
+    StartWorkflowExecutionRequest, StartWorkflowExecutionUseCase, StartedWorkflowExecution,
+};
+use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
+use aegis_orchestrator_core::domain::events::ExecutionEvent;
+use aegis_orchestrator_core::domain::execution::{
+    Execution, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
+};
 use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity, ZaruTier};
+use aegis_orchestrator_core::domain::repository::AgentVersion;
 use aegis_orchestrator_core::domain::schedule::{
-    RecurrenceInput, Schedule, ScheduleDraft, ScheduleId, SchedulePatch, ScheduleRepository,
-    ScheduleState, TargetKind, Timing, AT_REFUSAL, CRON_REFUSAL, OWNER_REFUSAL, TIMEZONE_REFUSAL,
-    UNAVAILABLE_REFUSAL,
+    FireOutcome, RecurrenceInput, Schedule, ScheduleDraft, ScheduleId, SchedulePatch,
+    ScheduleRepository, ScheduleState, TargetKind, Timing, AT_REFUSAL, CRON_REFUSAL, OWNER_REFUSAL,
+    TIMEZONE_REFUSAL, UNAVAILABLE_REFUSAL,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::InMemoryScheduleRepository;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use futures::Stream;
 use serde_json::json;
 
 const BINDING: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
@@ -182,20 +196,63 @@ impl ScheduleEnginePort for StandInEngine {
     }
 }
 
+// ── A run starter stand-in, for the fire's own decisions ────────────────────
+
+#[derive(Default)]
+struct StandInRuns {
+    started: Mutex<Vec<(ScheduleId, String)>>,
+    refuse_with: Mutex<Option<String>>,
+    status: Mutex<HashMap<ExecutionId, ExecutionStatus>>,
+}
+
+#[async_trait]
+impl ScheduledRunPort for StandInRuns {
+    async fn start(
+        &self,
+        schedule: &Schedule,
+        owner: &UserIdentity,
+    ) -> std::result::Result<ExecutionId, String> {
+        if let Some(sentence) = self.refuse_with.lock().unwrap().clone() {
+            return Err(sentence);
+        }
+        self.started
+            .lock()
+            .unwrap()
+            .push((schedule.id, owner.sub.clone()));
+        let id = ExecutionId::new();
+        self.status
+            .lock()
+            .unwrap()
+            .insert(id, ExecutionStatus::Running);
+        Ok(id)
+    }
+    async fn run_status(
+        &self,
+        _: TargetKind,
+        _: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Option<ExecutionStatus>> {
+        Ok(self.status.lock().unwrap().get(&id).cloned())
+    }
+}
+
 struct Fixture {
     service: ScheduleService,
     store: Arc<InMemoryScheduleRepository>,
     engine: Arc<StandInEngine>,
+    runs: Arc<StandInRuns>,
 }
 
 fn fixture() -> Fixture {
     let store = Arc::new(InMemoryScheduleRepository::new());
     let engine = Arc::new(StandInEngine::default());
     *engine.store.lock().unwrap() = Some(store.clone());
+    let runs = Arc::new(StandInRuns::default());
     Fixture {
-        service: ScheduleService::new(store.clone(), engine.clone()),
+        service: ScheduleService::new(store.clone(), engine.clone(), runs.clone()),
         store,
         engine,
+        runs,
     }
 }
 
@@ -589,6 +646,389 @@ async fn a_schedule_answers_only_its_owner_and_the_tenants_operator() {
     );
 }
 
+/// N10: `next_run_at` is Temporal's next action time; `last_run` is the
+/// newest fire.
+#[tokio::test]
+async fn a_schedule_answers_its_next_run_and_its_last_run() {
+    let f = fixture();
+    let next = at(60);
+    *f.engine.next_action.lock().unwrap() = Some(next);
+    let s = create(&f, "owner", recurring("x", "0 15 * * *")).await;
+    f.service
+        .fire(&tenant_of("owner"), s.id, at(0))
+        .await
+        .expect("fire");
+    let view = f
+        .service
+        .get(
+            &ScheduleReader::Owner {
+                sub: "owner".into(),
+            },
+            s.id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(view.next_run_at, Some(next));
+    let last = view.last_run.expect("no last run");
+    assert_eq!(
+        (last.scheduled_time, last.outcome),
+        (at(0), FireOutcome::Started)
+    );
+}
+
+// ── N6, N7: the fire ─────────────────────────────────────────────────────────
+
+/// N6: a repeated fire of one scheduled time answers the first one's row
+/// and starts nothing more.
+#[tokio::test]
+async fn a_fire_is_decided_once_per_scheduled_time() {
+    let f = fixture();
+    let s = create(&f, "owner", recurring("x", "0 15 * * *")).await;
+    let first = f
+        .service
+        .fire(&tenant_of("owner"), s.id, at(0))
+        .await
+        .unwrap();
+    let again = f
+        .service
+        .fire(&tenant_of("owner"), s.id, at(0))
+        .await
+        .unwrap();
+    assert_eq!(first, again, "the repeated fire answered another row");
+    assert_eq!(f.runs.started.lock().unwrap().len(), 1, "two runs started");
+    assert_eq!(first.outcome, FireOutcome::Started);
+}
+
+/// A fire in another tenant than the schedule's is not found.
+#[tokio::test]
+async fn a_fire_in_another_tenant_is_not_found() {
+    let f = fixture();
+    let s = create(&f, "owner", recurring("x", "0 15 * * *")).await;
+    assert_eq!(
+        f.service
+            .fire(&tenant_of("stranger"), s.id, at(0))
+            .await
+            .unwrap_err(),
+        ScheduleError::NotFound
+    );
+}
+
+/// N7: a schedule not active answers `skipped_paused`.
+#[tokio::test]
+async fn a_paused_schedules_fire_is_skipped() {
+    let f = fixture();
+    let s = create(&f, "owner", recurring("x", "0 15 * * *")).await;
+    f.service.pause(&consumer("owner"), s.id).await.unwrap();
+    let fire = f
+        .service
+        .fire(&tenant_of("owner"), s.id, at(0))
+        .await
+        .unwrap();
+    assert_eq!(fire.outcome, FireOutcome::SkippedPaused);
+    assert!(f.runs.started.lock().unwrap().is_empty());
+}
+
+/// N7: while the last run is still running the fire answers
+/// `skipped_overlap`; once it has ended the next fire starts a run.
+#[tokio::test]
+async fn a_fire_while_the_last_run_runs_is_skipped() {
+    let f = fixture();
+    let s = create(&f, "owner", recurring("x", "0 15 * * *")).await;
+    let first = f
+        .service
+        .fire(&tenant_of("owner"), s.id, at(0))
+        .await
+        .unwrap();
+    let second = f
+        .service
+        .fire(&tenant_of("owner"), s.id, at(30))
+        .await
+        .unwrap();
+    assert_eq!(second.outcome, FireOutcome::SkippedOverlap);
+    f.runs
+        .status
+        .lock()
+        .unwrap()
+        .insert(first.execution_id.unwrap(), ExecutionStatus::Completed);
+    let third = f
+        .service
+        .fire(&tenant_of("owner"), s.id, at(60))
+        .await
+        .unwrap();
+    assert_eq!(third.outcome, FireOutcome::Started);
+}
+
+/// N7: a refused start is recorded with its sentence; after three in a row
+/// the schedule pauses itself, in Temporal too, and says why.
+#[tokio::test]
+async fn three_refused_fires_in_a_row_pause_the_schedule() {
+    let f = fixture();
+    let s = create(&f, "owner", recurring("x", "0 15 * * *")).await;
+    let sentence = "agent 'mail-triage' requires a imap context and none was chosen";
+    *f.runs.refuse_with.lock().unwrap() = Some(sentence.to_string());
+    let mut outcomes = Vec::new();
+    for n in 0..3 {
+        let fire = f
+            .service
+            .fire(&tenant_of("owner"), s.id, at(n * 60))
+            .await
+            .unwrap();
+        outcomes.push((fire.outcome, fire.detail));
+        let state = f.store.get(s.id).await.unwrap().unwrap().state;
+        if n < 2 {
+            assert_eq!(
+                state,
+                ScheduleState::Active,
+                "paused after {} refusals",
+                n + 1
+            );
+        }
+    }
+    assert_eq!(
+        outcomes,
+        vec![(FireOutcome::Refused, Some(sentence.to_string())); 3]
+    );
+    let row = f.store.get(s.id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.paused_reason.as_deref()),
+        (
+            ScheduleState::Paused,
+            Some("Paused after three runs could not start: agent 'mail-triage' requires a imap context and none was chosen.")
+        )
+    );
+    assert!(f
+        .engine
+        .calls()
+        .contains(&EngineCall::Paused(s.temporal_schedule_id.clone(), true)));
+}
+
+/// N2: a one-time schedule is completed once it has fired.
+#[tokio::test]
+async fn a_one_time_schedule_completes_after_its_fire() {
+    let f = fixture();
+    let s = create(&f, "owner", once("once", Utc::now() + Duration::hours(1))).await;
+    f.service
+        .fire(&tenant_of("owner"), s.id, at(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.get(s.id).await.unwrap().unwrap().state,
+        ScheduleState::Completed
+    );
+}
+
+/// N7: a started run's record carries the schedule.
+#[tokio::test]
+async fn a_started_run_is_bound_to_its_schedule() {
+    let f = fixture();
+    let s = create(&f, "owner", recurring("x", "0 15 * * *")).await;
+    let fire = f
+        .service
+        .fire(&tenant_of("owner"), s.id, at(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.bound_schedule(fire.execution_id.unwrap()).await,
+        Some((TargetKind::Agent, s.id))
+    );
+}
+
+// ── N7, N8: the run starter, through the start services ─────────────────────
+
+#[derive(Default)]
+struct RecordingExecutions {
+    started: Mutex<Vec<(AgentId, ExecutionInput, String, Option<UserIdentity>)>>,
+}
+
+#[async_trait]
+impl ExecutionService for RecordingExecutions {
+    async fn start_execution(
+        &self,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+        identity: Option<&UserIdentity>,
+    ) -> Result<ExecutionId> {
+        self.started.lock().unwrap().push((
+            agent_id,
+            input,
+            security_context_name,
+            identity.cloned(),
+        ));
+        Ok(ExecutionId::new())
+    }
+    async fn start_execution_with_id(
+        &self,
+        _: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&UserIdentity>,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_executions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: Option<AgentId>,
+        _: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
+        anyhow::bail!("not exercised")
+    }
+    async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: aegis_orchestrator_core::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<aegis_orchestrator_core::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+}
+
+/// One agent, `mail-triage`, visible in every tenant.
+struct OneAgent(AgentId);
+
+#[async_trait]
+impl AgentLifecycleService for OneAgent {
+    async fn deploy_agent_for_tenant(
+        &self,
+        _: &TenantId,
+        _: AgentManifest,
+        _: bool,
+        _: AgentScope,
+        _: Option<&UserIdentity>,
+    ) -> Result<AgentId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> Result<Agent> {
+        anyhow::bail!("not exercised")
+    }
+    async fn update_agent_for_tenant(
+        &self,
+        _: &TenantId,
+        _: AgentId,
+        _: AgentManifest,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn delete_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_agents_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+        Ok(vec![])
+    }
+    async fn lookup_agent_for_tenant(&self, _: &TenantId, _: &str) -> Result<Option<AgentId>> {
+        Ok(None)
+    }
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        _: &TenantId,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        Ok((name == "mail-triage").then_some(self.0))
+    }
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        _: &TenantId,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<AgentId>> {
+        Ok(None)
+    }
+    async fn list_agents_visible_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+        Ok(vec![])
+    }
+    async fn list_versions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: AgentId,
+    ) -> Result<Vec<AgentVersion>> {
+        Ok(vec![])
+    }
+}
+
+#[derive(Default)]
+struct RecordingWorkflowStarts {
+    started: Mutex<
+        Vec<(
+            TenantId,
+            StartWorkflowExecutionRequest,
+            Option<UserIdentity>,
+        )>,
+    >,
+}
+
+#[async_trait]
+impl StartWorkflowExecutionUseCase for RecordingWorkflowStarts {
+    async fn start_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        request: StartWorkflowExecutionRequest,
+        identity: Option<&UserIdentity>,
+    ) -> Result<StartedWorkflowExecution> {
+        let workflow_id = request.workflow_id.clone();
+        self.started
+            .lock()
+            .unwrap()
+            .push((tenant_id.clone(), request, identity.cloned()));
+        Ok(StartedWorkflowExecution {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            workflow_id,
+            temporal_run_id: "run".into(),
+            status: "running".into(),
+            started_at: Utc::now(),
+        })
+    }
+}
+
 fn scheduled(kind: &str, target: &str) -> Schedule {
     Schedule::create(
         ScheduleDraft {
@@ -610,6 +1050,101 @@ fn scheduled(kind: &str, target: &str) -> Schedule {
         Utc::now(),
     )
     .unwrap()
+}
+
+/// N7, N8: an agent's run starts as the owner, in the owner's tenant, with
+/// the schedule's intent, input, contexts and repositories, no
+/// conversation, under the starting tools' security context.
+#[tokio::test]
+async fn an_agent_run_starts_as_the_owner_with_the_schedules_choices() {
+    let executions = Arc::new(RecordingExecutions::default());
+    let agent = AgentId::new();
+    let starter = ServiceRunStarter::new(executions.clone(), Arc::new(OneAgent(agent)), None, None);
+    let schedule = scheduled("agent", "mail-triage");
+    let owner = schedule.owner.to_identity(&schedule.tenant_id).unwrap();
+    starter.start(&schedule, &owner).await.expect("started");
+
+    let started = executions.started.lock().unwrap();
+    let (agent_id, input, context, identity) = &started[0];
+    let identity = identity.as_ref().expect("no identity");
+    assert_eq!(*agent_id, agent);
+    assert_eq!(context, "aegis-system-agent-runtime");
+    assert_eq!(identity.sub, "owner");
+    assert!(matches!(
+        &identity.identity_kind,
+        IdentityKind::ConsumerUser { tenant_id, zaru_tier: ZaruTier::Pro } if *tenant_id == tenant_of("owner")
+    ));
+    assert_eq!(input.intent.as_deref(), Some("triage"));
+    assert_eq!(
+        input.input,
+        json!({
+            "folder": "inbox",
+            "contexts": { "imap": BINDING },
+            "repositories": [{ "binding_id": BINDING, "branch": "work" }],
+            "tenant_id": tenant_of("owner").as_str(),
+        }),
+        "the run's input"
+    );
+}
+
+/// N7: a target that does not exist refuses the start with the starting
+/// tool's sentence.
+#[tokio::test]
+async fn an_unknown_agent_refuses_the_start() {
+    let starter = ServiceRunStarter::new(
+        Arc::new(RecordingExecutions::default()),
+        Arc::new(OneAgent(AgentId::new())),
+        None,
+        None,
+    );
+    let schedule = scheduled("agent", "gone-agent");
+    let owner = schedule.owner.to_identity(&schedule.tenant_id).unwrap();
+    assert_eq!(
+        starter.start(&schedule, &owner).await,
+        Err("Agent 'gone-agent' not found".to_string())
+    );
+}
+
+/// N7, N8: a workflow's run starts through the workflow start service as
+/// the owner, in the schedule's tenant.
+#[tokio::test]
+async fn a_workflow_run_starts_as_the_owner_with_the_schedules_choices() {
+    let workflows = Arc::new(RecordingWorkflowStarts::default());
+    let starter = ServiceRunStarter::new(
+        Arc::new(RecordingExecutions::default()),
+        Arc::new(OneAgent(AgentId::new())),
+        Some(workflows.clone()),
+        None,
+    );
+    let schedule = scheduled("workflow", "email-inbox-triage");
+    let owner = schedule.owner.to_identity(&schedule.tenant_id).unwrap();
+    starter.start(&schedule, &owner).await.expect("started");
+    let started = workflows.started.lock().unwrap();
+    let (tenant, request, identity) = &started[0];
+    assert_eq!(*tenant, tenant_of("owner"));
+    assert_eq!(identity.as_ref().map(|i| i.sub.as_str()), Some("owner"));
+    assert_eq!(
+        (
+            request.workflow_id.as_str(),
+            request.security_context_name.as_deref(),
+            request.intent.as_deref(),
+            request.tenant_id.clone(),
+        ),
+        (
+            "email-inbox-triage",
+            Some("aegis-system-agent-runtime"),
+            Some("triage"),
+            Some(tenant_of("owner")),
+        )
+    );
+    assert_eq!(
+        request.input,
+        json!({
+            "folder": "inbox",
+            "contexts": { "imap": BINDING },
+            "repositories": [{ "binding_id": BINDING, "branch": "work" }],
+        })
+    );
 }
 
 // ── Migration 048 and the Postgres store ─────────────────────────────────────

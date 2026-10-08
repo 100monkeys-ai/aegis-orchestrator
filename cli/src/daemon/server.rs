@@ -42,6 +42,65 @@ use sqlx::postgres::PgPool;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 
+/// Temporal's schedule service through the daemon's shared Temporal client
+/// (AEGIS ADR-139 N5). A call made while no client is connected fails, and
+/// the schedule service answers that nothing was saved.
+struct ContainerScheduleEngine {
+    container: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
+}
+
+impl ContainerScheduleEngine {
+    async fn client(&self) -> Result<Arc<TemporalClient>> {
+        self.container
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no Temporal client is connected"))
+    }
+}
+
+#[async_trait::async_trait]
+impl aegis_orchestrator_core::application::ports::ScheduleEnginePort for ContainerScheduleEngine {
+    async fn create_schedule(
+        &self,
+        spec: &aegis_orchestrator_core::application::ports::TemporalScheduleSpec,
+    ) -> Result<()> {
+        self.client().await?.create_schedule(spec).await
+    }
+
+    async fn update_schedule(
+        &self,
+        spec: &aegis_orchestrator_core::application::ports::TemporalScheduleSpec,
+    ) -> Result<()> {
+        self.client().await?.update_schedule(spec).await
+    }
+
+    async fn set_schedule_paused(&self, temporal_schedule_id: &str, paused: bool) -> Result<()> {
+        self.client()
+            .await?
+            .set_schedule_paused(temporal_schedule_id, paused)
+            .await
+    }
+
+    async fn delete_schedule(&self, temporal_schedule_id: &str) -> Result<()> {
+        self.client()
+            .await?
+            .delete_schedule(temporal_schedule_id)
+            .await
+    }
+
+    async fn describe_schedule(
+        &self,
+        temporal_schedule_id: &str,
+    ) -> Result<Option<aegis_orchestrator_core::application::ports::TemporalScheduleDescription>>
+    {
+        self.client()
+            .await?
+            .describe_schedule(temporal_schedule_id)
+            .await
+    }
+}
+
 // Helper to establish a Temporal client connection with retry logic.
 // Extracted to module scope for improved testability and separation of concerns.
 async fn connect_temporal_with_retry(
@@ -2746,6 +2805,51 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             },
         );
 
+    // ─── Schedules (AEGIS ADR-139) ──────────────────────────────────────────
+    // A person's schedules and their fires live in PostgreSQL (migration
+    // 048); a node without a database keeps them in process. Each is backed
+    // by a Temporal Schedule through the shared Temporal client; a run is
+    // started through the same services the starting tools use. At boot
+    // every active or paused schedule whose Temporal Schedule is missing is
+    // made again (N5).
+    let schedule_repo: Arc<dyn aegis_orchestrator_core::domain::schedule::ScheduleRepository> =
+        match db_pool.as_ref() {
+            Some(pool) => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::PostgresScheduleRepository::new(pool.clone()),
+            ),
+            None => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::InMemoryScheduleRepository::new(),
+            ),
+        };
+    let schedule_service = Arc::new(
+        aegis_orchestrator_core::application::schedule_service::ScheduleService::new(
+            schedule_repo,
+            Arc::new(ContainerScheduleEngine {
+                container: temporal_client_container.clone(),
+            }),
+            Arc::new(
+                aegis_orchestrator_core::application::schedule_service::ServiceRunStarter::new(
+                    execution_service.clone(),
+                    agent_service.clone(),
+                    Some(start_workflow_execution_use_case.clone()),
+                    Some(workflow_execution_repo.clone()),
+                ),
+            ),
+        ),
+    );
+    if temporal_required {
+        let schedules = schedule_service.clone();
+        tokio::spawn(async move {
+            match schedules.recreate_missing().await {
+                Ok(0) => {}
+                Ok(made) => info!(made, "Re-created missing Temporal Schedules"),
+                Err(e) => {
+                    tracing::error!(error = %e, "Re-creating missing Temporal Schedules failed")
+                }
+            }
+        });
+    }
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -2826,6 +2930,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .as_ref()
             .and_then(|cfg| resolve_env_value(cfg.internal_secret.expose()).ok()),
         edge_api: edge_api_state,
+        schedule_service: Some(schedule_service),
     };
 
     info!("Building router...");

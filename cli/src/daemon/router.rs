@@ -73,6 +73,7 @@ use crate::daemon::handlers::observability::{
 use crate::daemon::handlers::operator_escalations::{
     operator_escalations_router, OperatorEscalationsState,
 };
+use crate::daemon::handlers::schedules::{schedules_router, SchedulesState};
 use crate::daemon::handlers::script::{
     create_script, delete_script, get_script, list_scripts, update_script,
 };
@@ -399,6 +400,12 @@ pub(crate) fn create_router(
     let router = router.merge(tool_approvals_router(ToolApprovalsState {
         service: app_state.tool_invocation_service.tool_approvals(),
         runner: app_state.tool_invocation_service.clone(),
+    }));
+
+    // Schedules (AEGIS ADR-139 N10) and the worker's fire route (N6), over
+    // their own narrow state: the schedule service.
+    let router = router.merge(schedules_router(SchedulesState {
+        service: app_state.schedule_service.clone(),
     }));
 
     // Credential bindings by id (ADR-078; security audit 003 F-1), over

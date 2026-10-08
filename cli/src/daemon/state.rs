@@ -9,7 +9,7 @@ use aegis_orchestrator_core::{
         canvas_service::CanvasService, credential_service::CredentialManagementService,
         execution::StandardExecutionService, file_operations_service::FileOperationsService,
         lifecycle::StandardAgentLifecycleService,
-        register_workflow::StandardRegisterWorkflowUseCase,
+        register_workflow::StandardRegisterWorkflowUseCase, schedule_service::ScheduleService,
         start_workflow_execution::StandardStartWorkflowExecutionUseCase, stimulus::StimulusService,
         user_volume_service::UserVolumeService, CorrelatedActivityStreamService,
     },
@@ -152,4 +152,7 @@ pub(crate) struct AppState {
     /// dispatcher hooks. `None` on deployments where a Postgres pool is not
     /// available or the controller is configured without edge enrollment.
     pub(crate) edge_api: Option<aegis_orchestrator_core::api::rest::edge::EdgeApiState>,
+    /// A person's schedules and their fires (AEGIS ADR-139); `None` on a
+    /// node without one, where every schedule route answers 503.
+    pub(crate) schedule_service: Option<Arc<ScheduleService>>,
 }
