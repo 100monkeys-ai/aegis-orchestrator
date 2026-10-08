@@ -158,6 +158,9 @@ impl ToolInvocationService {
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut input)?;
         super::repository_args::carry_repositories(args, &mut input)?;
+        // AEGIS ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: the
+        // conversation the run was started from, only as the facade wrote it.
+        super::context_args::carry_conversation(args, &mut input);
         let blackboard = args.get("blackboard").cloned();
         let intent = args
             .get("intent")
@@ -601,6 +604,9 @@ impl ToolInvocationService {
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut payload)?;
         super::repository_args::carry_repositories(args, &mut payload)?;
+        // AEGIS ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: the
+        // conversation the run was started from, only as the facade wrote it.
+        super::context_args::carry_conversation(args, &mut payload);
 
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,

@@ -247,6 +247,15 @@ pub struct ExecutionInput {
 /// and the rendered prompt never see it.
 pub const CONTEXTS_INPUT_KEY: &str = "contexts";
 
+/// The reserved key of an execution's `input` that names the Zaru
+/// conversation the run was started from (AEGIS ADR-126, Update of
+/// 2026-10-07 (2), clause 3). Kept by a starting tool from its call's
+/// `_meta.conversation_id` only (clause 3a), inherited by an agent state and
+/// a child as `contexts` is, and read by the approval gate for a call of an
+/// execution with a record. Like `contexts`, it is the platform's: the input
+/// schema and the rendered prompt never see it.
+pub const CONVERSATION_INPUT_KEY: &str = "conversation_id";
+
 /// The refusal of a `contexts` value of any shape but S11a's, before
 /// anything starts or is called (AEGIS ADR-132 Update (13) S11a).
 pub const CONTEXTS_SHAPE: &str = "'contexts' must be an object naming, for each server, a binding id, a list of binding ids, or null";
@@ -390,6 +399,17 @@ impl ExecutionInput {
     /// The dispatch's credential choices (Zaru ADR-0055 D14).
     pub fn contexts(&self) -> ExecutionContexts {
         ExecutionContexts::from_value(self.input.get(CONTEXTS_INPUT_KEY))
+    }
+
+    /// The conversation the run was started from, read from the reserved
+    /// key [`CONVERSATION_INPUT_KEY`]: only a string holding a UUID names
+    /// one (AEGIS ADR-126, Update of 2026-10-07 (2), clause 3a); anything
+    /// else names none.
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.input
+            .get(CONVERSATION_INPUT_KEY)
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
     }
 }
 
@@ -1035,6 +1055,44 @@ mod tests {
     /// AEGIS ADR-132 Update (13) S11b: a list is a set in the person's
     /// order, a bare id a set of one, `null` none, a server not named
     /// nothing; every value that cannot be read is none, never nothing.
+    /// AEGIS ADR-126, Update of 2026-10-07 (2), clause 3a: only a string
+    /// holding a UUID under the reserved key names the run's conversation.
+    #[test]
+    fn conversation_id_reads_only_a_uuid_string_under_the_reserved_key() {
+        const CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+        let input_of = |value: serde_json::Value| ExecutionInput {
+            intent: None,
+            input: value,
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+        let mut complaints = Vec::new();
+        let named = input_of(serde_json::json!({ CONVERSATION_INPUT_KEY: CONVERSATION }));
+        if named.conversation_id() != Some(CONVERSATION) {
+            complaints.push(format!(
+                "a UUID string under the reserved key read {:?}, not the conversation",
+                named.conversation_id()
+            ));
+        }
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({ CONVERSATION_INPUT_KEY: "not-a-uuid" }),
+            serde_json::json!({ CONVERSATION_INPUT_KEY: 7 }),
+            serde_json::json!({ CONVERSATION_INPUT_KEY: [CONVERSATION] }),
+            serde_json::json!({ CONVERSATION_INPUT_KEY: null }),
+            serde_json::json!(CONVERSATION),
+        ] {
+            let read = input_of(value.clone());
+            if let Some(id) = read.conversation_id() {
+                complaints.push(format!("{value} named the conversation {id}"));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
     #[test]
     fn contexts_read_a_list_as_a_set_and_an_unreadable_value_as_none() {
         use crate::domain::credential::CredentialBindingId;

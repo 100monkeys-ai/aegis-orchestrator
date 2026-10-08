@@ -15,7 +15,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::domain::execution::{check_contexts_shape, CONTEXTS_INPUT_KEY};
+use crate::domain::execution::{check_contexts_shape, CONTEXTS_INPUT_KEY, CONVERSATION_INPUT_KEY};
 use crate::domain::seal_session::SealSessionError;
 
 /// Parse the `contexts` argument of a starting tool's call, or a call's
@@ -75,6 +75,43 @@ pub(super) fn put_contexts(input: &mut Value, contexts: Map<String, Value>) {
     }
 }
 
+/// Keep the conversation a starting call names in its `_meta` in `input`'s
+/// reserved key [`CONVERSATION_INPUT_KEY`] (AEGIS ADR-126, Update of
+/// 2026-10-07 (2), clauses 3 and 3a). Any `conversation_id` the call's input
+/// already carries is removed first, so only `_meta` names a run's
+/// conversation; with none named, the input keeps none. A non-object input
+/// is first wrapped as `{"input": <value>}`, as [`put_contexts`] does.
+pub(super) fn put_conversation(input: &mut Value, conversation: Option<&str>) {
+    if !input.is_object() {
+        if conversation.is_none() {
+            return;
+        }
+        let original = std::mem::replace(input, Value::Null);
+        *input = serde_json::json!({ "input": original });
+    }
+    if let Value::Object(map) = input {
+        map.remove(CONVERSATION_INPUT_KEY);
+        if let Some(conversation) = conversation {
+            map.insert(
+                CONVERSATION_INPUT_KEY.to_string(),
+                Value::String(conversation.to_string()),
+            );
+        }
+    }
+}
+
+/// Keep the conversation the facade wrote into a starting call's `args`
+/// (the call's `_meta.conversation_id` on a session with no execution
+/// record, clauses 3 and 3b) in `input`, as [`carry_contexts`] keeps the
+/// call's `contexts`; with none written, `input` keeps none (clause 3a).
+pub(super) fn carry_conversation(args: &Value, input: &mut Value) {
+    let conversation = args
+        .get(CONVERSATION_INPUT_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    put_conversation(input, conversation.as_deref());
+}
+
 /// Parse the call's `contexts` and keep it in `input`, as every starting
 /// tool does before anything starts.
 pub(super) fn carry_contexts(args: &Value, input: &mut Value) -> Result<(), SealSessionError> {
@@ -129,6 +166,54 @@ mod tests {
             input,
             json!({ "input": "convert 43 inches", "contexts": { "nuclear-notes": null } }),
             "a scalar input was not wrapped as {{\"input\": ...}}"
+        );
+    }
+
+    const CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+
+    /// ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: the call's
+    /// conversation is kept in the reserved key, a scalar input is wrapped,
+    /// and a `conversation_id` the input carried is replaced, or removed
+    /// when the call names none.
+    #[test]
+    fn put_conversation_keeps_only_the_calls_conversation() {
+        let mut complaints = Vec::new();
+        let planted = "0b0b0b0b-1c1c-4d4d-8e8e-2f2f2f2f2f2f";
+        for (mut input, conversation, expected) in [
+            (
+                json!({ "topic": "x" }),
+                Some(CONVERSATION),
+                json!({ "topic": "x", "conversation_id": CONVERSATION }),
+            ),
+            (
+                json!("convert 43 inches"),
+                Some(CONVERSATION),
+                json!({ "input": "convert 43 inches", "conversation_id": CONVERSATION }),
+            ),
+            (
+                json!({ "topic": "x", "conversation_id": planted }),
+                Some(CONVERSATION),
+                json!({ "topic": "x", "conversation_id": CONVERSATION }),
+            ),
+            (
+                json!({ "topic": "x", "conversation_id": planted }),
+                None,
+                json!({ "topic": "x" }),
+            ),
+            (json!({ "topic": "x" }), None, json!({ "topic": "x" })),
+        ] {
+            let before = input.clone();
+            put_conversation(&mut input, conversation);
+            if input != expected {
+                complaints.push(format!(
+                    "{before} with {conversation:?} became {input}, not {expected}"
+                ));
+            }
+        }
+        assert!(
+            complaints.is_empty(),
+            "the input does not carry only the call's conversation:\n{}",
+            complaints.join("\n")
         );
     }
 

@@ -57,6 +57,9 @@ impl ToolInvocationService {
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut input)?;
         super::repository_args::carry_repositories(args, &mut input)?;
+        // AEGIS ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: the
+        // conversation the run was started from, only as the facade wrote it.
+        super::context_args::carry_conversation(args, &mut input);
 
         // Resolve and inject the caller's tenant_id into the payload so that
         // start_execution (and any cluster forwarding) picks up the correct tenant.

@@ -257,6 +257,9 @@ impl ToolInvocationService {
         // input's reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut payload)?;
         super::repository_args::carry_repositories(args, &mut payload)?;
+        // AEGIS ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: the
+        // conversation the run was started from, only as the facade wrote it.
+        super::context_args::carry_conversation(args, &mut payload);
         if let Some(map) = payload.as_object_mut() {
             map.entry("tenant_id")
                 .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));

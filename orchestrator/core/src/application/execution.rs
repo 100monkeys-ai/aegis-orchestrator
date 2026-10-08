@@ -4690,6 +4690,174 @@ mod tests {
         );
     }
 
+    /// The conversation a run was started from (AEGIS ADR-126, Update of
+    /// 2026-10-07 (2), clause 3).
+    const RUN_CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+
+    /// Clause 3: the agent's input schema and its rendered prompt never see
+    /// the reserved `conversation_id`; the persisted input keeps it.
+    #[tokio::test]
+    async fn the_conversation_is_kept_from_the_input_schema_and_the_prompt() {
+        let tenant_id = CoreTenantId::consumer();
+        let mut agent = make_agent("schema-closed", None, None);
+        agent.manifest.spec.input_schema = Some(serde_json::json!({
+            "type": "object",
+            "required": ["topic"],
+            "properties": {
+                "topic": { "type": "string" },
+                "tenant_id": { "type": "string" }
+            },
+            "additionalProperties": false
+        }));
+        let (service, _runtime, _repo, _bus) = refusal_service(&tenant_id, &[&agent], &[]).await;
+        let started = service
+            .start_execution(
+                agent.id,
+                input_with(serde_json::json!({
+                    "topic": "units",
+                    "tenant_id": tenant_id.as_str(),
+                    "conversation_id": RUN_CONVERSATION
+                })),
+                "test-ctx".to_string(),
+                None,
+            )
+            .await;
+        let mut complaints = Vec::new();
+        match started {
+            Err(e) => complaints.push(format!("the input schema saw the conversation: {e}")),
+            Ok(id) => {
+                let execution = service.get_execution_unscoped(id).await.unwrap();
+                if execution.input.input.get("conversation_id")
+                    != Some(&serde_json::json!(RUN_CONVERSATION))
+                {
+                    complaints.push(format!(
+                        "the persisted input lost the conversation: {}",
+                        execution.input.input
+                    ));
+                }
+            }
+        }
+        let prompt = StandardExecutionService::render_task(
+            &input_with(serde_json::json!({
+                "topic": "units",
+                "conversation_id": RUN_CONVERSATION
+            })),
+            &agent,
+        )
+        .unwrap()
+        .unwrap_or_default();
+        if prompt.contains(RUN_CONVERSATION) || prompt.contains("\"conversation_id\"") {
+            complaints.push(format!(
+                "the rendered prompt carries the conversation: {prompt}"
+            ));
+        }
+        if !prompt.contains("units") {
+            complaints.push(format!("the prompt lost the input: {prompt}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Clause 3: an agent state with no conversation of its own takes its
+    /// workflow execution's, as it takes its contexts.
+    #[tokio::test]
+    async fn an_agent_state_takes_its_workflow_executions_conversation() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("state-worker", None, None);
+        let workflow_execution_id = uuid::Uuid::new_v4();
+        let workflows = Arc::new(
+            crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new(),
+        );
+        let now = Utc::now();
+        crate::domain::repository::WorkflowExecutionRepository::save_for_tenant(
+            workflows.as_ref(),
+            &tenant_id,
+            &crate::domain::workflow::WorkflowExecution {
+                id: crate::domain::execution::ExecutionId(workflow_execution_id),
+                workflow_id: crate::domain::workflow::WorkflowId::new(),
+                tenant_id: tenant_id.clone(),
+                status: crate::domain::execution::ExecutionStatus::Running,
+                current_state: crate::domain::workflow::StateName::new("START").unwrap(),
+                blackboard: crate::domain::workflow::Blackboard::new(),
+                input: serde_json::json!({
+                    "topic": "units",
+                    "contexts": { "nuclear-notes": CONTEXT_BINDING },
+                    "repositories": [],
+                    "conversation_id": RUN_CONVERSATION
+                }),
+                state_outputs: HashMap::new(),
+                final_output: None,
+                started_at: now,
+                last_transition_at: now,
+                initiating_user_sub: Some("u-starter".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        let service = service.with_workflow_executions(workflows);
+
+        // The state carries contexts and repositories of its own, so only
+        // the conversation can send the start to its workflow's input.
+        let mut input = workflow_step_input(VolumeId::new(), workflow_execution_id);
+        if let serde_json::Value::Object(map) = &mut input.input {
+            map.insert(
+                "contexts".to_string(),
+                serde_json::json!({ "nuclear-notes": null }),
+            );
+            map.insert("repositories".to_string(), serde_json::json!([]));
+        }
+        let id = service
+            .start_execution(
+                agent.id,
+                input,
+                "test-ctx".to_string(),
+                Some(&temporal_worker()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the state did not start: {e}"));
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert_eq!(
+            execution.input.input.get("conversation_id"),
+            Some(&serde_json::json!(RUN_CONVERSATION)),
+            "the state's persisted input lacks its workflow's conversation: {}",
+            execution.input.input
+        );
+    }
+
+    /// Clause 3: a child with no conversation of its own takes its parent's.
+    #[tokio::test]
+    async fn a_child_execution_takes_its_parents_conversation() {
+        let tenant = CoreTenantId::from_string("u-abc123").unwrap();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("child-worker", None, None);
+        let mut parent_execution = make_parent_execution_with_tenant(parent_agent.id, "u-abc123");
+        parent_execution.input.input["conversation_id"] = serde_json::json!(RUN_CONVERSATION);
+        let (service, execution_repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &child_agent, &parent_execution)
+                .await;
+
+        let child_id = service
+            .start_child_execution(
+                child_agent.id,
+                input_with(serde_json::json!({ "task": "read" })),
+                parent_execution.id,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the child did not start: {e}"));
+        let child = execution_repo
+            .find_by_id_for_tenant(&tenant, child_id)
+            .await
+            .unwrap()
+            .expect("the child was persisted");
+        assert_eq!(
+            child.input.input.get("conversation_id"),
+            Some(&serde_json::json!(RUN_CONVERSATION)),
+            "the child's persisted input lacks its parent's conversation: {}",
+            child.input.input
+        );
+    }
+
     /// An agent carrying a two-file program, run with `cmd.run`.
     fn program_agent(name: &str) -> Agent {
         let mut agent = make_agent(name, None, None);
@@ -6057,37 +6225,44 @@ impl StandardExecutionService {
     }
 
     /// The input as the agent's `input_schema` sees it: without the caller's
-    /// reserved `outputs` and `contexts`, which are the platform's, not the
-    /// agent's (Zaru ADR-0055 D14 for `contexts`).
+    /// reserved `outputs`, `contexts` and `conversation_id`, which are the
+    /// platform's, not the agent's (Zaru ADR-0055 D14 for `contexts`; AEGIS
+    /// ADR-126, Update of 2026-10-07 (2), clause 3 for `conversation_id`).
     fn without_caller_outputs(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
         match payload {
             JsonValue::Object(map)
                 if map.contains_key("outputs")
                     || map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
-                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove("outputs");
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
+                map.remove(crate::domain::execution::CONVERSATION_INPUT_KEY);
                 std::borrow::Cow::Owned(JsonValue::Object(map))
             }
             _ => std::borrow::Cow::Borrowed(payload),
         }
     }
 
-    /// The input without the reserved `contexts` (Zaru ADR-0055 D14) and
-    /// `repositories` (AEGIS ADR-136 G3): the rendered prompt never carries
-    /// the dispatch's binding choices or the run's repositories.
+    /// The input without the reserved `contexts` (Zaru ADR-0055 D14),
+    /// `repositories` (AEGIS ADR-136 G3) and `conversation_id` (AEGIS
+    /// ADR-126, Update of 2026-10-07 (2), clause 3): the rendered prompt never
+    /// carries the dispatch's binding choices, the run's repositories or the
+    /// conversation it was started from.
     fn without_contexts(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
         match payload {
             JsonValue::Object(map)
                 if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
-                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
+                map.remove(crate::domain::execution::CONVERSATION_INPUT_KEY);
                 std::borrow::Cow::Owned(JsonValue::Object(map))
             }
             _ => std::borrow::Cow::Borrowed(payload),
@@ -6414,6 +6589,21 @@ impl StandardExecutionService {
         }
     }
 
+    /// Keep `from`'s conversation on `input` when it carries none of its own
+    /// (AEGIS ADR-126, Update of 2026-10-07 (2), clause 3): an agent state
+    /// takes its workflow execution's, a child its parent's, as each takes
+    /// its contexts.
+    fn inherit_conversation(input: &mut ExecutionInput, from: Option<&JsonValue>) {
+        let key = crate::domain::execution::CONVERSATION_INPUT_KEY;
+        let Some(conversation) = from.and_then(|from| from.get(key)) else {
+            return;
+        };
+        if let JsonValue::Object(map) = &mut input.input {
+            map.entry(key.to_string())
+                .or_insert_with(|| conversation.clone());
+        }
+    }
+
     /// Keep `from`'s repositories on `input` when it carries none of its own
     /// (AEGIS ADR-136 G3): an agent state takes its workflow execution's, a
     /// child its parent's, as each takes its contexts.
@@ -6726,12 +6916,19 @@ impl StandardExecutionService {
                 .input
                 .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
                 .is_none()
+            || input
+                .input
+                .get(crate::domain::execution::CONVERSATION_INPUT_KEY)
+                .is_none()
         {
             let workflow_input = self
                 .workflow_execution_input(&tenant_id, input.workflow_execution_id)
                 .await?;
             Self::inherit_contexts(&mut input, workflow_input.as_ref());
             Self::inherit_repositories(&mut input, workflow_input.as_ref());
+            // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and so does
+            // it take the conversation its workflow was started from.
+            Self::inherit_conversation(&mut input, workflow_input.as_ref());
         }
         Self::refuse_malformed_contexts(&input)?;
         Self::refuse_malformed_repositories(&input)?;
@@ -7852,6 +8049,9 @@ impl ExecutionService for StandardExecutionService {
         // Zaru ADR-0055 D14: a child with no binding choices of its own takes
         // its parent's; D16: a required context left unfilled refuses it.
         Self::inherit_contexts(&mut input, Some(&parent.input.input));
+        // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and its
+        // parent's conversation.
+        Self::inherit_conversation(&mut input, Some(&parent.input.input));
         Self::refuse_malformed_contexts(&input)?;
         Self::refuse_unfilled_context(&agent, &input)?;
         // AEGIS ADR-132 Update (13) S11f: a child acts for its parent's

@@ -6313,6 +6313,160 @@ async fn each_starting_tool_carries_the_calls_contexts_into_the_input_it_starts(
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
 
+// AEGIS ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: each starting
+// tool keeps the conversation the facade wrote into its `args` in the input
+// it starts, under the reserved key `conversation_id`, and only that one.
+
+const RUN_CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+const PLANTED_CONVERSATION: &str = "0b0b0b0b-1c1c-4d4d-8e8e-2f2f2f2f2f2f";
+
+/// What each of the five starting tools started from `args`: the input it
+/// started, or a complaint.
+async fn started_inputs(
+    args_for: impl Fn(&str) -> serde_json::Value,
+) -> Vec<(&'static str, Result<serde_json::Value, String>)> {
+    let mut answers = Vec::new();
+    for (tool, agent_name) in [
+        ("aegis.task.execute", "doc-summarizer"),
+        ("aegis.agent.generate", "agent-creator-agent"),
+    ] {
+        let (service, captured) = build_attachments_capturing_service(agent_name, AgentId::new());
+        let context = empty_security_context();
+        let mut args = args_for(tool);
+        let answer = if tool == "aegis.task.execute" {
+            service
+                .invoke_aegis_task_execute_tool(&mut args, &context, None, &test_tenant_scope())
+                .await
+        } else {
+            service
+                .invoke_aegis_agent_generate_tool(&mut args, &context, None, &test_tenant_scope())
+                .await
+        };
+        let started = captured.lock().unwrap().clone();
+        answers.push((
+            tool,
+            match (answer, started) {
+                (Err(e), _) => Err(e.to_string()),
+                (Ok(_), Some(input)) => Ok(input.input),
+                (Ok(_), None) => Err("started nothing".to_string()),
+            },
+        ));
+    }
+    for tool in [
+        "aegis.execute.intent",
+        "aegis.workflow.generate",
+        "aegis.workflow.run",
+    ] {
+        let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+        let (service, operator_context) = workflow_start_service(start_use_case.clone());
+        let mut args = args_for(tool);
+        let answer = match tool {
+            "aegis.execute.intent" => {
+                service
+                    .invoke_aegis_execute_intent_tool(
+                        &mut args,
+                        &make_security_context("zaru-pro"),
+                        None,
+                        &test_tenant_scope(),
+                    )
+                    .await
+            }
+            "aegis.workflow.generate" => {
+                service
+                    .invoke_aegis_workflow_generate_tool(&mut args, None, &test_tenant_scope())
+                    .await
+            }
+            _ => {
+                service
+                    .invoke_aegis_workflow_run_tool(
+                        &mut args,
+                        &operator_context,
+                        None,
+                        &test_tenant_scope(),
+                    )
+                    .await
+            }
+        };
+        let started = start_use_case.last_request.lock().await.clone();
+        answers.push((
+            tool,
+            match (answer, started) {
+                (Err(e), _) => Err(e.to_string()),
+                (Ok(_), Some(request)) => Ok(request.input),
+                (Ok(_), None) => Err("started nothing".to_string()),
+            },
+        ));
+    }
+    answers
+}
+
+/// The arguments of a call of `tool`, with `extra` merged in at the top.
+fn starting_args(
+    tool: &str,
+    input: serde_json::Value,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut args = match tool {
+        "aegis.task.execute" => serde_json::json!({ "agent_id": "doc-summarizer", "input": input }),
+        "aegis.agent.generate" => serde_json::json!({ "input": input }),
+        "aegis.execute.intent" => serde_json::json!({ "intent": "add two numbers" }),
+        "aegis.workflow.generate" => serde_json::json!({ "input": "a workflow that greets" }),
+        _ => serde_json::json!({ "name": "my-workflow", "input": input }),
+    };
+    if let (Some(map), serde_json::Value::Object(extra)) = (args.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    args
+}
+
+#[tokio::test]
+async fn each_starting_tool_keeps_its_conversation_in_the_input_it_starts() {
+    let answers = started_inputs(|tool| {
+        starting_args(
+            tool,
+            serde_json::json!({ "topic": "units" }),
+            serde_json::json!({ "conversation_id": RUN_CONVERSATION }),
+        )
+    })
+    .await;
+    let complaints: Vec<String> = answers
+        .into_iter()
+        .filter_map(|(tool, started)| match started {
+            Ok(input)
+                if input.get("conversation_id") == Some(&serde_json::json!(RUN_CONVERSATION)) =>
+            {
+                None
+            }
+            Ok(input) => Some(format!(
+                "{tool} did not keep its conversation under conversation_id: started {input}"
+            )),
+            Err(e) => Some(format!("{tool}: {e}")),
+        })
+        .collect();
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+#[tokio::test]
+async fn a_start_given_no_conversation_carries_none_and_drops_a_planted_one() {
+    let answers = started_inputs(|tool| {
+        starting_args(
+            tool,
+            serde_json::json!({ "topic": "units", "conversation_id": PLANTED_CONVERSATION }),
+            serde_json::json!({}),
+        )
+    })
+    .await;
+    let complaints: Vec<String> = answers
+        .into_iter()
+        .filter_map(|(tool, started)| match started {
+            Ok(input) if input.get("conversation_id").is_none() => None,
+            Ok(input) => Some(format!("{tool} given no conversation started one: {input}")),
+            Err(e) => Some(format!("{tool}: {e}")),
+        })
+        .collect();
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
 #[tokio::test]
 async fn a_starting_tool_refuses_contexts_of_another_shape_and_starts_nothing() {
     let (service, captured) = build_attachments_capturing_service("doc-summarizer", AgentId::new());

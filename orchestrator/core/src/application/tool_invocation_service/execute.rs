@@ -149,6 +149,9 @@ impl ToolInvocationService {
         // of the pipeline's input, in the reserved key `contexts`.
         super::context_args::carry_contexts(args, &mut input)?;
         super::repository_args::carry_repositories(args, &mut input)?;
+        // AEGIS ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: the
+        // conversation the run was started from, only as the facade wrote it.
+        super::context_args::carry_conversation(args, &mut input);
 
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,

@@ -161,3 +161,59 @@ async fn the_contexts_reach_the_persisted_execution_and_never_the_schema_or_temp
         "the persisted workflow execution lost the contexts its agent states inherit"
     );
 }
+
+/// AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: the conversation a run
+/// was started from reaches the persisted workflow execution, where its
+/// agent states inherit it, and never the workflow's input schema (closed
+/// here) or the Temporal input.
+#[tokio::test]
+async fn the_conversation_reaches_the_persisted_execution_and_never_the_schema_or_temporal() {
+    const CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+    let workflow = closed_schema_workflow();
+    let tenant = TenantId::consumer();
+    let workflows = Arc::new(InMemoryWorkflowRepository::new());
+    workflows.save_for_tenant(&tenant, &workflow).await.unwrap();
+    let executions = Arc::new(InMemoryWorkflowExecutionRepository::new());
+    let engine = Arc::new(RecordingEngine::default());
+    let use_case = StandardStartWorkflowExecutionUseCase::new(
+        workflows,
+        executions.clone(),
+        Arc::new(tokio::sync::RwLock::new(Some(
+            engine.clone() as Arc<dyn WorkflowEnginePort>
+        ))),
+        Arc::new(EventBus::new(8)),
+    );
+
+    let started = use_case
+        .start_execution(StartWorkflowExecutionRequest {
+            workflow_id: workflow.metadata.name.clone(),
+            input: json!({ "topic": "units", "conversation_id": CONVERSATION }),
+            blackboard: None,
+            version: None,
+            tenant_id: Some(tenant.clone()),
+            security_context_name: None,
+            intent: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the workflow's schema saw the conversation: {e:#}"));
+
+    let temporal_inputs = engine.inputs.lock().unwrap().clone();
+    assert_eq!(temporal_inputs.len(), 1, "one start reached Temporal");
+    assert!(
+        !temporal_inputs[0].contains_key("conversation_id"),
+        "Temporal's input carried the conversation: {:?}",
+        temporal_inputs[0]
+    );
+
+    let id = ExecutionId(uuid::Uuid::parse_str(&started.execution_id).unwrap());
+    let persisted = executions
+        .find_by_id_for_tenant(&tenant, id)
+        .await
+        .unwrap()
+        .expect("the workflow execution was persisted");
+    assert_eq!(
+        persisted.input.get("conversation_id"),
+        Some(&json!(CONVERSATION)),
+        "the persisted workflow execution lost the conversation its agent states inherit"
+    );
+}

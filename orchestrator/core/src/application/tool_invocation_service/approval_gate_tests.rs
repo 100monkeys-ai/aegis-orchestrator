@@ -320,6 +320,13 @@ struct Harness {
     other_users_execution: ExecutionId,
     /// An execution of the same tenant with no initiating user.
     userless_execution: ExecutionId,
+    /// An execution of `USER`'s whose record names the conversation
+    /// `CONVERSATION` it was started from (ADR-126, Update of 2026-10-07
+    /// (2), clause 3).
+    conversation_execution: ExecutionId,
+    /// An execution of `USER`'s whose record's `conversation_id` is not a
+    /// UUID (clause 3a).
+    garbled_conversation_execution: ExecutionId,
     target_agent: String,
 }
 
@@ -332,16 +339,25 @@ async fn harness_declaring(
     repo: Arc<InMemoryToolApprovalRepository>,
     contract: ApprovalContract,
 ) -> Harness {
+    harness_gating(tool_pattern, repo, contract, GATED_TOOL).await
+}
+
+async fn harness_gating(
+    tool_pattern: &str,
+    repo: Arc<InMemoryToolApprovalRepository>,
+    contract: ApprovalContract,
+    gated_tool: &str,
+) -> Harness {
     let tenant = TenantId::for_consumer_user(USER).unwrap();
     let agent = agent();
     let agent_id = agent.id;
-    let execution_for = |user: Option<&str>| {
+    let execution_with = |user: Option<&str>, input: Value| {
         let mut e = Execution::new_with_id(
             ExecutionId::new(),
             agent_id,
             ExecutionInput {
                 intent: None,
-                input: json!({}),
+                input,
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
@@ -355,13 +371,18 @@ async fn harness_declaring(
         e.initiating_user_sub = user.map(str::to_string);
         e
     };
+    let execution_for = |user: Option<&str>| execution_with(user, json!({}));
     let executions: Vec<Execution> = vec![
         execution_for(Some(USER)),
         execution_for(Some("user-2")),
         execution_for(None),
+        execution_with(Some(USER), json!({ "conversation_id": CONVERSATION })),
+        execution_with(Some(USER), json!({ "conversation_id": "not-a-uuid" })),
     ];
     let (execution, other_users_execution, userless_execution) =
         (executions[0].id, executions[1].id, executions[2].id);
+    let (conversation_execution, garbled_conversation_execution) =
+        (executions[3].id, executions[4].id);
     let started = Arc::new(StdMutex::new(Vec::new()));
     let exec_service = Arc::new(RecordingExecutionService {
         executions: executions.into_iter().map(|e| (e.id, e)).collect(),
@@ -375,7 +396,7 @@ async fn harness_declaring(
         .await
         .unwrap();
 
-    let router = Arc::new(ToolRouter::new(dispatchers_gating(GATED_TOOL, &contract)));
+    let router = Arc::new(ToolRouter::new(dispatchers_gating(gated_tool, &contract)));
     let storage_root =
         std::env::temp_dir().join(format!("aegis-gate-tests-{}", uuid::Uuid::new_v4()));
     let fsal = Arc::new(AegisFSAL::new(
@@ -413,6 +434,8 @@ async fn harness_declaring(
         execution,
         other_users_execution,
         userless_execution,
+        conversation_execution,
+        garbled_conversation_execution,
         target_agent: agent.id.to_string(),
     }
 }
@@ -897,12 +920,23 @@ impl Harness {
     /// One call of the gated tool through the invoke route, with `meta` as
     /// the payload's `params._meta`.
     async fn route(&self, token: &str, meta: Option<Value>) -> Result<Value, SealSessionError> {
+        self.route_with(token, self.args("b-1"), meta).await
+    }
+
+    /// One call of the harness's starting tool through the invoke route,
+    /// with `args` and `meta` as the payload's `params._meta`.
+    async fn route_with(
+        &self,
+        token: &str,
+        args: Value,
+        meta: Option<Value>,
+    ) -> Result<Value, SealSessionError> {
         self.service
             .invoke_tool_with_meta(
                 &RouteEnvelope {
                     token: token.to_string().into(),
                     tool: GATED_TOOL.to_string(),
-                    args: self.args("b-1"),
+                    args,
                     nonce: uuid::Uuid::new_v4().to_string(),
                 },
                 meta.as_ref(),
@@ -993,5 +1027,132 @@ async fn inside_an_execution_with_a_record_meta_conversation_id_is_ignored() {
     assert_eq!(
         rows[0].conversation_id, None,
         "inside an execution with a record the call's _meta.conversation_id was stored"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a to 3d: a run started
+// from a conversation names it, and its gated calls store it
+// ---------------------------------------------------------------------------
+
+/// A harness in which `aegis.task.execute` is not gated, so a start runs.
+async fn ungated_start_harness() -> Harness {
+    harness_gating(
+        "aegis.*",
+        Arc::new(InMemoryToolApprovalRepository::new()),
+        declared_contract(),
+        "aegis.task.status",
+    )
+    .await
+}
+
+/// Clauses 3 and 3a: a conversation's start (its session has no execution
+/// record) keeps its `_meta.conversation_id` in the input it starts, and a
+/// `conversation_id` the call wrote in its own arguments counts for nothing.
+#[tokio::test]
+async fn a_conversations_start_keeps_its_meta_conversation_id() {
+    let h = ungated_start_harness().await;
+    let token = h.session_for(ExecutionId::new()).await;
+    let mut args = h.args("b-1");
+    args["conversation_id"] = json!("0b0b0b0b-1c1c-4d4d-8e8e-2f2f2f2f2f2f");
+    h.route_with(
+        &token,
+        args,
+        Some(json!({ "conversation_id": CONVERSATION })),
+    )
+    .await
+    .expect("the start answers");
+    let started = h.started();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(
+        started[0].1.get("conversation_id"),
+        Some(&json!(CONVERSATION)),
+        "a session with no record did not start an input carrying _meta's conversation id: {}",
+        started[0].1
+    );
+}
+
+/// Clause 3b: a starting tool called inside an execution with a record keeps
+/// no conversation, whatever its record or its `_meta` names.
+#[tokio::test]
+async fn a_starting_tool_called_inside_a_record_keeps_none() {
+    let h = ungated_start_harness().await;
+    let token = h.session_for(h.conversation_execution).await;
+    h.route(&token, Some(json!({ "conversation_id": CONVERSATION })))
+        .await
+        .expect("the start answers");
+    h.call_as(h.conversation_execution, GATED_TOOL, h.args("b-1"))
+        .await
+        .expect("the start answers");
+    let started = h.started();
+    assert_eq!(started.len(), 2, "{started:?}");
+    for (_, input) in &started {
+        assert!(
+            input.get("conversation_id").is_none(),
+            "a starting tool called inside a record kept a conversation: {input}"
+        );
+    }
+}
+
+/// Clause 3: a gated call of an execution whose record names a conversation
+/// stores it, and the user's list (the one `GET /v1/tool-approvals` reads)
+/// answers it.
+#[tokio::test]
+async fn a_gated_call_of_a_run_started_from_a_conversation_stores_it_and_the_list_answers_it() {
+    let h = harness().await;
+    let value = direct(
+        h.call_as(h.conversation_execution, GATED_TOOL, h.args("b-1"))
+            .await,
+    );
+    assert_eq!(value["status"], "approval_pending", "{value}");
+    let listed = h
+        .approvals
+        .list_for_user(&h.tenant, USER, None)
+        .await
+        .expect("the user's list answers");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(
+        listed[0].conversation_id.as_deref(),
+        Some(CONVERSATION),
+        "the gated call of a run started from a conversation did not store the record's conversation id"
+    );
+}
+
+/// Clauses 3 and 3a: a gated call of an execution whose record names no
+/// conversation, or names one that is not a UUID, stores null.
+#[tokio::test]
+async fn a_gated_call_of_a_record_naming_none_stores_null() {
+    let h = harness().await;
+    for execution in [h.execution, h.garbled_conversation_execution] {
+        direct(h.call_as(execution, GATED_TOOL, h.args("b-1")).await);
+    }
+    let rows = h.rows().await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert_eq!(
+            row.conversation_id, None,
+            "a gated call of a record naming no conversation stored one"
+        );
+    }
+}
+
+/// Clause 3 with clause 2: a record's conversation wins over a different
+/// one in the call's `_meta`.
+#[tokio::test]
+async fn a_records_conversation_wins_over_a_different_meta_one() {
+    let h = harness().await;
+    let token = h.session_for(h.conversation_execution).await;
+    h.route(
+        &token,
+        Some(json!({ "conversation_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d" })),
+    )
+    .await
+    .expect("the gated call answers");
+    let rows = h.rows().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].conversation_id.as_deref(),
+        Some(CONVERSATION),
+        "the call's _meta conversation id was stored in place of its record's"
     );
 }

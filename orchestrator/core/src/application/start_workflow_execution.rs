@@ -412,15 +412,19 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         // The dispatch's binding choices (Zaru ADR-0055 D14) are the
         // platform's: the workflow's schema and its Temporal input never see
         // them; the persisted execution keeps them for its agent states.
-        // So are the run's repositories (AEGIS ADR-136 G3).
+        // So are the run's repositories (AEGIS ADR-136 G3), and the
+        // conversation it was started from (AEGIS ADR-126, Update of
+        // 2026-10-07 (2), clause 3).
         let input_without_contexts = match &request.input {
             serde_json::Value::Object(map)
                 if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
-                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
+                map.remove(crate::domain::execution::CONVERSATION_INPUT_KEY);
                 serde_json::Value::Object(map)
             }
             other => other.clone(),

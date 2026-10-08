@@ -1,6 +1,25 @@
 use super::*;
 use crate::domain::iam::TenantScope;
 
+/// The tools that start an execution from a call (AEGIS ADR-126, Update of
+/// 2026-10-07 (2), clause 3).
+const STARTING_TOOLS: [&str; 5] = [
+    "aegis.task.execute",
+    "aegis.agent.generate",
+    "aegis.execute.intent",
+    "aegis.workflow.generate",
+    "aegis.workflow.run",
+];
+
+/// A call's conversation as the gate and a starting tool each take it
+/// (ADR-126, Update of 2026-10-07 (2), clauses 2, 3, 3a, 3b and 3d).
+struct CallConversation {
+    /// What the gate stores for the call.
+    gated: Option<String>,
+    /// What a starting tool keeps in the run it starts.
+    started: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
     /// Bind the `tenant_id` argument of an `aegis.*` tool call to the
@@ -949,21 +968,14 @@ impl ToolInvocationService {
                 use crate::application::tool_approval_service::{
                     GateOutcome, GatedCall, ToolApprovalError,
                 };
-                // ADR-126, Update of 2026-10-07 (2), clause 2: the call's
-                // conversation counts only for a session with no execution
-                // record (a conversation's call); inside an execution with a
-                // record it is ignored, as S7 ignores `_meta.contexts`.
-                let conversation_id = match call_conversation {
-                    Some(id) => match self
-                        .execution_service
-                        .get_execution_unscoped(execution_id)
-                        .await
-                    {
-                        Ok(_) => None,
-                        Err(_) => Some(id),
-                    },
-                    None => None,
-                };
+                // ADR-126, Update of 2026-10-07 (2), clauses 2, 3, 3a and 3d:
+                // a conversation's call names its own; a call of an execution
+                // with a record takes the record's.
+                let gated_conversation = self
+                    .conversation_of_call(execution_id, call_conversation)
+                    .await
+                    .gated;
+                let conversation_id = gated_conversation.as_deref();
                 let gated = approvals
                     .gate(GatedCall {
                         tenant_id,
@@ -1007,6 +1019,15 @@ impl ToolInvocationService {
             }
         }
 
+        // ADR-126, Update of 2026-10-07 (2), clauses 3 and 3b: the
+        // conversation a starting tool keeps in the run it starts.
+        let started_conversation = if STARTING_TOOLS.contains(&tool_name.as_str()) {
+            self.conversation_of_call(execution_id, call_conversation)
+                .await
+                .started
+        } else {
+            None
+        };
         let outcome = self
             .dispatch_after_gate_choosing(
                 agent_id,
@@ -1021,6 +1042,7 @@ impl ToolInvocationService {
                 invocation_id,
                 started_at,
                 call_contexts,
+                started_conversation.as_deref(),
             )
             .await;
         if let (Some(approval_id), Some(approvals)) = (auto_allowed, &self.tool_approval_service) {
@@ -1076,6 +1098,9 @@ impl ToolInvocationService {
             invocation_id,
             started_at,
             None,
+            // ADR-126, Update of 2026-10-07 (2), clause 3c: a stored call
+            // run on its user's approval starts with no conversation.
+            None,
         )
         .await
     }
@@ -1098,6 +1123,10 @@ impl ToolInvocationService {
         invocation_id: ToolInvocationId,
         started_at: Instant,
         call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+        // The conversation a starting tool keeps in the run it starts (ADR-126,
+        // Update of 2026-10-07 (2), clauses 3 and 3b); `None` for every other
+        // tool, inside an execution with a record, and on an approved re-run.
+        started_conversation: Option<&str>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = &tenant_scope.authenticated_tenant;
 
@@ -1390,6 +1419,7 @@ impl ToolInvocationService {
                 security_context,
                 caller_identity,
                 tenant_scope,
+                started_conversation,
             )
             .await;
         if let Some(result) = aegis_result {
@@ -1555,6 +1585,37 @@ impl ToolInvocationService {
         }
     }
 
+    /// The conversation of a call (AEGIS ADR-126, Update of 2026-10-07 (2),
+    /// clauses 2, 3, 3a, 3b and 3d). For an execution with a record, the
+    /// gate takes the record's `conversation_id` (a UUID string only) and a
+    /// starting tool keeps none; for a session with no record (a
+    /// conversation's call, or a record that cannot be read), both take the
+    /// call's `_meta.conversation_id`.
+    async fn conversation_of_call(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+        call_conversation: Option<&str>,
+    ) -> CallConversation {
+        match self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+        {
+            // Clauses 3, 3a and 3b: a run's record names its conversation
+            // for the gate; a start inside it keeps none.
+            Ok(execution) => CallConversation {
+                gated: execution.input.conversation_id().map(str::to_string),
+                started: None,
+            },
+            // Clauses 2 and 3d: a session with no record, or a record that
+            // cannot be read, takes the call's own.
+            Err(_) => CallConversation {
+                gated: call_conversation.map(str::to_string),
+                started: call_conversation.map(str::to_string),
+            },
+        }
+    }
+
     /// Attempt to dispatch an aegis.* tool by name. Returns `Some(result)` if
     /// the tool name matched an aegis.* handler, `None` if it should fall through
     /// to the builtin / gateway chain.
@@ -1570,7 +1631,14 @@ impl ToolInvocationService {
         security_context: &crate::domain::security_context::SecurityContext,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
         tenant_scope: &TenantScope,
+        started_conversation: Option<&str>,
     ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
+        // ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: a starting
+        // tool's handler keeps, from its `args`, only the conversation
+        // written here; whatever the call itself wrote there is removed.
+        if STARTING_TOOLS.contains(&tool_name) {
+            super::context_args::put_conversation(args, started_conversation);
+        }
         match tool_name {
             "aegis.agent.create" => {
                 // The calling agent's name reaches the generator's floor
