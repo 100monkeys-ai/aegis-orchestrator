@@ -74,7 +74,9 @@ pub struct ToolRouter {
 /// waits for its user's answer at the approval gate. A node configuration's
 /// capability entry may gate further tools; it cannot clear this mark.
 /// `mail.send` and `mail.reply` carry it (AEGIS ADR-125's Update of
-/// 2026-10-07 (3) clause 12).
+/// 2026-10-07 (3) clause 12), as do `mail.delete` (its Update of
+/// 2026-10-08 (4) clause 20) and `mail.archive` (its Update of 2026-10-08
+/// (5) clause 29).
 struct BuiltinToolDefinition {
     name: &'static str,
     description: &'static str,
@@ -146,6 +148,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.read", "Reads one thread in one folder of a connected mailbox: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers every message of the thread in that folder, oldest first, with its headers, flags, labels and plain-text body, and the folder read; a thread's id is the same in every folder. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox's inbox, flags or unflags it, and marks it read or unread."),
     BuiltinToolDefinition::new("mail.delete", "Moves every message of a thread in a connected mailbox's inbox to its Trash folder; deletes nothing permanently. Waits for the person's approval before anything is moved.").requires_approval(),
+    BuiltinToolDefinition::new("mail.archive", "Archives a thread of a connected mailbox: moves every message of the thread in its inbox to its Archive folder (on a server that keeps all mail in one folder, to that folder), so the thread leaves the inbox and stays in the mailbox; deletes nothing. Waits for the person's approval before anything is moved.").requires_approval(),
     BuiltinToolDefinition::new("calendar.calendars", "Lists the calendars of a connected calendar account: each calendar's id, name, description, colour where given, and whether the account may write to it. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("calendar.list", "Lists the events of one calendar of a connected calendar account in a window of at most 92 days (by default now and the seven days on), by start: repeating events as their occurrences, each with its id, title, times, location, organiser, attendees and their answers, and status. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("calendar.read", "Reads one event of a calendar of a connected calendar account: everything calendar.list answers, its description, its start and end as written with their time zone, and its etag. Changes nothing.").skip_judge(),
@@ -350,6 +353,7 @@ impl ToolRouter {
             "mail.read" => Self::schema_mail_read(),
             "mail.label" => Self::schema_mail_label(),
             "mail.delete" => Self::schema_mail_delete(),
+            "mail.archive" => Self::schema_mail_archive(),
             "calendar.calendars" => Self::schema_calendar(CalendarShape::Calendars),
             "calendar.list" => Self::schema_calendar(CalendarShape::List),
             "calendar.read" => Self::schema_calendar(CalendarShape::Read),
@@ -1037,6 +1041,26 @@ impl ToolRouter {
                 "thread_id": {
                     "type": "string",
                     "description": "A thread id mail.list answered; every message of it in the inbox moves to Trash."
+                }
+            },
+            "required": ["mailbox", "thread_id"]
+        })
+    }
+
+    /// JSON schema for the `mail.archive` builtin tool (AEGIS ADR-125's
+    /// Update of 2026-10-08 (5) clause 27). `subject` and `from` are not
+    /// offered: the admission writes them before the gate.
+    fn schema_mail_archive() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mailbox": {
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "A thread id mail.list answered; every message of it in the inbox moves to the Archive folder."
                 }
             },
             "required": ["mailbox", "thread_id"]
@@ -2948,8 +2972,9 @@ mod tests {
     /// whose pattern matches; with no entry only the catalogue's marked
     /// tools, `mail.send` and `mail.reply` (AEGIS ADR-125's Update of
     /// 2026-10-07 (3) clause 12), `mail.delete` (its Update of 2026-10-08
-    /// (4) clause 20) and the four calendar writes (AEGIS ADR-138 K7), are
-    /// gated, and an entry without the flag does not gate.
+    /// (4) clause 20), `mail.archive` (its Update of 2026-10-08 (5) clause
+    /// 29) and the four calendar writes (AEGIS ADR-138 K7), are gated, and
+    /// an entry without the flag does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
         let plain = ToolRouter::new(ToolRouter::builtin_dispatchers());
@@ -2959,6 +2984,7 @@ mod tests {
                 "mail.send"
                     | "mail.reply"
                     | "mail.delete"
+                    | "mail.archive"
                     | "calendar.create"
                     | "calendar.update"
                     | "calendar.delete"

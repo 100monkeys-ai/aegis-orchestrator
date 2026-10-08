@@ -295,7 +295,8 @@ pub struct ApprovalDeclaration {
 /// Update of 2026-10-07 (3) clause 12). `mail.delete` acts through the same
 /// argument and shows the mailbox, the thread, and the thread's subject and
 /// senders, which its admission reads before the gate (its Update of
-/// 2026-10-08 (4) clause 20). The four calendar writes act through the
+/// 2026-10-08 (4) clause 20); `mail.archive` declares the same (its Update
+/// of 2026-10-08 (5) clause 29). The four calendar writes act through the
 /// calendar account their `account` argument names, and a person reads the
 /// event, its time and its attendees before answering; for update, delete
 /// and respond the admission reads those values from the event before the
@@ -314,6 +315,11 @@ pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
     },
     ApprovalDeclaration {
         tool: "mail.delete",
+        binding_argument: Some("mailbox"),
+        approval_summary: Some(&["mailbox", "thread_id", "subject", "from"]),
+    },
+    ApprovalDeclaration {
+        tool: "mail.archive",
         binding_argument: Some("mailbox"),
         approval_summary: Some(&["mailbox", "thread_id", "subject", "from"]),
     },
@@ -401,7 +407,9 @@ impl ToolInputContract {
             "web.search" => &["query"],
             "web.fetch" => &["url"],
             "mail.list" => &["mailbox"],
-            "mail.read" | "mail.label" | "mail.delete" => &["mailbox", "thread_id"],
+            "mail.read" | "mail.label" | "mail.delete" | "mail.archive" => {
+                &["mailbox", "thread_id"]
+            }
             "mail.draft" => &["mailbox", "body"],
             "mail.send" => &["mailbox", "to", "subject", "body"],
             "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],

@@ -18,7 +18,16 @@
 //!   reads the thread's subject and senders into the call over the model's
 //!   values and nothing moves before approval; a call its mailbox, thread
 //!   or Trash would refuse is refused before the gate with no row; a
-//!   delete approved once runs over XOAUTH2 with its token nowhere.
+//!   delete approved once runs over XOAUTH2 with its token nowhere;
+//! - `mail.archive` (its Update of 2026-10-08 (5) clauses 27 to 29) moves a
+//!   thread's `INBOX` messages to the Archive folder (`\Archive`, else the
+//!   name `Archive`, else `\All`) by `UID MOVE`, else by `UID COPY`, `UID
+//!   STORE +FLAGS (\Deleted)` and `UID EXPUNGE` of those uids, the rest of
+//!   `INBOX` untouched and no plain `EXPUNGE` sent; it refuses with nothing
+//!   changed where the mailbox has no Archive folder or the server can do
+//!   neither; it is gated by the catalogue with the contract `mailbox`,
+//!   `thread_id`, `subject`, `from`, a capability entry at `false` does not
+//!   clear the mark, and a call its admission refuses writes no row.
 //!
 //! Sessions in detail are tested in `mail_session_tests.rs`.
 
@@ -35,17 +44,20 @@ use aegis_orchestrator_core::application::tool_approval_service::ToolApprovalSer
 use aegis_orchestrator_core::application::tool_invocation_service::{
     ToolInvocationResult, ToolInvocationService,
 };
-use aegis_orchestrator_core::application::tools::builtin_mail::NOT_GRANTED;
+use aegis_orchestrator_core::application::tools::builtin_mail::{
+    MailActing, MailTools, NOT_GRANTED,
+};
 use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, MailSecurity, MailboxSettings,
 };
 use aegis_orchestrator_core::domain::events::ExecutionEvent;
 use aegis_orchestrator_core::domain::execution::{
-    Execution, ExecutionId, ExecutionInput, Iteration,
+    Execution, ExecutionId, ExecutionInput, Iteration, ServerChoice,
 };
 use aegis_orchestrator_core::domain::fsal::AegisFSAL;
 use aegis_orchestrator_core::domain::mcp::ToolInputContract;
+use aegis_orchestrator_core::domain::node_config::ToolCapabilityConfig;
 use aegis_orchestrator_core::domain::repository::AgentVersion;
 use aegis_orchestrator_core::domain::seal_session::{CallerAnswer, SealSessionError};
 use aegis_orchestrator_core::domain::secrets::SensitiveString;
@@ -91,7 +103,7 @@ const ANN: &str = "ann@example.test";
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_seven_mail_tools_list_with_contracts_declaring_mailbox_and_three_are_gated() {
+async fn the_eight_mail_tools_list_with_contracts_declaring_mailbox_and_four_are_gated() {
     let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
     let tools = router.list_tools().await.unwrap();
     let mut wrong = Vec::new();
@@ -107,6 +119,7 @@ async fn the_seven_mail_tools_list_with_contracts_declaring_mailbox_and_three_ar
             true,
         ),
         ("mail.delete", vec!["mailbox", "thread_id"], true),
+        ("mail.archive", vec!["mailbox", "thread_id"], true),
     ] {
         let Some(tool) = tools.iter().find(|t| t.name == name) else {
             wrong.push(format!("{name} is not listed"));
@@ -134,7 +147,7 @@ async fn the_seven_mail_tools_list_with_contracts_declaring_mailbox_and_three_ar
                 router.requires_approval(name)
             ));
         }
-        let summary: &[&str] = if name == "mail.delete" {
+        let summary: &[&str] = if matches!(name, "mail.delete" | "mail.archive") {
             &["mailbox", "thread_id", "subject", "from"]
         } else {
             &["mailbox", "to", "cc", "subject", "body"]
@@ -154,7 +167,13 @@ async fn the_seven_mail_tools_list_with_contracts_declaring_mailbox_and_three_ar
             ));
         }
     }
-    for name in ["mail.draft", "mail.send", "mail.reply", "mail.delete"] {
+    for name in [
+        "mail.draft",
+        "mail.send",
+        "mail.reply",
+        "mail.delete",
+        "mail.archive",
+    ] {
         if router.is_skip_judge(name).await {
             wrong.push(format!("{name} skips the judge"));
         }
@@ -163,6 +182,34 @@ async fn the_seven_mail_tools_list_with_contracts_declaring_mailbox_and_three_ar
                 wrong.push(format!("{name} offers bcc"));
             }
         }
+    }
+    // `mail.archive` (its Update of 2026-10-08 (5) clauses 27 and 29): it
+    // says what it does and that it waits; it offers neither `folder` nor
+    // the summary's `subject` and `from`, which the admission writes; and a
+    // capability entry at `false` does not clear the catalogue's mark.
+    match tools.iter().find(|t| t.name == "mail.archive") {
+        Some(tool) => {
+            if !tool.description.contains("to its Archive folder")
+                || !tool
+                    .description
+                    .contains("Waits for the person's approval before anything is moved.")
+            {
+                wrong.push(format!("mail.archive's description: {}", tool.description));
+            }
+            for offered in ["folder", "subject", "from"] {
+                if tool.input_schema["properties"].get(offered).is_some() {
+                    wrong.push(format!("mail.archive offers {offered}"));
+                }
+            }
+        }
+        None => wrong.push("mail.archive is not listed".to_string()),
+    }
+    let entries: Vec<ToolCapabilityConfig> =
+        serde_yaml::from_str("- tool_pattern: mail.archive\n  requires_approval: false\n").unwrap();
+    let configured =
+        ToolRouter::new(ToolRouter::builtin_dispatchers()).with_tool_capabilities(&entries);
+    if !configured.requires_approval("mail.archive") {
+        wrong.push("a capability entry at false cleared mail.archive's mark".to_string());
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -1284,4 +1331,458 @@ impl aegis_orchestrator_core::domain::fsal::EventPublisher for NoOpPublisher {
         _event: aegis_orchestrator_core::domain::events::StorageEvent,
     ) {
     }
+}
+
+// ---------------------------------------------------------------------------
+// mail.archive (its Update of 2026-10-08 (5), clauses 27 to 29)
+// ---------------------------------------------------------------------------
+
+/// The refusal for a mailbox with no Archive folder, as clause 28 gives it.
+const NO_ARCHIVE_SENTENCE: &str = "This mailbox has no Archive folder; nothing was archived.";
+/// The refusal for a server with neither `MOVE` nor `UIDPLUS`, as clause 27
+/// gives it.
+const NO_SAFE_ARCHIVE_SENTENCE: &str =
+    "This mailbox's server can neither move messages nor expunge only chosen ones; nothing was archived.";
+
+/// A mailbox whose `CAPABILITY` answers `capabilities`, its `INBOX` the
+/// delete tests' (thread `<a1@x>` at uids 1 and 2, another message at 3),
+/// with `folders` beside it.
+async fn archive_mailbox(
+    folders: Vec<StandInFolder>,
+    capabilities: &str,
+    inbox: Vec<StoredMessage>,
+    granted: bool,
+) -> (MailboxStandIn, Owned) {
+    let mailbox =
+        imap_mailbox_standin_with_capabilities(ADDRESS, PASSWORD, inbox, folders, capabilities)
+            .await;
+    let owned = Owned {
+        id: CredentialBindingId::new(),
+        name: "Inbox".to_string(),
+        granted,
+        imap_port: mailbox.port(),
+        smtp_port: 465,
+        auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
+    };
+    (mailbox, owned)
+}
+
+/// A conversation's call by the owner: no execution record, nothing chosen.
+fn owner_in_conversation() -> MailActing {
+    MailActing {
+        tenant_id: TenantId::default(),
+        user_id: Some(USER.to_string()),
+        agent_id: AgentId::new(),
+        workflow_id: None,
+        choice: ServerChoice::NotGiven,
+        has_execution_record: false,
+    }
+}
+
+/// `mail.archive` run by the mail tools themselves, past the gate.
+async fn archive_directly(owned: &Owned, args: Value) -> Result<Value, SealSessionError> {
+    let tools = MailTools::with_connector(
+        Arc::new(Mailboxes(vec![owned.clone()])),
+        Arc::new(PlainConnector),
+    );
+    let mut args = args;
+    args["mailbox"] = json!(owned.id.0.to_string());
+    tools
+        .invoke("mail.archive", &args, &owner_in_conversation())
+        .await
+}
+
+/// A recorded command without its tag.
+fn untagged(command: &str) -> String {
+    command
+        .split_once(' ')
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_default()
+}
+
+/// The commands that change a mailbox: a move, copy, store or expunge, plain
+/// or by UID, without their tags.
+fn changes(mailbox: &MailboxStandIn) -> Vec<String> {
+    mailbox
+        .commands()
+        .iter()
+        .map(|c| untagged(c))
+        .filter(|c| {
+            let upper = c.to_ascii_uppercase();
+            upper.starts_with("UID MOVE ")
+                || upper.starts_with("UID COPY ")
+                || upper.starts_with("UID STORE ")
+                || upper.starts_with("UID EXPUNGE")
+                || upper.starts_with("EXPUNGE")
+        })
+        .collect()
+}
+
+fn uids_in(mailbox: &MailboxStandIn, folder: &str) -> Vec<u32> {
+    mailbox
+        .folder_messages(folder)
+        .iter()
+        .map(|m| m.uid)
+        .collect()
+}
+
+/// The sentence a direct call's refusal tells its caller.
+fn refused_with(result: &Result<Value, SealSessionError>) -> String {
+    match result {
+        Ok(value) => format!("answered {value}"),
+        Err(SealSessionError::Answered {
+            answer: CallerAnswer::NotFound(message),
+            ..
+        }) => message.clone(),
+        Err(SealSessionError::InvalidArguments(message)) => message.clone(),
+        Err(other) => format!("{other:?}"),
+    }
+}
+
+/// Clause 27 and 28: by each move path, into the folder marked `\Archive`
+/// (over a folder named Archive and the `\All` folder), into the folder
+/// named `Archive` at the top level or under `INBOX` (over `\All`), and into
+/// the `\All` folder where there is neither, the thread's `INBOX` messages
+/// move and the rest of `INBOX` stays; the copy path stores `\Deleted` and
+/// expunges by UID exactly the thread's uids, so a message another client
+/// marked deleted survives; no plain `EXPUNGE` is sent and the Archive
+/// folder is never opened. The result carries clause 27's fields with
+/// `folder_kind` `inbox` (clause 23).
+#[tokio::test]
+async fn mail_archive_moves_exactly_the_threads_inbox_messages_into_the_archive_folder_by_either_path(
+) {
+    let mut wrong = Vec::new();
+    let all_mail = || StandInFolder::new("[Gmail]/All Mail", "\\All");
+    for (case, folders, expected) in [
+        (
+            "the folder marked \\Archive",
+            vec![
+                StandInFolder::new("Archive", ""),
+                StandInFolder::new("Kept", "\\Archive"),
+                all_mail(),
+            ],
+            "Kept",
+        ),
+        (
+            "the folder named Archive",
+            vec![StandInFolder::new("Archive", ""), all_mail()],
+            "Archive",
+        ),
+        (
+            "the folder named Archive under INBOX",
+            vec![all_mail(), StandInFolder::new("INBOX/Archive", "")],
+            "INBOX/Archive",
+        ),
+        (
+            "the folder marked \\All",
+            vec![StandInFolder::new("[Gmail]/Trash", "\\Trash"), all_mail()],
+            "[Gmail]/All Mail",
+        ),
+    ] {
+        for capabilities in ["IMAP4rev1 MOVE", "IMAP4rev1 UIDPLUS", "IMAP4rev2"] {
+            let mut inbox = delete_inbox();
+            // Another client marked message 3 deleted: a plain EXPUNGE
+            // would remove it, UID EXPUNGE of the thread's uids does not.
+            inbox[2].flags.push("\\Deleted".to_string());
+            let (mailbox, owned) =
+                archive_mailbox(folders.clone(), capabilities, inbox, false).await;
+            let at = format!("{case} with {capabilities}");
+            match archive_directly(&owned, json!({"thread_id": "<a1@x>"})).await {
+                Ok(result) => {
+                    let fields = json!({
+                        "mailbox": owned.id.0.to_string(),
+                        "folder": "INBOX",
+                        "folder_kind": "inbox",
+                        "thread_id": "<a1@x>",
+                        "archive_folder": expected,
+                        "moved": 2,
+                        "message_uids": [1, 2],
+                    });
+                    if result != fields {
+                        wrong.push(format!("{at}: the result is {result}"));
+                    }
+                }
+                Err(e) => wrong.push(format!("{at}: mail.archive failed: {e:?}")),
+            }
+            let quoted = format!("\"{expected}\"");
+            let wanted = if capabilities == "IMAP4rev1 UIDPLUS" {
+                vec![
+                    format!("UID COPY 1,2 {quoted}"),
+                    "UID STORE 1,2 +FLAGS (\\Deleted)".to_string(),
+                    "UID EXPUNGE 1,2".to_string(),
+                ]
+            } else {
+                vec![format!("UID MOVE 1,2 {quoted}")]
+            };
+            let changed = changes(&mailbox);
+            if changed != wanted {
+                wrong.push(format!(
+                    "{at}: the changing commands were {changed:?}, not {wanted:?}"
+                ));
+            }
+            if uids_in(&mailbox, "INBOX") != vec![3] {
+                wrong.push(format!(
+                    "{at}: INBOX holds {:?}, not the other message 3",
+                    uids_in(&mailbox, "INBOX")
+                ));
+            }
+            let archived = mailbox.folder_messages(expected);
+            if archived.len() != 2 || !archived.iter().all(|m| m.raw.contains("Invoice")) {
+                wrong.push(format!(
+                    "{at}: {expected} holds {} messages, not the thread's two",
+                    archived.len()
+                ));
+            }
+            for folder in &folders {
+                if folder.name != expected && !mailbox.folder_messages(&folder.name).is_empty() {
+                    wrong.push(format!("{at}: {} received messages", folder.name));
+                }
+            }
+            let opened: Vec<String> = mailbox
+                .commands()
+                .iter()
+                .map(|c| untagged(c))
+                .filter(|c| {
+                    let upper = c.to_ascii_uppercase();
+                    (upper.starts_with("SELECT ") || upper.starts_with("EXAMINE "))
+                        && c.contains(&quoted)
+                })
+                .collect();
+            if !opened.is_empty() {
+                wrong.push(format!("{at}: the Archive folder was opened: {opened:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Clause 27 and 28: a mailbox with no Archive folder (none marked
+/// `\Archive` or `\All`, none named Archive), and a server that can neither
+/// move nor expunge chosen messages, are refused with their sentences and
+/// nothing changes.
+#[tokio::test]
+async fn mail_archive_refuses_with_no_archive_folder_or_no_safe_move_and_changes_nothing() {
+    let mut wrong = Vec::new();
+    for (case, folders, capabilities, expected) in [
+        (
+            "a mailbox with no Archive folder",
+            vec![
+                StandInFolder::new("Sent", "\\Sent"),
+                StandInFolder::new("Trash", "\\Trash"),
+                StandInFolder::new("Archived", ""),
+                StandInFolder::new("Work/Archive", ""),
+            ],
+            "IMAP4rev1 MOVE UIDPLUS",
+            NO_ARCHIVE_SENTENCE,
+        ),
+        (
+            "a server with neither MOVE nor UIDPLUS",
+            vec![StandInFolder::new("Archive", "\\Archive")],
+            "IMAP4rev1",
+            NO_SAFE_ARCHIVE_SENTENCE,
+        ),
+    ] {
+        let (mailbox, owned) = archive_mailbox(folders, capabilities, delete_inbox(), false).await;
+        let result = archive_directly(&owned, json!({"thread_id": "<a1@x>"})).await;
+        if refused_with(&result) != expected {
+            wrong.push(format!("{case}: {}", refused_with(&result)));
+        }
+        let changed = changes(&mailbox);
+        if !changed.is_empty() {
+            wrong.push(format!("{case}: the refused call sent {changed:?}"));
+        }
+        if uids_in(&mailbox, "INBOX") != vec![1, 2, 3] {
+            wrong.push(format!("{case}: INBOX changed"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Clause 29: an archive waits for approval with the thread's subject and
+/// senders read before the gate over the model's values (clause 20's
+/// admission), and nothing moves before the person answers; approved once,
+/// the run moves the thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_waits_with_the_threads_subject_and_senders_and_moves_only_once_approved() {
+    let (mailbox, owned) = archive_mailbox(
+        vec![StandInFolder::new("Archive", "\\Archive")],
+        "IMAP4rev1 MOVE",
+        delete_inbox(),
+        false,
+    )
+    .await;
+    let id = owned.id.0.to_string();
+    let h = harness(vec![owned], &[Some(json!({ "imap": [id.clone()] }))]).await;
+    let result = h
+        .call(
+            0,
+            "mail.archive",
+            json!({"mailbox": id, "thread_id": "<a1@x>", "subject": "Harmless", "from": "nobody"}),
+        )
+        .await;
+    let mut wrong = Vec::new();
+    let summary = format!(
+        "mail.archive\nmailbox: {id}\nthread_id: <a1@x>\nsubject: Invoice\nfrom: Ann <ann@example.test>, Bea <bea@example.test>"
+    );
+    let approval_id = match direct(&result) {
+        Some(value) if value["status"] == "approval_pending" => {
+            if value["summary"] != summary.as_str() {
+                wrong.push(format!("the summary is {:?}", value["summary"]));
+            }
+            value["approval_id"].as_str().map(str::to_string)
+        }
+        _ => {
+            wrong.push(format!(
+                "mail.archive did not wait for approval: {}",
+                told(&result)
+            ));
+            None
+        }
+    };
+    match h.rows().await.as_slice() {
+        [row] => {
+            if row.arguments["subject"] != "Invoice"
+                || row.arguments["from"]
+                    != json!(["Ann <ann@example.test>", "Bea <bea@example.test>"])
+            {
+                wrong.push(format!(
+                    "the stored call keeps the model's values: {}",
+                    row.arguments
+                ));
+            }
+        }
+        rows => wrong.push(format!("{} approval rows, not 1", rows.len())),
+    }
+    let moved = changes(&mailbox);
+    if !moved.is_empty() || uids_in(&mailbox, "INBOX") != vec![1, 2, 3] {
+        wrong.push(format!("a pending archive changed the mailbox: {moved:?}"));
+    }
+    if let Some(approval_id) = approval_id {
+        let decided = h
+            .approvals
+            .decide(
+                aegis_orchestrator_core::domain::tool_approval::ToolApprovalId::from_string(
+                    &approval_id,
+                )
+                .unwrap(),
+                &TenantId::default(),
+                USER,
+                ToolApprovalDecision::Once,
+                h.service.as_ref(),
+            )
+            .await
+            .unwrap();
+        let result = decided.result.clone().unwrap_or(Value::Null);
+        if decided.status != ToolApprovalStatus::ApprovedOnce
+            || result["moved"] != 2
+            || result["archive_folder"] != "Archive"
+        {
+            wrong.push(format!(
+                "the approved archive did not move the thread: {:?} {result} {:?}",
+                decided.status, decided.error
+            ));
+        }
+        if uids_in(&mailbox, "INBOX") != vec![3] || uids_in(&mailbox, "Archive").len() != 2 {
+            wrong.push(format!(
+                "INBOX holds {:?} after the archive",
+                uids_in(&mailbox, "INBOX")
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Clauses 25, 27, 28 and 29: a call its mailbox, its `folder`, its thread,
+/// its Archive folder or its server would refuse is refused before the gate
+/// with its sentence; no approval row is written, no approval is requested
+/// and nothing changes; a `folder` other than the inbox is refused before
+/// any connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_its_admission_would_refuse_is_refused_before_the_gate_with_no_row() {
+    const INBOX_ONLY: &str =
+        "This tool works on threads in the inbox only; leave out 'folder' or set it to inbox.";
+    let archive = || vec![StandInFolder::new("Archive", "\\Archive")];
+    let mut wrong = Vec::new();
+    for (case, folders, capabilities, granted, chosen, args, expected) in [
+        (
+            "an ungranted mailbox",
+            archive(),
+            "IMAP4rev1 MOVE",
+            false,
+            false,
+            json!({"thread_id": "<a1@x>"}),
+            NOT_GRANTED,
+        ),
+        (
+            "a folder other than the inbox",
+            archive(),
+            "IMAP4rev1 MOVE",
+            false,
+            true,
+            json!({"thread_id": "<a1@x>", "folder": "sent"}),
+            INBOX_ONLY,
+        ),
+        (
+            "a thread not in the inbox",
+            archive(),
+            "IMAP4rev1 MOVE",
+            false,
+            true,
+            json!({"thread_id": "<nope@x>"}),
+            "There is no thread '<nope@x>' in this mailbox's inbox.",
+        ),
+        (
+            "a mailbox with no Archive folder",
+            vec![StandInFolder::new("Trash", "\\Trash")],
+            "IMAP4rev1 MOVE",
+            false,
+            true,
+            json!({"thread_id": "<a1@x>"}),
+            NO_ARCHIVE_SENTENCE,
+        ),
+        (
+            "a server that cannot move safely",
+            archive(),
+            "IMAP4rev1",
+            false,
+            true,
+            json!({"thread_id": "<a1@x>"}),
+            NO_SAFE_ARCHIVE_SENTENCE,
+        ),
+    ] {
+        let (mailbox, owned) =
+            archive_mailbox(folders, capabilities, delete_inbox(), granted).await;
+        let id = owned.id.0.to_string();
+        let contexts = chosen.then(|| json!({ "imap": [id.clone()] }));
+        let h = harness(vec![owned], &[contexts]).await;
+        let mut events = h.event_bus.subscribe();
+        let mut args = args;
+        args["mailbox"] = json!(id);
+        let result = h.call(0, "mail.archive", args).await;
+        let said = match &result {
+            Err(SealSessionError::Answered {
+                answer: CallerAnswer::NotFound(message),
+                ..
+            }) => message.clone(),
+            other => told(other),
+        };
+        if said != expected {
+            wrong.push(format!("{case} was not refused before the gate: {said}"));
+        }
+        if !h.rows().await.is_empty() {
+            wrong.push(format!("{case}: approval rows were written"));
+        }
+        while let Ok(event) = events.try_recv() {
+            if format!("{event:?}").contains("ApprovalRequested") {
+                wrong.push(format!("{case}: an approval was requested"));
+            }
+        }
+        if !changes(&mailbox).is_empty() || uids_in(&mailbox, "INBOX") != vec![1, 2, 3] {
+            wrong.push(format!("{case}: the mailbox changed"));
+        }
+        if expected == INBOX_ONLY && mailbox.connections() != 0 {
+            wrong.push(format!("{case}: the mail server was reached"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

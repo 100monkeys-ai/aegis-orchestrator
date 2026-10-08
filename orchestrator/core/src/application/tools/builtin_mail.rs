@@ -3,8 +3,9 @@
 //! The mail tools: `mail.list`, `mail.read` and `mail.label` (AEGIS
 //! ADR-125 D4; its Update of 2026-10-07 clauses 1, 2 and 7), and the
 //! outbound `mail.draft`, `mail.send` and `mail.reply` (its Update of
-//! 2026-10-07 (3), clauses 11 to 15), and `mail.delete` (its Update of
-//! 2026-10-08 (4), clauses 17 to 20).
+//! 2026-10-07 (3), clauses 11 to 15), `mail.delete` (its Update of
+//! 2026-10-08 (4), clauses 17 to 20), and `mail.archive` (its Update of
+//! 2026-10-08 (5), clauses 27 to 29).
 //!
 //! They speak IMAP only, over a mailbox of the acting person (ADR-125's
 //! Update of 2026-10-04 clause 3), inside the orchestrator: an `imap`
@@ -58,6 +59,15 @@
 //! before the gate its admission reads the thread's subject and senders
 //! into the call's `subject` and `from`, so the person reads what is
 //! deleted.
+//!
+//! **Archiving.** `mail.archive` moves a thread's `INBOX` messages to the
+//! Archive folder (the folder `LIST` marks `\Archive`, else one named
+//! `Archive`, else the folder `LIST` marks `\All`, where a server that
+//! shows the inbox as a label archives by a move out of `INBOX`) by the same
+//! move as `mail.delete` and with the same refusals, its own sentences
+//! saying nothing was archived. It is matched by the RFC 6154 attribute,
+//! never by a provider's folder name or extension. It is gated, and its
+//! admission reads the thread's subject and senders as `mail.delete`'s does.
 //!
 //! **Threads.** A thread's id is the root `Message-ID` of its messages (the
 //! first `References` entry, else `In-Reply-To`, else the message's own); a
@@ -128,6 +138,13 @@ pub const NO_TRASH: &str = "This mailbox has no Trash folder; nothing was delete
 /// `MOVE` nor `UIDPLUS` (nor `IMAP4rev2`, which holds both).
 pub const NO_SAFE_MOVE: &str =
     "This mailbox's server can neither move messages nor expunge only chosen ones; nothing was deleted.";
+/// The refusal of `mail.archive` for a mailbox with no Archive folder (the
+/// Update of 2026-10-08 (5) clause 28).
+pub const NO_ARCHIVE: &str = "This mailbox has no Archive folder; nothing was archived.";
+/// The refusal of `mail.archive` for a server that advertises neither
+/// `MOVE` nor `UIDPLUS` (nor `IMAP4rev2`) (its clause 27).
+pub const NO_SAFE_ARCHIVE: &str =
+    "This mailbox's server can neither move messages nor expunge only chosen ones; nothing was archived.";
 /// What a send's result says when the mailbox has no Sent folder.
 pub const NO_SENT: &str = "This mailbox has no Sent folder.";
 /// The refusal of a `folder` that is not one of the six (the Update of
@@ -166,13 +183,14 @@ pub fn is_mail_tool(tool_name: &str) -> bool {
             | "mail.send"
             | "mail.reply"
             | "mail.delete"
+            | "mail.archive"
     )
 }
 
 /// What [`MailTools::admit_mailbox`] admitted: the binding the call names,
 /// and the arguments the admission read for the person (`subject` and
-/// `from` for `mail.delete`; none for another tool), which the caller
-/// writes into the call before the gate.
+/// `from` for `mail.delete` and `mail.archive`; none for another tool),
+/// which the caller writes into the call before the gate.
 #[derive(Debug, Clone)]
 pub struct Admitted {
     pub binding: CredentialBindingId,
@@ -254,7 +272,9 @@ impl MailTools {
     /// reads before answering: `subject` and `from`, which the caller
     /// writes into the call over any value the model gave. A thread not in
     /// `INBOX`, a mailbox with no Trash folder, or a server that cannot move
-    /// safely is refused here, so no person is asked about it.
+    /// safely is refused here, so no person is asked about it. `mail.archive`
+    /// is admitted the same way, its Archive folder in place of Trash (the
+    /// Update of 2026-10-08 (5) clause 29).
     pub async fn admit_mailbox(
         &self,
         tool_name: &str,
@@ -264,8 +284,8 @@ impl MailTools {
         let mailbox = self.mailbox_for(args, acting).await?;
         let request = Request::parse(tool_name, args)?;
         let shown = match &request {
-            Request::Delete { thread_id } => {
-                let read = shown_for_delete(self.connector.as_ref(), &mailbox, thread_id);
+            Request::Move { thread_id, to } => {
+                let read = shown_for_move(self.connector.as_ref(), &mailbox, thread_id, *to);
                 match tokio::time::timeout(CALL_TIMEOUT, read).await {
                     Ok(shown) => shown?,
                     Err(_) => return Err(timed_out()),
@@ -432,9 +452,54 @@ enum Request {
         message: Outbound,
         thread_id: String,
     },
-    Delete {
+    /// `mail.delete` (to Trash) and `mail.archive` (to Archive).
+    Move {
         thread_id: String,
+        to: MoveTo,
     },
+}
+
+/// Where a thread's `INBOX` messages move: Trash (`mail.delete`) or the
+/// Archive folder (`mail.archive`), each with its own refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveTo {
+    Trash,
+    Archive,
+}
+
+impl MoveTo {
+    /// The folder kind located by `locate`.
+    fn kind(self) -> FolderKind {
+        match self {
+            MoveTo::Trash => FolderKind::Trash,
+            MoveTo::Archive => FolderKind::Archive,
+        }
+    }
+
+    /// The refusal for a mailbox without the folder.
+    fn no_folder(self) -> &'static str {
+        match self {
+            MoveTo::Trash => NO_TRASH,
+            MoveTo::Archive => NO_ARCHIVE,
+        }
+    }
+
+    /// The refusal for a server that can neither move nor expunge chosen
+    /// messages.
+    fn no_safe_move(self) -> &'static str {
+        match self {
+            MoveTo::Trash => NO_SAFE_MOVE,
+            MoveTo::Archive => NO_SAFE_ARCHIVE,
+        }
+    }
+
+    /// The result's key naming the folder the thread moved to.
+    fn result_key(self) -> &'static str {
+        match self {
+            MoveTo::Trash => "trash_folder",
+            MoveTo::Archive => "archive_folder",
+        }
+    }
 }
 
 /// Which folder a read tool works on (the Update of 2026-10-08 (5) clause
@@ -651,7 +716,7 @@ impl Request {
     fn parse(tool_name: &str, args: &Value) -> Result<Self, SealSessionError> {
         if matches!(
             tool_name,
-            "mail.label" | "mail.delete" | "mail.reply" | "mail.draft"
+            "mail.label" | "mail.delete" | "mail.archive" | "mail.reply" | "mail.draft"
         ) {
             inbox_only(args)?;
         }
@@ -725,8 +790,13 @@ impl Request {
                 thread_id: thread_id(args)?,
                 message: Outbound::parse(args, false)?,
             }),
-            "mail.delete" => Ok(Request::Delete {
+            "mail.delete" => Ok(Request::Move {
                 thread_id: thread_id(args)?,
+                to: MoveTo::Trash,
+            }),
+            "mail.archive" => Ok(Request::Move {
+                thread_id: thread_id(args)?,
+                to: MoveTo::Archive,
             }),
             other => Err(invalid(format!("'{other}' is not a mail tool."))),
         }
@@ -750,7 +820,9 @@ async fn run(
         Request::Reply { message, thread_id } => {
             return send(connector, mailbox, message, Some(thread_id.as_str())).await
         }
-        Request::Delete { thread_id } => return delete(connector, mailbox, thread_id).await,
+        Request::Move { thread_id, to } => {
+            return move_thread(connector, mailbox, thread_id, *to).await
+        }
         Request::List { .. } | Request::Read { .. } | Request::Label { .. } => {}
     }
     let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
@@ -779,8 +851,8 @@ async fn run(
         Request::Draft { .. }
         | Request::Send { .. }
         | Request::Reply { .. }
-        | Request::Delete { .. } => {
-            unreachable!("an outbound or delete request is run before the session opens")
+        | Request::Move { .. } => {
+            unreachable!("an outbound or move request is run before the session opens")
         }
     };
     session.logout().await;
@@ -1076,34 +1148,38 @@ async fn save_to_sent(
 }
 
 // ---------------------------------------------------------------------------
-// Deleting (the Update of 2026-10-08 (4), clauses 17 to 20)
+// Deleting and archiving (the Update of 2026-10-08 (4), clauses 17 to 20,
+// and the Update of 2026-10-08 (5), clauses 27 to 29)
 // ---------------------------------------------------------------------------
 
-/// How a thread reaches Trash.
+/// How a thread reaches Trash or the Archive folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrashMove {
+enum MoveHow {
     /// `UID MOVE` (RFC 6851).
     Move,
     /// `UID COPY`, `UID STORE +FLAGS (\Deleted)`, `UID EXPUNGE` (RFC 4315).
     CopyThenExpunge,
 }
 
-/// The Trash folder and how to reach it, or the refusal: the server's
+/// The folder `to` names and how to reach it, or the refusal: the server's
 /// `CAPABILITY` after authentication (`IMAP4rev2` holds both `MOVE` and
 /// `UID EXPUNGE`) and the folders `LIST` answers.
-async fn trash_plan(session: &mut ImapSession) -> Result<(String, TrashMove), SealSessionError> {
+async fn move_plan(
+    session: &mut ImapSession,
+    to: MoveTo,
+) -> Result<(String, MoveHow), SealSessionError> {
     let capabilities = session.capabilities().await.map_err(session_error)?;
     let has = |name: &str| capabilities.iter().any(|c| c == name || c == "IMAP4REV2");
     let how = if has("MOVE") {
-        TrashMove::Move
+        MoveHow::Move
     } else if has("UIDPLUS") {
-        TrashMove::CopyThenExpunge
+        MoveHow::CopyThenExpunge
     } else {
-        return Err(invalid(NO_SAFE_MOVE));
+        return Err(invalid(to.no_safe_move()));
     };
     let folders = session.list_folders().await.map_err(session_error)?;
-    let trash = locate(&folders, FolderKind::Trash).ok_or_else(|| invalid(NO_TRASH))?;
-    Ok((trash, how))
+    let folder = locate(&folders, to.kind()).ok_or_else(|| invalid(to.no_folder()))?;
+    Ok((folder, how))
 }
 
 /// Text a person reads, control characters removed.
@@ -1111,20 +1187,22 @@ fn shown_text(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// The admission's read for `mail.delete` before the gate: the plan's
-/// refusals, the thread's presence in `INBOX`, and what the person reads:
-/// `subject`, the oldest message's subject, and `from`, the distinct
-/// senders, oldest first. Read-only: `EXAMINE`, headers by `BODY.PEEK`.
-async fn shown_for_delete(
+/// The admission's read for `mail.delete` and `mail.archive` before the
+/// gate: the plan's refusals, the thread's presence in `INBOX`, and what the
+/// person reads: `subject`, the oldest message's subject, and `from`, the
+/// distinct senders, oldest first. Read-only: `EXAMINE`, headers by
+/// `BODY.PEEK`.
+async fn shown_for_move(
     connector: &dyn MailConnector,
     mailbox: &ToolMailbox,
     thread_id: &str,
+    to: MoveTo,
 ) -> Result<Vec<(&'static str, Value)>, SealSessionError> {
     let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
         .await
         .map_err(session_error)?;
     let shown = async {
-        trash_plan(&mut session).await?;
+        move_plan(&mut session, to).await?;
         let status = session.examine(FOLDER).await.map_err(session_error)?;
         let messages = thread_messages(
             &mut session,
@@ -1154,20 +1232,22 @@ async fn shown_for_delete(
     shown
 }
 
-/// `mail.delete`: the thread's `INBOX` messages at the run moved to Trash,
-/// by `UID MOVE`, else by `UID COPY`, `UID STORE +FLAGS (\Deleted)` and
-/// `UID EXPUNGE` of exactly those UIDs. Trash is never selected and a plain
-/// `EXPUNGE` is never sent.
-async fn delete(
+/// `mail.delete` and `mail.archive`: the thread's `INBOX` messages at the
+/// run moved to Trash or the Archive folder, by `UID MOVE`, else by `UID
+/// COPY`, `UID STORE +FLAGS (\Deleted)` and `UID EXPUNGE` of exactly those
+/// UIDs. The folder moved to is never selected and a plain `EXPUNGE` is
+/// never sent.
+async fn move_thread(
     connector: &dyn MailConnector,
     mailbox: &ToolMailbox,
     thread_id: &str,
+    to: MoveTo,
 ) -> Result<Value, SealSessionError> {
     let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
         .await
         .map_err(session_error)?;
     let answer = async {
-        let (trash, how) = trash_plan(&mut session).await?;
+        let (folder, how) = move_plan(&mut session, to).await?;
         let status = session.select(FOLDER).await.map_err(session_error)?;
         let messages = thread_messages(
             &mut session,
@@ -1179,13 +1259,13 @@ async fn delete(
         .await?;
         let uids: Vec<u32> = messages.iter().map(|f| f.uid).collect();
         match how {
-            TrashMove::Move => session
-                .uid_move(&uids, &trash)
+            MoveHow::Move => session
+                .uid_move(&uids, &folder)
                 .await
                 .map_err(session_error)?,
-            TrashMove::CopyThenExpunge => {
+            MoveHow::CopyThenExpunge => {
                 session
-                    .uid_copy(&uids, &trash)
+                    .uid_copy(&uids, &folder)
                     .await
                     .map_err(session_error)?;
                 session
@@ -1195,15 +1275,16 @@ async fn delete(
                 session.uid_expunge(&uids).await.map_err(session_error)?;
             }
         }
-        Ok(json!({
+        let mut answer = json!({
             "mailbox": mailbox.binding_id.0.to_string(),
             "folder": FOLDER,
             "folder_kind": FolderKind::Inbox.as_str(),
             "thread_id": thread_id,
-            "trash_folder": trash,
             "moved": uids.len(),
             "message_uids": uids,
-        }))
+        });
+        answer[to.result_key()] = json!(folder);
+        Ok(answer)
     }
     .await;
     session.logout().await;
