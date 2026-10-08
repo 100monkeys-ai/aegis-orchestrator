@@ -536,19 +536,49 @@ pub const REPOSITORIES_INPUT_KEY: &str = "repositories";
 pub const REPOSITORIES_SHAPE: &str =
     "'repositories' must be a list of objects naming a binding_id and, optionally, a branch";
 
-/// One repository a run is given: the binding, and the work branch the run
-/// works on. A start with no `branch` fills in the run's default once
-/// (G5a), so every state and child of the run reads the same branch.
+/// One repository a run is given: the binding, the work branch the run
+/// works on, and the person its commits are authored as. A start with no
+/// `branch` fills in the run's default once (G5a), so every state and child
+/// of the run reads the same branch. `author` is the platform's, written
+/// when the run's repositories are prepared and never taken from a caller
+/// (AEGIS ADR-136 G5d).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRepository {
     pub binding_id: GitRepoBindingId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<RunAuthor>,
+}
+
+/// The person a run's commits are authored as: `name <email>` (AEGIS
+/// ADR-136 G5d).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAuthor {
+    pub name: String,
+    pub email: String,
+}
+
+impl RunAuthor {
+    /// An author, when both parts can stand in a commit's `name <email>`:
+    /// not empty, and holding no `<`, `>` or control character.
+    pub fn new(name: impl Into<String>, email: impl Into<String>) -> Option<Self> {
+        let (name, email) = (name.into(), email.into());
+        (is_author_part(&name) && is_author_part(&email)).then_some(Self { name, email })
+    }
+}
+
+/// Whether `part` can be a commit author's name or email: not empty, and
+/// holding no `<`, `>` or control character, which git refuses or strips.
+fn is_author_part(part: &str) -> bool {
+    !part.trim().is_empty() && !part.chars().any(|c| c == '<' || c == '>' || c.is_control())
 }
 
 /// Read a `repositories` value as G3 admits it: a list of objects whose only
-/// keys are `binding_id` (a UUID) and, optionally, `branch` (a name git
-/// accepts for a branch). Anything else answers [`REPOSITORIES_SHAPE`].
+/// keys are `binding_id` (a UUID), optionally `branch` (a name git accepts
+/// for a branch) and, as the platform stores it, `author` (an object of
+/// exactly `name` and `email`, each fit for a commit, G5d). Anything else
+/// answers [`REPOSITORIES_SHAPE`].
 pub fn parse_run_repositories(
     value: &serde_json::Value,
 ) -> Result<Vec<RunRepository>, &'static str> {
@@ -560,7 +590,10 @@ pub fn parse_run_repositories(
         let serde_json::Value::Object(map) = item else {
             return Err(REPOSITORIES_SHAPE);
         };
-        if map.keys().any(|key| key != "binding_id" && key != "branch") {
+        if map
+            .keys()
+            .any(|key| key != "binding_id" && key != "branch" && key != "author")
+        {
             return Err(REPOSITORIES_SHAPE);
         }
         let binding_id = match map.get("binding_id") {
@@ -576,9 +609,29 @@ pub fn parse_run_repositories(
             }
             Some(_) => return Err(REPOSITORIES_SHAPE),
         };
+        let author = match map.get("author") {
+            None => None,
+            Some(serde_json::Value::Object(author))
+                if author.len() == 2
+                    && author.contains_key("name")
+                    && author.contains_key("email") =>
+            {
+                match (author.get("name"), author.get("email")) {
+                    (
+                        Some(serde_json::Value::String(name)),
+                        Some(serde_json::Value::String(email)),
+                    ) => Some(
+                        RunAuthor::new(name.clone(), email.clone()).ok_or(REPOSITORIES_SHAPE)?,
+                    ),
+                    _ => return Err(REPOSITORIES_SHAPE),
+                }
+            }
+            Some(_) => return Err(REPOSITORIES_SHAPE),
+        };
         entries.push(RunRepository {
             binding_id: GitRepoBindingId(binding_id),
             branch,
+            author,
         });
     }
     Ok(entries)
@@ -870,6 +923,78 @@ mod tests {
             assert!(
                 !error.contains("Mk6"),
                 "the refusal repeats the URL it refused: {error}"
+            );
+        }
+    }
+
+    const RUN_BINDING: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+
+    /// AEGIS ADR-136 G5d: an entry's stored author is read with it.
+    #[test]
+    fn a_stored_author_is_read_with_the_entry() {
+        let value = serde_json::json!([{
+            "binding_id": RUN_BINDING,
+            "branch": "aegis/1234abcd",
+            "author": { "name": "Ada Lovelace", "email": "ada@example.com" }
+        }]);
+        let entries = parse_run_repositories(&value)
+            .unwrap_or_else(|e| panic!("an entry with a stored author was refused: {e}"));
+        assert_eq!(
+            entries[0].author,
+            RunAuthor::new("Ada Lovelace", "ada@example.com"),
+            "the entry's author was not read"
+        );
+        assert_eq!(
+            serde_json::to_value(&entries).unwrap(),
+            value,
+            "the entry does not write back as it was read"
+        );
+    }
+
+    /// AEGIS ADR-136 G5d: a malformed author is refused with G3's sentence,
+    /// every shape of it reported before failing.
+    #[test]
+    fn a_malformed_author_is_refused_with_the_sentence() {
+        let mut admitted = Vec::new();
+        for author in [
+            serde_json::json!("Ada <ada@example.com>"),
+            serde_json::json!(null),
+            serde_json::json!({ "name": "Ada" }),
+            serde_json::json!({ "email": "ada@example.com" }),
+            serde_json::json!({ "name": "Ada", "email": "ada@example.com", "extra": 1 }),
+            serde_json::json!({ "name": "", "email": "ada@example.com" }),
+            serde_json::json!({ "name": "  ", "email": "ada@example.com" }),
+            serde_json::json!({ "name": "Ada", "email": "" }),
+            serde_json::json!({ "name": "Ada <x>", "email": "ada@example.com" }),
+            serde_json::json!({ "name": "Ada", "email": "<ada@example.com>" }),
+            serde_json::json!({ "name": "Ada\nEvil", "email": "ada@example.com" }),
+            serde_json::json!({ "name": 7, "email": "ada@example.com" }),
+        ] {
+            let value = serde_json::json!([{ "binding_id": RUN_BINDING, "author": author }]);
+            if parse_run_repositories(&value) != Err(REPOSITORIES_SHAPE) {
+                admitted.push(author);
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "a malformed author was not refused with G3's sentence: {admitted:?}"
+        );
+    }
+
+    #[test]
+    fn an_author_part_holding_angle_brackets_or_control_characters_makes_no_author() {
+        assert!(RunAuthor::new("Ada Lovelace", "ada@example.com").is_some());
+        for (name, email) in [
+            ("", "ada@example.com"),
+            ("Ada", " "),
+            ("Ada <a>", "ada@example.com"),
+            ("Ada", "ada@example.com>"),
+            ("Ada\u{7}", "ada@example.com"),
+        ] {
+            assert_eq!(
+                RunAuthor::new(name, email),
+                None,
+                "{name:?} <{email:?}> made an author"
             );
         }
     }

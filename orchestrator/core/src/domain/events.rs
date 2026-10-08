@@ -591,6 +591,10 @@ pub enum ExecutionEvent {
         label: String,
         branch: String,
         commit_sha: String,
+        /// The name the commit is authored as (AEGIS ADR-136 G5d): the run's
+        /// person's, or the platform's when the run has none.
+        #[serde(default)]
+        author: String,
         committed_at: DateTime<Utc>,
     },
 

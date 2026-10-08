@@ -25,6 +25,9 @@
 //! | A failed checkout | `a_failed_checkout_releases_the_hold` |
 //! | The mount's place | `the_mount_is_the_working_tree_at_workspace_label` |
 //! | A hold a restart cleared | `a_mount_takes_a_hold_no_run_has` |
+//! | The person's name and email stored (G5d) | `a_run_started_by_a_person_with_a_name_and_email_stores_them_in_each_entry` |
+//! | No profile, or one unread (G5d) | `a_run_whose_person_has_no_profile_stores_no_author`, `a_profile_that_cannot_be_read_stores_no_author` |
+//! | A given author replaced (G5d) | `an_author_an_entry_carried_is_replaced_by_the_persons_own` |
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -38,7 +41,7 @@ use aegis_orchestrator_core::application::git_clone_executor::{
     EphemeralCliEngine, EphemeralCliPaths, GitCloneExecutor,
 };
 use aegis_orchestrator_core::application::git_repo_service::{
-    GitRepoError, GitRepoService, RunRepositories, RunRepositoryError,
+    GitRepoError, GitRepoService, PersonProfiles, RunRepositories, RunRepositoryError,
 };
 use aegis_orchestrator_core::application::nfs_gateway::NfsVolumeRegistry;
 use aegis_orchestrator_core::application::user_volume_service::UserVolumeService;
@@ -46,7 +49,7 @@ use aegis_orchestrator_core::application::volume_manager::VolumeService;
 use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
 use aegis_orchestrator_core::domain::git_repo::{
     default_work_branch, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
-    GitRepoBindingRepository, RunRepository,
+    GitRepoBindingRepository, RunAuthor, RunRepository,
 };
 use aegis_orchestrator_core::domain::repository::{RepositoryError, VolumeRepository};
 use aegis_orchestrator_core::domain::runtime::{
@@ -523,6 +526,36 @@ impl Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(None).await
+}
+
+/// A person's profile as a stub identity provider answers it, keeping the
+/// subjects it was asked for.
+struct Profiles {
+    answer: Result<Option<(String, String)>, String>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl Profiles {
+    fn answering(answer: Result<Option<(&str, &str)>, &str>) -> Arc<Self> {
+        Arc::new(Self {
+            answer: answer
+                .map(|found| found.map(|(n, e)| (n.to_string(), e.to_string())))
+                .map_err(str::to_string),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl PersonProfiles for Profiles {
+    async fn name_and_email(&self, sub: &str) -> Result<Option<(String, String)>, String> {
+        self.asked.lock().unwrap().push(sub.to_string());
+        self.answer.clone()
+    }
+}
+
+async fn fixture_with(profiles: Option<Arc<dyn PersonProfiles>>) -> Fixture {
     let dirs = tempfile::tempdir().unwrap();
     let (bare, _seed) = upstream(dirs.path());
     let workspace = dirs.path().join("ws");
@@ -563,13 +596,17 @@ async fn fixture() -> Fixture {
         Some(Arc::new(engine)),
     ));
     let bindings = Arc::new(Bindings::default());
-    let service = Arc::new(GitRepoService::new(
+    let service = GitRepoService::new(
         bindings.clone() as Arc<dyn GitRepoBindingRepository>,
         user_volume_service,
         clone_executor,
         secrets_manager,
         event_bus,
-    ));
+    );
+    let service = Arc::new(match profiles {
+        Some(profiles) => service.with_person_profiles(profiles),
+        None => service,
+    });
     Fixture {
         service,
         bindings,
@@ -585,6 +622,7 @@ fn entry(id: GitRepoBindingId, branch: Option<&str>) -> RunRepository {
     RunRepository {
         binding_id: id,
         branch: branch.map(str::to_string),
+        author: None,
     }
 }
 
@@ -992,4 +1030,165 @@ async fn a_mount_takes_a_hold_no_run_has() {
         }
         other => panic!("another run mounted a held binding: {other:?}"),
     }
+}
+
+// ===========================================================================
+// G5d: the person a run's commits are authored as
+// ===========================================================================
+
+/// A run started by a person whose profile has a name and an email stores
+/// them in each of its entries, read once by the person's subject.
+#[tokio::test]
+async fn a_run_started_by_a_person_with_a_name_and_email_stores_them_in_each_entry() {
+    let profiles = Profiles::answering(Ok(Some(("Ada Lovelace", "ada@example.com"))));
+    let fx = fixture_with(Some(profiles.clone() as Arc<dyn PersonProfiles>)).await;
+    let (first, _) = fx.host_binding("app", OWNER).await;
+    let (second, _) = fx.host_binding("lib", OWNER).await;
+    let run = uuid::Uuid::new_v4();
+    let prepared = fx
+        .service
+        .prepare_for_run(
+            &fx.tenant,
+            Some(OWNER),
+            run,
+            &[entry(first, None), entry(second, None)],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+
+    let author = RunAuthor::new("Ada Lovelace", "ada@example.com");
+    let authors: Vec<_> = prepared.iter().map(|e| e.author.clone()).collect();
+    assert_eq!(
+        authors,
+        vec![author.clone(), author],
+        "the person's name and email are not stored in each entry"
+    );
+    assert_eq!(
+        *profiles.asked.lock().unwrap(),
+        vec![OWNER.to_string()],
+        "the profile was not read once, by the run's person"
+    );
+}
+
+/// A run whose person has no profile with an email, or no person at all,
+/// stores no author, and its commits carry the platform's author as before.
+#[tokio::test]
+async fn a_run_whose_person_has_no_profile_stores_no_author() {
+    let fx = fixture_with(Some(
+        Profiles::answering(Ok(None)) as Arc<dyn PersonProfiles>
+    ))
+    .await;
+    let (id, _) = fx.host_binding("app", OWNER).await;
+    let prepared = fx
+        .service
+        .prepare_for_run(
+            &fx.tenant,
+            Some(OWNER),
+            uuid::Uuid::new_v4(),
+            &[entry(id, None)],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+    assert_eq!(
+        prepared[0].author, None,
+        "an author was stored with no profile"
+    );
+
+    let fx = fixture().await;
+    let (id, _) = fx.host_binding("app", OWNER).await;
+    let prepared = fx
+        .service
+        .prepare_for_run(
+            &fx.tenant,
+            Some(OWNER),
+            uuid::Uuid::new_v4(),
+            &[entry(id, None)],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+    assert_eq!(
+        prepared[0].author, None,
+        "an author was stored with no profile reader"
+    );
+}
+
+/// A profile that cannot be read leaves the run without an author: the run
+/// starts, and commits as before.
+#[tokio::test]
+async fn a_profile_that_cannot_be_read_stores_no_author() {
+    let fx = fixture_with(Some(Profiles::answering(Err(
+        "keycloak admin read failed: connection refused",
+    )) as Arc<dyn PersonProfiles>))
+    .await;
+    let (id, _) = fx.host_binding("app", OWNER).await;
+    let prepared = fx
+        .service
+        .prepare_for_run(
+            &fx.tenant,
+            Some(OWNER),
+            uuid::Uuid::new_v4(),
+            &[entry(id, None)],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("an unread profile refused the run: {e}"));
+    assert_eq!(
+        prepared[0].author, None,
+        "an unread profile stored an author"
+    );
+}
+
+/// The author is the platform's: one an entry carried (the HTTP execute
+/// route keeps the value unchecked) is replaced by the person's own, or
+/// removed when the person's profile gives none.
+#[tokio::test]
+async fn an_author_an_entry_carried_is_replaced_by_the_persons_own() {
+    let forged = RunRepository {
+        author: RunAuthor::new("Someone Else", "someone@example.com"),
+        ..entry(GitRepoBindingId::new(), None)
+    };
+
+    let fx = fixture_with(Some(
+        Profiles::answering(Ok(Some(("Ada Lovelace", "ada@example.com"))))
+            as Arc<dyn PersonProfiles>,
+    ))
+    .await;
+    let (id, _) = fx.host_binding("app", OWNER).await;
+    let given = RunRepository {
+        binding_id: id,
+        ..forged.clone()
+    };
+    let prepared = fx
+        .service
+        .prepare_for_run(
+            &fx.tenant,
+            Some(OWNER),
+            uuid::Uuid::new_v4(),
+            &[given.clone()],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+    assert_eq!(
+        prepared[0].author,
+        RunAuthor::new("Ada Lovelace", "ada@example.com"),
+        "the entry's given author was not replaced by the person's"
+    );
+
+    let fx = fixture_with(Some(
+        Profiles::answering(Ok(None)) as Arc<dyn PersonProfiles>
+    ))
+    .await;
+    let (id, _) = fx.host_binding("app", OWNER).await;
+    let given = RunRepository {
+        binding_id: id,
+        ..forged
+    };
+    let prepared = fx
+        .service
+        .prepare_for_run(&fx.tenant, Some(OWNER), uuid::Uuid::new_v4(), &[given])
+        .await
+        .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+    assert_eq!(
+        prepared[0].author, None,
+        "the entry's given author survived a person with no profile"
+    );
 }

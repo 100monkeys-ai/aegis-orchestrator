@@ -2330,6 +2330,37 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             event_bus.clone(),
         )
         .with_credential_repo(credential_repo);
+        // A run's commits are authored as its person, read from their
+        // Keycloak user in the consumer realm, then the system realm (AEGIS
+        // ADR-136 G5d). Without the admin client a run commits as the
+        // platform's author.
+        let service = match colony_keycloak_admin.clone() {
+            Some(admin) => {
+                let realms: Vec<String> = ["consumer", "system"]
+                    .iter()
+                    .filter_map(|kind| {
+                        config.spec.iam.as_ref().and_then(|iam| {
+                            iam.realms
+                                .iter()
+                                .find(|realm| {
+                                    resolve_env_value(&realm.kind)
+                                        .unwrap_or_else(|_| realm.kind.clone())
+                                        == *kind
+                                })
+                                .map(|realm| {
+                                    resolve_env_value(&realm.slug)
+                                        .unwrap_or_else(|_| realm.slug.clone())
+                                })
+                        })
+                    })
+                    .collect();
+                info!(realms = ?realms, "A run's commits are authored as its person");
+                service.with_person_profiles(Arc::new(
+                    aegis_orchestrator_core::infrastructure::iam::keycloak_person_profiles::KeycloakPersonProfiles::new(admin, realms),
+                ))
+            }
+            None => service,
+        };
         // An OAuth binding's git credential is its access token, read
         // through the credential service (AEGIS ADR-136 G1b, G2d).
         let service = match credential_service.as_ref() {

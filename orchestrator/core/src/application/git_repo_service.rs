@@ -62,7 +62,7 @@ use crate::domain::git_host_keys::{host_keys_for, ssh_remote, SshHostKey};
 use crate::domain::git_repo::{
     default_work_branch, is_mountable_label, validate_repo_url, CloneStrategy, GitRef,
     GitRepoBinding, GitRepoBindingId, GitRepoBindingRepository, GitRepoEvent, GitRepoStatus,
-    RunRepository,
+    RunAuthor, RunRepository,
 };
 use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
 use crate::domain::iam::ZaruTier;
@@ -313,6 +313,23 @@ impl OAuthAccessTokens for CredentialServiceTokens {
 }
 
 // ============================================================================
+// The person a run's commits are authored as (AEGIS ADR-136 G5d)
+// ============================================================================
+
+/// Answers a person's name and email by their subject, from their profile
+/// with the identity provider. `Ok(None)` when the provider holds no such
+/// person, or none with an email; `Err` when it could not be asked.
+#[async_trait]
+pub trait PersonProfiles: Send + Sync {
+    async fn name_and_email(&self, sub: &str) -> Result<Option<(String, String)>, String>;
+}
+
+/// What the daemon logs when a run's person's name and email could not be
+/// read (AEGIS ADR-136 G5d): the run still starts, and commits as before.
+pub const RUN_AUTHOR_UNREAD: &str =
+    "the person's name and email could not be read; the run's commits carry the platform's author";
+
+// ============================================================================
 // Service
 // ============================================================================
 
@@ -326,6 +343,9 @@ pub struct GitRepoService {
     /// Answers an `OAuth2` binding's access token. Absent, a git binding
     /// naming an `OAuth2` credential is refused as not implemented.
     access_tokens: Option<Arc<dyn OAuthAccessTokens>>,
+    /// Answers a run's person's name and email (AEGIS ADR-136 G5d). Absent,
+    /// a run's commits carry the platform's author.
+    person_profiles: Option<Arc<dyn PersonProfiles>>,
     event_bus: Arc<EventBus>,
     /// Orchestrator identifier used in [`AccessContext`] audit rows.
     orchestrator_id: String,
@@ -355,6 +375,7 @@ impl GitRepoService {
             secret_manager,
             credential_repo: None,
             access_tokens: None,
+            person_profiles: None,
             event_bus,
             orchestrator_id: "git-repo-service".to_string(),
             run_holds: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -376,6 +397,27 @@ impl GitRepoService {
     pub fn with_access_tokens(mut self, tokens: Arc<dyn OAuthAccessTokens>) -> Self {
         self.access_tokens = Some(tokens);
         self
+    }
+
+    /// Inject the reader of a run's person's name and email (AEGIS ADR-136
+    /// G5d).
+    pub fn with_person_profiles(mut self, profiles: Arc<dyn PersonProfiles>) -> Self {
+        self.person_profiles = Some(profiles);
+        self
+    }
+
+    /// The author of `person`'s run (AEGIS ADR-136 G5d): their profile's
+    /// name and email when both can stand in a commit, else none. A profile
+    /// that cannot be read is logged and makes none.
+    async fn run_author(&self, person: Option<&str>) -> Option<RunAuthor> {
+        let (profiles, person) = (self.person_profiles.as_ref()?, person?);
+        match profiles.name_and_email(person).await {
+            Ok(found) => found.and_then(|(name, email)| RunAuthor::new(name, email)),
+            Err(error) => {
+                warn!(%error, "{RUN_AUTHOR_UNREAD}");
+                None
+            }
+        }
     }
 
     /// Override the orchestrator identifier used in audit events.
@@ -1859,6 +1901,9 @@ impl RunRepositories for GitRepoService {
             }
         }
         let owner = person.unwrap_or_default();
+        // The author is the platform's: any an entry carried is replaced by
+        // the person's own, or removed when there is none (G5d).
+        let author = self.run_author(person).await;
         let mut prepared = Vec::with_capacity(checked.len());
         let mut preparations = Vec::with_capacity(checked.len());
         for (binding, branch) in checked {
@@ -1883,6 +1928,7 @@ impl RunRepositories for GitRepoService {
                     prepared.push(RunRepository {
                         binding_id: binding.id,
                         branch: Some(branch),
+                        author: author.clone(),
                     });
                 }
                 Err(e) => {

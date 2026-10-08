@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-use crate::domain::git_repo::{parse_run_repositories, REPOSITORIES_INPUT_KEY};
+use crate::domain::git_repo::{parse_run_repositories, REPOSITORIES_INPUT_KEY, REPOSITORIES_SHAPE};
 use crate::domain::seal_session::SealSessionError;
 
 /// Parse the `repositories` argument of a starting tool's call.
@@ -24,8 +24,15 @@ pub(super) fn parse_repositories(args: &Value) -> Result<Option<Value>, SealSess
     let Some(raw) = args.get(REPOSITORIES_INPUT_KEY) else {
         return Ok(None);
     };
-    parse_run_repositories(raw)
+    let entries = parse_run_repositories(raw)
         .map_err(|sentence| SealSessionError::InvalidArguments(sentence.to_string()))?;
+    // The author is the platform's, written when the run's repositories are
+    // prepared: a caller never names one (AEGIS ADR-136 G5d).
+    if entries.iter().any(|entry| entry.author.is_some()) {
+        return Err(SealSessionError::InvalidArguments(
+            REPOSITORIES_SHAPE.to_string(),
+        ));
+    }
     Ok(Some(raw.clone()))
 }
 
@@ -103,6 +110,26 @@ mod tests {
                     "the refusal of {bad} is not G3's sentence"
                 ),
                 other => panic!("{bad} was not refused with G3's sentence: {other:?}"),
+            }
+        }
+    }
+
+    /// AEGIS ADR-136 G5d: the author is the platform's; a caller that names
+    /// one, well formed or not, is refused with G3's sentence.
+    #[test]
+    fn a_callers_author_is_refused_with_the_sentence() {
+        for author in [
+            json!({ "name": "Ada Lovelace", "email": "ada@example.com" }),
+            json!({ "name": "", "email": "ada@example.com" }),
+        ] {
+            let args = json!({ "repositories": [{ "binding_id": BINDING, "author": author }] });
+            match parse_repositories(&args) {
+                Err(SealSessionError::InvalidArguments(sentence)) => assert_eq!(
+                    sentence,
+                    "'repositories' must be a list of objects naming a binding_id and, optionally, a branch",
+                    "the refusal of the caller's author {author} is not G3's sentence"
+                ),
+                other => panic!("the caller's author {author} was not refused: {other:?}"),
             }
         }
     }

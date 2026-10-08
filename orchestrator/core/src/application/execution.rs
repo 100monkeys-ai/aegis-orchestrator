@@ -5076,6 +5076,7 @@ mod tests {
                             .clone()
                             .unwrap_or_else(|| crate::domain::git_repo::default_work_branch(run)),
                     ),
+                    author: entry.author.clone(),
                 })
                 .collect())
         }

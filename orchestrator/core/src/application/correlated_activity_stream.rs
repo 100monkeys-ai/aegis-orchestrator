@@ -678,8 +678,9 @@ fn event_message(event: &DomainEvent) -> String {
             label,
             branch,
             commit_sha,
+            author,
             ..
-        }) => format!("Committed {commit_sha} on branch {branch} of repository {label}"),
+        }) => format!("Committed {commit_sha} on branch {branch} of repository {label} as {author}"),
         DomainEvent::Execution(ExecutionEvent::RepositoryPushed {
             label,
             branch,
@@ -1440,12 +1441,13 @@ mod tests {
                     label: "app".to_string(),
                     branch: "aegis/1234abcd".to_string(),
                     commit_sha: sha.clone(),
+                    author: "Ada Lovelace".to_string(),
                     committed_at: Utc::now(),
                 }),
                 (
                     "repository_committed".to_string(),
                     repository.clone(),
-                    format!("Committed {sha} on branch aegis/1234abcd of repository app"),
+                    format!("Committed {sha} on branch aegis/1234abcd of repository app as Ada Lovelace"),
                 ),
             ),
             (

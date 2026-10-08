@@ -689,10 +689,21 @@ impl ToolInvocationService {
         };
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
         let owner = user_sub(caller);
-        let (author_name, author_email) = commit_author(caller);
         if let Some(run) = self.run_of_git_call(execution_id).await {
             let (label, bid, branch) = self.run_repository(&run, args, &tenant_id, &owner).await?;
             let message = require_str(args, "message")?;
+            // The run's person, as stored in its entry when its repositories
+            // were prepared; else the platform's author, as before (AEGIS
+            // ADR-136 G5d).
+            let (author_name, author_email) = match run
+                .entries
+                .iter()
+                .find(|entry| entry.binding_id == bid)
+                .and_then(|entry| entry.author.clone())
+            {
+                Some(author) => (author.name, author.email),
+                None => commit_author(caller),
+            };
             let commit_sha = svc
                 .commit_for_run(
                     run.run,
@@ -712,6 +723,7 @@ impl ToolInvocationService {
                     label,
                     branch,
                     commit_sha: commit_sha.clone(),
+                    author: author_name,
                     committed_at: chrono::Utc::now(),
                 },
             );
@@ -720,6 +732,7 @@ impl ToolInvocationService {
         let binding_id = require_str(args, "binding_id")?;
         let message = require_str(args, "message")?;
         let bid = parse_binding_id(binding_id)?;
+        let (author_name, author_email) = commit_author(caller);
 
         let commit_sha = svc
             .commit(

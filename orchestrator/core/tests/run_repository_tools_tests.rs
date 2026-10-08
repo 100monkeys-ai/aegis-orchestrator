@@ -541,6 +541,7 @@ fn entry(id: GitRepoBindingId, branch: Option<&str>) -> RunRepository {
     RunRepository {
         binding_id: id,
         branch: branch.map(str::to_string),
+        author: None,
     }
 }
 

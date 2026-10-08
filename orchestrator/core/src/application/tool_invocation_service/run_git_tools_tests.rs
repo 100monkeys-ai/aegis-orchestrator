@@ -21,6 +21,8 @@
 //! | Status | `status_answers_the_work_branch_clean_or_changed_and_its_head` |
 //! | Push, and the credential | `the_run_pushes_only_its_work_branch_and_no_part_of_the_token_is_anywhere` |
 //! | A non-fast-forward | `a_push_the_remote_refuses_as_not_a_fast_forward_answers_its_sentence_and_pushes_nothing` |
+//! | The person as author (G5d) | `a_commit_inside_a_run_started_by_a_person_with_a_name_and_email_is_authored_as_them` |
+//! | No person's name, as before (G5d) | `a_run_started_with_no_identity_commits_as_before` |
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,7 +40,7 @@ use crate::application::execution::ExecutionService;
 use crate::application::git_clone_executor::{
     EphemeralCliEngine, EphemeralCliPaths, GitCloneExecutor,
 };
-use crate::application::git_repo_service::{GitRepoService, RunRepositories};
+use crate::application::git_repo_service::{GitRepoService, PersonProfiles, RunRepositories};
 use crate::application::git_test_server::{holds_any_part_of, GitTestServer, HostShellRunner};
 use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::application::tool_invocation_service::{ToolInvocationResult, ToolInvocationService};
@@ -224,7 +226,7 @@ async fn the_run_commits_on_the_binding_it_holds_and_a_clean_tree_answers_its_se
     );
     let rows = harness.rows();
     let expected = format!(
-        "Committed {sha} on branch {} of repository {LABEL}",
+        "Committed {sha} on branch {} of repository {LABEL} as User",
         harness.branch
     );
     assert!(
@@ -246,6 +248,82 @@ async fn the_run_commits_on_the_binding_it_holds_and_a_clean_tree_answers_its_se
         }) if sentence == CLEAN => {}
         other => panic!("a clean tree answered {}, not `{CLEAN}`", told(other)),
     }
+}
+
+/// AEGIS ADR-136 G5d: a commit inside a run started by a person whose
+/// profile has a name and an email is authored "name <email>", on a volume
+/// (the git step) and on a host directory (libgit2), and its row names them.
+#[tokio::test]
+async fn a_commit_inside_a_run_started_by_a_person_with_a_name_and_email_is_authored_as_them() {
+    let mut wrong = Vec::new();
+    for host in [false, true] {
+        let arm = if host { "host directory" } else { "volume" };
+        let mut harness =
+            Harness::new_with(None, host, Some(("Ada Lovelace", "ada@example.com"))).await;
+        std::fs::write(harness.tree().join("CHANGE.md"), "a change\n").unwrap();
+        let committed = harness
+            .call(
+                "aegis.git.commit",
+                json!({"repository": LABEL, "message": "the person's change"}),
+            )
+            .await;
+        let sha = direct(&committed)["commit_sha"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let author = git(&harness.tree(), &["log", "-1", "--format=%an <%ae>"]);
+        if author != "Ada Lovelace <ada@example.com>" {
+            wrong.push(format!("on a {arm} the commit is authored `{author}`"));
+        }
+        let expected = format!(
+            "Committed {sha} on branch {} of repository {LABEL} as Ada Lovelace",
+            harness.branch
+        );
+        let rows = harness.rows();
+        if !rows
+            .iter()
+            .any(|(kind, line)| kind == "repository_committed" && *line == expected)
+        {
+            wrong.push(format!("on a {arm} no row `{expected}` among {rows:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the run's commit is not authored as its person: {wrong:?}"
+    );
+}
+
+/// AEGIS ADR-136 G5d: a run whose person has no name and email to read
+/// commits as before, "User <user@aegis.local>".
+#[tokio::test]
+async fn a_run_started_with_no_identity_commits_as_before() {
+    let mut harness = Harness::new(None).await;
+    std::fs::write(harness.tree().join("CHANGE.md"), "a change\n").unwrap();
+    let committed = harness
+        .call(
+            "aegis.git.commit",
+            json!({"repository": LABEL, "message": "the run's change"}),
+        )
+        .await;
+    let sha = direct(&committed)["commit_sha"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        git(&harness.tree(), &["log", "-1", "--format=%an <%ae>"]),
+        "User <user@aegis.local>",
+        "a run with no person's name and email does not commit as before"
+    );
+    let expected = format!(
+        "Committed {sha} on branch {} of repository {LABEL} as User",
+        harness.branch
+    );
+    let rows = harness.rows();
+    assert!(
+        rows.iter()
+            .any(|(kind, line)| kind == "repository_committed" && *line == expected),
+        "no row `{expected}` among {rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -445,6 +523,16 @@ impl Harness {
     /// As [`Self::new`], the repository on a host directory (libgit2) when
     /// `host`, its `origin` the server's URL with no user info.
     async fn new_on(server: Option<(&GitTestServer, &str)>, host: bool) -> Self {
+        Self::new_with(server, host, None).await
+    }
+
+    /// As [`Self::new_on`], the run's person's profile answering `profile`
+    /// as their name and email (AEGIS ADR-136 G5d).
+    async fn new_with(
+        server: Option<(&GitTestServer, &str)>,
+        host: bool,
+        profile: Option<(&str, &str)>,
+    ) -> Self {
         let dirs = tempfile::tempdir().unwrap();
         let workspace = dirs.path().join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -493,13 +581,18 @@ impl Harness {
             Some(Arc::new(engine)),
         ));
         let bindings = Arc::new(Bindings::default());
-        let git_repos = Arc::new(GitRepoService::new(
+        let git_repos = GitRepoService::new(
             bindings.clone() as Arc<dyn GitRepoBindingRepository>,
             user_volume_service,
             clone_executor,
             secrets_manager,
             event_bus.clone(),
-        ));
+        );
+        let git_repos = Arc::new(match profile {
+            Some((name, email)) => git_repos
+                .with_person_profiles(Arc::new(Profile(name.to_string(), email.to_string()))),
+            None => git_repos,
+        });
 
         let host_tree = dirs.path().join("host-tree");
         let volume = Volume::new(
@@ -569,6 +662,7 @@ impl Harness {
                 &[RunRepository {
                     binding_id: binding.id,
                     branch: None,
+                    author: None,
                 }],
             )
             .await
@@ -672,6 +766,18 @@ impl Harness {
                 (row.event_type, row.message)
             })
             .collect()
+    }
+}
+
+/// A person's profile with a name and an email, as the identity provider
+/// answers it for the run's person.
+struct Profile(String, String);
+
+#[async_trait]
+impl PersonProfiles for Profile {
+    async fn name_and_email(&self, sub: &str) -> Result<Option<(String, String)>, String> {
+        assert_eq!(sub, USER, "the profile was read for another subject");
+        Ok(Some((self.0.clone(), self.1.clone())))
     }
 }
 
