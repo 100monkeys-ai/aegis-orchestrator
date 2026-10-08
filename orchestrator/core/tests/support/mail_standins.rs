@@ -570,8 +570,16 @@ pub fn smtp_submitted_a_message(commands: &[String]) -> bool {
 // An IMAP stand-in with a mailbox
 // ---------------------------------------------------------------------------
 
-/// The `UIDVALIDITY` the mailbox stand-in reports.
+/// The `UIDVALIDITY` the mailbox stand-in reports for `INBOX`.
 pub const UIDVALIDITY: u32 = 7;
+
+/// The `UIDVALIDITY` a folder beside `INBOX` reports unless a test sets
+/// one: its own, from its name, never `INBOX`'s (UIDs are per folder, so a
+/// `uid:` thread id names the folder it was answered from; AEGIS ADR-125's
+/// Update of 2026-10-08 (5) clause 24).
+pub fn folder_uidvalidity(name: &str) -> u32 {
+    1000 + name.bytes().map(u32::from).sum::<u32>()
+}
 
 /// One message of the stand-in's `INBOX`.
 #[derive(Debug, Clone)]
@@ -606,12 +614,14 @@ impl StoredMessage {
 }
 
 /// A folder of the mailbox stand-in beside `INBOX`, with the attributes
-/// `LIST` answers for it (`\Sent`, `\Drafts`, or none).
+/// `LIST` answers for it (`\Sent`, `\Drafts`, or none) and the
+/// `UIDVALIDITY` `SELECT`, `EXAMINE` and `APPENDUID` report for it.
 #[derive(Debug, Clone)]
 pub struct StandInFolder {
     pub name: String,
     pub attributes: String,
     pub messages: Vec<StoredMessage>,
+    pub uidvalidity: u32,
 }
 
 impl StandInFolder {
@@ -620,6 +630,7 @@ impl StandInFolder {
             name: name.to_string(),
             attributes: attributes.to_string(),
             messages: Vec::new(),
+            uidvalidity: folder_uidvalidity(name),
         }
     }
 
@@ -961,6 +972,21 @@ fn transfer(
     true
 }
 
+/// The `UIDVALIDITY` of `selected`: [`UIDVALIDITY`] for `INBOX`, else the
+/// folder's own.
+fn validity_of(folders: &Arc<Mutex<Vec<StandInFolder>>>, selected: &str) -> u32 {
+    if selected.eq_ignore_ascii_case("INBOX") {
+        return UIDVALIDITY;
+    }
+    folders
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|f| f.name == selected)
+        .map(|f| f.uidvalidity)
+        .unwrap_or(UIDVALIDITY)
+}
+
 /// Run `f` over the messages of the selected folder.
 fn with_folder<R>(
     inbox: &Arc<Mutex<Vec<StoredMessage>>>,
@@ -1115,6 +1141,7 @@ async fn mailbox_standin(
                                     name
                                 };
                                 let n = with_folder(&mailbox, &others, &selected, |m| m.len());
+                                let validity = validity_of(&others, &selected);
                                 let mode = if verb == "SELECT" {
                                     "READ-WRITE"
                                 } else {
@@ -1122,7 +1149,7 @@ async fn mailbox_standin(
                                 };
                                 reply.extend(
                                     format!(
-                                        "* {n} EXISTS\r\n* OK [UIDVALIDITY {UIDVALIDITY}] UIDs valid\r\n* OK [PERMANENTFLAGS ({permanent})] flags kept\r\n{tag} OK [{mode}] {verb} completed\r\n"
+                                        "* {n} EXISTS\r\n* OK [UIDVALIDITY {validity}] UIDs valid\r\n* OK [PERMANENTFLAGS ({permanent})] flags kept\r\n{tag} OK [{mode}] {verb} completed\r\n"
                                     )
                                     .bytes(),
                                 );
@@ -1166,6 +1193,7 @@ async fn mailbox_standin(
                                     let uid =
                                         target.messages.iter().map(|m| m.uid).max().unwrap_or(0)
                                             + 1;
+                                    let validity = target.uidvalidity;
                                     target.messages.push(StoredMessage {
                                         uid,
                                         flags,
@@ -1174,7 +1202,7 @@ async fn mailbox_standin(
                                     });
                                     reply.extend(
                                         format!(
-                                            "{tag} OK [APPENDUID {UIDVALIDITY} {uid}] APPEND completed\r\n"
+                                            "{tag} OK [APPENDUID {validity} {uid}] APPEND completed\r\n"
                                         )
                                         .bytes(),
                                     );

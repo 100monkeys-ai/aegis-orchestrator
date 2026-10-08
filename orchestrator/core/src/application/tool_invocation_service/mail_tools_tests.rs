@@ -94,6 +94,30 @@ async fn the_mail_tools_are_listed_with_contracts_declaring_mailbox_and_flagged(
                 label.input_schema
             ));
         }
+        // AEGIS ADR-125's Update of 2026-10-08 (5) clause 26.
+        if label.input_schema["properties"]["seen"]["type"] != "boolean" {
+            problems.push(format!(
+                "mail.label's schema does not declare seen: {}",
+                label.input_schema
+            ));
+        }
+        if label.input_schema["properties"].get("folder").is_some() {
+            problems.push("mail.label's schema offers folder".to_string());
+        }
+    }
+    // Its clause 23: `folder` on the two read tools, an enum of the six.
+    for name in ["mail.list", "mail.read"] {
+        let Some(tool) = tools.iter().find(|t| t.name == name) else {
+            continue;
+        };
+        let folder = &tool.input_schema["properties"]["folder"];
+        if folder["enum"] != json!(["inbox", "sent", "drafts", "trash", "archive", "all"])
+            || folder["type"] != "string"
+            || folder["description"]
+                != "Which folder: inbox (the default), sent, drafts, trash, archive, or all your mail where the server keeps such a folder."
+        {
+            problems.push(format!("{name}'s folder is {folder}"));
+        }
     }
     assert!(problems.is_empty(), "{problems:#?}");
 }

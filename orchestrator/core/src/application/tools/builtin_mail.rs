@@ -11,8 +11,16 @@
 //! `mailbox` binding logs in with its password, and an OAuth binding
 //! granted Google's mail scope authenticates with XOAUTH2 and the token
 //! `access_token_for` answers (its Update of 2026-10-07 clauses 8 and 10);
-//! neither secret reaches an agent. They work on `INBOX` only and by UID;
-//! bodies are read with `BODY.PEEK`, so no tool marks a message read.
+//! neither secret reaches an agent. They work by UID; bodies are read with
+//! `BODY.PEEK`, so no tool marks a message read.
+//!
+//! **Folders** (its Update of 2026-10-08 (5), clauses 22 to 25).
+//! `mail.list` and `mail.read` take `folder`: `inbox` (the default),
+//! `sent`, `drafts`, `trash`, `archive` or `all`, each located by its RFC
+//! 6154 attribute or the name rule (`locate`) and opened by `EXAMINE`;
+//! one folder per call, since UIDs are per folder. Every other tool that
+//! names a thread works on `INBOX` and refuses another `folder` before any
+//! connection. `mail.label` sets and clears `\Seen` by `seen` (clause 26).
 //!
 //! **Who may use a mailbox** (clause 7, and the Update of 2026-10-07 (2)).
 //! The tool acts as the call's person (none for a service account:
@@ -77,7 +85,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The folder every mail tool works on.
+/// The inbox: the folder every mail tool but the two read tools works on,
+/// and theirs by default.
 pub const FOLDER: &str = "INBOX";
 /// The newest matches `mail.list` groups into threads.
 pub const LIST_WINDOW: usize = 200;
@@ -121,6 +130,14 @@ pub const NO_SAFE_MOVE: &str =
     "This mailbox's server can neither move messages nor expunge only chosen ones; nothing was deleted.";
 /// What a send's result says when the mailbox has no Sent folder.
 pub const NO_SENT: &str = "This mailbox has no Sent folder.";
+/// The refusal of a `folder` that is not one of the six (the Update of
+/// 2026-10-08 (5) clause 22).
+pub const UNKNOWN_FOLDER: &str =
+    "'folder' must be one of inbox, sent, drafts, trash, archive or all.";
+/// The refusal of a `folder` other than the inbox on a tool that works on
+/// the inbox only (its clause 25).
+pub const INBOX_ONLY: &str =
+    "This tool works on threads in the inbox only; leave out 'folder' or set it to inbox.";
 
 /// The most recipients one message has, `to` and `cc` together.
 pub const MAX_RECIPIENTS: usize = 50;
@@ -391,15 +408,18 @@ enum Request {
         flagged_only: bool,
         since: Option<chrono::NaiveDate>,
         limit: usize,
+        folder: FolderKind,
     },
     Read {
         thread_id: String,
+        folder: FolderKind,
     },
     Label {
         thread_id: String,
         add: Vec<String>,
         remove: Vec<String>,
         flagged: Option<bool>,
+        seen: Option<bool>,
     },
     Draft {
         message: Outbound,
@@ -415,6 +435,81 @@ enum Request {
     Delete {
         thread_id: String,
     },
+}
+
+/// Which folder a read tool works on (the Update of 2026-10-08 (5) clause
+/// 22): the `folder` argument's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderKind {
+    Inbox,
+    Sent,
+    Drafts,
+    Trash,
+    Archive,
+    All,
+}
+
+impl FolderKind {
+    /// The `folder` argument: absent or null is the inbox; anything but
+    /// one of the six lowercase values is refused.
+    fn parse(args: &Value) -> Result<Self, SealSessionError> {
+        match args.get("folder") {
+            None | Some(Value::Null) => Ok(FolderKind::Inbox),
+            Some(Value::String(s)) => match s.as_str() {
+                "inbox" => Ok(FolderKind::Inbox),
+                "sent" => Ok(FolderKind::Sent),
+                "drafts" => Ok(FolderKind::Drafts),
+                "trash" => Ok(FolderKind::Trash),
+                "archive" => Ok(FolderKind::Archive),
+                "all" => Ok(FolderKind::All),
+                _ => Err(invalid(UNKNOWN_FOLDER)),
+            },
+            Some(_) => Err(invalid(UNKNOWN_FOLDER)),
+        }
+    }
+
+    /// The argument's value, which a result carries as `folder_kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FolderKind::Inbox => "inbox",
+            FolderKind::Sent => "sent",
+            FolderKind::Drafts => "drafts",
+            FolderKind::Trash => "trash",
+            FolderKind::Archive => "archive",
+            FolderKind::All => "all",
+        }
+    }
+
+    /// The folder as a person names it.
+    fn title(self) -> &'static str {
+        match self {
+            FolderKind::Inbox => "Inbox",
+            FolderKind::Sent => "Sent",
+            FolderKind::Drafts => "Drafts",
+            FolderKind::Trash => "Trash",
+            FolderKind::Archive => "Archive",
+            FolderKind::All => "All Mail",
+        }
+    }
+
+    /// Where a thread was looked for, in the not-found sentence (clause
+    /// 24): `inbox`, as before, or `<title> folder`.
+    fn place(self) -> String {
+        match self {
+            FolderKind::Inbox => "inbox".to_string(),
+            other => format!("{} folder", other.title()),
+        }
+    }
+}
+
+/// A tool that works on the inbox only refuses any other `folder` (the
+/// Update of 2026-10-08 (5) clause 25): absent, null and `inbox` pass.
+fn inbox_only(args: &Value) -> Result<(), SealSessionError> {
+    match args.get("folder") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) if s == "inbox" => Ok(()),
+        Some(_) => Err(invalid(INBOX_ONLY)),
+    }
 }
 
 /// What an outbound call gives: the recipients, subject and body.
@@ -554,8 +649,15 @@ fn is_keyword(s: &str) -> bool {
 
 impl Request {
     fn parse(tool_name: &str, args: &Value) -> Result<Self, SealSessionError> {
+        if matches!(
+            tool_name,
+            "mail.label" | "mail.delete" | "mail.reply" | "mail.draft"
+        ) {
+            inbox_only(args)?;
+        }
         match tool_name {
             "mail.list" => {
+                let folder = FolderKind::parse(args)?;
                 let since = match optional_string(args, "since")? {
                     None => None,
                     Some(s) => Some(
@@ -581,9 +683,11 @@ impl Request {
                     flagged_only: optional_bool(args, "flagged_only")?.unwrap_or(false),
                     since,
                     limit: limit as usize,
+                    folder,
                 })
             }
             "mail.read" => Ok(Request::Read {
+                folder: FolderKind::parse(args)?,
                 thread_id: thread_id(args)?,
             }),
             "mail.label" => {
@@ -592,17 +696,19 @@ impl Request {
                     add: keywords(args, "add")?,
                     remove: keywords(args, "remove")?,
                     flagged: optional_bool(args, "flagged")?,
+                    seen: optional_bool(args, "seen")?,
                 };
                 if let Request::Label {
                     add,
                     remove,
                     flagged: None,
+                    seen: None,
                     ..
                 } = &request
                 {
                     if add.is_empty() && remove.is_empty() {
                         return Err(invalid(
-                            "mail.label needs at least one of 'add', 'remove' or 'flagged'.",
+                            "mail.label needs at least one of 'add', 'remove', 'flagged' or 'seen'.",
                         ));
                     }
                 }
@@ -652,13 +758,24 @@ async fn run(
         .map_err(session_error)?;
     let answer = match request {
         Request::List { .. } => list(&mut session, mailbox, request).await,
-        Request::Read { thread_id } => read(&mut session, mailbox, thread_id).await,
+        Request::Read { thread_id, folder } => {
+            read(&mut session, mailbox, thread_id, *folder).await
+        }
         Request::Label {
             thread_id,
             add,
             remove,
             flagged,
-        } => label(&mut session, mailbox, thread_id, add, remove, *flagged).await,
+            seen,
+        } => {
+            let marks = Marks {
+                add,
+                remove,
+                flagged: *flagged,
+                seen: *seen,
+            };
+            label(&mut session, mailbox, thread_id, &marks).await
+        }
         Request::Draft { .. }
         | Request::Send { .. }
         | Request::Reply { .. }
@@ -695,6 +812,7 @@ async fn threading_of(
         &status,
         thread_id,
         "UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]",
+        FolderKind::Inbox,
     )
     .await?;
     let newest = messages.last().expect("a thread has a message");
@@ -735,6 +853,56 @@ fn special_folder(folders: &[ListedFolder], attribute: &str, names: &[&str]) -> 
     })
 }
 
+/// The folder `LIST` marks with `attribute`, by that attribute alone.
+fn marked_folder(folders: &[ListedFolder], attribute: &str) -> Option<String> {
+    folders
+        .iter()
+        .find(|f| f.has_attribute(attribute))
+        .map(|f| f.name.clone())
+}
+
+/// The folder of `kind` among `folders`, by one rule for every tool (the
+/// Update of 2026-10-07 (3) clause 15, the Update of 2026-10-08 (4) clause
+/// 18 and the Update of 2026-10-08 (5) clauses 22 and 28): Sent, Drafts and
+/// Trash by their attribute, else by name (Trash, else Deleted); Archive by
+/// `\Archive`, else by the name Archive, else the `\All` folder; all mail
+/// by `\All` only. Never by a provider's folder name.
+fn locate(folders: &[ListedFolder], kind: FolderKind) -> Option<String> {
+    match kind {
+        FolderKind::Inbox => Some(FOLDER.to_string()),
+        FolderKind::Sent => special_folder(folders, "\\Sent", &["Sent"]),
+        FolderKind::Drafts => special_folder(folders, "\\Drafts", &["Drafts"]),
+        FolderKind::Trash => special_folder(folders, "\\Trash", &["Trash", "Deleted"]),
+        FolderKind::Archive => special_folder(folders, "\\Archive", &["Archive"])
+            .or_else(|| marked_folder(folders, "\\All")),
+        FolderKind::All => marked_folder(folders, "\\All"),
+    }
+}
+
+/// Open the folder of `kind` read-only by `EXAMINE`: the inbox directly,
+/// another folder after `LIST` locates it; a mailbox without it is refused
+/// with nothing opened. Answers the folder's name as `LIST` wrote it and
+/// its status.
+async fn examine_kind(
+    session: &mut ImapSession,
+    kind: FolderKind,
+) -> Result<(String, FolderStatus), SealSessionError> {
+    let name = match kind {
+        FolderKind::Inbox => FOLDER.to_string(),
+        other => {
+            let folders = session.list_folders().await.map_err(session_error)?;
+            locate(&folders, other).ok_or_else(|| {
+                invalid(format!(
+                    "This mailbox has no {} folder; nothing was read.",
+                    other.title()
+                ))
+            })?
+        }
+    };
+    let status = session.examine(&name).await.map_err(session_error)?;
+    Ok((name, status))
+}
+
 /// The message `given` from `mailbox`, with `message_id` and `threading`.
 fn compose(
     mailbox: &ToolMailbox,
@@ -773,7 +941,7 @@ async fn draft(
             None => Threading::default(),
         };
         let folders = session.list_folders().await.map_err(session_error)?;
-        let Some(drafts) = special_folder(&folders, "\\Drafts", &["Drafts"]) else {
+        let Some(drafts) = locate(&folders, FolderKind::Drafts) else {
             return Err(invalid(NO_DRAFTS));
         };
         let message_id = mint_message_id(&mailbox.settings.address);
@@ -884,7 +1052,7 @@ async fn save_to_sent(
     };
     let copy: Result<SentCopy, MailboxCheckFailure> = async {
         let folders = session.list_folders().await?;
-        let Some(sent) = special_folder(&folders, "\\Sent", &["Sent"]) else {
+        let Some(sent) = locate(&folders, FolderKind::Sent) else {
             return Ok(SentCopy::NoFolder);
         };
         session.examine(&sent).await?;
@@ -934,8 +1102,7 @@ async fn trash_plan(session: &mut ImapSession) -> Result<(String, TrashMove), Se
         return Err(invalid(NO_SAFE_MOVE));
     };
     let folders = session.list_folders().await.map_err(session_error)?;
-    let trash = special_folder(&folders, "\\Trash", &["Trash", "Deleted"])
-        .ok_or_else(|| invalid(NO_TRASH))?;
+    let trash = locate(&folders, FolderKind::Trash).ok_or_else(|| invalid(NO_TRASH))?;
     Ok((trash, how))
 }
 
@@ -964,6 +1131,7 @@ async fn shown_for_delete(
             &status,
             thread_id,
             "UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)]",
+            FolderKind::Inbox,
         )
         .await?;
         let mut subject = String::new();
@@ -1006,6 +1174,7 @@ async fn delete(
             &status,
             thread_id,
             "UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]",
+            FolderKind::Inbox,
         )
         .await?;
         let uids: Vec<u32> = messages.iter().map(|f| f.uid).collect();
@@ -1029,6 +1198,7 @@ async fn delete(
         Ok(json!({
             "mailbox": mailbox.binding_id.0.to_string(),
             "folder": FOLDER,
+            "folder_kind": FolderKind::Inbox.as_str(),
             "thread_id": thread_id,
             "trash_folder": trash,
             "moved": uids.len(),
@@ -1095,11 +1265,12 @@ async fn list(
         flagged_only,
         since,
         limit,
+        folder,
     } = request
     else {
         unreachable!("list is called with a list request")
     };
-    let status = session.examine(FOLDER).await.map_err(session_error)?;
+    let (name, status) = examine_kind(session, *folder).await?;
     let mut criteria = Vec::new();
     if let Some(query) = query {
         criteria.push(Arg::atom("TEXT"));
@@ -1192,20 +1363,24 @@ async fn list(
     let threads: Vec<Value> = summaries.into_iter().take(*limit).map(|(_, v)| v).collect();
     Ok(json!({
         "mailbox": mailbox.binding_id.0.to_string(),
-        "folder": FOLDER,
+        "folder": name,
+        "folder_kind": folder.as_str(),
         "matched_messages": matched.len(),
         "truncated": truncated,
         "threads": threads,
     }))
 }
 
-/// The UIDs of the messages whose thread is `thread_id`, ascending, and the
-/// fetch of each that `items` asked for.
+/// The UIDs of the messages whose thread is `thread_id` in the open folder
+/// (of `kind`), ascending, and the fetch of each that `items` asked for. A
+/// `uid:` id names a message only in the folder whose `UIDVALIDITY` it
+/// carries; a thread with no message here is refused with the folder named.
 async fn thread_messages(
     session: &mut ImapSession,
     status: &FolderStatus,
     thread_id: &str,
     items: &str,
+    kind: FolderKind,
 ) -> Result<Vec<Fetched>, SealSessionError> {
     let candidates = if let Some(rest) = thread_id.strip_prefix("uid:") {
         let mut parts = rest.splitn(2, ':');
@@ -1258,7 +1433,10 @@ async fn thread_messages(
             .filter(|c| !c.is_control())
             .take(200)
             .collect();
-        let message = format!("There is no thread '{shown}' in this mailbox's inbox.");
+        let message = format!(
+            "There is no thread '{shown}' in this mailbox's {}.",
+            kind.place()
+        );
         return Err(
             SealSessionError::NotFound(message.clone()).answered(CallerAnswer::NotFound(message))
         );
@@ -1270,13 +1448,15 @@ async fn read(
     session: &mut ImapSession,
     mailbox: &ToolMailbox,
     thread_id: &str,
+    folder: FolderKind,
 ) -> Result<Value, SealSessionError> {
-    let status = session.examine(FOLDER).await.map_err(session_error)?;
+    let (name, status) = examine_kind(session, folder).await?;
     let messages = thread_messages(
         session,
         &status,
         thread_id,
         "UID FLAGS INTERNALDATE BODY.PEEK[]",
+        folder,
     )
     .await?;
     let truncated = messages.len() > READ_MAX_MESSAGES;
@@ -1317,7 +1497,8 @@ async fn read(
         .collect();
     Ok(json!({
         "mailbox": mailbox.binding_id.0.to_string(),
-        "folder": FOLDER,
+        "folder": name,
+        "folder_kind": folder.as_str(),
         "thread_id": thread_id,
         "subject": subject,
         "truncated": truncated,
@@ -1325,14 +1506,27 @@ async fn read(
     }))
 }
 
+/// What `mail.label` changes on every message of a thread: keywords added
+/// and removed, and `\Flagged` and `\Seen` set or cleared.
+struct Marks<'a> {
+    add: &'a [String],
+    remove: &'a [String],
+    flagged: Option<bool>,
+    seen: Option<bool>,
+}
+
 async fn label(
     session: &mut ImapSession,
     mailbox: &ToolMailbox,
     thread_id: &str,
-    add: &[String],
-    remove: &[String],
-    flagged: Option<bool>,
+    marks: &Marks<'_>,
 ) -> Result<Value, SealSessionError> {
+    let Marks {
+        add,
+        remove,
+        flagged,
+        seen,
+    } = *marks;
     let status = session.select(FOLDER).await.map_err(session_error)?;
     // A label the server will not keep is refused before anything is stored.
     if let Some(unkept) = add.iter().find(|k| !status.keeps_keyword(k)) {
@@ -1345,6 +1539,7 @@ async fn label(
         &status,
         thread_id,
         "UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]",
+        FolderKind::Inbox,
     )
     .await?;
     let uids: Vec<u32> = messages.iter().map(|f| f.uid).collect();
@@ -1356,25 +1551,25 @@ async fn label(
         .uid_store(&uids, StoreOp::Remove, remove)
         .await
         .map_err(session_error)?;
-    if let Some(flagged) = flagged {
-        let op = if flagged {
-            StoreOp::Add
-        } else {
-            StoreOp::Remove
-        };
-        session
-            .uid_store(&uids, op, &["\\Flagged".to_string()])
-            .await
-            .map_err(session_error)?;
+    for (flag, set) in [("\\Flagged", flagged), ("\\Seen", seen)] {
+        if let Some(set) = set {
+            let op = if set { StoreOp::Add } else { StoreOp::Remove };
+            session
+                .uid_store(&uids, op, &[flag.to_string()])
+                .await
+                .map_err(session_error)?;
+        }
     }
     Ok(json!({
         "mailbox": mailbox.binding_id.0.to_string(),
         "folder": FOLDER,
+        "folder_kind": FolderKind::Inbox.as_str(),
         "thread_id": thread_id,
         "message_uids": uids,
         "added": add,
         "removed": remove,
         "flagged": flagged,
+        "seen": seen,
     }))
 }
 

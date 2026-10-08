@@ -575,6 +575,80 @@ async fn an_ungranted_mailbox_is_refused_before_the_gate_and_no_row_is_written()
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A gated or ungated inbox tool naming a folder other than the inbox is
+/// refused before any connection and, for a gated tool, before the gate,
+/// with no row written (AEGIS ADR-125's Update of 2026-10-08 (5) clause
+/// 25); named `inbox`, the gated call waits for approval as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inbox_tool_naming_another_folder_is_refused_before_the_gate_and_no_row_is_written() {
+    const INBOX_ONLY: &str =
+        "This tool works on threads in the inbox only; leave out 'folder' or set it to inbox.";
+    let (mailbox, smtp, owned) = password_mailbox("Inbox", false).await;
+    let id = owned.id.0.to_string();
+    let h = harness(vec![owned], &[Some(json!({ "imap": [id.clone()] }))]).await;
+    let mut events = h.event_bus.subscribe();
+    let mut wrong = Vec::new();
+    for (tool, args) in [
+        (
+            "mail.reply",
+            json!({"mailbox": id, "thread_id": "<a1@x>", "to": [ANN], "subject": "Re: Invoice", "body": "Got it."}),
+        ),
+        ("mail.delete", json!({"mailbox": id, "thread_id": "<a1@x>"})),
+        (
+            "mail.label",
+            json!({"mailbox": id, "thread_id": "<a1@x>", "flagged": true}),
+        ),
+        ("mail.draft", json!({"mailbox": id, "body": "A draft."})),
+    ] {
+        for folder in ["sent", "drafts", "trash", "archive", "all"] {
+            let mut args = args.clone();
+            args["folder"] = json!(folder);
+            let result = h.call(0, tool, args).await;
+            if told(&result) != INBOX_ONLY {
+                wrong.push(format!("{tool} in {folder}: {}", told(&result)));
+            }
+        }
+    }
+    if !h.rows().await.is_empty() {
+        wrong.push(format!(
+            "approval rows were written: {:?}",
+            h.rows()
+                .await
+                .iter()
+                .map(|r| r.tool_name.clone())
+                .collect::<Vec<_>>()
+        ));
+    }
+    while let Ok(event) = events.try_recv() {
+        if format!("{event:?}").contains("ApprovalRequested") {
+            wrong.push("an approval was requested".to_string());
+        }
+    }
+    if mailbox.connections() != 0 || smtp.standin.connections() != 0 {
+        wrong.push(format!(
+            "the refused calls reached the mail servers: IMAP {}, SMTP {}",
+            mailbox.connections(),
+            smtp.standin.connections()
+        ));
+    }
+    // Named `inbox`, the reply is admitted and waits for approval.
+    let result = h
+        .call(
+            0,
+            "mail.reply",
+            json!({"mailbox": id, "thread_id": "<a1@x>", "to": [ANN], "subject": "Re: Invoice", "body": "Got it.", "folder": "inbox"}),
+        )
+        .await;
+    match direct(&result) {
+        Some(value) if value["status"] == "approval_pending" => {}
+        _ => wrong.push(format!(
+            "mail.reply with folder inbox did not wait: {}",
+            told(&result)
+        )),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mailbox_named_by_its_context_name_is_stored_with_its_binding_id() {
     let (_m1, _s1, inbox_box) = password_mailbox("Inbox", false).await;

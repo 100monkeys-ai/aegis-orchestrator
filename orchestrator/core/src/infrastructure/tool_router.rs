@@ -142,9 +142,9 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.draft", "Saves a plain-text message as a draft in a connected mailbox's Drafts folder, optionally as a reply in a thread. Sends nothing."),
     BuiltinToolDefinition::new("mail.send", "Sends a plain-text message from a connected mailbox to the addresses in to and cc, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
     BuiltinToolDefinition::new("mail.reply", "Replies in a thread of a connected mailbox: sends a plain-text message to the addresses in to and cc, threaded to the thread's newest message, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
-    BuiltinToolDefinition::new("mail.list", "Lists threads in a connected mailbox's inbox that match a query, newest first: each thread's id, subject, participants, latest date, message count, unread count, flag and labels. Marks nothing as read.").skip_judge(),
-    BuiltinToolDefinition::new("mail.read", "Reads one thread of a connected mailbox: every message's headers, flags, labels and plain-text body, oldest first. Marks nothing as read.").skip_judge(),
-    BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox, and flags or unflags it."),
+    BuiltinToolDefinition::new("mail.list", "Lists threads in one folder of a connected mailbox that match a query, newest first: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers each thread's id, subject, participants, latest date, message count, unread count, flag and labels, and the folder read. Marks nothing as read.").skip_judge(),
+    BuiltinToolDefinition::new("mail.read", "Reads one thread in one folder of a connected mailbox: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers every message of the thread in that folder, oldest first, with its headers, flags, labels and plain-text body, and the folder read; a thread's id is the same in every folder. Marks nothing as read.").skip_judge(),
+    BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox's inbox, flags or unflags it, and marks it read or unread."),
     BuiltinToolDefinition::new("mail.delete", "Moves every message of a thread in a connected mailbox's inbox to its Trash folder; deletes nothing permanently. Waits for the person's approval before anything is moved.").requires_approval(),
     BuiltinToolDefinition::new("calendar.calendars", "Lists the calendars of a connected calendar account: each calendar's id, name, description, colour where given, and whether the account may write to it. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("calendar.list", "Lists the events of one calendar of a connected calendar account in a window of at most 92 days (by default now and the seven days on), by start: repeating events as their occurrences, each with its id, title, times, location, organiser, attendees and their answers, and status. Changes nothing.").skip_judge(),
@@ -964,6 +964,11 @@ impl ToolRouter {
                     "type": "string",
                     "description": "The id of one of your mailbox connections."
                 },
+                "folder": {
+                    "type": "string",
+                    "enum": ["inbox", "sent", "drafts", "trash", "archive", "all"],
+                    "description": "Which folder: inbox (the default), sent, drafts, trash, archive, or all your mail where the server keeps such a folder."
+                },
                 "query": {
                     "type": "string",
                     "description": "Words a message's headers or body contain."
@@ -1003,6 +1008,11 @@ impl ToolRouter {
                 "mailbox": {
                     "type": "string",
                     "description": "The id of one of your mailbox connections."
+                },
+                "folder": {
+                    "type": "string",
+                    "enum": ["inbox", "sent", "drafts", "trash", "archive", "all"],
+                    "description": "Which folder: inbox (the default), sent, drafts, trash, archive, or all your mail where the server keeps such a folder."
                 },
                 "thread_id": {
                     "type": "string",
@@ -1059,6 +1069,10 @@ impl ToolRouter {
                 "flagged": {
                     "type": "boolean",
                     "description": "true flags every message of the thread, false unflags it; leave it out to keep the flag as it is."
+                },
+                "seen": {
+                    "type": "boolean",
+                    "description": "true marks every message of the thread read, false marks it unread; leave it out to keep it as it is."
                 }
             },
             "required": ["mailbox", "thread_id"]
