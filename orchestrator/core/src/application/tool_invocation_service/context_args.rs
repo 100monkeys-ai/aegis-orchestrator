@@ -38,6 +38,30 @@ pub(super) fn parse_contexts(args: &Value) -> Result<Option<Map<String, Value>>,
     Ok(Some(map.clone()))
 }
 
+/// The key of a call's `_meta` naming the Zaru conversation the call was
+/// made in (AEGIS ADR-126, Update of 2026-10-07 (2), clause 2).
+pub(super) const CONVERSATION_META_KEY: &str = "conversation_id";
+
+/// The refusal of a `_meta.conversation_id` that is not a string holding a
+/// UUID, before anything runs.
+pub(super) const CONVERSATION_ID_SHAPE: &str =
+    "'_meta.conversation_id' must be a conversation id (a UUID)";
+
+/// Parse a call's `_meta.conversation_id`: `Ok(None)` when absent, the id
+/// as sent when it is a string holding a UUID, refused with
+/// [`CONVERSATION_ID_SHAPE`] otherwise.
+pub(super) fn parse_conversation_id(meta: &Value) -> Result<Option<String>, SealSessionError> {
+    let Some(raw) = meta.get(CONVERSATION_META_KEY) else {
+        return Ok(None);
+    };
+    match raw {
+        Value::String(id) if uuid::Uuid::parse_str(id).is_ok() => Ok(Some(id.clone())),
+        _ => Err(SealSessionError::InvalidArguments(
+            CONVERSATION_ID_SHAPE.to_string(),
+        )),
+    }
+}
+
 /// Keep `contexts` in `input`'s reserved key. A non-object input is first
 /// wrapped as `{"input": <value>}`, the form the agent's rendering already
 /// reads its input from.

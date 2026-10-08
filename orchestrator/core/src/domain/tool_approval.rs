@@ -168,6 +168,10 @@ pub struct ToolApprovalRequest {
     /// The security context the call was evaluated under; a run on approval
     /// dispatches under the context of this name.
     pub security_context_name: String,
+    /// The Zaru conversation the gated call was made in; absent for a call
+    /// no conversation started (ADR-126, Update of 2026-10-07 (2), clause 1).
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     /// The policy an `auto_allowed` call matched.
     pub policy_id: Option<ToolApprovalPolicyId>,
     pub status: ToolApprovalStatus,

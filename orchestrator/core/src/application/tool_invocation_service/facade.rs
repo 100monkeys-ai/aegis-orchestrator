@@ -507,6 +507,14 @@ impl ToolInvocationService {
             }),
             None => None,
         };
+        // 2b3. AEGIS ADR-126, Update of 2026-10-07 (2), clause 2: the
+        // conversation the call was made in, refused before anything runs
+        // when malformed. The gate reads it only for a session with no
+        // execution record.
+        let call_conversation = match meta {
+            Some(meta) => super::context_args::parse_conversation_id(meta)?,
+            None => None,
+        };
 
         // 2c. AEGIS ADR-129 D19: a session attested under an operator
         // escalation runs a call only while that escalation is active,
@@ -576,6 +584,7 @@ impl ToolInvocationService {
                 Vec::new(),
                 seal_caller_identity.as_ref(),
                 call_contexts.as_ref(),
+                call_conversation.as_deref(),
             )
             .await?;
 
@@ -785,6 +794,7 @@ impl ToolInvocationService {
             tool_audit_history,
             caller_identity.as_ref(),
             None,
+            None,
         )
         .await
     }
@@ -812,6 +822,10 @@ impl ToolInvocationService {
         // A conversation's choices from the call's payload (AEGIS ADR-132
         // S7); `None` on every path but the invoke route's.
         call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+        // The conversation the call names in its payload's
+        // `_meta.conversation_id` (AEGIS ADR-126, Update of 2026-10-07 (2),
+        // clause 2); `None` on every path but the invoke route's.
+        call_conversation: Option<&str>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         // Convenience binding for code paths that only need the authenticated
         // tenant — agent lookups, judge spawning, gateway forwarding, etc.
@@ -935,6 +949,21 @@ impl ToolInvocationService {
                 use crate::application::tool_approval_service::{
                     GateOutcome, GatedCall, ToolApprovalError,
                 };
+                // ADR-126, Update of 2026-10-07 (2), clause 2: the call's
+                // conversation counts only for a session with no execution
+                // record (a conversation's call); inside an execution with a
+                // record it is ignored, as S7 ignores `_meta.contexts`.
+                let conversation_id = match call_conversation {
+                    Some(id) => match self
+                        .execution_service
+                        .get_execution_unscoped(execution_id)
+                        .await
+                    {
+                        Ok(_) => None,
+                        Err(_) => Some(id),
+                    },
+                    None => None,
+                };
                 let gated = approvals
                     .gate(GatedCall {
                         tenant_id,
@@ -944,6 +973,7 @@ impl ToolInvocationService {
                         tool_name: &tool_name,
                         arguments: &args,
                         security_context_name: &security_context.name,
+                        conversation_id,
                         contract: self.tool_router.approval_contract(&tool_name),
                     })
                     .await;

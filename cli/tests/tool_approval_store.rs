@@ -13,7 +13,10 @@
 //! answer wins when two race; a policy matches only its own user, tool and
 //! binding (the argument the tool's contract declares, ADR-126 Update of
 //! 2026-10-04 clause 1), and stops matching once revoked; the sweep expires only what has
-//! waited 72 hours; and migration 036 run again changes nothing.
+//! waited 72 hours; migration 036 run again changes nothing; and the
+//! conversation a request was made in (ADR-126, Update of 2026-10-07 (2),
+//! clause 1): migration 044 run again changes nothing, and the store
+//! round-trips `conversation_id`, a value and null.
 
 use std::sync::{Arc, Mutex};
 
@@ -155,6 +158,7 @@ async fn gate_declaring(
         tool_name: tool,
         arguments: args,
         security_context_name: "zaru-pro",
+        conversation_id: None,
         contract,
     })
     .await
@@ -411,6 +415,129 @@ async fn a_policy_keyed_on_a_contract_declared_argument_matches_only_its_own_too
     assert!(
         summaries.contains(&"outbound.reply\nto: \nsubject: \nbody: "),
         "{summaries:?}"
+    );
+    db.remove().await;
+}
+
+const CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+
+/// A pending request of `USER`'s, made in `conversation` when given, as the
+/// gate builds one.
+fn request_in(conversation: Option<&str>) -> ToolApprovalRequest {
+    ToolApprovalRequest {
+        id: ToolApprovalId::new(),
+        tenant_id: tenant(),
+        user_sub: USER.to_string(),
+        execution_id: ExecutionId::new(),
+        agent_id: AgentId::new(),
+        tool_name: "outbound.send".to_string(),
+        arguments: json!({"account": "b-1"}),
+        summary: "outbound.send".to_string(),
+        binding_id: Some("b-1".to_string()),
+        security_context_name: "zaru-pro".to_string(),
+        conversation_id: conversation.map(str::to_string),
+        policy_id: None,
+        status: ToolApprovalStatus::Pending,
+        created_at: chrono::Utc::now(),
+        decided_at: None,
+        decided_by: None,
+        result: None,
+        error: None,
+    }
+}
+
+/// Migration 044 adds `conversation_id`, and applied again over a migrated
+/// schema, with a row naming a conversation in it, changes nothing.
+#[tokio::test]
+async fn migration_044_run_again_changes_nothing() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let snapshot = || async {
+        sqlx::query(
+            "SELECT (SELECT count(*) FROM tool_approval_requests) AS requests, \
+                    (SELECT count(*) FROM information_schema.columns \
+                      WHERE table_name = 'tool_approval_requests' \
+                        AND column_name = 'conversation_id' AND is_nullable = 'YES') AS columns",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map(|row| (row.get::<i64, _>("requests"), row.get::<i64, _>("columns")))
+        .unwrap()
+    };
+    assert_eq!(
+        snapshot().await.1,
+        1,
+        "tool_approval_requests has no nullable conversation_id column after every migration"
+    );
+    let repo = PostgresToolApprovalRepository::new(db.pool.clone());
+    let stored = request_in(Some(CONVERSATION));
+    repo.insert_request(&stored).await.unwrap();
+    let before = snapshot().await;
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 44)
+        .expect("migration 044 ships");
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 044 run again");
+    assert_eq!(
+        snapshot().await,
+        before,
+        "migration 044 run again changed the schema or the rows"
+    );
+    let found = repo.find_request(stored.id).await.unwrap().unwrap();
+    assert_eq!(
+        found.conversation_id.as_deref(),
+        Some(CONVERSATION),
+        "migration 044 run again lost a stored conversation_id"
+    );
+    db.remove().await;
+}
+
+/// The store keeps a request's conversation: a value, and null for a
+/// request no conversation started, read back by id and in the user's list.
+#[tokio::test]
+async fn a_conversation_id_round_trips_through_the_store_a_value_and_null() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = PostgresToolApprovalRepository::new(db.pool.clone());
+    let in_conversation = request_in(Some(CONVERSATION));
+    let in_none = request_in(None);
+    repo.insert_request(&in_conversation).await.unwrap();
+    repo.insert_request(&in_none).await.unwrap();
+    let by_id = (
+        repo.find_request(in_conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .conversation_id,
+        repo.find_request(in_none.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .conversation_id,
+    );
+    let listed = repo
+        .list_requests_for_user(&tenant(), USER, None)
+        .await
+        .unwrap();
+    let in_list = |id: ToolApprovalId| {
+        listed
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.conversation_id.clone())
+    };
+    assert_eq!(
+        (by_id, in_list(in_conversation.id), in_list(in_none.id)),
+        (
+            (Some(CONVERSATION.to_string()), None),
+            Some(Some(CONVERSATION.to_string())),
+            Some(None)
+        ),
+        "the store did not round-trip conversation_id (a value and null)"
     );
     db.remove().await;
 }

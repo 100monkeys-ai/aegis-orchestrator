@@ -307,6 +307,7 @@ fn dispatchers_gating(
 
 struct Harness {
     service: ToolInvocationService,
+    sessions: Arc<InMemorySealSessionRepository>,
     approvals: Arc<ToolApprovalService>,
     repo: Arc<InMemoryToolApprovalRepository>,
     event_bus: Arc<EventBus>,
@@ -385,8 +386,9 @@ async fn harness_declaring(
     ));
     let event_bus = Arc::new(EventBus::new(1024));
     let approvals = Arc::new(ToolApprovalService::new(repo.clone(), event_bus.clone()));
+    let sessions = Arc::new(InMemorySealSessionRepository::new());
     let service = ToolInvocationService::new(
-        Arc::new(InMemorySealSessionRepository::new()),
+        sessions.clone(),
         security_context_repo,
         Arc::new(SealMiddleware::new()),
         router,
@@ -401,6 +403,7 @@ async fn harness_declaring(
     .with_tool_approvals(approvals.clone());
     Harness {
         service,
+        sessions,
         approvals,
         repo,
         event_bus,
@@ -831,4 +834,164 @@ async fn a_tool_declaring_neither_key_keeps_the_fallback_summary() {
         format!("{GATED_TOOL} with arguments {args}")
     );
     assert_eq!(h.rows().await[0].binding_id, None);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-126, Update of 2026-10-07 (2), clauses 1 and 2: the conversation a
+// gated call was made in, from the call's `_meta.conversation_id`
+// ---------------------------------------------------------------------------
+
+use crate::domain::secrets::SensitiveString;
+
+const CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+
+/// A SEAL envelope the middleware accepts as signed, for the invoke route.
+struct RouteEnvelope {
+    token: SensitiveString,
+    tool: String,
+    args: Value,
+    nonce: String,
+}
+
+impl EnvelopeVerifier for RouteEnvelope {
+    fn security_token(&self) -> &SensitiveString {
+        &self.token
+    }
+    fn verify_signature(&self, _: &[u8]) -> Result<(), SealSessionError> {
+        Ok(())
+    }
+    fn extract_tool_name(&self) -> Option<String> {
+        Some(self.tool.clone())
+    }
+    fn extract_arguments(&self) -> Option<Value> {
+        Some(self.args.clone())
+    }
+    fn replay_nonce(&self) -> String {
+        self.nonce.clone()
+    }
+}
+
+impl Harness {
+    /// A session of `USER` for `execution`: a conversation's session when
+    /// `execution` has no record, an agent's when it has one.
+    async fn session_for(&self, execution: ExecutionId) -> String {
+        let token = format!("token-{}", uuid::Uuid::new_v4());
+        let session = crate::domain::seal_session::SealSession::new(
+            self.agent_id,
+            execution,
+            vec![],
+            token.clone(),
+            security_context("aegis.*"),
+            self.tenant.clone(),
+        )
+        .with_principal_metadata(
+            Some(USER.to_string()),
+            Some(USER.to_string()),
+            None,
+            None,
+        );
+        self.sessions.save(session).await.unwrap();
+        token
+    }
+
+    /// One call of the gated tool through the invoke route, with `meta` as
+    /// the payload's `params._meta`.
+    async fn route(&self, token: &str, meta: Option<Value>) -> Result<Value, SealSessionError> {
+        self.service
+            .invoke_tool_with_meta(
+                &RouteEnvelope {
+                    token: token.to_string().into(),
+                    tool: GATED_TOOL.to_string(),
+                    args: self.args("b-1"),
+                    nonce: uuid::Uuid::new_v4().to_string(),
+                },
+                meta.as_ref(),
+            )
+            .await
+    }
+}
+
+/// Clause 2: a conversation's gated call (its session has no execution
+/// record) stores the conversation its payload's `_meta` names.
+#[tokio::test]
+async fn a_conversations_gated_call_stores_its_meta_conversation_id() {
+    let h = harness().await;
+    let token = h.session_for(ExecutionId::new()).await;
+    let value = h
+        .route(&token, Some(json!({ "conversation_id": CONVERSATION })))
+        .await
+        .expect("the gated call answers");
+    assert_eq!(value["status"], "approval_pending", "{value}");
+    let rows = h.rows().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].conversation_id.as_deref(),
+        Some(CONVERSATION),
+        "the conversation's gated call did not store its _meta.conversation_id"
+    );
+}
+
+/// Clause 1: a gated call that names no conversation stores none.
+#[tokio::test]
+async fn a_gated_call_naming_no_conversation_stores_none() {
+    let h = harness().await;
+    let token = h.session_for(ExecutionId::new()).await;
+    for meta in [None, Some(json!({ "contexts": {} }))] {
+        h.route(&token, meta).await.expect("the gated call answers");
+    }
+    let rows = h.rows().await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert_eq!(
+            row.conversation_id, None,
+            "a call naming no conversation stored one"
+        );
+    }
+}
+
+/// Clause 2: a `_meta.conversation_id` that is not a string holding a UUID
+/// is refused with its sentence before anything runs.
+#[tokio::test]
+async fn a_malformed_meta_conversation_id_is_refused_before_anything_runs() {
+    let h = harness().await;
+    let token = h.session_for(ExecutionId::new()).await;
+    let mut failures = Vec::new();
+    for bad in [
+        json!("not-a-uuid"),
+        json!(7),
+        json!([CONVERSATION]),
+        json!(null),
+    ] {
+        match h
+            .route(&token, Some(json!({ "conversation_id": bad })))
+            .await
+        {
+            Err(e)
+                if e.to_string()
+                    .contains(super::context_args::CONVERSATION_ID_SHAPE) => {}
+            other => failures.push(format!("{bad}: {other:?}")),
+        }
+    }
+    let rows = h.rows().await;
+    assert!(
+        failures.is_empty() && rows.is_empty(),
+        "a malformed _meta.conversation_id was not refused before anything ran: {failures:?}; rows {rows:?}"
+    );
+}
+
+/// Clause 2: inside an execution with a record, the call's
+/// `_meta.conversation_id` is ignored, as S7 ignores its `_meta.contexts`.
+#[tokio::test]
+async fn inside_an_execution_with_a_record_meta_conversation_id_is_ignored() {
+    let h = harness().await;
+    let token = h.session_for(h.execution).await;
+    h.route(&token, Some(json!({ "conversation_id": CONVERSATION })))
+        .await
+        .expect("the gated call answers");
+    let rows = h.rows().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].conversation_id, None,
+        "inside an execution with a record the call's _meta.conversation_id was stored"
+    );
 }

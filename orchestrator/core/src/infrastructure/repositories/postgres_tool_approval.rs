@@ -4,7 +4,8 @@
 //!
 //! [`PostgresToolApprovalRepository`] stores requests and policies in the
 //! `tool_approval_requests` and `tool_approval_policies` tables of migration
-//! `036_tool_approvals.sql`; [`InMemoryToolApprovalRepository`] keeps them in
+//! `036_tool_approvals.sql`, with the `conversation_id` column of
+//! `044_tool_approval_conversation.sql`; [`InMemoryToolApprovalRepository`] keeps them in
 //! process, for tests and for a daemon run without a database.
 
 use std::collections::HashMap;
@@ -28,7 +29,7 @@ use crate::domain::tool_approval::{
 
 const REQUEST_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
      arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
-     decided_at, decided_by, result, error";
+     decided_at, decided_by, result, error, conversation_id";
 
 const POLICY_COLUMNS: &str =
     "id, tenant_id, user_sub, tool_name, binding_id, created_at, created_by, revoked_at";
@@ -72,6 +73,7 @@ fn hydrate_request(row: &PgRow) -> Result<ToolApprovalRequest, RepositoryError> 
         summary: column(row, "summary")?,
         binding_id: column(row, "binding_id")?,
         security_context_name: column(row, "security_context_name")?,
+        conversation_id: column(row, "conversation_id")?,
         policy_id: policy_id.map(ToolApprovalPolicyId),
         status,
         created_at: column(row, "created_at")?,
@@ -100,7 +102,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
     async fn insert_request(&self, request: &ToolApprovalRequest) -> Result<(), RepositoryError> {
         sqlx::query(&format!(
             "INSERT INTO tool_approval_requests ({REQUEST_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
         ))
         .bind(request.id.0)
         .bind(request.tenant_id.as_str())
@@ -119,6 +121,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(&request.decided_by)
         .bind(&request.result)
         .bind(&request.error)
+        .bind(&request.conversation_id)
         .execute(&self.pool)
         .await?;
         Ok(())

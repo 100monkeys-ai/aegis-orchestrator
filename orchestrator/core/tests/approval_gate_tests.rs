@@ -55,6 +55,7 @@ async fn the_mail_send_contract_keys_the_request_and_the_policy_on_mailbox_and_l
                 tool_name: "mail.send",
                 arguments: &args,
                 security_context_name: "zaru-pro",
+                conversation_id: None,
                 contract: router.approval_contract("mail.send"),
             })
             .await

@@ -156,6 +156,7 @@ fn request_view(request: &ToolApprovalRequest) -> Value {
         "arguments": request.arguments,
         "summary": request.summary,
         "binding_id": request.binding_id,
+        "conversation_id": request.conversation_id,
         "status": request.status.as_str(),
         "created_at": request.created_at,
         "decided_at": request.decided_at,
@@ -353,6 +354,15 @@ mod tests {
     }
 
     async fn pending(service: &ToolApprovalService, args: Value) -> ToolApprovalId {
+        pending_in(service, args, None).await
+    }
+
+    /// A pending request of the owner's, made in `conversation` when given.
+    async fn pending_in(
+        service: &ToolApprovalService,
+        args: Value,
+        conversation: Option<&str>,
+    ) -> ToolApprovalId {
         let tenant = TenantId::for_consumer_user("owner-sub").unwrap();
         let outcome = service
             .gate(GatedCall {
@@ -363,6 +373,7 @@ mod tests {
                 tool_name: "mail.send",
                 arguments: &args,
                 security_context_name: "zaru-pro",
+                conversation_id: conversation,
                 contract: ApprovalContract {
                     binding_argument: Some("mailbox".into()),
                     approval_summary: Some(vec![
@@ -392,6 +403,41 @@ mod tests {
             Some(token),
         )
         .await
+    }
+
+    /// ADR-126, Update of 2026-10-07 (2), clause 1: the list answers each
+    /// request's conversation, a string, or `null` for a request no
+    /// conversation started.
+    #[tokio::test]
+    async fn the_list_answers_each_requests_conversation_id_or_null() {
+        const CONVERSATION: &str = "6c1f0b52-8a3e-4d7b-9f21-0e5d4c3b2a19";
+        let f = fixture(&[("owner", owner(), SCOPES)]).await;
+        let in_conversation =
+            pending_in(&f.service, json!({"mailbox": "b-1"}), Some(CONVERSATION)).await;
+        let in_none = pending_in(&f.service, json!({"mailbox": "b-2"}), None).await;
+
+        let (status, body) = send(
+            &f.base,
+            &Method::GET,
+            "/v1/tool-approvals?status=pending",
+            &None,
+            Some("owner"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let answered = |id: ToolApprovalId| {
+            body["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id.to_string())
+                .and_then(|r| r.get("conversation_id").cloned())
+        };
+        assert_eq!(
+            (answered(in_conversation), answered(in_none)),
+            (Some(json!(CONVERSATION)), Some(Value::Null)),
+            "GET /v1/tool-approvals did not answer each request's conversation_id: {body}"
+        );
     }
 
     #[tokio::test]
