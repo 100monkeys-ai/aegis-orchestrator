@@ -17,7 +17,11 @@
 //!   the inbox's byte for byte as before (clause 24);
 //! - `mail.label`, `mail.delete`, `mail.reply` and `mail.draft` refuse a
 //!   `folder` other than `inbox` before any connection (clause 25);
-//! - `mail.label` takes `seen` (clause 26).
+//! - `mail.label` takes `seen` (clause 26);
+//! - a thread `mail.list` names is read whole in the same folder though
+//!   the server's `HEADER References` search matches nothing, as Gmail's
+//!   does: a reply linked to its thread by `References` alone is read
+//!   (clause 39, proposed under the Update's Status tracking).
 //!
 //! The gated tools' refusal before the gate, with no approval row, is
 //! tested in `mail_tools_tests.rs`.
@@ -669,6 +673,174 @@ async fn a_thread_not_in_the_named_folder_is_refused_with_that_folders_sentence(
         Err(e) if sentence(&e) == "There is no thread '<nope@x>' in this mailbox's inbox." => {}
         other => wrong.push(format!("with no folder: {other:?}")),
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// Clause 39: a thread is read whole when `HEADER References` matches nothing
+// ---------------------------------------------------------------------------
+
+/// The person's own reply in thread `<g1@x>`: `In-Reply-To` the later
+/// message `<g2@x>`, the root in `References` alone, so only a
+/// `HEADER References` search would find it by the root's id.
+fn own_reply(uid: u32) -> StoredMessage {
+    message(
+        uid,
+        &["\\Seen"],
+        &[
+            "Message-ID: <g3@x>",
+            "In-Reply-To: <g2@x>",
+            "References: <g1@x> <g2@x>",
+            "From: owner@example.test",
+            "To: Ann <ann@example.test>",
+            "Subject: Re: Plans",
+            "Date: Tue, 06 Oct 2026 16:55:19 +0000",
+        ],
+        "See you there.",
+    )
+}
+
+/// Thread `<g1@x>` whole: Ann's message, her follow-up (`In-Reply-To` the
+/// root) and the person's reply ([`own_reply`]), after an unrelated one.
+fn whole_thread() -> Vec<StoredMessage> {
+    vec![
+        message(
+            1,
+            &["\\Seen"],
+            &[
+                "Message-ID: <u1@x>",
+                "From: Bob <bob@example.test>",
+                "Subject: Unrelated",
+                "Date: Tue, 06 Oct 2026 08:00:00 +0000",
+            ],
+            "Not this thread.",
+        ),
+        message(
+            2,
+            &["\\Seen"],
+            &[
+                "Message-ID: <g1@x>",
+                "From: Ann <ann@example.test>",
+                "To: owner@example.test",
+                "Subject: Plans",
+                "Date: Tue, 06 Oct 2026 09:00:00 +0000",
+            ],
+            "Dinner on Friday?",
+        ),
+        message(
+            3,
+            &["\\Seen"],
+            &[
+                "Message-ID: <g2@x>",
+                "In-Reply-To: <g1@x>",
+                "References: <g1@x>",
+                "From: Ann <ann@example.test>",
+                "To: owner@example.test",
+                "Subject: Re: Plans",
+                "Date: Tue, 06 Oct 2026 10:00:00 +0000",
+            ],
+            "At seven.",
+        ),
+        own_reply(4),
+    ]
+}
+
+/// The `message_id`s a read answered, oldest first.
+fn read_ids(answer: &Value) -> Vec<String> {
+    answer["messages"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .filter_map(|m| m["message_id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_reply_listed_in_sent_is_read_there_when_the_references_search_matches_nothing() {
+    let f = fixture(vec![
+        StandInFolder::new(SENT, "\\Sent").holding(vec![own_reply(1)])
+    ])
+    .await;
+    f.mailbox.references_search_matches_nothing();
+    let mut wrong = Vec::new();
+    match call(&f, "mail.list", json!({"folder": "sent"})).await {
+        Ok(answer) => {
+            let listed = answer["threads"]
+                .as_array()
+                .and_then(|t| t.iter().find(|t| t["thread_id"] == "<g1@x>"));
+            if !listed.is_some_and(|t| t["message_count"] == 1) {
+                wrong.push(format!(
+                    "Sent did not list <g1@x> with one message: {answer}"
+                ));
+            }
+        }
+        Err(e) => wrong.push(format!("mail.list sent failed: {}", sentence(&e))),
+    }
+    match call(
+        &f,
+        "mail.read",
+        json!({"folder": "sent", "thread_id": "<g1@x>"}),
+    )
+    .await
+    {
+        Ok(answer) => {
+            if read_ids(&answer) != vec!["<g3@x>"] {
+                wrong.push(format!(
+                    "reading <g1@x> in Sent answered {:?}, not the reply <g3@x>",
+                    read_ids(&answer)
+                ));
+            }
+        }
+        Err(e) => wrong.push(format!(
+            "the thread Sent listed was refused in Sent: '{}'",
+            sentence(&e)
+        )),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn a_threads_own_reply_is_in_its_read_when_the_references_search_matches_nothing() {
+    let f = fixture(vec![
+        StandInFolder::new(ALL, "\\All").holding(whole_thread())
+    ])
+    .await;
+    f.mailbox.references_search_matches_nothing();
+    let mut wrong = Vec::new();
+    match call(&f, "mail.list", json!({"folder": "all"})).await {
+        Ok(answer) => {
+            let listed = answer["threads"]
+                .as_array()
+                .and_then(|t| t.iter().find(|t| t["thread_id"] == "<g1@x>"));
+            if !listed.is_some_and(|t| t["message_count"] == 3) {
+                wrong.push(format!(
+                    "All Mail did not list <g1@x> with three messages: {answer}"
+                ));
+            }
+        }
+        Err(e) => wrong.push(format!("mail.list all failed: {}", sentence(&e))),
+    }
+    let from = f.mailbox.commands().len();
+    match call(
+        &f,
+        "mail.read",
+        json!({"folder": "all", "thread_id": "<g1@x>"}),
+    )
+    .await
+    {
+        Ok(answer) => {
+            let ids = read_ids(&answer);
+            if ids != vec!["<g1@x>", "<g2@x>", "<g3@x>"] {
+                wrong.push(format!(
+                    "reading <g1@x> in All Mail answered {ids:?}: the thread's own reply <g3@x> is missing"
+                ));
+            }
+        }
+        Err(e) => wrong.push(format!("mail.read all failed: {}", sentence(&e))),
+    }
+    wrong.extend(not_read_only(&sent_since(&f.mailbox, from), ALL));
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 

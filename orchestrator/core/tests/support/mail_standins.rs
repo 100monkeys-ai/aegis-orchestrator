@@ -20,7 +20,7 @@
 //! [`imap_mailbox_standin`] is a second IMAP stand-in holding an in-memory
 //! `INBOX`, for the mail tools (AEGIS ADR-125 D4): `EXAMINE`, `SELECT`,
 //! `UID SEARCH` (ALL, SEEN, UNSEEN, FLAGGED, TEXT, FROM, SINCE, HEADER, OR,
-//! UID, CHARSET), `UID FETCH` (UID, FLAGS, INTERNALDATE, `BODY[]`,
+//! UID, CHARSET, and a sequence set such as `151:200`), `UID FETCH` (UID, FLAGS, INTERNALDATE, `BODY[]`,
 //! `BODY.PEEK[]`, `BODY.PEEK[HEADER.FIELDS (...)]`; a `BODY[]` without
 //! `PEEK` sets `\Seen`, as a server does) and `UID STORE` (`+FLAGS`,
 //! `-FLAGS`; a keyword its `PERMANENTFLAGS` does not keep is dropped, as a
@@ -53,6 +53,7 @@ use aegis_orchestrator_core::infrastructure::mail::{
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -647,9 +648,18 @@ pub struct MailboxStandIn {
     pub standin: StandIn,
     pub messages: Arc<Mutex<Vec<StoredMessage>>>,
     pub folders: Arc<Mutex<Vec<StandInFolder>>>,
+    /// Whether `UID SEARCH HEADER References <id>` matches nothing.
+    pub references_search_blind: Arc<AtomicBool>,
 }
 
 impl MailboxStandIn {
+    /// From now on `UID SEARCH HEADER References <id>` matches no message,
+    /// as Gmail's search answers it, while `HEADER Message-ID` and `HEADER
+    /// In-Reply-To` match as before.
+    pub fn references_search_matches_nothing(&self) {
+        self.references_search_blind.store(true, Ordering::SeqCst);
+    }
+
     /// The messages folder `name` holds now (`INBOX` included).
     pub fn folder_messages(&self, name: &str) -> Vec<StoredMessage> {
         if name.eq_ignore_ascii_case("INBOX") {
@@ -747,8 +757,38 @@ fn uid_set(set: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Where a message stands for `UID SEARCH`: its sequence number in the
+/// selected folder, the folder's last, and whether `HEADER References`
+/// matches nothing ([`MailboxStandIn::references_search_matches_nothing`]).
+struct SearchPlace {
+    seq: u32,
+    last: u32,
+    references_blind: bool,
+}
+
+/// Whether sequence number `seq` is in `set` (`1`, `3:5`, `151:*`, `2,4`),
+/// `*` being `last`; `None` when `set` is not a sequence set.
+fn in_sequence_set(set: &str, seq: u32, last: u32) -> Option<bool> {
+    let number = |n: &str| -> Option<u32> {
+        if n == "*" {
+            Some(last)
+        } else {
+            n.parse().ok()
+        }
+    };
+    let mut found = false;
+    for part in set.split(',') {
+        let (from, to) = match part.split_once(':') {
+            Some((a, b)) => (number(a)?, number(b)?),
+            None => (number(part)?, number(part)?),
+        };
+        found |= (from.min(to)..=from.max(to)).contains(&seq);
+    }
+    Some(found)
+}
+
 /// One search key at `at` (and its arguments), for `m`.
-fn search_key(tokens: &[String], at: &mut usize, m: &StoredMessage) -> bool {
+fn search_key(tokens: &[String], at: &mut usize, m: &StoredMessage, place: &SearchPlace) -> bool {
     let Some(key) = tokens.get(*at).map(|k| k.to_ascii_uppercase()) else {
         return true;
     };
@@ -776,15 +816,18 @@ fn search_key(tokens: &[String], at: &mut usize, m: &StoredMessage) -> bool {
         "HEADER" => {
             let name = arg();
             let needle = arg();
+            if place.references_blind && name.eq_ignore_ascii_case("References") {
+                return false;
+            }
             header_contains(m, &name, &needle)
         }
         "UID" => uid_set(&arg()).contains(&m.uid),
         "OR" => {
-            let a = search_key(tokens, at, m);
-            let b = search_key(tokens, at, m);
+            let a = search_key(tokens, at, m, place);
+            let b = search_key(tokens, at, m, place);
             a || b
         }
-        _ => false,
+        other => in_sequence_set(other, place.seq, place.last).unwrap_or(false),
     }
 }
 
@@ -1020,6 +1063,8 @@ async fn mailbox_standin(
     let folder_store = Arc::new(Mutex::new(folders));
     let (seen, count, mailbox) = (commands.clone(), accepted.clone(), store.clone());
     let others = folder_store.clone();
+    let references_search_blind = Arc::new(AtomicBool::new(false));
+    let blind_shared = references_search_blind.clone();
     let permanent = permanent_flags.to_string();
     let capabilities = capabilities.to_ascii_uppercase();
     let shared = standin.clone();
@@ -1031,6 +1076,7 @@ async fn mailbox_standin(
             let seen = seen.clone();
             let mailbox = mailbox.clone();
             let others = others.clone();
+            let blind = blind_shared.clone();
             let (auth, permanent, standin) = (auth.clone(), permanent.clone(), shared.clone());
             let capabilities = capabilities.clone();
             let caps_line = format!("* CAPABILITY {capabilities}\r\n");
@@ -1219,12 +1265,21 @@ async fn mailbox_standin(
                                     let tokens = imap_args(args);
                                     let messages =
                                         with_folder(&mailbox, &others, &selected, |m| m.clone());
+                                    let mut ordered: Vec<u32> =
+                                        messages.iter().map(|m| m.uid).collect();
+                                    ordered.sort_unstable();
+                                    let references_blind = blind.load(Ordering::SeqCst);
                                     let mut found = Vec::new();
                                     for m in &messages {
+                                        let place = SearchPlace {
+                                            seq: ordered.partition_point(|u| *u < m.uid) as u32 + 1,
+                                            last: ordered.len() as u32,
+                                            references_blind,
+                                        };
                                         let mut at = 0;
                                         let mut all = true;
                                         while at < tokens.len() {
-                                            all &= search_key(&tokens, &mut at, m);
+                                            all &= search_key(&tokens, &mut at, m, &place);
                                         }
                                         if all {
                                             found.push(m.uid.to_string());
@@ -1403,6 +1458,7 @@ async fn mailbox_standin(
         standin,
         messages: store,
         folders: folder_store,
+        references_search_blind,
     }
 }
 

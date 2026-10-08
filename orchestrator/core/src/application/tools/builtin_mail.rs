@@ -1452,10 +1452,23 @@ async fn list(
     }))
 }
 
+/// The header fields that place a message in its thread.
+const THREAD_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]";
+
 /// The UIDs of the messages whose thread is `thread_id` in the open folder
 /// (of `kind`), ascending, and the fetch of each that `items` asked for. A
 /// `uid:` id names a message only in the folder whose `UIDVALIDITY` it
 /// carries; a thread with no message here is refused with the folder named.
+///
+/// The candidates are the union of a `HEADER` search for the id and the
+/// folder's [`LIST_WINDOW`] newest messages, the window `mail.list` groups
+/// (AEGIS ADR-125's Update of 2026-10-08 (5), clause 39): a server whose
+/// `HEADER References` search does not match (Gmail's) still yields every
+/// message `mail.list` counted in the thread, a reply linked to it by
+/// `References` alone among them. The union is one `UID SEARCH`, the
+/// window a sequence set; the candidates' threading headers are fetched,
+/// and only the messages whose [`thread_root`] is the id are fetched with
+/// `items`.
 async fn thread_messages(
     session: &mut ImapSession,
     status: &FolderStatus,
@@ -1476,37 +1489,41 @@ async fn thread_messages(
         }
     } else {
         let id = Arg::string(thread_id.to_string());
+        let mut criteria = Vec::new();
+        if status.exists > 0 {
+            let first = status.exists.saturating_sub(LIST_WINDOW as u32 - 1).max(1);
+            criteria.push(Arg::atom("OR"));
+            criteria.push(Arg::atom(format!("{first}:{}", status.exists)));
+        }
+        criteria.extend([
+            Arg::atom("OR"),
+            Arg::atom("OR"),
+            Arg::atom("HEADER"),
+            Arg::atom("Message-ID"),
+            id.clone(),
+            Arg::atom("HEADER"),
+            Arg::atom("References"),
+            id.clone(),
+            Arg::atom("HEADER"),
+            Arg::atom("In-Reply-To"),
+            id,
+        ]);
+        let found = session.uid_search(&criteria).await.map_err(session_error)?;
         session
-            .uid_search(&[
-                Arg::atom("OR"),
-                Arg::atom("OR"),
-                Arg::atom("HEADER"),
-                Arg::atom("Message-ID"),
-                id.clone(),
-                Arg::atom("HEADER"),
-                Arg::atom("References"),
-                id.clone(),
-                Arg::atom("HEADER"),
-                Arg::atom("In-Reply-To"),
-                id,
-            ])
+            .uid_fetch(&found, &format!("UID {THREAD_FIELDS}"))
             .await
             .map_err(session_error)?
+            .into_iter()
+            .filter(|f| in_thread_of(f, status, thread_id))
+            .map(|f| f.uid)
+            .collect()
     };
-    let fetched = session
+    let in_thread: Vec<Fetched> = session
         .uid_fetch(&candidates, items)
         .await
-        .map_err(session_error)?;
-    let in_thread: Vec<Fetched> = fetched
+        .map_err(session_error)?
         .into_iter()
-        .filter(|f| {
-            let raw = f
-                .header
-                .as_deref()
-                .or(f.full.as_deref())
-                .unwrap_or_default();
-            thread_root(&parse_headers(raw), status, f.uid) == thread_id
-        })
+        .filter(|f| in_thread_of(f, status, thread_id))
         .collect();
     if in_thread.is_empty() {
         let shown: String = thread_id
@@ -1523,6 +1540,16 @@ async fn thread_messages(
         );
     }
     Ok(in_thread)
+}
+
+/// Whether the fetched message `f` belongs to thread `thread_id`.
+fn in_thread_of(f: &Fetched, status: &FolderStatus, thread_id: &str) -> bool {
+    let raw = f
+        .header
+        .as_deref()
+        .or(f.full.as_deref())
+        .unwrap_or_default();
+    thread_root(&parse_headers(raw), status, f.uid) == thread_id
 }
 
 async fn read(
