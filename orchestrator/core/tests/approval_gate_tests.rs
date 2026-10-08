@@ -14,7 +14,7 @@ use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::tool_approval::{
-    ToolApprovalPolicy, ToolApprovalPolicyId, ToolApprovalRepository,
+    ToolApprovalPolicy, ToolApprovalPolicyEffect, ToolApprovalPolicyId, ToolApprovalRepository,
 };
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository;
@@ -90,6 +90,7 @@ async fn the_mail_send_contract_keys_the_request_and_the_policy_on_mailbox_and_l
         user_sub: USER.to_string(),
         tool_name: "mail.send".to_string(),
         binding_id: Some("b-1".to_string()),
+        effect: ToolApprovalPolicyEffect::Allow,
         created_at: chrono::Utc::now(),
         created_by: USER.to_string(),
         revoked_at: None,

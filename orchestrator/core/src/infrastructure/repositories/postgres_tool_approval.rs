@@ -5,8 +5,17 @@
 //! [`PostgresToolApprovalRepository`] stores requests and policies in the
 //! `tool_approval_requests` and `tool_approval_policies` tables of migration
 //! `036_tool_approvals.sql`, with the `conversation_id` column of
-//! `044_tool_approval_conversation.sql`; [`InMemoryToolApprovalRepository`] keeps them in
+//! `044_tool_approval_conversation.sql` and the policies' `effect` of
+//! `046_tool_approval_policy_effect.sql`; [`InMemoryToolApprovalRepository`] keeps them in
 //! process, for tests and for a daemon run without a database.
+//!
+//! ## One standing choice per key (ADR-126, Update of 2026-10-08 (2))
+//!
+//! [`ToolApprovalRepository::insert_policy`] revokes every unrevoked policy of
+//! the same tenant, user, tool and binding and inserts the new one in one
+//! transaction, holding a transaction-scoped advisory lock on that key, so
+//! two writers of one key run one after the other and an allow and a deny
+//! never coexist.
 //!
 //! ## Sealing (ADR-126, Updates of 2026-10-04 clause 2 and 2026-10-08)
 //!
@@ -42,8 +51,8 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
 use crate::domain::tool_approval::{
-    ToolApprovalId, ToolApprovalPolicy, ToolApprovalPolicyId, ToolApprovalRepository,
-    ToolApprovalRequest, ToolApprovalStatus,
+    ToolApprovalId, ToolApprovalPolicy, ToolApprovalPolicyEffect, ToolApprovalPolicyId,
+    ToolApprovalRepository, ToolApprovalRequest, ToolApprovalStatus,
 };
 use crate::infrastructure::secrets_manager::SecretsManager;
 
@@ -52,7 +61,23 @@ const REQUEST_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, 
      decided_at, decided_by, result, error, conversation_id, sealed";
 
 const POLICY_COLUMNS: &str =
-    "id, tenant_id, user_sub, tool_name, binding_id, created_at, created_by, revoked_at";
+    "id, tenant_id, user_sub, tool_name, binding_id, effect, created_at, created_by, revoked_at";
+
+/// The text a policy's advisory lock is keyed on: its tenant, user, tool and
+/// binding (`=<binding>`, or `-` for none), separated by a byte none of them
+/// holds.
+fn policy_lock_key(policy: &ToolApprovalPolicy) -> String {
+    let binding = match &policy.binding_id {
+        Some(binding) => format!("={binding}"),
+        None => "-".to_string(),
+    };
+    format!(
+        "tool_approval_policy\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{binding}",
+        policy.tenant_id.as_str(),
+        policy.user_sub,
+        policy.tool_name,
+    )
+}
 
 /// The Transit key a tenant's approval requests are sealed under.
 pub fn transit_key(tenant_id: &TenantId) -> String {
@@ -218,12 +243,17 @@ fn hydrate_request(row: &PgRow) -> Result<StoredRequest, RepositoryError> {
 }
 
 fn hydrate_policy(row: &PgRow) -> Result<ToolApprovalPolicy, RepositoryError> {
+    let effect_text: String = column(row, "effect")?;
+    let effect = ToolApprovalPolicyEffect::parse(&effect_text).ok_or_else(|| {
+        RepositoryError::Serialization(format!("unknown approval policy effect: {effect_text}"))
+    })?;
     Ok(ToolApprovalPolicy {
         id: ToolApprovalPolicyId(column(row, "id")?),
         tenant_id: tenant(column(row, "tenant_id")?)?,
         user_sub: column(row, "user_sub")?,
         tool_name: column(row, "tool_name")?,
         binding_id: column(row, "binding_id")?,
+        effect,
         created_at: column(row, "created_at")?,
         created_by: column(row, "created_by")?,
         revoked_at: column(row, "revoked_at")?,
@@ -406,20 +436,39 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
     }
 
     async fn insert_policy(&self, policy: &ToolApprovalPolicy) -> Result<(), RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(policy_lock_key(policy))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE tool_approval_policies SET revoked_at = $5 \
+             WHERE tenant_id = $1 AND user_sub = $2 AND tool_name = $3 \
+             AND binding_id IS NOT DISTINCT FROM $4 AND revoked_at IS NULL",
+        )
+        .bind(policy.tenant_id.as_str())
+        .bind(&policy.user_sub)
+        .bind(&policy.tool_name)
+        .bind(&policy.binding_id)
+        .bind(policy.created_at)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(&format!(
             "INSERT INTO tool_approval_policies ({POLICY_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         ))
         .bind(policy.id.0)
         .bind(policy.tenant_id.as_str())
         .bind(&policy.user_sub)
         .bind(&policy.tool_name)
         .bind(&policy.binding_id)
+        .bind(policy.effect.as_str())
         .bind(policy.created_at)
         .bind(&policy.created_by)
         .bind(policy.revoked_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -605,10 +654,18 @@ impl ToolApprovalRepository for InMemoryToolApprovalRepository {
     }
 
     async fn insert_policy(&self, policy: &ToolApprovalPolicy) -> Result<(), RepositoryError> {
-        self.policies
-            .write()
-            .await
-            .insert(policy.id, policy.clone());
+        let mut policies = self.policies.write().await;
+        for other in policies.values_mut() {
+            if other.tenant_id == policy.tenant_id
+                && other.user_sub == policy.user_sub
+                && other.tool_name == policy.tool_name
+                && other.binding_id == policy.binding_id
+                && other.revoked_at.is_none()
+            {
+                other.revoked_at = Some(policy.created_at);
+            }
+        }
+        policies.insert(policy.id, policy.clone());
         Ok(())
     }
 

@@ -27,6 +27,12 @@
 //! [`TransitStandIn`], local to this file: its ciphertext is opaque
 //! (`vault:v1:` and random characters, no plaintext encoded in it) and it opens
 //! a ciphertext only under the key that sealed it.
+//!
+//! The deny policies (ADR-126, Update of 2026-10-08 (2)): migration 046 run
+//! again changes nothing and a policy stored before it reads `allow`; a call
+//! matching a deny policy is stored `auto_denied`, which the status CHECK
+//! admits; an allow and a deny policy are never both unrevoked for one key,
+//! under concurrent writes too, and another binding's policy is untouched.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -44,8 +50,9 @@ use aegis_orchestrator_core::domain::secrets::{
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::tool_approval::{
-    ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository,
-    ToolApprovalRequest, ToolApprovalStatus,
+    ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalPolicy,
+    ToolApprovalPolicyEffect, ToolApprovalPolicyId, ToolApprovalRepository, ToolApprovalRequest,
+    ToolApprovalStatus,
 };
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::{
@@ -1018,5 +1025,231 @@ async fn a_refused_seal_stores_nothing() {
         outcome.is_err() && rows == 0,
         "a refused seal stored {rows} rows and the gate answered {outcome:?}"
     );
+    db.remove().await;
+}
+
+// ─── Deny policies (ADR-126, Update of 2026-10-08 (2)) ────────────────────
+
+fn policy_on(binding: &str, effect: ToolApprovalPolicyEffect) -> ToolApprovalPolicy {
+    ToolApprovalPolicy {
+        id: ToolApprovalPolicyId::new(),
+        tenant_id: tenant(),
+        user_sub: USER.to_string(),
+        tool_name: "outbound.send".to_string(),
+        binding_id: Some(binding.to_string()),
+        effect,
+        created_at: chrono::Utc::now(),
+        created_by: USER.to_string(),
+        revoked_at: None,
+    }
+}
+
+/// Clause 1: migration 046 over a database holding a policy stored before
+/// it leaves that policy reading `allow`, admits `auto_denied` in the status
+/// CHECK, and run again changes nothing.
+#[tokio::test]
+async fn migration_046_run_again_changes_nothing_and_a_policy_stored_before_it_reads_allow() {
+    let Some(db) = TestDb::create_before(46).await else {
+        return;
+    };
+    let before_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tool_approval_policies \
+         (id, tenant_id, user_sub, tool_name, binding_id, created_at, created_by) \
+         VALUES ($1, $2, $3, 'outbound.send', 'b-1', now(), $3)",
+    )
+    .bind(before_id)
+    .bind(tenant().as_str())
+    .bind(USER)
+    .execute(&db.pool)
+    .await
+    .expect("store a policy before migration 046");
+    let snapshot = || async {
+        sqlx::query(
+            "SELECT (SELECT count(*) FROM tool_approval_policies) AS policies, \
+                    (SELECT count(*) FROM information_schema.columns \
+                      WHERE table_name = 'tool_approval_policies' AND column_name = 'effect') \
+                      AS effect_columns, \
+                    (SELECT string_agg(pg_get_constraintdef(oid), ' | ' ORDER BY conname) \
+                       FROM pg_constraint \
+                      WHERE conrelid IN ('tool_approval_requests'::regclass, \
+                                         'tool_approval_policies'::regclass) \
+                        AND contype = 'c') AS checks",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map(|row| {
+            (
+                row.get::<i64, _>("policies"),
+                row.get::<i64, _>("effect_columns"),
+                row.get::<Option<String>, _>("checks").unwrap_or_default(),
+            )
+        })
+        .unwrap()
+    };
+    let mut wrong = Vec::new();
+    let Some(migration) = MIGRATOR.iter().find(|m| m.version == 46) else {
+        panic!("{:#?}", vec!["migration 046 does not ship"]);
+    };
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 046 over a policy stored before it");
+    let after_first = snapshot().await;
+    if after_first.1 != 1 {
+        wrong.push("tool_approval_policies has no effect column after migration 046".to_string());
+    }
+    if !after_first.2.contains("'auto_denied'") {
+        wrong.push(format!(
+            "the status CHECK does not admit auto_denied after migration 046: {}",
+            after_first.2
+        ));
+    }
+    match repo(&db.pool).list_active_policies(&tenant(), USER).await {
+        Ok(policies) => {
+            if policies.len() != 1 || policies[0].effect != ToolApprovalPolicyEffect::Allow {
+                wrong.push(format!(
+                    "the policy stored before migration 046 does not read allow: {policies:?}"
+                ));
+            }
+        }
+        Err(e) => wrong.push(format!(
+            "the policies cannot be read after migration 046: {e}"
+        )),
+    }
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 046 run again");
+    if snapshot().await != after_first {
+        wrong.push("migration 046 run again changed the schema or the rows".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    db.remove().await;
+}
+
+/// Clause 3 against the real schema: a call matching a deny policy is
+/// stored `auto_denied` with the policy's id, and the status CHECK admits it.
+#[tokio::test]
+async fn a_call_matching_a_deny_policy_is_stored_auto_denied() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let svc = service(&db.pool);
+    let runner = RecordingRunner::default();
+    let args = json!({"account": "b-1", "to": "x@example.com"});
+    let id = pending_id(gate(&svc, USER, "outbound.send", &args).await);
+    svc.decide(
+        id,
+        &tenant(),
+        USER,
+        ToolApprovalDecision::AlwaysDeny,
+        &runner,
+    )
+    .await
+    .expect("always_deny");
+    let mut wrong = Vec::new();
+    match svc
+        .gate(GatedCall {
+            tenant_id: &tenant(),
+            user_sub: Some(USER),
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tool_name: "outbound.send",
+            arguments: &args,
+            security_context_name: "zaru-pro",
+            conversation_id: None,
+            contract: contract(),
+        })
+        .await
+    {
+        Ok(GateOutcome::Denied { result }) if result["status"] == "auto_denied" => {}
+        other => wrong.push(format!(
+            "a call matching the deny policy answered {other:?}, not auto_denied"
+        )),
+    }
+    let policy = svc.list_policies(&tenant(), USER).await.unwrap();
+    let rows = svc
+        .list_for_user(&tenant(), USER, Some(ToolApprovalStatus::AutoDenied))
+        .await
+        .unwrap();
+    if rows.len() != 1 || rows[0].policy_id != policy.first().map(|p| p.id) {
+        wrong.push(format!(
+            "no single stored auto_denied row with the deny policy's id: {rows:?}"
+        ));
+    }
+    if !runner.ran.lock().unwrap().is_empty() {
+        wrong.push("a denied call ran".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    db.remove().await;
+}
+
+/// Clause 4: an allow and a deny policy are never both unrevoked for one
+/// key: a later write replaces the earlier one, sixteen concurrent writes of
+/// one key leave exactly one, and another binding's policy is untouched.
+#[tokio::test]
+async fn an_allow_and_a_deny_policy_never_coexist_for_one_key() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let store = Arc::new(repo(&db.pool));
+    let mut wrong = Vec::new();
+    store
+        .insert_policy(&policy_on("b-2", ToolApprovalPolicyEffect::Allow))
+        .await
+        .unwrap();
+    store
+        .insert_policy(&policy_on("b-1", ToolApprovalPolicyEffect::Allow))
+        .await
+        .unwrap();
+    store
+        .insert_policy(&policy_on("b-1", ToolApprovalPolicyEffect::Deny))
+        .await
+        .unwrap();
+
+    let writers: Vec<_> = (0..16)
+        .map(|i| {
+            let store = store.clone();
+            let effect = if i % 2 == 0 {
+                ToolApprovalPolicyEffect::Allow
+            } else {
+                ToolApprovalPolicyEffect::Deny
+            };
+            tokio::spawn(async move { store.insert_policy(&policy_on("b-3", effect)).await })
+        })
+        .collect();
+    for writer in writers {
+        writer.await.unwrap().expect("a concurrent policy write");
+    }
+
+    let active = store.list_active_policies(&tenant(), USER).await.unwrap();
+    let on = |binding: &str| -> Vec<ToolApprovalPolicyEffect> {
+        active
+            .iter()
+            .filter(|p| p.binding_id.as_deref() == Some(binding))
+            .map(|p| p.effect)
+            .collect()
+    };
+    if on("b-1") != vec![ToolApprovalPolicyEffect::Deny] {
+        wrong.push(format!(
+            "b-1 holds {:?}, not the one deny that replaced the allow",
+            on("b-1")
+        ));
+    }
+    if on("b-2") != vec![ToolApprovalPolicyEffect::Allow] {
+        wrong.push(format!(
+            "another binding's policy was touched: b-2 holds {:?}",
+            on("b-2")
+        ));
+    }
+    if on("b-3").len() != 1 {
+        wrong.push(format!(
+            "sixteen concurrent writes of one key left {} unrevoked policies: {:?}",
+            on("b-3").len(),
+            on("b-3")
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
     db.remove().await;
 }

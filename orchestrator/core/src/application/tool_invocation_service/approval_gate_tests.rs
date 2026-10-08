@@ -16,8 +16,8 @@ use crate::domain::execution::{Execution, ExecutionId, ExecutionInput, Iteration
 use crate::domain::repository::AgentVersion;
 use crate::domain::security_context::SecurityContext;
 use crate::domain::tool_approval::{
-    ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository,
-    ToolApprovalRequest, ToolApprovalStatus,
+    ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalPolicyEffect,
+    ToolApprovalRepository, ToolApprovalRequest, ToolApprovalStatus,
 };
 use crate::infrastructure::event_bus::DomainEvent;
 use crate::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository;
@@ -615,6 +615,142 @@ async fn deny_records_denied_and_runs_nothing() {
     let row = h.repo.find_request(id).await.unwrap().unwrap();
     assert_eq!(row.status, ToolApprovalStatus::Denied);
     assert!(row.result.is_none());
+}
+
+/// "always deny" (ADR-126, Update of 2026-10-08 (2), clause 2): the request
+/// reads `denied`, nothing runs, and a deny policy is written for the
+/// request's tool and binding.
+#[tokio::test]
+async fn always_deny_records_denied_writes_a_deny_policy_and_runs_nothing() {
+    let h = harness().await;
+    let id = pending_id(h.call(h.args("b-1")).await);
+    let decided = h
+        .decide(id, ToolApprovalDecision::AlwaysDeny)
+        .await
+        .unwrap();
+    let mut wrong = Vec::new();
+    if decided.status != ToolApprovalStatus::Denied {
+        wrong.push(format!("the request reads {}, not denied", decided.status));
+    }
+    if !h.started().is_empty() {
+        wrong.push(format!("always_deny ran the call: {:?}", h.started()));
+    }
+    let policies = h.approvals.list_policies(&h.tenant, USER).await.unwrap();
+    let deny = policies.iter().any(|p| {
+        p.effect == ToolApprovalPolicyEffect::Deny
+            && p.tool_name == GATED_TOOL
+            && p.binding_id.as_deref() == Some("b-1")
+    });
+    if policies.len() != 1 || !deny {
+        wrong.push(format!(
+            "always_deny did not leave one deny policy on the tool and b-1: {policies:?}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A gated call matching a deny policy (clause 3): answered `auto_denied` at
+/// once with an `auto_denied` row carrying the policy's id; nothing runs;
+/// no `ApprovalRequested`; `aegis.approval.status` answers `auto_denied`;
+/// another binding still waits for its user.
+#[tokio::test]
+async fn a_call_matching_a_deny_policy_answers_auto_denied_and_nothing_runs() {
+    let h = harness().await;
+    let id = pending_id(h.call(h.args("b-1")).await);
+    h.decide(id, ToolApprovalDecision::AlwaysDeny)
+        .await
+        .unwrap();
+    let policy = h.approvals.list_policies(&h.tenant, USER).await.unwrap()[0].clone();
+    let mut events = h.event_bus.subscribe();
+
+    let value = direct(h.call(h.args("b-1")).await);
+
+    let mut wrong = Vec::new();
+    if value["status"] != "auto_denied" {
+        wrong.push(format!("the call answered {value}, not auto_denied"));
+    }
+    if !h.started().is_empty() {
+        wrong.push(format!(
+            "a call matching a deny policy ran: {:?}",
+            h.started()
+        ));
+    }
+    let auto: Vec<_> = h
+        .rows()
+        .await
+        .into_iter()
+        .filter(|r| r.status == ToolApprovalStatus::AutoDenied)
+        .collect();
+    if auto.len() != 1 || auto[0].policy_id != Some(policy.id) || auto[0].decided_at.is_none() {
+        wrong.push(format!(
+            "no single auto_denied row with the policy's id and a decision time: {auto:?}"
+        ));
+    }
+    if value["approval_id"].as_str() != auto.first().map(|r| r.id.to_string()).as_deref() {
+        wrong.push(format!(
+            "the answer's approval_id is not the row's: {value}"
+        ));
+    }
+    while let Ok(event) = events.try_recv() {
+        if let DomainEvent::MCP(MCPToolEvent::ApprovalRequested { .. }) = event {
+            wrong.push("an auto_denied call published ApprovalRequested".to_string());
+        }
+    }
+    if let Some(row) = auto.first() {
+        let status = direct(
+            h.call_as(
+                h.execution,
+                "aegis.approval.status",
+                json!({ "approval_id": row.id.to_string() }),
+            )
+            .await,
+        );
+        if status["status"] != "auto_denied" {
+            wrong.push(format!("aegis.approval.status answered {status}"));
+        }
+    }
+    let other = direct(h.call(h.args("b-2")).await);
+    if other["status"] != "approval_pending" {
+        wrong.push(format!(
+            "the deny policy on b-1 refused a call on b-2: {other}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// One standing choice per key (clause 4): with two requests pending, an
+/// "always" after an "always_deny" replaces the deny policy, and the next
+/// call proceeds as `auto_allowed`.
+#[tokio::test]
+async fn an_always_after_an_always_deny_replaces_it_and_the_next_call_is_auto_allowed() {
+    let h = harness().await;
+    let first = pending_id(h.call(h.args("b-1")).await);
+    let second = pending_id(h.call(h.args("b-1")).await);
+    h.decide(first, ToolApprovalDecision::AlwaysDeny)
+        .await
+        .unwrap();
+    h.decide(second, ToolApprovalDecision::Always)
+        .await
+        .unwrap();
+
+    let mut wrong = Vec::new();
+    let policies = h.approvals.list_policies(&h.tenant, USER).await.unwrap();
+    let effects: Vec<_> = policies.iter().map(|p| p.effect).collect();
+    if effects != vec![ToolApprovalPolicyEffect::Allow] {
+        wrong.push(format!(
+            "the key holds {effects:?}, not the one allow that replaced the deny"
+        ));
+    }
+    let value = direct(h.call(h.args("b-1")).await);
+    let auto_allowed = h
+        .rows()
+        .await
+        .iter()
+        .any(|r| r.status == ToolApprovalStatus::AutoAllowed);
+    if value["status"] == "auto_denied" || !auto_allowed {
+        wrong.push(format!("the next call was not auto_allowed: {value}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[tokio::test]

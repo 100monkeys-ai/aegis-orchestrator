@@ -5,8 +5,10 @@
 //! An outbound tool call waits for its user's answer: approve once, always
 //! allow, or deny. The gate in the tool dispatch path writes a
 //! [`ToolApprovalRequest`] for every call of a gated tool, and a
-//! [`ToolApprovalPolicy`] holds a user's "always allow" for one tool on one
-//! binding (the argument the tool's [`ApprovalContract`] names, or none).
+//! [`ToolApprovalPolicy`] holds a user's standing choice for one tool on one
+//! binding (the argument the tool's [`ApprovalContract`] names, or none):
+//! "always allow" or "always deny" ([`ToolApprovalPolicyEffect`]), at most
+//! one unrevoked choice per key.
 //!
 //! Both are stored durably by a [`ToolApprovalRepository`]: a pending request
 //! outlives the agent that made the call and the process that stored it.
@@ -56,7 +58,7 @@ impl std::fmt::Display for ToolApprovalId {
     }
 }
 
-/// Identifier of one "always allow" policy.
+/// Identifier of one standing choice ("always allow" or "always deny").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ToolApprovalPolicyId(pub Uuid);
 
@@ -98,6 +100,8 @@ pub enum ToolApprovalStatus {
     Expired,
     /// Matched an "always allow" policy; the call proceeded at once.
     AutoAllowed,
+    /// Matched an "always deny" policy; refused at once, nothing ran.
+    AutoDenied,
 }
 
 impl ToolApprovalStatus {
@@ -109,6 +113,7 @@ impl ToolApprovalStatus {
             Self::Denied => "denied",
             Self::Expired => "expired",
             Self::AutoAllowed => "auto_allowed",
+            Self::AutoDenied => "auto_denied",
         }
     }
 
@@ -120,6 +125,7 @@ impl ToolApprovalStatus {
             "denied" => Some(Self::Denied),
             "expired" => Some(Self::Expired),
             "auto_allowed" => Some(Self::AutoAllowed),
+            "auto_denied" => Some(Self::AutoDenied),
             _ => None,
         }
     }
@@ -135,9 +141,14 @@ impl std::fmt::Display for ToolApprovalStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolApprovalDecision {
+    /// Run this one call.
     Once,
+    /// Run this call, and allow every later call on the same key.
     Always,
+    /// Refuse this one call.
     Deny,
+    /// Refuse this call, and every later call on the same key.
+    AlwaysDeny,
 }
 
 impl ToolApprovalDecision {
@@ -146,7 +157,48 @@ impl ToolApprovalDecision {
         match self {
             Self::Once => ToolApprovalStatus::ApprovedOnce,
             Self::Always => ToolApprovalStatus::ApprovedAlways,
-            Self::Deny => ToolApprovalStatus::Denied,
+            Self::Deny | Self::AlwaysDeny => ToolApprovalStatus::Denied,
+        }
+    }
+
+    /// The standing choice this answer writes, if any.
+    pub fn policy_effect(&self) -> Option<ToolApprovalPolicyEffect> {
+        match self {
+            Self::Always => Some(ToolApprovalPolicyEffect::Allow),
+            Self::AlwaysDeny => Some(ToolApprovalPolicyEffect::Deny),
+            Self::Once | Self::Deny => None,
+        }
+    }
+
+    /// Whether this answer runs the stored call.
+    pub fn runs_the_call(&self) -> bool {
+        matches!(self, Self::Once | Self::Always)
+    }
+}
+
+/// What a standing choice does to a matching call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalPolicyEffect {
+    /// The call proceeds at once (`auto_allowed`).
+    Allow,
+    /// The call is refused at once (`auto_denied`).
+    Deny,
+}
+
+impl ToolApprovalPolicyEffect {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            _ => None,
         }
     }
 }
@@ -195,8 +247,8 @@ impl ToolApprovalRequest {
     }
 }
 
-/// A user's "always allow" for one tool on one binding
-/// (`tool_approval_policies`).
+/// A user's standing choice for one tool on one binding
+/// (`tool_approval_policies`): "always allow" or "always deny".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolApprovalPolicy {
     pub id: ToolApprovalPolicyId,
@@ -204,6 +256,7 @@ pub struct ToolApprovalPolicy {
     pub user_sub: String,
     pub tool_name: String,
     pub binding_id: Option<String>,
+    pub effect: ToolApprovalPolicyEffect,
     pub created_at: DateTime<Utc>,
     pub created_by: String,
     pub revoked_at: Option<DateTime<Utc>>,
@@ -345,6 +398,10 @@ pub trait ToolApprovalRepository: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Vec<ToolApprovalRequest>, RepositoryError>;
 
+    /// Store a standing choice, revoking (at its `created_at`) every
+    /// unrevoked policy of the same user, tool and binding in the same
+    /// atomic step, so a user holds at most one unrevoked choice per key and
+    /// an allow and a deny never coexist.
     async fn insert_policy(&self, policy: &ToolApprovalPolicy) -> Result<(), RepositoryError>;
 
     /// The user's unrevoked policy for this tool on this binding.
@@ -388,10 +445,44 @@ mod tests {
             ToolApprovalStatus::Denied,
             ToolApprovalStatus::Expired,
             ToolApprovalStatus::AutoAllowed,
+            ToolApprovalStatus::AutoDenied,
         ] {
             assert_eq!(ToolApprovalStatus::parse(status.as_str()), Some(status));
         }
+        assert_eq!(
+            ToolApprovalStatus::parse("auto_denied"),
+            Some(ToolApprovalStatus::AutoDenied),
+            "auto_denied does not round-trip"
+        );
         assert_eq!(ToolApprovalStatus::parse("approved"), None);
+    }
+
+    /// The decision body's four answers, `always_deny` among them (ADR-126,
+    /// Update of 2026-10-08 (2), clause 2), and the policy each writes.
+    #[test]
+    fn always_deny_deserialises_and_writes_a_deny_policy() {
+        let decision: ToolApprovalDecision =
+            serde_json::from_value(json!("always_deny")).expect("always_deny deserialises");
+        assert_eq!(decision, ToolApprovalDecision::AlwaysDeny);
+        assert_eq!(decision.status(), ToolApprovalStatus::Denied);
+        assert_eq!(
+            decision.policy_effect(),
+            Some(ToolApprovalPolicyEffect::Deny)
+        );
+        assert!(!decision.runs_the_call(), "always_deny runs the call");
+        assert_eq!(
+            ToolApprovalDecision::Always.policy_effect(),
+            Some(ToolApprovalPolicyEffect::Allow)
+        );
+        for effect in [
+            ToolApprovalPolicyEffect::Allow,
+            ToolApprovalPolicyEffect::Deny,
+        ] {
+            assert_eq!(
+                ToolApprovalPolicyEffect::parse(effect.as_str()),
+                Some(effect)
+            );
+        }
     }
 
     /// Test (a)'s domain half: the binding is the argument the contract

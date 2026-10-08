@@ -8,13 +8,15 @@
 //!   gated call, after the security context allowed it and before the
 //!   inner-loop judge (D2). It refuses a call with no initiating user, lets a
 //!   call matching the user's "always allow" proceed (an `auto_allowed` row),
-//!   and otherwise stores a `pending` row and tells the caller to return
-//!   `approval_pending`.
+//!   refuses at once a call matching the user's "always deny" (an
+//!   `auto_denied` row; nothing runs), and otherwise stores a `pending` row
+//!   and tells the caller to return `approval_pending`.
 //! - [`ToolApprovalService::decide`] takes the user's answer (D4). "once" and
 //!   "always" run the stored call through an [`ApprovedCallRunner`] (the
 //!   dispatch stages after the gate, as the request's user, with the stored
-//!   arguments) and record its result; "always" also writes a policy;
-//!   "deny" runs nothing.
+//!   arguments) and record its result; "always" also writes an allow policy;
+//!   "deny" runs nothing; "always_deny" runs nothing and writes a deny
+//!   policy. A policy written replaces any standing choice on the same key.
 //! - [`ToolApprovalService::expire_stale`] expires requests pending for
 //!   72 hours; the daemon runs it every ten minutes
 //!   ([`ToolApprovalService::spawn_expiry_sweep`]).
@@ -33,8 +35,8 @@ use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
 use crate::domain::tool_approval::{
     ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalPolicy,
-    ToolApprovalPolicyId, ToolApprovalRepository, ToolApprovalRequest, ToolApprovalStatus,
-    PENDING_APPROVAL_TTL_HOURS,
+    ToolApprovalPolicyEffect, ToolApprovalPolicyId, ToolApprovalRepository, ToolApprovalRequest,
+    ToolApprovalStatus, PENDING_APPROVAL_TTL_HOURS,
 };
 use crate::infrastructure::event_bus::EventBus;
 
@@ -93,6 +95,9 @@ pub enum GateOutcome {
     Proceed { approval_id: ToolApprovalId },
     /// Stored as pending: return `result` (`approval_pending`) at once.
     Pending { result: Value },
+    /// An "always deny" policy matched: return `result` (`auto_denied`) at
+    /// once; the call never runs.
+    Denied { result: Value },
 }
 
 /// Runs a stored call through the dispatch stages after the gate, with the
@@ -150,6 +155,28 @@ impl ToolApprovalService {
             result: None,
             error: None,
         };
+        if let Some(policy) = policy
+            .as_ref()
+            .filter(|p| p.effect == ToolApprovalPolicyEffect::Deny)
+        {
+            request.status = ToolApprovalStatus::AutoDenied;
+            request.policy_id = Some(policy.id);
+            request.decided_at = Some(now);
+            self.repo.insert_request(&request).await?;
+            tracing::info!(
+                approval_id = %request.id,
+                policy_id = %policy.id,
+                tool_name = %request.tool_name,
+                "Gated tool call refused by the user's always-deny policy"
+            );
+            return Ok(GateOutcome::Denied {
+                result: serde_json::json!({
+                    "status": ToolApprovalStatus::AutoDenied.as_str(),
+                    "approval_id": request.id.to_string(),
+                    "summary": request.summary,
+                }),
+            });
+        }
         if let Some(policy) = policy {
             request.status = ToolApprovalStatus::AutoAllowed;
             request.policy_id = Some(policy.id);
@@ -281,13 +308,14 @@ impl ToolApprovalService {
         };
         self.publish_decided(&decided);
 
-        if decision == ToolApprovalDecision::Always {
+        if let Some(effect) = decision.policy_effect() {
             let policy = ToolApprovalPolicy {
                 id: ToolApprovalPolicyId::new(),
                 tenant_id: decided.tenant_id.clone(),
                 user_sub: decided.user_sub.clone(),
                 tool_name: decided.tool_name.clone(),
                 binding_id: decided.binding_id.clone(),
+                effect,
                 created_at: now,
                 created_by: user_sub.to_string(),
                 revoked_at: None,
@@ -295,7 +323,7 @@ impl ToolApprovalService {
             self.repo.insert_policy(&policy).await?;
         }
 
-        if decision != ToolApprovalDecision::Deny {
+        if decision.runs_the_call() {
             let outcome = runner.run_approved_call(&decided).await;
             self.record_outcome(decided.id, &outcome).await?;
             match outcome {

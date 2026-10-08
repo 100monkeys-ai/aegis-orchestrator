@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Tool approval routes (AEGIS ADR-126 D4)
 //!
-//! How a user answers a gated tool call, and manages "always allow":
+//! How a user answers a gated tool call, and manages their standing
+//! choices ("always allow" and "always deny"):
 //!
 //! | Route | Caller | Scope |
 //! |-------|--------|-------|
@@ -20,7 +21,10 @@
 //!
 //! On "once" and "always" the orchestrator runs the stored call through
 //! the tool invocation service (the dispatch stages after the gate, as the
-//! request's user) and the response carries its result.
+//! request's user) and the response carries its result. "always" writes an
+//! allow policy and "always_deny" a deny policy for the request's tool and
+//! binding, replacing any standing choice on that key; "deny" and
+//! "always_deny" run nothing.
 
 use std::sync::Arc;
 
@@ -171,6 +175,7 @@ fn policy_view(policy: &ToolApprovalPolicy) -> Value {
         "id": policy.id.to_string(),
         "tool_name": policy.tool_name,
         "binding_id": policy.binding_id,
+        "effect": policy.effect.as_str(),
         "created_at": policy.created_at,
         "created_by": policy.created_by,
     })
@@ -216,7 +221,7 @@ pub(crate) struct DecisionBody {
 }
 
 /// `POST /v1/tool-approvals/{id}/decision` with `{"decision": "once" |
-/// "always" | "deny"}`: the request's own user answers.
+/// "always" | "deny" | "always_deny"}`: the request's own user answers.
 pub(crate) async fn decide_tool_approval_handler(
     State(state): State<ToolApprovalsState>,
     scope_guard: ScopeGuard,
@@ -237,7 +242,8 @@ pub(crate) async fn decide_tool_approval_handler(
     Ok(Json(json!({ "request": request_view(&decided) })))
 }
 
-/// `GET /v1/tool-approval-policies`: the caller's "always allow" policies.
+/// `GET /v1/tool-approval-policies`: the caller's standing choices, each
+/// with its `effect` (`allow` or `deny`).
 pub(crate) async fn list_tool_approval_policies_handler(
     State(state): State<ToolApprovalsState>,
     scope_guard: ScopeGuard,
@@ -256,8 +262,8 @@ pub(crate) async fn list_tool_approval_policies_handler(
     })))
 }
 
-/// `DELETE /v1/tool-approval-policies/{id}`: revoke an "always allow"; the
-/// next matching call waits for its user again.
+/// `DELETE /v1/tool-approval-policies/{id}`: revoke a standing choice,
+/// allow or deny; the next matching call waits for its user again.
 pub(crate) async fn revoke_tool_approval_policy_handler(
     State(state): State<ToolApprovalsState>,
     scope_guard: ScopeGuard,
@@ -546,6 +552,66 @@ mod tests {
         assert!(f.runner.ran.lock().unwrap().is_empty());
     }
 
+    /// "always_deny" through the route (ADR-126, Update of 2026-10-08 (2),
+    /// clauses 2 and 5): the request reads `denied` and nothing runs; the
+    /// list answers the policy with `effect: "deny"`; a revoke removes it and
+    /// the next call waits for its user again.
+    #[tokio::test]
+    async fn always_deny_writes_a_deny_policy_the_user_lists_with_its_effect_and_revokes() {
+        let f = fixture(&[("owner", owner(), SCOPES)]).await;
+        let id = pending(&f.service, json!({"mailbox": "b-1"})).await;
+        let mut wrong = Vec::new();
+
+        let (status, body) = decide(&f, "owner", id, "always_deny").await;
+        if status != 200 || body["request"]["status"] != "denied" {
+            wrong.push(format!("always_deny answered {status} {body}"));
+        }
+        if !f.runner.ran.lock().unwrap().is_empty() {
+            wrong.push("always_deny ran the call".to_string());
+        }
+
+        let (_, body) = send(
+            &f.base,
+            &Method::GET,
+            "/v1/tool-approval-policies",
+            &None,
+            Some("owner"),
+        )
+        .await;
+        if body["count"] != 1 || body["policies"][0]["effect"] != "deny" {
+            wrong.push(format!("the list does not answer one deny policy: {body}"));
+        }
+        if let Some(policy_id) = body["policies"][0]["id"].as_str() {
+            let (status, _) = send(
+                &f.base,
+                &Method::DELETE,
+                &format!("/v1/tool-approval-policies/{policy_id}"),
+                &None,
+                Some("owner"),
+            )
+            .await;
+            if status != 204 {
+                wrong.push(format!("the revoke of the deny policy answered {status}"));
+            }
+        }
+        let (_, body) = send(
+            &f.base,
+            &Method::GET,
+            "/v1/tool-approval-policies",
+            &None,
+            Some("owner"),
+        )
+        .await;
+        if body["count"] != 0 {
+            wrong.push(format!(
+                "the deny policy is still listed after its revoke: {body}"
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // The next call waits for its user again (`pending` panics otherwise).
+        pending(&f.service, json!({"mailbox": "b-1"})).await;
+    }
+
     #[tokio::test]
     async fn always_writes_a_policy_the_user_lists_and_revokes() {
         let f = fixture(&[
@@ -570,6 +636,7 @@ mod tests {
         assert_eq!(body["count"], 1, "{body}");
         assert_eq!(body["policies"][0]["tool_name"], "mail.send");
         assert_eq!(body["policies"][0]["binding_id"], "b-1");
+        assert_eq!(body["policies"][0]["effect"], "allow", "{body}");
         let policy_id = body["policies"][0]["id"].as_str().unwrap().to_string();
 
         let (status, _) = send(

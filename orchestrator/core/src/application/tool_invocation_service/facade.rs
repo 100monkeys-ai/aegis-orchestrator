@@ -996,7 +996,7 @@ impl ToolInvocationService {
                     .await;
                 match gated {
                     Ok(GateOutcome::Proceed { approval_id }) => auto_allowed = Some(approval_id),
-                    Ok(GateOutcome::Pending { result }) => {
+                    Ok(GateOutcome::Pending { result } | GateOutcome::Denied { result }) => {
                         self.publish_invocation_completed(
                             invocation_id,
                             execution_id,
