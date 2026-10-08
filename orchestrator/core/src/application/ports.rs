@@ -41,6 +41,52 @@ pub trait WorkflowEnginePort: Send + Sync {
     async fn start_workflow(&self, params: StartWorkflowParams<'_>) -> anyhow::Result<String>;
 }
 
+/// What the orchestrator asks Temporal to hold for one schedule (AEGIS
+/// ADR-139 N5): the Temporal Schedule `aegis-schedule-<schedule id>`, its
+/// timing, whether it is paused, and the only input its fire carries,
+/// `{schedule_id, tenant_id}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalScheduleSpec {
+    /// The Temporal Schedule's id.
+    pub temporal_schedule_id: String,
+    /// The AEGIS schedule's id, the fire's `schedule_id`.
+    pub schedule_id: String,
+    /// The schedule's tenant, the fire's `tenant_id`.
+    pub tenant_id: String,
+    pub timing: crate::domain::schedule::Timing,
+    pub paused: bool,
+}
+
+/// What Temporal answers about a Temporal Schedule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalScheduleDescription {
+    pub paused: bool,
+    /// The next times it will act, soonest first.
+    pub next_action_times: Vec<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Temporal's schedule service, as the schedule service uses it.
+#[async_trait]
+pub trait ScheduleEnginePort: Send + Sync {
+    /// `CreateSchedule`.
+    async fn create_schedule(&self, spec: &TemporalScheduleSpec) -> anyhow::Result<()>;
+    /// `UpdateSchedule`: the whole schedule replaced by `spec`.
+    async fn update_schedule(&self, spec: &TemporalScheduleSpec) -> anyhow::Result<()>;
+    /// `PatchSchedule`: pause or unpause.
+    async fn set_schedule_paused(
+        &self,
+        temporal_schedule_id: &str,
+        paused: bool,
+    ) -> anyhow::Result<()>;
+    /// `DeleteSchedule`; a schedule Temporal does not hold is not an error.
+    async fn delete_schedule(&self, temporal_schedule_id: &str) -> anyhow::Result<()>;
+    /// `DescribeSchedule`; `None` when Temporal holds no such schedule.
+    async fn describe_schedule(
+        &self,
+        temporal_schedule_id: &str,
+    ) -> anyhow::Result<Option<TemporalScheduleDescription>>;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrajectoryStepCommand {
     pub tool_name: String,

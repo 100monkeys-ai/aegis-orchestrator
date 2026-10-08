@@ -58,7 +58,10 @@
 //! - **Namespace**: Logical isolation boundary for workflows
 //! - **Task Queue**: Worker registration and task routing identifier
 
-use crate::application::ports::WorkflowEnginePort;
+use crate::application::ports::{
+    ScheduleEnginePort, TemporalScheduleDescription, TemporalScheduleSpec, WorkflowEnginePort,
+};
+use crate::domain::schedule::{Timing, CATCHUP_WINDOW_SECONDS, FIRE_WORKFLOW_TYPE};
 use crate::domain::secrets::SensitiveUrl;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -332,5 +335,351 @@ impl WorkflowEnginePort for TemporalClient {
         params: crate::application::ports::StartWorkflowParams<'_>,
     ) -> Result<String> {
         TemporalClient::start_workflow(self, params).await
+    }
+}
+
+// ── Temporal Schedules (AEGIS ADR-139 N5) ───────────────────────────────────
+
+use crate::infrastructure::temporal_proto::temporal::api::enums::v1::ScheduleOverlapPolicy;
+use crate::infrastructure::temporal_proto::temporal::api::schedule::v1::{
+    CalendarSpec, Schedule as TemporalSchedule, ScheduleAction, SchedulePatch, SchedulePolicies,
+    ScheduleSpec, ScheduleState as TemporalScheduleState,
+};
+use crate::infrastructure::temporal_proto::temporal::api::taskqueue::v1::TaskQueue;
+use crate::infrastructure::temporal_proto::temporal::api::workflow::v1::NewWorkflowExecutionInfo;
+use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::{
+    CreateScheduleRequest, DeleteScheduleRequest, DescribeScheduleRequest, PatchScheduleRequest,
+    UpdateScheduleRequest,
+};
+use chrono::{Datelike, Timelike};
+
+/// The identity this client gives Temporal on schedule calls.
+const SCHEDULE_IDENTITY: &str = "aegis-orchestrator";
+
+/// The Temporal Schedule for `spec` (N5): a recurrence's `cron_string`,
+/// `timezone_name` and `jitter`, or one `calendar` entry at `at` limited to
+/// one action; the SKIP overlap policy, the catch-up window and no pause on
+/// failure; an action that starts the worker's fire workflow on `task_queue`
+/// with `{schedule_id, tenant_id}` as its only input.
+pub fn temporal_schedule(spec: &TemporalScheduleSpec, task_queue: &str) -> TemporalSchedule {
+    let (schedule_spec, limited_actions, remaining_actions) = match &spec.timing {
+        Timing::Recurrence(recurrence) => (
+            ScheduleSpec {
+                cron_string: vec![recurrence.cron.clone()],
+                timezone_name: recurrence.timezone.clone(),
+                jitter: Some(prost_types::Duration {
+                    seconds: i64::from(recurrence.jitter_seconds),
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            false,
+            0,
+        ),
+        Timing::Once { at } => (
+            ScheduleSpec {
+                calendar: vec![CalendarSpec {
+                    second: at.second().to_string(),
+                    minute: at.minute().to_string(),
+                    hour: at.hour().to_string(),
+                    day_of_month: at.day().to_string(),
+                    month: at.month().to_string(),
+                    year: at.year().to_string(),
+                    day_of_week: "*".to_string(),
+                    comment: String::new(),
+                }],
+                timezone_name: "UTC".to_string(),
+                ..Default::default()
+            },
+            true,
+            1,
+        ),
+    };
+    let input = serde_json::json!({
+        "schedule_id": spec.schedule_id,
+        "tenant_id": spec.tenant_id,
+    });
+    let mut metadata = HashMap::new();
+    metadata.insert("encoding".to_string(), "json/plain".as_bytes().to_vec());
+    let payload = Payload {
+        metadata,
+        data: serde_json::to_vec(&input).unwrap_or_default(),
+        ..Default::default()
+    };
+    TemporalSchedule {
+        spec: Some(schedule_spec),
+        action: Some(ScheduleAction {
+            action: Some(
+                crate::infrastructure::temporal_proto::temporal::api::schedule::v1::schedule_action::Action::StartWorkflow(
+                    NewWorkflowExecutionInfo {
+                        workflow_id: format!("aegis-schedule-fire-{}", spec.schedule_id),
+                        workflow_type: Some(WorkflowType {
+                            name: FIRE_WORKFLOW_TYPE.to_string(),
+                        }),
+                        task_queue: Some(TaskQueue {
+                            name: task_queue.to_string(),
+                            kind: 0,
+                            ..Default::default()
+                        }),
+                        input: Some(Payloads {
+                            payloads: vec![payload],
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        }),
+        policies: Some(SchedulePolicies {
+            overlap_policy: ScheduleOverlapPolicy::Skip as i32,
+            catchup_window: Some(prost_types::Duration {
+                seconds: CATCHUP_WINDOW_SECONDS as i64,
+                nanos: 0,
+            }),
+            pause_on_failure: false,
+            ..Default::default()
+        }),
+        state: Some(TemporalScheduleState {
+            paused: spec.paused,
+            limited_actions,
+            remaining_actions,
+            ..Default::default()
+        }),
+    }
+}
+
+fn timestamp_to_utc(ts: &prost_types::Timestamp) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(ts.seconds, u32::try_from(ts.nanos).ok()?)
+}
+
+#[async_trait]
+impl ScheduleEnginePort for TemporalClient {
+    async fn create_schedule(&self, spec: &TemporalScheduleSpec) -> Result<()> {
+        let request = CreateScheduleRequest {
+            namespace: self.namespace.clone(),
+            schedule_id: spec.temporal_schedule_id.clone(),
+            schedule: Some(temporal_schedule(spec, &self.task_queue)),
+            identity: SCHEDULE_IDENTITY.to_string(),
+            request_id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        };
+        self.client
+            .clone()
+            .create_schedule(request)
+            .await
+            .context("Temporal CreateSchedule failed")?;
+        Ok(())
+    }
+
+    async fn update_schedule(&self, spec: &TemporalScheduleSpec) -> Result<()> {
+        let request = UpdateScheduleRequest {
+            namespace: self.namespace.clone(),
+            schedule_id: spec.temporal_schedule_id.clone(),
+            schedule: Some(temporal_schedule(spec, &self.task_queue)),
+            identity: SCHEDULE_IDENTITY.to_string(),
+            request_id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        };
+        self.client
+            .clone()
+            .update_schedule(request)
+            .await
+            .context("Temporal UpdateSchedule failed")?;
+        Ok(())
+    }
+
+    async fn set_schedule_paused(&self, temporal_schedule_id: &str, paused: bool) -> Result<()> {
+        let note = "paused by its owner or by the orchestrator".to_string();
+        let patch = if paused {
+            SchedulePatch {
+                pause: note,
+                ..Default::default()
+            }
+        } else {
+            SchedulePatch {
+                unpause: note,
+                ..Default::default()
+            }
+        };
+        let request = PatchScheduleRequest {
+            namespace: self.namespace.clone(),
+            schedule_id: temporal_schedule_id.to_string(),
+            patch: Some(patch),
+            identity: SCHEDULE_IDENTITY.to_string(),
+            request_id: Uuid::new_v4().to_string(),
+        };
+        self.client
+            .clone()
+            .patch_schedule(request)
+            .await
+            .context("Temporal PatchSchedule failed")?;
+        Ok(())
+    }
+
+    async fn delete_schedule(&self, temporal_schedule_id: &str) -> Result<()> {
+        let request = DeleteScheduleRequest {
+            namespace: self.namespace.clone(),
+            schedule_id: temporal_schedule_id.to_string(),
+            identity: SCHEDULE_IDENTITY.to_string(),
+        };
+        match self.client.clone().delete_schedule(request).await {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+            Err(status) => Err(anyhow::anyhow!("Temporal DeleteSchedule failed: {status}")),
+        }
+    }
+
+    async fn describe_schedule(
+        &self,
+        temporal_schedule_id: &str,
+    ) -> Result<Option<TemporalScheduleDescription>> {
+        let request = DescribeScheduleRequest {
+            namespace: self.namespace.clone(),
+            schedule_id: temporal_schedule_id.to_string(),
+        };
+        match self.client.clone().describe_schedule(request).await {
+            Ok(response) => {
+                let response = response.into_inner();
+                let paused = response
+                    .schedule
+                    .as_ref()
+                    .and_then(|s| s.state.as_ref())
+                    .is_some_and(|state| state.paused);
+                let next_action_times = response
+                    .info
+                    .map(|info| {
+                        info.future_action_times
+                            .iter()
+                            .filter_map(timestamp_to_utc)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(Some(TemporalScheduleDescription {
+                    paused,
+                    next_action_times,
+                }))
+            }
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(anyhow::anyhow!(
+                "Temporal DescribeSchedule failed: {status}"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use crate::domain::schedule::Recurrence;
+    use crate::infrastructure::temporal_proto::temporal::api::schedule::v1::schedule_action::Action;
+
+    fn spec(timing: Timing) -> TemporalScheduleSpec {
+        TemporalScheduleSpec {
+            temporal_schedule_id: "aegis-schedule-s-1".into(),
+            schedule_id: "s-1".into(),
+            tenant_id: "u-owner".into(),
+            timing,
+            paused: false,
+        }
+    }
+
+    fn assert_common(schedule: &TemporalSchedule) {
+        let policies = schedule.policies.as_ref().expect("policies");
+        let mut wrong = Vec::new();
+        if policies.overlap_policy != ScheduleOverlapPolicy::Skip as i32 {
+            wrong.push(format!("overlap_policy {}", policies.overlap_policy));
+        }
+        if policies.catchup_window.as_ref().map(|d| d.seconds) != Some(600) {
+            wrong.push(format!("catchup_window {:?}", policies.catchup_window));
+        }
+        if policies.pause_on_failure {
+            wrong.push("pause_on_failure true".into());
+        }
+        match schedule.action.as_ref().and_then(|a| a.action.as_ref()) {
+            Some(Action::StartWorkflow(start)) => {
+                let workflow = start.workflow_type.as_ref().map(|t| t.name.as_str());
+                if workflow != Some("aegis_schedule_fire") {
+                    wrong.push(format!("workflow type {workflow:?}"));
+                }
+                let queue = start.task_queue.as_ref().map(|q| q.name.as_str());
+                if queue != Some("aegis-queue") {
+                    wrong.push(format!("task queue {queue:?}"));
+                }
+                let input: serde_json::Value =
+                    serde_json::from_slice(&start.input.as_ref().expect("input").payloads[0].data)
+                        .expect("json input");
+                if input != serde_json::json!({"schedule_id": "s-1", "tenant_id": "u-owner"}) {
+                    wrong.push(format!("input {input}"));
+                }
+            }
+            other => wrong.push(format!("action {other:?}")),
+        }
+        assert!(
+            wrong.is_empty(),
+            "the schedule's policies and action: {wrong:?}"
+        );
+    }
+
+    /// N5: a recurrence's spec, the SKIP policy, the 600 s window, and an
+    /// action that starts the fire workflow with only the two ids.
+    #[test]
+    fn a_recurrence_is_held_as_cron_timezone_and_jitter() {
+        let schedule = temporal_schedule(
+            &spec(Timing::Recurrence(Recurrence {
+                cron: "0 15 * * 1-5".into(),
+                timezone: "Europe/Berlin".into(),
+                jitter_seconds: 1_800,
+            })),
+            "aegis-queue",
+        );
+        let s = schedule.spec.as_ref().expect("spec");
+        assert_eq!(
+            (
+                s.cron_string.clone(),
+                s.timezone_name.as_str(),
+                s.jitter.as_ref().map(|d| d.seconds),
+                s.calendar.len()
+            ),
+            (
+                vec!["0 15 * * 1-5".to_string()],
+                "Europe/Berlin",
+                Some(1_800),
+                0
+            ),
+            "the recurrence's spec"
+        );
+        let state = schedule.state.as_ref().expect("state");
+        assert!(!state.limited_actions && !state.paused, "{state:?}");
+        assert_common(&schedule);
+    }
+
+    /// N5: `at` is one calendar entry, limited to one action.
+    #[test]
+    fn at_is_held_as_one_calendar_entry_with_one_remaining_action() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-02T15:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let schedule = temporal_schedule(&spec(Timing::Once { at }), "aegis-queue");
+        let s = schedule.spec.as_ref().expect("spec");
+        let c = &s.calendar;
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(
+            (
+                c[0].year.as_str(),
+                c[0].month.as_str(),
+                c[0].day_of_month.as_str(),
+                c[0].hour.as_str(),
+                c[0].minute.as_str(),
+                c[0].second.as_str(),
+                s.cron_string.len(),
+                s.timezone_name.as_str()
+            ),
+            ("2026", "11", "2", "15", "4", "5", 0, "UTC")
+        );
+        let state = schedule.state.as_ref().expect("state");
+        assert!(
+            state.limited_actions && state.remaining_actions == 1,
+            "{state:?}"
+        );
+        assert_common(&schedule);
     }
 }

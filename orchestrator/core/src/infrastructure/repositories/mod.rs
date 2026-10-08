@@ -59,6 +59,7 @@ pub mod postgres_git_repo;
 pub mod postgres_goal;
 pub mod postgres_operator_escalation;
 pub mod postgres_realm;
+pub mod postgres_schedule;
 pub mod postgres_script;
 pub mod postgres_storage_event;
 pub mod postgres_team;

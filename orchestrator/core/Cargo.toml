@@ -26,6 +26,7 @@ serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["uuid1", "chrono"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
+jiff = { version = "0.2.35", features = ["tzdb-bundle-always"] }
 humantime-serde = "1.1"
 thiserror = { workspace = true }
 anyhow = { workspace = true }

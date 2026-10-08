@@ -77,6 +77,7 @@ pub mod rate_limit;
 pub mod repository;
 pub mod runtime;
 pub mod runtime_registry;
+pub mod schedule;
 pub mod script;
 pub mod script_tier_limits;
 pub mod seal_session;
