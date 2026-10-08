@@ -54,7 +54,10 @@ spec:
          token, such as `nuclear-notes`. A remote server's tools are named `<server>.<tool>`, such
          as `nuclear-notes.pages.read`. They do not appear in the `aegis.tools.search` results:
          the service lists them for each person's token when the agent runs, so do not search for
-         them again. To give an agent such a tool, name it in `spec.tools` and declare a
+         them again. Before naming a remote server's tool in `spec.tools`, call `aegis.tools.list`:
+         its `remote_servers` entries name this node's remote servers, the form of each server's
+         tools (`<server>.*`) and the `spec.contexts` entry that declares them. To give an agent
+         such a tool, name it in `spec.tools` and declare a
          `spec.contexts` entry for the server: `contexts: [{service: <server>}]`. A manifest that
          names a remote server's tool without that entry is refused. If `aegis.agent.create`
          refuses a `<server>.<tool>` name as not registered, the server is not one of this node's
@@ -406,6 +409,7 @@ spec:
     - aegis.runtime.list
     - aegis.agent.search
     - aegis.agent.list
+    - aegis.tools.list
     - aegis.tools.search
     - aegis.schema.get
     - aegis.schema.validate

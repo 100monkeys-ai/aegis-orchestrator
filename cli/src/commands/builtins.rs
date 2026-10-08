@@ -1303,6 +1303,55 @@ mod tests {
         }
     }
 
+    /// AEGIS ADR-132 S7c and S7e, the creator half: the creator may call
+    /// `aegis.tools.list`, whose `remote_servers` entries name this node's
+    /// remote servers, and its step 3 tells it to read them before naming a
+    /// remote server's tool. Both clauses are reported together.
+    #[test]
+    fn agent_creator_lists_tools_and_step_3_says_to_read_the_remote_servers() {
+        let manifest: serde_yaml::Value = serde_yaml::from_str(AGENT_GENERATOR_AGENT_TEMPLATE)
+            .expect("agent-creator-agent yaml parses");
+        let mut complaints = Vec::new();
+
+        let tools: Vec<&str> = manifest["spec"]["tools"]
+            .as_sequence()
+            .map(|t| t.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let expected = [
+            "aegis.runtime.list",
+            "aegis.agent.search",
+            "aegis.agent.list",
+            "aegis.tools.list",
+            "aegis.tools.search",
+            "aegis.schema.get",
+            "aegis.schema.validate",
+            "aegis.agent.create",
+            "aegis.agent.update",
+            "aegis.agent.export",
+        ];
+        if tools != expected {
+            complaints.push(format!(
+                "the creator's spec.tools are {tools:?}, not the ten tools {expected:?} naming aegis.tools.list"
+            ));
+        }
+
+        let flat = manifest["spec"]["task"]["instruction"]
+            .as_str()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sentence =
+            "Before naming a remote server's tool in `spec.tools`, call `aegis.tools.list`: \
+             its `remote_servers` entries name this node's remote servers, the form of each \
+             server's tools (`<server>.*`) and the `spec.contexts` entry that declares them.";
+        if !flat.contains(sentence) {
+            complaints.push(format!("the creator's step 3 does not say: {sentence}"));
+        }
+
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
     /// Regression test for the agent-generator-judge under the corrected
     /// ADR-113 design. The judge MUST require generated manifests to
     /// reference `input.attachments` in prose AND MUST reject Handlebars
