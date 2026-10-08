@@ -292,8 +292,11 @@ pub struct ApprovalDeclaration {
 /// `mail.reply` act through the mailbox their `mailbox` argument names, and
 /// a person reads the mailbox, the recipients, the subject and the body
 /// before answering (AEGIS ADR-125's Update of 2026-10-07 clause 3 and its
-/// Update of 2026-10-07 (3) clause 12). A gateway or MCP tool declares the
-/// same keys on its capability entry in the node configuration.
+/// Update of 2026-10-07 (3) clause 12). `mail.delete` acts through the same
+/// argument and shows the mailbox, the thread, and the thread's subject and
+/// senders, which its admission reads before the gate (its Update of
+/// 2026-10-08 (4) clause 20). A gateway or MCP tool declares the same keys
+/// on its capability entry in the node configuration.
 pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
     ApprovalDeclaration {
         tool: "mail.send",
@@ -304,6 +307,11 @@ pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
         tool: "mail.reply",
         binding_argument: Some("mailbox"),
         approval_summary: Some(&["mailbox", "to", "cc", "subject", "body"]),
+    },
+    ApprovalDeclaration {
+        tool: "mail.delete",
+        binding_argument: Some("mailbox"),
+        approval_summary: Some(&["mailbox", "thread_id", "subject", "from"]),
     },
 ];
 
@@ -344,7 +352,7 @@ impl ToolInputContract {
             "web.search" => &["query"],
             "web.fetch" => &["url"],
             "mail.list" => &["mailbox"],
-            "mail.read" | "mail.label" => &["mailbox", "thread_id"],
+            "mail.read" | "mail.label" | "mail.delete" => &["mailbox", "thread_id"],
             "mail.draft" => &["mailbox", "body"],
             "mail.send" => &["mailbox", "to", "subject", "body"],
             "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],

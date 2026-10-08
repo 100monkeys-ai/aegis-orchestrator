@@ -145,6 +145,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.list", "Lists threads in a connected mailbox's inbox that match a query, newest first: each thread's id, subject, participants, latest date, message count, unread count, flag and labels. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.read", "Reads one thread of a connected mailbox: every message's headers, flags, labels and plain-text body, oldest first. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox, and flags or unflags it."),
+    BuiltinToolDefinition::new("mail.delete", "Moves every message of a thread in a connected mailbox's inbox to its Trash folder; deletes nothing permanently. Waits for the person's approval before anything is moved.").requires_approval(),
     BuiltinToolDefinition::new("aegis.git.status", "Shows one of your run's repositories: its work branch, whether the tree is clean or changed, and the commit HEAD is on.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.diff", "Shows the changes in one of your run's repositories as a unified diff: unstaged by default, or what is staged.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
@@ -341,6 +342,7 @@ impl ToolRouter {
             "mail.list" => Self::schema_mail_list(),
             "mail.read" => Self::schema_mail_read(),
             "mail.label" => Self::schema_mail_label(),
+            "mail.delete" => Self::schema_mail_delete(),
             "aegis.git.status" => Self::schema_aegis_git(false, false),
             "aegis.git.diff" => Self::schema_aegis_git(false, true),
             "aegis.git.commit" => Self::schema_aegis_git(true, false),
@@ -821,6 +823,26 @@ impl ToolRouter {
                 "thread_id": {
                     "type": "string",
                     "description": "A thread id mail.list answered."
+                }
+            },
+            "required": ["mailbox", "thread_id"]
+        })
+    }
+
+    /// JSON schema for the `mail.delete` builtin tool (AEGIS ADR-125's
+    /// Update of 2026-10-08 (4) clause 17). `subject` and `from` are not
+    /// offered: the admission writes them before the gate.
+    fn schema_mail_delete() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mailbox": {
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "A thread id mail.list answered; every message of it in the inbox moves to Trash."
                 }
             },
             "required": ["mailbox", "thread_id"]
@@ -2712,13 +2734,14 @@ mod tests {
     /// its tool, a builtin dispatcher's or a `spec.tool_capabilities` entry
     /// whose pattern matches; with no entry only the catalogue's marked
     /// tools, `mail.send` and `mail.reply` (AEGIS ADR-125's Update of
-    /// 2026-10-07 (3) clause 12), are gated, and an entry without the flag
+    /// 2026-10-07 (3) clause 12) and `mail.delete` (its Update of 2026-10-08
+    /// (4) clause 20), are gated, and an entry without the flag
     /// does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
         let plain = ToolRouter::new(ToolRouter::builtin_dispatchers());
         for def in BUILTIN_TOOL_DEFINITIONS {
-            let marked = matches!(def.name, "mail.send" | "mail.reply");
+            let marked = matches!(def.name, "mail.send" | "mail.reply" | "mail.delete");
             assert_eq!(
                 plain.requires_approval(def.name),
                 marked,

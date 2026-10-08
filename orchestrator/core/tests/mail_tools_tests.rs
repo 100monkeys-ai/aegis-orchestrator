@@ -12,7 +12,13 @@
 //!   refused with its sentence and no approval row is written, and a
 //!   mailbox named by its context name is stored by its binding id;
 //! - a send approved once runs over XOAUTH2, and its token appears in no
-//!   result, event or log line.
+//!   result, event or log line;
+//! - `mail.delete` (its Update of 2026-10-08 (4) clause 20) is gated with
+//!   the contract `mailbox`, `thread_id`, `subject`, `from`; its admission
+//!   reads the thread's subject and senders into the call over the model's
+//!   values and nothing moves before approval; a call its mailbox, thread
+//!   or Trash would refuse is refused before the gate with no row; a
+//!   delete approved once runs over XOAUTH2 with its token nowhere.
 //!
 //! Sessions in detail are tested in `mail_session_tests.rs`.
 
@@ -63,9 +69,10 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures::Stream;
 use mail_standins::{
-    imap_mailbox_standin_with_folders, imap_xoauth2_standin_with_folders, smtp_submission_standin,
-    xoauth2_string, MailboxStandIn, PlainConnector, SmtpSubmission, StandInFolder, StoredMessage,
-    SubmitAuth,
+    imap_mailbox_standin_with_capabilities, imap_mailbox_standin_with_folders,
+    imap_xoauth2_standin_with_capabilities, imap_xoauth2_standin_with_folders,
+    smtp_submission_standin, xoauth2_string, MailboxStandIn, PlainConnector, SmtpSubmission,
+    StandInFolder, StoredMessage, SubmitAuth,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -84,7 +91,7 @@ const ANN: &str = "ann@example.test";
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_six_mail_tools_list_with_contracts_declaring_mailbox_and_two_are_gated() {
+async fn the_seven_mail_tools_list_with_contracts_declaring_mailbox_and_three_are_gated() {
     let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
     let tools = router.list_tools().await.unwrap();
     let mut wrong = Vec::new();
@@ -99,6 +106,7 @@ async fn the_six_mail_tools_list_with_contracts_declaring_mailbox_and_two_are_ga
             vec!["mailbox", "thread_id", "to", "subject", "body"],
             true,
         ),
+        ("mail.delete", vec!["mailbox", "thread_id"], true),
     ] {
         let Some(tool) = tools.iter().find(|t| t.name == name) else {
             wrong.push(format!("{name} is not listed"));
@@ -126,15 +134,15 @@ async fn the_six_mail_tools_list_with_contracts_declaring_mailbox_and_two_are_ga
                 router.requires_approval(name)
             ));
         }
+        let summary: &[&str] = if name == "mail.delete" {
+            &["mailbox", "thread_id", "subject", "from"]
+        } else {
+            &["mailbox", "to", "cc", "subject", "body"]
+        };
         let expected = if gated {
             ApprovalContract {
                 binding_argument: Some("mailbox".to_string()),
-                approval_summary: Some(
-                    ["mailbox", "to", "cc", "subject", "body"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                ),
+                approval_summary: Some(summary.iter().map(|s| s.to_string()).collect()),
             }
         } else {
             ApprovalContract::default()
@@ -146,7 +154,7 @@ async fn the_six_mail_tools_list_with_contracts_declaring_mailbox_and_two_are_ga
             ));
         }
     }
-    for name in ["mail.draft", "mail.send", "mail.reply"] {
+    for name in ["mail.draft", "mail.send", "mail.reply", "mail.delete"] {
         if router.is_skip_judge(name).await {
             wrong.push(format!("{name} skips the judge"));
         }
@@ -266,7 +274,7 @@ spec:
     version: "3.11"
     isolation: inherit
     model: smart
-  tools: ["mail.list", "mail.read", "mail.label", "mail.draft", "mail.send", "mail.reply"]
+  tools: ["mail.list", "mail.read", "mail.label", "mail.draft", "mail.send", "mail.reply", "mail.delete"]
 "#,
     )
     .unwrap();
@@ -716,6 +724,298 @@ async fn an_approved_send_runs_over_xoauth2_and_its_token_reaches_no_result_even
             smtp.mechanisms(),
             smtp.submitted().len()
         ));
+    }
+    let mut seen: Vec<DomainEvent> = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    let logs = captured.0.lock().unwrap().clone();
+    if !logs.contains("Running a stored tool call") {
+        wrong.push("the log capture saw nothing of the run".to_string());
+    }
+    if seen.is_empty() {
+        wrong.push("no event was published".to_string());
+    }
+    let base64_response = STANDARD.encode(xoauth2_string(ADDRESS, TOKEN));
+    for (place, text) in [
+        ("the pending answer", format!("{pending:?}")),
+        ("the request", format!("{decided:?}")),
+        ("an event", format!("{seen:?}")),
+        ("a log line", logs.clone()),
+    ] {
+        if text.contains(TOKEN) || text.contains(&base64_response) {
+            wrong.push(format!("the token reached {place}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// mail.delete at the gate (its Update of 2026-10-08 (4) clause 20)
+// ---------------------------------------------------------------------------
+
+/// The refusal for a mailbox with no Trash folder, as the clause gives it.
+const NO_TRASH_SENTENCE: &str = "This mailbox has no Trash folder; nothing was deleted.";
+
+/// Thread `<a1@x>` from Ann and then Bea (uids 1 and 2), and another
+/// message (uid 3).
+fn delete_inbox() -> Vec<StoredMessage> {
+    vec![
+        StoredMessage::new(
+            1,
+            &["\\Seen"],
+            "05-Oct-2026 09:00:00 +0000",
+            &[
+                "Message-ID: <a1@x>",
+                "From: Ann <ann@example.test>",
+                "Subject: Invoice",
+            ],
+            "Please find the invoice.",
+        ),
+        StoredMessage::new(
+            2,
+            &[],
+            "05-Oct-2026 10:00:00 +0000",
+            &[
+                "Message-ID: <a2@x>",
+                "References: <a1@x>",
+                "From: Bea <bea@example.test>",
+                "Subject: Re: Invoice",
+            ],
+            "Paid.",
+        ),
+        StoredMessage::new(
+            3,
+            &[],
+            "05-Oct-2026 11:00:00 +0000",
+            &[
+                "Message-ID: <c1@x>",
+                "From: Cid <cid@example.test>",
+                "Subject: Lunch",
+            ],
+            "Lunch?",
+        ),
+    ]
+}
+
+fn trash() -> Vec<StandInFolder> {
+    vec![StandInFolder::new("Trash", "\\Trash")]
+}
+
+async fn delete_mailbox(folders: Vec<StandInFolder>, granted: bool) -> (MailboxStandIn, Owned) {
+    let mailbox = imap_mailbox_standin_with_capabilities(
+        ADDRESS,
+        PASSWORD,
+        delete_inbox(),
+        folders,
+        "IMAP4rev1 MOVE",
+    )
+    .await;
+    let owned = Owned {
+        id: CredentialBindingId::new(),
+        name: "Inbox".to_string(),
+        granted,
+        imap_port: mailbox.port(),
+        smtp_port: 465,
+        auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
+    };
+    (mailbox, owned)
+}
+
+fn moved_anything(mailbox: &MailboxStandIn) -> Vec<String> {
+    mailbox
+        .commands()
+        .into_iter()
+        .filter(|c| {
+            let upper = c.to_ascii_uppercase();
+            upper.contains(" UID MOVE ")
+                || upper.contains(" UID COPY ")
+                || upper.contains(" UID STORE ")
+                || upper.contains("EXPUNGE")
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_waits_with_the_threads_subject_and_senders_and_moves_nothing_before_approval() {
+    let (mailbox, owned) = delete_mailbox(trash(), false).await;
+    let id = owned.id.0.to_string();
+    let h = harness(vec![owned], &[Some(json!({ "imap": [id.clone()] }))]).await;
+    let result = h
+        .call(
+            0,
+            "mail.delete",
+            json!({"mailbox": id, "thread_id": "<a1@x>", "subject": "Harmless", "from": "nobody"}),
+        )
+        .await;
+    let mut wrong = Vec::new();
+    let summary = format!(
+        "mail.delete\nmailbox: {id}\nthread_id: <a1@x>\nsubject: Invoice\nfrom: Ann <ann@example.test>, Bea <bea@example.test>"
+    );
+    match direct(&result) {
+        Some(value) if value["status"] == "approval_pending" => {
+            if value["summary"] != summary.as_str() {
+                wrong.push(format!("the summary is {:?}", value["summary"]));
+            }
+        }
+        _ => wrong.push(format!(
+            "mail.delete did not wait for approval: {}",
+            told(&result)
+        )),
+    }
+    match h.rows().await.as_slice() {
+        [row] => {
+            if row.arguments["subject"] != "Invoice"
+                || row.arguments["from"]
+                    != json!(["Ann <ann@example.test>", "Bea <bea@example.test>"])
+            {
+                wrong.push(format!(
+                    "the stored call keeps the model's values: {}",
+                    row.arguments
+                ));
+            }
+        }
+        rows => wrong.push(format!("{} approval rows, not 1", rows.len())),
+    }
+    let moved = moved_anything(&mailbox);
+    if !moved.is_empty() || mailbox.folder_messages("INBOX").len() != 3 {
+        wrong.push(format!("a pending delete changed the mailbox: {moved:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_its_mailbox_thread_or_trash_would_refuse_is_refused_before_the_gate_with_no_row()
+{
+    let mut wrong = Vec::new();
+    for (case, folders, granted, chosen, thread, expected) in [
+        (
+            "an ungranted mailbox",
+            trash(),
+            false,
+            false,
+            "<a1@x>",
+            NOT_GRANTED.to_string(),
+        ),
+        (
+            "a thread not in the inbox",
+            trash(),
+            false,
+            true,
+            "<nope@x>",
+            "There is no thread '<nope@x>' in this mailbox's inbox.".to_string(),
+        ),
+        (
+            "a mailbox with no Trash folder",
+            vec![StandInFolder::new("Sent", "\\Sent")],
+            false,
+            true,
+            "<a1@x>",
+            NO_TRASH_SENTENCE.to_string(),
+        ),
+    ] {
+        let (mailbox, owned) = delete_mailbox(folders, granted).await;
+        let id = owned.id.0.to_string();
+        let contexts = chosen.then(|| json!({ "imap": [id.clone()] }));
+        let h = harness(vec![owned], &[contexts]).await;
+        let mut events = h.event_bus.subscribe();
+        let result = h
+            .call(
+                0,
+                "mail.delete",
+                json!({"mailbox": id, "thread_id": thread}),
+            )
+            .await;
+        let said = match &result {
+            Err(SealSessionError::Answered {
+                answer: CallerAnswer::NotFound(message),
+                ..
+            }) => message.clone(),
+            other => told(other),
+        };
+        if said != expected {
+            wrong.push(format!("{case} was not refused before the gate: {said}"));
+        }
+        if !h.rows().await.is_empty() {
+            wrong.push(format!("{case}: approval rows were written"));
+        }
+        while let Ok(event) = events.try_recv() {
+            if format!("{event:?}").contains("ApprovalRequested") {
+                wrong.push(format!("{case}: an approval was requested"));
+            }
+        }
+        if !moved_anything(&mailbox).is_empty() {
+            wrong.push(format!("{case}: the mailbox changed"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn an_approved_delete_runs_over_xoauth2_and_its_token_reaches_no_result_event_or_log() {
+    let captured = Captured::default();
+    let _logs = tracing::subscriber::set_default(captured.clone());
+    let mailbox = imap_xoauth2_standin_with_capabilities(
+        ADDRESS,
+        TOKEN,
+        delete_inbox(),
+        trash(),
+        "IMAP4rev1 MOVE",
+    )
+    .await;
+    let owned = Owned {
+        id: CredentialBindingId::new(),
+        name: ADDRESS.to_string(),
+        granted: true,
+        imap_port: mailbox.port(),
+        smtp_port: 465,
+        auth: MailAuth::XOAuth2(SensitiveString::new(TOKEN)),
+    };
+    let id = owned.id.0.to_string();
+    let h = harness(vec![owned], &[None]).await;
+    let mut events = h.event_bus.subscribe();
+    let pending = h
+        .call(
+            0,
+            "mail.delete",
+            json!({"mailbox": id, "thread_id": "<a1@x>"}),
+        )
+        .await;
+    let mut wrong = Vec::new();
+    let approval_id = direct(&pending)
+        .and_then(|v| v["approval_id"].as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("mail.delete did not wait for approval: {}", told(&pending)));
+    let decided = h
+        .approvals
+        .decide(
+            aegis_orchestrator_core::domain::tool_approval::ToolApprovalId::from_string(
+                &approval_id,
+            )
+            .unwrap(),
+            &TenantId::default(),
+            USER,
+            ToolApprovalDecision::Once,
+            h.service.as_ref(),
+        )
+        .await
+        .unwrap();
+    if decided.status != ToolApprovalStatus::ApprovedOnce {
+        wrong.push(format!("the request reads {:?}", decided.status));
+    }
+    let result = decided.result.clone().unwrap_or(Value::Null);
+    if result["moved"] != 2 || result["trash_folder"] != "Trash" {
+        wrong.push(format!(
+            "the approved delete did not move the thread: {result} {:?}",
+            decided.error
+        ));
+    }
+    let inbox: Vec<u32> = mailbox
+        .folder_messages("INBOX")
+        .iter()
+        .map(|m| m.uid)
+        .collect();
+    if inbox != vec![3] || mailbox.folder_messages("Trash").len() != 2 {
+        wrong.push(format!("INBOX holds {inbox:?} after the delete"));
     }
     let mut seen: Vec<DomainEvent> = Vec::new();
     while let Ok(event) = events.try_recv() {

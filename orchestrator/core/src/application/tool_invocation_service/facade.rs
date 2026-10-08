@@ -943,7 +943,12 @@ impl ToolInvocationService {
                     )
                     .await;
                 match tools.admit_mailbox(&tool_name, &args, &acting).await {
-                    Ok(binding) => args["mailbox"] = Value::String(binding.0.to_string()),
+                    Ok(admitted) => {
+                        args["mailbox"] = Value::String(admitted.binding.0.to_string());
+                        for (name, value) in admitted.shown {
+                            args[name] = value;
+                        }
+                    }
                     Err(e) => {
                         self.publish_invocation_failed(
                             invocation_id,

@@ -26,6 +26,14 @@
 //!   and `References`; a refused recipient sends nothing; malformed
 //!   arguments are refused before any connection.
 //!
+//! - `mail.delete` (its Update of 2026-10-08 (4), clauses 17 to 19) moves a
+//!   thread's `INBOX` messages to Trash (`\Trash`, else `Trash` or
+//!   `Deleted`) by `UID MOVE`, else by `UID COPY`, `UID STORE +FLAGS
+//!   (\Deleted)` and `UID EXPUNGE` of exactly those UIDs; it refuses a
+//!   mailbox with no Trash folder and a server that can do neither, with
+//!   nothing changed; it never sends a plain `EXPUNGE` and never selects
+//!   Trash.
+//!
 //! The mailbox source here answers one mailbox for its owner; the real
 //! source's ownership checks are tested beside it in the crate
 //! (`tool_invocation_service/mail_tools_tests.rs`).
@@ -51,10 +59,11 @@ use aegis_orchestrator_core::infrastructure::mail::MailAuth;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mail_standins::{
-    imap_mailbox_standin, imap_mailbox_standin_with_folders, imap_xoauth2_standin,
-    imap_xoauth2_standin_with_folders, smtp_submission_standin, xoauth2_string, MailboxStandIn,
-    PlainConnector, SmtpSubmission, StandInFolder, StoredMessage, SubmitAuth, RCPT_REFUSAL,
-    XOAUTH2_CHALLENGE, XOAUTH2_IMAP_REFUSAL,
+    imap_mailbox_standin, imap_mailbox_standin_with_capabilities,
+    imap_mailbox_standin_with_folders, imap_xoauth2_standin, imap_xoauth2_standin_with_folders,
+    smtp_submission_standin, xoauth2_string, MailboxStandIn, PlainConnector, SmtpSubmission,
+    StandInFolder, StoredMessage, SubmitAuth, RCPT_REFUSAL, XOAUTH2_CHALLENGE,
+    XOAUTH2_IMAP_REFUSAL,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -1286,6 +1295,346 @@ async fn malformed_outbound_arguments_are_refused_before_any_connection() {
     }
     if o.smtp.standin.connections() != 0 || o.mailbox.connections() != 0 {
         wrong.push("a malformed call opened a session".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// mail.delete (AEGIS ADR-125's Update of 2026-10-08 (4), clauses 17 to 19)
+// ---------------------------------------------------------------------------
+
+/// The refusal for a mailbox with no Trash folder, as the clause gives it.
+const NO_TRASH_SENTENCE: &str = "This mailbox has no Trash folder; nothing was deleted.";
+/// The refusal for a server with neither `MOVE` nor `UIDPLUS`.
+const NO_SAFE_MOVE_SENTENCE: &str =
+    "This mailbox's server can neither move messages nor expunge only chosen ones; nothing was deleted.";
+
+/// A fixture over a mailbox whose `CAPABILITY` answers `capabilities`, with
+/// `folders` beside `INBOX` holding `messages`.
+async fn delete_fixture(
+    capabilities: &str,
+    messages: Vec<StoredMessage>,
+    folders: Vec<StandInFolder>,
+) -> Fixture {
+    let mailbox =
+        imap_mailbox_standin_with_capabilities(LOGIN, PASSWORD, messages, folders, capabilities)
+            .await;
+    let id = CredentialBindingId::new();
+    let source = Arc::new(OneMailbox {
+        id,
+        port: mailbox.port(),
+        host: "127.0.0.1".to_string(),
+        granted: false,
+    });
+    Fixture {
+        tools: MailTools::with_connector(source, Arc::new(PlainConnector)),
+        mailbox,
+        id,
+    }
+}
+
+/// The verb of a recorded command (`UID MOVE` counts as `UID MOVE`).
+fn verb_of(command: &str) -> String {
+    let mut words = command.split_whitespace().skip(1);
+    let first = words.next().unwrap_or("").to_ascii_uppercase();
+    if first == "UID" {
+        format!("UID {}", words.next().unwrap_or("").to_ascii_uppercase())
+    } else {
+        first
+    }
+}
+
+/// The commands that change a mailbox: a move, copy, store or expunge.
+fn changing(commands: &[String]) -> Vec<String> {
+    commands
+        .iter()
+        .filter(|c| {
+            matches!(
+                verb_of(c).as_str(),
+                "UID MOVE" | "UID COPY" | "UID STORE" | "UID EXPUNGE" | "EXPUNGE"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// What `commands` did that the tool never does: a plain `EXPUNGE`, or
+/// opening a Trash folder.
+fn trash_touched(commands: &[String], trash: &str) -> Vec<String> {
+    commands
+        .iter()
+        .filter(|c| {
+            let verb = verb_of(c);
+            verb == "EXPUNGE"
+                || (matches!(verb.as_str(), "SELECT" | "EXAMINE") && c.contains(trash))
+        })
+        .cloned()
+        .collect()
+}
+
+fn uids_of(messages: &[StoredMessage]) -> Vec<u32> {
+    messages.iter().map(|m| m.uid).collect()
+}
+
+#[tokio::test]
+async fn mail_delete_moves_exactly_the_threads_inbox_messages_to_trash_by_uid_move() {
+    let f = delete_fixture(
+        "IMAP4rev1 MOVE UIDPLUS",
+        inbox(),
+        vec![
+            StandInFolder::new("Trash", ""),
+            StandInFolder::new("[Gmail]/Trash", "\\Trash"),
+        ],
+    )
+    .await;
+    let mut wrong = Vec::new();
+    match call(
+        &f,
+        "mail.delete",
+        json!({"thread_id": "<a1@x>"}),
+        &conversation(),
+    )
+    .await
+    {
+        Ok(result) => {
+            if result["moved"] != 2
+                || result["message_uids"] != json!([1, 3])
+                || result["trash_folder"] != "[Gmail]/Trash"
+                || result["folder"] != "INBOX"
+                || result["thread_id"] != "<a1@x>"
+            {
+                wrong.push(format!("the result is {result}"));
+            }
+        }
+        Err(e) => wrong.push(format!("mail.delete failed: {}", sentence(&e))),
+    }
+    if uids_of(&f.mailbox.folder_messages("INBOX")) != vec![2, 4] {
+        wrong.push(format!(
+            "INBOX holds {:?}, not the other messages 2 and 4",
+            uids_of(&f.mailbox.folder_messages("INBOX"))
+        ));
+    }
+    let moved = f.mailbox.folder_messages("[Gmail]/Trash");
+    if moved.len() != 2 || !moved.iter().all(|m| m.raw.contains("Invoice")) {
+        wrong.push(format!(
+            "the \\Trash folder holds {} messages, not the thread's two",
+            moved.len()
+        ));
+    }
+    if !f.mailbox.folder_messages("Trash").is_empty() {
+        wrong.push("the folder named Trash was used over the one marked \\Trash".to_string());
+    }
+    let commands = f.mailbox.commands();
+    let changed = changing(&commands);
+    if changed.len() != 1 || !changed[0].contains("UID MOVE 1,3 ") {
+        wrong.push(format!(
+            "the changing commands were {changed:?}, not one UID MOVE of 1,3"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_delete_without_move_copies_stores_deleted_and_expunges_only_those_uids() {
+    let mut messages = inbox();
+    // An unrelated message another client already marked deleted: a plain
+    // EXPUNGE would remove it, UID EXPUNGE of the thread's uids does not.
+    messages[1].flags.push("\\Deleted".to_string());
+    let f = delete_fixture(
+        "IMAP4rev1 UIDPLUS",
+        messages,
+        vec![StandInFolder::new("Trash", "\\Trash")],
+    )
+    .await;
+    let mut wrong = Vec::new();
+    match call(
+        &f,
+        "mail.delete",
+        json!({"thread_id": "<a1@x>"}),
+        &conversation(),
+    )
+    .await
+    {
+        Ok(result) => {
+            if result["moved"] != 2 || result["message_uids"] != json!([1, 3]) {
+                wrong.push(format!("the result is {result}"));
+            }
+        }
+        Err(e) => wrong.push(format!("mail.delete failed: {}", sentence(&e))),
+    }
+    let changed: Vec<String> = changing(&f.mailbox.commands())
+        .iter()
+        .map(|c| {
+            c.split_once(' ')
+                .map(|(_, rest)| rest.to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let expected = vec![
+        "UID COPY 1,3 \"Trash\"".to_string(),
+        "UID STORE 1,3 +FLAGS (\\Deleted)".to_string(),
+        "UID EXPUNGE 1,3".to_string(),
+    ];
+    if changed != expected {
+        wrong.push(format!(
+            "the changing commands were {changed:?}, not {expected:?}"
+        ));
+    }
+    if uids_of(&f.mailbox.folder_messages("INBOX")) != vec![2, 4] {
+        wrong.push(format!(
+            "INBOX holds {:?}: the unrelated deleted message 2 must survive",
+            uids_of(&f.mailbox.folder_messages("INBOX"))
+        ));
+    }
+    if f.mailbox.folder_messages("Trash").len() != 2 {
+        wrong.push("Trash does not hold the thread's two messages".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_delete_without_a_trash_folder_refuses_and_changes_nothing() {
+    let f = delete_fixture(
+        "IMAP4rev1 MOVE UIDPLUS",
+        inbox(),
+        vec![StandInFolder::new("Sent", "\\Sent")],
+    )
+    .await;
+    let mut wrong = Vec::new();
+    match call(
+        &f,
+        "mail.delete",
+        json!({"thread_id": "<a1@x>"}),
+        &conversation(),
+    )
+    .await
+    {
+        Err(e) if sentence(&e) == NO_TRASH_SENTENCE => {}
+        other => wrong.push(format!("not refused for its missing Trash: {other:?}")),
+    }
+    let changed = changing(&f.mailbox.commands());
+    if !changed.is_empty() {
+        wrong.push(format!("the refused call sent {changed:?}"));
+    }
+    if uids_of(&f.mailbox.folder_messages("INBOX")) != vec![1, 2, 3, 4] {
+        wrong.push("INBOX changed".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_delete_finds_a_trash_folder_named_deleted_or_under_inbox() {
+    let mut wrong = Vec::new();
+    for (folder, expected) in [
+        ("Deleted", "Deleted"),
+        ("INBOX/Trash", "INBOX/Trash"),
+        ("trash", "trash"),
+    ] {
+        let f = delete_fixture(
+            "IMAP4rev1 MOVE",
+            inbox(),
+            vec![
+                StandInFolder::new("Archive", ""),
+                StandInFolder::new(folder, ""),
+            ],
+        )
+        .await;
+        match call(
+            &f,
+            "mail.delete",
+            json!({"thread_id": "<b1@x>"}),
+            &conversation(),
+        )
+        .await
+        {
+            Ok(result) if result["trash_folder"] == expected && result["moved"] == 1 => {}
+            Ok(result) => wrong.push(format!("with {folder}: {result}")),
+            Err(e) => wrong.push(format!("with {folder}: {}", sentence(&e))),
+        }
+        if f.mailbox.folder_messages(folder).len() != 1 {
+            wrong.push(format!("{folder} does not hold the moved message"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_delete_on_a_server_with_neither_move_nor_uidplus_refuses_and_changes_nothing() {
+    let f = delete_fixture(
+        "IMAP4rev1",
+        inbox(),
+        vec![StandInFolder::new("Trash", "\\Trash")],
+    )
+    .await;
+    let mut wrong = Vec::new();
+    match call(
+        &f,
+        "mail.delete",
+        json!({"thread_id": "<a1@x>"}),
+        &conversation(),
+    )
+    .await
+    {
+        Err(e) if sentence(&e) == NO_SAFE_MOVE_SENTENCE => {}
+        other => wrong.push(format!("not refused for its server: {other:?}")),
+    }
+    let changed = changing(&f.mailbox.commands());
+    if !changed.is_empty() {
+        wrong.push(format!("the refused call sent {changed:?}"));
+    }
+    if uids_of(&f.mailbox.folder_messages("INBOX")) != vec![1, 2, 3, 4]
+        || !f.mailbox.folder_messages("Trash").is_empty()
+    {
+        wrong.push("a folder changed".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn mail_delete_never_expunges_trash_nor_sends_a_plain_expunge() {
+    let mut wrong = Vec::new();
+    for capabilities in ["IMAP4rev1 MOVE", "IMAP4rev1 UIDPLUS", "IMAP4rev2"] {
+        // Trash already holds a message marked deleted: expunging Trash, or
+        // a plain EXPUNGE there, would remove it.
+        let kept = StoredMessage::new(
+            1,
+            &["\\Seen", "\\Deleted"],
+            "01-Oct-2026 09:00:00 +0000",
+            &["Message-ID: <old@x>", "Subject: Old"],
+            "Old.",
+        );
+        let f = delete_fixture(
+            capabilities,
+            inbox(),
+            vec![StandInFolder::new("Trash", "\\Trash").holding(vec![kept])],
+        )
+        .await;
+        if let Err(e) = call(
+            &f,
+            "mail.delete",
+            json!({"thread_id": "<a1@x>"}),
+            &conversation(),
+        )
+        .await
+        {
+            wrong.push(format!("with {capabilities}: {}", sentence(&e)));
+        }
+        let touched = trash_touched(&f.mailbox.commands(), "Trash");
+        if !touched.is_empty() {
+            wrong.push(format!("with {capabilities}: sent {touched:?}"));
+        }
+        let trash = f.mailbox.folder_messages("Trash");
+        if trash.len() != 3 || !trash.iter().any(|m| m.raw.contains("<old@x>")) {
+            wrong.push(format!(
+                "with {capabilities}: Trash holds {} messages, the old one {}",
+                trash.len(),
+                if trash.iter().any(|m| m.raw.contains("<old@x>")) {
+                    "kept"
+                } else {
+                    "gone"
+                }
+            ));
+        }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }

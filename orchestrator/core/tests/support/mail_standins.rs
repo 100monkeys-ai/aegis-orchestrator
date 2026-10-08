@@ -806,6 +806,7 @@ pub async fn imap_mailbox_standin(
         messages,
         permanent_flags,
         Vec::new(),
+        BASE_CAPABILITIES,
     )
     .await
 }
@@ -826,6 +827,7 @@ pub async fn imap_xoauth2_standin(
         messages,
         permanent_flags,
         Vec::new(),
+        BASE_CAPABILITIES,
     )
     .await
 }
@@ -846,6 +848,7 @@ pub async fn imap_mailbox_standin_with_folders(
         messages,
         "\\*",
         folders,
+        BASE_CAPABILITIES,
     )
     .await
 }
@@ -865,8 +868,97 @@ pub async fn imap_xoauth2_standin_with_folders(
         messages,
         "\\*",
         folders,
+        BASE_CAPABILITIES,
     )
     .await
+}
+
+/// What the mailbox stand-in's `CAPABILITY` answers unless a test names
+/// more: neither `MOVE` nor `UIDPLUS`.
+pub const BASE_CAPABILITIES: &str = "IMAP4rev1";
+
+/// [`imap_mailbox_standin_with_folders`] whose `CAPABILITY` answers
+/// `capabilities` (AEGIS ADR-125's Update of 2026-10-08 (4) clause 19):
+/// `UID MOVE` is served only with `MOVE` and `UID EXPUNGE` only with
+/// `UIDPLUS`; a plain `EXPUNGE` removes every `\Deleted` message of the
+/// selected folder, so a test tells the two expunges apart.
+pub async fn imap_mailbox_standin_with_capabilities(
+    user: &str,
+    password: &str,
+    messages: Vec<StoredMessage>,
+    folders: Vec<StandInFolder>,
+    capabilities: &str,
+) -> MailboxStandIn {
+    mailbox_standin(
+        StandInAuth::Login {
+            user: user.to_string(),
+            password: password.to_string(),
+        },
+        messages,
+        "\\*",
+        folders,
+        capabilities,
+    )
+    .await
+}
+
+/// [`imap_xoauth2_standin_with_folders`] whose `CAPABILITY` answers
+/// `capabilities`.
+pub async fn imap_xoauth2_standin_with_capabilities(
+    user: &str,
+    token: &str,
+    messages: Vec<StoredMessage>,
+    folders: Vec<StandInFolder>,
+    capabilities: &str,
+) -> MailboxStandIn {
+    mailbox_standin(
+        StandInAuth::XOAuth2 {
+            user: user.to_string(),
+            token: token.to_string(),
+        },
+        messages,
+        "\\*",
+        folders,
+        capabilities,
+    )
+    .await
+}
+
+/// Move (or copy) the messages `set` names from the selected folder to
+/// `target`, each taking the next UID there; `false` when `target` does
+/// not exist.
+fn transfer(
+    inbox: &Arc<Mutex<Vec<StoredMessage>>>,
+    folders: &Arc<Mutex<Vec<StandInFolder>>>,
+    selected: &str,
+    set: &[u32],
+    target: &str,
+    remove: bool,
+) -> bool {
+    if !folders.lock().unwrap().iter().any(|f| f.name == target) {
+        return false;
+    }
+    let taken: Vec<StoredMessage> = with_folder(inbox, folders, selected, |m| {
+        let taken: Vec<StoredMessage> =
+            m.iter().filter(|x| set.contains(&x.uid)).cloned().collect();
+        if remove {
+            m.retain(|x| !set.contains(&x.uid));
+        }
+        taken
+    });
+    let mut folders = folders.lock().unwrap();
+    let to = folders
+        .iter_mut()
+        .find(|f| f.name == target)
+        .expect("checked");
+    for mut message in taken {
+        message.uid = to.messages.iter().map(|m| m.uid).max().unwrap_or(0) + 1;
+        message
+            .flags
+            .retain(|f| !f.eq_ignore_ascii_case("\\Deleted"));
+        to.messages.push(message);
+    }
+    true
 }
 
 /// Run `f` over the messages of the selected folder.
@@ -891,6 +983,7 @@ async fn mailbox_standin(
     messages: Vec<StoredMessage>,
     permanent_flags: &str,
     folders: Vec<StandInFolder>,
+    capabilities: &str,
 ) -> MailboxStandIn {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind imap");
     let addr = listener.local_addr().unwrap();
@@ -902,6 +995,7 @@ async fn mailbox_standin(
     let (seen, count, mailbox) = (commands.clone(), accepted.clone(), store.clone());
     let others = folder_store.clone();
     let permanent = permanent_flags.to_string();
+    let capabilities = capabilities.to_ascii_uppercase();
     let shared = standin.clone();
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -912,6 +1006,14 @@ async fn mailbox_standin(
             let mailbox = mailbox.clone();
             let others = others.clone();
             let (auth, permanent, standin) = (auth.clone(), permanent.clone(), shared.clone());
+            let capabilities = capabilities.clone();
+            let caps_line = format!("* CAPABILITY {capabilities}\r\n");
+            // IMAP4rev2 holds both MOVE and UID EXPUNGE (RFC 9051).
+            let can = move |name: &str| {
+                capabilities
+                    .split_whitespace()
+                    .any(|c| c == name || c == "IMAP4REV2")
+            };
             tokio::spawn(async move {
                 let _ = write
                     .write_all(b"* OK IMAP4rev1 mailbox stand-in ready\r\n")
@@ -985,8 +1087,18 @@ async fn mailbox_standin(
                                 .await;
                             break;
                         }
+                        "CAPABILITY" => {
+                            reply.extend(caps_line.bytes());
+                            reply.extend(format!("{tag} OK CAPABILITY completed\r\n").bytes());
+                        }
                         _ if !logged_in => {
                             reply.extend(format!("{tag} BAD not authenticated\r\n").bytes());
+                        }
+                        "EXPUNGE" => {
+                            with_folder(&mailbox, &others, &selected, |m| {
+                                m.retain(|x| !has_flag_ci(&x.flags, "\\Deleted"))
+                            });
+                            reply.extend(format!("{tag} OK EXPUNGE completed\r\n").bytes());
                         }
                         "SELECT" | "EXAMINE" => {
                             let name = imap_args(&rest).into_iter().next().unwrap_or_default();
@@ -1209,6 +1321,42 @@ async fn mailbox_standin(
                                         *m = messages.clone()
                                     });
                                     reply.extend(format!("{tag} OK STORE completed\r\n").bytes());
+                                }
+                                verb @ ("MOVE" | "COPY") => {
+                                    let (set, target) = args.split_once(' ').unwrap_or((args, ""));
+                                    let target =
+                                        imap_args(target).into_iter().next().unwrap_or_default();
+                                    if verb == "MOVE" && !can("MOVE") {
+                                        reply.extend(
+                                            format!("{tag} BAD MOVE is not offered\r\n").bytes(),
+                                        );
+                                    } else if transfer(
+                                        &mailbox,
+                                        &others,
+                                        &selected,
+                                        &uid_set(set),
+                                        &target,
+                                        verb == "MOVE",
+                                    ) {
+                                        reply.extend(
+                                            format!("{tag} OK {verb} completed\r\n").bytes(),
+                                        );
+                                    } else {
+                                        reply.extend(
+                                            format!("{tag} NO [TRYCREATE] no folder {target}\r\n")
+                                                .bytes(),
+                                        );
+                                    }
+                                }
+                                "EXPUNGE" if can("UIDPLUS") => {
+                                    let set = uid_set(args.trim());
+                                    with_folder(&mailbox, &others, &selected, |m| {
+                                        m.retain(|x| {
+                                            !(set.contains(&x.uid)
+                                                && has_flag_ci(&x.flags, "\\Deleted"))
+                                        })
+                                    });
+                                    reply.extend(format!("{tag} OK EXPUNGE completed\r\n").bytes());
                                 }
                                 _ => reply
                                     .extend(format!("{tag} BAD unknown UID command\r\n").bytes()),

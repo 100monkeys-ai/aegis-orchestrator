@@ -3,7 +3,8 @@
 //! The mail tools: `mail.list`, `mail.read` and `mail.label` (AEGIS
 //! ADR-125 D4; its Update of 2026-10-07 clauses 1, 2 and 7), and the
 //! outbound `mail.draft`, `mail.send` and `mail.reply` (its Update of
-//! 2026-10-07 (3), clauses 11 to 15).
+//! 2026-10-07 (3), clauses 11 to 15), and `mail.delete` (its Update of
+//! 2026-10-08 (4), clauses 17 to 20).
 //!
 //! They speak IMAP only, over a mailbox of the acting person (ADR-125's
 //! Update of 2026-10-04 clause 3), inside the orchestrator: an `imap`
@@ -39,6 +40,16 @@
 //! answers a thread's newest `INBOX` message, threading by `In-Reply-To`
 //! and `References`. `mail.send` and `mail.reply` are gated by the
 //! approval gate; their mailbox is admitted before it ([`MailTools::admit_mailbox`]).
+//!
+//! **Deleting.** `mail.delete` moves a thread's `INBOX` messages to the
+//! Trash folder (the folder `LIST` marks `\Trash`, else one named `Trash`
+//! or `Deleted`), by `UID MOVE` where the server can move, else by `UID
+//! COPY`, `UID STORE +FLAGS (\Deleted)` and `UID EXPUNGE` of those UIDs
+//! only; a server that can do neither is refused before any change. It
+//! never expunges Trash and never sends a plain `EXPUNGE`. It is gated;
+//! before the gate its admission reads the thread's subject and senders
+//! into the call's `subject` and `from`, so the person reads what is
+//! deleted.
 //!
 //! **Threads.** A thread's id is the root `Message-ID` of its messages (the
 //! first `References` entry, else `In-Reply-To`, else the message's own); a
@@ -102,6 +113,12 @@ pub const NONE_CHOSEN: &str = "This tool needs your own mailbox, and none was ch
 pub const NOT_GRANTED: &str = "This tool needs your own mailbox, granted to this agent.";
 /// The refusal of `mail.draft` for a mailbox with no Drafts folder.
 pub const NO_DRAFTS: &str = "This mailbox has no Drafts folder; nothing was saved.";
+/// The refusal of `mail.delete` for a mailbox with no Trash folder.
+pub const NO_TRASH: &str = "This mailbox has no Trash folder; nothing was deleted.";
+/// The refusal of `mail.delete` for a server that advertises neither
+/// `MOVE` nor `UIDPLUS` (nor `IMAP4rev2`, which holds both).
+pub const NO_SAFE_MOVE: &str =
+    "This mailbox's server can neither move messages nor expunge only chosen ones; nothing was deleted.";
 /// What a send's result says when the mailbox has no Sent folder.
 pub const NO_SENT: &str = "This mailbox has no Sent folder.";
 
@@ -125,8 +142,24 @@ pub const BAD_BODY: &str = "'body' must be plain text of at most 100000 characte
 pub fn is_mail_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "mail.list" | "mail.read" | "mail.label" | "mail.draft" | "mail.send" | "mail.reply"
+        "mail.list"
+            | "mail.read"
+            | "mail.label"
+            | "mail.draft"
+            | "mail.send"
+            | "mail.reply"
+            | "mail.delete"
     )
+}
+
+/// What [`MailTools::admit_mailbox`] admitted: the binding the call names,
+/// and the arguments the admission read for the person (`subject` and
+/// `from` for `mail.delete`; none for another tool), which the caller
+/// writes into the call before the gate.
+#[derive(Debug, Clone)]
+pub struct Admitted {
+    pub binding: CredentialBindingId,
+    pub shown: Vec<(&'static str, Value)>,
 }
 
 /// Who a mail tool's call acts for, and what its run chose for `imap`.
@@ -188,10 +221,7 @@ impl MailTools {
         let run = run(self.connector.as_ref(), &mailbox, &request);
         match tokio::time::timeout(CALL_TIMEOUT, run).await {
             Ok(result) => result,
-            Err(_) => Err(SealSessionError::UpstreamUnavailable(format!(
-                "The mail server did not answer within {} seconds.",
-                CALL_TIMEOUT.as_secs()
-            ))),
+            Err(_) => Err(timed_out()),
         }
     }
 
@@ -201,15 +231,35 @@ impl MailTools {
     /// call itself makes. Answers the binding's id, which the caller writes
     /// back into `mailbox` so the stored call and any standing choice name
     /// the binding by id; a refusal is the call's own sentence.
+    ///
+    /// For `mail.delete` (the Update of 2026-10-08 (4) clause 20) it also
+    /// reads the thread, read-only, and answers the arguments the person
+    /// reads before answering: `subject` and `from`, which the caller
+    /// writes into the call over any value the model gave. A thread not in
+    /// `INBOX`, a mailbox with no Trash folder, or a server that cannot move
+    /// safely is refused here, so no person is asked about it.
     pub async fn admit_mailbox(
         &self,
         tool_name: &str,
         args: &Value,
         acting: &MailActing,
-    ) -> Result<CredentialBindingId, SealSessionError> {
+    ) -> Result<Admitted, SealSessionError> {
         let mailbox = self.mailbox_for(args, acting).await?;
-        Request::parse(tool_name, args)?;
-        Ok(mailbox.binding_id)
+        let request = Request::parse(tool_name, args)?;
+        let shown = match &request {
+            Request::Delete { thread_id } => {
+                let read = shown_for_delete(self.connector.as_ref(), &mailbox, thread_id);
+                match tokio::time::timeout(CALL_TIMEOUT, read).await {
+                    Ok(shown) => shown?,
+                    Err(_) => return Err(timed_out()),
+                }
+            }
+            _ => Vec::new(),
+        };
+        Ok(Admitted {
+            binding: mailbox.binding_id,
+            shown,
+        })
     }
 
     /// The mailbox the call may use, or its refusal.
@@ -299,6 +349,13 @@ pub fn not_configured() -> SealSessionError {
         .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
 }
 
+fn timed_out() -> SealSessionError {
+    SealSessionError::UpstreamUnavailable(format!(
+        "The mail server did not answer within {} seconds.",
+        CALL_TIMEOUT.as_secs()
+    ))
+}
+
 fn binding_required(message: String) -> SealSessionError {
     SealSessionError::NotFound(message.clone())
         .answered(CallerAnswer::CredentialBindingRequired { message })
@@ -353,6 +410,9 @@ enum Request {
     },
     Reply {
         message: Outbound,
+        thread_id: String,
+    },
+    Delete {
         thread_id: String,
     },
 }
@@ -559,6 +619,9 @@ impl Request {
                 thread_id: thread_id(args)?,
                 message: Outbound::parse(args, false)?,
             }),
+            "mail.delete" => Ok(Request::Delete {
+                thread_id: thread_id(args)?,
+            }),
             other => Err(invalid(format!("'{other}' is not a mail tool."))),
         }
     }
@@ -581,6 +644,7 @@ async fn run(
         Request::Reply { message, thread_id } => {
             return send(connector, mailbox, message, Some(thread_id.as_str())).await
         }
+        Request::Delete { thread_id } => return delete(connector, mailbox, thread_id).await,
         Request::List { .. } | Request::Read { .. } | Request::Label { .. } => {}
     }
     let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
@@ -595,8 +659,11 @@ async fn run(
             remove,
             flagged,
         } => label(&mut session, mailbox, thread_id, add, remove, *flagged).await,
-        Request::Draft { .. } | Request::Send { .. } | Request::Reply { .. } => {
-            unreachable!("an outbound request is run before the session opens")
+        Request::Draft { .. }
+        | Request::Send { .. }
+        | Request::Reply { .. }
+        | Request::Delete { .. } => {
+            unreachable!("an outbound or delete request is run before the session opens")
         }
     };
     session.logout().await;
@@ -648,21 +715,24 @@ async fn threading_of(
     })
 }
 
-/// The folder `LIST` marks with `attribute` (RFC 6154), else the one named
-/// `name` (case-insensitive) at the top level or directly under `INBOX`.
-fn special_folder(folders: &[ListedFolder], attribute: &str, name: &str) -> Option<String> {
+/// The folder `LIST` marks with `attribute` (RFC 6154), else the first of
+/// `names`, in their order, that names a folder (case-insensitive) at the
+/// top level or directly under `INBOX`.
+fn special_folder(folders: &[ListedFolder], attribute: &str, names: &[&str]) -> Option<String> {
     if let Some(marked) = folders.iter().find(|f| f.has_attribute(attribute)) {
         return Some(marked.name.clone());
     }
-    folders
-        .iter()
-        .find(|f| {
-            f.name.eq_ignore_ascii_case(name)
-                || f.delimiter
-                    .as_deref()
-                    .is_some_and(|d| f.name.eq_ignore_ascii_case(&format!("{FOLDER}{d}{name}")))
-        })
-        .map(|f| f.name.clone())
+    names.iter().find_map(|name| {
+        folders
+            .iter()
+            .find(|f| {
+                f.name.eq_ignore_ascii_case(name)
+                    || f.delimiter
+                        .as_deref()
+                        .is_some_and(|d| f.name.eq_ignore_ascii_case(&format!("{FOLDER}{d}{name}")))
+            })
+            .map(|f| f.name.clone())
+    })
 }
 
 /// The message `given` from `mailbox`, with `message_id` and `threading`.
@@ -703,7 +773,7 @@ async fn draft(
             None => Threading::default(),
         };
         let folders = session.list_folders().await.map_err(session_error)?;
-        let Some(drafts) = special_folder(&folders, "\\Drafts", "Drafts") else {
+        let Some(drafts) = special_folder(&folders, "\\Drafts", &["Drafts"]) else {
             return Err(invalid(NO_DRAFTS));
         };
         let message_id = mint_message_id(&mailbox.settings.address);
@@ -814,7 +884,7 @@ async fn save_to_sent(
     };
     let copy: Result<SentCopy, MailboxCheckFailure> = async {
         let folders = session.list_folders().await?;
-        let Some(sent) = special_folder(&folders, "\\Sent", "Sent") else {
+        let Some(sent) = special_folder(&folders, "\\Sent", &["Sent"]) else {
             return Ok(SentCopy::NoFolder);
         };
         session.examine(&sent).await?;
@@ -835,6 +905,139 @@ async fn save_to_sent(
     copy.unwrap_or_else(|failure| SentCopy::Failed {
         reply: failure.reply,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Deleting (the Update of 2026-10-08 (4), clauses 17 to 20)
+// ---------------------------------------------------------------------------
+
+/// How a thread reaches Trash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrashMove {
+    /// `UID MOVE` (RFC 6851).
+    Move,
+    /// `UID COPY`, `UID STORE +FLAGS (\Deleted)`, `UID EXPUNGE` (RFC 4315).
+    CopyThenExpunge,
+}
+
+/// The Trash folder and how to reach it, or the refusal: the server's
+/// `CAPABILITY` after authentication (`IMAP4rev2` holds both `MOVE` and
+/// `UID EXPUNGE`) and the folders `LIST` answers.
+async fn trash_plan(session: &mut ImapSession) -> Result<(String, TrashMove), SealSessionError> {
+    let capabilities = session.capabilities().await.map_err(session_error)?;
+    let has = |name: &str| capabilities.iter().any(|c| c == name || c == "IMAP4REV2");
+    let how = if has("MOVE") {
+        TrashMove::Move
+    } else if has("UIDPLUS") {
+        TrashMove::CopyThenExpunge
+    } else {
+        return Err(invalid(NO_SAFE_MOVE));
+    };
+    let folders = session.list_folders().await.map_err(session_error)?;
+    let trash = special_folder(&folders, "\\Trash", &["Trash", "Deleted"])
+        .ok_or_else(|| invalid(NO_TRASH))?;
+    Ok((trash, how))
+}
+
+/// Text a person reads, control characters removed.
+fn shown_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The admission's read for `mail.delete` before the gate: the plan's
+/// refusals, the thread's presence in `INBOX`, and what the person reads:
+/// `subject`, the oldest message's subject, and `from`, the distinct
+/// senders, oldest first. Read-only: `EXAMINE`, headers by `BODY.PEEK`.
+async fn shown_for_delete(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    thread_id: &str,
+) -> Result<Vec<(&'static str, Value)>, SealSessionError> {
+    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
+        .await
+        .map_err(session_error)?;
+    let shown = async {
+        trash_plan(&mut session).await?;
+        let status = session.examine(FOLDER).await.map_err(session_error)?;
+        let messages = thread_messages(
+            &mut session,
+            &status,
+            thread_id,
+            "UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)]",
+        )
+        .await?;
+        let mut subject = String::new();
+        let mut from: Vec<String> = Vec::new();
+        for message in &messages {
+            let headers = parse_headers(message.header.as_deref().unwrap_or_default());
+            if subject.is_empty() {
+                subject = shown_text(&headers.get("Subject").unwrap_or_default());
+            }
+            if let Some(sender) = headers.get("From").map(|f| shown_text(&f)) {
+                if !from.contains(&sender) {
+                    from.push(sender);
+                }
+            }
+        }
+        Ok(vec![("subject", json!(subject)), ("from", json!(from))])
+    }
+    .await;
+    session.logout().await;
+    shown
+}
+
+/// `mail.delete`: the thread's `INBOX` messages at the run moved to Trash,
+/// by `UID MOVE`, else by `UID COPY`, `UID STORE +FLAGS (\Deleted)` and
+/// `UID EXPUNGE` of exactly those UIDs. Trash is never selected and a plain
+/// `EXPUNGE` is never sent.
+async fn delete(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    thread_id: &str,
+) -> Result<Value, SealSessionError> {
+    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
+        .await
+        .map_err(session_error)?;
+    let answer = async {
+        let (trash, how) = trash_plan(&mut session).await?;
+        let status = session.select(FOLDER).await.map_err(session_error)?;
+        let messages = thread_messages(
+            &mut session,
+            &status,
+            thread_id,
+            "UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]",
+        )
+        .await?;
+        let uids: Vec<u32> = messages.iter().map(|f| f.uid).collect();
+        match how {
+            TrashMove::Move => session
+                .uid_move(&uids, &trash)
+                .await
+                .map_err(session_error)?,
+            TrashMove::CopyThenExpunge => {
+                session
+                    .uid_copy(&uids, &trash)
+                    .await
+                    .map_err(session_error)?;
+                session
+                    .uid_store(&uids, StoreOp::Add, &["\\Deleted".to_string()])
+                    .await
+                    .map_err(session_error)?;
+                session.uid_expunge(&uids).await.map_err(session_error)?;
+            }
+        }
+        Ok(json!({
+            "mailbox": mailbox.binding_id.0.to_string(),
+            "folder": FOLDER,
+            "thread_id": thread_id,
+            "trash_folder": trash,
+            "moved": uids.len(),
+            "message_uids": uids,
+        }))
+    }
+    .await;
+    session.logout().await;
+    answer
 }
 
 /// The root `Message-ID` of a message: its thread's id.

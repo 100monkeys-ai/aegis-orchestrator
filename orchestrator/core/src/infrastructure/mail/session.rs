@@ -4,7 +4,10 @@
 //! 2026-10-07 clauses 1, 2 and 7, and its Update of 2026-10-07 (3) clause
 //! 15): `EXAMINE` or `SELECT`, `UID SEARCH`, `UID FETCH`, `UID STORE`,
 //! `LIST` and `APPEND` over the same wire, TLS and guard as the mailbox
-//! check.
+//! check; and, for `mail.delete` (its Update of 2026-10-08 (4) clause 19),
+//! `CAPABILITY`, `UID MOVE`, `UID COPY` and `UID EXPUNGE`. A plain
+//! `EXPUNGE`, which removes every message any client marked `\Deleted`, is
+//! never sent.
 //!
 //! The session is opened as the check opens it ([`super::imap`]): the
 //! endpoint is admitted by the connector (the production connector applies
@@ -254,6 +257,77 @@ impl ImapSession {
             Arg::atom(uid_set(uids)),
             Arg::atom(verb),
             Arg::atom(format!("({})", flags.join(" "))),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// `CAPABILITY`: what the server says it can do, after authentication
+    /// (a server may name more once a client has logged in). Upper-cased.
+    pub async fn capabilities(&mut self) -> Result<Vec<String>, MailboxCheckFailure> {
+        let responses = self.command(&[Arg::atom("CAPABILITY")]).await?;
+        Ok(responses
+            .iter()
+            .filter_map(|r| {
+                let text = r.text();
+                let upper = text.to_ascii_uppercase();
+                upper.strip_prefix("* CAPABILITY").map(|rest| {
+                    rest.split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .flatten()
+            .collect())
+    }
+
+    /// `UID MOVE <uids> <folder>` (RFC 6851).
+    pub async fn uid_move(
+        &mut self,
+        uids: &[u32],
+        folder: &str,
+    ) -> Result<(), MailboxCheckFailure> {
+        self.uid_to_folder("MOVE", uids, folder).await
+    }
+
+    /// `UID COPY <uids> <folder>`.
+    pub async fn uid_copy(
+        &mut self,
+        uids: &[u32],
+        folder: &str,
+    ) -> Result<(), MailboxCheckFailure> {
+        self.uid_to_folder("COPY", uids, folder).await
+    }
+
+    async fn uid_to_folder(
+        &mut self,
+        verb: &str,
+        uids: &[u32],
+        folder: &str,
+    ) -> Result<(), MailboxCheckFailure> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        self.command(&[
+            Arg::atom("UID"),
+            Arg::atom(verb),
+            Arg::atom(uid_set(uids)),
+            Arg::string(folder),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// `UID EXPUNGE <uids>` (RFC 4315): removes only those of `uids` that
+    /// carry `\Deleted`, never another message.
+    pub async fn uid_expunge(&mut self, uids: &[u32]) -> Result<(), MailboxCheckFailure> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        self.command(&[
+            Arg::atom("UID"),
+            Arg::atom("EXPUNGE"),
+            Arg::atom(uid_set(uids)),
         ])
         .await?;
         Ok(())
