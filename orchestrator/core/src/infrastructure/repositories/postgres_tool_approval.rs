@@ -7,8 +7,27 @@
 //! `036_tool_approvals.sql`, with the `conversation_id` column of
 //! `044_tool_approval_conversation.sql`; [`InMemoryToolApprovalRepository`] keeps them in
 //! process, for tests and for a daemon run without a database.
+//!
+//! ## Sealing (ADR-126, Updates of 2026-10-04 clause 2 and 2026-10-08)
+//!
+//! A request's `arguments`, `summary`, `result` and `error` are stored as
+//! OpenBao Transit ciphertext under the tenant's key ([`transit_key`]), and the
+//! row says so in `sealed` (migration `045_tool_approval_sealed.sql`): the
+//! ciphertext is a JSON string in the JSONB columns `arguments` and `result`
+//! and the text itself in the TEXT columns `summary` and `error`. A row
+//! written before the migration has `sealed = false` and is read as stored.
+//!
+//! The reads that answer the request's own user or run its stored call
+//! ([`ToolApprovalRepository::find_request`],
+//! [`ToolApprovalRepository::list_requests_for_user`],
+//! [`ToolApprovalRepository::decide_pending`]) unseal; the operator's list
+//! ([`ToolApprovalRepository::list_requests`]) and the expiry sweep
+//! ([`ToolApprovalRepository::expire_pending_before`]) answer the four fields
+//! still sealed and decrypt nothing. A refused seal stores nothing, and a
+//! refused unseal fails the read.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -26,22 +45,132 @@ use crate::domain::tool_approval::{
     ToolApprovalId, ToolApprovalPolicy, ToolApprovalPolicyId, ToolApprovalRepository,
     ToolApprovalRequest, ToolApprovalStatus,
 };
+use crate::infrastructure::secrets_manager::SecretsManager;
 
 const REQUEST_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
      arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
-     decided_at, decided_by, result, error, conversation_id";
+     decided_at, decided_by, result, error, conversation_id, sealed";
 
 const POLICY_COLUMNS: &str =
     "id, tenant_id, user_sub, tool_name, binding_id, created_at, created_by, revoked_at";
 
+/// The Transit key a tenant's approval requests are sealed under.
+pub fn transit_key(tenant_id: &TenantId) -> String {
+    format!("tool-approvals-{}", tenant_id.as_str())
+}
+
 pub struct PostgresToolApprovalRepository {
     pool: PgPool,
+    secrets: Arc<SecretsManager>,
+}
+
+/// A request as its row holds it, before any unsealing.
+struct StoredRequest {
+    request: ToolApprovalRequest,
+    sealed: bool,
 }
 
 impl PostgresToolApprovalRepository {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, secrets: Arc<SecretsManager>) -> Self {
+        Self { pool, secrets }
     }
+
+    async fn seal(
+        &self,
+        tenant_id: &TenantId,
+        plaintext: &[u8],
+    ) -> Result<String, RepositoryError> {
+        self.secrets
+            .encrypt(&transit_key(tenant_id), plaintext)
+            .await
+            .map_err(|e| RepositoryError::Database(format!("seal approval request: {e}")))
+    }
+
+    async fn unseal(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        ciphertext: &str,
+    ) -> Result<Vec<u8>, RepositoryError> {
+        self.secrets
+            .decrypt(&transit_key(tenant_id), ciphertext)
+            .await
+            .map_err(|e| RepositoryError::Database(format!("unseal approval request {name}: {e}")))
+    }
+
+    async fn seal_json(
+        &self,
+        tenant_id: &TenantId,
+        value: &Value,
+    ) -> Result<Value, RepositoryError> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|e| RepositoryError::Serialization(format!("seal approval request: {e}")))?;
+        Ok(Value::String(self.seal(tenant_id, &bytes).await?))
+    }
+
+    async fn unseal_json(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        value: &Value,
+    ) -> Result<Value, RepositoryError> {
+        let ciphertext = value.as_str().ok_or_else(|| {
+            RepositoryError::Serialization(format!("sealed {name} is not a ciphertext string"))
+        })?;
+        let bytes = self.unseal(tenant_id, name, ciphertext).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| RepositoryError::Serialization(format!("unsealed {name}: {e}")))
+    }
+
+    async fn unseal_text(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        ciphertext: &str,
+    ) -> Result<String, RepositoryError> {
+        let bytes = self.unseal(tenant_id, name, ciphertext).await?;
+        String::from_utf8(bytes)
+            .map_err(|e| RepositoryError::Serialization(format!("unsealed {name}: {e}")))
+    }
+
+    /// The request with its four sealed fields opened; a row written before
+    /// the migration is answered as stored.
+    async fn open(&self, stored: StoredRequest) -> Result<ToolApprovalRequest, RepositoryError> {
+        let mut request = stored.request;
+        if !stored.sealed {
+            return Ok(request);
+        }
+        let tenant_id = request.tenant_id.clone();
+        request.arguments = self
+            .unseal_json(&tenant_id, "arguments", &request.arguments)
+            .await?;
+        request.summary = self
+            .unseal_text(&tenant_id, "summary", &request.summary)
+            .await?;
+        if let Some(result) = request.result.take() {
+            request.result = Some(self.unseal_json(&tenant_id, "result", &result).await?);
+        }
+        if let Some(error) = request.error.take() {
+            request.error = Some(self.unseal_text(&tenant_id, "error", &error).await?);
+        }
+        Ok(request)
+    }
+
+    async fn open_all(
+        &self,
+        stored: Vec<StoredRequest>,
+    ) -> Result<Vec<ToolApprovalRequest>, RepositoryError> {
+        let mut opened = Vec::with_capacity(stored.len());
+        for row in stored {
+            opened.push(self.open(row).await?);
+        }
+        Ok(opened)
+    }
+}
+
+/// The requests as stored, their sealed fields left sealed.
+fn still_sealed(stored: Vec<StoredRequest>) -> Vec<ToolApprovalRequest> {
+    stored.into_iter().map(|s| s.request).collect()
 }
 
 fn column<'r, T>(row: &'r PgRow, name: &str) -> Result<T, RepositoryError>
@@ -56,13 +185,13 @@ fn tenant(value: String) -> Result<TenantId, RepositoryError> {
     TenantId::new(value).map_err(|e| RepositoryError::Serialization(format!("tenant_id: {e}")))
 }
 
-fn hydrate_request(row: &PgRow) -> Result<ToolApprovalRequest, RepositoryError> {
+fn hydrate_request(row: &PgRow) -> Result<StoredRequest, RepositoryError> {
     let status_text: String = column(row, "status")?;
     let status = ToolApprovalStatus::parse(&status_text).ok_or_else(|| {
         RepositoryError::Serialization(format!("unknown approval status: {status_text}"))
     })?;
     let policy_id: Option<Uuid> = column(row, "policy_id")?;
-    Ok(ToolApprovalRequest {
+    let request = ToolApprovalRequest {
         id: ToolApprovalId(column(row, "id")?),
         tenant_id: tenant(column(row, "tenant_id")?)?,
         user_sub: column(row, "user_sub")?,
@@ -81,6 +210,10 @@ fn hydrate_request(row: &PgRow) -> Result<ToolApprovalRequest, RepositoryError> 
         decided_by: column(row, "decided_by")?,
         result: column(row, "result")?,
         error: column(row, "error")?,
+    };
+    Ok(StoredRequest {
+        request,
+        sealed: column(row, "sealed")?,
     })
 }
 
@@ -100,9 +233,20 @@ fn hydrate_policy(row: &PgRow) -> Result<ToolApprovalPolicy, RepositoryError> {
 #[async_trait]
 impl ToolApprovalRepository for PostgresToolApprovalRepository {
     async fn insert_request(&self, request: &ToolApprovalRequest) -> Result<(), RepositoryError> {
+        let tenant_id = &request.tenant_id;
+        let arguments = self.seal_json(tenant_id, &request.arguments).await?;
+        let summary = self.seal(tenant_id, request.summary.as_bytes()).await?;
+        let result = match &request.result {
+            Some(result) => Some(self.seal_json(tenant_id, result).await?),
+            None => None,
+        };
+        let error = match &request.error {
+            Some(error) => Some(self.seal(tenant_id, error.as_bytes()).await?),
+            None => None,
+        };
         sqlx::query(&format!(
             "INSERT INTO tool_approval_requests ({REQUEST_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, TRUE)"
         ))
         .bind(request.id.0)
         .bind(request.tenant_id.as_str())
@@ -110,8 +254,8 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(request.execution_id.0)
         .bind(request.agent_id.0)
         .bind(&request.tool_name)
-        .bind(&request.arguments)
-        .bind(&request.summary)
+        .bind(&arguments)
+        .bind(&summary)
         .bind(&request.binding_id)
         .bind(&request.security_context_name)
         .bind(request.policy_id.map(|p| p.0))
@@ -119,8 +263,8 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(request.created_at)
         .bind(request.decided_at)
         .bind(&request.decided_by)
-        .bind(&request.result)
-        .bind(&request.error)
+        .bind(&result)
+        .bind(&error)
         .bind(&request.conversation_id)
         .execute(&self.pool)
         .await?;
@@ -137,7 +281,10 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref().map(hydrate_request).transpose()
+        match row.as_ref().map(hydrate_request).transpose()? {
+            Some(stored) => Ok(Some(self.open(stored).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn list_requests_for_user(
@@ -156,7 +303,8 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(status.map(|s| s.as_str()))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(hydrate_request).collect()
+        let stored = rows.iter().map(hydrate_request).collect::<Result<_, _>>()?;
+        self.open_all(stored).await
     }
 
     async fn list_requests(
@@ -170,7 +318,10 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(status.map(|s| s.as_str()))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(hydrate_request).collect()
+        // The operator's read: answered sealed, nothing decrypted.
+        Ok(still_sealed(
+            rows.iter().map(hydrate_request).collect::<Result<_, _>>()?,
+        ))
     }
 
     async fn decide_pending(
@@ -190,7 +341,10 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(decided_at)
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref().map(hydrate_request).transpose()
+        match row.as_ref().map(hydrate_request).transpose()? {
+            Some(stored) => Ok(Some(self.open(stored).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn record_outcome(
@@ -199,6 +353,30 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         result: Option<&Value>,
         error: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        let Some(row) =
+            sqlx::query("SELECT tenant_id, sealed FROM tool_approval_requests WHERE id = $1")
+                .bind(id.0)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(());
+        };
+        let tenant_id = tenant(column(&row, "tenant_id")?)?;
+        let sealed: bool = column(&row, "sealed")?;
+        // A row written before the migration keeps its fields as stored.
+        let (result, error) = if sealed {
+            let result = match result {
+                Some(result) => Some(self.seal_json(&tenant_id, result).await?),
+                None => None,
+            };
+            let error = match error {
+                Some(error) => Some(self.seal(&tenant_id, error.as_bytes()).await?),
+                None => None,
+            };
+            (result, error)
+        } else {
+            (result.cloned(), error.map(str::to_string))
+        };
         sqlx::query("UPDATE tool_approval_requests SET result = $2, error = $3 WHERE id = $1")
             .bind(id.0)
             .bind(result)
@@ -221,7 +399,10 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(now)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(hydrate_request).collect()
+        // The sweep publishes only ids and statuses: nothing is decrypted.
+        Ok(still_sealed(
+            rows.iter().map(hydrate_request).collect::<Result<_, _>>()?,
+        ))
     }
 
     async fn insert_policy(&self, policy: &ToolApprovalPolicy) -> Result<(), RepositoryError> {

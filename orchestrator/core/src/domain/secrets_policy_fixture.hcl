@@ -38,3 +38,19 @@ path "transit/sign/edge-enrollment-token" {
 path "transit/verify/edge-enrollment-token" {
   capabilities = ["update"]
 }
+# Core seals a tool-approval row's arguments, summary, result and error under
+# its tenant's Transit key, tool-approvals-<tenant>, and a git binding's
+# webhook secret under webhook-secret (AEGIS ADR-126, Update of 2026-10-08,
+# clauses 4 and 5). The first encrypt creates the key, hence "create".
+path "transit/encrypt/tool-approvals-*" {
+  capabilities = ["create", "update"]
+}
+path "transit/decrypt/tool-approvals-*" {
+  capabilities = ["update"]
+}
+path "transit/encrypt/webhook-secret" {
+  capabilities = ["create", "update"]
+}
+path "transit/decrypt/webhook-secret" {
+  capabilities = ["update"]
+}

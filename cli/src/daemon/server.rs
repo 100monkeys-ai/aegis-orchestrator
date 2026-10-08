@@ -2031,13 +2031,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // ─── Tool approval gate (AEGIS ADR-126) ─────────────────────────────────
     // Requests and "always allow" policies live in PostgreSQL (migration
     // 036), so a pending request outlives the agent and this process; a node
-    // without a database keeps them in process. The sweep expires requests
-    // pending for 72 hours, every ten minutes.
+    // without a database keeps them in process. A stored request's arguments,
+    // summary, result and error are sealed under its tenant's Transit key
+    // (migration 045). The sweep expires requests pending for 72 hours,
+    // every ten minutes.
     let tool_approval_repo: Arc<
         dyn aegis_orchestrator_core::domain::tool_approval::ToolApprovalRepository,
     > = match db_pool.as_ref() {
         Some(pool) => Arc::new(
-            aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::PostgresToolApprovalRepository::new(pool.clone()),
+            aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::PostgresToolApprovalRepository::new(
+                pool.clone(),
+                secrets_manager.clone(),
+            ),
         ),
         None => Arc::new(
             aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository::new(),

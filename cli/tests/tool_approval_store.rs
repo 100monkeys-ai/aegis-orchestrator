@@ -17,21 +17,41 @@
 //! conversation a request was made in (ADR-126, Update of 2026-10-07 (2),
 //! clause 1): migration 044 run again changes nothing, and the store
 //! round-trips `conversation_id`, a value and null.
+//!
+//! The sealing (ADR-126, Update of 2026-10-08): a stored request's
+//! `arguments`, `summary`, `result` and `error` hold Transit ciphertext under
+//! the tenant's own key and no plaintext of a planted message; a read answers
+//! the plaintext to the request's user; a row written before migration 045
+//! still reads; 045 run again changes nothing; the operator's list and the
+//! sweep decrypt nothing; a refused seal stores nothing. Transit is
+//! [`TransitStandIn`], local to this file: its ciphertext is opaque
+//! (`vault:v1:` and random characters, no plaintext encoded in it) and it opens
+//! a ciphertext only under the key that sealed it.
 
-use std::sync::{Arc, Mutex};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use aegis_orchestrator_core::application::tool_approval_service::{
     ApprovedCallRunner, GateOutcome, GatedCall, ToolApprovalService,
 };
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
+use aegis_orchestrator_core::domain::secrets::{
+    DomainDynamicSecret, SecretStore, SecretsError, SensitiveString,
+};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::tool_approval::{
     ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository,
     ToolApprovalRequest, ToolApprovalStatus,
 };
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
-use aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::PostgresToolApprovalRepository;
+use aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::{
+    transit_key, PostgresToolApprovalRepository,
+};
+use aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager;
 use serde_json::{json, Value};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -63,6 +83,27 @@ struct TestDb {
 
 impl TestDb {
     async fn create() -> Option<Self> {
+        Self::create_with(&MIGRATOR).await
+    }
+
+    /// A database migrated only to the migrations numbered below `version`.
+    async fn create_before(version: i64) -> Option<Self> {
+        let before = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| m.version < version)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        Self::create_with(&before).await
+    }
+
+    async fn create_with(migrator: &Migrator) -> Option<Self> {
         let url = postgres_url()?;
         let server = PgPoolOptions::new()
             .max_connections(1)
@@ -76,7 +117,7 @@ impl TestDb {
             .expect("create the test database");
         let options: PgConnectOptions = url.parse::<PgConnectOptions>().unwrap().database(&name);
         let pool = Self::connect(&options).await;
-        MIGRATOR.run(&pool).await.expect("apply every migration");
+        migrator.run(&pool).await.expect("apply the migrations");
         Some(Self {
             server,
             name,
@@ -115,11 +156,126 @@ impl ApprovedCallRunner for RecordingRunner {
     }
 }
 
-fn service(pool: &PgPool) -> ToolApprovalService {
+/// Transit as OpenBao answers it, for these tests: `encrypt` returns an opaque
+/// `vault:v1:` ciphertext carrying nothing of the plaintext, and `decrypt`
+/// opens it only under the key that sealed it. It records the key of every
+/// ciphertext, counts decrypts, and can be told to refuse.
+#[derive(Default)]
+struct TransitStandIn {
+    sealed: Mutex<HashMap<String, (String, Vec<u8>)>>,
+    decrypts: AtomicUsize,
+    refuse: AtomicBool,
+}
+
+impl TransitStandIn {
+    fn key_of(&self, ciphertext: &str) -> Option<String> {
+        self.sealed
+            .lock()
+            .unwrap()
+            .get(ciphertext)
+            .map(|(key, _)| key.clone())
+    }
+}
+
+fn not_kept() -> SecretsError {
+    SecretsError::ConfigError("the Transit stand-in keeps no KV or dynamic secrets".into())
+}
+
+#[async_trait::async_trait]
+impl SecretStore for TransitStandIn {
+    async fn read(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
+        Err(not_kept())
+    }
+    async fn write(
+        &self,
+        _: &str,
+        _: &str,
+        _: HashMap<String, SensitiveString>,
+    ) -> Result<(), SecretsError> {
+        Err(not_kept())
+    }
+    async fn generate_dynamic(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<DomainDynamicSecret, SecretsError> {
+        Err(not_kept())
+    }
+    async fn renew_lease(&self, _: &str, _: Duration) -> Result<Duration, SecretsError> {
+        Err(not_kept())
+    }
+    async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+        Err(not_kept())
+    }
+    async fn transit_sign(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+        Err(not_kept())
+    }
+    async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+        Err(not_kept())
+    }
+    async fn transit_encrypt(&self, key: &str, plaintext: &[u8]) -> Result<String, SecretsError> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(SecretsError::TransitError(
+                "Encrypt failed: permission denied".into(),
+            ));
+        }
+        let ciphertext = format!(
+            "vault:v1:{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        self.sealed
+            .lock()
+            .unwrap()
+            .insert(ciphertext.clone(), (key.to_string(), plaintext.to_vec()));
+        Ok(ciphertext)
+    }
+    async fn transit_decrypt(&self, key: &str, ciphertext: &str) -> Result<Vec<u8>, SecretsError> {
+        self.decrypts.fetch_add(1, Ordering::SeqCst);
+        match self.sealed.lock().unwrap().get(ciphertext) {
+            Some((sealed_under, plaintext)) if sealed_under == key => Ok(plaintext.clone()),
+            _ => Err(SecretsError::TransitError(
+                "Decrypt failed: cipher: message authentication failed".into(),
+            )),
+        }
+    }
+}
+
+/// The Transit every rebuilt service of a test process shares, as every core
+/// pod shares one OpenBao.
+fn shared_transit() -> Arc<TransitStandIn> {
+    static TRANSIT: OnceLock<Arc<TransitStandIn>> = OnceLock::new();
+    TRANSIT.get_or_init(Default::default).clone()
+}
+
+fn secrets(transit: &Arc<TransitStandIn>) -> Arc<SecretsManager> {
+    Arc::new(SecretsManager::from_store(
+        transit.clone(),
+        Arc::new(EventBus::new(64)),
+    ))
+}
+
+fn repo_with(pool: &PgPool, transit: &Arc<TransitStandIn>) -> PostgresToolApprovalRepository {
+    PostgresToolApprovalRepository::new(pool.clone(), secrets(transit))
+}
+
+fn repo(pool: &PgPool) -> PostgresToolApprovalRepository {
+    repo_with(pool, &shared_transit())
+}
+
+fn service_with(pool: &PgPool, transit: &Arc<TransitStandIn>) -> ToolApprovalService {
     ToolApprovalService::new(
-        Arc::new(PostgresToolApprovalRepository::new(pool.clone())),
+        Arc::new(repo_with(pool, transit)),
         Arc::new(EventBus::new(64)),
     )
+}
+
+fn service(pool: &PgPool) -> ToolApprovalService {
+    service_with(pool, &shared_transit())
 }
 
 fn tenant() -> TenantId {
@@ -210,11 +366,7 @@ async fn a_pending_request_survives_a_rebuild_of_the_service_on_the_same_databas
         .unwrap();
     assert_eq!(decided.status, ToolApprovalStatus::ApprovedOnce);
     assert_eq!(*runner.ran.lock().unwrap(), vec![args]);
-    let stored = PostgresToolApprovalRepository::new(pool.clone())
-        .find_request(id)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = repo(&pool).find_request(id).await.unwrap().unwrap();
     assert_eq!(
         stored.result,
         Some(json!({"message_id": "<1@example.com>"}))
@@ -325,7 +477,7 @@ async fn the_sweep_expires_only_requests_pending_72_hours() {
     .unwrap();
 
     assert_eq!(svc.expire_stale(chrono::Utc::now()).await.unwrap(), 1);
-    let repo = PostgresToolApprovalRepository::new(db.pool.clone());
+    let repo = repo(&db.pool);
     assert_eq!(
         repo.find_request(old).await.unwrap().unwrap().status,
         ToolApprovalStatus::Expired
@@ -407,7 +559,7 @@ async fn a_policy_keyed_on_a_contract_declared_argument_matches_only_its_own_too
         )
         .await,
     );
-    let stored = PostgresToolApprovalRepository::new(db.pool.clone())
+    let stored = repo(&db.pool)
         .list_requests_for_user(&tenant(), USER, Some(ToolApprovalStatus::Pending))
         .await
         .unwrap();
@@ -470,7 +622,7 @@ async fn migration_044_run_again_changes_nothing() {
         1,
         "tool_approval_requests has no nullable conversation_id column after every migration"
     );
-    let repo = PostgresToolApprovalRepository::new(db.pool.clone());
+    let repo = repo(&db.pool);
     let stored = request_in(Some(CONVERSATION));
     repo.insert_request(&stored).await.unwrap();
     let before = snapshot().await;
@@ -503,7 +655,7 @@ async fn a_conversation_id_round_trips_through_the_store_a_value_and_null() {
     let Some(db) = TestDb::create().await else {
         return;
     };
-    let repo = PostgresToolApprovalRepository::new(db.pool.clone());
+    let repo = repo(&db.pool);
     let in_conversation = request_in(Some(CONVERSATION));
     let in_none = request_in(None);
     repo.insert_request(&in_conversation).await.unwrap();
@@ -538,6 +690,333 @@ async fn a_conversation_id_round_trips_through_the_store_a_value_and_null() {
             Some(None)
         ),
         "the store did not round-trip conversation_id (a value and null)"
+    );
+    db.remove().await;
+}
+
+// ── Sealing (ADR-126, Update of 2026-10-08) ─────────────────────────────────
+
+const PLANTED: &str = "PLANTED-7f3a the meeting moves to Thursday at the old place";
+
+fn planted_args() -> Value {
+    json!({
+        "account": "b-1",
+        "to": "friend@example.com",
+        "subject": "Planted subject 7f3a",
+        "body": PLANTED,
+    })
+}
+
+/// Answers the run with the planted message in its result.
+struct EchoRunner;
+
+#[async_trait::async_trait]
+impl ApprovedCallRunner for EchoRunner {
+    async fn run_approved_call(&self, _: &ToolApprovalRequest) -> Result<Value, String> {
+        Ok(json!({"sent": PLANTED}))
+    }
+}
+
+/// Refuses the run with an error naming the planted message.
+struct RefusingRunner;
+
+#[async_trait::async_trait]
+impl ApprovedCallRunner for RefusingRunner {
+    async fn run_approved_call(&self, _: &ToolApprovalRequest) -> Result<Value, String> {
+        Err(format!(
+            "'{PLANTED}' is not an email address this tool can send to."
+        ))
+    }
+}
+
+async fn gate_for(svc: &ToolApprovalService, sub: &str, args: &Value) -> GateOutcome {
+    svc.gate(GatedCall {
+        tenant_id: &TenantId::for_consumer_user(sub).unwrap(),
+        user_sub: Some(sub),
+        execution_id: ExecutionId::new(),
+        agent_id: AgentId::new(),
+        tool_name: "outbound.send",
+        arguments: args,
+        security_context_name: "zaru-pro",
+        conversation_id: None,
+        contract: contract(),
+    })
+    .await
+    .expect("gate")
+}
+
+/// The four sealed columns of a row as their text values.
+async fn stored_columns(pool: &PgPool, id: ToolApprovalId) -> Vec<(&'static str, Option<String>)> {
+    let row = sqlx::query(
+        "SELECT arguments #>> '{}' AS arguments, summary, result #>> '{}' AS result, error \
+         FROM tool_approval_requests WHERE id = $1",
+    )
+    .bind(id.0)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    ["arguments", "summary", "result", "error"]
+        .into_iter()
+        .map(|c| (c, row.get::<Option<String>, _>(c)))
+        .collect()
+}
+
+/// Test 1: after the write, no sealed column holds plaintext of the planted
+/// message; each holds `vault:v1:` ciphertext.
+#[tokio::test]
+async fn a_stored_requests_arguments_summary_result_and_error_hold_no_plaintext_of_its_message() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let svc = service(&db.pool);
+    let sent = pending_id(gate(&svc, USER, "outbound.send", &planted_args()).await);
+    svc.decide(
+        sent,
+        &tenant(),
+        USER,
+        ToolApprovalDecision::Once,
+        &EchoRunner,
+    )
+    .await
+    .unwrap();
+    let refused = pending_id(gate(&svc, USER, "outbound.send", &planted_args()).await);
+    svc.decide(
+        refused,
+        &tenant(),
+        USER,
+        ToolApprovalDecision::Once,
+        &RefusingRunner,
+    )
+    .await
+    .unwrap();
+
+    let mut failures = Vec::new();
+    for (id, columns) in [
+        (sent, ["arguments", "summary", "result"].as_slice()),
+        (refused, ["arguments", "summary", "error"].as_slice()),
+    ] {
+        for (column, value) in stored_columns(&db.pool, id).await {
+            if !columns.contains(&column) {
+                continue;
+            }
+            let value = value.unwrap_or_default();
+            if value.contains("PLANTED-7f3a") || value.contains("Planted subject") {
+                failures.push(format!(
+                    "{column} holds plaintext of the planted message: {value}"
+                ));
+            } else if !value.starts_with("vault:v1:") {
+                failures.push(format!("{column} is not Transit ciphertext: {value}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    db.remove().await;
+}
+
+/// Test 2: every read the request's user makes answers the plaintext, and
+/// the approved run receives the plaintext arguments.
+#[tokio::test]
+async fn a_read_answers_the_plaintext_to_its_user() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let svc = service(&db.pool);
+    let id = pending_id(gate(&svc, USER, "outbound.send", &planted_args()).await);
+    let listed = svc
+        .list_for_user(&tenant(), USER, Some(ToolApprovalStatus::Pending))
+        .await
+        .unwrap();
+    assert_eq!(listed[0].arguments, planted_args());
+    assert!(listed[0].summary.contains(PLANTED), "{}", listed[0].summary);
+
+    let runner = RecordingRunner::default();
+    svc.decide(id, &tenant(), USER, ToolApprovalDecision::Once, &runner)
+        .await
+        .unwrap();
+    assert_eq!(*runner.ran.lock().unwrap(), vec![planted_args()]);
+    let read = svc.get_for_user(id, &tenant(), USER).await.unwrap();
+    assert_eq!(read.arguments, planted_args());
+    assert_eq!(read.result, Some(json!({"message_id": "<1@example.com>"})));
+    db.remove().await;
+}
+
+/// Test 3: a row written before migration 045 reads as it was stored, and
+/// its approved run receives its arguments.
+#[tokio::test]
+async fn a_row_written_before_migration_045_still_reads() {
+    let Some(db) = TestDb::create_before(45).await else {
+        return;
+    };
+    let id = ToolApprovalId::new();
+    let args = json!({"account": "b-1", "to": "old@example.com", "body": "written before"});
+    sqlx::query(
+        "INSERT INTO tool_approval_requests (id, tenant_id, user_sub, execution_id, agent_id, \
+         tool_name, arguments, summary, binding_id, security_context_name, status, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 'outbound.send', $6, 'outbound.send\nbody: written before', \
+         'b-1', 'zaru-pro', 'pending', now())",
+    )
+    .bind(id.0)
+    .bind(tenant().as_str())
+    .bind(USER)
+    .bind(uuid::Uuid::new_v4())
+    .bind(uuid::Uuid::new_v4())
+    .bind(&args)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    MIGRATOR.run(&db.pool).await.expect("apply migration 045");
+
+    let svc = service(&db.pool);
+    let read = svc.get_for_user(id, &tenant(), USER).await;
+    let read = read.unwrap_or_else(|e| panic!("a row written before 045 did not read: {e}"));
+    assert_eq!(read.arguments, args);
+    assert_eq!(read.summary, "outbound.send\nbody: written before");
+    let runner = RecordingRunner::default();
+    let decided = svc
+        .decide(id, &tenant(), USER, ToolApprovalDecision::Once, &runner)
+        .await
+        .unwrap_or_else(|e| panic!("a row written before 045 could not be answered: {e}"));
+    assert_eq!(*runner.ran.lock().unwrap(), vec![args]);
+    assert_eq!(
+        decided.result,
+        Some(json!({"message_id": "<1@example.com>"}))
+    );
+    db.remove().await;
+}
+
+/// Test 4: migration 045 applied again over a migrated schema, with sealed
+/// rows in it, changes nothing.
+#[tokio::test]
+async fn migration_045_run_again_changes_nothing() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let svc = service(&db.pool);
+    pending_id(gate(&svc, USER, "outbound.send", &planted_args()).await);
+    let snapshot = || async {
+        sqlx::query(
+            "SELECT (SELECT count(*) FROM tool_approval_requests WHERE sealed) AS sealed, \
+                    (SELECT count(*) FROM information_schema.columns \
+                     WHERE table_name = 'tool_approval_requests') AS columns",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map(|row| (row.get::<i64, _>("sealed"), row.get::<i64, _>("columns")))
+        .unwrap()
+    };
+    let before = snapshot().await;
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 45)
+        .expect("migration 045 ships");
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 045 run again");
+    assert_eq!(snapshot().await, before);
+    db.remove().await;
+}
+
+/// Test 5: each tenant's rows are sealed under its own key.
+#[tokio::test]
+async fn each_tenant_seals_under_its_own_key() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let transit = Arc::new(TransitStandIn::default());
+    let svc = service_with(&db.pool, &transit);
+    let mut failures = Vec::new();
+    for sub in [USER, "other-sub"] {
+        let id = pending_id(gate_for(&svc, sub, &planted_args()).await);
+        let expected = transit_key(&TenantId::for_consumer_user(sub).unwrap());
+        for (column, value) in stored_columns(&db.pool, id).await {
+            let Some(value) = value else { continue };
+            match transit.key_of(&value) {
+                Some(key) if key == expected => {}
+                other => failures.push(format!(
+                    "{sub}'s {column} is not sealed under {expected}: sealed under {other:?}"
+                )),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    db.remove().await;
+}
+
+/// Test 6: the operator's list answers the sealed columns as ciphertext, and
+/// neither it nor the sweep decrypts anything.
+#[tokio::test]
+async fn the_operator_read_and_the_sweep_decrypt_nothing() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let transit = Arc::new(TransitStandIn::default());
+    let svc = service_with(&db.pool, &transit);
+    pending_id(gate(&svc, USER, "outbound.send", &planted_args()).await);
+    let old = pending_id(gate(&svc, USER, "outbound.send", &planted_args()).await);
+    sqlx::query(
+        "UPDATE tool_approval_requests SET created_at = now() - interval '73 hours' WHERE id = $1",
+    )
+    .bind(old.0)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let mut failures = Vec::new();
+    for request in svc.list_all(None).await.unwrap() {
+        let arguments = request.arguments.as_str().unwrap_or_default().to_string();
+        for (column, value) in [
+            ("arguments", arguments),
+            ("summary", request.summary.clone()),
+        ] {
+            if !value.starts_with("vault:v1:") {
+                failures.push(format!(
+                    "the operator's list answers {column} unsealed: {value}"
+                ));
+            }
+        }
+    }
+    assert_eq!(svc.expire_stale(chrono::Utc::now()).await.unwrap(), 1);
+    let decrypts = transit.decrypts.load(Ordering::SeqCst);
+    if decrypts != 0 {
+        failures.push(format!(
+            "the operator's list and the sweep decrypted {decrypts} values"
+        ));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    db.remove().await;
+}
+
+/// Test 7: a seal Transit refuses stores no row, and the gate fails.
+#[tokio::test]
+async fn a_refused_seal_stores_nothing() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let transit = Arc::new(TransitStandIn::default());
+    transit.refuse.store(true, Ordering::SeqCst);
+    let svc = service_with(&db.pool, &transit);
+    let outcome = svc
+        .gate(GatedCall {
+            tenant_id: &tenant(),
+            user_sub: Some(USER),
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tool_name: "outbound.send",
+            arguments: &planted_args(),
+            security_context_name: "zaru-pro",
+            conversation_id: None,
+            contract: contract(),
+        })
+        .await;
+    let rows: i64 = sqlx::query("SELECT count(*) AS n FROM tool_approval_requests")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert!(
+        outcome.is_err() && rows == 0,
+        "a refused seal stored {rows} rows and the gate answered {outcome:?}"
     );
     db.remove().await;
 }

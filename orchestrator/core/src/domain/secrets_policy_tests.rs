@@ -121,11 +121,15 @@ impl PolicyEnforcingStore {
     }
 
     fn require(&self, caps: &[&str], engine: &str, path: &str) -> Result<(), SecretsError> {
-        let api = format!("{engine}/data/{path}");
+        self.require_api(caps, &format!("{engine}/data/{path}"))
+    }
+
+    /// `api` is the request's API path, as a policy rule names it.
+    fn require_api(&self, caps: &[&str], api: &str) -> Result<(), SecretsError> {
         let granted = caps.iter().all(|cap| {
             self.rules
                 .iter()
-                .any(|(rule, have)| matches(rule, &api) && have.iter().any(|h| h == cap))
+                .any(|(rule, have)| matches(rule, api) && have.iter().any(|h| h == cap))
         });
         if granted {
             Ok(())
@@ -184,10 +188,14 @@ impl SecretStore for PolicyEnforcingStore {
     ) -> Result<bool, SecretsError> {
         self.inner.transit_verify(key, data, sig).await
     }
+    /// Encrypt upserts: a key that does not exist yet is created by the first
+    /// encrypt only under `create`, so both capabilities are required.
     async fn transit_encrypt(&self, key: &str, pt: &[u8]) -> Result<String, SecretsError> {
+        self.require_api(&["create", "update"], &format!("transit/encrypt/{key}"))?;
         self.inner.transit_encrypt(key, pt).await
     }
     async fn transit_decrypt(&self, key: &str, ct: &str) -> Result<Vec<u8>, SecretsError> {
+        self.require_api(&["update"], &format!("transit/decrypt/{key}"))?;
         self.inner.transit_decrypt(key, ct).await
     }
 }
@@ -491,4 +499,35 @@ fn organisation_team_and_system_tenants_resolve_as_before() {
         (p.namespace.as_str(), p.effective_mount().as_str()),
         ("tenant-zaru-consumer", "tenant-zaru-consumer/kv")
     );
+}
+
+/// The deployed policy admits encrypt (creating the key on first use) and
+/// decrypt under a tenant's tool-approval key and under the webhook key, and
+/// under no other key.
+#[tokio::test]
+async fn the_policy_admits_the_tool_approval_and_webhook_transit_keys_and_no_other() {
+    let store = PolicyEnforcingStore::new();
+    let tenant = TenantId::for_consumer_user(ALICE).unwrap();
+    let mut failures = Vec::new();
+    for key in [
+        crate::infrastructure::repositories::postgres_tool_approval::transit_key(&tenant),
+        "webhook-secret".to_string(),
+    ] {
+        match store.transit_encrypt(&key, b"message").await {
+            Ok(ciphertext) => {
+                if let Err(e) = store.transit_decrypt(&key, &ciphertext).await {
+                    failures.push(format!("decrypt under {key} refused: {e}"));
+                }
+            }
+            Err(e) => failures.push(format!("encrypt under {key} refused: {e}")),
+        }
+    }
+    if store
+        .transit_encrypt("edge-enrollment-token", b"message")
+        .await
+        .is_ok()
+    {
+        failures.push("encrypt under edge-enrollment-token admitted".to_string());
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
