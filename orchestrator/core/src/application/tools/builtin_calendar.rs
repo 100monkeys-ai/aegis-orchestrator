@@ -1,13 +1,35 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! The calendar read tools: `calendar.calendars`, `calendar.list` and
-//! `calendar.read` (AEGIS ADR-138 K5a, K6's read half, K6a's read refusals,
-//! K6c, K6d).
+//! The calendar tools (AEGIS ADR-138 K5a, K6, K6a, K6b, K6c, K6d, K6e, K7a):
+//! `calendar.calendars`, `calendar.list` and `calendar.read` read;
+//! `calendar.create`, `calendar.update`, `calendar.delete` and
+//! `calendar.respond` write.
 //!
 //! They speak CalDAV only, over a calendar account of the acting person
 //! (K1), inside the orchestrator: the OAuth access token `access_token_for`
-//! answers goes as a bearer and never reaches an agent. They read and never
-//! write, so they skip the inner-loop judge (K6c) and no gate holds them.
+//! answers goes as a bearer and never reaches an agent. The reads skip the
+//! inner-loop judge and no gate holds them; the writes pass the judge and
+//! wait at the approval gate (K6c, K7).
+//!
+//! **Writes** (K6, K6e). `calendar.create` puts a new resource
+//! `<uuid>.ics` with `If-None-Match: *`, its times in UTC (dates all day),
+//! and with attendees the account as `ORGANIZER` and each attendee invited
+//! and unanswered. `calendar.update`, `calendar.delete` and
+//! `calendar.respond` read the event (`GET`), refuse before any change a
+//! repeating event (update, delete), an event another address organises
+//! (update, delete) or one the account does not attend (respond), and write
+//! with `If-Match` of the `ETag` they read: a `412` is answered "The event
+//! changed since it was read; read it again; nothing was changed.". The
+//! tools send no mail: invitations and updates to attendees are the
+//! calendar server's (K6b).
+//!
+//! **The admission before the gate** (K7a). [`CalendarTools::admit`] checks
+//! the account and the arguments, and for update, delete and respond reads
+//! the event and answers the values the person reads on the card
+//! (`current_title`, `current_start`; `title`, `start`, `end`, `attendees`;
+//! `title`, `start`, `organizer`, `repeats`), which the dispatch writes over
+//! the model's. A stored call run on its person's approval reads the event
+//! again and writes with the `ETag` it then reads.
 //!
 //! **Who may use an account** (K5a, the mail tools' rules with "mailbox"
 //! read as "calendar account"). The tool acts as the call's person (none
@@ -42,10 +64,15 @@ use crate::domain::credential::CredentialBindingId;
 use crate::domain::execution::{ContextChoice, ServerChoice};
 use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
 use crate::domain::tenant::TenantId;
+use crate::infrastructure::calendar::caldav::EventResource;
 use crate::infrastructure::calendar::caldav::{CalDavClient, CalDavError};
-use crate::infrastructure::calendar::ical::{parse_calendar, IcalTime, Party, VEvent};
+use crate::infrastructure::calendar::ical::{
+    attendee_line, new_event_calendar, organizer_line, parse_calendar, same_address, utc_value,
+    write_component, Component, ContentLine, EventTime, IcalTime, NewEvent, Party, VEvent,
+};
 use crate::infrastructure::calendar::{shown_reply, CalDavTransport, ReqwestTransport};
-use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, TimeZone, Utc};
+use crate::infrastructure::mail::message::is_address;
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,12 +114,52 @@ pub const BAD_LIMIT: &str = "'limit' must be a whole number from 1 to 100.";
 /// The refusal for an `event_id` that is not one path segment.
 pub const BAD_EVENT_ID: &str = "'event_id' must be an event id calendar.list answered.";
 
+/// The most attendees an event may have (K6a).
+pub const MAX_ATTENDEES: usize = 50;
+/// The most characters of a title (K6a).
+pub const TITLE_MAX_CHARS: usize = 1_000;
+
+/// The refusal for a title that is not one line of at most 1000
+/// characters (K6a).
+pub const BAD_TITLE: &str = "'title' must be one line of at most 1000 characters.";
+/// The refusal for a description over 32000 characters (K6a).
+pub const BAD_DESCRIPTION: &str = "'description' must be plain text of at most 32000 characters.";
+/// The refusal for more than [`MAX_ATTENDEES`] attendees (K6a).
+pub const TOO_MANY_ATTENDEES: &str = "An event has at most 50 attendees.";
+/// The refusal for a repeating event to update or delete (K6a).
+pub const REPEATS: &str = "This event repeats; changing or deleting a repeating event is not supported yet; nothing was changed.";
+/// The refusal for an event another address organises (K6a).
+pub const NOT_ORGANISER: &str = "You are not this event's organiser; answer it with calendar.respond instead; nothing was changed.";
+/// The refusal for an event the account does not attend (K6a).
+pub const NOT_ATTENDEE: &str = "You are not an attendee of this event; nothing was answered.";
+/// The answer to a `412` on any write (K6a).
+pub const EVENT_CHANGED: &str =
+    "The event changed since it was read; read it again; nothing was changed.";
+/// The refusal for an event its server gave no `ETag` (K6e (b)).
+pub const NO_ETAG: &str = "The calendar server gave this event no etag; nothing was changed.";
+/// The refusal for a date and a time given together (K6e (c)).
+pub const MIXED_TIMES: &str = "'start' and 'end' must both be dates (YYYY-MM-DD) or both be times.";
+/// The refusal for a `response` other than the three answers (K6e (i)).
+pub const BAD_RESPONSE: &str = "'response' must be accepted, declined or tentative.";
+/// The refusal for a `calendar.update` that changes nothing.
+pub const NOTHING_TO_UPDATE: &str =
+    "calendar.update needs at least one of title, start, end, description, location or attendees.";
+
+/// The calendar tools that change an event; each waits for its person's
+/// approval (K7).
+pub const WRITE_TOOLS: &[&str] = &[
+    "calendar.create",
+    "calendar.update",
+    "calendar.delete",
+    "calendar.respond",
+];
+
 /// Whether `tool_name` is one of the calendar tools this module serves.
 pub fn is_calendar_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "calendar.calendars" | "calendar.list" | "calendar.read"
-    )
+    ) || WRITE_TOOLS.contains(&tool_name)
 }
 
 /// The refusal of `'<x>' is not an active calendar connection of yours.`
@@ -124,6 +191,14 @@ impl CalendarActing {
     pub fn choice_key() -> &'static str {
         CALENDAR_CHOICE_KEY
     }
+}
+
+/// A gated calendar call as its admission found it: the account's binding
+/// id, and the values read from the event to write over the model's.
+#[derive(Debug, Clone)]
+pub struct CalendarAdmitted {
+    pub binding: CredentialBindingId,
+    pub shown: Vec<(&'static str, Value)>,
 }
 
 /// The calendar tools: the account source and the transport their requests
@@ -165,6 +240,30 @@ impl CalendarTools {
             Ok(result) => result,
             Err(_) => Err(timed_out()),
         }
+    }
+
+    /// Admit a gated calendar tool's call before the approval gate (K7a):
+    /// the account (answered by id, a context name resolved), the arguments
+    /// by K6a, the calendar's origin (K6d), and for update, delete and
+    /// respond the event read and refused by K6a, with the values a person
+    /// reads before answering. Nothing is written.
+    pub async fn admit(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        acting: &CalendarActing,
+    ) -> Result<CalendarAdmitted, SealSessionError> {
+        let account = self.account_for(args, acting).await?;
+        let request = Request::parse(tool_name, args, Utc::now())?;
+        let admit = admit(self.transport.as_ref(), &account, &request);
+        let shown = match tokio::time::timeout(CALL_TIMEOUT, admit).await {
+            Ok(shown) => shown?,
+            Err(_) => return Err(timed_out()),
+        };
+        Ok(CalendarAdmitted {
+            binding: account.binding_id,
+            shown,
+        })
     }
 
     /// The account the call may use, or its refusal.
@@ -263,6 +362,13 @@ fn invalid(message: impl Into<String>) -> SealSessionError {
     SealSessionError::InvalidArguments(message.into())
 }
 
+/// A refusal about the event's own state: the call conflicts with it
+/// (K6e (a)).
+fn conflict(message: &str) -> SealSessionError {
+    SealSessionError::InvalidArguments(message.to_string())
+        .answered(CallerAnswer::Conflict(message.to_string()))
+}
+
 /// A client failure as the caller is told it: an identifier off the
 /// server's origin with the client's own sentence (K6d), an event id that
 /// is not one segment with [`BAD_EVENT_ID`], and anything else as the
@@ -272,6 +378,7 @@ fn caldav_error(error: CalDavError, account: &ToolCalendar) -> SealSessionError 
     match error {
         CalDavError::OutsideServer(_) => invalid(error.to_string()),
         CalDavError::InvalidEventId(_) => invalid(BAD_EVENT_ID),
+        CalDavError::Changed => conflict(EVENT_CHANGED),
         other => SealSessionError::UpstreamUnavailable(format!(
             "The calendar server did not complete the request: {}",
             shown_reply(&other.to_string(), &account.auth)
@@ -294,6 +401,155 @@ enum Request {
         calendar_id: String,
         event_id: String,
     },
+    Create(NewEventArgs),
+    Update {
+        calendar_id: String,
+        event_id: String,
+        changes: Changes,
+    },
+    Delete {
+        calendar_id: String,
+        event_id: String,
+    },
+    Respond {
+        calendar_id: String,
+        event_id: String,
+        /// `accepted`, `declined` or `tentative`, as the call gave it.
+        response: &'static str,
+    },
+}
+
+/// `calendar.create`'s arguments, checked.
+#[derive(Debug, Clone, PartialEq)]
+struct NewEventArgs {
+    calendar_id: String,
+    title: String,
+    start: EventTime,
+    end: EventTime,
+    description: Option<String>,
+    location: Option<String>,
+    attendees: Vec<String>,
+}
+
+/// What `calendar.update` changes; `None` leaves a property as it is.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Changes {
+    title: Option<String>,
+    start: Option<EventTime>,
+    end: Option<EventTime>,
+    description: Option<String>,
+    location: Option<String>,
+    attendees: Option<Vec<String>>,
+}
+
+impl Changes {
+    fn is_empty(&self) -> bool {
+        *self == Changes::default()
+    }
+}
+
+/// A title: one line of at most [`TITLE_MAX_CHARS`] characters, not empty
+/// (K6a, K6e (i)).
+fn title_argument(args: &Value) -> Result<Option<String>, SealSessionError> {
+    match args.get("title") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(title))
+            if !title.trim().is_empty()
+                && !title.contains(['\n', '\r'])
+                && title.chars().count() <= TITLE_MAX_CHARS =>
+        {
+            Ok(Some(title.clone()))
+        }
+        Some(_) => Err(invalid(BAD_TITLE)),
+    }
+}
+
+/// A description: plain text of at most [`DESCRIPTION_MAX_CHARS`]
+/// characters (K6a).
+fn description_argument(args: &Value) -> Result<Option<String>, SealSessionError> {
+    match args.get("description") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(d)) if d.chars().count() <= DESCRIPTION_MAX_CHARS => Ok(Some(d.clone())),
+        Some(_) => Err(invalid(BAD_DESCRIPTION)),
+    }
+}
+
+/// A location: text.
+fn location_argument(args: &Value) -> Result<Option<String>, SealSessionError> {
+    match args.get("location") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(l)) => Ok(Some(l.clone())),
+        Some(_) => Err(invalid("'location' must be text.")),
+    }
+}
+
+/// The attendees: a list of at most [`MAX_ATTENDEES`] addresses, each by
+/// the mail tools' address rule (K6a). `None` when absent.
+fn attendees_argument(args: &Value) -> Result<Option<Vec<String>>, SealSessionError> {
+    const NOT_A_LIST: &str = "'attendees' must be a list of email addresses.";
+    let list = match args.get("attendees") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err(invalid(NOT_A_LIST)),
+    };
+    if list.len() > MAX_ATTENDEES {
+        return Err(invalid(TOO_MANY_ATTENDEES));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        let Some(address) = item.as_str() else {
+            return Err(invalid(NOT_A_LIST));
+        };
+        if !is_address(address) {
+            let shown: String = address
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(80)
+                .collect();
+            return Err(invalid(format!(
+                "'{shown}' is not an email address this tool can invite."
+            )));
+        }
+        out.push(address.to_string());
+    }
+    Ok(Some(out))
+}
+
+/// A time a write takes: an RFC 3339 time with an offset (written in UTC)
+/// or a date `YYYY-MM-DD` (all day) (K6e (c)).
+fn event_time_argument(args: &Value, name: &str) -> Result<Option<EventTime>, SealSessionError> {
+    let refusal = || {
+        invalid(format!(
+            "'{name}' must be a time in RFC 3339 form with an offset, or a date written YYYY-MM-DD."
+        ))
+    };
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            if let Ok(at) = DateTime::parse_from_rfc3339(s) {
+                return Ok(Some(EventTime::At(at.with_timezone(&Utc))));
+            }
+            if s.len() == 10 {
+                if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                    return Ok(Some(EventTime::Date(date)));
+                }
+            }
+            Err(refusal())
+        }
+        Some(_) => Err(refusal()),
+    }
+}
+
+/// `end` after `start`, both of one kind (K6a, K6e (c)).
+fn check_order(start: &EventTime, end: &EventTime) -> Result<(), SealSessionError> {
+    match (start, end) {
+        (EventTime::At(s), EventTime::At(e)) if e > s => Ok(()),
+        (EventTime::Date(s), EventTime::Date(e)) if e > s => Ok(()),
+        (EventTime::At(_), EventTime::At(_)) | (EventTime::Date(_), EventTime::Date(_)) => {
+            Err(invalid(END_NOT_AFTER_START))
+        }
+        _ => Err(invalid(MIXED_TIMES)),
+    }
 }
 
 fn required_string(args: &Value, name: &str, refusal: &str) -> Result<String, SealSessionError> {
@@ -360,6 +616,70 @@ impl Request {
                 calendar_id: required_string(args, "calendar_id", BAD_CALENDAR)?,
                 event_id: required_string(args, "event_id", BAD_EVENT_ID)?,
             }),
+            "calendar.create" => {
+                let calendar_id = required_string(args, "calendar_id", BAD_CALENDAR)?;
+                let title = title_argument(args)?.ok_or_else(|| invalid(BAD_TITLE))?;
+                let start = event_time_argument(args, "start")?;
+                let end = event_time_argument(args, "end")?;
+                let (Some(start), Some(end)) = (start, end) else {
+                    let missing = if start.is_none() { "start" } else { "end" };
+                    return Err(invalid(format!(
+                        "'{missing}' must be a time in RFC 3339 form with an offset, or a date written YYYY-MM-DD."
+                    )));
+                };
+                check_order(&start, &end)?;
+                Ok(Request::Create(NewEventArgs {
+                    calendar_id,
+                    title,
+                    start,
+                    end,
+                    description: description_argument(args)?,
+                    location: location_argument(args)?,
+                    attendees: attendees_argument(args)?.unwrap_or_default(),
+                }))
+            }
+            "calendar.update" => {
+                let calendar_id = required_string(args, "calendar_id", BAD_CALENDAR)?;
+                let event_id = required_string(args, "event_id", BAD_EVENT_ID)?;
+                let changes = Changes {
+                    title: title_argument(args)?,
+                    start: event_time_argument(args, "start")?,
+                    end: event_time_argument(args, "end")?,
+                    description: description_argument(args)?,
+                    location: location_argument(args)?,
+                    attendees: attendees_argument(args)?,
+                };
+                if changes.is_empty() {
+                    return Err(invalid(NOTHING_TO_UPDATE));
+                }
+                if let (Some(start), Some(end)) = (&changes.start, &changes.end) {
+                    check_order(start, end)?;
+                }
+                Ok(Request::Update {
+                    calendar_id,
+                    event_id,
+                    changes,
+                })
+            }
+            "calendar.delete" => Ok(Request::Delete {
+                calendar_id: required_string(args, "calendar_id", BAD_CALENDAR)?,
+                event_id: required_string(args, "event_id", BAD_EVENT_ID)?,
+            }),
+            "calendar.respond" => {
+                let calendar_id = required_string(args, "calendar_id", BAD_CALENDAR)?;
+                let event_id = required_string(args, "event_id", BAD_EVENT_ID)?;
+                let response = match args.get("response").and_then(Value::as_str) {
+                    Some("accepted") => "accepted",
+                    Some("declined") => "declined",
+                    Some("tentative") => "tentative",
+                    _ => return Err(invalid(BAD_RESPONSE)),
+                };
+                Ok(Request::Respond {
+                    calendar_id,
+                    event_id,
+                    response,
+                })
+            }
             other => Err(invalid(format!("'{other}' is not a calendar tool."))),
         }
     }
@@ -494,7 +814,412 @@ async fn run(
             answer["etag"] = json!(resource.etag);
             Ok(answer)
         }
+        Request::Create(event) => {
+            client
+                .resolve(&event.calendar_id)
+                .map_err(|e| caldav_error(e, account))?;
+            let id = uuid::Uuid::new_v4();
+            let event_id = format!("{id}.ics");
+            let uid = match account.settings.address.rsplit_once('@') {
+                Some((_, domain)) if !domain.is_empty() => {
+                    format!("{id}@{}", domain.to_ascii_lowercase())
+                }
+                _ => id.to_string(),
+            };
+            let calendar = new_event_calendar(&NewEvent {
+                uid: uid.clone(),
+                stamp: Utc::now(),
+                start: event.start,
+                end: event.end,
+                title: event.title.clone(),
+                description: event.description.clone(),
+                location: event.location.clone(),
+                organizer: account.settings.address.clone(),
+                attendees: event.attendees.clone(),
+            });
+            let etag = client
+                .put_new(&event.calendar_id, &event_id, write_component(&calendar))
+                .await
+                .map_err(|e| caldav_error(e, account))?;
+            Ok(json!({
+                "account": account_id,
+                "calendar_id": event.calendar_id,
+                "event_id": event_id,
+                "uid": uid,
+                "etag": etag,
+            }))
+        }
+        Request::Update {
+            calendar_id,
+            event_id,
+            changes,
+        } => {
+            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            refuse_change(&read, &account.settings.address)?;
+            let calendar = updated(&read, changes, &account.settings.address, Utc::now())?;
+            let etag = client
+                .put_existing(
+                    calendar_id,
+                    event_id,
+                    write_component(&calendar),
+                    &read.etag,
+                )
+                .await
+                .map_err(|e| caldav_error(e, account))?;
+            Ok(json!({
+                "account": account_id,
+                "calendar_id": calendar_id,
+                "event_id": event_id,
+                "etag": etag,
+            }))
+        }
+        Request::Delete {
+            calendar_id,
+            event_id,
+        } => {
+            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            refuse_change(&read, &account.settings.address)?;
+            client
+                .delete(calendar_id, event_id, &read.etag)
+                .await
+                .map_err(|e| caldav_error(e, account))?;
+            Ok(json!({
+                "account": account_id,
+                "calendar_id": calendar_id,
+                "event_id": event_id,
+                "deleted": true,
+            }))
+        }
+        Request::Respond {
+            calendar_id,
+            event_id,
+            response,
+        } => {
+            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            let calendar = responded(&read, &account.settings.address, response, Utc::now())?;
+            let etag = client
+                .put_existing(
+                    calendar_id,
+                    event_id,
+                    write_component(&calendar),
+                    &read.etag,
+                )
+                .await
+                .map_err(|e| caldav_error(e, account))?;
+            Ok(json!({
+                "account": account_id,
+                "calendar_id": calendar_id,
+                "event_id": event_id,
+                "response": response,
+                "etag": etag,
+            }))
+        }
     }
+}
+
+/// The admission's half of a gated call (K7a): the calendar's origin
+/// checked, and for update, delete and respond the event read, refused by
+/// K6a and answered as the values a person reads. Nothing is written.
+async fn admit(
+    transport: &dyn CalDavTransport,
+    account: &ToolCalendar,
+    request: &Request,
+) -> Result<Vec<(&'static str, Value)>, SealSessionError> {
+    let client = CalDavClient::new(transport, &account.settings, &account.auth)
+        .map_err(|e| caldav_error(e, account))?;
+    let address = &account.settings.address;
+    match request {
+        Request::Create(event) => {
+            client
+                .resolve(&event.calendar_id)
+                .map_err(|e| caldav_error(e, account))?;
+            Ok(Vec::new())
+        }
+        Request::Update {
+            calendar_id,
+            event_id,
+            changes,
+        } => {
+            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            refuse_change(&read, address)?;
+            updated(&read, changes, address, Utc::now())?;
+            let event = read.master();
+            Ok(vec![
+                ("current_title", json!(event.summary().map(|t| clean(&t)))),
+                (
+                    "current_start",
+                    json!(event.start().as_ref().map(time_shown)),
+                ),
+            ])
+        }
+        Request::Delete {
+            calendar_id,
+            event_id,
+        } => {
+            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            refuse_change(&read, address)?;
+            let event = read.master();
+            Ok(vec![
+                ("title", json!(event.summary().map(|t| clean(&t)))),
+                ("start", json!(event.start().as_ref().map(time_shown))),
+                ("end", json!(event.end().as_ref().map(time_shown))),
+                (
+                    "attendees",
+                    json!(event
+                        .attendees()
+                        .iter()
+                        .map(|a| clean(&a.address))
+                        .collect::<Vec<_>>()),
+                ),
+            ])
+        }
+        Request::Respond {
+            calendar_id,
+            event_id,
+            response,
+        } => {
+            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            responded(&read, address, response, Utc::now())?;
+            let event = read.master();
+            Ok(vec![
+                ("title", json!(event.summary().map(|t| clean(&t)))),
+                ("start", json!(event.start().as_ref().map(time_shown))),
+                (
+                    "organizer",
+                    json!(event.organizer().as_ref().map(party_shown)),
+                ),
+                ("repeats", json!(read.repeats())),
+            ])
+        }
+        Request::Calendars | Request::List { .. } | Request::Read { .. } => Ok(Vec::new()),
+    }
+}
+
+/// An event read to be changed: its resource, its calendar object, and the
+/// `ETag` the change is conditioned on.
+struct ReadEvent {
+    calendar: Component,
+    etag: String,
+}
+
+impl ReadEvent {
+    /// The index of the event the resource is about: its `VEVENT` without a
+    /// `RECURRENCE-ID`, else its first.
+    fn master_index(&self) -> usize {
+        let events: Vec<usize> = self
+            .calendar
+            .components
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name == "VEVENT")
+            .map(|(i, _)| i)
+            .collect();
+        events
+            .iter()
+            .copied()
+            .find(|&i| {
+                VEvent(&self.calendar.components[i])
+                    .recurrence_id()
+                    .is_none()
+            })
+            .or_else(|| events.first().copied())
+            .expect("a read event holds a VEVENT")
+    }
+
+    fn master(&self) -> VEvent<'_> {
+        VEvent(&self.calendar.components[self.master_index()])
+    }
+
+    /// Whether any event of the resource repeats.
+    fn repeats(&self) -> bool {
+        self.calendar.events().any(|e| e.repeats())
+    }
+}
+
+/// `GET` of the event to change, read and holding an `ETag` (K6e (b)).
+async fn read_for_change(
+    client: &CalDavClient<'_>,
+    account: &ToolCalendar,
+    calendar_id: &str,
+    event_id: &str,
+) -> Result<ReadEvent, SealSessionError> {
+    let EventResource { etag, data, .. } = client
+        .event(calendar_id, event_id)
+        .await
+        .map_err(|e| caldav_error(e, account))?;
+    let calendar = parse_calendar(&data).map_err(|detail| {
+        SealSessionError::UpstreamUnavailable(format!(
+            "The calendar server did not complete the request: the event could not be read: {detail}"
+        ))
+    })?;
+    if calendar.events().next().is_none() {
+        return Err(SealSessionError::UpstreamUnavailable(
+            "The calendar server did not complete the request: the resource holds no event."
+                .to_string(),
+        ));
+    }
+    let etag = etag
+        .filter(|e| !e.trim().is_empty())
+        .ok_or_else(|| conflict(NO_ETAG))?;
+    Ok(ReadEvent { calendar, etag })
+}
+
+/// K6a's refusals for `calendar.update` and `calendar.delete`: a repeating
+/// event, and an event whose `ORGANIZER` is another address.
+fn refuse_change(read: &ReadEvent, address: &str) -> Result<(), SealSessionError> {
+    if read.repeats() {
+        return Err(conflict(REPEATS));
+    }
+    if let Some(organizer) = read.master().organizer() {
+        if !same_address(&organizer.address, address) {
+            return Err(conflict(NOT_ORGANISER));
+        }
+    }
+    Ok(())
+}
+
+/// The event's other end as a write compares with it: a UTC time as it is,
+/// a date as a date, and a `TZID` or floating time read as UTC (no time
+/// zone database is carried).
+fn as_event_time(time: &IcalTime) -> Option<EventTime> {
+    if time.all_day {
+        return time.date().map(EventTime::Date);
+    }
+    time.utc()
+        .or_else(|| time.local().map(|t| Utc.from_utc_datetime(&t)))
+        .map(EventTime::At)
+}
+
+/// The calendar object `calendar.update` writes (K6, K6e (d)): only the
+/// named properties changed, times in UTC with `TZID` dropped, a lone
+/// `start` or `end` checked against the event's other end, `DURATION`
+/// replaced by `DTEND` when `end` is given, the attendees replaced (those
+/// kept keep their answer, an empty list removes them all), `SEQUENCE`
+/// incremented and `DTSTAMP` refreshed.
+fn updated(
+    read: &ReadEvent,
+    changes: &Changes,
+    address: &str,
+    now: DateTime<Utc>,
+) -> Result<Component, SealSessionError> {
+    let index = read.master_index();
+    let mut calendar = read.calendar.clone();
+    let current = VEvent(&read.calendar.components[index]);
+    match (&changes.start, &changes.end) {
+        (Some(start), None) => {
+            if let Some(end) = current.end().as_ref().and_then(as_event_time) {
+                check_order(start, &end)?;
+            }
+        }
+        (None, Some(end)) => {
+            if let Some(start) = current.start().as_ref().and_then(as_event_time) {
+                check_order(&start, end)?;
+            }
+        }
+        _ => {}
+    }
+    let event = &mut calendar.components[index];
+    if let Some(title) = &changes.title {
+        event.set_property(ContentLine::new("SUMMARY", escape(title)));
+    }
+    if let Some(description) = &changes.description {
+        event.set_property(ContentLine::new("DESCRIPTION", escape(description)));
+    }
+    if let Some(location) = &changes.location {
+        event.set_property(ContentLine::new("LOCATION", escape(location)));
+    }
+    if let Some(start) = &changes.start {
+        event.set_property(start.line("DTSTART"));
+    }
+    if let Some(end) = &changes.end {
+        event.remove_properties("DURATION");
+        event.set_property(end.line("DTEND"));
+    }
+    if let Some(attendees) = &changes.attendees {
+        let kept: Vec<ContentLine> = attendees
+            .iter()
+            .map(|wanted| {
+                event
+                    .properties_named("ATTENDEE")
+                    .find(|line| same_address(&Party::from_property(line).address, wanted))
+                    .cloned()
+                    .unwrap_or_else(|| attendee_line(wanted))
+            })
+            .collect();
+        let at = event
+            .properties
+            .iter()
+            .position(|p| p.name == "ATTENDEE")
+            .unwrap_or(event.properties.len());
+        event.remove_properties("ATTENDEE");
+        let at = at.min(event.properties.len());
+        for (offset, line) in kept.into_iter().enumerate() {
+            event.properties.insert(at + offset, line);
+        }
+        if !attendees.is_empty() && event.property("ORGANIZER").is_none() {
+            event.properties.push(organizer_line(address));
+        }
+    }
+    event.bump_sequence();
+    event.set_property(ContentLine::new("DTSTAMP", utc_value(now)));
+    Ok(calendar)
+}
+
+/// The calendar object `calendar.respond` writes (K6, K6e (h)): `PARTSTAT`
+/// set on the account's `ATTENDEE` in every `VEVENT` it attends, `RSVP`
+/// kept, and those events' `DTSTAMP` refreshed. Refused when the account
+/// attends none (K6a).
+fn responded(
+    read: &ReadEvent,
+    address: &str,
+    response: &str,
+    now: DateTime<Utc>,
+) -> Result<Component, SealSessionError> {
+    let partstat = response.to_ascii_uppercase();
+    let mut calendar = read.calendar.clone();
+    let mut attends = false;
+    for event in calendar
+        .components
+        .iter_mut()
+        .filter(|c| c.name == "VEVENT")
+    {
+        if event.set_partstat(address, &partstat) {
+            attends = true;
+            event.set_property(ContentLine::new("DTSTAMP", utc_value(now)));
+        }
+    }
+    if !attends {
+        return Err(conflict(NOT_ATTENDEE));
+    }
+    Ok(calendar)
+}
+
+fn escape(text: &str) -> String {
+    crate::infrastructure::calendar::ical::escape_text(text)
+}
+
+/// `text` with its control characters removed, for a value a person reads.
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// A time as a person reads it on the card (K6e (f)): RFC 3339 as written,
+/// with its `TZID` after it when it has one.
+fn time_shown(time: &IcalTime) -> String {
+    let written = time.rfc3339().unwrap_or_else(|| time.value.clone());
+    clean(&match &time.tzid {
+        Some(tzid) => format!("{written} {tzid}"),
+        None => written,
+    })
+}
+
+/// A party as a person reads it on the card (K6e (f)): `Name <address>`,
+/// or the address alone.
+fn party_shown(party: &Party) -> String {
+    clean(&match &party.name {
+        Some(name) if !name.trim().is_empty() => format!("{name} <{}>", party.address),
+        _ => party.address.clone(),
+    })
 }
 
 /// An instant to order events by: a UTC value as it is, an all-day value

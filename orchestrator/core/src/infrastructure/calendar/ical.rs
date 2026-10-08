@@ -11,6 +11,12 @@
 //! - **Components** are kept as a tree with every property in its order, so
 //!   what is not read is written back unchanged; [`VEvent`] reads the event
 //!   properties the calendar tools use.
+//! - **Writing an event** (AEGIS ADR-138 K6, K6e): [`new_event_calendar`]
+//!   builds a new `VCALENDAR` holding one `VEVENT` with its times in UTC (or
+//!   `DATE` values all day); [`Component::set_property`],
+//!   [`Component::remove_properties`], [`Component::bump_sequence`] and
+//!   [`Component::set_partstat`] change an event read from its server and
+//!   leave every other line as it was.
 //! - **Times** are carried as written: a `TZID` parameter is kept with its
 //!   local time, a UTC time (`Z`) and an all-day `DATE` are read as such. No
 //!   time zone database and no recurrence engine: a server's `expand` gives
@@ -251,6 +257,181 @@ impl Component {
             .iter()
             .filter(|c| c.name == "VEVENT")
             .map(VEvent)
+    }
+}
+
+impl Component {
+    /// Put `line` in place of the first property of its name, removing any
+    /// further ones of that name; with none, add it after the others.
+    pub fn set_property(&mut self, line: ContentLine) {
+        match self.properties.iter().position(|p| p.name == line.name) {
+            Some(first) => {
+                let name = line.name.clone();
+                self.properties[first] = line;
+                let mut index = 0;
+                self.properties.retain(|p| {
+                    let keep = index <= first || p.name != name;
+                    index += 1;
+                    keep
+                });
+            }
+            None => self.properties.push(line),
+        }
+    }
+
+    /// Remove every property `name`.
+    pub fn remove_properties(&mut self, name: &str) {
+        self.properties
+            .retain(|p| !p.name.eq_ignore_ascii_case(name));
+    }
+
+    /// Increment `SEQUENCE` (RFC 5545 §3.8.7.4): an absent or unreadable
+    /// value counts as 0. Answers the new value.
+    pub fn bump_sequence(&mut self) -> u64 {
+        let next = self
+            .property("SEQUENCE")
+            .and_then(|p| p.value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            + 1;
+        self.set_property(ContentLine::new("SEQUENCE", next.to_string()));
+        next
+    }
+
+    /// Set `PARTSTAT` to `partstat` on every `ATTENDEE` whose address is
+    /// `address` ([`same_address`]), keeping its other parameters. Answers
+    /// whether any did.
+    pub fn set_partstat(&mut self, address: &str, partstat: &str) -> bool {
+        let mut found = false;
+        for property in self.properties.iter_mut().filter(|p| p.name == "ATTENDEE") {
+            if !same_address(&Party::from_property(property).address, address) {
+                continue;
+            }
+            found = true;
+            match property
+                .params
+                .iter_mut()
+                .find(|(name, _)| name == "PARTSTAT")
+            {
+                Some((_, values)) => *values = vec![partstat.to_string()],
+                None => property
+                    .params
+                    .push(("PARTSTAT".to_string(), vec![partstat.to_string()])),
+            }
+        }
+        found
+    }
+}
+
+/// Whether two calendar addresses are the same: compared without case,
+/// `mailto:` removed from either.
+pub fn same_address(a: &str, b: &str) -> bool {
+    fn bare(s: &str) -> &str {
+        let s = s.trim();
+        match s.get(..7) {
+            Some(scheme) if scheme.eq_ignore_ascii_case("mailto:") => &s[7..],
+            _ => s,
+        }
+    }
+    bare(a).eq_ignore_ascii_case(bare(b))
+}
+
+/// The `PRODID` of every calendar object the tools write.
+pub const PRODID: &str = "-//100monkeys.ai//AEGIS calendar tools//EN";
+
+/// A time the tools write: an instant, written in UTC, or an all-day date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTime {
+    At(DateTime<Utc>),
+    Date(NaiveDate),
+}
+
+impl EventTime {
+    /// The property `name` (`DTSTART`, `DTEND`) holding this time:
+    /// `<name>:YYYYMMDDTHHMMSSZ`, or `<name>;VALUE=DATE:YYYYMMDD`.
+    pub fn line(&self, name: &str) -> ContentLine {
+        match self {
+            EventTime::At(at) => ContentLine::new(name, utc_value(*at)),
+            EventTime::Date(date) => ContentLine {
+                name: name.to_ascii_uppercase(),
+                params: vec![("VALUE".to_string(), vec!["DATE".to_string()])],
+                value: date.format("%Y%m%d").to_string(),
+            },
+        }
+    }
+}
+
+/// An instant as a UTC DATE-TIME value, `YYYYMMDDTHHMMSSZ`.
+pub fn utc_value(at: DateTime<Utc>) -> String {
+    at.format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// `ORGANIZER:mailto:<address>`.
+pub fn organizer_line(address: &str) -> ContentLine {
+    ContentLine::new("ORGANIZER", format!("mailto:{address}"))
+}
+
+/// `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:<address>`: an invited
+/// attendee who has not answered.
+pub fn attendee_line(address: &str) -> ContentLine {
+    ContentLine {
+        name: "ATTENDEE".to_string(),
+        params: vec![
+            ("PARTSTAT".to_string(), vec!["NEEDS-ACTION".to_string()]),
+            ("RSVP".to_string(), vec!["TRUE".to_string()]),
+        ],
+        value: format!("mailto:{address}"),
+    }
+}
+
+/// A new event as `calendar.create` writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewEvent {
+    pub uid: String,
+    pub stamp: DateTime<Utc>,
+    pub start: EventTime,
+    pub end: EventTime,
+    pub title: String,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    /// The organiser's address, written only with attendees.
+    pub organizer: String,
+    pub attendees: Vec<String>,
+}
+
+/// A new `VCALENDAR` holding `event` as its one `VEVENT`: `UID`,
+/// `DTSTAMP`, `DTSTART` and `DTEND` (UTC, or `DATE` all day), `SUMMARY`,
+/// `DESCRIPTION` and `LOCATION` when given, `SEQUENCE:0`, and with
+/// attendees the `ORGANIZER` and each `ATTENDEE` invited and unanswered.
+pub fn new_event_calendar(event: &NewEvent) -> Component {
+    let mut properties = vec![
+        ContentLine::new("UID", event.uid.clone()),
+        ContentLine::new("DTSTAMP", utc_value(event.stamp)),
+        event.start.line("DTSTART"),
+        event.end.line("DTEND"),
+        ContentLine::new("SUMMARY", escape_text(&event.title)),
+    ];
+    if let Some(description) = &event.description {
+        properties.push(ContentLine::new("DESCRIPTION", escape_text(description)));
+    }
+    if let Some(location) = &event.location {
+        properties.push(ContentLine::new("LOCATION", escape_text(location)));
+    }
+    properties.push(ContentLine::new("SEQUENCE", "0"));
+    if !event.attendees.is_empty() {
+        properties.push(organizer_line(&event.organizer));
+        properties.extend(event.attendees.iter().map(|a| attendee_line(a)));
+    }
+    Component {
+        name: "VCALENDAR".to_string(),
+        properties: vec![
+            ContentLine::new("VERSION", "2.0"),
+            ContentLine::new("PRODID", PRODID),
+        ],
+        components: vec![Component {
+            name: "VEVENT".to_string(),
+            properties,
+            components: Vec::new(),
+        }],
     }
 }
 
@@ -630,5 +811,123 @@ mod tests {
             .unwrap_err()
             .contains("never closed"));
         assert!(parse_calendar("no colon here").is_err());
+    }
+
+    #[test]
+    fn a_new_event_is_written_in_utc_with_its_organiser_and_unanswered_attendees() {
+        let stamp = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
+        let event = NewEvent {
+            uid: "u-1@example.test".to_string(),
+            stamp,
+            start: EventTime::At(Utc.with_ymd_and_hms(2026, 10, 9, 8, 0, 0).unwrap()),
+            end: EventTime::At(Utc.with_ymd_and_hms(2026, 10, 9, 9, 0, 0).unwrap()),
+            title: "Plan, review; go".to_string(),
+            description: Some("Two\nlines".to_string()),
+            location: None,
+            organizer: "me@example.test".to_string(),
+            attendees: vec!["ann@example.test".to_string()],
+        };
+        let written = write_component(&new_event_calendar(&event));
+        let mut wrong = Vec::new();
+        for line in [
+            "PRODID:-//100monkeys.ai//AEGIS calendar tools//EN",
+            "UID:u-1@example.test",
+            "DTSTAMP:20261008T120000Z",
+            "DTSTART:20261009T080000Z",
+            "DTEND:20261009T090000Z",
+            "SUMMARY:Plan\\, review\\; go",
+            "SEQUENCE:0",
+            "ORGANIZER:mailto:me@example.test",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.test",
+        ] {
+            if !written.split("\r\n").any(|l| l == line) {
+                wrong.push(format!("no line {line:?}"));
+            }
+        }
+        if written.contains("LOCATION") {
+            wrong.push("a LOCATION was written without one".to_string());
+        }
+        let alone = NewEvent {
+            attendees: Vec::new(),
+            start: EventTime::Date(NaiveDate::from_ymd_opt(2026, 10, 9).unwrap()),
+            end: EventTime::Date(NaiveDate::from_ymd_opt(2026, 10, 10).unwrap()),
+            ..event
+        };
+        let written = write_component(&new_event_calendar(&alone));
+        if !written.contains("\r\nDTSTART;VALUE=DATE:20261009\r\n")
+            || !written.contains("\r\nDTEND;VALUE=DATE:20261010\r\n")
+        {
+            wrong.push(format!(
+                "an all-day event is not written as dates: {written}"
+            ));
+        }
+        if written.contains("ORGANIZER") || written.contains("ATTENDEE") {
+            wrong.push("an event without attendees names an organiser".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn setting_a_property_changes_only_its_line_and_sequence_counts_up() {
+        let mut calendar = parse_calendar(EVENT).expect("parses");
+        let before = calendar.components[0].clone();
+        let event = &mut calendar.components[0];
+        event.set_property(ContentLine::new("SUMMARY", "New"));
+        event.set_property(ContentLine::new("X-NEW", "1"));
+        let mut wrong = Vec::new();
+        if event.bump_sequence() != 1 || event.bump_sequence() != 2 {
+            wrong.push("SEQUENCE did not count up from none".to_string());
+        }
+        let changed: Vec<String> = event
+            .properties
+            .iter()
+            .filter(|p| !before.properties.contains(p))
+            .map(ContentLine::to_line)
+            .collect();
+        if changed != ["SUMMARY:New", "X-NEW:1", "SEQUENCE:2"] {
+            wrong.push(format!("the changed lines are {changed:?}"));
+        }
+        if event.properties.iter().position(|p| p.name == "SUMMARY")
+            != before.properties.iter().position(|p| p.name == "SUMMARY")
+        {
+            wrong.push("SUMMARY moved".to_string());
+        }
+        if event.components != before.components {
+            wrong.push("the alarm changed".to_string());
+        }
+        event.remove_properties("rrule");
+        if event.property("RRULE").is_some() {
+            wrong.push("RRULE was not removed".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn partstat_is_set_on_the_attendee_of_that_address_only() {
+        let mut calendar = parse_calendar(EVENT).expect("parses");
+        let event = &mut calendar.components[0];
+        let mut wrong = Vec::new();
+        if !event.set_partstat("A@Example.Test", "ACCEPTED") {
+            wrong.push("the attendee was not found without case".to_string());
+        }
+        if event.set_partstat("nobody@example.test", "ACCEPTED") {
+            wrong.push("an address that attends nothing was found".to_string());
+        }
+        let lines: Vec<String> = event
+            .properties_named("ATTENDEE")
+            .map(ContentLine::to_line)
+            .collect();
+        if lines
+            != [
+                "ATTENDEE;CN=Sam;PARTSTAT=ACCEPTED:MAILTO:sam@example.test",
+                "ATTENDEE;PARTSTAT=ACCEPTED;RSVP=TRUE:mailto:a@example.test",
+            ]
+        {
+            wrong.push(format!("the attendees read {lines:?}"));
+        }
+        if !same_address("MAILTO:sam@example.test", "Sam@Example.test") {
+            wrong.push("mailto: and case are not ignored".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

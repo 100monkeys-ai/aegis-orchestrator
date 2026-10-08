@@ -991,6 +991,45 @@ impl ToolInvocationService {
             }
         }
 
+        // --- A gated calendar tool's account and event, admitted before the
+        // gate (AEGIS ADR-138 K7a, the mail tools' clause 11) ---
+        // A person is never asked about a call its account, its arguments or
+        // its event would refuse; the stored call names the account by id,
+        // and the values a person reads (the event's title, times,
+        // attendees, organiser) are the event's as read, never the model's.
+        if crate::application::tools::builtin_calendar::is_calendar_tool(&tool_name)
+            && self.tool_router.requires_approval(&tool_name)
+        {
+            if let Some(tools) = self.calendar_tools.as_deref() {
+                let acting = self
+                    .calendar_acting(
+                        *agent_id,
+                        execution_id,
+                        tenant_id,
+                        caller_identity,
+                        call_contexts,
+                    )
+                    .await;
+                match tools.admit(&tool_name, &args, &acting).await {
+                    Ok(admitted) => {
+                        args["account"] = Value::String(admitted.binding.0.to_string());
+                        for (name, value) in admitted.shown {
+                            args[name] = value;
+                        }
+                    }
+                    Err(e) => {
+                        self.publish_invocation_failed(
+                            invocation_id,
+                            execution_id,
+                            *agent_id,
+                            e.to_string(),
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         // --- Approval gate (ADR-126 D2) ---
         // After the security context allowed the call and before the
         // inner-loop judge: a call the policy forbids never reaches a person,

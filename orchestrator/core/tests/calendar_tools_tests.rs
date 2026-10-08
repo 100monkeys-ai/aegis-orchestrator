@@ -1,7 +1,9 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Calendar accounts over CalDAV, AEGIS ADR-138 K2, K4 and K5, and the read
-//! tools of K5a, K6, K6a, K6c and K6d (the module `read_tools`).
+//! Calendar accounts over CalDAV, AEGIS ADR-138 K2, K4 and K5, the read
+//! tools of K5a, K6, K6a, K6c and K6d (the module `read_tools`), and the
+//! write tools of K6, K6a, K6b, K6c, K6e, K7 and K7a (the module
+//! `read_tools::write_tools`).
 //!
 //! - K4: an OAuth callback granted the calendar scope stores the binding's
 //!   CalDAV settings (`metadata.calendar`) with its address as label; one
@@ -21,6 +23,15 @@
 //!   refusals, the query, `truncated`, the times as the server gave them,
 //!   the capped description, the identifiers kept on the server's origin,
 //!   and the catalogue's entries (skip the judge, not gated).
+//! - K6, K6a, K6b, K6c, K6e, K7, K7a: `calendar.create`, `calendar.update`,
+//!   `calendar.delete` and `calendar.respond`: each write's request (`PUT`
+//!   with `If-None-Match: *` or `If-Match`, `DELETE` with `If-Match`, times
+//!   in UTC, `SEQUENCE`, `PARTSTAT`), a `412` answered with its sentence and
+//!   nothing changed, each K6a refusal before any change, the four
+//!   contracts and the catalogue's mark no capability entry clears, the
+//!   admission before the gate writing the account's id and the event's
+//!   values over the model's, a refused admission writing no row, and an
+//!   approved run reading the event again.
 //!
 //! Every server these tests talk to is on 127.0.0.1: the CalDAV stand-in
 //! (`support/caldav_standins.rs`) and a mockito token endpoint. No request
@@ -2160,6 +2171,1156 @@ spec:
             &self,
             _event: aegis_orchestrator_core::domain::events::StorageEvent,
         ) {
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // K6, K6a, K6b, K6c, K6e, K7, K7a: the write tools
+    // -----------------------------------------------------------------------
+
+    /// The four calendar writes, against the loopback CalDAV stand-in: the
+    /// tools' requests driven directly (ungated, as the approved run drives
+    /// them), and the tool service with the approval gate for the contracts,
+    /// the admission before the gate and the approved run.
+    mod write_tools {
+        use super::*;
+        use crate::caldav_standins::Recorded;
+        use aegis_orchestrator_core::application::tool_approval_service::ToolApprovalService;
+        use aegis_orchestrator_core::application::tools::builtin_calendar::{
+            CalendarActing, CalendarTools, BAD_DESCRIPTION, BAD_RESPONSE, BAD_TITLE, EVENT_CHANGED,
+            MIXED_TIMES, NOTHING_TO_UPDATE, NOT_ATTENDEE, NOT_ORGANISER, NO_ETAG, REPEATS,
+            TOO_MANY_ATTENDEES,
+        };
+        use aegis_orchestrator_core::domain::execution::ServerChoice;
+        use aegis_orchestrator_core::domain::node_config::ToolCapabilityConfig;
+        use aegis_orchestrator_core::domain::tool_approval::{
+            ApprovalContract, ToolApprovalDecision, ToolApprovalId, ToolApprovalRepository,
+            ToolApprovalStatus,
+        };
+        use aegis_orchestrator_core::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository;
+
+        /// An event the account organises: zoned times, one attendee who
+        /// accepted and one who has not answered, an alarm and a property
+        /// the tools do not read.
+        const MINE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Stand-in//EN\r\nBEGIN:VEVENT\r\nUID:mine@example.test\r\nDTSTAMP:20261001T000000Z\r\nDTSTART;TZID=Europe/Berlin:20261009T100000\r\nDTEND;TZID=Europe/Berlin:20261009T110000\r\nSUMMARY:Board review\r\nLOCATION:Room 4\r\nSEQUENCE:3\r\nX-STAND-IN-KEEP:untouched\r\nORGANIZER;CN=Me:mailto:a@example.test\r\nATTENDEE;CN=Ann;PARTSTAT=ACCEPTED:mailto:ann@example.test\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:dave@example.test\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        /// An event Jane organises, to which the account is invited.
+        const THEIRS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Stand-in//EN\r\nBEGIN:VEVENT\r\nUID:theirs@example.test\r\nDTSTAMP:20261001T000000Z\r\nDTSTART:20261010T090000Z\r\nDTEND:20261010T100000Z\r\nSUMMARY:Jane's sync\r\nSEQUENCE:1\r\nORGANIZER;CN=Jane:mailto:jane@example.test\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:MAILTO:A@Example.Test\r\nATTENDEE;CN=Sam;PARTSTAT=ACCEPTED:mailto:sam@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        /// A weekly event the account organises.
+        const WEEKLY_MINE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Stand-in//EN\r\nBEGIN:VEVENT\r\nUID:weekly-mine@example.test\r\nDTSTART:20261006T090000Z\r\nDTEND:20261006T100000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Weekly\r\nORGANIZER:mailto:a@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        /// An event with no organiser and no attendees.
+        const SOLO: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Stand-in//EN\r\nBEGIN:VEVENT\r\nUID:solo@example.test\r\nDTSTART:20261011T090000Z\r\nDTEND:20261011T100000Z\r\nSUMMARY:Focus time\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        fn event(name: &str, etag: &str, ics: &str) -> StandInEvent {
+            StandInEvent {
+                name: name.to_string(),
+                etag: etag.to_string(),
+                ics: ics.to_string(),
+            }
+        }
+
+        /// The client's stand-in with the write tests' events on Work.
+        fn write_config() -> StandInConfig {
+            let mut config = client_config();
+            config.calendars[0].events.extend([
+                event("mine.ics", "\"etag-mine-1\"", MINE),
+                event("theirs.ics", "\"etag-theirs-1\"", THEIRS),
+                event("weekly-mine.ics", "\"etag-weekly-1\"", WEEKLY_MINE),
+                event("solo.ics", "\"etag-solo-1\"", SOLO),
+                event("no-etag.ics", "", SOLO),
+            ]);
+            config
+        }
+
+        /// A conversation of the person with nothing chosen: admitted on
+        /// ownership alone.
+        fn conversation() -> CalendarActing {
+            CalendarActing {
+                tenant_id: TenantId::default(),
+                user_id: Some(PERSON.to_string()),
+                agent_id: AgentId::new(),
+                workflow_id: None,
+                choice: ServerChoice::NotGiven,
+                has_execution_record: false,
+            }
+        }
+
+        fn tools(account: &Account, standin: &CalDavStandIn) -> CalendarTools {
+            CalendarTools::with_transport(
+                Arc::new(Accounts(vec![account.clone()])),
+                Arc::new(ReqwestTransport::to_origin(standin.origin())),
+            )
+        }
+
+        /// The sentence a refusal tells its caller.
+        fn refusal(error: &SealSessionError) -> String {
+            match error {
+                SealSessionError::Answered {
+                    answer:
+                        CallerAnswer::Conflict(message)
+                        | CallerAnswer::CredentialBindingRequired { message },
+                    ..
+                } => message.clone(),
+                SealSessionError::InvalidArguments(message)
+                | SealSessionError::UpstreamUnavailable(message) => message.clone(),
+                other => format!("{other:?}"),
+            }
+        }
+
+        /// What a tool's call answered, or the sentence its refusal tells.
+        fn said(result: &std::result::Result<Value, SealSessionError>) -> String {
+            match result {
+                Ok(value) => format!("answered {value}"),
+                Err(e) => refusal(e),
+            }
+        }
+
+        /// The sentence a service call's refusal tells its caller.
+        fn told_by(result: &std::result::Result<ToolInvocationResult, SealSessionError>) -> String {
+            match result {
+                Ok(ToolInvocationResult::Direct(value)) => format!("answered {value}"),
+                Ok(_) => "the call was dispatched".to_string(),
+                Err(e) => refusal(e),
+            }
+        }
+
+        /// The requests that would change something.
+        fn writes(requests: &[Recorded]) -> Vec<String> {
+            requests
+                .iter()
+                .filter(|r| r.method == "PUT" || r.method == "DELETE")
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect()
+        }
+
+        /// The unfolded content lines of an iCalendar body.
+        fn lines(ics: &str) -> Vec<String> {
+            aegis_orchestrator_core::infrastructure::calendar::ical::unfold(ics)
+                .split("\r\n")
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn path(name: &str) -> String {
+            format!("{WORK}{name}")
+        }
+
+        // --- each write's request ----------------------------------------
+
+        #[tokio::test]
+        async fn calendar_create_puts_a_new_resource_with_if_none_match_its_times_in_utc_and_its_invitations(
+        ) {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let account = Account::new("Work account", true);
+            let tools = tools(&account, &standin);
+            let mut wrong = Vec::new();
+            let result = tools
+                .invoke(
+                    "calendar.create",
+                    &json!({
+                        "account": account.id.0.to_string(),
+                        "calendar_id": WORK,
+                        "title": "Board review, Q4",
+                        "start": "2026-10-09T10:00:00+02:00",
+                        "end": "2026-10-09T11:00:00+02:00",
+                        "location": "Room 4",
+                        "attendees": ["ann@example.test", "bob@example.test"],
+                    }),
+                    &conversation(),
+                )
+                .await;
+            let answer = match &result {
+                Ok(answer) => answer.clone(),
+                Err(e) => panic!("calendar.create failed: {}", refusal(e)),
+            };
+            let event_id = answer["event_id"].as_str().unwrap_or_default().to_string();
+            let id = event_id.strip_suffix(".ics").unwrap_or_default();
+            if uuid::Uuid::parse_str(id).is_err() {
+                wrong.push(format!("the event id {event_id:?} is not <uuid>.ics"));
+            }
+            if answer["uid"] != json!(format!("{id}@example.test")) {
+                wrong.push(format!("the uid is {}", answer["uid"]));
+            }
+            if answer["account"] != json!(account.id.0.to_string()) || answer["calendar_id"] != WORK
+            {
+                wrong.push(format!("the answer is {answer}"));
+            }
+            let requests = standin.requests();
+            let puts: Vec<&Recorded> = requests.iter().filter(|r| r.method == "PUT").collect();
+            match puts.as_slice() {
+                [put] => {
+                    if put.path != path(&event_id) {
+                        wrong.push(format!("the PUT went to {}", put.path));
+                    }
+                    if put.header("if-none-match") != Some("*") || put.header("if-match").is_some()
+                    {
+                        wrong.push(format!(
+                            "the PUT's conditions are {:?} / {:?}",
+                            put.header("if-none-match"),
+                            put.header("if-match")
+                        ));
+                    }
+                    if put.header("content-type") != Some("text/calendar; charset=utf-8") {
+                        wrong.push(format!("the PUT is {:?}", put.header("content-type")));
+                    }
+                    let written = lines(&put.body);
+                    for line in [
+                        format!("UID:{id}@example.test"),
+                        "DTSTART:20261009T080000Z".to_string(),
+                        "DTEND:20261009T090000Z".to_string(),
+                        "SUMMARY:Board review\\, Q4".to_string(),
+                        "LOCATION:Room 4".to_string(),
+                        "SEQUENCE:0".to_string(),
+                        "ORGANIZER:mailto:a@example.test".to_string(),
+                        "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ann@example.test"
+                            .to_string(),
+                        "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:bob@example.test"
+                            .to_string(),
+                    ] {
+                        if !written.contains(&line) {
+                            wrong.push(format!("the PUT's body has no line {line:?}"));
+                        }
+                    }
+                }
+                other => wrong.push(format!("{} PUTs, not 1", other.len())),
+            }
+            match standin.event(WORK, &event_id) {
+                Some(stored) => {
+                    if answer["etag"] != json!(stored.etag) {
+                        wrong.push(format!(
+                            "the answered etag {} is not the resource's {}",
+                            answer["etag"], stored.etag
+                        ));
+                    }
+                }
+                None => wrong.push("the stand-in does not hold the new event".to_string()),
+            }
+
+            let all_day = tools
+                .invoke(
+                    "calendar.create",
+                    &json!({
+                        "account": account.id.0.to_string(),
+                        "calendar_id": WORK,
+                        "title": "Offsite",
+                        "start": "2026-10-12",
+                        "end": "2026-10-14",
+                    }),
+                    &conversation(),
+                )
+                .await;
+            match &all_day {
+                Ok(answer) => {
+                    let id = answer["event_id"].as_str().unwrap_or_default();
+                    let body = standin
+                        .event(WORK, id)
+                        .map(|e| lines(&e.ics))
+                        .unwrap_or_default();
+                    if !body.contains(&"DTSTART;VALUE=DATE:20261012".to_string())
+                        || !body.contains(&"DTEND;VALUE=DATE:20261014".to_string())
+                    {
+                        wrong.push(format!("an all-day event was written as {body:?}"));
+                    }
+                    if body
+                        .iter()
+                        .any(|l| l.starts_with("ORGANIZER") || l.starts_with("ATTENDEE"))
+                    {
+                        wrong.push("an event without attendees names an organiser".to_string());
+                    }
+                }
+                Err(e) => wrong.push(format!("the all-day create failed: {}", refusal(e))),
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test]
+        async fn calendar_update_reads_then_puts_with_if_match_changing_only_the_named_properties_and_counting_sequence(
+        ) {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let account = Account::new("Work account", true);
+            let tools = tools(&account, &standin);
+            let mut wrong = Vec::new();
+            let before = lines(MINE);
+            let result = tools
+                .invoke(
+                    "calendar.update",
+                    &json!({
+                        "account": account.id.0.to_string(),
+                        "calendar_id": WORK,
+                        "event_id": "mine.ics",
+                        "title": "Board review (moved)",
+                        "start": "2026-10-09T12:00:00Z",
+                        "end": "2026-10-09T13:30:00+00:00",
+                    }),
+                    &conversation(),
+                )
+                .await;
+            let requests = standin.requests();
+            let order: Vec<String> = requests
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect();
+            if order
+                != [
+                    format!("GET {}", path("mine.ics")),
+                    format!("PUT {}", path("mine.ics")),
+                ]
+            {
+                wrong.push(format!("the requests were {order:?}"));
+            }
+            if let Some(put) = requests.iter().find(|r| r.method == "PUT") {
+                if put.header("if-match") != Some("\"etag-mine-1\"")
+                    || put.header("if-none-match").is_some()
+                {
+                    wrong.push(format!(
+                        "the PUT's condition is If-Match {:?}",
+                        put.header("if-match")
+                    ));
+                }
+                let after = lines(&put.body);
+                let changed: Vec<&String> = after.iter().filter(|l| !before.contains(l)).collect();
+                let dropped: Vec<&String> = before.iter().filter(|l| !after.contains(l)).collect();
+                let changed_names: Vec<&str> = changed
+                    .iter()
+                    .map(|l| l.split([':', ';']).next().unwrap_or_default())
+                    .collect();
+                if changed_names != ["DTSTAMP", "DTSTART", "DTEND", "SUMMARY", "SEQUENCE"] {
+                    wrong.push(format!("the changed lines are {changed:?}"));
+                }
+                if dropped.len() != changed.len() {
+                    wrong.push(format!("lines were dropped: {dropped:?}"));
+                }
+                for line in [
+                    "SUMMARY:Board review (moved)",
+                    "DTSTART:20261009T120000Z",
+                    "DTEND:20261009T133000Z",
+                    "SEQUENCE:4",
+                ] {
+                    if !after.iter().any(|l| l == line) {
+                        wrong.push(format!("the PUT's body has no line {line:?}"));
+                    }
+                }
+                if after.iter().any(|l| l == "DTSTAMP:20261001T000000Z") {
+                    wrong.push("DTSTAMP was not refreshed".to_string());
+                }
+            }
+            match &result {
+                Ok(answer) => {
+                    let stored = standin.event(WORK, "mine.ics").map(|e| e.etag);
+                    if answer["etag"] != json!(stored) || answer["event_id"] != "mine.ics" {
+                        wrong.push(format!("the answer is {answer}"));
+                    }
+                }
+                Err(e) => wrong.push(format!("calendar.update failed: {}", refusal(e))),
+            }
+
+            // The attendees replaced: Ann kept with her answer, Dave removed,
+            // Carol invited.
+            let replaced = tools
+                .invoke(
+                    "calendar.update",
+                    &json!({
+                        "account": account.id.0.to_string(),
+                        "calendar_id": WORK,
+                        "event_id": "mine.ics",
+                        "attendees": ["ANN@example.test", "carol@example.test"],
+                    }),
+                    &conversation(),
+                )
+                .await;
+            if let Err(e) = &replaced {
+                wrong.push(format!("the attendee update failed: {}", refusal(e)));
+            }
+            let attendees: Vec<String> = standin
+                .event(WORK, "mine.ics")
+                .map(|e| lines(&e.ics))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|l| l.starts_with("ATTENDEE"))
+                .collect();
+            if attendees
+                != [
+                    "ATTENDEE;CN=Ann;PARTSTAT=ACCEPTED:mailto:ann@example.test",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carol@example.test",
+                ]
+            {
+                wrong.push(format!("the attendees are {attendees:?}"));
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test]
+        async fn calendar_delete_reads_then_deletes_with_if_match() {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let account = Account::new("Work account", true);
+            let result = tools(&account, &standin)
+                .invoke(
+                    "calendar.delete",
+                    &json!({"account": account.id.0.to_string(), "calendar_id": WORK, "event_id": "mine.ics"}),
+                    &conversation(),
+                )
+                .await;
+            let mut wrong = Vec::new();
+            match &result {
+                Ok(answer) => {
+                    if answer["deleted"] != true || answer["event_id"] != "mine.ics" {
+                        wrong.push(format!("the answer is {answer}"));
+                    }
+                }
+                Err(e) => wrong.push(format!("calendar.delete failed: {}", refusal(e))),
+            }
+            let requests = standin.requests();
+            let order: Vec<String> = requests
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect();
+            if order
+                != [
+                    format!("GET {}", path("mine.ics")),
+                    format!("DELETE {}", path("mine.ics")),
+                ]
+            {
+                wrong.push(format!("the requests were {order:?}"));
+            }
+            if let Some(delete) = requests.iter().find(|r| r.method == "DELETE") {
+                if delete.header("if-match") != Some("\"etag-mine-1\"") {
+                    wrong.push(format!(
+                        "the DELETE's condition is If-Match {:?}",
+                        delete.header("if-match")
+                    ));
+                }
+            }
+            if standin.event(WORK, "mine.ics").is_some() {
+                wrong.push("the event is still there".to_string());
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test]
+        async fn calendar_respond_sets_the_accounts_partstat_and_puts_with_if_match() {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let account = Account::new("Work account", true);
+            let result = tools(&account, &standin)
+                .invoke(
+                    "calendar.respond",
+                    &json!({"account": account.id.0.to_string(), "calendar_id": WORK, "event_id": "theirs.ics", "response": "tentative"}),
+                    &conversation(),
+                )
+                .await;
+            let mut wrong = Vec::new();
+            match &result {
+                Ok(answer) => {
+                    if answer["response"] != "tentative" || answer["event_id"] != "theirs.ics" {
+                        wrong.push(format!("the answer is {answer}"));
+                    }
+                }
+                Err(e) => wrong.push(format!("calendar.respond failed: {}", refusal(e))),
+            }
+            let requests = standin.requests();
+            match requests.iter().find(|r| r.method == "PUT") {
+                Some(put) => {
+                    if put.header("if-match") != Some("\"etag-theirs-1\"") {
+                        wrong.push(format!(
+                            "the PUT's condition is If-Match {:?}",
+                            put.header("if-match")
+                        ));
+                    }
+                    let before = lines(THEIRS);
+                    let after = lines(&put.body);
+                    let changed: Vec<&String> =
+                        after.iter().filter(|l| !before.contains(l)).collect();
+                    let names: Vec<&str> = changed
+                        .iter()
+                        .map(|l| l.split([':', ';']).next().unwrap_or_default())
+                        .collect();
+                    if names != ["DTSTAMP", "ATTENDEE"]
+                        || !after.contains(
+                            &"ATTENDEE;PARTSTAT=TENTATIVE;RSVP=TRUE:MAILTO:A@Example.Test"
+                                .to_string(),
+                        )
+                    {
+                        wrong.push(format!("the changed lines are {changed:?}"));
+                    }
+                    if after.len() != before.len() {
+                        wrong.push(format!(
+                            "the body has {} lines, not {}",
+                            after.len(),
+                            before.len()
+                        ));
+                    }
+                }
+                None => wrong.push("no PUT was sent".to_string()),
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        // --- a 412, and every K6a refusal before any change ---------------
+
+        #[tokio::test]
+        async fn a_412_on_any_write_is_answered_with_its_sentence_and_nothing_changes() {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let account = Account::new("Work account", true);
+            let tools = tools(&account, &standin);
+            let id = account.id.0.to_string();
+            let mut wrong = Vec::new();
+            standin.move_etag_after_get(true);
+            for (tool, args, name) in [
+                (
+                    "calendar.update",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "mine.ics", "title": "Changed"}),
+                    "mine.ics",
+                ),
+                (
+                    "calendar.delete",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "mine.ics"}),
+                    "mine.ics",
+                ),
+                (
+                    "calendar.respond",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "theirs.ics", "response": "declined"}),
+                    "theirs.ics",
+                ),
+            ] {
+                let before = standin.event(WORK, name).map(|e| e.ics);
+                let result = tools.invoke(tool, &args, &conversation()).await;
+                if said(&result) != EVENT_CHANGED {
+                    wrong.push(format!("{tool} after a change answered: {}", said(&result)));
+                }
+                if standin.event(WORK, name).map(|e| e.ics) != before {
+                    wrong.push(format!("{tool} changed the event"));
+                }
+            }
+            standin.move_etag_after_get(false);
+            standin.refuse_writes_412(true);
+            let count = standin.events(WORK).len();
+            let created = tools
+                .invoke(
+                    "calendar.create",
+                    &json!({"account": id, "calendar_id": WORK, "title": "New", "start": "2026-10-09T10:00:00Z", "end": "2026-10-09T11:00:00Z"}),
+                    &conversation(),
+                )
+                .await;
+            if said(&created) != EVENT_CHANGED {
+                wrong.push(format!("a create answered 412 said: {}", said(&created)));
+            }
+            if standin.events(WORK).len() != count {
+                wrong.push("a refused create added an event".to_string());
+            }
+            if let Err(SealSessionError::Answered { answer, .. }) = &created {
+                if !matches!(answer, CallerAnswer::Conflict(_)) {
+                    wrong.push(format!("a 412 is answered as {answer:?}, not a conflict"));
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test]
+        async fn every_k6a_refusal_comes_before_any_change() {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let account = Account::new("Work account", true);
+            let tools = tools(&account, &standin);
+            let id = account.id.0.to_string();
+            let create = |extra: Value| {
+                let mut args = json!({"account": id, "calendar_id": WORK, "title": "New", "start": "2026-10-09T10:00:00Z", "end": "2026-10-09T11:00:00Z"});
+                for (k, v) in extra.as_object().unwrap() {
+                    args[k] = v.clone();
+                }
+                args
+            };
+            let many: Vec<String> = (0..51).map(|i| format!("p{i}@example.test")).collect();
+            let mut wrong = Vec::new();
+            // (tool, arguments, sentence, whether a request may be sent: the
+            // event is read, never written)
+            let cases: Vec<(&str, Value, String, bool)> = vec![
+                ("calendar.update", json!({"account": id, "calendar_id": WORK, "event_id": "weekly-mine.ics", "title": "x"}), REPEATS.to_string(), true),
+                ("calendar.delete", json!({"account": id, "calendar_id": WORK, "event_id": "weekly-mine.ics"}), REPEATS.to_string(), true),
+                ("calendar.update", json!({"account": id, "calendar_id": WORK, "event_id": "theirs.ics", "title": "x"}), NOT_ORGANISER.to_string(), true),
+                ("calendar.delete", json!({"account": id, "calendar_id": WORK, "event_id": "theirs.ics"}), NOT_ORGANISER.to_string(), true),
+                ("calendar.respond", json!({"account": id, "calendar_id": WORK, "event_id": "solo.ics", "response": "accepted"}), NOT_ATTENDEE.to_string(), true),
+                ("calendar.update", json!({"account": id, "calendar_id": WORK, "event_id": "mine.ics", "end": "2026-10-09T07:00:00Z"}), END_NOT_AFTER_START.to_string(), true),
+                ("calendar.update", json!({"account": id, "calendar_id": WORK, "event_id": "no-etag.ics", "title": "x"}), NO_ETAG.to_string(), true),
+                ("calendar.create", create(json!({"end": "2026-10-09T10:00:00Z"})), END_NOT_AFTER_START.to_string(), false),
+                ("calendar.create", create(json!({"end": "2026-10-10"})), MIXED_TIMES.to_string(), false),
+                ("calendar.create", create(json!({"start": "tomorrow"})), "'start' must be a time in RFC 3339 form with an offset, or a date written YYYY-MM-DD.".to_string(), false),
+                ("calendar.create", create(json!({"attendees": ["ann@example.test", "not an address"]})), "'not an address' is not an email address this tool can invite.".to_string(), false),
+                ("calendar.create", create(json!({"attendees": many})), TOO_MANY_ATTENDEES.to_string(), false),
+                ("calendar.create", create(json!({"title": "Two\nlines"})), BAD_TITLE.to_string(), false),
+                ("calendar.create", create(json!({"title": "t".repeat(1001)})), BAD_TITLE.to_string(), false),
+                ("calendar.create", create(json!({"description": "d".repeat(32_001)})), BAD_DESCRIPTION.to_string(), false),
+                ("calendar.respond", json!({"account": id, "calendar_id": WORK, "event_id": "theirs.ics", "response": "maybe"}), BAD_RESPONSE.to_string(), false),
+                ("calendar.update", json!({"account": id, "calendar_id": WORK, "event_id": "mine.ics"}), NOTHING_TO_UPDATE.to_string(), false),
+            ];
+            for (tool, args, expected, may_read) in cases {
+                let sent = standin.requests().len();
+                let result = tools.invoke(tool, &args, &conversation()).await;
+                let shown: String = said(&result).chars().take(160).collect();
+                if said(&result) != expected {
+                    wrong.push(format!("{tool} {expected:?}: said {shown}"));
+                }
+                let after = standin.requests();
+                if !may_read && after.len() != sent {
+                    wrong.push(format!("{tool} {expected:?}: a request was sent"));
+                }
+                let written = writes(&after[sent..]);
+                if !written.is_empty() {
+                    wrong.push(format!("{tool} {expected:?}: wrote {written:?}"));
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        // --- the tool service with the approval gate ----------------------
+
+        #[tokio::test]
+        async fn the_four_writes_are_gated_with_their_contracts_and_no_capability_entry_clears_the_mark(
+        ) {
+            let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+            let tools = router.list_tools().await.unwrap();
+            let mut wrong = Vec::new();
+            let invites =
+                "Attendees may be sent an invitation or an update by the calendar's server.";
+            for (name, required, summary, says_invites) in [
+                (
+                    "calendar.create",
+                    vec!["account", "calendar_id", "title", "start", "end"],
+                    vec![
+                        "account",
+                        "calendar_id",
+                        "title",
+                        "start",
+                        "end",
+                        "attendees",
+                        "location",
+                    ],
+                    true,
+                ),
+                (
+                    "calendar.update",
+                    vec!["account", "calendar_id", "event_id"],
+                    vec![
+                        "account",
+                        "event_id",
+                        "current_title",
+                        "current_start",
+                        "title",
+                        "start",
+                        "end",
+                        "attendees",
+                    ],
+                    true,
+                ),
+                (
+                    "calendar.delete",
+                    vec!["account", "calendar_id", "event_id"],
+                    vec!["account", "event_id", "title", "start", "end", "attendees"],
+                    false,
+                ),
+                (
+                    "calendar.respond",
+                    vec!["account", "calendar_id", "event_id", "response"],
+                    vec![
+                        "account",
+                        "event_id",
+                        "title",
+                        "start",
+                        "organizer",
+                        "repeats",
+                        "response",
+                    ],
+                    false,
+                ),
+            ] {
+                let Some(tool) = tools.iter().find(|t| t.name == name) else {
+                    wrong.push(format!("{name} is not listed"));
+                    continue;
+                };
+                let schema_required: Vec<&str> = tool.input_schema["required"]
+                    .as_array()
+                    .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if schema_required != required {
+                    wrong.push(format!("{name}'s schema requires {schema_required:?}"));
+                }
+                if ToolInputContract::required_fields(name) != required.as_slice() {
+                    wrong.push(format!(
+                        "{name}'s input contract requires {:?}",
+                        ToolInputContract::required_fields(name)
+                    ));
+                }
+                for offered in ["current_title", "current_start", "organizer", "repeats"] {
+                    if tool.input_schema["properties"].get(offered).is_some() {
+                        wrong.push(format!("{name} offers {offered}"));
+                    }
+                }
+                if !router.requires_approval(name) {
+                    wrong.push(format!("{name} is not gated"));
+                }
+                if router.is_skip_judge(name).await {
+                    wrong.push(format!("{name} skips the judge"));
+                }
+                let expected = ApprovalContract {
+                    binding_argument: Some("account".to_string()),
+                    approval_summary: Some(summary.iter().map(|s| s.to_string()).collect()),
+                };
+                if router.approval_contract(name) != expected {
+                    wrong.push(format!(
+                        "{name}'s approval contract is {:?}",
+                        router.approval_contract(name)
+                    ));
+                }
+                if tool.description.contains(invites) != says_invites {
+                    wrong.push(format!("{name}'s description: {}", tool.description));
+                }
+            }
+            // A node configuration whose entries say `false` clears nothing.
+            let mut dispatchers = ToolRouter::builtin_dispatchers();
+            for dispatcher in &mut dispatchers {
+                for capability in &mut dispatcher.capabilities {
+                    capability.requires_approval = false;
+                }
+            }
+            let entries: Vec<ToolCapabilityConfig> = serde_yaml::from_str(
+                "- tool_pattern: calendar.*\n  requires_approval: false\n- tool_pattern: calendar.create\n  requires_approval: false\n",
+            )
+            .unwrap();
+            let cleared = ToolRouter::new(dispatchers).with_tool_capabilities(&entries);
+            for name in [
+                "calendar.create",
+                "calendar.update",
+                "calendar.delete",
+                "calendar.respond",
+            ] {
+                if !cleared.requires_approval(name) {
+                    wrong.push(format!("{name}'s mark was cleared by an entry at false"));
+                }
+            }
+            for name in ["calendar.calendars", "calendar.list", "calendar.read"] {
+                if cleared.requires_approval(name) || router.requires_approval(name) {
+                    wrong.push(format!("{name} is gated"));
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        fn writing_agent() -> Agent {
+            let manifest: AgentManifest = serde_yaml::from_str(
+                r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: calendar-write-test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: smart
+  tools: ["calendar.calendars", "calendar.list", "calendar.read", "calendar.create", "calendar.update", "calendar.delete", "calendar.respond"]
+"#,
+            )
+            .unwrap();
+            Agent {
+                id: AgentId::new(),
+                tenant_id: TenantId::default(),
+                scope: aegis_orchestrator_core::domain::agent::AgentScope::default(),
+                name: manifest.metadata.name.clone(),
+                manifest,
+                status: AgentStatus::Active,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }
+        }
+
+        struct Gated {
+            service: Arc<ToolInvocationService>,
+            approvals: Arc<ToolApprovalService>,
+            repo: Arc<InMemoryToolApprovalRepository>,
+            event_bus: Arc<EventBus>,
+            agent_id: AgentId,
+            runs: Vec<ExecutionId>,
+        }
+
+        /// The tool service with the calendar tools over `accounts`, every
+        /// request going to `standin`, the approval gate, and one execution
+        /// of [`PERSON`] per entry of `runs` (its `contexts`).
+        async fn gated(
+            accounts: Vec<Account>,
+            standin: &CalDavStandIn,
+            runs: &[Option<Value>],
+        ) -> Gated {
+            let agent = writing_agent();
+            let agent_id = agent.id;
+            let executions: Vec<Execution> = runs
+                .iter()
+                .map(|contexts| {
+                    let mut e = Execution::new_with_id(
+                        ExecutionId::new(),
+                        agent_id,
+                        ExecutionInput {
+                            intent: None,
+                            input: match contexts {
+                                Some(contexts) => json!({ "contexts": contexts }),
+                                None => json!({}),
+                            },
+                            workspace_volume_id: None,
+                            workspace_volume_mount_path: None,
+                            workspace_remote_path: None,
+                            workflow_execution_id: None,
+                            attachments: Vec::new(),
+                        },
+                        5,
+                        CONTEXT.to_string(),
+                    );
+                    e.tenant_id = TenantId::default();
+                    e.initiating_user_sub = Some(PERSON.to_string());
+                    e
+                })
+                .collect();
+            let ids = executions.iter().map(|e| e.id).collect();
+            let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
+            security_context_repo
+                .save(security_context())
+                .await
+                .unwrap();
+            let storage_root = std::env::temp_dir().join(format!(
+                "aegis-calendar-write-tests-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let fsal = Arc::new(AegisFSAL::new(
+                Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+                Arc::new(InMemoryVolumeRepository::new()),
+                Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                Arc::new(NoOpPublisher),
+            ));
+            let event_bus = Arc::new(EventBus::new(1024));
+            let repo = Arc::new(InMemoryToolApprovalRepository::new());
+            let approvals = Arc::new(ToolApprovalService::new(repo.clone(), event_bus.clone()));
+            let accounts = Arc::new(Accounts(accounts));
+            let service = ToolInvocationService::new(
+                Arc::new(InMemorySealSessionRepository::new()),
+                security_context_repo,
+                Arc::new(SealMiddleware::new()),
+                Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers())),
+                fsal,
+                NfsVolumeRegistry::new(),
+                Arc::new(OneAgent(agent)),
+                Arc::new(Executions(
+                    executions.into_iter().map(|e| (e.id, e)).collect(),
+                )),
+                Arc::new(
+                    aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured(),
+                ),
+                event_bus.clone(),
+                None,
+            )
+            .with_tool_approvals(approvals.clone())
+            .with_tool_credentials(accounts.clone())
+            .with_calendar_tools_over(
+                accounts,
+                Arc::new(ReqwestTransport::to_origin(standin.origin())),
+            );
+            Gated {
+                service: Arc::new(service),
+                approvals,
+                repo,
+                event_bus,
+                agent_id,
+                runs: ids,
+            }
+        }
+
+        impl Gated {
+            async fn call(
+                &self,
+                run: usize,
+                tool: &str,
+                args: Value,
+            ) -> std::result::Result<ToolInvocationResult, SealSessionError> {
+                self.service
+                    .invoke_tool_internal(
+                        &self.agent_id,
+                        self.runs[run],
+                        TenantId::default(),
+                        0,
+                        Vec::new(),
+                        tool.to_string(),
+                        args,
+                    )
+                    .await
+            }
+
+            async fn rows(
+                &self,
+            ) -> Vec<aegis_orchestrator_core::domain::tool_approval::ToolApprovalRequest>
+            {
+                self.repo
+                    .list_requests_for_user(&TenantId::default(), PERSON, None)
+                    .await
+                    .unwrap()
+            }
+        }
+
+        fn pending(
+            result: &std::result::Result<ToolInvocationResult, SealSessionError>,
+        ) -> Option<Value> {
+            match result {
+                Ok(ToolInvocationResult::Direct(value))
+                    if value["status"] == "approval_pending" =>
+                {
+                    Some(value.clone())
+                }
+                _ => None,
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_admission_names_the_account_by_id_and_writes_the_events_values_over_the_models(
+        ) {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let work = Account::new("Work account", false);
+            let id = work.id.0.to_string();
+            let h = gated(
+                vec![work.clone()],
+                &standin,
+                &[Some(json!({"caldav": [id.clone()]}))],
+            )
+            .await;
+            let mut wrong = Vec::new();
+            let cases = [
+                (
+                    "calendar.create",
+                    json!({"account": "Work account", "calendar_id": WORK, "title": "Plan", "start": "2026-10-09T10:00:00+02:00", "end": "2026-10-09T11:00:00+02:00", "attendees": ["ann@example.test", "bob@example.test"], "location": "Room 4"}),
+                    format!("calendar.create\naccount: {id}\ncalendar_id: {WORK}\ntitle: Plan\nstart: 2026-10-09T10:00:00+02:00\nend: 2026-10-09T11:00:00+02:00\nattendees: ann@example.test, bob@example.test\nlocation: Room 4"),
+                    vec![],
+                ),
+                (
+                    "calendar.update",
+                    json!({"account": "Work account", "calendar_id": WORK, "event_id": "mine.ics", "title": "Board review (moved)", "current_title": "Harmless", "current_start": "never"}),
+                    format!("calendar.update\naccount: {id}\nevent_id: mine.ics\ncurrent_title: Board review\ncurrent_start: 2026-10-09T10:00:00 Europe/Berlin\ntitle: Board review (moved)\nstart: \nend: \nattendees: "),
+                    vec![("current_title", json!("Board review")), ("current_start", json!("2026-10-09T10:00:00 Europe/Berlin"))],
+                ),
+                (
+                    "calendar.delete",
+                    json!({"account": "Work account", "calendar_id": WORK, "event_id": "mine.ics", "title": "Nothing", "start": "never", "attendees": []}),
+                    format!("calendar.delete\naccount: {id}\nevent_id: mine.ics\ntitle: Board review\nstart: 2026-10-09T10:00:00 Europe/Berlin\nend: 2026-10-09T11:00:00 Europe/Berlin\nattendees: ann@example.test, dave@example.test"),
+                    vec![("title", json!("Board review")), ("attendees", json!(["ann@example.test", "dave@example.test"]))],
+                ),
+                (
+                    "calendar.respond",
+                    json!({"account": "Work account", "calendar_id": WORK, "event_id": "theirs.ics", "response": "accepted", "organizer": "me", "repeats": true}),
+                    format!("calendar.respond\naccount: {id}\nevent_id: theirs.ics\ntitle: Jane's sync\nstart: 2026-10-10T09:00:00Z\norganizer: Jane <jane@example.test>\nrepeats: false\nresponse: accepted"),
+                    vec![("organizer", json!("Jane <jane@example.test>")), ("repeats", json!(false))],
+                ),
+            ];
+            for (tool, args, summary, stored) in cases {
+                let result = h.call(0, tool, args).await;
+                match pending(&result) {
+                    Some(value) => {
+                        if value["summary"] != summary.as_str() {
+                            wrong.push(format!("{tool}'s summary is {:?}", value["summary"]));
+                        }
+                    }
+                    None => wrong.push(format!("{tool} did not wait: {}", told_by(&result))),
+                }
+                let rows = h.rows().await;
+                match rows.iter().find(|r| r.tool_name == tool) {
+                    Some(row) => {
+                        if row.arguments["account"] != json!(id) {
+                            wrong.push(format!(
+                                "{tool}'s stored account is {}",
+                                row.arguments["account"]
+                            ));
+                        }
+                        for (name, value) in stored {
+                            if row.arguments[name] != value {
+                                wrong.push(format!(
+                                    "{tool}'s stored {name} is {}, not the event's {value}",
+                                    row.arguments[name]
+                                ));
+                            }
+                        }
+                    }
+                    None => wrong.push(format!("{tool} wrote no row")),
+                }
+            }
+            let methods: Vec<String> = standin
+                .requests()
+                .iter()
+                .map(|r| r.method.clone())
+                .collect();
+            if methods.iter().any(|m| m != "GET") {
+                wrong.push(format!("a pending call changed the calendar: {methods:?}"));
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_call_its_admission_refuses_writes_no_row_and_asks_no_one() {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let work = Account::new("Work account", true);
+            let home = Account::new("Home account", true);
+            let id = work.id.0.to_string();
+            let h = gated(
+                vec![work.clone(), home.clone()],
+                &standin,
+                &[
+                    Some(json!({"caldav": [id.clone()]})),
+                    Some(json!({"caldav": [home.id.0.to_string()]})),
+                ],
+            )
+            .await;
+            let mut events = h.event_bus.subscribe();
+            let mut wrong = Vec::new();
+            for (run, tool, args, expected) in [
+                (
+                    0,
+                    "calendar.update",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "weekly-mine.ics", "title": "x"}),
+                    REPEATS.to_string(),
+                ),
+                (
+                    0,
+                    "calendar.delete",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "theirs.ics"}),
+                    NOT_ORGANISER.to_string(),
+                ),
+                (
+                    0,
+                    "calendar.respond",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "solo.ics", "response": "accepted"}),
+                    NOT_ATTENDEE.to_string(),
+                ),
+                (
+                    0,
+                    "calendar.create",
+                    json!({"account": id, "calendar_id": WORK, "title": "a\nb", "start": "2026-10-09T10:00:00Z", "end": "2026-10-09T11:00:00Z"}),
+                    BAD_TITLE.to_string(),
+                ),
+                (
+                    0,
+                    "calendar.create",
+                    json!({"account": id, "calendar_id": "https://elsewhere.example.test/x/", "title": "a", "start": "2026-10-09T10:00:00Z", "end": "2026-10-09T11:00:00Z"}),
+                    "'https://elsewhere.example.test/x/' is not on this calendar account's server"
+                        .to_string(),
+                ),
+                (
+                    1,
+                    "calendar.delete",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "mine.ics"}),
+                    CHOSEN_DIFFERENT.to_string(),
+                ),
+            ] {
+                let result = h.call(run, tool, args).await;
+                if told_by(&result) != expected {
+                    wrong.push(format!(
+                        "{tool} {expected:?} was not refused before the gate: {}",
+                        told_by(&result)
+                    ));
+                }
+            }
+            if !h.rows().await.is_empty() {
+                wrong.push(format!(
+                    "{} approval rows were written",
+                    h.rows().await.len()
+                ));
+            }
+            while let Ok(event) = events.try_recv() {
+                if format!("{event:?}").contains("ApprovalRequested") {
+                    wrong.push("an approval was requested".to_string());
+                }
+            }
+            if !writes(&standin.requests()).is_empty() {
+                wrong.push(format!(
+                    "the calendar changed: {:?}",
+                    writes(&standin.requests())
+                ));
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_approved_update_reads_the_event_again_and_writes_with_the_etag_it_then_reads() {
+            let standin = CalDavStandIn::start(write_config()).await;
+            let work = Account::new("Work account", false);
+            let id = work.id.0.to_string();
+            let h = gated(
+                vec![work.clone()],
+                &standin,
+                &[Some(json!({"caldav": [id.clone()]}))],
+            )
+            .await;
+            let result = h
+                .call(
+                    0,
+                    "calendar.update",
+                    json!({"account": id, "calendar_id": WORK, "event_id": "mine.ics", "title": "Board review (moved)"}),
+                )
+                .await;
+            let approval_id = pending(&result)
+                .and_then(|v| v["approval_id"].as_str().map(str::to_string))
+                .unwrap_or_else(|| panic!("calendar.update did not wait: {}", told_by(&result)));
+            // Someone else moves the room after the person was asked.
+            standin.set_event(
+                WORK,
+                event(
+                    "mine.ics",
+                    "\"etag-mine-2\"",
+                    &MINE.replace("LOCATION:Room 4", "LOCATION:Room 9"),
+                ),
+            );
+            let decided = h
+                .approvals
+                .decide(
+                    ToolApprovalId::from_string(&approval_id).unwrap(),
+                    &TenantId::default(),
+                    PERSON,
+                    ToolApprovalDecision::Once,
+                    h.service.as_ref(),
+                )
+                .await
+                .unwrap();
+            let mut wrong = Vec::new();
+            if decided.status != ToolApprovalStatus::ApprovedOnce {
+                wrong.push(format!(
+                    "the request reads {:?} {:?}",
+                    decided.status, decided.error
+                ));
+            }
+            let requests = standin.requests();
+            let reads = requests
+                .iter()
+                .filter(|r| r.method == "GET" && r.path == path("mine.ics"))
+                .count();
+            if reads != 2 {
+                wrong.push(format!(
+                    "the event was read {reads} times, not at the admission and again at the run"
+                ));
+            }
+            match requests.iter().find(|r| r.method == "PUT") {
+                Some(put) => {
+                    if put.header("if-match") != Some("\"etag-mine-2\"") {
+                        wrong.push(format!(
+                            "the run wrote with If-Match {:?}, not the etag it read",
+                            put.header("if-match")
+                        ));
+                    }
+                    let body = lines(&put.body);
+                    if !body.contains(&"LOCATION:Room 9".to_string())
+                        || !body.contains(&"SUMMARY:Board review (moved)".to_string())
+                    {
+                        wrong.push(format!("the run wrote {body:?}"));
+                    }
+                }
+                None => wrong.push(format!(
+                    "the approved run wrote nothing: {:?}",
+                    decided.error
+                )),
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
         }
     }
 }

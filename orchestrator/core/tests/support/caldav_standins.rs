@@ -2,8 +2,17 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! A loopback CalDAV stand-in (AEGIS ADR-138's tests): an HTTP/1.1 server on
 //! 127.0.0.1 that answers a principal's `PROPFIND`, a home set's `PROPFIND`,
-//! a calendar's `REPORT` and an event's `GET` as a CalDAV server does, and
-//! records every request it receives. No request leaves the machine.
+//! a calendar's `REPORT`, an event's `GET`, and an event's `PUT` and
+//! `DELETE` with their conditions (`If-None-Match: *`, `If-Match`, answered
+//! `412` when they do not hold), as a CalDAV server does, and records every
+//! request it receives. No request leaves the machine.
+//!
+//! Its calendars are its state: a write changes them, gives the resource a
+//! new `ETag`, and [`CalDavStandIn::event`] reads them back. Two switches:
+//! [`CalDavStandIn::move_etag_after_get`] gives an event a new `ETag` right
+//! after each `GET` of it (a change made by someone else between a read and
+//! a write), and [`CalDavStandIn::refuse_writes_412`] answers every `PUT` and
+//! `DELETE` `412`.
 //!
 //! A request whose `Authorization` is not `Bearer <accepted token>` is
 //! answered `401`, its body repeating the header it was given, so a test can
@@ -12,6 +21,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -68,10 +78,25 @@ pub struct StandInConfig {
     pub calendars: Vec<StandInCalendar>,
 }
 
+/// The stand-in's state: what it serves and its two switches.
+struct State {
+    config: Mutex<StandInConfig>,
+    move_etag_after_get: AtomicBool,
+    refuse_writes_412: AtomicBool,
+    next_etag: AtomicU64,
+}
+
+impl State {
+    fn new_etag(&self) -> String {
+        format!("\"w{}\"", self.next_etag.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
 /// A running stand-in.
 pub struct CalDavStandIn {
     pub addr: SocketAddr,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    state: Arc<State>,
 }
 
 impl CalDavStandIn {
@@ -80,20 +105,76 @@ impl CalDavStandIn {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let config = Arc::new(config);
+        let state = Arc::new(State {
+            config: Mutex::new(config),
+            move_etag_after_get: AtomicBool::new(false),
+            refuse_writes_412: AtomicBool::new(false),
+            next_etag: AtomicU64::new(1),
+        });
         let seen = requests.clone();
+        let served = state.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (config, seen) = (config.clone(), seen.clone());
+                let (state, seen) = (served.clone(), seen.clone());
                 tokio::spawn(async move {
-                    serve(stream, &config, &seen).await;
+                    serve(stream, &state, &seen).await;
                 });
             }
         });
-        Self { addr, requests }
+        Self {
+            addr,
+            requests,
+            state,
+        }
+    }
+
+    /// From now on, give an event a new `ETag` right after each `GET` of it.
+    pub fn move_etag_after_get(&self, on: bool) {
+        self.state.move_etag_after_get.store(on, Ordering::SeqCst);
+    }
+
+    /// From now on, answer every `PUT` and `DELETE` `412`.
+    pub fn refuse_writes_412(&self, on: bool) {
+        self.state.refuse_writes_412.store(on, Ordering::SeqCst);
+    }
+
+    /// The event `name` of the calendar `href` as the stand-in now holds it.
+    pub fn event(&self, href: &str, name: &str) -> Option<StandInEvent> {
+        let config = self.state.config.lock().unwrap();
+        config
+            .calendars
+            .iter()
+            .find(|c| c.href == href)
+            .and_then(|c| c.events.iter().find(|e| e.name == name).cloned())
+    }
+
+    /// Every event of the calendar `href` as the stand-in now holds them.
+    pub fn events(&self, href: &str) -> Vec<StandInEvent> {
+        let config = self.state.config.lock().unwrap();
+        config
+            .calendars
+            .iter()
+            .find(|c| c.href == href)
+            .map(|c| c.events.clone())
+            .unwrap_or_default()
+    }
+
+    /// Put `event` into the calendar `href` in place of the one of its
+    /// name, or beside the others: a change made by someone else.
+    pub fn set_event(&self, href: &str, event: StandInEvent) {
+        let mut config = self.state.config.lock().unwrap();
+        let calendar = config
+            .calendars
+            .iter_mut()
+            .find(|c| c.href == href)
+            .expect("the stand-in serves that calendar");
+        match calendar.events.iter_mut().find(|e| e.name == event.name) {
+            Some(existing) => *existing = event,
+            None => calendar.events.push(event),
+        }
     }
 
     /// The stand-in's origin, `http://127.0.0.1:<port>/`.
@@ -107,17 +188,20 @@ impl CalDavStandIn {
     }
 }
 
-async fn serve(mut stream: TcpStream, config: &StandInConfig, seen: &Mutex<Vec<Recorded>>) {
+async fn serve(mut stream: TcpStream, state: &State, seen: &Mutex<Vec<Recorded>>) {
     let Some(request) = read_request(&mut stream).await else {
         return;
     };
     seen.lock().unwrap().push(request.clone());
-    let (status, headers, body) = answer(config, &request);
+    let (status, headers, body) = answer(state, &request);
     let reason = match status {
         200 => "OK",
+        201 => "Created",
+        204 => "No Content",
         207 => "Multi-Status",
         401 => "Unauthorized",
         404 => "Not Found",
+        412 => "Precondition Failed",
         _ => "Other",
     };
     let mut head = format!(
@@ -192,7 +276,130 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn answer(config: &StandInConfig, request: &Recorded) -> Answer {
+fn answer(state: &State, request: &Recorded) -> Answer {
+    let mut config = state.config.lock().unwrap();
+    match request.method.as_str() {
+        "PUT" | "DELETE" => return write(state, &mut config, request),
+        "GET" => {
+            let answer = read(&config, request);
+            if answer.0 == 200 && state.move_etag_after_get.load(Ordering::SeqCst) {
+                let etag = state.new_etag();
+                if let Some(event) = event_at(&mut config, &request.path) {
+                    event.etag = etag;
+                }
+            }
+            return answer;
+        }
+        _ => {}
+    }
+    answer_read(&config, request)
+}
+
+/// The event whose path is `path`, mutable.
+fn event_at<'a>(config: &'a mut StandInConfig, path: &str) -> Option<&'a mut StandInEvent> {
+    config.calendars.iter_mut().find_map(|c| {
+        let href = c.href.clone();
+        c.events
+            .iter_mut()
+            .find(|e| format!("{href}{}", e.name) == path)
+    })
+}
+
+/// A request's `Authorization` refused, or `None` when it is the accepted
+/// bearer.
+fn unauthorized(config: &StandInConfig, request: &Recorded) -> Option<Answer> {
+    let presented = request.header("authorization").unwrap_or("").to_string();
+    (presented != format!("Bearer {}", config.accepted_token)).then(|| {
+        (
+            401,
+            vec![("Content-Type", "text/plain".to_string())],
+            format!("Unauthorized: the credentials presented ({presented}) are not valid for this calendar."),
+        )
+    })
+}
+
+/// `GET` of an event.
+fn read(config: &StandInConfig, request: &Recorded) -> Answer {
+    if let Some(refused) = unauthorized(config, request) {
+        return refused;
+    }
+    let found = config.calendars.iter().find_map(|c| {
+        c.events
+            .iter()
+            .find(|e| format!("{}{}", c.href, e.name) == request.path)
+    });
+    match found {
+        Some(event) => (
+            200,
+            vec![
+                ("Content-Type", "text/calendar; charset=utf-8".to_string()),
+                ("ETag", event.etag.clone()),
+            ],
+            event.ics.clone(),
+        ),
+        None => (404, Vec::new(), "no such event".to_string()),
+    }
+}
+
+/// `PUT` and `DELETE` of an event, with their conditions: `If-None-Match:
+/// *` refuses an existing resource, `If-Match` one whose `ETag` differs or
+/// that does not exist, each answered `412` with nothing changed.
+fn write(state: &State, config: &mut StandInConfig, request: &Recorded) -> Answer {
+    if let Some(refused) = unauthorized(config, request) {
+        return refused;
+    }
+    if state.refuse_writes_412.load(Ordering::SeqCst) {
+        return (412, Vec::new(), "precondition failed".to_string());
+    }
+    let Some((calendar, name)) = config.calendars.iter().enumerate().find_map(|(i, c)| {
+        request
+            .path
+            .strip_prefix(&c.href)
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .map(|rest| (i, rest.to_string()))
+    }) else {
+        return (404, Vec::new(), "no such calendar".to_string());
+    };
+    let events = &mut config.calendars[calendar].events;
+    let existing = events.iter().position(|e| e.name == name);
+    if request.header("if-none-match") == Some("*") && existing.is_some() {
+        return (412, Vec::new(), "the resource exists".to_string());
+    }
+    if let Some(wanted) = request.header("if-match") {
+        match existing {
+            Some(i) if events[i].etag == wanted => {}
+            _ => return (412, Vec::new(), "the resource changed".to_string()),
+        }
+    }
+    if request.method == "DELETE" {
+        return match existing {
+            Some(i) => {
+                events.remove(i);
+                (204, Vec::new(), String::new())
+            }
+            None => (404, Vec::new(), "no such event".to_string()),
+        };
+    }
+    let etag = state.new_etag();
+    let event = StandInEvent {
+        name,
+        etag: etag.clone(),
+        ics: request.body.clone(),
+    };
+    let status = match existing {
+        Some(i) => {
+            events[i] = event;
+            204
+        }
+        None => {
+            events.push(event);
+            201
+        }
+    };
+    (status, vec![("ETag", etag)], String::new())
+}
+
+fn answer_read(config: &StandInConfig, request: &Recorded) -> Answer {
     let presented = request.header("authorization").unwrap_or("").to_string();
     if presented != format!("Bearer {}", config.accepted_token) {
         return (
@@ -291,24 +498,6 @@ fn answer(config: &StandInConfig, request: &Recorded) -> Answer {
             }
             None => (404, Vec::new(), "no such calendar".to_string()),
         },
-        "GET" => {
-            let found = config.calendars.iter().find_map(|c| {
-                c.events
-                    .iter()
-                    .find(|e| format!("{}{}", c.href, e.name) == request.path)
-            });
-            match found {
-                Some(event) => (
-                    200,
-                    vec![
-                        ("Content-Type", "text/calendar; charset=utf-8".to_string()),
-                        ("ETag", event.etag.clone()),
-                    ],
-                    event.ics.clone(),
-                ),
-                None => (404, Vec::new(), "no such event".to_string()),
-            }
-        }
         _ => (404, Vec::new(), "not found".to_string()),
     }
 }

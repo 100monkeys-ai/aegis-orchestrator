@@ -295,8 +295,12 @@ pub struct ApprovalDeclaration {
 /// Update of 2026-10-07 (3) clause 12). `mail.delete` acts through the same
 /// argument and shows the mailbox, the thread, and the thread's subject and
 /// senders, which its admission reads before the gate (its Update of
-/// 2026-10-08 (4) clause 20). A gateway or MCP tool declares the same keys
-/// on its capability entry in the node configuration.
+/// 2026-10-08 (4) clause 20). The four calendar writes act through the
+/// calendar account their `account` argument names, and a person reads the
+/// event, its time and its attendees before answering; for update, delete
+/// and respond the admission reads those values from the event before the
+/// gate (AEGIS ADR-138 K7, K7a). A gateway or MCP tool declares the same
+/// keys on its capability entry in the node configuration.
 pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
     ApprovalDeclaration {
         tool: "mail.send",
@@ -312,6 +316,51 @@ pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
         tool: "mail.delete",
         binding_argument: Some("mailbox"),
         approval_summary: Some(&["mailbox", "thread_id", "subject", "from"]),
+    },
+    ApprovalDeclaration {
+        tool: "calendar.create",
+        binding_argument: Some("account"),
+        approval_summary: Some(&[
+            "account",
+            "calendar_id",
+            "title",
+            "start",
+            "end",
+            "attendees",
+            "location",
+        ]),
+    },
+    ApprovalDeclaration {
+        tool: "calendar.update",
+        binding_argument: Some("account"),
+        approval_summary: Some(&[
+            "account",
+            "event_id",
+            "current_title",
+            "current_start",
+            "title",
+            "start",
+            "end",
+            "attendees",
+        ]),
+    },
+    ApprovalDeclaration {
+        tool: "calendar.delete",
+        binding_argument: Some("account"),
+        approval_summary: Some(&["account", "event_id", "title", "start", "end", "attendees"]),
+    },
+    ApprovalDeclaration {
+        tool: "calendar.respond",
+        binding_argument: Some("account"),
+        approval_summary: Some(&[
+            "account",
+            "event_id",
+            "title",
+            "start",
+            "organizer",
+            "repeats",
+            "response",
+        ]),
     },
 ];
 
@@ -358,7 +407,11 @@ impl ToolInputContract {
             "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],
             "calendar.calendars" => &["account"],
             "calendar.list" => &["account", "calendar_id"],
-            "calendar.read" => &["account", "calendar_id", "event_id"],
+            "calendar.read" | "calendar.update" | "calendar.delete" => {
+                &["account", "calendar_id", "event_id"]
+            }
+            "calendar.create" => &["account", "calendar_id", "title", "start", "end"],
+            "calendar.respond" => &["account", "calendar_id", "event_id", "response"],
             "aegis.tools.list" | "aegis.tools.search" => &[],
             _ => &[],
         }

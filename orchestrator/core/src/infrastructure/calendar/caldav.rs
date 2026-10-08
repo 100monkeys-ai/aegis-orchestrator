@@ -18,6 +18,12 @@
 //!   `time-range` filter and `expand`, so a repeating event answers as its
 //!   occurrences in the window.
 //! - [`CalDavClient::event`]: `GET` of one event, with its `ETag`.
+//! - [`CalDavClient::put_new`]: `PUT` of a new event resource with
+//!   `If-None-Match: *`, so an existing resource is never replaced.
+//! - [`CalDavClient::put_existing`] and [`CalDavClient::delete`]: `PUT` and
+//!   `DELETE` of an event with `If-Match` of the `ETag` it was read with, so
+//!   a change made since that read is answered `412`
+//!   ([`CalDavError::Changed`]) and nothing is written.
 
 use super::xml::{self, DavResponse, Element, APPLE_ICAL, CALDAV, DAV};
 use super::CalendarCheckFailure;
@@ -25,6 +31,11 @@ use super::{shown_reply, CalDavAuth, CalDavRequest, CalDavResponse, CalDavTransp
 use crate::domain::credential::CalendarSettings;
 use chrono::{DateTime, Utc};
 use url::Url;
+
+/// The content type of a WebDAV request body.
+const XML_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
+/// The content type of an iCalendar resource written by `PUT`.
+const CALENDAR_CONTENT_TYPE: &str = "text/calendar; charset=utf-8";
 
 /// Why a CalDAV request did not give what the client asked for.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -51,6 +62,10 @@ pub enum CalDavError {
     /// The principal's answer named no calendar home set.
     #[error("the calendar server's answer names no calendar-home-set")]
     NoHomeSet,
+    /// A conditional write was answered `412`: the event changed since it
+    /// was read, or a new resource's name is already taken.
+    #[error("The event changed since it was read; read it again; nothing was changed.")]
+    Changed,
 }
 
 impl CalDavError {
@@ -165,8 +180,22 @@ impl<'a> CalDavClient<'a> {
         if let Some(depth) = depth {
             headers.push(("Depth", depth.to_string()));
         }
-        if body.is_some() {
-            headers.push(("Content-Type", "application/xml; charset=utf-8".to_string()));
+        let content_type = body.as_ref().map(|_| XML_CONTENT_TYPE);
+        self.send_with(method, url, headers, content_type, body)
+            .await
+    }
+
+    /// Send one request with `headers`, and `body` as `content_type`.
+    async fn send_with(
+        &self,
+        method: &'static str,
+        url: Url,
+        mut headers: Vec<(&'static str, String)>,
+        content_type: Option<&'static str>,
+        body: Option<String>,
+    ) -> Result<CalDavResponse, CalDavError> {
+        if let Some(content_type) = content_type {
+            headers.push(("Content-Type", content_type.to_string()));
         }
         self.transport
             .send(
@@ -316,13 +345,10 @@ impl<'a> CalDavClient<'a> {
         Ok(events)
     }
 
-    /// The event `event_id` of the calendar `calendar`: `GET`, answered 200
-    /// with its data and its `ETag`.
-    pub async fn event(
-        &self,
-        calendar: &str,
-        event_id: &str,
-    ) -> Result<EventResource, CalDavError> {
+    /// The URL of the event `event_id` of the calendar `calendar`: the
+    /// calendar resolved on the server's origin and the id appended as one
+    /// path segment; an id that is not one segment is refused.
+    pub fn event_url(&self, calendar: &str, event_id: &str) -> Result<Url, CalDavError> {
         if event_id.is_empty()
             || event_id == "."
             || event_id == ".."
@@ -336,6 +362,17 @@ impl<'a> CalDavClient<'a> {
             .map_err(|_| CalDavError::OutsideServer(shown(calendar)))?
             .pop_if_empty()
             .push(event_id);
+        Ok(url)
+    }
+
+    /// The event `event_id` of the calendar `calendar`: `GET`, answered 200
+    /// with its data and its `ETag`.
+    pub async fn event(
+        &self,
+        calendar: &str,
+        event_id: &str,
+    ) -> Result<EventResource, CalDavError> {
+        let url = self.event_url(calendar, event_id)?;
         let response = self.send("GET", url.clone(), None, None).await?;
         if response.status != 200 {
             return Err(CalDavError::Refused {
@@ -349,6 +386,88 @@ impl<'a> CalDavClient<'a> {
             etag: response.header("etag").map(str::to_string),
             data: response.body,
         })
+    }
+
+    /// A conditional write's answer: 200, 201 or 204 is written, with the
+    /// `ETag` the server gave if any; 412 is [`CalDavError::Changed`];
+    /// anything else is refused.
+    fn written(response: CalDavResponse) -> Result<Option<String>, CalDavError> {
+        match response.status {
+            200 | 201 | 204 => Ok(response.header("etag").map(str::to_string)),
+            412 => Err(CalDavError::Changed),
+            status => Err(CalDavError::Refused {
+                status,
+                reply: response.body,
+            }),
+        }
+    }
+
+    /// `PUT` of the new event `event_id` into the calendar `calendar` with
+    /// `If-None-Match: *`: a resource of that name is never replaced. Answers
+    /// the new resource's `ETag` when the server gives one.
+    pub async fn put_new(
+        &self,
+        calendar: &str,
+        event_id: &str,
+        ics: String,
+    ) -> Result<Option<String>, CalDavError> {
+        let url = self.event_url(calendar, event_id)?;
+        let response = self
+            .send_with(
+                "PUT",
+                url,
+                vec![("If-None-Match", "*".to_string())],
+                Some(CALENDAR_CONTENT_TYPE),
+                Some(ics),
+            )
+            .await?;
+        Self::written(response)
+    }
+
+    /// `PUT` of the event `event_id` of the calendar `calendar` with
+    /// `If-Match: <etag>`: written only while the resource still has the
+    /// `ETag` it was read with. Answers the new `ETag` when the server
+    /// gives one.
+    pub async fn put_existing(
+        &self,
+        calendar: &str,
+        event_id: &str,
+        ics: String,
+        etag: &str,
+    ) -> Result<Option<String>, CalDavError> {
+        let url = self.event_url(calendar, event_id)?;
+        let response = self
+            .send_with(
+                "PUT",
+                url,
+                vec![("If-Match", etag.to_string())],
+                Some(CALENDAR_CONTENT_TYPE),
+                Some(ics),
+            )
+            .await?;
+        Self::written(response)
+    }
+
+    /// `DELETE` of the event `event_id` of the calendar `calendar` with
+    /// `If-Match: <etag>`: removed only while the resource still has the
+    /// `ETag` it was read with.
+    pub async fn delete(
+        &self,
+        calendar: &str,
+        event_id: &str,
+        etag: &str,
+    ) -> Result<(), CalDavError> {
+        let url = self.event_url(calendar, event_id)?;
+        let response = self
+            .send_with(
+                "DELETE",
+                url,
+                vec![("If-Match", etag.to_string())],
+                None,
+                None,
+            )
+            .await?;
+        Self::written(response).map(|_| ())
     }
 }
 

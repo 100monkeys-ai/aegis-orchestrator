@@ -149,6 +149,10 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("calendar.calendars", "Lists the calendars of a connected calendar account: each calendar's id, name, description, colour where given, and whether the account may write to it. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("calendar.list", "Lists the events of one calendar of a connected calendar account in a window of at most 92 days (by default now and the seven days on), by start: repeating events as their occurrences, each with its id, title, times, location, organiser, attendees and their answers, and status. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("calendar.read", "Reads one event of a calendar of a connected calendar account: everything calendar.list answers, its description, its start and end as written with their time zone, and its etag. Changes nothing.").skip_judge(),
+    BuiltinToolDefinition::new("calendar.create", "Creates an event on one calendar of a connected calendar account: its title, start and end (RFC 3339 times with an offset, written in UTC, or dates YYYY-MM-DD for an all-day event), and optionally a description, a location and up to 50 attendees, with the account as organiser. Attendees may be sent an invitation or an update by the calendar's server. Waits for the person's approval before anything is changed.").requires_approval(),
+    BuiltinToolDefinition::new("calendar.update", "Changes an event of a calendar of a connected calendar account that the account organises: only the title, start, end, description, location or attendees given; attendees given replace the list. A repeating event cannot be changed. Attendees may be sent an invitation or an update by the calendar's server. Waits for the person's approval before anything is changed.").requires_approval(),
+    BuiltinToolDefinition::new("calendar.delete", "Deletes an event of a calendar of a connected calendar account that the account organises. A repeating event cannot be deleted. Waits for the person's approval before anything is changed.").requires_approval(),
+    BuiltinToolDefinition::new("calendar.respond", "Answers an invitation to an event of a calendar of a connected calendar account: accepted, declined or tentative, as the account's attendee answer. Waits for the person's approval before anything is changed.").requires_approval(),
     BuiltinToolDefinition::new("aegis.git.status", "Shows one of your run's repositories: its work branch, whether the tree is clean or changed, and the commit HEAD is on.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.diff", "Shows the changes in one of your run's repositories as a unified diff: unstaged by default, or what is staged.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
@@ -349,6 +353,10 @@ impl ToolRouter {
             "calendar.calendars" => Self::schema_calendar(CalendarShape::Calendars),
             "calendar.list" => Self::schema_calendar(CalendarShape::List),
             "calendar.read" => Self::schema_calendar(CalendarShape::Read),
+            "calendar.create" => Self::schema_calendar_write(CalendarShape::Create),
+            "calendar.update" => Self::schema_calendar_write(CalendarShape::Update),
+            "calendar.delete" => Self::schema_calendar_write(CalendarShape::Delete),
+            "calendar.respond" => Self::schema_calendar_write(CalendarShape::Respond),
             "aegis.git.status" => Self::schema_aegis_git(false, false),
             "aegis.git.diff" => Self::schema_aegis_git(false, true),
             "aegis.git.commit" => Self::schema_aegis_git(true, false),
@@ -841,6 +849,108 @@ impl ToolRouter {
                 }),
             );
             required.push("event_id");
+        }
+        json!({"type": "object", "properties": properties, "required": required})
+    }
+
+    /// JSON schema for the calendar writes (AEGIS ADR-138 K6, K7a). Every
+    /// one takes `account` and `calendar_id`; update, delete and respond an
+    /// `event_id`. The values the admission reads from the event before the
+    /// gate (`current_title`, `current_start`, and for delete and respond
+    /// `title`, `start`, `end`, `attendees`, `organizer`, `repeats`) are not
+    /// offered.
+    fn schema_calendar_write(shape: CalendarShape) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "account".to_string(),
+            json!({
+                "type": "string",
+                "description": "The id of one of your calendar accounts."
+            }),
+        );
+        properties.insert(
+            "calendar_id".to_string(),
+            json!({
+                "type": "string",
+                "description": "A calendar_id calendar.calendars answered."
+            }),
+        );
+        let mut required = vec!["account", "calendar_id"];
+        if shape != CalendarShape::Create {
+            properties.insert(
+                "event_id".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "An event_id calendar.list answered."
+                }),
+            );
+            required.push("event_id");
+        }
+        if matches!(shape, CalendarShape::Create | CalendarShape::Update) {
+            properties.insert(
+                "title".to_string(),
+                json!({
+                    "type": "string",
+                    "maxLength": 1000,
+                    "description": "The event's title: one line of at most 1000 characters."
+                }),
+            );
+            properties.insert(
+                "start".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "When the event starts: an RFC 3339 time with an offset, or a date YYYY-MM-DD for an all-day event."
+                }),
+            );
+            properties.insert(
+                "end".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "When the event ends, after start and of the same form: an RFC 3339 time with an offset, or the date after an all-day event's last day."
+                }),
+            );
+            properties.insert(
+                "description".to_string(),
+                json!({
+                    "type": "string",
+                    "maxLength": 32000,
+                    "description": "Plain text of at most 32000 characters."
+                }),
+            );
+            properties.insert(
+                "location".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Where the event takes place."
+                }),
+            );
+            properties.insert(
+                "attendees".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 50,
+                    "description": if shape == CalendarShape::Create {
+                        "Up to 50 email addresses to invite."
+                    } else {
+                        "Up to 50 email addresses: the event's attendees replaced by these; an empty list removes them all."
+                    }
+                }),
+            );
+        }
+        if shape == CalendarShape::Create {
+            required.extend(["title", "start", "end"]);
+        }
+        if shape == CalendarShape::Respond {
+            properties.insert(
+                "response".to_string(),
+                json!({
+                    "type": "string",
+                    "enum": ["accepted", "declined", "tentative"],
+                    "description": "The account's answer to the invitation."
+                }),
+            );
+            required.push("response");
         }
         json!({"type": "object", "properties": properties, "required": required})
     }
@@ -2131,12 +2241,16 @@ enum OutboundShape {
     Reply,
 }
 
-/// Which calendar read tool a schema is for.
+/// Which calendar tool a schema is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CalendarShape {
     Calendars,
     List,
     Read,
+    Create,
+    Update,
+    Delete,
+    Respond,
 }
 
 // =============================================================================
@@ -2819,14 +2933,23 @@ mod tests {
     /// its tool, a builtin dispatcher's or a `spec.tool_capabilities` entry
     /// whose pattern matches; with no entry only the catalogue's marked
     /// tools, `mail.send` and `mail.reply` (AEGIS ADR-125's Update of
-    /// 2026-10-07 (3) clause 12) and `mail.delete` (its Update of 2026-10-08
-    /// (4) clause 20), are gated, and an entry without the flag
-    /// does not gate.
+    /// 2026-10-07 (3) clause 12), `mail.delete` (its Update of 2026-10-08
+    /// (4) clause 20) and the four calendar writes (AEGIS ADR-138 K7), are
+    /// gated, and an entry without the flag does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
         let plain = ToolRouter::new(ToolRouter::builtin_dispatchers());
         for def in BUILTIN_TOOL_DEFINITIONS {
-            let marked = matches!(def.name, "mail.send" | "mail.reply" | "mail.delete");
+            let marked = matches!(
+                def.name,
+                "mail.send"
+                    | "mail.reply"
+                    | "mail.delete"
+                    | "calendar.create"
+                    | "calendar.update"
+                    | "calendar.delete"
+                    | "calendar.respond"
+            );
             assert_eq!(
                 plain.requires_approval(def.name),
                 marked,
