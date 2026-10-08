@@ -304,7 +304,7 @@ fn stub_agent(id: AgentId) -> Agent {
             contexts: Vec::new(),
             execution: None,
             security: None,
-            schedule: None,
+            default_schedule: None,
             tools: vec![],
             env: std::collections::HashMap::new(),
             volumes: vec![],

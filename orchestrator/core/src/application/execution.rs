@@ -1311,7 +1311,7 @@ mod tests {
                 contexts: Vec::new(),
                 execution: None,
                 security: None,
-                schedule: None,
+                default_schedule: None,
                 tools: Vec::new(),
                 env: HashMap::new(),
                 volumes: mount_path

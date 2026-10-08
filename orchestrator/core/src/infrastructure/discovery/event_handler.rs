@@ -861,7 +861,7 @@ mod tests {
                 contexts: Vec::new(),
                 execution: None,
                 security: None,
-                schedule: None,
+                default_schedule: None,
                 tools: vec![],
                 env: HashMap::new(),
                 volumes: vec![],
@@ -914,6 +914,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let mut wf = Workflow::new(metadata, spec).expect("valid workflow");

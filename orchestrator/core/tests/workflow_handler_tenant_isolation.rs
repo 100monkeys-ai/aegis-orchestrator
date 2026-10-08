@@ -89,6 +89,7 @@ fn build_minimal_workflow(name: &str) -> Workflow {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         },
     )
     .expect("workflow")

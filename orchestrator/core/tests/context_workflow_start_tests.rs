@@ -104,6 +104,7 @@ fn closed_schema_workflow() -> Workflow {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         },
     )
     .unwrap()

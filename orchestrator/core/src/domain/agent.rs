@@ -187,9 +187,10 @@ pub struct AgentSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityConfig>,
 
-    /// Optional scheduling configuration
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<ScheduleConfig>,
+    /// A recommended timing for a schedule of this agent: offered when a
+    /// person makes one, never acted on by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_schedule: Option<crate::domain::schedule::DefaultSchedule>,
 
     /// Optional tools/MCP servers
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -551,23 +552,6 @@ pub struct VolumeSpec {
     /// TTL in hours (only for ephemeral volumes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_hours: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ScheduleConfig {
-    Cron {
-        cron: String,
-        timezone: String,
-        #[serde(default = "default_true")]
-        enabled: bool,
-    },
-    Interval {
-        seconds: u64,
-        #[serde(default = "default_true")]
-        enabled: bool,
-    },
-    Manual,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -1057,10 +1041,6 @@ pub enum AgentStatus {
 }
 
 // Defaults
-fn default_true() -> bool {
-    true
-}
-
 fn default_volume_type() -> String {
     "seaweedfs".to_string()
 }
@@ -1221,6 +1201,14 @@ impl AgentManifest {
             }
         }
 
+        // A recommended schedule is held to a schedule's own timing rules
+        // (AEGIS ADR-139 N2, N12).
+        if let Some(default_schedule) = &self.spec.default_schedule {
+            default_schedule
+                .validate()
+                .map_err(|refusal| format!("spec.default_schedule: {refusal}"))?;
+        }
+
         // spec.task is required — an agent without a task block has no instruction and cannot run
         match &self.spec.task {
             None => {
@@ -1293,7 +1281,7 @@ mod tests {
                 contexts: Vec::new(),
                 execution: None,
                 security: None,
-                schedule: None,
+                default_schedule: None,
                 tools: vec![],
                 env: std::collections::HashMap::new(),
                 volumes: vec![],

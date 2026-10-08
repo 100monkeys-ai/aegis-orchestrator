@@ -44,8 +44,14 @@ pub struct AgentManifestParser;
 impl AgentManifestParser {
     /// Parse agent manifest from YAML string
     pub fn parse_yaml(yaml: &str) -> Result<AgentManifest> {
-        let mut manifest: AgentManifest =
+        // A manifest may only recommend a schedule (`spec.default_schedule`);
+        // the retired `spec.schedule` is refused, never silently dropped
+        // (AEGIS ADR-139 N12).
+        let raw: serde_yaml::Value =
             serde_yaml::from_str(yaml).context("Failed to parse YAML manifest")?;
+        crate::domain::schedule::refuse_spec_schedule(&raw).map_err(|refusal| anyhow!(refusal))?;
+        let mut manifest: AgentManifest =
+            serde_yaml::from_value(raw).context("Failed to parse YAML manifest")?;
 
         // Filter out empty tool names produced by YAML tool objects with missing name fields
         manifest.spec.tools.retain(|t| !t.is_empty());
@@ -316,7 +322,7 @@ spec:
                 contexts: Vec::new(),
                 execution: None,
                 security: None,
-                schedule: None,
+                default_schedule: None,
                 tools: vec![],
                 env: HashMap::new(),
                 volumes: vec![],

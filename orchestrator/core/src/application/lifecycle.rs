@@ -387,7 +387,7 @@ mod tests {
                 contexts: Vec::new(),
                 execution: None,
                 security: None,
-                schedule: None,
+                default_schedule: None,
                 tools: vec![],
                 env: HashMap::new(),
                 volumes: vec![],

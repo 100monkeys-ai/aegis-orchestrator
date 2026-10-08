@@ -96,6 +96,14 @@ pub struct ScheduleView {
     pub last_run: Option<ScheduleFire>,
 }
 
+/// One fire with its run's status, for `GET /v1/schedules/{id}/runs`.
+#[derive(Debug, Clone)]
+pub struct ScheduleRunView {
+    pub fire: ScheduleFire,
+    pub kind: TargetKind,
+    pub status: Option<ExecutionStatus>,
+}
+
 pub struct ScheduleService {
     repo: Arc<dyn ScheduleRepository>,
     engine: Arc<dyn ScheduleEnginePort>,
@@ -341,6 +349,38 @@ impl ScheduleService {
         schedule.updated_at = now;
         self.repo.update(&schedule).await?;
         Ok(())
+    }
+
+    /// `GET /v1/schedules/{id}/runs`: its fires newest first, each with its
+    /// run's status.
+    pub async fn runs(
+        &self,
+        reader: &ScheduleReader,
+        id: ScheduleId,
+        limit: usize,
+    ) -> Result<Vec<ScheduleRunView>, ScheduleError> {
+        let schedule = self.readable(reader, id).await?;
+        let fires = self.repo.fires(id, limit).await?;
+        let mut views = Vec::with_capacity(fires.len());
+        for fire in fires {
+            let status = match fire.execution_id {
+                Some(execution) => self
+                    .runs
+                    .run_status(schedule.target_kind, &schedule.tenant_id, execution)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "a scheduled run's status could not be read");
+                        None
+                    }),
+                None => None,
+            };
+            views.push(ScheduleRunView {
+                fire,
+                kind: schedule.target_kind,
+                status,
+            });
+        }
+        Ok(views)
     }
 
     /// `POST /v1/internal/schedules/{id}/fire` (N6, N7): decided once per

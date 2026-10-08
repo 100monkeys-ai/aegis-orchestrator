@@ -4,7 +4,7 @@
 //!
 //! Comprehensive unit tests for the Agent aggregate root and its value objects:
 //! `Agent`, `AgentManifest`, `RuntimeConfig`, `SecurityConfig`, `ResourceLimits`,
-//! `VolumeSpec`, `ExecutionStrategy`, `ScheduleConfig`, `ValidationConfig`, and
+//! `VolumeSpec`, `ExecutionStrategy`, `DefaultSchedule`, `ValidationConfig`, and
 //! serialization round-trips.
 //!
 //! # Architecture
@@ -17,8 +17,9 @@ use aegis_orchestrator_core::domain::agent::{
     Agent, AgentManifest, AgentSpec, AgentStatus, ContextItem, DeliveryCondition, DeliveryConfig,
     DeliveryDestination, DeliveryType, EmailConfig, ExecutionMode, ExecutionStrategy,
     FilesystemPolicy, ManifestMetadata, NetworkPolicy, ResourceLimits, RuntimeConfig, RuntimeType,
-    ScheduleConfig, SecurityConfig, TaskConfig, ValidatorSpec, VolumeSpec, WebhookConfig,
+    SecurityConfig, TaskConfig, ValidatorSpec, VolumeSpec, WebhookConfig,
 };
+use aegis_orchestrator_core::domain::schedule::DefaultSchedule;
 use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ImagePullPolicy};
 use aegis_orchestrator_core::domain::workflow::ConsensusStrategy;
 use std::collections::HashMap;
@@ -58,7 +59,7 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
             contexts: Vec::new(),
             execution: None,
             security: None,
-            schedule: None,
+            default_schedule: None,
             tools: vec![],
             env: HashMap::new(),
             volumes: vec![],
@@ -698,47 +699,38 @@ fn execution_strategy_webhook_delivery() {
 }
 
 // ============================================================================
-// 9. ScheduleConfig
+// 9. DefaultSchedule (a recommended schedule; it never creates one)
 // ============================================================================
 
 #[test]
-fn schedule_config_cron_variant() {
-    let sc = ScheduleConfig::Cron {
-        cron: "0 */6 * * *".to_string(),
+fn default_schedule_takes_utc_and_no_jitter_when_unsaid() {
+    let parsed: DefaultSchedule =
+        serde_json::from_value(serde_json::json!({ "cron": "0 15 * * 1-5" })).expect("parses");
+    assert_eq!(
+        parsed,
+        DefaultSchedule {
+            cron: "0 15 * * 1-5".to_string(),
+            timezone: "UTC".to_string(),
+            jitter_seconds: 0,
+        }
+    );
+    assert_eq!(parsed.validate(), Ok(()));
+}
+
+#[test]
+fn default_schedule_is_held_to_a_schedules_timing_rules() {
+    let too_often = DefaultSchedule {
+        cron: "* * * * *".to_string(),
         timezone: "UTC".to_string(),
-        enabled: true,
+        jitter_seconds: 0,
     };
-    assert!(matches!(sc, ScheduleConfig::Cron { .. }));
-    if let ScheduleConfig::Cron {
-        cron,
-        timezone,
-        enabled,
-    } = &sc
-    {
-        assert_eq!(cron, "0 */6 * * *");
-        assert_eq!(timezone, "UTC");
-        assert!(enabled);
-    }
-}
-
-#[test]
-fn schedule_config_interval_variant() {
-    let sc = ScheduleConfig::Interval {
-        seconds: 3600,
-        enabled: true,
-    };
-    if let ScheduleConfig::Interval { seconds, enabled } = &sc {
-        assert_eq!(*seconds, 3600);
-        assert!(enabled);
-    } else {
-        panic!("expected Interval variant");
-    }
-}
-
-#[test]
-fn schedule_config_manual_variant() {
-    let sc = ScheduleConfig::Manual;
-    assert!(matches!(sc, ScheduleConfig::Manual));
+    assert_eq!(
+        too_often.validate(),
+        Err("A schedule runs at most once every 5 minutes.".to_string())
+    );
+    let unknown_key: Result<DefaultSchedule, _> =
+        serde_json::from_value(serde_json::json!({ "cron": "0 15 * * *", "enabled": true }));
+    assert!(unknown_key.is_err(), "an unknown key was accepted");
 }
 
 // ============================================================================
@@ -903,33 +895,14 @@ fn custom_runtime_manifest_json_round_trip() {
 }
 
 #[test]
-fn schedule_config_cron_json_round_trip() {
-    let original = ScheduleConfig::Cron {
+fn default_schedule_json_round_trip() {
+    let original = DefaultSchedule {
         cron: "0 0 * * *".to_string(),
         timezone: "America/New_York".to_string(),
-        enabled: true,
+        jitter_seconds: 900,
     };
     let json = serde_json::to_string(&original).expect("serialize");
-    let deserialized: ScheduleConfig = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(original, deserialized);
-}
-
-#[test]
-fn schedule_config_interval_json_round_trip() {
-    let original = ScheduleConfig::Interval {
-        seconds: 1800,
-        enabled: false,
-    };
-    let json = serde_json::to_string(&original).expect("serialize");
-    let deserialized: ScheduleConfig = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(original, deserialized);
-}
-
-#[test]
-fn schedule_config_manual_json_round_trip() {
-    let original = ScheduleConfig::Manual;
-    let json = serde_json::to_string(&original).expect("serialize");
-    let deserialized: ScheduleConfig = serde_json::from_str(&json).expect("deserialize");
+    let deserialized: DefaultSchedule = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(original, deserialized);
 }
 
@@ -1111,8 +1084,7 @@ spec:
       memory: 1Gi
       disk: 5Gi
       timeout: 10m
-  schedule:
-    type: cron
+  default_schedule:
     cron: "0 */6 * * *"
     timezone: UTC
   volumes:
@@ -1145,10 +1117,14 @@ spec:
     assert_eq!(exec.max_retries, 3);
     assert_eq!(exec.validation.as_ref().unwrap().len(), 2);
 
-    assert!(matches!(
-        manifest.spec.schedule,
-        Some(ScheduleConfig::Cron { .. })
-    ));
+    assert_eq!(
+        manifest.spec.default_schedule,
+        Some(DefaultSchedule {
+            cron: "0 */6 * * *".to_string(),
+            timezone: "UTC".to_string(),
+            jitter_seconds: 0,
+        })
+    );
     assert_eq!(manifest.spec.volumes.len(), 1);
     assert_eq!(manifest.spec.tools, vec!["github-mcp"]);
     assert_eq!(manifest.spec.env.get("REVIEW_MODE").unwrap(), "strict");

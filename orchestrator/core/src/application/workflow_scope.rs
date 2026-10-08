@@ -245,6 +245,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let mut workflow =

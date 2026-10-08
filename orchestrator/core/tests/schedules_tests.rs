@@ -1,10 +1,10 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Schedules (AEGIS ADR-139 N1 to N8)
+//! # Schedules (AEGIS ADR-139 N1 to N8, N12)
 //!
 //! The schedule service against a Temporal schedule stand-in that records
 //! every call and can be made to fail, over the in-memory store; the run
-//! starter against recording start services; and,
+//! starter against recording start services; the two manifest parsers; and,
 //! when `AEGIS_TEST_POSTGRES_URL` names a database, migration 048 applied
 //! twice and the Postgres store.
 
@@ -33,11 +33,13 @@ use aegis_orchestrator_core::domain::repository::AgentVersion;
 use aegis_orchestrator_core::domain::schedule::{
     FireOutcome, RecurrenceInput, Schedule, ScheduleDraft, ScheduleId, SchedulePatch,
     ScheduleRepository, ScheduleState, TargetKind, Timing, AT_REFUSAL, CRON_REFUSAL, OWNER_REFUSAL,
-    TIMEZONE_REFUSAL, UNAVAILABLE_REFUSAL,
+    SPEC_SCHEDULE_REFUSAL, TIMEZONE_REFUSAL, UNAVAILABLE_REFUSAL,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::infrastructure::agent_manifest_parser::AgentManifestParser;
 use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::InMemoryScheduleRepository;
+use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -1145,6 +1147,94 @@ async fn a_workflow_run_starts_as_the_owner_with_the_schedules_choices() {
             "repositories": [{ "binding_id": BINDING, "branch": "work" }],
         })
     );
+}
+
+// ── N12: what a manifest may say ─────────────────────────────────────────────
+
+const AGENT_YAML: &str = r#"apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: mail-triage
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+  task:
+    instruction: Triage the inbox.
+"#;
+
+const WORKFLOW_YAML: &str = r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: email-inbox-triage
+  version: "1.0.0"
+spec:
+  initial_state: done
+  states:
+    done:
+      kind: System
+      command: echo done
+      transitions: []
+"#;
+
+/// N12: `spec.schedule` is refused at parse with its sentence, on an agent
+/// and on a workflow.
+#[test]
+fn a_manifest_carrying_spec_schedule_is_refused() {
+    let agent = format!(
+        "{AGENT_YAML}  schedule:\n    type: cron\n    cron: \"0 * * * *\"\n    timezone: UTC\n"
+    );
+    let workflow = format!("{WORKFLOW_YAML}  schedule:\n    cron: \"0 * * * *\"\n");
+    let agent_error = AgentManifestParser::parse_yaml(&agent)
+        .expect_err("an agent with spec.schedule parsed")
+        .to_string();
+    let workflow_error = WorkflowParser::parse_yaml(&workflow)
+        .expect_err("a workflow with spec.schedule parsed")
+        .to_string();
+    let mut wrong = Vec::new();
+    if !agent_error.contains(SPEC_SCHEDULE_REFUSAL) {
+        wrong.push(format!("agent: {agent_error}"));
+    }
+    if !workflow_error.contains(SPEC_SCHEDULE_REFUSAL) {
+        wrong.push(format!("workflow: {workflow_error}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// N12: `spec.default_schedule` is parsed on an agent and on a workflow,
+/// and held to N2's rules.
+#[test]
+fn spec_default_schedule_is_parsed_on_both_manifests() {
+    let default = "  default_schedule:\n    cron: \"0 15 * * 1-5\"\n    timezone: Europe/Berlin\n    jitter_seconds: 600\n";
+    let agent = AgentManifestParser::parse_yaml(&format!("{AGENT_YAML}{default}"))
+        .expect("the agent parses");
+    let workflow = WorkflowParser::parse_yaml(&format!("{WORKFLOW_YAML}{default}"))
+        .expect("the workflow parses");
+    let expected = Some(aegis_orchestrator_core::domain::schedule::DefaultSchedule {
+        cron: "0 15 * * 1-5".into(),
+        timezone: "Europe/Berlin".into(),
+        jitter_seconds: 600,
+    });
+    assert_eq!(agent.spec.default_schedule, expected);
+    assert_eq!(workflow.spec.default_schedule, expected);
+    let round_trip = WorkflowParser::parse_yaml(&WorkflowParser::to_yaml(&workflow).unwrap())
+        .expect("the workflow's YAML parses again");
+    assert_eq!(round_trip.spec.default_schedule, expected);
+
+    let too_often = "  default_schedule:\n    cron: \"* * * * *\"\n";
+    let agent_error = AgentManifestParser::parse_yaml(&format!("{AGENT_YAML}{too_often}"))
+        .expect_err("a too-frequent default parsed")
+        .to_string();
+    let workflow_error = WorkflowParser::parse_yaml(&format!("{WORKFLOW_YAML}{too_often}"))
+        .expect_err("a too-frequent default parsed")
+        .to_string();
+    for error in [agent_error, workflow_error] {
+        assert!(
+            error.contains("A schedule runs at most once every 5 minutes."),
+            "{error}"
+        );
+    }
 }
 
 // ── Migration 048 and the Postgres store ─────────────────────────────────────

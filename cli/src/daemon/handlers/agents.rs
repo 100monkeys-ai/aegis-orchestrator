@@ -96,15 +96,40 @@ pub(crate) struct ExecuteAgentQuery {
     version: Option<String>,
 }
 
+/// A manifest sent as JSON, refusing the retired `spec.schedule` (AEGIS
+/// ADR-139 N12) rather than dropping it unread; anything else deserializes
+/// as the typed body did.
+fn manifest_refusing_spec_schedule(
+    raw: serde_json::Value,
+) -> Result<aegis_orchestrator_sdk::AgentManifest, (StatusCode, Json<serde_json::Value>)> {
+    if raw.get("spec").and_then(|s| s.get("schedule")).is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": aegis_orchestrator_core::domain::schedule::SPEC_SCHEDULE_REFUSAL
+            })),
+        ));
+    }
+    serde_json::from_value(raw).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("Failed to deserialize the JSON body into the target type: {e}")
+            })),
+        )
+    })
+}
+
 pub(crate) async fn deploy_agent_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<DeployAgentQuery>,
-    Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("agent:deploy")?;
+    let manifest = manifest_refusing_spec_schedule(raw)?;
     let delegation = headers
         .get(TENANT_DELEGATION_HEADER)
         .and_then(|v| v.to_str().ok());
@@ -608,9 +633,10 @@ pub(crate) async fn update_agent_handler(
     identity: Option<Extension<UserIdentity>>,
     headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
-    Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("agent:deploy")?;
+    let manifest = manifest_refusing_spec_schedule(raw)?;
     let delegation = headers
         .get(TENANT_DELEGATION_HEADER)
         .and_then(|v| v.to_str().ok());
@@ -774,6 +800,48 @@ mod tests {
     /// granted operator privileges. After the fix, missing identity MUST
     /// resolve to the empty role set, and any operator-tier check must
     /// fail closed against it.
+    /// AEGIS ADR-139 N12: a manifest deployed or updated as JSON that still
+    /// carries `spec.schedule` is refused with its sentence, never dropped
+    /// unread; one without it deserializes, its `spec.default_schedule` kept.
+    #[test]
+    fn a_json_manifest_carrying_spec_schedule_is_refused() {
+        let manifest = |extra: serde_json::Value| {
+            let mut spec = serde_json::json!({
+                "runtime": { "language": "python", "version": "3.11" },
+                "task": { "instruction": "Triage the inbox." },
+            });
+            spec.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::json!({
+                "apiVersion": "100monkeys.ai/v1",
+                "kind": "Agent",
+                "metadata": { "name": "mail-triage", "version": "1.0.0" },
+                "spec": spec,
+            })
+        };
+        let refused = manifest_refusing_spec_schedule(manifest(serde_json::json!({
+            "schedule": { "type": "cron", "cron": "0 * * * *", "timezone": "UTC" }
+        })))
+        .expect_err("a manifest with spec.schedule deserialized");
+        assert_eq!(
+            (refused.0, refused.1 .0["error"].clone()),
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!(aegis_orchestrator_core::domain::schedule::SPEC_SCHEDULE_REFUSAL)
+            ),
+            "the refusal of spec.schedule"
+        );
+        let kept = manifest_refusing_spec_schedule(manifest(serde_json::json!({
+            "default_schedule": { "cron": "0 15 * * 1-5" }
+        })))
+        .expect("a manifest without spec.schedule deserializes");
+        assert_eq!(
+            kept.spec.default_schedule.map(|d| d.cron),
+            Some("0 15 * * 1-5".to_string())
+        );
+    }
+
     #[test]
     fn build_roles_without_identity_returns_empty_role_set_not_operator() {
         let roles = build_roles(&None);

@@ -106,6 +106,10 @@ pub struct WorkflowSpecYaml {
     /// Default: 50. Ceiling: 100.
     #[serde(default)]
     pub max_total_transitions: Option<u32>,
+    /// A recommended timing for a schedule of this workflow: offered when a
+    /// person makes one, never acted on by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_schedule: Option<crate::domain::schedule::DefaultSchedule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -352,8 +356,15 @@ impl WorkflowParser {
 
     /// Parse a workflow manifest from YAML string
     pub fn parse_yaml(yaml: &str) -> Result<Workflow, WorkflowParseError> {
-        let manifest: WorkflowManifest =
+        // A manifest may only recommend a schedule (`spec.default_schedule`);
+        // the retired `spec.schedule` is refused, never silently dropped
+        // (AEGIS ADR-139 N12).
+        let raw: serde_yaml::Value =
             serde_yaml::from_str(yaml).map_err(|e| WorkflowParseError::YamlError(e.to_string()))?;
+        crate::domain::schedule::refuse_spec_schedule(&raw)
+            .map_err(WorkflowParseError::ValidationError)?;
+        let manifest: WorkflowManifest = serde_yaml::from_value(raw)
+            .map_err(|e| WorkflowParseError::YamlError(e.to_string()))?;
 
         Self::validate_and_convert(manifest)
     }
@@ -421,12 +432,19 @@ impl WorkflowParser {
         let initial_state = StateName::new(manifest.spec.initial_state)
             .map_err(|e| WorkflowParseError::ValidationError(e.to_string()))?;
 
+        if let Some(default_schedule) = &manifest.spec.default_schedule {
+            default_schedule.validate().map_err(|refusal| {
+                WorkflowParseError::ValidationError(format!("spec.default_schedule: {refusal}"))
+            })?;
+        }
+
         let spec = WorkflowSpec {
             initial_state,
             context: manifest.spec.context,
             states,
             storage: manifest.spec.storage,
             max_total_transitions: manifest.spec.max_total_transitions,
+            default_schedule: manifest.spec.default_schedule,
         };
 
         // Create and validate workflow
@@ -681,6 +699,7 @@ impl WorkflowParser {
             states,
             storage: workflow.spec.storage.clone(),
             max_total_transitions: workflow.spec.max_total_transitions,
+            default_schedule: workflow.spec.default_schedule.clone(),
         };
 
         WorkflowManifest {

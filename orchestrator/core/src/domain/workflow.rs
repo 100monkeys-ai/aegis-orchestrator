@@ -672,6 +672,11 @@ pub struct WorkflowSpec {
     /// Default: 50. Ceiling: 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_transitions: Option<u32>,
+
+    /// A recommended timing for a schedule of this workflow (AEGIS ADR-139
+    /// N12): offered when a person makes one, never acted on by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_schedule: Option<crate::domain::schedule::DefaultSchedule>,
 }
 
 fn is_default_storage(s: &WorkflowStorageSpec) -> bool {
@@ -1731,6 +1736,7 @@ mod tests {
                 states,
                 storage: Default::default(),
                 max_total_transitions: None,
+                default_schedule: None,
             },
             created_at: Utc::now(),
             updated_at: None,
@@ -1766,6 +1772,7 @@ mod tests {
             states: HashMap::new(),
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1806,6 +1813,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1859,6 +1867,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1922,6 +1931,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1979,6 +1989,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -2021,6 +2032,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -2064,6 +2076,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -2107,6 +2120,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -2145,6 +2159,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -2188,6 +2203,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let workflow = Workflow::new(metadata, spec).expect("valid workflow");
@@ -2237,6 +2253,7 @@ mod tests {
             states,
             storage: Default::default(),
             max_total_transitions: None,
+            default_schedule: None,
         };
 
         let workflow = Workflow::new(metadata, spec).expect("valid workflow");

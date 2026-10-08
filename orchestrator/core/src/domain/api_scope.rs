@@ -56,6 +56,9 @@ pub enum ApiScope {
     // tool approval (ADR-126): a user's own gated tool calls
     ToolApprovalRead,
     ToolApprovalDecide,
+    // schedule (a person's own schedules)
+    ScheduleRead,
+    ScheduleWrite,
     // stimulus
     StimulusIngest,
     // node
@@ -129,6 +132,8 @@ impl ApiScope {
             Self::ApprovalApprove => "approval:approve",
             Self::ApprovalReject => "approval:reject",
             Self::ToolApprovalRead => "tool_approval:read",
+            Self::ScheduleRead => "schedule:read",
+            Self::ScheduleWrite => "schedule:write",
             Self::ToolApprovalDecide => "tool_approval:decide",
             Self::StimulusIngest => "stimulus:ingest",
             Self::NodeRead => "node:read",
@@ -198,6 +203,8 @@ impl ApiScope {
             "approval:approve" => Some(Self::ApprovalApprove),
             "approval:reject" => Some(Self::ApprovalReject),
             "tool_approval:read" => Some(Self::ToolApprovalRead),
+            "schedule:read" => Some(Self::ScheduleRead),
+            "schedule:write" => Some(Self::ScheduleWrite),
             "tool_approval:decide" => Some(Self::ToolApprovalDecide),
             "stimulus:ingest" => Some(Self::StimulusIngest),
             "node:read" => Some(Self::NodeRead),
@@ -258,6 +265,8 @@ impl ApiScope {
             Self::ApprovalReject,
             Self::ToolApprovalRead,
             Self::ToolApprovalDecide,
+            Self::ScheduleRead,
+            Self::ScheduleWrite,
         ]);
         scopes
     }
@@ -330,6 +339,8 @@ impl ApiScope {
             Self::ApprovalReject,
             Self::ToolApprovalRead,
             Self::ToolApprovalDecide,
+            Self::ScheduleRead,
+            Self::ScheduleWrite,
             Self::StimulusIngest,
             Self::NodeRead,
             Self::NodeList,
@@ -384,5 +395,30 @@ mod tests {
         assert!(execution.contains(&ApiScope::ToolApprovalRead));
         assert!(execution.contains(&ApiScope::ToolApprovalDecide));
         assert!(!ApiScope::preset_readonly().contains(&ApiScope::ToolApprovalDecide));
+    }
+
+    /// The two schedule scopes (AEGIS ADR-139 N10) parse, are named in
+    /// every scope's list, and an execution key holds both.
+    #[test]
+    fn schedule_scopes_parse_and_are_granted_with_execution() {
+        let parsed = (
+            ApiScope::parse("schedule:read"),
+            ApiScope::parse("schedule:write"),
+        );
+        assert_eq!(
+            parsed,
+            (Some(ApiScope::ScheduleRead), Some(ApiScope::ScheduleWrite)),
+            "the schedule scopes did not parse"
+        );
+        let all = ApiScope::all();
+        let execution = ApiScope::preset_execution();
+        for scope in [ApiScope::ScheduleRead, ApiScope::ScheduleWrite] {
+            assert!(all.contains(&scope), "{scope} is not among every scope");
+            assert!(
+                execution.contains(&scope),
+                "{scope} is not in an execution key"
+            );
+            assert_eq!(ApiScope::parse(scope.as_str()), Some(scope.clone()));
+        }
     }
 }
