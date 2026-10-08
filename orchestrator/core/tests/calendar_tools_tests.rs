@@ -1,6 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Calendar accounts over CalDAV, AEGIS ADR-138 K2, K4 and K5.
+//! Calendar accounts over CalDAV, AEGIS ADR-138 K2, K4 and K5, and the read
+//! tools of K5a, K6, K6a, K6c and K6d (the module `read_tools`).
 //!
 //! - K4: an OAuth callback granted the calendar scope stores the binding's
 //!   CalDAV settings (`metadata.calendar`) with its address as label; one
@@ -14,6 +15,12 @@
 //!   the server's origin.
 //! - Migration 047 applied twice changes nothing, and the repository stores
 //!   and reads the settings (`AEGIS_TEST_POSTGRES_URL`).
+//! - K5a, K6, K6a, K6c, K6d: `calendar.calendars`, `calendar.list` and
+//!   `calendar.read` in the tool service: who may use an account and the
+//!   six refusals, the run's `account` enum, the `caldav` pool, the window's
+//!   refusals, the query, `truncated`, the times as the server gave them,
+//!   the capped description, the identifiers kept on the server's origin,
+//!   and the catalogue's entries (skip the judge, not gated).
 //!
 //! Every server these tests talk to is on 127.0.0.1: the CalDAV stand-in
 //! (`support/caldav_standins.rs`) and a mockito token endpoint. No request
@@ -951,4 +958,1208 @@ async fn migration_047_applied_twice_changes_nothing_and_the_repository_stores_c
         .await
         .expect("drop schema");
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// K5a, K6's read half, K6a's read refusals, K6c, K6d: the read tools
+// ---------------------------------------------------------------------------
+
+/// The three read tools in the tool service, against the loopback CalDAV
+/// stand-in: who may use an account (K5a's six sentences, a chosen account
+/// by name, the run's `account` enum, the `caldav` pool the start check
+/// reads), `calendar.calendars`, `calendar.list` (the query, the window's
+/// refusals, `truncated`, occurrences in UTC), `calendar.read` (`tzid`,
+/// `etag`, the capped description), the identifiers' origin (K6d), and the
+/// catalogue's entries (skip the judge, not gated).
+mod read_tools {
+    use super::*;
+    use aegis_orchestrator_core::application::agent::AgentLifecycleService;
+    use aegis_orchestrator_core::application::credential_service::{
+        ContextBinding, ToolCalendar, ToolCalendarSource, ToolCallActor, ToolCredentialSource,
+    };
+    use aegis_orchestrator_core::application::execution::ExecutionService;
+    use aegis_orchestrator_core::application::nfs_gateway::NfsVolumeRegistry;
+    use aegis_orchestrator_core::application::tool_invocation_service::{
+        ToolInvocationResult, ToolInvocationService,
+    };
+    use aegis_orchestrator_core::application::tools::builtin_calendar::{
+        BAD_LIMIT, CHOSEN_DIFFERENT, END_NOT_AFTER_START, NONE_CHOSEN, NOT_AMONG_CHOSEN,
+        NOT_GRANTED, NO_PERSON, WINDOW_TOO_WIDE,
+    };
+    use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
+    use aegis_orchestrator_core::domain::events::ExecutionEvent;
+    use aegis_orchestrator_core::domain::execution::{
+        Execution, ExecutionId, ExecutionInput, Iteration,
+    };
+    use aegis_orchestrator_core::domain::fsal::AegisFSAL;
+    use aegis_orchestrator_core::domain::mcp::ToolInputContract;
+    use aegis_orchestrator_core::domain::repository::AgentVersion;
+    use aegis_orchestrator_core::domain::seal_session::{CallerAnswer, SealSessionError};
+    use aegis_orchestrator_core::domain::security_context::{
+        SecurityContext, SecurityContextRepository,
+    };
+    use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
+    use aegis_orchestrator_core::infrastructure::repositories::InMemoryVolumeRepository;
+    use aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware;
+    use aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository;
+    use aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository;
+    use aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider;
+    use aegis_orchestrator_core::infrastructure::tool_router::ToolRouter;
+    use anyhow::Result;
+    use futures::Stream;
+    use serde_json::{json, Value};
+    use std::pin::Pin;
+
+    const CONTEXT: &str = "calendar-read-test-context";
+    const PERSON: &str = "calendar-read-person";
+
+    fn agent() -> Agent {
+        let manifest: AgentManifest = serde_yaml::from_str(
+            r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: calendar-read-test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: smart
+  tools: ["calendar.calendars", "calendar.list", "calendar.read"]
+"#,
+        )
+        .unwrap();
+        Agent {
+            id: AgentId::new(),
+            tenant_id: TenantId::default(),
+            scope: aegis_orchestrator_core::domain::agent::AgentScope::default(),
+            name: manifest.metadata.name.clone(),
+            manifest,
+            status: AgentStatus::Active,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn security_context() -> SecurityContext {
+        SecurityContext {
+            name: CONTEXT.to_string(),
+            description: "calendar read test".to_string(),
+            capabilities: vec![
+                aegis_orchestrator_core::domain::security_context::Capability {
+                    tool_pattern: "calendar.*".to_string(),
+                    path_allowlist: None,
+                    command_allowlist: None,
+                    subcommand_allowlist: None,
+                    domain_allowlist: None,
+                    max_response_size: None,
+                    rate_limit: None,
+                    max_concurrent: None,
+                },
+            ],
+            deny_list: vec![],
+            metadata: aegis_orchestrator_core::domain::security_context::SecurityContextMetadata {
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                version: 1,
+            },
+        }
+    }
+
+    /// One of the person's calendar accounts as the stub source answers it.
+    #[derive(Clone)]
+    struct Account {
+        id: CredentialBindingId,
+        name: String,
+        granted: bool,
+    }
+
+    impl Account {
+        fn new(name: &str, granted: bool) -> Self {
+            Self {
+                id: CredentialBindingId::new(),
+                name: name.to_string(),
+                granted,
+            }
+        }
+    }
+
+    /// The person's calendar accounts, each answered to its owner only,
+    /// with its context name and the stand-in's settings.
+    struct Accounts(Vec<Account>);
+
+    #[async_trait]
+    impl ToolCalendarSource for Accounts {
+        async fn tool_calendar(
+            &self,
+            actor: &ToolCallActor<'_>,
+            binding_id: &CredentialBindingId,
+        ) -> anyhow::Result<Option<ToolCalendar>> {
+            if actor.user_id != PERSON {
+                return Ok(None);
+            }
+            Ok(self
+                .0
+                .iter()
+                .find(|a| &a.id == binding_id)
+                .map(|a| ToolCalendar {
+                    binding_id: a.id,
+                    settings: client_settings(),
+                    auth: CalDavAuth::Bearer(SensitiveString::new(TOKEN)),
+                    granted: a.granted,
+                }))
+        }
+
+        async fn calendar_contexts(
+            &self,
+            _tenant_id: &TenantId,
+            user_id: &str,
+        ) -> anyhow::Result<Vec<ContextBinding>> {
+            Ok(self.named(user_id))
+        }
+    }
+
+    impl Accounts {
+        fn named(&self, user_id: &str) -> Vec<ContextBinding> {
+            if user_id != PERSON {
+                return Vec::new();
+            }
+            self.0
+                .iter()
+                .map(|a| ContextBinding {
+                    id: a.id,
+                    name: a.name.clone(),
+                    reach: None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ToolCredentialSource for Accounts {
+        async fn tool_server_credential(
+            &self,
+            _actor: &ToolCallActor<'_>,
+            _server: &str,
+        ) -> anyhow::Result<Option<SensitiveString>> {
+            Ok(None)
+        }
+
+        async fn context_bindings(
+            &self,
+            _tenant_id: &TenantId,
+            user_id: &str,
+            server: &str,
+        ) -> anyhow::Result<Vec<ContextBinding>> {
+            Ok(if server == "caldav" {
+                self.named(user_id)
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    /// One run: its person (none for a service account) and its
+    /// `contexts` input.
+    struct Run {
+        person: Option<&'static str>,
+        contexts: Option<Value>,
+    }
+
+    fn run_of(contexts: Option<Value>) -> Run {
+        Run {
+            person: Some(PERSON),
+            contexts,
+        }
+    }
+
+    struct Harness {
+        service: Arc<ToolInvocationService>,
+        agent_id: AgentId,
+        runs: Vec<ExecutionId>,
+    }
+
+    /// A tool service with the calendar tools over `accounts`, every request
+    /// going to `standin`, and one execution per run.
+    async fn harness(accounts: Vec<Account>, standin: &CalDavStandIn, runs: Vec<Run>) -> Harness {
+        let agent = agent();
+        let agent_id = agent.id;
+        let executions: Vec<Execution> = runs
+            .iter()
+            .map(|run| {
+                let mut e = Execution::new_with_id(
+                    ExecutionId::new(),
+                    agent_id,
+                    ExecutionInput {
+                        intent: None,
+                        input: match &run.contexts {
+                            Some(contexts) => json!({ "contexts": contexts }),
+                            None => json!({}),
+                        },
+                        workspace_volume_id: None,
+                        workspace_volume_mount_path: None,
+                        workspace_remote_path: None,
+                        workflow_execution_id: None,
+                        attachments: Vec::new(),
+                    },
+                    5,
+                    CONTEXT.to_string(),
+                );
+                e.tenant_id = TenantId::default();
+                e.initiating_user_sub = run.person.map(str::to_string);
+                e
+            })
+            .collect();
+        let ids = executions.iter().map(|e| e.id).collect();
+        let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
+        security_context_repo
+            .save(security_context())
+            .await
+            .unwrap();
+        let storage_root = std::env::temp_dir().join(format!(
+            "aegis-calendar-read-tests-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+            Arc::new(InMemoryVolumeRepository::new()),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoOpPublisher),
+        ));
+        let accounts = Arc::new(Accounts(accounts));
+        let service = ToolInvocationService::new(
+            Arc::new(InMemorySealSessionRepository::new()),
+            security_context_repo,
+            Arc::new(SealMiddleware::new()),
+            Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers())),
+            fsal,
+            NfsVolumeRegistry::new(),
+            Arc::new(OneAgent(agent)),
+            Arc::new(Executions(
+                executions.into_iter().map(|e| (e.id, e)).collect(),
+            )),
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured(),
+            ),
+            Arc::new(EventBus::new(256)),
+            None,
+        )
+        .with_tool_credentials(accounts.clone())
+        .with_calendar_tools_over(
+            accounts,
+            Arc::new(ReqwestTransport::to_origin(standin.origin())),
+        );
+        Harness {
+            service: Arc::new(service),
+            agent_id,
+            runs: ids,
+        }
+    }
+
+    impl Harness {
+        async fn call(
+            &self,
+            run: usize,
+            tool: &str,
+            args: Value,
+        ) -> std::result::Result<ToolInvocationResult, SealSessionError> {
+            self.service
+                .invoke_tool_internal(
+                    &self.agent_id,
+                    self.runs[run],
+                    TenantId::default(),
+                    0,
+                    Vec::new(),
+                    tool.to_string(),
+                    args,
+                )
+                .await
+        }
+    }
+
+    /// The value a call answered directly.
+    fn answered(result: &std::result::Result<ToolInvocationResult, SealSessionError>) -> Value {
+        match result {
+            Ok(ToolInvocationResult::Direct(value)) => value.clone(),
+            other => panic!("the call did not answer: {other:?}"),
+        }
+    }
+
+    /// The sentence a refusal tells its caller.
+    fn told(result: &std::result::Result<ToolInvocationResult, SealSessionError>) -> String {
+        match result {
+            Ok(ToolInvocationResult::Direct(value)) => format!("answered {value}"),
+            Ok(_) => "the call was dispatched".to_string(),
+            Err(SealSessionError::Answered {
+                answer: CallerAnswer::CredentialBindingRequired { message },
+                ..
+            }) => message.clone(),
+            Err(SealSessionError::InvalidArguments(message))
+            | Err(SealSessionError::UpstreamUnavailable(message)) => message.clone(),
+            Err(other) => format!("{other:?}"),
+        }
+    }
+
+    const REVIEW: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Stand-in//EN\r\nBEGIN:VEVENT\r\nUID:review@example.test\r\nDTSTART:20261008T150000Z\r\nDTEND:20261008T160000Z\r\nSUMMARY:Budget review\r\nLOCATION:Room 4\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    /// A weekly event as a `GET` answers it: an override first, then the
+    /// series' master.
+    const WEEKLY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Stand-in//EN\r\nBEGIN:VEVENT\r\nUID:weekly@example.test\r\nRECURRENCE-ID:20261013T090000Z\r\nDTSTART:20261013T100000Z\r\nDTEND:20261013T110000Z\r\nSUMMARY:Weekly (moved)\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly@example.test\r\nDTSTART:20261006T090000Z\r\nDTEND:20261006T100000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Weekly\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    fn long_event(description: &str) -> String {
+        let mut ics = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Stand-in//EN\r\nBEGIN:VEVENT\r\nUID:long@example.test\r\nDTSTART;VALUE=DATE:20261010\r\nDTEND;VALUE=DATE:20261011\r\nSUMMARY:Offsite\r\n");
+        let line = format!("DESCRIPTION:{description}");
+        ics.push_str(&aegis_orchestrator_core::infrastructure::calendar::ical::fold(&line));
+        ics.push_str("\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        ics
+    }
+
+    /// The client's stand-in with three more events on Work: a UTC review,
+    /// a weekly series with an override, and an all-day event with a
+    /// description longer than the cap.
+    fn tools_config() -> StandInConfig {
+        let mut config = client_config();
+        let work = &mut config.calendars[0];
+        work.events.push(StandInEvent {
+            name: "review.ics".to_string(),
+            etag: "\"etag-review-2\"".to_string(),
+            ics: REVIEW.to_string(),
+        });
+        config
+    }
+
+    fn read_config() -> StandInConfig {
+        let mut config = client_config();
+        let work = &mut config.calendars[0];
+        work.events.push(StandInEvent {
+            name: "weekly.ics".to_string(),
+            etag: "\"etag-weekly-3\"".to_string(),
+            ics: WEEKLY.to_string(),
+        });
+        work.events.push(StandInEvent {
+            name: "long.ics".to_string(),
+            etag: "\"etag-long-4\"".to_string(),
+            ics: long_event(&"x".repeat(32_005)),
+        });
+        config
+    }
+
+    fn week() -> Value {
+        json!({"start": "2026-10-08T09:00:00Z", "end": "2026-10-15T09:00:00Z"})
+    }
+
+    fn with(base: Value, more: Value) -> Value {
+        let mut base = base;
+        for (k, v) in more.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        base
+    }
+
+    #[tokio::test]
+    async fn the_three_read_tools_are_listed_declaring_account_skip_the_judge_and_are_not_gated() {
+        let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+        let tools = router.list_tools().await.unwrap();
+        let mut wrong = Vec::new();
+        for (name, required) in [
+            ("calendar.calendars", vec!["account"]),
+            ("calendar.list", vec!["account", "calendar_id"]),
+            ("calendar.read", vec!["account", "calendar_id", "event_id"]),
+        ] {
+            let Some(tool) = tools.iter().find(|t| t.name == name) else {
+                wrong.push(format!("{name} is not listed"));
+                continue;
+            };
+            if tool.input_schema["properties"]["account"]["description"]
+                != "The id of one of your calendar accounts."
+            {
+                wrong.push(format!("{name}'s schema does not declare account"));
+            }
+            let schema_required: Vec<&str> = tool.input_schema["required"]
+                .as_array()
+                .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if schema_required != required {
+                wrong.push(format!("{name}'s schema requires {schema_required:?}"));
+            }
+            if ToolInputContract::required_fields(name) != required.as_slice() {
+                wrong.push(format!(
+                    "{name}'s input contract requires {:?}",
+                    ToolInputContract::required_fields(name)
+                ));
+            }
+            if !router.is_skip_judge(name).await {
+                wrong.push(format!("{name} does not skip the judge"));
+            }
+            if router.requires_approval(name) {
+                wrong.push(format!("{name} is gated"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calendar_calendars_answers_each_calendar_with_its_name_colour_and_whether_it_is_writable(
+    ) {
+        let standin = CalDavStandIn::start(client_config()).await;
+        let work = Account::new("Work account", false);
+        let h = harness(
+            vec![work.clone()],
+            &standin,
+            vec![run_of(Some(json!({"caldav": [work.id.0.to_string()]})))],
+        )
+        .await;
+        let result = h
+            .call(
+                0,
+                "calendar.calendars",
+                json!({"account": work.id.0.to_string()}),
+            )
+            .await;
+        let answer = answered(&result);
+        assert_eq!(
+            answer,
+            json!({
+                "account": work.id.0.to_string(),
+                "calendars": [
+                    {"calendar_id": WORK, "name": "Work", "description": "Meetings & reviews", "color": "#16A765FF", "writable": true},
+                    {"calendar_id": HOLIDAYS, "name": "Holidays", "description": null, "writable": false},
+                ]
+            }),
+            "calendar.calendars answered otherwise"
+        );
+        let methods: Vec<(String, String)> = standin
+            .requests()
+            .iter()
+            .map(|r| (r.method.clone(), r.path.clone()))
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                (
+                    "PROPFIND".to_string(),
+                    "/dav/a@example.test/user".to_string()
+                ),
+                ("PROPFIND".to_string(), "/dav/a@example.test/".to_string()),
+            ],
+            "calendar.calendars did not discover the home set and list it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calendar_list_queries_the_window_and_answers_its_events_by_start_utc_as_the_server_gave_it(
+    ) {
+        let standin = CalDavStandIn::start(tools_config()).await;
+        let work = Account::new("Work account", true);
+        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let result = h
+            .call(
+                0,
+                "calendar.list",
+                with(
+                    week(),
+                    json!({"account": work.id.0.to_string(), "calendar_id": WORK}),
+                ),
+            )
+            .await;
+        let answer = answered(&result);
+        let requests = standin.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "REPORT");
+        assert_eq!(requests[0].path, WORK);
+        assert!(
+            requests[0]
+                .body
+                .contains(r#"<c:expand start="20261008T090000Z" end="20261015T090000Z"/>"#)
+                && requests[0]
+                    .body
+                    .contains(r#"<c:time-range start="20261008T090000Z" end="20261015T090000Z"/>"#),
+            "calendar.list did not query its window with time-range and expand: {}",
+            requests[0].body
+        );
+        let titles: Vec<&str> = answer["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["title"].as_str().unwrap_or("?"))
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Budget review", "Planning, Q4 & next", "Stand-up"],
+            "the events are not answered by start"
+        );
+        assert_eq!(answer["truncated"], json!(false));
+        assert_eq!(answer["account"], json!(work.id.0.to_string()));
+        assert_eq!(answer["calendar_id"], json!(WORK));
+        assert_eq!(answer["start"], json!("2026-10-08T09:00:00Z"));
+        assert_eq!(answer["end"], json!("2026-10-15T09:00:00Z"));
+        assert_eq!(
+            answer["events"][2],
+            json!({
+                "event_id": "standup daily.ics",
+                "uid": "standup@example.test",
+                "title": "Stand-up",
+                "start": "2026-10-12T08:00:00Z",
+                "start_tzid": null,
+                "end": "2026-10-12T08:15:00Z",
+                "end_tzid": null,
+                "all_day": false,
+                "location": null,
+                "organizer": null,
+                "attendees": [],
+                "status": null,
+                "repeats": true,
+                "recurrence_id": "2026-10-12T08:00:00Z",
+            }),
+            "an expanded occurrence is not answered in UTC with its recurrence"
+        );
+        let planning = &answer["events"][1];
+        assert_eq!(
+            (planning["start"].clone(), planning["start_tzid"].clone()),
+            (json!("2026-10-09T10:00:00"), json!("Europe/Berlin")),
+            "a time the server gave with a TZID is not answered as written with its tzid"
+        );
+        assert_eq!(
+            planning["organizer"],
+            json!({"address": "jane@example.test", "name": "Jane"})
+        );
+        assert_eq!(
+            planning["attendees"],
+            json!([{"address": "a@example.test", "name": null, "answer": "ACCEPTED"}])
+        );
+        assert!(
+            planning.get("description").is_none(),
+            "calendar.list answers a description"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calendar_list_matches_its_query_and_says_truncated_past_its_limit() {
+        let standin = CalDavStandIn::start(tools_config()).await;
+        let work = Account::new("Work account", true);
+        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let base = with(
+            week(),
+            json!({"account": work.id.0.to_string(), "calendar_id": WORK}),
+        );
+        let mut wrong = Vec::new();
+        for (case, more, titles, truncated) in [
+            (
+                "limit 2",
+                json!({"limit": 2}),
+                vec!["Budget review", "Planning, Q4 & next"],
+                true,
+            ),
+            (
+                "limit 3",
+                json!({"limit": 3}),
+                vec!["Budget review", "Planning, Q4 & next", "Stand-up"],
+                false,
+            ),
+            (
+                "a description's words",
+                json!({"query": "NUMBERS"}),
+                vec!["Planning, Q4 & next"],
+                false,
+            ),
+            (
+                "a location",
+                json!({"query": "room 4"}),
+                vec!["Budget review"],
+                false,
+            ),
+            (
+                "a title",
+                json!({"query": "stand"}),
+                vec!["Stand-up"],
+                false,
+            ),
+            ("nothing", json!({"query": "holiday"}), vec![], false),
+        ] {
+            let answer = answered(&h.call(0, "calendar.list", with(base.clone(), more)).await);
+            let got: Vec<&str> = answer["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["title"].as_str().unwrap_or("?"))
+                .collect();
+            if got != titles || answer["truncated"] != json!(truncated) {
+                wrong.push(format!(
+                    "{case}: answered {got:?}, truncated {}",
+                    answer["truncated"]
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calendar_list_refuses_a_window_over_92_days_an_end_not_after_start_and_a_bad_limit_sending_nothing(
+    ) {
+        let standin = CalDavStandIn::start(tools_config()).await;
+        let work = Account::new("Work account", true);
+        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let base = json!({"account": work.id.0.to_string(), "calendar_id": WORK});
+        let mut wrong = Vec::new();
+        for (more, expected) in [
+            (
+                json!({"start": "2026-10-01T00:00:00Z", "end": "2027-01-01T00:00:01Z"}),
+                WINDOW_TOO_WIDE,
+            ),
+            (
+                json!({"start": "2026-10-08T09:00:00Z", "end": "2026-10-08T09:00:00Z"}),
+                END_NOT_AFTER_START,
+            ),
+            (
+                json!({"start": "2026-10-08T09:00:00Z", "end": "2026-10-01T09:00:00Z"}),
+                END_NOT_AFTER_START,
+            ),
+            (json!({"limit": 101}), BAD_LIMIT),
+            (
+                json!({"start": "next tuesday"}),
+                "'start' must be a time in RFC 3339 form with an offset.",
+            ),
+        ] {
+            let said = told(
+                &h.call(0, "calendar.list", with(base.clone(), more.clone()))
+                    .await,
+            );
+            if said != expected {
+                wrong.push(format!("{more}: told {said:?}"));
+            }
+        }
+        let sent = standin.requests();
+        if !sent.is_empty() {
+            wrong.push(format!("a refused call sent {} requests", sent.len()));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calendar_read_answers_the_event_with_its_description_tzid_and_etag() {
+        let standin = CalDavStandIn::start(read_config()).await;
+        let work = Account::new("Work account", true);
+        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let read = |event: &str| json!({"account": work.id.0.to_string(), "calendar_id": WORK, "event_id": event});
+        let planning = answered(&h.call(0, "calendar.read", read("planning.ics")).await);
+        assert_eq!(
+            planning,
+            json!({
+                "account": work.id.0.to_string(),
+                "calendar_id": WORK,
+                "event_id": "planning.ics",
+                "uid": "planning@example.test",
+                "title": "Planning, Q4 & next",
+                "start": "2026-10-09T10:00:00",
+                "start_tzid": "Europe/Berlin",
+                "end": "2026-10-09T11:00:00",
+                "end_tzid": "Europe/Berlin",
+                "all_day": false,
+                "location": null,
+                "organizer": {"address": "jane@example.test", "name": "Jane"},
+                "attendees": [{"address": "a@example.test", "name": null, "answer": "ACCEPTED"}],
+                "status": null,
+                "repeats": false,
+                "recurrence_id": null,
+                "description": "Bring the numbers\nand the plan",
+                "description_truncated": false,
+                "etag": "\"etag-planning-1\"",
+            }),
+            "calendar.read answered otherwise"
+        );
+        let get = standin.requests().pop().unwrap();
+        assert_eq!(
+            (get.method.as_str(), get.path.as_str()),
+            ("GET", "/dav/a@example.test/work/planning.ics"),
+            "calendar.read did not GET the event"
+        );
+
+        let long = answered(&h.call(0, "calendar.read", read("long.ics")).await);
+        assert_eq!(
+            long["description"].as_str().map(|d| d.chars().count()),
+            Some(32_000),
+            "a long description is not capped at 32000 characters"
+        );
+        assert_eq!(long["description_truncated"], json!(true));
+        assert_eq!(
+            (long["start"].clone(), long["all_day"].clone()),
+            (json!("2026-10-10"), json!(true))
+        );
+
+        let weekly = answered(&h.call(0, "calendar.read", read("weekly.ics")).await);
+        assert_eq!(
+            (
+                weekly["title"].clone(),
+                weekly["recurrence_id"].clone(),
+                weekly["repeats"].clone()
+            ),
+            (json!("Weekly"), json!(null), json!(true)),
+            "a repeating event's resource is not answered by its series' master"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_calendar_off_the_accounts_server_or_an_event_id_of_two_segments_is_refused_before_any_request(
+    ) {
+        let standin = CalDavStandIn::start(client_config()).await;
+        let work = Account::new("Work account", true);
+        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let account = work.id.0.to_string();
+        let mut wrong = Vec::new();
+        for (tool, args, expected) in [
+            (
+                "calendar.list",
+                json!({"account": account, "calendar_id": "https://elsewhere.example.test/dav/x/"}),
+                "'https://elsewhere.example.test/dav/x/' is not on this calendar account's server",
+            ),
+            (
+                "calendar.read",
+                json!({"account": account, "calendar_id": "//elsewhere.example.test/x/", "event_id": "a.ics"}),
+                "'//elsewhere.example.test/x/' is not on this calendar account's server",
+            ),
+            (
+                "calendar.read",
+                json!({"account": account, "calendar_id": WORK, "event_id": "../holidays/a.ics"}),
+                "'event_id' must be an event id calendar.list answered.",
+            ),
+        ] {
+            let said = told(&h.call(0, tool, args.clone()).await);
+            if said != expected {
+                wrong.push(format!("{args}: told {said:?}"));
+            }
+        }
+        if !standin.requests().is_empty() {
+            wrong.push(format!("requests were sent: {:?}", standin.requests()));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_account_is_refused_with_k5a_sentences_and_a_chosen_one_is_used_by_its_name() {
+        let standin = CalDavStandIn::start(client_config()).await;
+        let work = Account::new("Work account", false);
+        let home = Account::new("Home account", true);
+        let other = CredentialBindingId::new();
+        let h = harness(
+            vec![work.clone(), home.clone()],
+            &standin,
+            vec![
+                Run {
+                    person: None,
+                    contexts: None,
+                },
+                run_of(None),
+                run_of(Some(json!({"caldav": null}))),
+                run_of(Some(json!({"caldav": [home.id.0.to_string()]}))),
+                run_of(Some(
+                    json!({"caldav": [home.id.0.to_string(), work.id.0.to_string()]}),
+                )),
+            ],
+        )
+        .await;
+        let calls = |id: &CredentialBindingId| json!({"account": id.0.to_string()});
+        let mut wrong = Vec::new();
+        for (case, run, args, expected) in [
+            ("no person", 0, calls(&work.id), NO_PERSON.to_string()),
+            (
+                "not the person's",
+                1,
+                calls(&other),
+                format!(
+                    "'{}' is not an active calendar connection of yours.",
+                    other.0
+                ),
+            ),
+            ("none chosen", 2, calls(&home.id), NONE_CHOSEN.to_string()),
+            (
+                "one chosen, another named",
+                3,
+                calls(&work.id),
+                CHOSEN_DIFFERENT.to_string(),
+            ),
+            (
+                "two chosen, a third named",
+                4,
+                calls(&other),
+                format!(
+                    "'{}' is not an active calendar connection of yours.",
+                    other.0
+                ),
+            ),
+            (
+                "nothing chosen, not granted",
+                1,
+                calls(&work.id),
+                NOT_GRANTED.to_string(),
+            ),
+            (
+                "a name not chosen",
+                3,
+                json!({"account": "Work account"}),
+                "'Work account' is not an active calendar connection of yours.".to_string(),
+            ),
+            (
+                "not a string",
+                1,
+                json!({"account": 7}),
+                "'account' must be the id of one of your calendar accounts.".to_string(),
+            ),
+        ] {
+            let said = told(&h.call(run, "calendar.calendars", args).await);
+            if said != expected {
+                wrong.push(format!("{case}: told {said:?}"));
+            }
+        }
+        // Several chosen, one of the person's own not among them: K5a's
+        // fifth sentence. The person's third account is not in the set.
+        let third = Account::new("Third account", true);
+        let h3 = harness(
+            vec![work.clone(), home.clone(), third.clone()],
+            &standin,
+            vec![run_of(Some(
+                json!({"caldav": [home.id.0.to_string(), work.id.0.to_string()]}),
+            ))],
+        )
+        .await;
+        let said = told(&h3.call(0, "calendar.calendars", calls(&third.id)).await);
+        if said != NOT_AMONG_CHOSEN {
+            wrong.push(format!("several chosen, another named: told {said:?}"));
+        }
+        let before = standin.requests().len();
+        if before != 0 {
+            wrong.push(format!("a refused call sent {before} requests"));
+        }
+        // Chosen accounts named by their context names are used.
+        for (run, name) in [(3, "Home account"), (4, "Work account")] {
+            let result = h
+                .call(run, "calendar.calendars", json!({"account": name}))
+                .await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(answer)) if answer["calendars"].is_array() => {}
+                other => wrong.push(format!("{name} by its name: {}", told(other))),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_chosen_calendar_accounts_lists_account_as_their_names() {
+        let standin = CalDavStandIn::start(client_config()).await;
+        let work = Account::new("Work", true);
+        let home = Account::new("Home", true);
+        let h = harness(
+            vec![work.clone(), home.clone()],
+            &standin,
+            vec![
+                run_of(Some(
+                    json!({"caldav": [home.id.0.to_string(), work.id.0.to_string()]}),
+                )),
+                run_of(None),
+            ],
+        )
+        .await;
+        let mut wrong = Vec::new();
+        for (run, expected) in [
+            (
+                0,
+                json!({
+                    "type": "string",
+                    "enum": ["Home", "Work"],
+                    "description": "Which of your calendar accounts this call uses: Home; Work"
+                }),
+            ),
+            (
+                1,
+                json!({"type": "string", "description": "The id of one of your calendar accounts."}),
+            ),
+        ] {
+            let listed = h
+                .service
+                .get_available_tools_for_agent_run(
+                    &TenantId::default(),
+                    h.agent_id,
+                    h.runs[run],
+                    CONTEXT,
+                )
+                .await
+                .unwrap();
+            let mut names: Vec<&str> = listed.iter().map(|t| t.name.as_str()).collect();
+            names.sort();
+            if names != vec!["calendar.calendars", "calendar.list", "calendar.read"] {
+                wrong.push(format!("run {run}: listed {names:?}"));
+            }
+            for tool in &listed {
+                if tool.input_schema["properties"]["account"] != expected {
+                    wrong.push(format!(
+                        "run {run}: {}'s account reads {}",
+                        tool.name, tool.input_schema["properties"]["account"]
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn the_caldav_key_reads_the_persons_active_calendar_accounts_and_answers_their_token() {
+        let mut server = mockito::Server::new_async().await;
+        let c = connect(
+            &mut server,
+            token_body(&granted_calendar_scope(), Some(ADDRESS)),
+            standin_config(TOKEN, Some(HOME_SET)),
+            None,
+        )
+        .await;
+        let connected = *c
+            .outcome
+            .as_ref()
+            .unwrap_or_else(|e| panic!("the connect did not complete: {e:#}"));
+        let calendar = c.repo.find_by_id(&connected).await.unwrap().unwrap();
+        // Beside it: an expired calendar account, and an OAuth binding with
+        // no calendar settings; neither is one of the person's calendars.
+        let mut expired = calendar.clone();
+        expired.id = CredentialBindingId::new();
+        expired.status = CredentialStatus::Expired;
+        expired.metadata.label = "expired@example.test".to_string();
+        c.repo.save(&expired).await.unwrap();
+        let mut plain = calendar.clone();
+        plain.id = CredentialBindingId::new();
+        plain.metadata.calendar = None;
+        plain.metadata.label = "plain@example.test".to_string();
+        c.repo.save(&plain).await.unwrap();
+        let service = StandardCredentialManagementService::with_http_client(
+            c.repo.clone(),
+            c.secrets.clone(),
+            Arc::new(EventBus::new(16)),
+            Arc::new(calendar_registry(format!("{}/token", server.url()))),
+            reqwest::Client::new(),
+        );
+        let pool = ToolCredentialSource::context_bindings(&service, &tenant(), USER, "caldav")
+            .await
+            .unwrap();
+        assert_eq!(
+            pool.iter()
+                .map(|b| (b.id, b.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(connected, ADDRESS)],
+            "the caldav key does not read the person's active calendar accounts"
+        );
+        let names = ToolCalendarSource::calendar_contexts(&service, &tenant(), USER)
+            .await
+            .unwrap();
+        assert_eq!(names, pool, "the tools' names are not the start check's");
+
+        let actor = ToolCallActor {
+            tenant_id: &tenant(),
+            user_id: USER,
+            agent_id: AgentId::new(),
+            workflow_id: None,
+            context: aegis_orchestrator_core::domain::execution::ContextChoice::NotGiven,
+        };
+        let found = service
+            .tool_calendar(&actor, &connected)
+            .await
+            .unwrap()
+            .expect("the connected calendar is not the person's");
+        assert_eq!(found.settings, google_settings(ADDRESS));
+        let CalDavAuth::Bearer(token) = &found.auth;
+        assert_eq!(
+            token.expose(),
+            TOKEN,
+            "the account's token is not its access token"
+        );
+        for (case, id) in [("expired", expired.id), ("no calendar", plain.id)] {
+            assert!(
+                service.tool_calendar(&actor, &id).await.unwrap().is_none(),
+                "{case} is answered as a calendar account"
+            );
+        }
+        let stranger = ToolCallActor {
+            user_id: "someone-else",
+            ..actor
+        };
+        assert!(
+            service
+                .tool_calendar(&stranger, &connected)
+                .await
+                .unwrap()
+                .is_none(),
+            "another person's calendar is answered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test doubles the dispatch reads
+    // -----------------------------------------------------------------------
+    struct Executions(HashMap<ExecutionId, Execution>);
+
+    #[async_trait]
+    impl ExecutionService for Executions {
+        async fn start_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_execution_with_id(
+            &self,
+            execution_id: ExecutionId,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+        ) -> Result<ExecutionId> {
+            Ok(execution_id)
+        }
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            id: ExecutionId,
+        ) -> Result<Execution> {
+            self.get_execution_unscoped(id).await
+        }
+        async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
+            self.0
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("execution not found"))
+        }
+        async fn get_iterations_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Vec<Iteration>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_executions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: Option<AgentId>,
+            _: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
+            _: usize,
+        ) -> Result<Vec<Execution>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: aegis_orchestrator_core::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<aegis_orchestrator_core::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Resolves every agent to one agent with no `tool_validation`, so the
+    /// inner-loop judge does not run.
+    struct OneAgent(Agent);
+
+    #[async_trait]
+    impl AgentLifecycleService for OneAgent {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentManifest,
+            _: bool,
+            _: aegis_orchestrator_core::domain::agent::AgentScope,
+            _: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+        ) -> Result<AgentId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> Result<Agent> {
+            Ok(self.0.clone())
+        }
+        async fn update_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentId,
+            _: AgentManifest,
+        ) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn delete_agent_for_tenant(&self, _: &TenantId, _: AgentId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_agents_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+            Ok(vec![self.0.clone()])
+        }
+        async fn lookup_agent_for_tenant(&self, _: &TenantId, _: &str) -> Result<Option<AgentId>> {
+            Ok(Some(self.0.id))
+        }
+        async fn lookup_agent_visible_for_tenant(
+            &self,
+            _: &TenantId,
+            _: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(Some(self.0.id))
+        }
+        async fn lookup_agent_for_tenant_with_version(
+            &self,
+            _: &TenantId,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<AgentId>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_agents_visible_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+            Ok(vec![self.0.clone()])
+        }
+        async fn list_versions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentId,
+        ) -> Result<Vec<AgentVersion>> {
+            Ok(vec![])
+        }
+    }
+
+    struct NoOpPublisher;
+
+    #[async_trait]
+    impl aegis_orchestrator_core::domain::fsal::EventPublisher for NoOpPublisher {
+        async fn publish_storage_event(
+            &self,
+            _event: aegis_orchestrator_core::domain::events::StorageEvent,
+        ) {
+        }
+    }
 }

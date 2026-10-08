@@ -356,6 +356,9 @@ impl ToolInputContract {
             "mail.draft" => &["mailbox", "body"],
             "mail.send" => &["mailbox", "to", "subject", "body"],
             "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],
+            "calendar.calendars" => &["account"],
+            "calendar.list" => &["account", "calendar_id"],
+            "calendar.read" => &["account", "calendar_id", "event_id"],
             "aegis.tools.list" | "aegis.tools.search" => &[],
             _ => &[],
         }

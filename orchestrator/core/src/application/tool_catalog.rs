@@ -53,6 +53,7 @@ pub enum ToolCategory {
     Execution,
     WebNetwork,
     Mail,
+    Calendar,
     ToolDiscovery,
     External,
 }
@@ -355,6 +356,9 @@ impl StandardToolCatalog {
         if name.starts_with("mail.") {
             return ToolCategory::Mail;
         }
+        if name.starts_with("calendar.") {
+            return ToolCategory::Calendar;
+        }
         ToolCategory::External
     }
 
@@ -373,6 +377,8 @@ impl StandardToolCatalog {
             "web.search",
             "web.fetch",
             "mail.read",
+            "calendar.calendars",
+            "calendar.read",
         ];
         if read_only_suffixes.iter().any(|s| name.ends_with(s)) || read_only_names.contains(&name) {
             tags.push("read-only".to_string());
@@ -488,6 +494,29 @@ mod tests {
         assert_eq!(entry.category, ToolCategory::WebNetwork);
         assert!(entry.tags.contains(&"read-only".to_string()));
         assert!(entry.tags.contains(&"network".to_string()));
+    }
+
+    /// The calendar read tools are their own category and read-only (AEGIS
+    /// ADR-138 K6).
+    #[test]
+    fn enrich_classifies_the_calendar_read_tools_as_read_only_calendar_tools() {
+        let mut wrong = Vec::new();
+        for name in ["calendar.calendars", "calendar.list", "calendar.read"] {
+            let entry =
+                StandardToolCatalog::enrich(crate::infrastructure::tool_router::ToolMetadata {
+                    name: name.to_string(),
+                    description: "A calendar tool".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                });
+            if entry.category != ToolCategory::Calendar {
+                wrong.push(format!("{name} is in {:?}", entry.category));
+            }
+            if !entry.tags.contains(&"read-only".to_string()) {
+                wrong.push(format!("{name} is not tagged read-only: {:?}", entry.tags));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

@@ -146,6 +146,9 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.read", "Reads one thread of a connected mailbox: every message's headers, flags, labels and plain-text body, oldest first. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox, and flags or unflags it."),
     BuiltinToolDefinition::new("mail.delete", "Moves every message of a thread in a connected mailbox's inbox to its Trash folder; deletes nothing permanently. Waits for the person's approval before anything is moved.").requires_approval(),
+    BuiltinToolDefinition::new("calendar.calendars", "Lists the calendars of a connected calendar account: each calendar's id, name, description, colour where given, and whether the account may write to it. Changes nothing.").skip_judge(),
+    BuiltinToolDefinition::new("calendar.list", "Lists the events of one calendar of a connected calendar account in a window of at most 92 days (by default now and the seven days on), by start: repeating events as their occurrences, each with its id, title, times, location, organiser, attendees and their answers, and status. Changes nothing.").skip_judge(),
+    BuiltinToolDefinition::new("calendar.read", "Reads one event of a calendar of a connected calendar account: everything calendar.list answers, its description, its start and end as written with their time zone, and its etag. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.status", "Shows one of your run's repositories: its work branch, whether the tree is clean or changed, and the commit HEAD is on.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.diff", "Shows the changes in one of your run's repositories as a unified diff: unstaged by default, or what is staged.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
@@ -343,6 +346,9 @@ impl ToolRouter {
             "mail.read" => Self::schema_mail_read(),
             "mail.label" => Self::schema_mail_label(),
             "mail.delete" => Self::schema_mail_delete(),
+            "calendar.calendars" => Self::schema_calendar(CalendarShape::Calendars),
+            "calendar.list" => Self::schema_calendar(CalendarShape::List),
+            "calendar.read" => Self::schema_calendar(CalendarShape::Read),
             "aegis.git.status" => Self::schema_aegis_git(false, false),
             "aegis.git.diff" => Self::schema_aegis_git(false, true),
             "aegis.git.commit" => Self::schema_aegis_git(true, false),
@@ -768,6 +774,74 @@ impl ToolRouter {
             OutboundShape::Send => vec!["mailbox", "to", "subject", "body"],
             OutboundShape::Reply => vec!["mailbox", "thread_id", "to", "subject", "body"],
         };
+        json!({"type": "object", "properties": properties, "required": required})
+    }
+
+    /// JSON schema for the calendar read tools (AEGIS ADR-138 K6). Every
+    /// one takes `account`; a run with chosen accounts lists it as their
+    /// names' `enum` instead.
+    fn schema_calendar(shape: CalendarShape) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "account".to_string(),
+            json!({
+                "type": "string",
+                "description": "The id of one of your calendar accounts."
+            }),
+        );
+        let mut required = vec!["account"];
+        if matches!(shape, CalendarShape::List | CalendarShape::Read) {
+            properties.insert(
+                "calendar_id".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "A calendar_id calendar.calendars answered."
+                }),
+            );
+            required.push("calendar_id");
+        }
+        if matches!(shape, CalendarShape::List) {
+            properties.insert(
+                "start".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "The window's start, an RFC 3339 time with an offset (default now)."
+                }),
+            );
+            properties.insert(
+                "end".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "The window's end, an RFC 3339 time with an offset after start and at most 92 days on (default seven days after start)."
+                }),
+            );
+            properties.insert(
+                "query".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Words an event's title, location or description contains."
+                }),
+            );
+            properties.insert(
+                "limit".to_string(),
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "The most events to answer (default 50); truncated says when there were more."
+                }),
+            );
+        }
+        if matches!(shape, CalendarShape::Read) {
+            properties.insert(
+                "event_id".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "An event_id calendar.list answered."
+                }),
+            );
+            required.push("event_id");
+        }
         json!({"type": "object", "properties": properties, "required": required})
     }
 
@@ -2057,6 +2131,14 @@ enum OutboundShape {
     Reply,
 }
 
+/// Which calendar read tool a schema is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalendarShape {
+    Calendars,
+    List,
+    Read,
+}
+
 // =============================================================================
 // ToolMetadata — Tool discovery metadata
 // =============================================================================
@@ -2421,6 +2503,9 @@ mod tests {
         "web.fetch",
         "mail.list",
         "mail.read",
+        "calendar.calendars",
+        "calendar.list",
+        "calendar.read",
         "aegis.schema.get",
         "aegis.schema.validate",
         "aegis.agent.create",

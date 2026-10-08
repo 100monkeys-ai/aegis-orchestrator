@@ -336,7 +336,10 @@ impl ToolInvocationService {
     /// (13) S11i: with the run's `imap` set filled, each mail tool's
     /// `mailbox` is an `enum` of the chosen mailboxes' names, described as
     /// "Which of your mailboxes this call uses: " and the names joined by
-    /// "; ", so no id reaches a model. With nothing chosen the router's
+    /// "; ", so no id reaches a model. ADR-138 K5a gives the calendar tools
+    /// the same rule: with the run's `caldav` set filled, `account` is an
+    /// `enum` of the chosen accounts' names, described as "Which of your
+    /// calendar accounts this call uses: ". With nothing chosen the router's
     /// schema stands.
     async fn name_chosen_mailboxes(
         &self,
@@ -345,51 +348,79 @@ impl ToolInvocationService {
         contexts: &crate::domain::execution::ExecutionContexts,
         tools: &mut [crate::infrastructure::tool_router::ToolMetadata],
     ) {
-        let ServerChoice::Bindings(chosen) =
-            contexts.server(crate::application::tools::builtin_mail::MailActing::choice_key())
-        else {
+        self.name_chosen_bindings(
+            tenant_id,
+            person,
+            contexts,
+            tools,
+            ChosenNames {
+                key: crate::application::tools::builtin_mail::MailActing::choice_key(),
+                property: "mailbox",
+                described: "Which of your mailboxes this call uses: ",
+                of_tool: crate::application::tools::builtin_mail::is_mail_tool,
+            },
+        )
+        .await;
+        self.name_chosen_bindings(
+            tenant_id,
+            person,
+            contexts,
+            tools,
+            ChosenNames {
+                key: crate::application::tools::builtin_calendar::CalendarActing::choice_key(),
+                property: "account",
+                described: "Which of your calendar accounts this call uses: ",
+                of_tool: crate::application::tools::builtin_calendar::is_calendar_tool,
+            },
+        )
+        .await;
+    }
+
+    /// With the run's set for `names.key` filled, each tool `names.of_tool`
+    /// holds has its `names.property` rewritten to an `enum` of the chosen
+    /// bindings' context names, described as `names.described` and the
+    /// names joined by "; ".
+    async fn name_chosen_bindings(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        contexts: &crate::domain::execution::ExecutionContexts,
+        tools: &mut [crate::infrastructure::tool_router::ToolMetadata],
+        names: ChosenNames,
+    ) {
+        let ServerChoice::Bindings(chosen) = contexts.server(names.key) else {
             return;
         };
         let (Some(person), Some(source)) = (person, &self.tool_credentials) else {
             return;
         };
-        let named = match source
-            .context_bindings(
-                tenant_id,
-                person,
-                crate::application::tools::builtin_mail::MailActing::choice_key(),
-            )
-            .await
-        {
+        let named = match source.context_bindings(tenant_id, person, names.key).await {
             Ok(named) => named,
             Err(e) => {
-                tracing::warn!(error = %e, "the run's chosen mailboxes could not be named; the mail tools keep their schema");
+                tracing::warn!(error = %e, key = names.key, "the run's chosen bindings could not be named; their tools keep their schema");
                 return;
             }
         };
-        let names: Vec<String> = chosen
+        let chosen_names: Vec<String> = chosen
             .iter()
             .filter_map(|id| named.iter().find(|b| &b.id == id))
             .map(|b| b.name.clone())
             .collect();
-        if names.is_empty() {
+        if chosen_names.is_empty() {
             return;
         }
         let property = serde_json::json!({
             "type": "string",
-            "enum": names,
-            "description": format!("Which of your mailboxes this call uses: {}", names.join("; ")),
+            "enum": chosen_names,
+            "description": format!("{}{}", names.described, chosen_names.join("; ")),
         });
-        for tool in tools
-            .iter_mut()
-            .filter(|tool| crate::application::tools::builtin_mail::is_mail_tool(&tool.name))
-        {
+        for tool in tools.iter_mut().filter(|tool| (names.of_tool)(&tool.name)) {
             if let Some(properties) = tool
                 .input_schema
                 .get_mut("properties")
                 .and_then(serde_json::Value::as_object_mut)
             {
-                properties.insert("mailbox".to_string(), property.clone());
+                properties.insert(names.property.to_string(), property.clone());
             }
         }
     }
@@ -1646,4 +1677,17 @@ fn verify_listing_envelope(
             "a context-tools listing is a 'tools/list' request".to_string(),
         )),
     }
+}
+
+/// Which tools a run's chosen bindings of one key name, and how
+/// ([`ToolInvocationService::name_chosen_bindings`]).
+struct ChosenNames {
+    /// The choice key (`imap`, `caldav`).
+    key: &'static str,
+    /// The argument rewritten to the names' `enum`.
+    property: &'static str,
+    /// The description's opening, before the names.
+    described: &'static str,
+    /// Whether a tool is one of the key's.
+    of_tool: fn(&str) -> bool,
 }

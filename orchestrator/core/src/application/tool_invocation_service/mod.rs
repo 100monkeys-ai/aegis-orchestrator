@@ -153,6 +153,10 @@ pub struct ToolInvocationService {
     /// the connector their sessions open over. `None`: every mail tool is
     /// answered as not configured.
     mail_tools: Option<Arc<crate::application::tools::builtin_mail::MailTools>>,
+    /// The calendar tools (AEGIS ADR-138 K6's read half): the acting
+    /// person's calendar account and the transport their requests go over.
+    /// `None`: every calendar tool is answered as not configured.
+    calendar_tools: Option<Arc<crate::application::tools::builtin_calendar::CalendarTools>>,
     /// Schema registry for builtin schema.get / schema.validate tools.
     schema_registry: Arc<SchemaRegistry>,
     /// Optional port for workflow execution control (cancel, signal, remove).

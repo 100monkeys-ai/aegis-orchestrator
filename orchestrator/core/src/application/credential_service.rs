@@ -801,6 +801,51 @@ pub fn is_calendar_binding(binding: &UserCredentialBinding) -> bool {
     binding.metadata.calendar.is_some() && binding.credential_type == CredentialType::OAuth2
 }
 
+/// The key a run's or a conversation's chosen calendar accounts are read
+/// under (AEGIS ADR-138 K5a), whatever the binding's provider.
+pub const CALENDAR_CHOICE_KEY: &str = "caldav";
+
+/// A calendar tool's account (AEGIS ADR-138 K5a, K6): a calendar binding of
+/// the acting person ([`is_calendar_binding`]), its CalDAV settings, how its
+/// requests authenticate (the OAuth access token as a bearer), and whether
+/// it is granted to the calling agent, its workflow or all the person's
+/// agents.
+pub struct ToolCalendar {
+    pub binding_id: CredentialBindingId,
+    pub settings: crate::domain::credential::CalendarSettings,
+    pub auth: CalDavAuth,
+    pub granted: bool,
+}
+
+/// Answers the calendar account a calendar tool's `account` argument names
+/// (AEGIS ADR-138 K5a), as [`ToolMailboxSource`] answers a mailbox.
+#[async_trait]
+pub trait ToolCalendarSource: Send + Sync {
+    /// `binding_id` when it is the acting person's own Active calendar
+    /// account in the tenant, with the access token `access_token_for`
+    /// answers (refreshed within 60 seconds of expiry); `Ok(None)` for
+    /// anything else, another person's binding and a binding whose token can
+    /// no longer be refreshed included. Whether the call may use it (the
+    /// choice and the grant) is the calendar tools' decision, from
+    /// [`ToolCalendar::granted`].
+    async fn tool_calendar(
+        &self,
+        actor: &ToolCallActor<'_>,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<Option<ToolCalendar>>;
+
+    /// The acting person's own Active calendar accounts in the tenant,
+    /// oldest first, each with its context name (ADR-132 Update (13) S11c),
+    /// so `account` may name a chosen one by name. The default answers none.
+    async fn calendar_contexts(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        Ok(Vec::new())
+    }
+}
+
 /// Answers the mailbox a mail tool's `mailbox` argument names (AEGIS
 /// ADR-125 D4, its Update of 2026-10-07 clause 7).
 #[async_trait]
@@ -969,6 +1014,12 @@ impl ToolCredentialSource for StandardCredentialManagementService {
         if server == CredentialProvider::IMAP {
             return self.active_mailbox_bindings(tenant_id, user_id).await;
         }
+        // The key `caldav` chooses calendar accounts whatever their provider
+        // (AEGIS ADR-138 K5a): the start check and the run's account names
+        // read the same pool as the calendar tools.
+        if server == CALENDAR_CHOICE_KEY {
+            return self.active_calendar_bindings(tenant_id, user_id).await;
+        }
         self.active_context_bindings(tenant_id, user_id, &CredentialProvider::new(server))
             .await
     }
@@ -1041,7 +1092,76 @@ impl ToolMailboxSource for StandardCredentialManagementService {
     }
 }
 
+#[async_trait]
+impl ToolCalendarSource for StandardCredentialManagementService {
+    async fn tool_calendar(
+        &self,
+        actor: &ToolCallActor<'_>,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<Option<ToolCalendar>> {
+        let Some(binding) = self.repo.find_by_id(binding_id).await? else {
+            return Ok(None);
+        };
+        let settings = match &binding.metadata.calendar {
+            Some(settings)
+                if binding.owner_user_id == actor.user_id
+                    && &binding.tenant_id == actor.tenant_id
+                    && is_calendar_binding(&binding)
+                    && binding.status == CredentialStatus::Active =>
+            {
+                settings.clone()
+            }
+            _ => return Ok(None),
+        };
+        let granted = granted_to(&binding, actor);
+        let binding_id = binding.id;
+        // The access token, read from `access_token` and refreshed inside the
+        // margin; a token that can no longer be refreshed has set the binding
+        // Expired, and the account is not an active one.
+        Ok(self
+            .binding_secret(binding)
+            .await?
+            .map(|token| ToolCalendar {
+                binding_id,
+                settings,
+                auth: CalDavAuth::Bearer(token),
+                granted,
+            }))
+    }
+
+    async fn calendar_contexts(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        self.active_calendar_bindings(tenant_id, user_id).await
+    }
+}
+
 impl StandardCredentialManagementService {
+    /// The person's own Active calendar accounts in the tenant
+    /// ([`is_calendar_binding`]), oldest first, named as contexts in one
+    /// pool (AEGIS ADR-138 K5a; ADR-132 Update (13) S11c).
+    async fn active_calendar_bindings(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        let mut active: Vec<UserCredentialBinding> = self
+            .repo
+            .find_by_owner(tenant_id, user_id)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                is_calendar_binding(binding)
+                    && binding.owner_user_id == user_id
+                    && &binding.tenant_id == tenant_id
+                    && binding.status == CredentialStatus::Active
+            })
+            .collect();
+        Ok(Self::named_contexts(&mut active))
+    }
+
     /// The person's own Active mailboxes in the tenant, of either form (the
     /// `imap` bindings and the OAuth bindings with mailbox settings), oldest
     /// first, named as contexts in one pool

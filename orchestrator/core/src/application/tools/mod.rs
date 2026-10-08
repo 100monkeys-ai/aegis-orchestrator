@@ -1,3 +1,4 @@
+pub mod builtin_calendar;
 pub mod builtin_dispatch;
 pub mod builtin_execution_file;
 pub mod builtin_fsal;
@@ -27,6 +28,13 @@ pub struct MailCall<'a> {
     pub acting: builtin_mail::MailActing,
 }
 
+/// A calendar tool's call: the node's calendar tools, if configured, and
+/// who the call acts for (AEGIS ADR-138 K5a).
+pub struct CalendarCall<'a> {
+    pub tools: Option<&'a builtin_calendar::CalendarTools>,
+    pub acting: builtin_calendar::CalendarActing,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn try_invoke_builtin(
     tool_name: &str,
@@ -37,7 +45,20 @@ pub async fn try_invoke_builtin(
     web_tool_port: &Arc<dyn ExternalWebToolPort>,
     schema_registry: &Arc<SchemaRegistry>,
     mail: Option<MailCall<'_>>,
+    calendar: Option<CalendarCall<'_>>,
 ) -> Result<BuiltinToolResult, SealSessionError> {
+    if builtin_calendar::is_calendar_tool(tool_name) {
+        if let Some(call) = calendar {
+            let Some(tools) = call.tools else {
+                return Err(builtin_calendar::not_configured());
+            };
+            return tools
+                .invoke(tool_name, args, &call.acting)
+                .await
+                .map(|value| BuiltinToolResult::Handled(ToolInvocationResult::Direct(value)));
+        }
+    }
+
     if builtin_mail::is_mail_tool(tool_name) {
         if let Some(call) = mail {
             let Some(tools) = call.tools else {

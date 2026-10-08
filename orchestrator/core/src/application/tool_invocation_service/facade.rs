@@ -118,6 +118,7 @@ impl ToolInvocationService {
             tool_credentials: None,
             remote_tool_servers: Vec::new(),
             mail_tools: None,
+            calendar_tools: None,
             schema_registry: Arc::new(SchemaRegistry::build()),
             workflow_execution_control: None,
             agent_activity: None,
@@ -243,6 +244,34 @@ impl ToolInvocationService {
         self.mail_tools = Some(Arc::new(
             crate::application::tools::builtin_mail::MailTools::with_connector(
                 mailboxes, connector,
+            ),
+        ));
+        self
+    }
+
+    /// The calendar tools, resolving the acting person's calendar account
+    /// through `accounts` and sending their requests over `https` with no
+    /// redirect followed (AEGIS ADR-138 K1, K6).
+    pub fn with_calendar_tools(
+        self,
+        accounts: Arc<dyn crate::application::credential_service::ToolCalendarSource>,
+    ) -> Self {
+        self.with_calendar_tools_over(
+            accounts,
+            Arc::new(crate::infrastructure::calendar::ReqwestTransport::new()),
+        )
+    }
+
+    /// The calendar tools over another transport (tests: one that sends
+    /// every request to a loopback stand-in).
+    pub fn with_calendar_tools_over(
+        mut self,
+        accounts: Arc<dyn crate::application::credential_service::ToolCalendarSource>,
+        transport: Arc<dyn crate::infrastructure::calendar::CalDavTransport>,
+    ) -> Self {
+        self.calendar_tools = Some(Arc::new(
+            crate::application::tools::builtin_calendar::CalendarTools::with_transport(
+                accounts, transport,
             ),
         ));
         self
@@ -1451,6 +1480,26 @@ impl ToolInvocationService {
             None
         };
 
+        // A calendar tool acts for the call's person, under its run's choice
+        // and grant (AEGIS ADR-138 K5a).
+        let calendar_call =
+            if crate::application::tools::builtin_calendar::is_calendar_tool(&tool_name) {
+                Some(crate::application::tools::CalendarCall {
+                    tools: self.calendar_tools.as_deref(),
+                    acting: self
+                        .calendar_acting(
+                            *agent_id,
+                            execution_id,
+                            tenant_id,
+                            caller_identity,
+                            call_contexts,
+                        )
+                        .await,
+                })
+            } else {
+                None
+            };
+
         // Try invoking built-in tools (ADR-033, ADR-040, ADR-048)
         match crate::application::tools::try_invoke_builtin(
             &tool_name,
@@ -1461,6 +1510,7 @@ impl ToolInvocationService {
             &self.web_tool_port,
             &self.schema_registry,
             mail_call,
+            calendar_call,
         )
         .await
         {
@@ -1586,6 +1636,45 @@ impl ToolInvocationService {
             choice: acting
                 .contexts
                 .server(crate::application::tools::builtin_mail::MailActing::choice_key()),
+            has_execution_record,
+        }
+    }
+
+    /// Who a calendar tool's call acts for (AEGIS ADR-138 K5a, the mail
+    /// tools' rule): the call's person, the calling agent and its workflow,
+    /// the choice for `caldav` (the execution record's `contexts` when the
+    /// execution has a record, else the call's `_meta.contexts`), and
+    /// whether the execution has a record.
+    async fn calendar_acting(
+        &self,
+        agent_id: AgentId,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &TenantId,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+    ) -> crate::application::tools::builtin_calendar::CalendarActing {
+        let has_execution_record = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .is_ok();
+        let acting = self
+            .gateway_acting(
+                agent_id,
+                execution_id,
+                tenant_id,
+                caller_identity,
+                call_contexts,
+            )
+            .await;
+        crate::application::tools::builtin_calendar::CalendarActing {
+            tenant_id: tenant_id.clone(),
+            user_id: acting.user_id,
+            agent_id: acting.agent_id,
+            workflow_id: acting.workflow_id,
+            choice: acting
+                .contexts
+                .server(crate::application::tools::builtin_calendar::CalendarActing::choice_key()),
             has_execution_record,
         }
     }

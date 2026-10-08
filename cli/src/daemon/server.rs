@@ -145,7 +145,8 @@ use aegis_orchestrator_core::{
 
 use aegis_orchestrator_core::application::credential_service::{
     oauth_provider_registry_from_config, CredentialManagementService, RemoteServerGrounding,
-    StandardCredentialManagementService, ToolCredentialSource, ToolMailboxSource,
+    StandardCredentialManagementService, ToolCalendarSource, ToolCredentialSource,
+    ToolMailboxSource,
 };
 use aegis_orchestrator_core::domain::credential::CredentialBindingRepository;
 use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
@@ -1799,6 +1800,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // The mail tools resolve the acting person's mailbox from the same store
     // (AEGIS ADR-125 D4).
     let mut mailbox_source: Option<Arc<dyn ToolMailboxSource>> = None;
+    let mut calendar_source: Option<Arc<dyn ToolCalendarSource>> = None;
     // Handed the remote servers' grounding once the tool invocation service
     // that implements it is built (AEGIS ADR-132 (7a) S2).
     let mut grounded_credentials: Option<Arc<StandardCredentialManagementService>> = None;
@@ -1841,6 +1843,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             );
             tool_credentials = Some(service.clone() as Arc<dyn ToolCredentialSource>);
             mailbox_source = Some(service.clone() as Arc<dyn ToolMailboxSource>);
+            calendar_source = Some(service.clone() as Arc<dyn ToolCalendarSource>);
             grounded_credentials = Some(service.clone());
             Some(service as Arc<dyn CredentialManagementService>)
         }
@@ -1962,6 +1965,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // The mail tools resolve the acting person's mailbox from the same store.
     if let Some(source) = mailbox_source {
         tool_invocation_service_builder = tool_invocation_service_builder.with_mail_tools(source);
+    }
+    // The calendar tools resolve the acting person's calendar account from
+    // the same store (AEGIS ADR-138 K5a).
+    if let Some(source) = calendar_source {
+        tool_invocation_service_builder =
+            tool_invocation_service_builder.with_calendar_tools(source);
     }
 
     // Wire discovery service into ToolInvocationService if available (ADR-075)
