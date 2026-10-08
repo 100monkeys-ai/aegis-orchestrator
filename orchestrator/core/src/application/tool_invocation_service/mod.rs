@@ -23,6 +23,7 @@ mod mail_tools_tests;
 mod operator_escalation_tests;
 mod repository_args;
 mod runtime;
+mod schedules;
 mod storage;
 mod summary;
 mod system;
@@ -30,6 +31,8 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 mod workflows;
+
+pub use schedules::{schedule_run_view, schedule_view};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -209,6 +212,9 @@ pub struct ToolInvocationService {
     /// AEGIS ADR-131: goals, their evaluation by `goal-judge`, and the
     /// `goal_id` of the four starting tools. `None` refuses every goal.
     goal_service: Option<Arc<crate::application::goal_service::GoalService>>,
+    /// AEGIS ADR-139 N11: the person's schedules, for the `aegis.schedule.*`
+    /// tools. `None` answers every schedule tool as unavailable.
+    schedule_service: Option<Arc<crate::application::schedule_service::ScheduleService>>,
 }
 
 impl ToolInvocationService {
@@ -220,6 +226,16 @@ impl ToolInvocationService {
         runner: Arc<dyn crate::domain::runtime::ContainerStepRunner>,
     ) -> Self {
         self.program_runner = Some(runner);
+        self
+    }
+
+    /// The schedule service the `aegis.schedule.*` tools use (AEGIS ADR-139
+    /// N11), the one the `/v1/schedules` routes use.
+    pub fn with_schedule_service(
+        mut self,
+        service: Arc<crate::application::schedule_service::ScheduleService>,
+    ) -> Self {
+        self.schedule_service = Some(service);
         self
     }
 }

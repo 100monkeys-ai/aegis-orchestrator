@@ -33,6 +33,10 @@
 //! matching a deny policy is stored `auto_denied`, which the status CHECK
 //! admits; an allow and a deny policy are never both unrevoked for one key,
 //! under concurrent writes too, and another binding's policy is untouched.
+//!
+//! The schedule a gated call's run belongs to (AEGIS ADR-139 N9): the gate
+//! stores it from the run's record (an agent run's own, else its workflow
+//! run's), and every read answers the schedule's name, a deleted one's too.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -595,6 +599,8 @@ fn request_in(conversation: Option<&str>) -> ToolApprovalRequest {
         binding_id: Some("b-1".to_string()),
         security_context_name: "zaru-pro".to_string(),
         conversation_id: conversation.map(str::to_string),
+        schedule_id: None,
+        schedule_name: None,
         policy_id: None,
         status: ToolApprovalStatus::Pending,
         created_at: chrono::Utc::now(),
@@ -697,6 +703,157 @@ async fn a_conversation_id_round_trips_through_the_store_a_value_and_null() {
             Some(None)
         ),
         "the store did not round-trip conversation_id (a value and null)"
+    );
+    db.remove().await;
+}
+
+// ── The schedule a gated call's run belongs to (AEGIS ADR-139 N9) ──────────
+
+/// A schedule row of `USER`'s named `name`, deleted when `deleted`.
+async fn schedule_row(pool: &PgPool, name: &str, deleted: bool) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO schedules (id, tenant_id, owner_sub, owner_realm, owner_kind, name, \
+         target_kind, target, run_at, state, temporal_schedule_id, created_at, updated_at, \
+         deleted_at) VALUES ($1, $2, $3, 'zaru-consumer', 'consumer_user', $4, 'agent', \
+         'palindrome-checker', NOW() + INTERVAL '1 day', 'active', $5, NOW(), NOW(), \
+         CASE WHEN $6 THEN NOW() END)",
+    )
+    .bind(id)
+    .bind(tenant().as_str())
+    .bind(USER)
+    .bind(name)
+    .bind(format!("aegis-schedule-{id}"))
+    .bind(deleted)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// A gated call of a run a schedule started stores that schedule's id,
+/// read from the run's record: an agent run's own, and a workflow run's for
+/// the agent run of one of its states; a run no schedule started stores
+/// none. Every read answers the schedule's name, a deleted schedule's too.
+#[tokio::test]
+async fn a_gated_call_of_a_scheduled_run_stores_its_schedule_and_reads_its_name() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    const TENANT: &str = "aegis-system";
+    let agent = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, tenant_id, name, manifest_yaml, manifest_json, runtime, security_policy) \
+         VALUES ($1, $2, 'palindrome-checker', 'x', '{}', 'python:3.11', '{}')",
+    )
+    .bind(agent)
+    .bind(TENANT)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let workflow = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, tenant_id, name, version, yaml_source, domain_json, temporal_def_json) \
+         VALUES ($1, $2, 'email-inbox-triage', '1.0.0', 'x', '{}', '{}')",
+    )
+    .bind(workflow)
+    .bind(TENANT)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let digest = schedule_row(&db.pool, "Morning digest", false).await;
+    let triage = schedule_row(&db.pool, "Weekly triage", true).await;
+
+    let workflow_run = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflow_executions (id, tenant_id, workflow_id, temporal_workflow_id, \
+         temporal_run_id, started_at, schedule_id) VALUES ($1, $2, $3, 't', 'r', NOW(), $4)",
+    )
+    .bind(workflow_run)
+    .bind(TENANT)
+    .bind(workflow)
+    .bind(triage)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let run = |schedule: Option<uuid::Uuid>, workflow_run: Option<uuid::Uuid>| {
+        let pool = db.pool.clone();
+        async move {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO executions (id, tenant_id, agent_id, input, security_context_name, \
+                 schedule_id, workflow_execution_id) VALUES ($1, $2, $3, '{}', 'zaru-free', $4, $5)",
+            )
+            .bind(id)
+            .bind(TENANT)
+            .bind(agent)
+            .bind(schedule)
+            .bind(workflow_run)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ExecutionId(id)
+        }
+    };
+    let agent_run = run(Some(digest), None).await;
+    let state_run = run(None, Some(workflow_run)).await;
+    let unscheduled = run(None, None).await;
+
+    let svc = service(&db.pool);
+    let mut stored = Vec::new();
+    for execution_id in [agent_run, state_run, unscheduled] {
+        let outcome = svc
+            .gate(GatedCall {
+                tenant_id: &tenant(),
+                user_sub: Some(USER),
+                execution_id,
+                agent_id: AgentId(agent),
+                tool_name: "outbound.send",
+                arguments: &json!({"account": "b-1"}),
+                security_context_name: "zaru-pro",
+                conversation_id: None,
+                contract: contract(),
+            })
+            .await
+            .expect("gate");
+        let GateOutcome::Pending { result } = outcome else {
+            panic!("expected pending, got {outcome:?}");
+        };
+        stored.push(ToolApprovalId::from_string(result["approval_id"].as_str().unwrap()).unwrap());
+    }
+
+    let repo = repo(&db.pool);
+    let mut by_id = Vec::new();
+    for id in &stored {
+        let request = repo.find_request(*id).await.unwrap().unwrap();
+        by_id.push((request.schedule_id, request.schedule_name));
+    }
+    let listed = repo
+        .list_requests_for_user(&tenant(), USER, Some(ToolApprovalStatus::Pending))
+        .await
+        .unwrap();
+    let in_list: Vec<_> = stored
+        .iter()
+        .map(|id| {
+            listed
+                .iter()
+                .find(|r| r.id == *id)
+                .map(|r| (r.schedule_id, r.schedule_name.clone()))
+        })
+        .collect();
+    let expected = vec![
+        (Some(digest), Some("Morning digest".to_string())),
+        (Some(triage), Some("Weekly triage".to_string())),
+        (None, None),
+    ];
+    assert_eq!(
+        (by_id, in_list),
+        (
+            expected.clone(),
+            expected.into_iter().map(Some).collect::<Vec<_>>()
+        ),
+        "a scheduled run's gated call did not store its schedule's id and read its name \
+         (an agent run, a workflow state's run, a run no schedule started)"
     );
     db.remove().await;
 }

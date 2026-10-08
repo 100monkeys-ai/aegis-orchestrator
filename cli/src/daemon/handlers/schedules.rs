@@ -12,6 +12,7 @@
 //! | `POST /v1/schedules/{id}/resume` | the owner | `schedule:write` |
 //! | `DELETE /v1/schedules/{id}` | the owner | `schedule:write` |
 //! | `GET /v1/schedules/{id}/runs?limit=` | the owner; an operator (the tenant's) | `schedule:read` |
+//! | `GET /v1/schedules/defaults?target_kind=&target=` | a person; an operator | `schedule:read` |
 //! | `POST /v1/internal/schedules/{id}/fire` | the Temporal worker's service account only | none |
 //!
 //! Another person's schedule is answered 404, exactly as one that does not
@@ -20,13 +21,16 @@
 
 use std::sync::Arc;
 
+use aegis_orchestrator_core::application::agent::AgentLifecycleService;
 use aegis_orchestrator_core::application::schedule_service::{
     ScheduleError, ScheduleReader, ScheduleRunView, ScheduleService, ScheduleView,
 };
+use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
+use aegis_orchestrator_core::domain::repository::WorkflowRepository;
 use aegis_orchestrator_core::domain::schedule::{
-    ScheduleDraft, ScheduleFire, ScheduleId, SchedulePatch, Timing, FIRE_CLIENT_ID, OWNER_REFUSAL,
-    UNAVAILABLE_REFUSAL,
+    DefaultSchedule, ScheduleDraft, ScheduleFire, ScheduleId, SchedulePatch, Timing,
+    FIRE_CLIENT_ID, OWNER_REFUSAL, TARGET_KIND_REFUSAL, TARGET_REFUSAL, UNAVAILABLE_REFUSAL,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
@@ -51,6 +55,10 @@ const SCHEDULED_TIME_REFUSAL: &str = "'scheduled_time' must be an RFC 3339 time.
 pub(crate) struct SchedulesState {
     /// `None` when the node has no schedule service: every route answers 503.
     pub(crate) service: Option<Arc<ScheduleService>>,
+    /// The agents a defaults read looks a target up in (N12).
+    pub(crate) agents: Arc<dyn AgentLifecycleService>,
+    /// The workflows a defaults read looks a target up in (N12).
+    pub(crate) workflows: Arc<dyn WorkflowRepository>,
 }
 
 /// The `/v1/schedules*` routes and the worker's fire route, merged into the
@@ -71,6 +79,7 @@ pub(crate) fn schedules_router(state: SchedulesState) -> Router {
         .route("/v1/schedules/{id}/pause", post(pause_schedule_handler))
         .route("/v1/schedules/{id}/resume", post(resume_schedule_handler))
         .route("/v1/schedules/{id}/runs", get(list_schedule_runs_handler))
+        .route("/v1/schedules/defaults", get(schedule_defaults_handler))
         .route(
             "/v1/internal/schedules/{id}/fire",
             post(fire_schedule_handler),
@@ -367,6 +376,88 @@ pub(crate) async fn list_schedule_runs_handler(
     })))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct DefaultsQuery {
+    target_kind: Option<String>,
+    target: Option<String>,
+}
+
+/// The recommended timing the target's manifest carries in
+/// `spec.default_schedule`, or `None`; a 404 when no such target is
+/// visible to the tenant.
+async fn default_schedule_of(
+    state: &SchedulesState,
+    tenant: &TenantId,
+    target_kind: &str,
+    target: &str,
+) -> Result<Option<DefaultSchedule>, Refusal> {
+    let not_found = || refusal(StatusCode::NOT_FOUND, "Not found");
+    match target_kind {
+        "agent" => {
+            let id = match uuid::Uuid::parse_str(target) {
+                Ok(uuid) => AgentId(uuid),
+                Err(_) => state
+                    .agents
+                    .lookup_agent_visible_for_tenant(tenant, target)
+                    .await
+                    .ok()
+                    .flatten()
+                    .ok_or_else(not_found)?,
+            };
+            let agent = state
+                .agents
+                .get_agent_visible(tenant, id)
+                .await
+                .map_err(|_| not_found())?;
+            Ok(agent.manifest.spec.default_schedule)
+        }
+        "workflow" => {
+            let workflow = state
+                .workflows
+                .find_by_name_visible(tenant, target)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Workflow lookup failed");
+                    refusal(StatusCode::INTERNAL_SERVER_ERROR, "Workflow lookup failed")
+                })?
+                .ok_or_else(not_found)?;
+            Ok(workflow.spec.default_schedule)
+        }
+        _ => Err(refusal(StatusCode::BAD_REQUEST, TARGET_KIND_REFUSAL)),
+    }
+}
+
+/// `GET /v1/schedules/defaults?target_kind=&target=`: the timing the
+/// target's manifest recommends, or `null` (N12). It makes nothing.
+pub(crate) async fn schedule_defaults_handler(
+    State(state): State<SchedulesState>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    tenant: Option<Extension<TenantId>>,
+    Query(query): Query<DefaultsQuery>,
+) -> Result<Json<Value>, Refusal> {
+    scope_guard.require("schedule:read")?;
+    let tenant = match reader(identity.as_deref(), tenant.as_deref())? {
+        ScheduleReader::Operator { tenant } => tenant,
+        ScheduleReader::Owner { .. } => tenant
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| tenant_id_from_identity(identity.as_deref())),
+    };
+    let target_kind = query.target_kind.as_deref().unwrap_or_default();
+    if !matches!(target_kind, "agent" | "workflow") {
+        return Err(refusal(StatusCode::BAD_REQUEST, TARGET_KIND_REFUSAL));
+    }
+    let target = query
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, TARGET_REFUSAL))?;
+    let recommended = default_schedule_of(&state, &tenant, target_kind, target).await?;
+    Ok(Json(json!({ "default_schedule": recommended })))
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct FireBody {
     scheduled_time: String,
@@ -422,14 +513,26 @@ mod tests {
     use aegis_orchestrator_core::application::ports::{
         ScheduleEnginePort, TemporalScheduleDescription, TemporalScheduleSpec,
     };
+    use aegis_orchestrator_core::application::schedule_service::ScheduleReader;
     use aegis_orchestrator_core::application::schedule_service::{
         ScheduleService, ScheduledRunPort,
     };
+    use aegis_orchestrator_core::application::tool_invocation_service::{
+        schedule_run_view, schedule_view,
+    };
+    use aegis_orchestrator_core::domain::agent::Agent;
     use aegis_orchestrator_core::domain::execution::{ExecutionId, ExecutionStatus};
     use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity};
+    use aegis_orchestrator_core::domain::repository::{AgentRepository, WorkflowRepository};
     use aegis_orchestrator_core::domain::schedule::{Schedule, TargetKind, OWNER_REFUSAL};
+    use aegis_orchestrator_core::domain::schedule::{ScheduleId, TARGET_KIND_REFUSAL};
     use aegis_orchestrator_core::domain::shared_kernel::TenantId;
+    use aegis_orchestrator_core::infrastructure::agent_manifest_parser::AgentManifestParser;
     use aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::InMemoryScheduleRepository;
+    use aegis_orchestrator_core::infrastructure::repositories::{
+        InMemoryAgentRepository, InMemoryWorkflowRepository,
+    };
+    use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
     use reqwest::Method;
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -504,6 +607,9 @@ mod tests {
     struct Fixture {
         base: String,
         starts: Arc<RecordedStarts>,
+        service: Arc<ScheduleService>,
+        agents: Arc<InMemoryAgentRepository>,
+        workflows: Arc<InMemoryWorkflowRepository>,
     }
 
     fn other_service_account() -> UserIdentity {
@@ -522,9 +628,13 @@ mod tests {
             Arc::new(HeldSchedules::default()),
             starts.clone(),
         ));
+        let agents = Arc::new(InMemoryAgentRepository::new());
+        let workflows = Arc::new(InMemoryWorkflowRepository::new());
         let base = serve(
             schedules_router(SchedulesState {
-                service: Some(service),
+                service: Some(service.clone()),
+                agents: agents.clone(),
+                workflows: workflows.clone(),
             }),
             Some(identity_provider(&[
                 ("owner", consumer("owner-sub"), SCOPES),
@@ -536,7 +646,13 @@ mod tests {
             None,
         )
         .await;
-        Fixture { base, starts }
+        Fixture {
+            base,
+            starts,
+            service,
+            agents,
+            workflows,
+        }
     }
 
     fn draft() -> Value {
@@ -768,5 +884,131 @@ mod tests {
         )
         .await;
         assert_eq!(status, 400, "a limit over 100 was accepted");
+    }
+
+    const AGENT_YAML: &str = "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: NAME\n  version: \"1.0.0\"\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    instruction: Triage the inbox.\n";
+    const WORKFLOW_YAML: &str = "apiVersion: 100monkeys.ai/v1\nkind: Workflow\nmetadata:\n  name: email-inbox-triage\n  version: \"1.0.0\"\nspec:\n  initial_state: done\n  states:\n    done:\n      kind: System\n      command: echo done\n      transitions: []\n";
+    const DEFAULT: &str = "  default_schedule:\n    cron: \"0 15 * * 1-5\"\n    timezone: Europe/Berlin\n    jitter_seconds: 600\n";
+
+    /// Store an agent named `name` in the owner's tenant, recommending
+    /// N12's example timing when `recommends`.
+    async fn agent_named(f: &Fixture, name: &str, recommends: bool) -> String {
+        let yaml = format!(
+            "{}{}",
+            AGENT_YAML.replace("NAME", name),
+            if recommends { DEFAULT } else { "" }
+        );
+        let agent = Agent::new(AgentManifestParser::parse_yaml(&yaml).expect("agent parses"));
+        let tenant = TenantId::for_consumer_user("owner-sub").unwrap();
+        f.agents.save_for_tenant(&tenant, &agent).await.unwrap();
+        agent.id.0.to_string()
+    }
+
+    async fn defaults(f: &Fixture, query: &str) -> (u16, Value) {
+        send(
+            &f.base,
+            &Method::GET,
+            &format!("/v1/schedules/defaults?{query}"),
+            &None,
+            Some("owner"),
+        )
+        .await
+    }
+
+    /// N12: the defaults route answers the target's `spec.default_schedule`,
+    /// for an agent by name or UUID and for a workflow, `null` for a target
+    /// that recommends none, 404 for one that is not there, and 400 for a
+    /// kind that is neither; it makes no schedule.
+    #[tokio::test]
+    async fn the_defaults_route_answers_the_targets_recommended_timing_or_null() {
+        let f = fixture().await;
+        let recommending = agent_named(&f, "mail-triage", true).await;
+        agent_named(&f, "plain-agent", false).await;
+        let workflow = WorkflowParser::parse_yaml(&format!("{WORKFLOW_YAML}{DEFAULT}"))
+            .expect("workflow parses");
+        f.workflows
+            .save_for_tenant(
+                &TenantId::for_consumer_user("owner-sub").unwrap(),
+                &workflow,
+            )
+            .await
+            .unwrap();
+        let expected =
+            json!({"cron": "0 15 * * 1-5", "timezone": "Europe/Berlin", "jitter_seconds": 600});
+
+        let mut answered = Vec::new();
+        for query in [
+            "target_kind=agent&target=mail-triage".to_string(),
+            format!("target_kind=agent&target={recommending}"),
+            "target_kind=workflow&target=email-inbox-triage".to_string(),
+            "target_kind=agent&target=plain-agent".to_string(),
+            "target_kind=agent&target=nobody".to_string(),
+            "target_kind=pipeline&target=mail-triage".to_string(),
+        ] {
+            let (status, body) = defaults(&f, &query).await;
+            answered.push((status, body));
+        }
+        assert_eq!(
+            answered,
+            vec![
+                (200, json!({ "default_schedule": expected })),
+                (200, json!({ "default_schedule": expected })),
+                (200, json!({ "default_schedule": expected })),
+                (200, json!({ "default_schedule": null })),
+                (404, json!({ "error": "Not found" })),
+                (400, json!({ "error": TARGET_KIND_REFUSAL })),
+            ],
+            "the defaults route did not answer each target's recommended timing"
+        );
+        let (status, body) =
+            send(&f.base, &Method::GET, "/v1/schedules", &None, Some("owner")).await;
+        assert_eq!(
+            (status, body["count"].clone()),
+            (200, json!(0)),
+            "a defaults read made a schedule: {body}"
+        );
+    }
+
+    /// N11: the schedule tools answer their routes' shapes: the route's
+    /// schedule and its runs are exactly what the tools' views make of the
+    /// same schedule.
+    #[tokio::test]
+    async fn the_routes_answer_the_shapes_the_tools_answer() {
+        let f = fixture().await;
+        let id = create(&f).await;
+        let (status, fired) =
+            fire(&f, "worker", &id, &owner_tenant(), "2026-10-09T15:00:00Z").await;
+        assert_eq!(status, 200, "{fired}");
+        let reader = ScheduleReader::Owner {
+            sub: "owner-sub".into(),
+        };
+        let schedule_id = ScheduleId::parse(&id).unwrap();
+        let view = f.service.get(&reader, schedule_id).await.unwrap();
+        let runs = f.service.runs(&reader, schedule_id, 20).await.unwrap();
+
+        let (_, got) = send(
+            &f.base,
+            &Method::GET,
+            &format!("/v1/schedules/{id}"),
+            &None,
+            Some("owner"),
+        )
+        .await;
+        let (_, listed) = send(
+            &f.base,
+            &Method::GET,
+            &format!("/v1/schedules/{id}/runs"),
+            &None,
+            Some("owner"),
+        )
+        .await;
+        assert_eq!(
+            (got["schedule"].clone(), listed["runs"].clone()),
+            (
+                schedule_view(&view),
+                Value::Array(runs.iter().map(schedule_run_view).collect())
+            ),
+            "the route and the tool answer a schedule or its runs in different shapes"
+        );
     }
 }

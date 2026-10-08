@@ -138,6 +138,7 @@ impl ToolInvocationService {
             operator_escalations: None,
             execution_repository: None,
             goal_service: None,
+            schedule_service: None,
         }
     }
 
@@ -1493,6 +1494,7 @@ impl ToolInvocationService {
                 caller_identity,
                 tenant_scope,
                 started_conversation,
+                call_contexts,
             )
             .await;
         if let Some(result) = aegis_result {
@@ -1765,12 +1767,29 @@ impl ToolInvocationService {
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
         tenant_scope: &TenantScope,
         started_conversation: Option<&str>,
+        // A conversation's choices from the call's payload (AEGIS ADR-132
+        // S7), which `aegis.schedule.create` takes when it carries none.
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
     ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
         // ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: a starting
         // tool's handler keeps, from its `args`, only the conversation
         // written here; whatever the call itself wrote there is removed.
         if STARTING_TOOLS.contains(&tool_name) {
             super::context_args::put_conversation(args, started_conversation);
+        }
+        // AEGIS ADR-139 N11: the person's schedules.
+        if super::schedules::SCHEDULE_TOOLS.contains(&tool_name) {
+            return Some(
+                self.invoke_aegis_schedule_tool(
+                    tool_name,
+                    args,
+                    execution_id,
+                    caller_identity,
+                    tenant_scope,
+                    call_contexts,
+                )
+                .await,
+            );
         }
         match tool_name {
             "aegis.agent.create" => {

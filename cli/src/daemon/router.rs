@@ -403,9 +403,12 @@ pub(crate) fn create_router(
     }));
 
     // Schedules (AEGIS ADR-139 N10) and the worker's fire route (N6), over
-    // their own narrow state: the schedule service.
+    // their own narrow state: the schedule service, and the agents and
+    // workflows a defaults read looks its target up in (N12).
     let router = router.merge(schedules_router(SchedulesState {
         service: app_state.schedule_service.clone(),
+        agents: app_state.agent_service.clone(),
+        workflows: app_state.workflow_repo.clone(),
     }));
 
     // Credential bindings by id (ADR-078; security audit 003 F-1), over

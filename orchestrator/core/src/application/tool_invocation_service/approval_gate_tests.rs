@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 
 const GATED_TOOL: &str = "aegis.task.execute";
-const USER: &str = "user-1";
+pub(super) const USER: &str = "user-1";
 
 fn agent() -> Agent {
     let manifest: AgentManifest = serde_yaml::from_str(
@@ -305,17 +305,17 @@ fn dispatchers_gating(
         .collect()
 }
 
-struct Harness {
-    service: ToolInvocationService,
+pub(super) struct Harness {
+    pub(super) service: ToolInvocationService,
     sessions: Arc<InMemorySealSessionRepository>,
     approvals: Arc<ToolApprovalService>,
-    repo: Arc<InMemoryToolApprovalRepository>,
+    pub(super) repo: Arc<InMemoryToolApprovalRepository>,
     event_bus: Arc<EventBus>,
     started: Arc<StdMutex<Vec<Started>>>,
     tenant: TenantId,
     agent_id: AgentId,
     /// The execution whose initiating user is `USER`.
-    execution: ExecutionId,
+    pub(super) execution: ExecutionId,
     /// An execution of the same tenant whose initiating user is `user-2`.
     other_users_execution: ExecutionId,
     /// An execution of the same tenant with no initiating user.
@@ -440,7 +440,7 @@ async fn harness_gating(
     }
 }
 
-async fn harness() -> Harness {
+pub(super) async fn harness() -> Harness {
     harness_with("aegis.*", Arc::new(InMemoryToolApprovalRepository::new())).await
 }
 
@@ -449,7 +449,7 @@ impl Harness {
         json!({ "agent_id": self.target_agent, "account": account, "input": { "note": "the stored arguments" } })
     }
 
-    async fn call_as(
+    pub(super) async fn call_as(
         &self,
         execution: ExecutionId,
         tool: &str,
@@ -472,7 +472,7 @@ impl Harness {
         self.call_as(self.execution, GATED_TOOL, args).await
     }
 
-    async fn rows(&self) -> Vec<ToolApprovalRequest> {
+    pub(super) async fn rows(&self) -> Vec<ToolApprovalRequest> {
         self.repo.list_requests(None).await.unwrap()
     }
 
@@ -491,7 +491,7 @@ impl Harness {
     }
 }
 
-fn direct(result: Result<ToolInvocationResult, SealSessionError>) -> Value {
+pub(super) fn direct(result: Result<ToolInvocationResult, SealSessionError>) -> Value {
     match result {
         Ok(ToolInvocationResult::Direct(v)) => v,
         other => panic!("expected a direct result, got {other:?}"),
@@ -1033,7 +1033,7 @@ impl EnvelopeVerifier for RouteEnvelope {
 impl Harness {
     /// A session of `USER` for `execution`: a conversation's session when
     /// `execution` has no record, an agent's when it has one.
-    async fn session_for(&self, execution: ExecutionId) -> String {
+    pub(super) async fn session_for(&self, execution: ExecutionId) -> String {
         let token = format!("token-{}", uuid::Uuid::new_v4());
         let session = crate::domain::seal_session::SealSession::new(
             self.agent_id,
@@ -1067,11 +1067,23 @@ impl Harness {
         args: Value,
         meta: Option<Value>,
     ) -> Result<Value, SealSessionError> {
+        self.route_tool(token, GATED_TOOL, args, meta).await
+    }
+
+    /// One call of `tool` through the invoke route, with `args` and `meta`
+    /// as the payload's `params._meta`.
+    pub(super) async fn route_tool(
+        &self,
+        token: &str,
+        tool: &str,
+        args: Value,
+        meta: Option<Value>,
+    ) -> Result<Value, SealSessionError> {
         self.service
             .invoke_tool_with_meta(
                 &RouteEnvelope {
                     token: token.to_string().into(),
-                    tool: GATED_TOOL.to_string(),
+                    tool: tool.to_string(),
                     args,
                     nonce: uuid::Uuid::new_v4().to_string(),
                 },
@@ -1290,5 +1302,50 @@ async fn a_records_conversation_wins_over_a_different_meta_one() {
         rows[0].conversation_id.as_deref(),
         Some(CONVERSATION),
         "the call's _meta conversation id was stored in place of its record's"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-139 N9: the schedule a gated call's run belongs to
+// ---------------------------------------------------------------------------
+
+/// A gated call of a run a schedule started is stored pending with that
+/// schedule's id and read with its name; a call of a run no schedule
+/// started stores none.
+#[tokio::test]
+async fn a_scheduled_runs_gated_call_is_stored_with_its_schedule_and_its_name() {
+    let h = harness().await;
+    let schedule = uuid::Uuid::new_v4();
+    h.repo
+        .bind_run_to_schedule(h.execution, schedule, "Morning digest")
+        .await;
+
+    pending_id(h.call(h.args("b-1")).await);
+    pending_id(
+        h.call_as(h.other_users_execution, GATED_TOOL, h.args("b-1"))
+            .await,
+    );
+
+    let rows = h.rows().await;
+    let by_execution = |execution: ExecutionId| {
+        rows.iter()
+            .find(|r| r.execution_id == execution)
+            .map(|r| (r.status, r.schedule_id, r.schedule_name.clone()))
+    };
+    assert_eq!(
+        (
+            by_execution(h.execution),
+            by_execution(h.other_users_execution)
+        ),
+        (
+            Some((
+                ToolApprovalStatus::Pending,
+                Some(schedule),
+                Some("Morning digest".to_string())
+            )),
+            Some((ToolApprovalStatus::Pending, None, None)),
+        ),
+        "a scheduled run's gated call was not stored pending with its schedule and name, \
+         or an unscheduled one was given a schedule"
     );
 }

@@ -58,7 +58,16 @@ use crate::infrastructure::secrets_manager::SecretsManager;
 
 const REQUEST_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
      arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
-     decided_at, decided_by, result, error, conversation_id, sealed";
+     decided_at, decided_by, result, error, conversation_id, schedule_id, sealed";
+
+/// What a read answers: the stored columns and the name of the schedule
+/// whose run made the call (AEGIS ADR-139 N9). A deleted schedule keeps its
+/// row, so its name is still answered.
+const READ_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
+     arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
+     decided_at, decided_by, result, error, conversation_id, schedule_id, sealed, \
+     (SELECT s.name FROM schedules s WHERE s.id = tool_approval_requests.schedule_id) \
+     AS schedule_name";
 
 const POLICY_COLUMNS: &str =
     "id, tenant_id, user_sub, tool_name, binding_id, effect, created_at, created_by, revoked_at";
@@ -228,6 +237,8 @@ fn hydrate_request(row: &PgRow) -> Result<StoredRequest, RepositoryError> {
         binding_id: column(row, "binding_id")?,
         security_context_name: column(row, "security_context_name")?,
         conversation_id: column(row, "conversation_id")?,
+        schedule_id: column(row, "schedule_id")?,
+        schedule_name: column(row, "schedule_name")?,
         policy_id: policy_id.map(ToolApprovalPolicyId),
         status,
         created_at: column(row, "created_at")?,
@@ -276,7 +287,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         };
         sqlx::query(&format!(
             "INSERT INTO tool_approval_requests ({REQUEST_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, TRUE)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, TRUE)"
         ))
         .bind(request.id.0)
         .bind(request.tenant_id.as_str())
@@ -296,6 +307,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(&result)
         .bind(&error)
         .bind(&request.conversation_id)
+        .bind(request.schedule_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -306,7 +318,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         id: ToolApprovalId,
     ) -> Result<Option<ToolApprovalRequest>, RepositoryError> {
         let row = sqlx::query(&format!(
-            "SELECT {REQUEST_COLUMNS} FROM tool_approval_requests WHERE id = $1"
+            "SELECT {READ_COLUMNS} FROM tool_approval_requests WHERE id = $1"
         ))
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -324,7 +336,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         status: Option<ToolApprovalStatus>,
     ) -> Result<Vec<ToolApprovalRequest>, RepositoryError> {
         let rows = sqlx::query(&format!(
-            "SELECT {REQUEST_COLUMNS} FROM tool_approval_requests \
+            "SELECT {READ_COLUMNS} FROM tool_approval_requests \
              WHERE tenant_id = $1 AND user_sub = $2 AND ($3::TEXT IS NULL OR status = $3) \
              ORDER BY created_at DESC"
         ))
@@ -342,7 +354,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         status: Option<ToolApprovalStatus>,
     ) -> Result<Vec<ToolApprovalRequest>, RepositoryError> {
         let rows = sqlx::query(&format!(
-            "SELECT {REQUEST_COLUMNS} FROM tool_approval_requests \
+            "SELECT {READ_COLUMNS} FROM tool_approval_requests \
              WHERE ($1::TEXT IS NULL OR status = $1) ORDER BY created_at DESC"
         ))
         .bind(status.map(|s| s.as_str()))
@@ -363,7 +375,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
     ) -> Result<Option<ToolApprovalRequest>, RepositoryError> {
         let row = sqlx::query(&format!(
             "UPDATE tool_approval_requests SET status = $2, decided_by = $3, decided_at = $4 \
-             WHERE id = $1 AND status = 'pending' RETURNING {REQUEST_COLUMNS}"
+             WHERE id = $1 AND status = 'pending' RETURNING {READ_COLUMNS}"
         ))
         .bind(id.0)
         .bind(status.as_str())
@@ -423,7 +435,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
     ) -> Result<Vec<ToolApprovalRequest>, RepositoryError> {
         let rows = sqlx::query(&format!(
             "UPDATE tool_approval_requests SET status = 'expired', decided_at = $2 \
-             WHERE status = 'pending' AND created_at <= $1 RETURNING {REQUEST_COLUMNS}"
+             WHERE status = 'pending' AND created_at <= $1 RETURNING {READ_COLUMNS}"
         ))
         .bind(cutoff)
         .bind(now)
@@ -494,6 +506,27 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         row.as_ref().map(hydrate_policy).transpose()
     }
 
+    async fn schedule_of_run(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Option<Uuid>, RepositoryError> {
+        // The agent run's own schedule, else the schedule of the workflow
+        // run it is a state of (a workflow's agent states carry none).
+        let row = sqlx::query(
+            "SELECT COALESCE(e.schedule_id, we.schedule_id) AS schedule_id \
+             FROM executions e \
+             LEFT JOIN workflow_executions we ON we.id = e.workflow_execution_id \
+             WHERE e.id = $1",
+        )
+        .bind(execution_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => column(&row, "schedule_id"),
+            None => Ok(None),
+        }
+    }
+
     async fn list_active_policies(
         &self,
         tenant_id: &TenantId,
@@ -538,11 +571,29 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
 pub struct InMemoryToolApprovalRepository {
     requests: RwLock<HashMap<ToolApprovalId, ToolApprovalRequest>>,
     policies: RwLock<HashMap<ToolApprovalPolicyId, ToolApprovalPolicy>>,
+    /// The runs schedules started, with each schedule's name: what the
+    /// PostgreSQL form reads from the execution records and `schedules`.
+    runs: RwLock<HashMap<ExecutionId, (Uuid, String)>>,
 }
 
 impl InMemoryToolApprovalRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that `execution_id` is a run of the schedule `schedule_id`
+    /// named `name`: [`ToolApprovalRepository::schedule_of_run`] answers it,
+    /// and a request stored with that schedule is read with its name.
+    pub async fn bind_run_to_schedule(
+        &self,
+        execution_id: ExecutionId,
+        schedule_id: Uuid,
+        name: &str,
+    ) {
+        self.runs
+            .write()
+            .await
+            .insert(execution_id, (schedule_id, name.to_string()));
     }
 }
 
@@ -561,7 +612,18 @@ impl ToolApprovalRepository for InMemoryToolApprovalRepository {
                 request.id
             )));
         }
-        requests.insert(request.id, request.clone());
+        let mut stored = request.clone();
+        stored.schedule_name = match stored.schedule_id {
+            Some(schedule_id) => self
+                .runs
+                .read()
+                .await
+                .values()
+                .find(|(id, _)| *id == schedule_id)
+                .map(|(_, name)| name.clone()),
+            None => None,
+        };
+        requests.insert(request.id, stored);
         Ok(())
     }
 
@@ -690,6 +752,18 @@ impl ToolApprovalRepository for InMemoryToolApprovalRepository {
             })
             .max_by_key(|p| p.created_at)
             .cloned())
+    }
+
+    async fn schedule_of_run(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Option<Uuid>, RepositoryError> {
+        Ok(self
+            .runs
+            .read()
+            .await
+            .get(&execution_id)
+            .map(|(schedule_id, _)| *schedule_id))
     }
 
     async fn list_active_policies(

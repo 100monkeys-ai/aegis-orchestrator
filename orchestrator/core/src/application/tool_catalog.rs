@@ -47,6 +47,7 @@ pub enum ToolCategory {
     AgentManagement,
     WorkflowManagement,
     TaskManagement,
+    ScheduleManagement,
     SystemManagement,
     SchemaValidation,
     Filesystem,
@@ -332,6 +333,9 @@ impl StandardToolCatalog {
         if name.starts_with("aegis.task.") {
             return ToolCategory::TaskManagement;
         }
+        if name.starts_with("aegis.schedule.") {
+            return ToolCategory::ScheduleManagement;
+        }
         if name.starts_with("aegis.system.") {
             return ToolCategory::SystemManagement;
         }
@@ -465,6 +469,38 @@ mod tests {
         assert_eq!(entry.source, ToolSource::Builtin);
         assert_eq!(entry.category, ToolCategory::AgentManagement);
         assert!(entry.tags.contains(&"read-only".to_string()));
+    }
+
+    /// The schedule tools are their own category (AEGIS ADR-139 N11).
+    #[test]
+    fn enrich_classifies_the_schedule_tools_as_schedule_management() {
+        let wrong: Vec<String> = [
+            "aegis.schedule.create",
+            "aegis.schedule.list",
+            "aegis.schedule.get",
+            "aegis.schedule.update",
+            "aegis.schedule.pause",
+            "aegis.schedule.resume",
+            "aegis.schedule.delete",
+            "aegis.schedule.runs",
+        ]
+        .iter()
+        .map(|name| {
+            StandardToolCatalog::enrich(crate::infrastructure::tool_router::ToolMetadata {
+                name: name.to_string(),
+                description: String::new(),
+                input_schema: json!({"type": "object"}),
+                ..Default::default()
+            })
+        })
+        .filter(|entry| entry.category != ToolCategory::ScheduleManagement)
+        .map(|entry| format!("{} is in {:?}", entry.name, entry.category))
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        assert_eq!(
+            serde_json::to_value(ToolCategory::ScheduleManagement).unwrap(),
+            json!("schedule_management")
+        );
     }
 
     #[test]

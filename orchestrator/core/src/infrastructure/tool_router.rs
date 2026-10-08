@@ -197,6 +197,14 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.task.logs", "Returns paginated execution events for a task by UUID.").skip_judge(),
     BuiltinToolDefinition::new("aegis.task.wait", "Polls an execution until it reaches a terminal state and returns the result.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.wait", "Alias for aegis.task.wait. Blocks until an agent execution completes.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.schedule.create", "Creates a schedule that starts an agent or a workflow as you, once at a time (at) or on a recurrence (cron, timezone, jitter_seconds). Anything a run would send waits for your approval."),
+    BuiltinToolDefinition::new("aegis.schedule.list", "Lists your schedules with their state, next run and last run.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.schedule.get", "Returns one of your schedules by schedule_id, with its state, next run and last run.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.schedule.update", "Updates a schedule by schedule_id: only the fields given, and its time (at or recurrence) replaced when one is given."),
+    BuiltinToolDefinition::new("aegis.schedule.pause", "Pauses a schedule by schedule_id: it starts nothing until it is resumed."),
+    BuiltinToolDefinition::new("aegis.schedule.resume", "Resumes a paused schedule by schedule_id."),
+    BuiltinToolDefinition::new("aegis.schedule.delete", "Deletes a schedule by schedule_id. The runs it started are kept."),
+    BuiltinToolDefinition::new("aegis.schedule.runs", "Lists a schedule's runs by schedule_id, newest first: each time it fired, its outcome and the execution it started.").skip_judge(),
     BuiltinToolDefinition::new("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
     BuiltinToolDefinition::new("aegis.execute.status", "Returns the current status of an intent-to-execution pipeline run.").skip_judge(),
     BuiltinToolDefinition::new("aegis.execute.wait", "Alias for aegis.workflow.wait. Blocks until pipeline execution completes.").skip_judge(),
@@ -401,6 +409,14 @@ impl ToolRouter {
             "aegis.task.list" => Self::schema_aegis_task_list(),
             "aegis.task.cancel" => Self::schema_aegis_task_cancel(),
             "aegis.task.remove" => Self::schema_aegis_task_remove(),
+            "aegis.schedule.create" => Self::schema_aegis_schedule_write(true),
+            "aegis.schedule.update" => Self::schema_aegis_schedule_write(false),
+            "aegis.schedule.list" => json!({ "type": "object", "properties": {} }),
+            "aegis.schedule.get"
+            | "aegis.schedule.pause"
+            | "aegis.schedule.resume"
+            | "aegis.schedule.delete" => Self::schema_aegis_schedule_by_id(),
+            "aegis.schedule.runs" => Self::schema_aegis_schedule_runs(),
             "aegis.system.info" => Self::schema_aegis_system_info(),
             "aegis.system.config" => Self::schema_aegis_system_config(),
             // ADR-117 §D edge fleet system tools.
@@ -447,8 +463,8 @@ impl ToolRouter {
                     "type": "string",
                     "enum": [
                         "agent_management", "workflow_management", "task_management",
-                        "system_management", "schema_validation", "filesystem", "execution",
-                        "web_network", "tool_discovery", "external"
+                        "schedule_management", "system_management", "schema_validation",
+                        "filesystem", "execution", "web_network", "tool_discovery", "external"
                     ],
                     "description": "Only tools of this category."
                 },
@@ -1750,6 +1766,125 @@ impl ToolRouter {
         })
     }
 
+    /// JSON schema for `aegis.schedule.create` (`create`) and
+    /// `aegis.schedule.update` (AEGIS ADR-139 N11). `contexts` and
+    /// `repositories` are reserved dispatch keys the client writes from the
+    /// person's choices, never offered here.
+    fn schema_aegis_schedule_write(create: bool) -> Value {
+        let mut properties = json!({
+            "name": {
+                "type": "string",
+                "description": "Your label for the schedule, 1 to 80 characters."
+            },
+            "target_kind": {
+                "type": "string",
+                "enum": ["agent", "workflow"],
+                "description": "Whether the schedule starts an agent or a workflow."
+            },
+            "target": {
+                "type": "string",
+                "description": "UUID or name of the agent, or name of the workflow, each run starts."
+            },
+            "version": {
+                "type": "string",
+                "description": "Optional version of the agent or workflow, by name only. When omitted, each run uses the latest."
+            },
+            "intent": {
+                "type": "string",
+                "description": "Free-form natural-language steering each run is given, as aegis.task.execute and aegis.workflow.run take it."
+            },
+            "input": {
+                "type": "object",
+                "description": "Structured input each run is given. When the agent or workflow declares input_schema, pass exactly the properties defined there."
+            },
+            "attachments": {
+                "type": "array",
+                "description": "Files each run is given. Each entry references a file in a tenant-scoped volume.",
+                "items": {
+                    "type": "object",
+                    "required": ["volume_id", "path", "name", "mime_type", "size"],
+                    "properties": {
+                        "volume_id": { "type": "string" },
+                        "path":      { "type": "string" },
+                        "name":      { "type": "string" },
+                        "mime_type": { "type": "string" },
+                        "size":      { "type": "integer" },
+                        "sha256":    { "type": "string" }
+                    }
+                }
+            },
+            "at": {
+                "type": "string",
+                "description": "For one run: an RFC 3339 time at least one minute from now and at most a year ahead. Give either at or recurrence."
+            },
+            "recurrence": {
+                "type": "object",
+                "description": "For a run again and again. Give either at or recurrence.",
+                "properties": {
+                    "cron": {
+                        "type": "string",
+                        "description": "Five fields: minute, hour, day of month, month and day of week, such as \"0 15 * * 1-5\"."
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "A time zone name such as Europe/Berlin. Default: UTC."
+                    },
+                    "jitter_seconds": {
+                        "type": "integer",
+                        "description": "Up to this many seconds of random delay before each run. Default: 0."
+                    }
+                },
+                "required": ["cron"]
+            }
+        });
+        let required = if create {
+            json!(["name", "target_kind", "target"])
+        } else {
+            properties["schedule_id"] = json!({
+                "type": "string",
+                "description": "The id of the schedule to update."
+            });
+            json!(["schedule_id"])
+        };
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required
+        })
+    }
+
+    /// JSON schema for the `aegis.schedule.*` tools that name one schedule.
+    fn schema_aegis_schedule_by_id() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "schedule_id": {
+                    "type": "string",
+                    "description": "The id of the schedule."
+                }
+            },
+            "required": ["schedule_id"]
+        })
+    }
+
+    /// JSON schema for `aegis.schedule.runs`.
+    fn schema_aegis_schedule_runs() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "schedule_id": {
+                    "type": "string",
+                    "description": "The id of the schedule."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "The most runs answered, 1 to 100. Default: 20."
+                }
+            },
+            "required": ["schedule_id"]
+        })
+    }
+
     /// JSON schema for the `aegis.approval.status` builtin tool (ADR-126 D4).
     fn schema_aegis_approval_status() -> Value {
         json!({
@@ -2716,6 +2851,11 @@ mod tests {
         // deliberately; commit and push stay judged.
         "aegis.git.status",
         "aegis.git.diff",
+        // AEGIS ADR-139 N11: the schedule tools that only read, added
+        // deliberately; create, update, pause, resume and delete stay judged.
+        "aegis.schedule.list",
+        "aegis.schedule.get",
+        "aegis.schedule.runs",
     ];
 
     /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).

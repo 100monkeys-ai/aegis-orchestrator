@@ -135,6 +135,9 @@ impl ToolApprovalService {
                 binding_id.as_deref(),
             )
             .await?;
+        // AEGIS ADR-139 N9: the schedule whose run made the call, from the
+        // run's record, as the conversation is.
+        let schedule_id = self.repo.schedule_of_run(call.execution_id).await?;
         let mut request = ToolApprovalRequest {
             id: ToolApprovalId::new(),
             tenant_id: call.tenant_id.clone(),
@@ -147,6 +150,8 @@ impl ToolApprovalService {
             binding_id,
             security_context_name: call.security_context_name.to_string(),
             conversation_id: call.conversation_id.map(str::to_string),
+            schedule_id,
+            schedule_name: None,
             policy_id: None,
             status: ToolApprovalStatus::Pending,
             created_at: now,

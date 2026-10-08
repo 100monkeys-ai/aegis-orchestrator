@@ -395,6 +395,13 @@ impl ToolInputContract {
             "aegis.task.status" | "aegis.task.wait" | "aegis.task.logs" | "aegis.task.cancel"
             | "aegis.task.remove" => &["execution_id"],
             "aegis.goal.cancel" => &["goal_id"],
+            "aegis.schedule.create" => &["name", "target_kind", "target"],
+            "aegis.schedule.get"
+            | "aegis.schedule.update"
+            | "aegis.schedule.pause"
+            | "aegis.schedule.resume"
+            | "aegis.schedule.delete"
+            | "aegis.schedule.runs" => &["schedule_id"],
             "aegis.document.render" => &["content", "format"],
             "aegis.schema.get" => &["key"],
             "aegis.schema.validate" => &["kind", "manifest_yaml"],

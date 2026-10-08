@@ -224,6 +224,17 @@ pub struct ToolApprovalRequest {
     /// no conversation started (ADR-126, Update of 2026-10-07 (2), clause 1).
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// The schedule whose run made the gated call, read from the run's
+    /// record when the call is gated (the agent run's own, else its
+    /// workflow run's); absent for a run no schedule started (AEGIS ADR-139
+    /// N9).
+    #[serde(default)]
+    pub schedule_id: Option<Uuid>,
+    /// The name of [`Self::schedule_id`]'s schedule, as the store reads it
+    /// with the request (a deleted schedule keeps its row and its name);
+    /// never written by the gate.
+    #[serde(default)]
+    pub schedule_name: Option<String>,
     /// The policy an `auto_allowed` call matched.
     pub policy_id: Option<ToolApprovalPolicyId>,
     pub status: ToolApprovalStatus,
@@ -412,6 +423,15 @@ pub trait ToolApprovalRepository: Send + Sync {
         tool_name: &str,
         binding_id: Option<&str>,
     ) -> Result<Option<ToolApprovalPolicy>, RepositoryError>;
+
+    /// The schedule whose run `execution_id` is: the schedule the
+    /// execution's record names, else the one its workflow execution's
+    /// record names; `None` for a run no schedule started (AEGIS ADR-139 N7,
+    /// N9).
+    async fn schedule_of_run(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Option<Uuid>, RepositoryError>;
 
     /// The user's unrevoked policies, newest first.
     async fn list_active_policies(

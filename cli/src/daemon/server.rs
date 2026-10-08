@@ -1972,6 +1972,51 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
 
+    // ─── Schedules (AEGIS ADR-139) ──────────────────────────────────────────
+    // A person's schedules and their fires live in PostgreSQL (migration
+    // 048); a node without a database keeps them in process. Each is backed
+    // by a Temporal Schedule through the shared Temporal client; a run is
+    // started through the same services the starting tools use. At boot
+    // every active or paused schedule whose Temporal Schedule is missing is
+    // made again (N5).
+    let schedule_repo: Arc<dyn aegis_orchestrator_core::domain::schedule::ScheduleRepository> =
+        match db_pool.as_ref() {
+            Some(pool) => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::PostgresScheduleRepository::new(pool.clone()),
+            ),
+            None => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::InMemoryScheduleRepository::new(),
+            ),
+        };
+    let schedule_service = Arc::new(
+        aegis_orchestrator_core::application::schedule_service::ScheduleService::new(
+            schedule_repo,
+            Arc::new(ContainerScheduleEngine {
+                container: temporal_client_container.clone(),
+            }),
+            Arc::new(
+                aegis_orchestrator_core::application::schedule_service::ServiceRunStarter::new(
+                    execution_service.clone(),
+                    agent_service.clone(),
+                    Some(start_workflow_execution_use_case.clone()),
+                    Some(workflow_execution_repo.clone()),
+                ),
+            ),
+        ),
+    );
+    if temporal_required {
+        let schedules = schedule_service.clone();
+        tokio::spawn(async move {
+            match schedules.recreate_missing().await {
+                Ok(0) => {}
+                Ok(made) => info!(made, "Re-created missing Temporal Schedules"),
+                Err(e) => {
+                    tracing::error!(error = %e, "Re-creating missing Temporal Schedules failed")
+                }
+            }
+        });
+    }
+
     let mut tool_invocation_service_builder =
         aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
             seal_session_repo.clone(),
@@ -2264,6 +2309,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         aegis_orchestrator_core::application::goal_service::EXPIRY_SWEEP_INTERVAL,
     );
     tool_invocation_service_builder = tool_invocation_service_builder.with_goals(goal_service);
+    // AEGIS ADR-139 N11: the schedule tools use the service the
+    // `/v1/schedules` routes use.
+    tool_invocation_service_builder =
+        tool_invocation_service_builder.with_schedule_service(schedule_service.clone());
 
     let tool_invocation_service = Arc::new(tool_invocation_service_builder);
 
@@ -2804,51 +2853,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 }
             },
         );
-
-    // ─── Schedules (AEGIS ADR-139) ──────────────────────────────────────────
-    // A person's schedules and their fires live in PostgreSQL (migration
-    // 048); a node without a database keeps them in process. Each is backed
-    // by a Temporal Schedule through the shared Temporal client; a run is
-    // started through the same services the starting tools use. At boot
-    // every active or paused schedule whose Temporal Schedule is missing is
-    // made again (N5).
-    let schedule_repo: Arc<dyn aegis_orchestrator_core::domain::schedule::ScheduleRepository> =
-        match db_pool.as_ref() {
-            Some(pool) => Arc::new(
-                aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::PostgresScheduleRepository::new(pool.clone()),
-            ),
-            None => Arc::new(
-                aegis_orchestrator_core::infrastructure::repositories::postgres_schedule::InMemoryScheduleRepository::new(),
-            ),
-        };
-    let schedule_service = Arc::new(
-        aegis_orchestrator_core::application::schedule_service::ScheduleService::new(
-            schedule_repo,
-            Arc::new(ContainerScheduleEngine {
-                container: temporal_client_container.clone(),
-            }),
-            Arc::new(
-                aegis_orchestrator_core::application::schedule_service::ServiceRunStarter::new(
-                    execution_service.clone(),
-                    agent_service.clone(),
-                    Some(start_workflow_execution_use_case.clone()),
-                    Some(workflow_execution_repo.clone()),
-                ),
-            ),
-        ),
-    );
-    if temporal_required {
-        let schedules = schedule_service.clone();
-        tokio::spawn(async move {
-            match schedules.recreate_missing().await {
-                Ok(0) => {}
-                Ok(made) => info!(made, "Re-created missing Temporal Schedules"),
-                Err(e) => {
-                    tracing::error!(error = %e, "Re-creating missing Temporal Schedules failed")
-                }
-            }
-        });
-    }
 
     let app_state = AppState {
         agent_service: agent_service.clone(),

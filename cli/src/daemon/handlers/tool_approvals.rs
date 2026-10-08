@@ -161,6 +161,8 @@ fn request_view(request: &ToolApprovalRequest) -> Value {
         "summary": request.summary,
         "binding_id": request.binding_id,
         "conversation_id": request.conversation_id,
+        "schedule_id": request.schedule_id.map(|id| id.to_string()),
+        "schedule_name": request.schedule_name,
         "status": request.status.as_str(),
         "created_at": request.created_at,
         "decided_at": request.decided_at,
@@ -331,11 +333,13 @@ mod tests {
         service: Arc<ToolApprovalService>,
         runner: Arc<RecordingRunner>,
         base: String,
+        repo: Arc<InMemoryToolApprovalRepository>,
     }
 
     async fn fixture(callers: &[(&str, UserIdentity, &str)]) -> Fixture {
+        let repo = Arc::new(InMemoryToolApprovalRepository::new());
         let service = Arc::new(ToolApprovalService::new(
-            Arc::new(InMemoryToolApprovalRepository::new()),
+            repo.clone(),
             Arc::new(EventBus::new(64)),
         ));
         let runner = Arc::new(RecordingRunner::default());
@@ -352,6 +356,7 @@ mod tests {
             service,
             runner,
             base,
+            repo,
         }
     }
 
@@ -369,12 +374,22 @@ mod tests {
         args: Value,
         conversation: Option<&str>,
     ) -> ToolApprovalId {
+        pending_of(service, args, conversation, ExecutionId::new()).await
+    }
+
+    /// A pending request of the owner's, made by the run `execution_id`.
+    async fn pending_of(
+        service: &ToolApprovalService,
+        args: Value,
+        conversation: Option<&str>,
+        execution_id: ExecutionId,
+    ) -> ToolApprovalId {
         let tenant = TenantId::for_consumer_user("owner-sub").unwrap();
         let outcome = service
             .gate(GatedCall {
                 tenant_id: &tenant,
                 user_sub: Some("owner-sub"),
-                execution_id: ExecutionId::new(),
+                execution_id,
                 agent_id: AgentId::new(),
                 tool_name: "mail.send",
                 arguments: &args,
@@ -443,6 +458,47 @@ mod tests {
             (answered(in_conversation), answered(in_none)),
             (Some(json!(CONVERSATION)), Some(Value::Null)),
             "GET /v1/tool-approvals did not answer each request's conversation_id: {body}"
+        );
+    }
+
+    /// AEGIS ADR-139 N9: the list answers the schedule whose run asked,
+    /// by its id and its name, and `null` for both on a request no schedule
+    /// started.
+    #[tokio::test]
+    async fn the_list_answers_each_requests_schedule_and_its_name_or_null() {
+        let f = fixture(&[("owner", owner(), SCOPES)]).await;
+        let run = ExecutionId::new();
+        let schedule = uuid::Uuid::new_v4();
+        f.repo
+            .bind_run_to_schedule(run, schedule, "Morning digest")
+            .await;
+        let scheduled = pending_of(&f.service, json!({"mailbox": "b-1"}), None, run).await;
+        let unscheduled = pending_in(&f.service, json!({"mailbox": "b-2"}), None).await;
+
+        let (status, body) = send(
+            &f.base,
+            &Method::GET,
+            "/v1/tool-approvals?status=pending",
+            &None,
+            Some("owner"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let answered = |id: ToolApprovalId| {
+            body["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id.to_string())
+                .map(|r| (r["schedule_id"].clone(), r["schedule_name"].clone()))
+        };
+        assert_eq!(
+            (answered(scheduled), answered(unscheduled)),
+            (
+                Some((json!(schedule.to_string()), json!("Morning digest"))),
+                Some((Value::Null, Value::Null))
+            ),
+            "GET /v1/tool-approvals did not answer each request's schedule and its name: {body}"
         );
     }
 
