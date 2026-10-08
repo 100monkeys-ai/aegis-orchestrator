@@ -1476,10 +1476,22 @@ spec:
             )
             .await;
         let answer = answered(&result);
+        // The listing that resolves `calendar_id` (K6f), then the query.
         let requests = standin.requests();
-        assert_eq!(requests.len(), 1, "{requests:?}");
-        assert_eq!(requests[0].method, "REPORT");
-        assert_eq!(requests[0].path, WORK);
+        let sent: Vec<(&str, &str)> = requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                ("PROPFIND", "/dav/a@example.test/user"),
+                ("PROPFIND", "/dav/a@example.test/"),
+                ("REPORT", WORK),
+            ],
+            "{requests:?}"
+        );
+        let requests = &requests[2..];
         assert!(
             requests[0]
                 .body
@@ -2184,6 +2196,323 @@ spec:
     /// tools' requests driven directly (ungated, as the approved run drives
     /// them), and the tool service with the approval gate for the contracts,
     /// the admission before the gate and the approved run.
+    /// K6f: a `calendar_id` is one of the ids `calendar.calendars` answers
+    /// for the account, or `primary` or the account's own address, each
+    /// resolved to its own calendar; any other value is refused before any
+    /// request on a calendar; a `404` or `405` on the collection is the
+    /// identifier's fault, never the server's failure.
+    mod calendar_ids {
+        use super::*;
+        use aegis_orchestrator_core::application::tools::builtin_calendar::{
+            CalendarActing, CalendarTools,
+        };
+        use aegis_orchestrator_core::domain::execution::ServerChoice;
+
+        /// K6f's refusal, written out here so the test reads the sentence a
+        /// caller reads rather than the constant that holds it.
+        const UNKNOWN_CALENDAR: &str = "'calendar_id' must be one of the ids calendar.calendars answers for this account, or primary.";
+
+        /// The account's own calendar in Google's shape, its address
+        /// percent-encoded as Google's recorded answer gives it
+        /// (`/caldav/v2/<address with %40>/events/`).
+        const OWN: &str = "/dav/a%40example.test/events/";
+        const PRINCIPAL: &str = "/dav/a@example.test/user";
+        const HOME: &str = "/dav/a@example.test/";
+
+        /// Holidays first and the account's own calendar second, so the own
+        /// calendar is never picked by being first.
+        fn google_shaped() -> StandInConfig {
+            let mut config = client_config();
+            config.calendars.reverse();
+            config.calendars[1].href = OWN.to_string();
+            config
+        }
+
+        /// Each request as `METHOD path (Depth d)`.
+        fn sent(standin: &CalDavStandIn) -> Vec<String> {
+            standin
+                .requests()
+                .iter()
+                .map(|r| match r.header("depth") {
+                    Some(depth) => format!("{} {} (Depth {depth})", r.method, r.path),
+                    None => format!("{} {}", r.method, r.path),
+                })
+                .collect()
+        }
+
+        /// A refusal's R5 code and the sentence its caller reads.
+        fn refused(error: &SealSessionError) -> (u16, &'static str, String) {
+            let sentence = match error {
+                SealSessionError::InvalidArguments(m)
+                | SealSessionError::UpstreamUnavailable(m) => m.clone(),
+                other => format!("{other:?}"),
+            };
+            let refusal = error.refusal();
+            (refusal.http_status, refusal.code, sentence)
+        }
+
+        fn service_refusal(
+            result: &std::result::Result<ToolInvocationResult, SealSessionError>,
+        ) -> (u16, &'static str, String) {
+            match result {
+                Err(e) => refused(e),
+                Ok(other) => (0, "answered", format!("{other:?}")),
+            }
+        }
+
+        fn conversation() -> CalendarActing {
+            CalendarActing {
+                tenant_id: TenantId::default(),
+                user_id: Some(PERSON.to_string()),
+                agent_id: AgentId::new(),
+                workflow_id: None,
+                choice: ServerChoice::NotGiven,
+                has_execution_record: false,
+            }
+        }
+
+        fn tools(account: &Account, standin: &CalDavStandIn) -> CalendarTools {
+            CalendarTools::with_transport(
+                Arc::new(Accounts(vec![account.clone()])),
+                Arc::new(ReqwestTransport::to_origin(standin.origin())),
+            )
+        }
+
+        /// One `calendar.list` of the week with `calendar_id`, on a fresh
+        /// stand-in serving `config`: what it answered and what it sent.
+        async fn list_with(config: StandInConfig, calendar_id: &str) -> (Value, Vec<String>) {
+            let standin = CalDavStandIn::start(config).await;
+            let work = Account::new("Work account", true);
+            let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+            let result = h
+                .call(
+                    0,
+                    "calendar.list",
+                    with(
+                        week(),
+                        json!({"account": work.id.0.to_string(), "calendar_id": calendar_id}),
+                    ),
+                )
+                .await;
+            let answer = match &result {
+                Ok(ToolInvocationResult::Direct(value)) => value.clone(),
+                other => json!(format!("{other:?}")),
+            };
+            (answer, sent(&standin))
+        }
+
+        fn listing_then_report(calendar: &str) -> Vec<String> {
+            vec![
+                format!("PROPFIND {PRINCIPAL} (Depth 0)"),
+                format!("PROPFIND {HOME} (Depth 1)"),
+                format!("REPORT {calendar} (Depth 1)"),
+            ]
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_accounts_own_address_as_calendar_id_is_resolved_to_its_own_calendar() {
+            let mut wrong = Vec::new();
+            for given in ["a@example.test", "A@Example.TEST"] {
+                let (answer, sent) = list_with(google_shaped(), given).await;
+                if answer["calendar_id"] != json!(OWN) || sent != listing_then_report(OWN) {
+                    wrong.push(format!(
+                        "the address {given:?} was not resolved to the account's own calendar {OWN}: answered {answer}, sent {sent:?}"
+                    ));
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn primary_as_calendar_id_is_resolved_to_the_accounts_own_calendar_or_else_its_first()
+        {
+            let mut wrong = Vec::new();
+            let (answer, sent) = list_with(google_shaped(), "primary").await;
+            if answer["calendar_id"] != json!(OWN) || sent != listing_then_report(OWN) {
+                wrong.push(format!(
+                    "primary was not resolved to the account's own calendar {OWN}: answered {answer}, sent {sent:?}"
+                ));
+            }
+            // No calendar in Google's shape: the first the home set lists.
+            let mut config = client_config();
+            config.calendars.reverse();
+            let (answer, sent) = list_with(config, "primary").await;
+            if answer["calendar_id"] != json!(HOLIDAYS) || sent != listing_then_report(HOLIDAYS) {
+                wrong.push(format!(
+                    "with no calendar in Google's shape, primary was not resolved to the first calendar {HOLIDAYS}: answered {answer}, sent {sent:?}"
+                ));
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_calendar_id_calendar_calendars_answered_is_used_as_it_is_with_no_further_propfind(
+        ) {
+            let standin = CalDavStandIn::start(google_shaped()).await;
+            let work = Account::new("Work account", true);
+            let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+            let account = work.id.0.to_string();
+            let listed = answered(
+                &h.call(0, "calendar.calendars", json!({"account": account}))
+                    .await,
+            );
+            let mut wrong = Vec::new();
+            if listed["calendars"][1]["calendar_id"] != json!(OWN) {
+                wrong.push(format!("calendar.calendars answered {listed}"));
+            }
+            let before = sent(&standin).len();
+            for given in [OWN.to_string(), format!("https://caldav.example.test{OWN}")] {
+                let at = sent(&standin).len();
+                let result = h
+                    .call(
+                        0,
+                        "calendar.list",
+                        with(week(), json!({"account": account, "calendar_id": given})),
+                    )
+                    .await;
+                let after = sent(&standin)[at..].to_vec();
+                if after != vec![format!("REPORT {OWN} (Depth 1)")] || result.is_err() {
+                    wrong.push(format!(
+                        "the known id {given:?} was not used as it is: sent {after:?}, {}",
+                        told(&result)
+                    ));
+                }
+            }
+            if before != 2 {
+                wrong.push(format!("calendar.calendars sent {:?}", sent(&standin)));
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn any_other_calendar_id_is_refused_as_invalid_arguments_before_any_request_on_a_calendar(
+        ) {
+            let standin = CalDavStandIn::start(google_shaped()).await;
+            let work = Account::new("Work account", true);
+            let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+            let tools = tools(&work, &standin);
+            let account = work.id.0.to_string();
+            let mut wrong = Vec::new();
+            for given in [
+                "Work",
+                "/dav/a@example.test/",
+                "/dav/a@example.test/events/",
+                "someone@example.test",
+            ] {
+                let calls = [
+                    (
+                        "calendar.list",
+                        json!({"account": account, "calendar_id": given}),
+                    ),
+                    (
+                        "calendar.read",
+                        json!({"account": account, "calendar_id": given, "event_id": "planning.ics"}),
+                    ),
+                ];
+                for (tool, args) in calls {
+                    let told = service_refusal(&h.call(0, tool, args).await);
+                    if told != (422, "INVALID_ARGUMENTS", UNKNOWN_CALENDAR.to_string()) {
+                        wrong.push(format!(
+                            "{tool} with {given:?} was not refused as unknown: {told:?}"
+                        ));
+                    }
+                }
+                for (tool, more) in [
+                    (
+                        "calendar.create",
+                        json!({"title": "T", "start": "2026-10-13T10:00:00Z", "end": "2026-10-13T11:00:00Z"}),
+                    ),
+                    (
+                        "calendar.update",
+                        json!({"event_id": "planning.ics", "title": "T"}),
+                    ),
+                    ("calendar.delete", json!({"event_id": "planning.ics"})),
+                    (
+                        "calendar.respond",
+                        json!({"event_id": "planning.ics", "response": "accepted"}),
+                    ),
+                ] {
+                    let args = with(json!({"account": account, "calendar_id": given}), more);
+                    let told = match tools.invoke(tool, &args, &conversation()).await {
+                        Err(e) => refused(&e),
+                        Ok(v) => (0, "answered", v.to_string()),
+                    };
+                    if told != (422, "INVALID_ARGUMENTS", UNKNOWN_CALENDAR.to_string()) {
+                        wrong.push(format!(
+                            "{tool} with {given:?} was not refused as unknown: {told:?}"
+                        ));
+                    }
+                }
+            }
+            let on_a_calendar: Vec<String> = sent(&standin)
+                .into_iter()
+                .filter(|r| !r.starts_with("PROPFIND "))
+                .collect();
+            if !on_a_calendar.is_empty() {
+                wrong.push(format!("requests reached a calendar: {on_a_calendar:?}"));
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_405_or_404_on_the_collection_is_answered_as_invalid_arguments_and_sent_once() {
+            let mut wrong = Vec::new();
+            for status in [405u16, 404] {
+                let standin = CalDavStandIn::start(google_shaped()).await;
+                let work = Account::new("Work account", true);
+                let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+                let tools = tools(&work, &standin);
+                let account = work.id.0.to_string();
+                answered(
+                    &h.call(0, "calendar.calendars", json!({"account": account}))
+                        .await,
+                );
+                standin.refuse_collections(Some(status));
+                let expected = (
+                    422,
+                    "INVALID_ARGUMENTS",
+                    format!("The calendar '{OWN}' does not exist on this account."),
+                );
+                let at = sent(&standin).len();
+                let told = service_refusal(
+                    &h.call(
+                        0,
+                        "calendar.list",
+                        with(week(), json!({"account": account, "calendar_id": OWN})),
+                    )
+                    .await,
+                );
+                let after = sent(&standin)[at..].to_vec();
+                if told != expected || after != vec![format!("REPORT {OWN} (Depth 1)")] {
+                    wrong.push(format!(
+                        "calendar.list met {status} on the collection: told {told:?}, sent {after:?}"
+                    ));
+                }
+                let at = sent(&standin).len();
+                let args = json!({"account": account, "calendar_id": OWN, "title": "T", "start": "2026-10-13T10:00:00Z", "end": "2026-10-13T11:00:00Z"});
+                let told = match tools
+                    .invoke("calendar.create", &args, &conversation())
+                    .await
+                {
+                    Err(e) => refused(&e),
+                    Ok(v) => (0, "answered", v.to_string()),
+                };
+                let puts: Vec<String> = sent(&standin)[at..]
+                    .iter()
+                    .filter(|r| r.starts_with("PUT "))
+                    .cloned()
+                    .collect();
+                if told != expected || puts.len() != 1 {
+                    wrong.push(format!(
+                        "calendar.create met {status} on the collection: told {told:?}, sent {:?}",
+                        &sent(&standin)[at..]
+                    ));
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+    }
+
     mod write_tools {
         use super::*;
         use crate::caldav_standins::Recorded;
@@ -2465,8 +2794,11 @@ spec:
                 .iter()
                 .map(|r| format!("{} {}", r.method, r.path))
                 .collect();
+            // The listing that resolves `calendar_id` (K6f), then the event.
             if order
                 != [
+                    "PROPFIND /dav/a@example.test/user".to_string(),
+                    "PROPFIND /dav/a@example.test/".to_string(),
                     format!("GET {}", path("mine.ics")),
                     format!("PUT {}", path("mine.ics")),
                 ]
@@ -2579,8 +2911,11 @@ spec:
                 .iter()
                 .map(|r| format!("{} {}", r.method, r.path))
                 .collect();
+            // The listing that resolves `calendar_id` (K6f), then the event.
             if order
                 != [
+                    "PROPFIND /dav/a@example.test/user".to_string(),
+                    "PROPFIND /dav/a@example.test/".to_string(),
                     format!("GET {}", path("mine.ics")),
                     format!("DELETE {}", path("mine.ics")),
                 ]
@@ -3154,7 +3489,7 @@ spec:
                 .iter()
                 .map(|r| r.method.clone())
                 .collect();
-            if methods.iter().any(|m| m != "GET") {
+            if methods.iter().any(|m| m != "GET" && m != "PROPFIND") {
                 wrong.push(format!("a pending call changed the calendar: {methods:?}"));
             }
             assert!(wrong.is_empty(), "{wrong:#?}");

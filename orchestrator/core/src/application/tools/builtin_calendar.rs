@@ -49,10 +49,21 @@
 //! conversation, or an MCP client acting as the person) is admitted on the
 //! ownership check alone.
 //!
-//! **Identifiers** (K6d). A calendar is named by its collection's `href` as
-//! the server gives it (`calendar_id`), refused unless it resolves to the
-//! account's server origin; an event by its resource's last path segment
-//! (`event_id`).
+//! **Identifiers** (K6d, K6f). A calendar is named by its collection's
+//! `href` as the server gives it (`calendar_id`), refused unless it resolves
+//! to the account's server origin; an event by its resource's last path
+//! segment (`event_id`). A `calendar_id` must be one of the ids
+//! `calendar.calendars` answers for the account (compared after both are
+//! resolved on the server), or `primary` or the account's own address, each
+//! resolved to the account's own calendar ([`own_calendar`]); any other
+//! value is refused with [`UNKNOWN_CALENDAR`] before any request on a
+//! calendar. The ids are remembered per account from each listing, so a
+//! known id costs no request; any other value costs one `PROPFIND` of the
+//! home set (and the discovery of the home set the first time). A `404` or
+//! `405` on the collection is answered as the identifier's fault (`The
+//! calendar '<id>' does not exist on this account.`), never as the server's
+//! failure. A gated call's admission writes the resolved id over the
+//! model's, so the card and the approved run name the calendar itself.
 //!
 //! **Times.** `calendar.list` asks the server to expand repeating events
 //! into their occurrences in the window, in UTC, and answers them so. A
@@ -70,7 +81,9 @@ use crate::domain::execution::{ContextChoice, ServerChoice};
 use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::calendar::caldav::EventResource;
-use crate::infrastructure::calendar::caldav::{CalDavClient, CalDavError};
+use crate::infrastructure::calendar::caldav::{
+    is_event_id, own_calendar, CalDavClient, CalDavError, CalendarCollection,
+};
 use crate::infrastructure::calendar::ical::{
     attendee_line, new_event_calendar, organizer_line, parse_calendar, same_address, utc_value,
     write_component, Component, ContentLine, EventTime, IcalTime, NewEvent, Party, VEvent,
@@ -79,8 +92,10 @@ use crate::infrastructure::calendar::{shown_reply, CalDavTransport, ReqwestTrans
 use crate::infrastructure::mail::message::is_address;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use url::Url;
 
 /// The widest window `calendar.list` reads, in days.
 pub const MAX_WINDOW_DAYS: i64 = 92;
@@ -118,6 +133,15 @@ pub const BAD_ACCOUNT: &str = "'account' must be the id of one of your calendar 
 pub const BAD_LIMIT: &str = "'limit' must be a whole number from 1 to 100.";
 /// The refusal for an `event_id` that is not one path segment.
 pub const BAD_EVENT_ID: &str = "'event_id' must be an event id calendar.list answered.";
+/// The refusal for a `calendar_id` that is none of the account's calendars
+/// and not one of the two spellings of its own (K6f).
+pub const UNKNOWN_CALENDAR: &str =
+    "'calendar_id' must be one of the ids calendar.calendars answers for this account, or primary.";
+/// The `calendar_id` naming the account's own calendar (K6f).
+pub const PRIMARY: &str = "primary";
+/// The most accounts whose calendars are remembered at once; past it the
+/// memory starts over.
+const KNOWN_ACCOUNTS_MAX: usize = 4096;
 
 /// The most attendees an event may have (K6a).
 pub const MAX_ATTENDEES: usize = 50;
@@ -206,11 +230,55 @@ pub struct CalendarAdmitted {
     pub shown: Vec<(&'static str, Value)>,
 }
 
-/// The calendar tools: the account source and the transport their requests
-/// go over.
+/// The calendar tools: the account source, the transport their requests
+/// go over, and the calendars each account's last listing answered.
 pub struct CalendarTools {
     accounts: Arc<dyn ToolCalendarSource>,
     transport: Arc<dyn CalDavTransport>,
+    known: KnownCalendars,
+}
+
+/// One account's calendars as its last listing answered them: its home set
+/// and each calendar's id resolved on the server.
+#[derive(Debug, Clone)]
+struct Known {
+    home_set: Url,
+    calendars: Vec<Url>,
+}
+
+/// The calendars each account's last listing answered, by binding id (K6f):
+/// a `calendar_id` among them is used as it is, with no request.
+#[derive(Debug, Default)]
+struct KnownCalendars(Mutex<HashMap<CredentialBindingId, Known>>);
+
+impl KnownCalendars {
+    fn get(&self, account: &CredentialBindingId) -> Option<Known> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .cloned()
+    }
+
+    fn holds(&self, account: &CredentialBindingId, calendar: &Url) -> bool {
+        self.get(account)
+            .is_some_and(|known| known.calendars.contains(calendar))
+    }
+
+    fn record(&self, account: CredentialBindingId, known: Known) {
+        let mut accounts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if accounts.len() >= KNOWN_ACCOUNTS_MAX && !accounts.contains_key(&account) {
+            accounts.clear();
+        }
+        accounts.insert(account, known);
+    }
+
+    fn forget(&self, account: &CredentialBindingId) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(account);
+    }
 }
 
 impl CalendarTools {
@@ -228,6 +296,7 @@ impl CalendarTools {
         Self {
             accounts,
             transport,
+            known: KnownCalendars::default(),
         }
     }
 
@@ -240,7 +309,7 @@ impl CalendarTools {
     ) -> Result<Value, SealSessionError> {
         let account = self.account_for(args, acting).await?;
         let request = Request::parse(tool_name, args, Utc::now())?;
-        let run = run(self.transport.as_ref(), &account, &request);
+        let run = run(self.transport.as_ref(), &account, &self.known, request);
         match tokio::time::timeout(CALL_TIMEOUT, run).await {
             Ok(result) => result,
             Err(_) => Err(timed_out()),
@@ -260,7 +329,7 @@ impl CalendarTools {
     ) -> Result<CalendarAdmitted, SealSessionError> {
         let account = self.account_for(args, acting).await?;
         let request = Request::parse(tool_name, args, Utc::now())?;
-        let admit = admit(self.transport.as_ref(), &account, &request);
+        let admit = admit(self.transport.as_ref(), &account, &self.known, request);
         let shown = match tokio::time::timeout(CALL_TIMEOUT, admit).await {
             Ok(shown) => shown?,
             Err(_) => return Err(timed_out()),
@@ -375,13 +444,16 @@ fn conflict(message: &str) -> SealSessionError {
 }
 
 /// A client failure as the caller is told it: an identifier off the
-/// server's origin with the client's own sentence (K6d), an event id that
-/// is not one segment with [`BAD_EVENT_ID`], and anything else as the
+/// server's origin with the client's own sentence (K6d), a calendar the
+/// server answered `404` or `405` for with its sentence (K6f), an event id
+/// that is not one segment with [`BAD_EVENT_ID`], and anything else as the
 /// server's failure, the token redacted, control characters removed and
 /// cut.
 fn caldav_error(error: CalDavError, account: &ToolCalendar) -> SealSessionError {
     match error {
-        CalDavError::OutsideServer(_) => invalid(error.to_string()),
+        CalDavError::OutsideServer(_) | CalDavError::NoSuchCalendar(_) => {
+            invalid(error.to_string())
+        }
         CalDavError::InvalidEventId(_) => invalid(BAD_EVENT_ID),
         CalDavError::Changed => conflict(EVENT_CHANGED),
         other => SealSessionError::UpstreamUnavailable(format!(
@@ -557,6 +629,16 @@ fn check_order(start: &EventTime, end: &EventTime) -> Result<(), SealSessionErro
     }
 }
 
+/// The call's `event_id`: one path segment (K6d), refused before any
+/// request.
+fn event_id_argument(args: &Value) -> Result<String, SealSessionError> {
+    let event_id = required_string(args, "event_id", BAD_EVENT_ID)?;
+    if !is_event_id(&event_id) {
+        return Err(invalid(BAD_EVENT_ID));
+    }
+    Ok(event_id)
+}
+
 fn required_string(args: &Value, name: &str, refusal: &str) -> Result<String, SealSessionError> {
     match args.get(name).and_then(Value::as_str) {
         Some(value) if !value.is_empty() => Ok(value.to_string()),
@@ -580,6 +662,19 @@ fn time_argument(args: &Value, name: &str) -> Result<Option<DateTime<Utc>>, Seal
 }
 
 impl Request {
+    /// The call's `calendar_id`, for the tools that take one.
+    fn calendar_id_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Request::Calendars => None,
+            Request::Create(event) => Some(&mut event.calendar_id),
+            Request::List { calendar_id, .. }
+            | Request::Read { calendar_id, .. }
+            | Request::Update { calendar_id, .. }
+            | Request::Delete { calendar_id, .. }
+            | Request::Respond { calendar_id, .. } => Some(calendar_id),
+        }
+    }
+
     fn parse(tool_name: &str, args: &Value, now: DateTime<Utc>) -> Result<Self, SealSessionError> {
         const BAD_CALENDAR: &str =
             "'calendar_id' must be a calendar_id calendar.calendars answered.";
@@ -619,7 +714,7 @@ impl Request {
             }
             "calendar.read" => Ok(Request::Read {
                 calendar_id: required_string(args, "calendar_id", BAD_CALENDAR)?,
-                event_id: required_string(args, "event_id", BAD_EVENT_ID)?,
+                event_id: event_id_argument(args)?,
             }),
             "calendar.create" => {
                 let calendar_id = required_string(args, "calendar_id", BAD_CALENDAR)?;
@@ -645,7 +740,7 @@ impl Request {
             }
             "calendar.update" => {
                 let calendar_id = required_string(args, "calendar_id", BAD_CALENDAR)?;
-                let event_id = required_string(args, "event_id", BAD_EVENT_ID)?;
+                let event_id = event_id_argument(args)?;
                 let changes = Changes {
                     title: title_argument(args)?,
                     start: event_time_argument(args, "start")?,
@@ -668,11 +763,11 @@ impl Request {
             }
             "calendar.delete" => Ok(Request::Delete {
                 calendar_id: required_string(args, "calendar_id", BAD_CALENDAR)?,
-                event_id: required_string(args, "event_id", BAD_EVENT_ID)?,
+                event_id: event_id_argument(args)?,
             }),
             "calendar.respond" => {
                 let calendar_id = required_string(args, "calendar_id", BAD_CALENDAR)?;
-                let event_id = required_string(args, "event_id", BAD_EVENT_ID)?;
+                let event_id = event_id_argument(args)?;
                 let response = match args.get("response").and_then(Value::as_str) {
                     Some("accepted") => "accepted",
                     Some("declined") => "declined",
@@ -693,21 +788,17 @@ impl Request {
 async fn run(
     transport: &dyn CalDavTransport,
     account: &ToolCalendar,
-    request: &Request,
+    known: &KnownCalendars,
+    mut request: Request,
 ) -> Result<Value, SealSessionError> {
     let client = CalDavClient::new(transport, &account.settings, &account.auth)
         .map_err(|e| caldav_error(e, account))?;
+    resolve_calendar(&client, account, known, &mut request).await?;
+    let request = &request;
     let account_id = account.binding_id.0.to_string();
     match request {
         Request::Calendars => {
-            let discovery = client
-                .discover()
-                .await
-                .map_err(|e| caldav_error(e, account))?;
-            let calendars = client
-                .calendars(&discovery.home_set)
-                .await
-                .map_err(|e| caldav_error(e, account))?;
+            let calendars = list_calendars(&client, account, known).await?;
             let calendars: Vec<Value> = calendars
                 .into_iter()
                 .map(|calendar| {
@@ -928,24 +1019,35 @@ async fn run(
 async fn admit(
     transport: &dyn CalDavTransport,
     account: &ToolCalendar,
-    request: &Request,
+    known: &KnownCalendars,
+    mut request: Request,
 ) -> Result<Vec<(&'static str, Value)>, SealSessionError> {
     let client = CalDavClient::new(transport, &account.settings, &account.auth)
         .map_err(|e| caldav_error(e, account))?;
+    resolve_calendar(&client, account, known, &mut request).await?;
+    let mut shown = admitted_event(&client, account, &request).await?;
+    if let Some(calendar_id) = request.calendar_id_mut() {
+        shown.insert(0, ("calendar_id", json!(calendar_id)));
+    }
+    Ok(shown)
+}
+
+/// The admission's event half (K7a): for update, delete and respond the
+/// event read, refused by K6a and answered as the values a person reads.
+async fn admitted_event(
+    client: &CalDavClient<'_>,
+    account: &ToolCalendar,
+    request: &Request,
+) -> Result<Vec<(&'static str, Value)>, SealSessionError> {
     let address = &account.settings.address;
     match request {
-        Request::Create(event) => {
-            client
-                .resolve(&event.calendar_id)
-                .map_err(|e| caldav_error(e, account))?;
-            Ok(Vec::new())
-        }
+        Request::Create(_) => Ok(Vec::new()),
         Request::Update {
             calendar_id,
             event_id,
             changes,
         } => {
-            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            let read = read_for_change(client, account, calendar_id, event_id).await?;
             refuse_change(&read, address)?;
             updated(&read, changes, address, Utc::now())?;
             let event = read.master();
@@ -961,7 +1063,7 @@ async fn admit(
             calendar_id,
             event_id,
         } => {
-            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            let read = read_for_change(client, account, calendar_id, event_id).await?;
             refuse_change(&read, address)?;
             let event = read.master();
             Ok(vec![
@@ -983,7 +1085,7 @@ async fn admit(
             event_id,
             response,
         } => {
-            let read = read_for_change(&client, account, calendar_id, event_id).await?;
+            let read = read_for_change(client, account, calendar_id, event_id).await?;
             responded(&read, address, response, Utc::now())?;
             let event = read.master();
             Ok(vec![
@@ -998,6 +1100,86 @@ async fn admit(
         }
         Request::Calendars | Request::List { .. } | Request::Read { .. } => Ok(Vec::new()),
     }
+}
+
+/// The call's `calendar_id` resolved (K6f): an id the account's last
+/// listing answered is used as it is, with no request; `primary` and the
+/// account's own address become its own calendar's id; any other value is
+/// looked for in a fresh listing and refused with [`UNKNOWN_CALENDAR`] when
+/// it is not there. An id off the server's origin is refused first, with
+/// no request (K6d).
+async fn resolve_calendar(
+    client: &CalDavClient<'_>,
+    account: &ToolCalendar,
+    known: &KnownCalendars,
+    request: &mut Request,
+) -> Result<(), SealSessionError> {
+    let Some(calendar_id) = request.calendar_id_mut() else {
+        return Ok(());
+    };
+    let address = account.settings.address.trim();
+    let own = calendar_id.as_str() == PRIMARY
+        || (!address.is_empty() && calendar_id.eq_ignore_ascii_case(address));
+    if own {
+        let calendars = list_calendars(client, account, known).await?;
+        let mine = own_calendar(&calendars, address).ok_or_else(|| {
+            caldav_error(CalDavError::NoSuchCalendar(calendar_id.clone()), account)
+        })?;
+        *calendar_id = mine.href.clone();
+        return Ok(());
+    }
+    let wanted = client
+        .resolve(calendar_id)
+        .map_err(|e| caldav_error(e, account))?;
+    if known.holds(&account.binding_id, &wanted) {
+        return Ok(());
+    }
+    let calendars = list_calendars(client, account, known).await?;
+    let found = calendars
+        .iter()
+        .find(|c| client.resolve(&c.href).ok().as_ref() == Some(&wanted))
+        .ok_or_else(|| invalid(UNKNOWN_CALENDAR))?;
+    *calendar_id = found.href.clone();
+    Ok(())
+}
+
+/// The account's calendars: `PROPFIND` (Depth 1) on its home set, the home
+/// set discovered first unless an earlier listing found it. The listing is
+/// remembered for [`resolve_calendar`]; a listing that fails forgets the
+/// account, so the next one discovers its home set again.
+async fn list_calendars(
+    client: &CalDavClient<'_>,
+    account: &ToolCalendar,
+    known: &KnownCalendars,
+) -> Result<Vec<CalendarCollection>, SealSessionError> {
+    let home_set = match known.get(&account.binding_id) {
+        Some(earlier) => earlier.home_set,
+        None => {
+            client
+                .discover()
+                .await
+                .map_err(|e| caldav_error(e, account))?
+                .home_set
+        }
+    };
+    let calendars = match client.calendars(&home_set).await {
+        Ok(calendars) => calendars,
+        Err(e) => {
+            known.forget(&account.binding_id);
+            return Err(caldav_error(e, account));
+        }
+    };
+    known.record(
+        account.binding_id,
+        Known {
+            home_set,
+            calendars: calendars
+                .iter()
+                .filter_map(|c| client.resolve(&c.href).ok())
+                .collect(),
+        },
+    );
+    Ok(calendars)
 }
 
 /// An event read to be changed: its resource, its calendar object, and the

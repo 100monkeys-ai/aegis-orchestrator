@@ -803,7 +803,7 @@ impl ToolRouter {
                 "calendar_id".to_string(),
                 json!({
                     "type": "string",
-                    "description": "A calendar_id calendar.calendars answered."
+                    "description": "One of the calendar_id values calendar.calendars answers for this account, or primary for the account's own calendar; any other value is refused."
                 }),
             );
             required.push("calendar_id");
@@ -872,7 +872,7 @@ impl ToolRouter {
             "calendar_id".to_string(),
             json!({
                 "type": "string",
-                "description": "A calendar_id calendar.calendars answered."
+                "description": "One of the calendar_id values calendar.calendars answers for this account, or primary for the account's own calendar; any other value is refused."
             }),
         );
         let mut required = vec!["account", "calendar_id"];

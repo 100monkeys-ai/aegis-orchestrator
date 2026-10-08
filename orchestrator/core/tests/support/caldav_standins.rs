@@ -25,6 +25,13 @@
 //! root naming the principal and no home set, as a server's root does; and
 //! [`CalDavStandIn::serve_address`] adds a `calendar-user-address-set` to the
 //! principal's answer.
+//!
+//! [`CalDavStandIn::refuse_collections`] answers every `REPORT` on a
+//! collection and every `PUT` of a new resource with a status of the test's
+//! choosing and the body "Not allowed", as Google's CalDAV answers a
+//! collection that is not there (`405`), or as another server does (`404`)
+//! (AEGIS ADR-138 K6f). Without it, a `REPORT` on a collection the stand-in
+//! does not serve is answered `404`.
 
 #![allow(dead_code)]
 
@@ -98,6 +105,9 @@ struct State {
     root: Mutex<Option<String>>,
     /// The calendar user address the principal names.
     address: Mutex<Option<String>>,
+    /// The status every collection `REPORT` and new-resource `PUT` is
+    /// answered with, when set.
+    refuse_collections: Mutex<Option<u16>>,
 }
 
 impl State {
@@ -127,6 +137,7 @@ impl CalDavStandIn {
             basic: Mutex::new(None),
             root: Mutex::new(None),
             address: Mutex::new(None),
+            refuse_collections: Mutex::new(None),
         });
         let seen = requests.clone();
         let served = state.clone();
@@ -177,6 +188,13 @@ impl CalDavStandIn {
     /// `calendar-user-address-set`.
     pub fn serve_address(&self, href: &str) {
         *self.state.address.lock().unwrap() = Some(href.to_string());
+    }
+
+    /// From now on, answer every `REPORT` on a collection and every `PUT`
+    /// with `If-None-Match: *` with `status` and the body "Not allowed";
+    /// `None` serves them again.
+    pub fn refuse_collections(&self, status: Option<u16>) {
+        *self.state.refuse_collections.lock().unwrap() = status;
     }
 
     /// The event `name` of the calendar `href` as the stand-in now holds it.
@@ -241,6 +259,7 @@ async fn serve(mut stream: TcpStream, state: &State, seen: &Mutex<Vec<Recorded>>
         207 => "Multi-Status",
         401 => "Unauthorized",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         412 => "Precondition Failed",
         _ => "Other",
     };
@@ -365,6 +384,20 @@ fn answer(state: &State, request: &Recorded) -> Answer {
                 principal = escape(&config.principal),
             ),
         );
+    }
+    let refused = *state.refuse_collections.lock().unwrap();
+    if let Some(status) = refused {
+        let new_resource = request.method == "PUT" && request.header("if-none-match") == Some("*");
+        if request.method == "REPORT" || new_resource {
+            if let Some(refused) = unauthorized(&config, request) {
+                return refused;
+            }
+            return (
+                status,
+                vec![("Content-Type", "text/plain".to_string())],
+                "Not allowed".to_string(),
+            );
+        }
     }
     let address = state.address.lock().unwrap().clone();
     match request.method.as_str() {

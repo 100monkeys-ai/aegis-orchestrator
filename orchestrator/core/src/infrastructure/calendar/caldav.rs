@@ -29,6 +29,12 @@
 //!   `DELETE` of an event with `If-Match` of the `ETag` it was read with, so
 //!   a change made since that read is answered `412`
 //!   ([`CalDavError::Changed`]) and nothing is written.
+//!
+//! A `404` or `405` on a calendar collection (its `REPORT`, or the `PUT` of
+//! a new resource into it) is [`CalDavError::NoSuchCalendar`]: the
+//! collection is not there, which is the caller's identifier at fault and
+//! never the server's failure (AEGIS ADR-138 K6f). [`own_calendar`] picks
+//! the account's own calendar among a home set's.
 
 use super::xml::{self, DavResponse, Element, APPLE_ICAL, CALDAV, DAV};
 use super::CalendarCheckFailure;
@@ -77,6 +83,10 @@ pub enum CalDavError {
     /// was read, or a new resource's name is already taken.
     #[error("The event changed since it was read; read it again; nothing was changed.")]
     Changed,
+    /// The calendar collection answered `404` or `405`: there is no
+    /// calendar at that identifier on this account.
+    #[error("The calendar '{0}' does not exist on this account.")]
+    NoSuchCalendar(String),
 }
 
 impl CalDavError {
@@ -419,7 +429,8 @@ impl<'a> CalDavClient<'a> {
         let url = self.resolve(calendar)?;
         let responses = self
             .multistatus("REPORT", url, "1", xml::calendar_query(start, end))
-            .await?;
+            .await
+            .map_err(|e| on_collection(e, calendar))?;
         let mut events = Vec::new();
         for response in responses {
             let Some(data) = response
@@ -446,12 +457,7 @@ impl<'a> CalDavClient<'a> {
     /// calendar resolved on the server's origin and the id appended as one
     /// path segment; an id that is not one segment is refused.
     pub fn event_url(&self, calendar: &str, event_id: &str) -> Result<Url, CalDavError> {
-        if event_id.is_empty()
-            || event_id == "."
-            || event_id == ".."
-            || event_id.contains('/')
-            || event_id.chars().any(char::is_control)
-        {
+        if !is_event_id(event_id) {
             return Err(CalDavError::InvalidEventId(shown(event_id)));
         }
         let mut url = self.resolve(calendar)?;
@@ -518,7 +524,7 @@ impl<'a> CalDavClient<'a> {
                 Some(ics),
             )
             .await?;
-        Self::written(response)
+        Self::written(response).map_err(|e| on_collection(e, calendar))
     }
 
     /// `PUT` of the event `event_id` of the calendar `calendar` with
@@ -566,6 +572,44 @@ impl<'a> CalDavClient<'a> {
             .await?;
         Self::written(response).map(|_| ())
     }
+}
+
+/// Whether `event_id` can name an event: one path segment, not `.` or
+/// `..`, with no control character.
+pub fn is_event_id(event_id: &str) -> bool {
+    !(event_id.is_empty()
+        || event_id == "."
+        || event_id == ".."
+        || event_id.contains('/')
+        || event_id.chars().any(char::is_control))
+}
+
+/// A failure of a request on the collection `calendar` (its `REPORT`, or
+/// the `PUT` of a new resource into it): a `404` or `405` is
+/// [`CalDavError::NoSuchCalendar`], anything else as it was.
+fn on_collection(error: CalDavError, calendar: &str) -> CalDavError {
+    match error {
+        CalDavError::Refused {
+            status: 404 | 405, ..
+        } => CalDavError::NoSuchCalendar(shown(calendar)),
+        other => other,
+    }
+}
+
+/// The account's own calendar among `calendars`: the one whose id ends with
+/// `/<address>/events/` (Google's shape; the id percent-decoded and both
+/// compared without case), or failing that the first. `None` when there
+/// are no calendars.
+pub fn own_calendar<'c>(
+    calendars: &'c [CalendarCollection],
+    address: &str,
+) -> Option<&'c CalendarCollection> {
+    let address = address.trim().to_lowercase();
+    let suffix = format!("/{address}/events/");
+    calendars
+        .iter()
+        .find(|c| !address.is_empty() && percent_decode(&c.href).to_lowercase().ends_with(&suffix))
+        .or_else(|| calendars.first())
 }
 
 /// What one account `PROPFIND` answered.
