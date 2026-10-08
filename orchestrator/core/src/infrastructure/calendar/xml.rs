@@ -37,6 +37,23 @@ pub fn principal_propfind() -> String {
     )
 }
 
+/// The `PROPFIND` body a calendar account connected by password is
+/// discovered with (AEGIS ADR-138 K10): the principal, its calendar home
+/// set, and its calendar user addresses (RFC 6638).
+pub fn account_propfind() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="{DAV}" xmlns:c="{CALDAV}">
+  <d:prop>
+    <d:current-user-principal/>
+    <c:calendar-home-set/>
+    <c:calendar-user-address-set/>
+  </d:prop>
+</d:propfind>
+"#
+    )
+}
+
 /// The `PROPFIND` body asking a home set's members what each is: its
 /// resource type, name, description, colour, and what the account may do
 /// to it.

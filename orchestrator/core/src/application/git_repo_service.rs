@@ -1381,6 +1381,9 @@ impl GitRepoService {
             CredentialType::Mailbox => Err(GitRepoError::SecretResolutionFailed(
                 "mailbox credentials cannot be used for git authentication".into(),
             )),
+            CredentialType::Calendar => Err(GitRepoError::SecretResolutionFailed(
+                "calendar credentials cannot be used for git authentication".into(),
+            )),
         }
     }
 

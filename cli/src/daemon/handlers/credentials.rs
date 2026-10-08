@@ -11,6 +11,7 @@
 //! | `GET /v1/credentials` | ConsumerUser \| TenantUser | `CredentialList` |
 //! | `POST /v1/credentials/api-keys` | ConsumerUser \| TenantUser | `CredentialCreate` |
 //! | `POST /v1/credentials/mailboxes` | ConsumerUser \| TenantUser | `CredentialCreate` |
+//! | `POST /v1/credentials/calendars` | ConsumerUser \| TenantUser | `CredentialCreate` |
 //! | `GET /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialRead` |
 //! | `DELETE /v1/credentials/{id}` | ConsumerUser \| TenantUser \| Operator | `CredentialDelete` |
 //! | `POST /v1/credentials/{id}/rotate` | ConsumerUser \| TenantUser \| Operator | `CredentialRotate` |
@@ -34,8 +35,8 @@
 
 use crate::daemon::state::AppState;
 use aegis_orchestrator_core::application::credential_service::{
-    CreateImapMailboxCommand, CredentialActor, CredentialError, CredentialManagementService,
-    StoreApiKeyCommand,
+    CreateCalDavCalendarCommand, CreateImapMailboxCommand, CredentialActor, CredentialError,
+    CredentialManagementService, StoreApiKeyCommand,
 };
 use aegis_orchestrator_core::domain::api_scope::ApiScope;
 use aegis_orchestrator_core::domain::credential::{
@@ -220,6 +221,21 @@ pub(crate) fn credentials_mailboxes_router(state: CredentialsMailboxesState) -> 
         .with_state(state)
 }
 
+/// The state of `POST /v1/credentials/calendars` (AEGIS ADR-138 K10).
+#[derive(Clone)]
+pub(crate) struct CredentialsCalendarsState {
+    pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+}
+
+/// `POST /v1/credentials/calendars`, over its own narrow state. Merged into
+/// the daemon router by `router::create_router`, beneath the same
+/// authentication layers as `/v1/credentials/mailboxes`.
+pub(crate) fn credentials_calendars_router(state: CredentialsCalendarsState) -> Router {
+    Router::new()
+        .route("/v1/credentials/calendars", post(create_calendar_handler))
+        .with_state(state)
+}
+
 /// State of `GET /v1/credentials/oauth/providers`.
 #[derive(Clone)]
 pub(crate) struct CredentialsOAuthProvidersState {
@@ -320,6 +336,21 @@ pub(crate) struct CreateMailboxRequest {
     pub(crate) smtp_host: String,
     pub(crate) smtp_port: u16,
     pub(crate) smtp_security: MailSecurity,
+    pub(crate) username: String,
+    pub(crate) password: SensitiveString,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    /// "personal" | "team:\<uuid\>"
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
+}
+
+/// The body of `POST /v1/credentials/calendars` (AEGIS ADR-138 K10): the
+/// server's URL, the user name and the password. `password` is a
+/// [`SensitiveString`], so the derived `Debug` prints it redacted.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateCalendarRequest {
+    pub(crate) url: String,
     pub(crate) username: String,
     pub(crate) password: SensitiveString,
     #[serde(default)]
@@ -748,6 +779,119 @@ pub(crate) async fn create_mailbox_handler(
             Some(CredentialError::InvalidMailboxSettings(detail)) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Invalid mailbox settings: {detail}")})),
+            )
+                .into_response(),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+    }
+}
+
+/// `POST /v1/credentials/calendars` — connect a calendar account by
+/// password (AEGIS ADR-138 K10). The service holds the server to the address
+/// rule and checks it by a `PROPFIND` with HTTP Basic before it stores
+/// anything: 201 with the binding's metadata when the server names a
+/// calendar home set, 422 `calendar_host_not_allowed` naming the field when
+/// the URL is outside the rule (nothing dialled), and 422
+/// `calendar_unreachable` with the server's status and reply otherwise. The
+/// password is never in a response or a log line.
+pub(crate) async fn create_calendar_handler(
+    State(state): State<CredentialsCalendarsState>,
+    request: axum::extract::Request,
+) -> Response {
+    let (user_id, tenant_id) =
+        match require_credential_scope(request.extensions(), ApiScope::CredentialCreate) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    // serde's message can quote the offending value, which may be the
+    // password, so only its position is answered.
+    let payload: CreateCalendarRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "Invalid calendar body at line {} column {}: expected the fields url, username and password",
+                        e.line(),
+                        e.column()
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let scope = match parse_credential_scope(payload.scope.as_deref()) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+
+    let svc = match &state.credential_service {
+        Some(s) => s.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Credential service not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let command = CreateCalDavCalendarCommand {
+        owner_user_id: user_id,
+        tenant_id,
+        label: payload.label,
+        scope,
+        url: payload.url,
+        username: payload.username,
+        password: payload.password,
+    };
+
+    match svc.create_caldav_calendar(command).await {
+        Ok(binding) => (
+            StatusCode::CREATED,
+            Json(json!({"id": binding.id.to_string(), "credential": binding})),
+        )
+            .into_response(),
+        Err(e) => match e.downcast_ref::<CredentialError>() {
+            Some(CredentialError::CalendarUnreachable { status, reply }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "calendar_unreachable",
+                    "status": status,
+                    "reply": reply,
+                })),
+            )
+                .into_response(),
+            Some(CredentialError::CalendarHostNotAllowed { field, reason }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "calendar_host_not_allowed",
+                    "field": field,
+                    "message": reason,
+                })),
+            )
+                .into_response(),
+            Some(CredentialError::InvalidCalendarSettings(detail)) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid calendar settings: {detail}")})),
             )
                 .into_response(),
             _ => (
@@ -1990,6 +2134,11 @@ mod tests {
 #[path = "../../../../orchestrator/core/tests/support/mail_standins.rs"]
 mod mail_standins;
 
+/// The loopback CalDAV stand-in shared with the core crate's tests.
+#[cfg(test)]
+#[path = "../../../../orchestrator/core/tests/support/caldav_standins.rs"]
+mod caldav_standins;
+
 #[cfg(test)]
 mod mailbox_route_tests {
     //! `POST /v1/credentials/mailboxes` (AEGIS ADR-125 D1), driven through
@@ -2392,6 +2541,291 @@ mod mailbox_route_tests {
         .await;
         assert_eq!(status, 400, "{answer}");
         assert!(!answer.to_string().contains(PASSWORD), "{answer}");
+    }
+    mod calendars_route {
+        //! `POST /v1/credentials/calendars` (AEGIS ADR-138 K10), driven
+        //! through the daemon's real authentication stack against the real
+        //! `StandardCredentialManagementService`, whose calendar check talks
+        //! to the loopback CalDAV stand-in. Every log line the request
+        //! produces, at every level, is captured and searched for the
+        //! password.
+
+        use super::super::caldav_standins::{CalDavStandIn, StandInCalendar, StandInConfig};
+        use super::super::{credentials_calendars_router, CredentialsCalendarsState};
+        use super::{consumer, identity_provider, send, serve, Bindings, Captured, OWNER, SCOPES};
+        use aegis_orchestrator_core::application::credential_service::{
+            CredentialManagementService, OAuthProviderRegistry, StandardCredentialManagementService,
+        };
+        use aegis_orchestrator_core::domain::secrets::AccessContext;
+        use aegis_orchestrator_core::infrastructure::calendar::{CalDavProbe, ReqwestTransport};
+        use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+        use aegis_orchestrator_core::infrastructure::secrets_manager::{
+            SecretsManager, TestSecretStore,
+        };
+        use base64::Engine as _;
+        use std::sync::Arc;
+
+        const PASSWORD: &str = "Mk7-route-calendar-password";
+        const USERNAME: &str = "alice";
+        const URL: &str = "https://caldav.example.test/dav/";
+
+        struct Route {
+            base: String,
+            bindings: Arc<Bindings>,
+            secrets: Arc<SecretsManager>,
+        }
+
+        /// The route over the service; its calendar check over `transport`,
+        /// or the production one when `None`.
+        async fn route(transport: Option<ReqwestTransport>) -> Route {
+            let bindings = Arc::new(Bindings::default());
+            let event_bus = Arc::new(EventBus::new(64));
+            let secrets = Arc::new(SecretsManager::from_store(
+                Arc::new(TestSecretStore::new()),
+                event_bus.clone(),
+            ));
+            let mut service = StandardCredentialManagementService::new(
+                bindings.clone(),
+                secrets.clone(),
+                event_bus,
+                Arc::new(OAuthProviderRegistry::new()),
+            );
+            if let Some(transport) = transport {
+                service =
+                    service.with_calendar_probe(Arc::new(CalDavProbe::new(Arc::new(transport))));
+            }
+            let base = serve(
+                credentials_calendars_router(CredentialsCalendarsState {
+                    credential_service: Some(
+                        Arc::new(service) as Arc<dyn CredentialManagementService>
+                    ),
+                }),
+                Some(identity_provider(&[(
+                    "owner-token",
+                    consumer(OWNER),
+                    SCOPES,
+                )])),
+                None,
+            )
+            .await;
+            Route {
+                base,
+                bindings,
+                secrets,
+            }
+        }
+
+        /// A stand-in serving one calendar, its root naming the principal,
+        /// accepting the form's user name and password by Basic.
+        async fn standin() -> CalDavStandIn {
+            let standin = CalDavStandIn::start(StandInConfig {
+                accepted_token: "no-token-is-used-here".to_string(),
+                principal: "/dav/principals/alice/".to_string(),
+                home_set: Some("/dav/calendars/alice/".to_string()),
+                calendars: vec![StandInCalendar {
+                    href: "/dav/calendars/alice/work/".to_string(),
+                    name: "Work".to_string(),
+                    description: None,
+                    color: None,
+                    writable: true,
+                    events: Vec::new(),
+                }],
+            })
+            .await;
+            standin.accept_basic(USERNAME, PASSWORD);
+            standin.serve_root("/dav/");
+            standin.serve_address("mailto:alice@example.test");
+            standin
+        }
+
+        fn body(url: &str, password: &str) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "url": url,
+                "username": USERNAME,
+                "password": password,
+            }))
+        }
+
+        fn encoded(password: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{USERNAME}:{password}"))
+        }
+
+        #[tokio::test]
+        async fn a_calendar_the_server_accepts_by_basic_is_created_201_and_its_password_is_nowhere_but_openbao(
+        ) {
+            let logs = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let standin = standin().await;
+            let r = route(Some(ReqwestTransport::to_origin(standin.origin()))).await;
+            let (status, answer) = send(
+                &r.base,
+                &reqwest::Method::POST,
+                "/v1/credentials/calendars",
+                &body(URL, PASSWORD),
+                Some("owner-token"),
+            )
+            .await;
+
+            assert_eq!(status, 201, "{answer}");
+            let credential = &answer["credential"];
+            let mut wrong = Vec::new();
+            for (field, want) in [
+                (&credential["credential_type"], "calendar"),
+                (&credential["provider"], "caldav"),
+                (&credential["status"], "active"),
+                (&credential["metadata"]["calendar"]["server"], URL),
+                (
+                    &credential["metadata"]["calendar"]["principal"],
+                    "/dav/principals/alice/",
+                ),
+                (
+                    &credential["metadata"]["calendar"]["address"],
+                    "alice@example.test",
+                ),
+                (&credential["metadata"]["label"], "alice@example.test"),
+            ] {
+                if field != want {
+                    wrong.push(format!("{field} is not {want}"));
+                }
+            }
+            let text = answer.to_string();
+            if text.contains(PASSWORD) || text.contains(&encoded(PASSWORD)) {
+                wrong.push(format!("the answer carries the password: {text}"));
+            }
+            let rows = r.bindings.rows.read().await;
+            let stored = rows.values().next().expect("binding saved");
+            let secret = r
+                .secrets
+                .read_secret(
+                    &stored.secret_path.effective_mount(),
+                    &stored.secret_path.path,
+                    &AccessContext::system("test"),
+                )
+                .await
+                .expect("secret written");
+            if secret.get("password").map(|s| s.expose()) != Some(PASSWORD)
+                || secret.get("username").map(|s| s.expose()) != Some(USERNAME)
+            {
+                wrong.push("OpenBao does not hold the user name and password".to_string());
+            }
+            let captured = logs.text();
+            if !captured.contains("alice@example.test") {
+                wrong.push(format!(
+                    "the capture saw none of the request's log lines: {captured}"
+                ));
+            }
+            if captured.contains(PASSWORD) || captured.contains(&encoded(PASSWORD)) {
+                wrong.push(format!("a log line carried the password: {captured}"));
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test]
+        async fn a_url_outside_the_rule_is_422_calendar_host_not_allowed_and_dials_nothing() {
+            // The production check: the stand-in's own loopback address and
+            // port, and plain http to it, are each refused before a
+            // connection.
+            let standin = standin().await;
+            let r = route(None).await;
+            let port = standin.addr.port();
+            let mut wrong = Vec::new();
+            for url in [
+                format!("http://127.0.0.1:{port}/dav/"),
+                format!("https://127.0.0.1:{port}/dav/"),
+                "https://caldav.example.test:8443/dav/".to_string(),
+                "https://127.0.0.1/dav/".to_string(),
+                "https://10.20.30.40/dav/".to_string(),
+            ] {
+                let (status, answer) = send(
+                    &r.base,
+                    &reqwest::Method::POST,
+                    "/v1/credentials/calendars",
+                    &body(&url, PASSWORD),
+                    Some("owner-token"),
+                )
+                .await;
+                if status != 422
+                    || answer["error"] != "calendar_host_not_allowed"
+                    || answer["field"] != "url"
+                    || answer.to_string().contains(PASSWORD)
+                {
+                    wrong.push(format!("{url}: {status} {answer}"));
+                }
+            }
+            if !standin.requests().is_empty() {
+                wrong.push("the stand-in was reached".to_string());
+            }
+            if !r.bindings.rows.read().await.is_empty() {
+                wrong.push("a binding was stored".to_string());
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        #[tokio::test]
+        async fn a_refused_password_is_422_calendar_unreachable_with_no_password_in_the_answer_or_a_log(
+        ) {
+            let logs = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let wrong_password = "Mk7-route-calendar-wrong";
+            let standin = standin().await;
+            let r = route(Some(ReqwestTransport::to_origin(standin.origin()))).await;
+            let (status, answer) = send(
+                &r.base,
+                &reqwest::Method::POST,
+                "/v1/credentials/calendars",
+                &body(URL, wrong_password),
+                Some("owner-token"),
+            )
+            .await;
+            assert_eq!(status, 422, "{answer}");
+            assert_eq!(answer["error"], "calendar_unreachable", "{answer}");
+            assert_eq!(answer["status"], 401, "{answer}");
+            let text = answer.to_string();
+            assert!(
+                !text.contains(wrong_password) && !text.contains(&encoded(wrong_password)),
+                "the answer carries the password: {text}"
+            );
+            assert!(
+                r.bindings.rows.read().await.is_empty(),
+                "a binding was stored"
+            );
+            let captured = logs.text();
+            assert!(
+                captured.contains("Calendar check failed"),
+                "the capture saw none of the request's log lines: {captured}"
+            );
+            assert!(
+                !captured.contains(wrong_password) && !captured.contains(&encoded(wrong_password)),
+                "a log line carried the password: {captured}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_body_that_is_not_a_calendar_is_400_and_does_not_echo_the_password() {
+            let r = route(None).await;
+            let (status, answer) = send(
+                &r.base,
+                &reqwest::Method::POST,
+                "/v1/credentials/calendars",
+                &Some(serde_json::json!({ "url": 7, "username": USERNAME, "password": PASSWORD })),
+                Some("owner-token"),
+            )
+            .await;
+            assert_eq!(status, 400, "{answer}");
+            assert!(!answer.to_string().contains(PASSWORD), "{answer}");
+        }
     }
 }
 

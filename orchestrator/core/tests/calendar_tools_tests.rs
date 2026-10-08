@@ -1975,7 +1975,9 @@ spec:
             .unwrap()
             .expect("the connected calendar is not the person's");
         assert_eq!(found.settings, google_settings(ADDRESS));
-        let CalDavAuth::Bearer(token) = &found.auth;
+        let CalDavAuth::Bearer(token) = &found.auth else {
+            panic!("an OAuth calendar account is not reached with its token as a bearer");
+        };
         assert_eq!(
             token.expose(),
             TOKEN,
@@ -3322,5 +3324,555 @@ spec:
             }
             assert!(wrong.is_empty(), "{wrong:#?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A calendar account connected by password (AEGIS ADR-138 K10, K10a)
+// ---------------------------------------------------------------------------
+
+mod password_form {
+    //! `create_caldav_calendar` against the stand-in: the address rule
+    //! before any request, the check by a `PROPFIND` with HTTP Basic, the
+    //! binding stored only after it, the password in no answer, reply or
+    //! event, and the seven tools serving the stored account with Basic.
+
+    use super::*;
+    use aegis_orchestrator_core::application::credential_service::{
+        CreateCalDavCalendarCommand, ToolCalendarSource,
+    };
+    use aegis_orchestrator_core::application::tools::builtin_calendar::{
+        CalendarActing, CalendarTools,
+    };
+    use aegis_orchestrator_core::domain::agent::AgentId;
+    use aegis_orchestrator_core::domain::execution::ServerChoice;
+    use aegis_orchestrator_core::infrastructure::calendar::{admit, shown_reply, TransportFailure};
+    use aegis_orchestrator_core::infrastructure::event_bus::EventReceiver;
+    use aegis_orchestrator_core::infrastructure::mail::MailResolver;
+    use serde_json::json;
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+
+    const URL: &str = "https://caldav.example.test/dav/";
+    const ROOT: &str = "/dav/";
+    const PRINCIPAL: &str = "/dav/a@example.test/user";
+    const USERNAME: &str = "alice";
+    const PASSWORD: &str = "Mk7-caldav-password-form-secret";
+    const MAILTO: &str = "mailto:a@example.test";
+
+    /// The `Authorization` a request carries with `username` and `password`.
+    fn basic(username: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        )
+    }
+
+    /// The client's stand-in, its root naming the principal, accepting the
+    /// form's user name and password by Basic.
+    async fn password_standin(address: bool) -> CalDavStandIn {
+        let standin = CalDavStandIn::start(client_config()).await;
+        standin.accept_basic(USERNAME, PASSWORD);
+        standin.serve_root(ROOT);
+        if address {
+            standin.serve_address(MAILTO);
+        }
+        standin
+    }
+
+    /// Answers each listed host its addresses, any other host a public one,
+    /// and records every lookup.
+    struct Names {
+        answers: Vec<(String, Vec<SocketAddr>)>,
+        lookups: Mutex<Vec<String>>,
+    }
+
+    impl Names {
+        fn new(answers: &[(&str, &[&str])]) -> Arc<Self> {
+            Arc::new(Self {
+                answers: answers
+                    .iter()
+                    .map(|(h, a)| {
+                        (
+                            h.to_string(),
+                            a.iter()
+                                .map(|ip| SocketAddr::new(ip.parse().unwrap(), 443))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                lookups: Mutex::new(Vec::new()),
+            })
+        }
+        fn lookups(&self) -> Vec<String> {
+            self.lookups.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MailResolver for Names {
+        async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            self.lookups.lock().unwrap().push(host.to_string());
+            Ok(self
+                .answers
+                .iter()
+                .find(|(h, _)| h == host)
+                .map(|(_, a)| a.clone())
+                .unwrap_or_else(|| vec![SocketAddr::new("192.0.2.44".parse().unwrap(), port)]))
+        }
+    }
+
+    struct Service {
+        service: Arc<StandardCredentialManagementService>,
+        repo: Arc<InMemoryRepo>,
+        secrets: Arc<SecretsManager>,
+        events: EventReceiver,
+    }
+
+    /// The credential service with its calendar check over `transport`.
+    fn service(transport: ReqwestTransport) -> Service {
+        let repo = Arc::new(InMemoryRepo::default());
+        let event_bus = Arc::new(EventBus::new(256));
+        let events = event_bus.subscribe();
+        let secrets = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            event_bus.clone(),
+        ));
+        let service = StandardCredentialManagementService::new(
+            repo.clone(),
+            secrets.clone(),
+            event_bus,
+            Arc::new(OAuthProviderRegistry::new()),
+        )
+        .with_calendar_probe(Arc::new(CalDavProbe::new(Arc::new(transport))));
+        Service {
+            service: Arc::new(service),
+            repo,
+            secrets,
+            events,
+        }
+    }
+
+    fn command(url: &str, password: &str, label: Option<&str>) -> CreateCalDavCalendarCommand {
+        CreateCalDavCalendarCommand {
+            owner_user_id: USER.to_string(),
+            tenant_id: tenant(),
+            label: label.map(str::to_string),
+            scope: CredentialScope::Personal,
+            url: url.to_string(),
+            username: USERNAME.to_string(),
+            password: SensitiveString::new(password),
+        }
+    }
+
+    /// Every event published so far, as text.
+    fn events_text(events: &mut EventReceiver) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(format!("{event:?}"));
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_calendar_connected_by_password_is_stored_after_a_basic_propfind_names_its_home_set()
+    {
+        let standin = password_standin(true).await;
+        let mut s = service(ReqwestTransport::to_origin(standin.origin()));
+        let binding = s
+            .service
+            .create_caldav_calendar(command(URL, PASSWORD, None))
+            .await
+            .expect("the account the stand-in accepts is stored");
+
+        let mut wrong = Vec::new();
+        if binding.credential_type != CredentialType::Calendar {
+            wrong.push(format!("type {:?}", binding.credential_type));
+        }
+        if binding.provider != CredentialProvider::new("caldav") {
+            wrong.push(format!("provider {}", binding.provider));
+        }
+        if binding.status != CredentialStatus::Active {
+            wrong.push(format!("status {:?}", binding.status));
+        }
+        let expected = CalendarSettings {
+            server: URL.to_string(),
+            principal: PRINCIPAL.to_string(),
+            address: "a@example.test".to_string(),
+        };
+        if binding.metadata.calendar.as_ref() != Some(&expected) {
+            wrong.push(format!(
+                "the calendar settings are {:?}, not {expected:?}",
+                binding.metadata.calendar
+            ));
+        }
+        if binding.metadata.label != "a@example.test" {
+            wrong.push(format!("label {}", binding.metadata.label));
+        }
+        if !is_calendar_binding(&binding) {
+            wrong.push("the binding is not a calendar account".to_string());
+        }
+        let stored = s.repo.find_by_id(&binding.id).await.unwrap();
+        if stored.as_ref().map(|b| (b.id, b.metadata.calendar.clone()))
+            != Some((binding.id, binding.metadata.calendar.clone()))
+        {
+            wrong.push("the binding was not saved as answered".to_string());
+        }
+        let secret = s
+            .secrets
+            .read_secret(
+                &binding.secret_path.effective_mount(),
+                &binding.secret_path.path,
+                &AccessContext::system("test"),
+            )
+            .await
+            .expect("the secret is written");
+        if secret.get("username").map(|v| v.expose()) != Some(USERNAME)
+            || secret.get("password").map(|v| v.expose()) != Some(PASSWORD)
+        {
+            wrong.push("OpenBao does not hold the user name and password".to_string());
+        }
+
+        let requests = standin.requests();
+        let propfinds: Vec<(&str, Option<&str>, bool)> = requests
+            .iter()
+            .map(|r| {
+                (
+                    r.path.as_str(),
+                    r.header("authorization"),
+                    r.body.contains("calendar-user-address-set"),
+                )
+            })
+            .collect();
+        let auth = basic(USERNAME, PASSWORD);
+        let want = vec![
+            (ROOT, Some(auth.as_str()), true),
+            (PRINCIPAL, Some(auth.as_str()), true),
+        ];
+        if propfinds != want {
+            wrong.push(format!(
+                "the check sent {propfinds:?}, not a Basic PROPFIND on the root then the principal"
+            ));
+        }
+        let answered = serde_json::to_string(&binding).unwrap();
+        let encoded = basic(USERNAME, PASSWORD);
+        for (name, text) in [("the answer", answered)].into_iter().chain(
+            events_text(&mut s.events)
+                .into_iter()
+                .map(|e| ("an event", e)),
+        ) {
+            if text.contains(PASSWORD) || text.contains(&encoded[6..]) {
+                wrong.push(format!("{name} carries the password: {text}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn without_a_calendar_user_address_the_user_name_is_the_address_and_a_label_is_kept() {
+        let standin = password_standin(false).await;
+        let s = service(ReqwestTransport::to_origin(standin.origin()));
+        let binding = s
+            .service
+            .create_caldav_calendar(command(URL, PASSWORD, Some("Work calendar")))
+            .await
+            .expect("stored");
+        let settings = binding
+            .metadata
+            .calendar
+            .clone()
+            .expect("calendar settings");
+        assert_eq!(
+            (settings.address.as_str(), binding.metadata.label.as_str()),
+            (USERNAME, "Work calendar"),
+            "the address is not the user name, or the label given was not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_check_answers_calendar_unreachable_stores_nothing_and_repeats_no_password() {
+        let mut wrong = Vec::new();
+        for case in ["a wrong password", "no calendar home set"] {
+            let standin = if case == "no calendar home set" {
+                let mut config = client_config();
+                config.home_set = None;
+                let standin = CalDavStandIn::start(config).await;
+                standin.accept_basic(USERNAME, PASSWORD);
+                standin.serve_root(ROOT);
+                standin
+            } else {
+                password_standin(true).await
+            };
+            let password = if case == "a wrong password" {
+                "Mk7-wrong-password"
+            } else {
+                PASSWORD
+            };
+            let mut s = service(ReqwestTransport::to_origin(standin.origin()));
+            let outcome = s
+                .service
+                .create_caldav_calendar(command(URL, password, None))
+                .await;
+            match outcome
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<CredentialError>())
+            {
+                Some(CredentialError::CalendarUnreachable { status, reply }) => {
+                    let encoded = basic(USERNAME, password);
+                    if reply.contains(password) || reply.contains(&encoded[6..]) {
+                        wrong.push(format!("{case}: the reply carries the password: {reply}"));
+                    }
+                    if case == "a wrong password" && *status != Some(401) {
+                        wrong.push(format!("{case}: status {status:?}"));
+                    }
+                }
+                _ => wrong.push(format!(
+                    "{case}: answered {:?}, not calendar_unreachable",
+                    outcome.as_ref().map(|b| b.id)
+                )),
+            }
+            if !s.repo.bindings.read().await.is_empty() {
+                wrong.push(format!("{case}: a binding was stored"));
+            }
+            for event in events_text(&mut s.events) {
+                if event.contains("CredentialCreated") {
+                    wrong.push(format!("{case}: a binding was announced: {event}"));
+                }
+            }
+            if standin.requests().is_empty() {
+                wrong.push(format!("{case}: the server was never asked"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_server_outside_the_address_rule_is_refused_before_any_request_and_nothing_is_stored()
+    {
+        let standin = password_standin(true).await;
+        let names = Names::new(&[("intranet.example.test", &["203.0.113.9", "10.0.0.7"])]);
+        let s = service(ReqwestTransport::to_origin_with_resolver(
+            standin.origin(),
+            names.clone(),
+        ));
+        let mut wrong = Vec::new();
+        for (url, says) in [
+            ("http://caldav.example.test/dav/", "https"),
+            ("https://caldav.example.test:8443/dav/", "8443"),
+            ("https://127.0.0.1/dav/", "loopback"),
+            ("https://10.1.2.3/dav/", "private"),
+            ("https://[::ffff:127.0.0.1]/dav/", "loopback"),
+            ("https://intranet.example.test/dav/", "10.0.0.7"),
+        ] {
+            let outcome = s
+                .service
+                .create_caldav_calendar(command(url, PASSWORD, None))
+                .await;
+            match outcome
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<CredentialError>())
+            {
+                Some(CredentialError::CalendarHostNotAllowed { field, reason }) => {
+                    if field != "url" || !reason.contains(says) {
+                        wrong.push(format!("{url}: field {field}, reason {reason}"));
+                    }
+                }
+                other => wrong.push(format!(
+                    "{url}: answered {other:?}, not calendar_host_not_allowed"
+                )),
+            }
+        }
+        if !standin.requests().is_empty() {
+            wrong.push(format!(
+                "the stand-in was reached: {:?}",
+                standin
+                    .requests()
+                    .iter()
+                    .map(|r| r.path.clone())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if !s.repo.bindings.read().await.is_empty() {
+            wrong.push("a binding was stored".to_string());
+        }
+        if names.lookups() != vec!["intranet.example.test".to_string()] {
+            wrong.push(format!(
+                "the names looked up were {:?}, not the one host once",
+                names.lookups()
+            ));
+        }
+        // The control: a public server on 443 does reach the stand-in.
+        if let Err(e) = s
+            .service
+            .create_caldav_calendar(command(URL, PASSWORD, None))
+            .await
+        {
+            wrong.push(format!("the control, a public server, was refused: {e}"));
+        }
+        if standin.requests().is_empty() {
+            wrong.push("the control never reached the stand-in".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn the_address_rule_resolves_once_admits_only_public_addresses_on_443_and_keeps_them() {
+        let names = Names::new(&[
+            ("public.example.test", &["203.0.113.9", "2001:db8::9"]),
+            ("mixed.example.test", &["203.0.113.9", "169.254.169.254"]),
+        ]);
+        let mut wrong = Vec::new();
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        match admit(&url("https://public.example.test/dav/"), names.as_ref()).await {
+            Ok(admitted) => {
+                let want: Vec<SocketAddr> = vec![
+                    "203.0.113.9:443".parse().unwrap(),
+                    "[2001:db8::9]:443".parse().unwrap(),
+                ];
+                if admitted.addrs != want || admitted.host != "public.example.test" {
+                    wrong.push(format!("admitted {admitted:?}"));
+                }
+            }
+            Err(e) => wrong.push(format!("a public server was refused: {e}")),
+        }
+        for (u, says) in [
+            ("https://mixed.example.test/", "169.254.169.254"),
+            ("https://public.example.test:8443/", "8443"),
+            ("https://192.168.1.4/", "private"),
+            ("https://[fe80::1]/", "link-local"),
+        ] {
+            match admit(&url(u), names.as_ref()).await {
+                Err(TransportFailure::NotAllowed(reason)) if reason.contains(says) => {}
+                other => wrong.push(format!("{u}: {other:?}")),
+            }
+        }
+        if names.lookups()
+            != vec![
+                "public.example.test".to_string(),
+                "mixed.example.test".to_string(),
+            ]
+        {
+            wrong.push(format!(
+                "lookups {:?}: a literal or a refused port was resolved, or a name twice",
+                names.lookups()
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn a_reply_shown_from_a_basic_account_redacts_the_password_and_its_encoding() {
+        let auth = CalDavAuth::Basic {
+            username: USERNAME.to_string(),
+            password: SensitiveString::new(PASSWORD),
+        };
+        let encoded = basic(USERNAME, PASSWORD);
+        let reply = format!("401: you sent {encoded} for {USERNAME} with {PASSWORD}");
+        let shown = shown_reply(&reply, &auth);
+        assert!(
+            !shown.contains(PASSWORD) && !shown.contains(&encoded[6..]),
+            "the reply repeats the password: {shown}"
+        );
+        assert_eq!(format!("{auth:?}"), "Basic([REDACTED])");
+    }
+
+    #[tokio::test]
+    async fn the_calendar_tools_serve_an_account_connected_by_password_with_basic() {
+        let standin = password_standin(true).await;
+        let s = service(ReqwestTransport::to_origin(standin.origin()));
+        let binding = s
+            .service
+            .create_caldav_calendar(command(URL, PASSWORD, None))
+            .await
+            .expect("stored");
+        let tools = CalendarTools::with_transport(
+            s.service.clone() as Arc<dyn ToolCalendarSource>,
+            Arc::new(ReqwestTransport::to_origin(standin.origin())),
+        );
+        let acting = CalendarActing {
+            tenant_id: tenant(),
+            user_id: Some(USER.to_string()),
+            agent_id: AgentId::new(),
+            workflow_id: None,
+            choice: ServerChoice::NotGiven,
+            has_execution_record: false,
+        };
+        let account = binding.id.to_string();
+        let mut wrong = Vec::new();
+        let pool = s.service.calendar_contexts(&tenant(), USER).await.unwrap();
+        if !pool.iter().any(|c| c.id == binding.id) {
+            wrong.push("the caldav pool does not hold the account".to_string());
+        }
+        let before = standin.requests().len();
+        let calendars = tools
+            .invoke(
+                "calendar.calendars",
+                &json!({ "account": account }),
+                &acting,
+            )
+            .await;
+        match &calendars {
+            Ok(answer) if answer["calendars"].as_array().is_some_and(|c| c.len() == 2) => {}
+            other => wrong.push(format!("calendar.calendars answered {other:?}")),
+        }
+        let listed = tools
+            .invoke(
+                "calendar.list",
+                &json!({
+                    "account": account,
+                    "calendar_id": WORK,
+                    "start": "2026-10-08T09:00:00Z",
+                    "end": "2026-10-15T09:00:00Z",
+                }),
+                &acting,
+            )
+            .await;
+        match &listed {
+            Ok(answer) if answer["events"].as_array().is_some_and(|e| !e.is_empty()) => {}
+            other => wrong.push(format!("calendar.list answered {other:?}")),
+        }
+        let created = tools
+            .invoke(
+                "calendar.create",
+                &json!({
+                    "account": account,
+                    "calendar_id": WORK,
+                    "title": "Written by password",
+                    "start": "2026-10-20T09:00:00Z",
+                    "end": "2026-10-20T10:00:00Z",
+                }),
+                &acting,
+            )
+            .await;
+        match &created {
+            Ok(answer)
+                if answer["uid"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("@example.test")) => {}
+            other => wrong.push(format!("calendar.create answered {other:?}")),
+        }
+        let auth = basic(USERNAME, PASSWORD);
+        let sent: Vec<(String, Option<String>)> = standin.requests()[before..]
+            .iter()
+            .map(|r| {
+                (
+                    format!("{} {}", r.method, r.path),
+                    r.header("authorization").map(str::to_string),
+                )
+            })
+            .collect();
+        if sent.is_empty()
+            || sent
+                .iter()
+                .any(|(_, a)| a.as_deref() != Some(auth.as_str()))
+        {
+            wrong.push(format!("the tools' requests were not all Basic: {sent:?}"));
+        }
+        if !sent.iter().any(|(r, _)| r.starts_with("PUT ")) {
+            wrong.push(format!("no event was written: {sent:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

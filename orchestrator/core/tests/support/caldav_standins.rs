@@ -17,6 +17,14 @@
 //! A request whose `Authorization` is not `Bearer <accepted token>` is
 //! answered `401`, its body repeating the header it was given, so a test can
 //! show that a refusal's reply never carries the token.
+//!
+//! Three more setters serve a calendar account connected by password (AEGIS
+//! ADR-138 K10): [`CalDavStandIn::accept_basic`] accepts one user name and
+//! password by HTTP Basic as it accepts the token;
+//! [`CalDavStandIn::serve_root`] answers a `PROPFIND` (Depth 0) on a server
+//! root naming the principal and no home set, as a server's root does; and
+//! [`CalDavStandIn::serve_address`] adds a `calendar-user-address-set` to the
+//! principal's answer.
 
 #![allow(dead_code)]
 
@@ -84,6 +92,12 @@ struct State {
     move_etag_after_get: AtomicBool,
     refuse_writes_412: AtomicBool,
     next_etag: AtomicU64,
+    /// The `Authorization` accepted besides the bearer: `Basic <base64>`.
+    basic: Mutex<Option<String>>,
+    /// A server root answered with the principal and no home set.
+    root: Mutex<Option<String>>,
+    /// The calendar user address the principal names.
+    address: Mutex<Option<String>>,
 }
 
 impl State {
@@ -110,6 +124,9 @@ impl CalDavStandIn {
             move_etag_after_get: AtomicBool::new(false),
             refuse_writes_412: AtomicBool::new(false),
             next_etag: AtomicU64::new(1),
+            basic: Mutex::new(None),
+            root: Mutex::new(None),
+            address: Mutex::new(None),
         });
         let seen = requests.clone();
         let served = state.clone();
@@ -139,6 +156,27 @@ impl CalDavStandIn {
     /// From now on, answer every `PUT` and `DELETE` `412`.
     pub fn refuse_writes_412(&self, on: bool) {
         self.state.refuse_writes_412.store(on, Ordering::SeqCst);
+    }
+
+    /// From now on, accept `username` and `password` by HTTP Basic, as the
+    /// token is accepted.
+    pub fn accept_basic(&self, username: &str, password: &str) {
+        use base64::Engine as _;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        *self.state.basic.lock().unwrap() = Some(format!("Basic {encoded}"));
+    }
+
+    /// From now on, answer a `PROPFIND` (Depth 0) on `path` with the
+    /// principal as its `current-user-principal` and no home set.
+    pub fn serve_root(&self, path: &str) {
+        *self.state.root.lock().unwrap() = Some(path.to_string());
+    }
+
+    /// From now on, name `href` (`mailto:...`) as the principal's
+    /// `calendar-user-address-set`.
+    pub fn serve_address(&self, href: &str) {
+        *self.state.address.lock().unwrap() = Some(href.to_string());
     }
 
     /// The event `name` of the calendar `href` as the stand-in now holds it.
@@ -178,8 +216,10 @@ impl CalDavStandIn {
     }
 
     /// The stand-in's origin, `http://127.0.0.1:<port>/`.
-    pub fn origin(&self) -> url::Url {
-        url::Url::parse(&format!("http://{}/", self.addr)).expect("origin")
+    /// (`reqwest`'s re-export of `url::Url`, so a crate including this file
+    /// needs no `url` dependency of its own.)
+    pub fn origin(&self) -> reqwest::Url {
+        reqwest::Url::parse(&format!("http://{}/", self.addr)).expect("origin")
     }
 
     /// Every request received so far, in order.
@@ -278,6 +318,55 @@ fn escape(s: &str) -> String {
 
 fn answer(state: &State, request: &Recorded) -> Answer {
     let mut config = state.config.lock().unwrap();
+    // The accepted Basic credentials are answered as the token is.
+    let basic = state.basic.lock().unwrap().clone();
+    let normalised;
+    let request = match (&basic, request.header("authorization")) {
+        (Some(accepted), Some(presented)) if presented == accepted.as_str() => {
+            let mut r = request.clone();
+            r.headers
+                .retain(|(n, _)| !n.eq_ignore_ascii_case("authorization"));
+            r.headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", config.accepted_token),
+            ));
+            normalised = r;
+            &normalised
+        }
+        _ => request,
+    };
+    let root = state.root.lock().unwrap().clone();
+    if request.method == "PROPFIND"
+        && request.header("depth") == Some("0")
+        && root.as_deref() == Some(request.path.as_str())
+        && request.path != config.principal
+    {
+        if let Some(refused) = unauthorized(&config, request) {
+            return refused;
+        }
+        return xml(
+            207,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+ <D:response>
+  <D:href>{root}</D:href>
+  <D:propstat>
+   <D:prop><D:current-user-principal><D:href>{principal}</D:href></D:current-user-principal></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status>
+  </D:propstat>
+  <D:propstat>
+   <D:prop><C:calendar-home-set/></D:prop>
+   <D:status>HTTP/1.1 404 Not Found</D:status>
+  </D:propstat>
+ </D:response>
+</D:multistatus>"#,
+                root = escape(&request.path),
+                principal = escape(&config.principal),
+            ),
+        );
+    }
+    let address = state.address.lock().unwrap().clone();
     match request.method.as_str() {
         "PUT" | "DELETE" => return write(state, &mut config, request),
         "GET" => {
@@ -292,7 +381,7 @@ fn answer(state: &State, request: &Recorded) -> Answer {
         }
         _ => {}
     }
-    answer_read(&config, request)
+    answer_read(&config, request, address.as_deref())
 }
 
 /// The event whose path is `path`, mutable.
@@ -399,7 +488,7 @@ fn write(state: &State, config: &mut StandInConfig, request: &Recorded) -> Answe
     (status, vec![("ETag", etag)], String::new())
 }
 
-fn answer_read(config: &StandInConfig, request: &Recorded) -> Answer {
+fn answer_read(config: &StandInConfig, request: &Recorded, address: Option<&str>) -> Answer {
     let presented = request.header("authorization").unwrap_or("").to_string();
     if presented != format!("Bearer {}", config.accepted_token) {
         return (
@@ -417,6 +506,13 @@ fn answer_read(config: &StandInConfig, request: &Recorded) -> Answer {
                     escape(href)
                 ),
                 None => String::new(),
+            };
+            let home = match address {
+                Some(href) => format!(
+                    "{home}<C:calendar-user-address-set><D:href>{}</D:href></C:calendar-user-address-set>",
+                    escape(href)
+                ),
+                None => home,
             };
             xml(
                 207,

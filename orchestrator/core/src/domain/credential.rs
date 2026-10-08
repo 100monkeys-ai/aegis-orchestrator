@@ -123,14 +123,21 @@ pub enum CredentialType {
     /// 2026-10-04 may also carry an OAuth token in this type; it reads back
     /// as it was stored. A new OAuth binding is of type `oauth2`.
     Mailbox,
+    /// A calendar account connected by password (AEGIS ADR-138 K10): CalDAV
+    /// with HTTP Basic (provider `caldav`, the settings in
+    /// [`CredentialMetadata::calendar`], the fields `username` and
+    /// `password` in OpenBao). A calendar connected by OAuth is of type
+    /// `oauth2`.
+    Calendar,
 }
 
 /// The external service or platform this credential authenticates with: an
 /// opaque name (AEGIS ADR-125, Update of 2026-10-04, clause 1). An OAuth
 /// binding's provider is the `provider` string of its `spec.oauth_providers`
 /// entry; an API key's is the name its user gave. No provider name is known
-/// to the code, except [`CredentialProvider::imap`], the settings form of a
-/// standard protocol (a `mailbox` binding's SMTP-with-IMAP form).
+/// to the code, except the settings forms of two standard protocols:
+/// [`CredentialProvider::imap`] (a `mailbox` binding's SMTP-with-IMAP form)
+/// and [`CredentialProvider::caldav`] (a `calendar` binding's CalDAV form).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CredentialProvider {
@@ -143,6 +150,10 @@ impl CredentialProvider {
     /// Update of 2026-10-04 as a protocol, not a product).
     pub const IMAP: &'static str = "imap";
 
+    /// The provider of a calendar account connected by password (AEGIS
+    /// ADR-138 K10): a protocol, not a product.
+    pub const CALDAV: &'static str = "caldav";
+
     /// The provider of this name, as given.
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
@@ -151,6 +162,11 @@ impl CredentialProvider {
     /// The provider of an SMTP-with-IMAP mailbox.
     pub fn imap() -> Self {
         Self::new(Self::IMAP)
+    }
+
+    /// The provider of a calendar account connected by password.
+    pub fn caldav() -> Self {
+        Self::new(Self::CALDAV)
     }
 
     /// The provider's name.

@@ -26,9 +26,10 @@
 
 use crate::domain::agent::AgentId;
 use crate::domain::credential::{
-    BindingReach, CredentialBindingId, CredentialBindingRepository, CredentialGrantId,
-    CredentialMetadata, CredentialProvider, CredentialScope, CredentialStatus, CredentialType,
-    GrantTarget, MailboxSettings, OAuthPendingState, ReachKind, UserCredentialBinding,
+    BindingReach, CalendarSettings, CredentialBindingId, CredentialBindingRepository,
+    CredentialGrantId, CredentialMetadata, CredentialProvider, CredentialScope, CredentialStatus,
+    CredentialType, GrantTarget, MailboxSettings, OAuthPendingState, ReachKind,
+    UserCredentialBinding,
 };
 use crate::domain::events::CredentialEvent;
 use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry, RemoteServer};
@@ -350,6 +351,17 @@ pub enum CredentialError {
     /// characters removed and at most 512 characters. Nothing was stored.
     #[error("calendar_unreachable: the calendar server answered{}: {reply}", status.map(|s| format!(" {s}")).unwrap_or_default())]
     CalendarUnreachable { status: Option<u16>, reply: String },
+    /// A calendar account's server is outside the address rule: its URL is
+    /// not `https` on port 443, carries a user name, or resolves to an
+    /// address that is not public unicast (AEGIS ADR-138 K10, K10a).
+    /// Refused before any connection; `field` is the setting refused
+    /// (`url`), `reason` the sentence naming it. Nothing was stored.
+    #[error("calendar_host_not_allowed: {reason}")]
+    CalendarHostNotAllowed { field: String, reason: String },
+    /// Calendar settings no request could use (an empty user name or
+    /// password, a URL that does not parse).
+    #[error("invalid calendar settings: {0}")]
+    InvalidCalendarSettings(String),
     /// Mailbox settings no session could use.
     #[error("invalid mailbox settings: {0}")]
     InvalidMailboxSettings(String),
@@ -522,6 +534,24 @@ pub struct CreateImapMailboxCommand {
     pub password: SensitiveString,
 }
 
+/// Command object for [`CredentialManagementService::create_caldav_calendar`]
+/// (AEGIS ADR-138 K10).
+#[derive(Debug)]
+pub struct CreateCalDavCalendarCommand {
+    pub owner_user_id: String,
+    pub tenant_id: TenantId,
+    /// Display label; the account's address when absent (K10a (d)).
+    pub label: Option<String>,
+    pub scope: CredentialScope,
+    /// The CalDAV server's URL, `https` on port 443; stored as given.
+    pub url: String,
+    /// The user name the server accepts by HTTP Basic; stored only in
+    /// OpenBao, under the field `username` (K10a (b)).
+    pub username: String,
+    /// The password; stored only in OpenBao, under the field `password`.
+    pub password: SensitiveString,
+}
+
 // ============================================================================
 // Return type for OAuth initiation
 // ============================================================================
@@ -600,6 +630,18 @@ pub trait CredentialManagementService: Send + Sync {
     async fn create_imap_mailbox(
         &self,
         cmd: CreateImapMailboxCommand,
+    ) -> anyhow::Result<UserCredentialBinding>;
+
+    /// Create a `calendar` binding of provider `caldav` (AEGIS ADR-138
+    /// K10) after the account's server, held to the address rule, answers a
+    /// `PROPFIND` authenticated by HTTP Basic naming a calendar home set. A
+    /// URL outside the rule is [`CredentialError::CalendarHostNotAllowed`]
+    /// and nothing is dialled; a refusal is
+    /// [`CredentialError::CalendarUnreachable`]; either way nothing is
+    /// stored. The user name and password are written only to OpenBao.
+    async fn create_caldav_calendar(
+        &self,
+        cmd: CreateCalDavCalendarCommand,
     ) -> anyhow::Result<UserCredentialBinding>;
 
     /// The binding's OAuth access token (ADR-125 D3): the stored one when
@@ -794,11 +836,17 @@ pub fn is_mailbox_binding(binding: &UserCredentialBinding) -> bool {
         }
 }
 
-/// Whether `binding` is a calendar account (AEGIS ADR-138 K4): an OAuth
-/// binding whose callback found the calendar scope granted and gave it
-/// calendar settings.
+/// Whether `binding` is a calendar account (AEGIS ADR-138 K4, K10): it
+/// carries calendar settings, and it is either an OAuth binding whose
+/// callback found the calendar scope granted (K4) or a `calendar` binding
+/// of provider `caldav` connected by password (K10).
 pub fn is_calendar_binding(binding: &UserCredentialBinding) -> bool {
-    binding.metadata.calendar.is_some() && binding.credential_type == CredentialType::OAuth2
+    binding.metadata.calendar.is_some()
+        && match binding.credential_type {
+            CredentialType::OAuth2 => true,
+            CredentialType::Calendar => binding.provider == CredentialProvider::caldav(),
+            _ => false,
+        }
 }
 
 /// The key a run's or a conversation's chosen calendar accounts are read
@@ -807,7 +855,9 @@ pub const CALENDAR_CHOICE_KEY: &str = "caldav";
 
 /// A calendar tool's account (AEGIS ADR-138 K5a, K6): a calendar binding of
 /// the acting person ([`is_calendar_binding`]), its CalDAV settings, how its
-/// requests authenticate (the OAuth access token as a bearer), and whether
+/// requests authenticate (the OAuth access token as a bearer, or the user
+/// name and password of a binding connected by password by HTTP Basic,
+/// K10), and whether
 /// it is granted to the calling agent, its workflow or all the person's
 /// agents.
 pub struct ToolCalendar {
@@ -1115,6 +1165,32 @@ impl ToolCalendarSource for StandardCredentialManagementService {
         };
         let granted = granted_to(&binding, actor);
         let binding_id = binding.id;
+        if binding.credential_type == CredentialType::Calendar {
+            // Connected by password (K10): HTTP Basic with the user name and
+            // password stored in OpenBao.
+            let stored = self
+                .secrets
+                .read_secret(
+                    &binding.secret_path.effective_mount(),
+                    &binding.secret_path.path,
+                    &AccessContext::system("aegis-credential-service"),
+                )
+                .await?;
+            let field = |name: &str| {
+                stored
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("calendar binding {binding_id} holds no {name} field"))
+            };
+            let username = field("username")?.expose().to_string();
+            let password = field("password")?;
+            return Ok(Some(ToolCalendar {
+                binding_id,
+                settings,
+                auth: CalDavAuth::Basic { username, password },
+                granted,
+            }));
+        }
         // The access token, read from `access_token` and refreshed inside the
         // margin; a token that can no longer be refreshed has set the binding
         // Expired, and the account is not an active one.
@@ -2009,6 +2085,44 @@ fn calendar_check_refusal(failure: CalendarCheckFailure, address: &str) -> Crede
     }
 }
 
+/// The URL of a calendar account connected by password, refused unless it
+/// is an absolute `https` URL with a host, on port 443, carrying no user
+/// name or password (AEGIS ADR-138 K10). Nothing is resolved or dialled
+/// here; the transport's address rule judges the addresses.
+fn calendar_url_refusal(url: &str) -> Result<(), CredentialError> {
+    let not_allowed = |reason: String| CredentialError::CalendarHostNotAllowed {
+        field: "url".to_string(),
+        reason,
+    };
+    let parsed = url::Url::parse(url.trim()).map_err(|e| {
+        CredentialError::InvalidCalendarSettings(format!("url is not an absolute URL: {e}"))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(not_allowed(format!(
+            "url must be an https URL; the calendar check does not connect over {}",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host().is_none() {
+        return Err(not_allowed("url must name a host".to_string()));
+    }
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(crate::infrastructure::calendar::CALDAV_PORT);
+    if port != crate::infrastructure::calendar::CALDAV_PORT {
+        return Err(not_allowed(format!(
+            "url must be on port 443; the calendar check does not connect to port {port}"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(not_allowed(
+            "url must not carry a user name or password; give them as username and password"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The email address in an OpenID Connect ID token's claims. The token came
 /// straight from the token endpoint over TLS, which OpenID Connect Core
 /// §3.1.3.7 accepts in place of validating its signature; an address the
@@ -2202,6 +2316,126 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 tenant_id,
                 provider: CredentialProvider::imap(),
                 credential_type: CredentialType::Mailbox,
+            });
+
+        Ok(binding)
+    }
+
+    // -----------------------------------------------------------------------
+    // create_caldav_calendar (ADR-138 K10)
+    // -----------------------------------------------------------------------
+
+    async fn create_caldav_calendar(
+        &self,
+        cmd: CreateCalDavCalendarCommand,
+    ) -> anyhow::Result<UserCredentialBinding> {
+        let CreateCalDavCalendarCommand {
+            owner_user_id,
+            tenant_id,
+            label,
+            scope,
+            url,
+            username,
+            password,
+        } = cmd;
+        let url = url.trim().to_string();
+        let username = username.trim().to_string();
+        if username.is_empty() {
+            return Err(CredentialError::InvalidCalendarSettings(
+                "username must not be empty".into(),
+            )
+            .into());
+        }
+        if password.is_empty() {
+            return Err(CredentialError::InvalidCalendarSettings(
+                "password must not be empty".into(),
+            )
+            .into());
+        }
+        calendar_url_refusal(&url)?;
+
+        // The live check, before anything is stored: the address rule, then
+        // a PROPFIND with HTTP Basic naming a calendar home set.
+        let auth = CalDavAuth::Basic {
+            username: username.clone(),
+            password: password.clone(),
+        };
+        let discovery = match self.calendar_probe.discover_account(&url, &auth).await {
+            Ok(discovery) => discovery,
+            Err(failure) if failure.host_not_allowed => {
+                tracing::info!(
+                    reason = %failure.reply,
+                    "Calendar server outside the address rule; no binding stored"
+                );
+                return Err(CredentialError::CalendarHostNotAllowed {
+                    field: "url".to_string(),
+                    reason: failure.reply,
+                }
+                .into());
+            }
+            Err(failure) => return Err(calendar_check_refusal(failure, &username).into()),
+        };
+        let address = discovery.address.unwrap_or_else(|| username.clone());
+
+        let binding_id = CredentialBindingId::new();
+        let secret_path = user_credential_path(&tenant_id, &owner_user_id, &binding_id);
+        let mut secret_data = HashMap::new();
+        secret_data.insert("username".to_string(), SensitiveString::new(username));
+        secret_data.insert("password".to_string(), password);
+        self.secrets
+            .write_secret(
+                &secret_path.effective_mount(),
+                &secret_path.path,
+                secret_data,
+                &AccessContext::system("aegis-credential-service"),
+            )
+            .await?;
+
+        let now = Utc::now();
+        let binding = UserCredentialBinding {
+            id: binding_id,
+            owner_user_id: owner_user_id.clone(),
+            tenant_id: tenant_id.clone(),
+            credential_type: CredentialType::Calendar,
+            provider: CredentialProvider::caldav(),
+            secret_path,
+            scope,
+            status: CredentialStatus::Active,
+            metadata: CredentialMetadata {
+                label: label
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| address.clone()),
+                tags: None,
+                service_url: None,
+                external_account_id: Some(address.clone()),
+                oauth_scopes: None,
+                mailbox: None,
+                reach: None,
+                calendar: Some(CalendarSettings {
+                    server: url,
+                    principal: discovery.principal,
+                    address,
+                }),
+            },
+            grants: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.repo.save(&binding).await?;
+
+        tracing::info!(
+            binding_id = %binding_id,
+            address = ?binding.metadata.external_account_id,
+            "Calendar check passed; caldav binding stored"
+        );
+        self.event_bus
+            .publish_credential_event(CredentialEvent::CredentialCreated {
+                binding_id,
+                owner_user_id,
+                tenant_id,
+                provider: CredentialProvider::caldav(),
+                credential_type: CredentialType::Calendar,
             });
 
         Ok(binding)

@@ -6,8 +6,13 @@
 //! `calendar.respond` write.
 //!
 //! They speak CalDAV only, over a calendar account of the acting person
-//! (K1), inside the orchestrator: the OAuth access token `access_token_for`
-//! answers goes as a bearer and never reaches an agent. The reads skip the
+//! (K1), inside the orchestrator, authenticated as the account was
+//! connected: the OAuth access token `access_token_for` answers as a
+//! bearer (K4), or the user name and password of an account connected by
+//! password by HTTP Basic (K10). Neither ever reaches an agent, and both
+//! forms are served alike. A server outside the address rule (a port other
+//! than 443, an address that is not public) is refused before any
+//! connection and answered as the server's failure. The reads skip the
 //! inner-loop judge and no gate holds them; the writes pass the judge and
 //! wait at the approval gate (K6c, K7).
 //!

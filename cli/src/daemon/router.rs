@@ -49,11 +49,11 @@ use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
 use crate::daemon::handlers::credentials::{
-    credentials_by_id_router, credentials_mailboxes_router, credentials_oauth_providers_router,
-    delete_secret_handler, device_poll_handler, get_secret_handler, list_credentials_handler,
-    list_secrets_handler, oauth_callback_handler, oauth_initiate_handler, store_api_key_handler,
-    write_secret_handler, CredentialsByIdState, CredentialsMailboxesState,
-    CredentialsOAuthProvidersState,
+    credentials_by_id_router, credentials_calendars_router, credentials_mailboxes_router,
+    credentials_oauth_providers_router, delete_secret_handler, device_poll_handler,
+    get_secret_handler, list_credentials_handler, list_secrets_handler, oauth_callback_handler,
+    oauth_initiate_handler, store_api_key_handler, write_secret_handler, CredentialsByIdState,
+    CredentialsCalendarsState, CredentialsMailboxesState, CredentialsOAuthProvidersState,
 };
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
@@ -412,6 +412,13 @@ pub(crate) fn create_router(
     // own narrow state and beneath the same authentication layers as
     // `/v1/credentials/api-keys`.
     let router = router.merge(credentials_mailboxes_router(CredentialsMailboxesState {
+        credential_service: app_state.credential_service.clone(),
+    }));
+
+    // Calendar accounts by CalDAV password (AEGIS ADR-138 K10), over their
+    // own narrow state and beneath the same authentication layers as
+    // `/v1/credentials/mailboxes`.
+    let router = router.merge(credentials_calendars_router(CredentialsCalendarsState {
         credential_service: app_state.credential_service.clone(),
     }));
 

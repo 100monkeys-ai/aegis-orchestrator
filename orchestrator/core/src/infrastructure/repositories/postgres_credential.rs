@@ -52,6 +52,7 @@ fn credential_type_to_str(ct: &CredentialType) -> &'static str {
         CredentialType::Variable => "variable",
         CredentialType::ServiceAccount => "service_account",
         CredentialType::Mailbox => "mailbox",
+        CredentialType::Calendar => "calendar",
     }
 }
 
@@ -62,6 +63,7 @@ fn str_to_credential_type(s: &str) -> anyhow::Result<CredentialType> {
         "variable" => Ok(CredentialType::Variable),
         "service_account" => Ok(CredentialType::ServiceAccount),
         "mailbox" => Ok(CredentialType::Mailbox),
+        "calendar" => Ok(CredentialType::Calendar),
         other => Err(anyhow::anyhow!("Unknown credential_type: {other}")),
     }
 }

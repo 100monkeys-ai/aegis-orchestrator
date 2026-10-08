@@ -12,6 +12,11 @@
 //! - [`CalDavClient::discover`]: `PROPFIND` (Depth 0) on the principal for
 //!   `current-user-principal` and `calendar-home-set`. The connect-time
 //!   check is this request (K5).
+//! - [`CalDavClient::discover_account`]: the check of an account connected
+//!   by password (K10): `PROPFIND` (Depth 0) on the server's URL for
+//!   `current-user-principal`, `calendar-home-set` and
+//!   `calendar-user-address-set`, then on the principal it names when the
+//!   URL's own answer names no home set.
 //! - [`CalDavClient::calendars`]: `PROPFIND` (Depth 1) on the home set, the
 //!   members whose resource type is a calendar.
 //! - [`CalDavClient::events`]: `REPORT calendar-query` (Depth 1) with a
@@ -27,7 +32,9 @@
 
 use super::xml::{self, DavResponse, Element, APPLE_ICAL, CALDAV, DAV};
 use super::CalendarCheckFailure;
-use super::{shown_reply, CalDavAuth, CalDavRequest, CalDavResponse, CalDavTransport};
+use super::{
+    shown_reply, CalDavAuth, CalDavRequest, CalDavResponse, CalDavTransport, TransportFailure,
+};
 use crate::domain::credential::CalendarSettings;
 use chrono::{DateTime, Utc};
 use url::Url;
@@ -53,6 +60,10 @@ pub enum CalDavError {
     /// Nothing answered: the request failed before the server replied.
     #[error("{0}")]
     Unreachable(String),
+    /// The address rule refused the server before any connection: a port
+    /// other than 443, or an address that is not public unicast (K10).
+    #[error("{0}")]
+    HostNotAllowed(String),
     /// The server answered with a status the request does not accept.
     #[error("the calendar server answered {status}: {reply}")]
     Refused { status: u16, reply: String },
@@ -91,6 +102,7 @@ impl CalDavError {
         CalendarCheckFailure {
             status: self.status(),
             reply: shown_reply(&reply, auth),
+            host_not_allowed: matches!(self, CalDavError::HostNotAllowed(_)),
         }
     }
 }
@@ -101,6 +113,17 @@ impl CalDavError {
 pub struct Discovery {
     pub principal: Url,
     pub home_set: Url,
+}
+
+/// What the check of an account connected by password found (K10, K10a):
+/// its principal as a reference on the server (the `current-user-principal`
+/// href, or the server's URL itself when its own answer names the home set
+/// and no principal), and its first `mailto:` calendar user address, if
+/// any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDiscovery {
+    pub principal: String,
+    pub address: Option<String>,
 }
 
 /// One calendar of a home set.
@@ -208,7 +231,10 @@ impl<'a> CalDavClient<'a> {
                 self.auth,
             )
             .await
-            .map_err(CalDavError::Unreachable)
+            .map_err(|failure| match failure {
+                TransportFailure::NotAllowed(reason) => CalDavError::HostNotAllowed(reason),
+                TransportFailure::Failed(reason) => CalDavError::Unreachable(reason),
+            })
     }
 
     /// A multistatus answer's responses; any other status is refused.
@@ -266,6 +292,77 @@ impl<'a> CalDavClient<'a> {
             },
             home_set: self.resolve(&home_set)?,
         })
+    }
+
+    /// The check of an account connected by password (K10): `PROPFIND`
+    /// (Depth 0) on the principal URL this client was given (the server's
+    /// URL) for `current-user-principal`, `calendar-home-set` and
+    /// `calendar-user-address-set`. When that answer names no home set but
+    /// names a principal elsewhere on the server, the same `PROPFIND` goes to
+    /// that principal. No home set in the end is [`CalDavError::NoHomeSet`].
+    pub async fn discover_account(&self) -> Result<AccountDiscovery, CalDavError> {
+        let first = self.account_props(self.principal.clone()).await?;
+        if first.home_set.is_some() {
+            let principal = match first.principal {
+                Some(href) => {
+                    self.resolve(&href)?;
+                    href
+                }
+                None => self.principal.to_string(),
+            };
+            return Ok(AccountDiscovery {
+                principal,
+                address: first.address,
+            });
+        }
+        let Some(href) = first.principal else {
+            return Err(CalDavError::NoHomeSet);
+        };
+        let named = self.resolve(&href)?;
+        if named == self.principal {
+            return Err(CalDavError::NoHomeSet);
+        }
+        let second = self.account_props(named).await?;
+        if second.home_set.is_none() {
+            return Err(CalDavError::NoHomeSet);
+        }
+        Ok(AccountDiscovery {
+            principal: href,
+            address: second.address.or(first.address),
+        })
+    }
+
+    /// One account `PROPFIND` (Depth 0) on `url`: the principal, home set
+    /// and first `mailto:` address its answer names.
+    async fn account_props(&self, url: Url) -> Result<AccountProps, CalDavError> {
+        let responses = self
+            .multistatus("PROPFIND", url, "0", xml::account_propfind())
+            .await?;
+        let mut props = AccountProps::default();
+        for response in &responses {
+            if props.principal.is_none() {
+                props.principal = response
+                    .prop(DAV, "current-user-principal")
+                    .and_then(Element::href)
+                    .filter(|href| !href.is_empty());
+            }
+            if props.home_set.is_none() {
+                props.home_set = response
+                    .prop(CALDAV, "calendar-home-set")
+                    .and_then(Element::href)
+                    .filter(|href| !href.is_empty());
+            }
+            if props.address.is_none() {
+                props.address =
+                    response
+                        .prop(CALDAV, "calendar-user-address-set")
+                        .and_then(|set| {
+                            set.children_named(DAV, "href")
+                                .find_map(|href| mailto_address(&href.text))
+                        });
+            }
+        }
+        Ok(props)
     }
 
     /// The calendars of the home set `home_set`: `PROPFIND` (Depth 1), the
@@ -469,6 +566,24 @@ impl<'a> CalDavClient<'a> {
             .await?;
         Self::written(response).map(|_| ())
     }
+}
+
+/// What one account `PROPFIND` answered.
+#[derive(Debug, Default)]
+struct AccountProps {
+    principal: Option<String>,
+    home_set: Option<String>,
+    address: Option<String>,
+}
+
+/// The address of a `mailto:` calendar user address (the scheme compared
+/// without case), or `None` for any other.
+fn mailto_address(href: &str) -> Option<String> {
+    let href = href.trim();
+    let (scheme, rest) = href.split_once(':')?;
+    let address = rest.trim();
+    (scheme.eq_ignore_ascii_case("mailto") && !address.is_empty())
+        .then(|| address.chars().filter(|c| !c.is_control()).collect())
 }
 
 /// `reference` resolved against `server`, refused unless it keeps the
