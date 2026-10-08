@@ -41,6 +41,7 @@ pub mod aegis_cortex_proto;
 pub mod aegis_remote_storage_proto;
 pub mod aegis_runtime_proto;
 pub mod agent_manifest_parser;
+pub mod calendar;
 pub mod cluster;
 pub mod container_step_runner;
 pub mod context_loader;

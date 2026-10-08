@@ -119,6 +119,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "quick-xml",
  "rand_core 0.6.4",
  "rcgen",
  "regex",

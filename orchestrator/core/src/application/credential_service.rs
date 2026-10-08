@@ -35,6 +35,10 @@ use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry, RemoteSe
 use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, SensitiveUrl};
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
+use crate::infrastructure::calendar::{
+    grants_calendar_scope, oauth_calendar_settings, CalDavAuth, CalDavProbe, CalendarCheckFailure,
+    CalendarProbe,
+};
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::mail::{
     grants_mail_scope, oauth_mailbox_settings, CheckFailureKind, MailAuth, MailboxCheckFailure,
@@ -339,6 +343,13 @@ pub enum CredentialError {
     /// is the setting refused; `reason` the sentence naming it.
     #[error("mailbox_host_not_allowed: {reason}")]
     MailboxHostNotAllowed { field: String, reason: String },
+    /// The connect-time check of a calendar account did not pass: its
+    /// principal refused the `PROPFIND`, or answered without a
+    /// `calendar-home-set` (AEGIS ADR-138 K5). `status` is the server's, if
+    /// it answered; `reply` its answer with the token redacted, control
+    /// characters removed and at most 512 characters. Nothing was stored.
+    #[error("calendar_unreachable: the calendar server answered{}: {reply}", status.map(|s| format!(" {s}")).unwrap_or_default())]
+    CalendarUnreachable { status: Option<u16>, reply: String },
     /// Mailbox settings no session could use.
     #[error("invalid mailbox settings: {0}")]
     InvalidMailboxSettings(String),
@@ -781,6 +792,13 @@ pub fn is_mailbox_binding(binding: &UserCredentialBinding) -> bool {
             CredentialType::OAuth2 => true,
             _ => false,
         }
+}
+
+/// Whether `binding` is a calendar account (AEGIS ADR-138 K4): an OAuth
+/// binding whose callback found the calendar scope granted and gave it
+/// calendar settings.
+pub fn is_calendar_binding(binding: &UserCredentialBinding) -> bool {
+    binding.metadata.calendar.is_some() && binding.credential_type == CredentialType::OAuth2
 }
 
 /// Answers the mailbox a mail tool's `mailbox` argument names (AEGIS
@@ -1358,6 +1376,9 @@ pub struct StandardCredentialManagementService {
     /// The live IMAP and SMTP check run before a mailbox is stored: an
     /// `imap` mailbox, or an OAuth binding granted Google's mail scope.
     mailbox_probe: Arc<dyn MailboxProbe>,
+    /// The CalDAV check run before an OAuth binding granted the calendar
+    /// scope is stored (AEGIS ADR-138 K5).
+    calendar_probe: Arc<dyn CalendarProbe>,
     /// Where an OAuth mailbox's address is read when its token response
     /// carries no id_token naming one ([`MAIL_USERINFO_URL`]).
     mail_userinfo_url: String,
@@ -1394,6 +1415,7 @@ impl StandardCredentialManagementService {
             oauth_providers,
             membership_repo: None,
             mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
+            calendar_probe: Arc::new(CalDavProbe::https()),
             mail_userinfo_url: MAIL_USERINFO_URL.to_string(),
             remote_grounding: std::sync::OnceLock::new(),
         }
@@ -1417,6 +1439,7 @@ impl StandardCredentialManagementService {
             oauth_providers,
             membership_repo: None,
             mailbox_probe: Arc::new(SessionMailboxProbe::tls()),
+            calendar_probe: Arc::new(CalDavProbe::https()),
             mail_userinfo_url: MAIL_USERINFO_URL.to_string(),
             remote_grounding: std::sync::OnceLock::new(),
         }
@@ -1425,6 +1448,12 @@ impl StandardCredentialManagementService {
     /// Replace the mailbox check (tests point it at loopback stand-ins).
     pub fn with_mailbox_probe(mut self, probe: Arc<dyn MailboxProbe>) -> Self {
         self.mailbox_probe = probe;
+        self
+    }
+
+    /// Replace the calendar check (tests point it at a loopback stand-in).
+    pub fn with_calendar_probe(mut self, probe: Arc<dyn CalendarProbe>) -> Self {
+        self.calendar_probe = probe;
         self
     }
 
@@ -1844,6 +1873,22 @@ fn mailbox_check_refusal(failure: MailboxCheckFailure, address: &str) -> Credent
     }
 }
 
+/// The error a calendar check's refusal answers: `calendar_unreachable` with
+/// the server's status and reply (AEGIS ADR-138 K5). The reply arrives with
+/// the token already redacted.
+fn calendar_check_refusal(failure: CalendarCheckFailure, address: &str) -> CredentialError {
+    tracing::info!(
+        address = %address,
+        status = ?failure.status,
+        reply = %failure.reply,
+        "Calendar check failed; no binding stored"
+    );
+    CredentialError::CalendarUnreachable {
+        status: failure.status,
+        reply: failure.reply,
+    }
+}
+
 /// The email address in an OpenID Connect ID token's claims. The token came
 /// straight from the token endpoint over TLS, which OpenID Connect Core
 /// §3.1.3.7 accepts in place of validating its signature; an address the
@@ -1934,6 +1979,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 oauth_scopes: None,
                 mailbox: None,
                 reach,
+                calendar: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -2016,6 +2062,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 oauth_scopes: None,
                 mailbox: Some(settings),
                 reach: None,
+                calendar: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -2218,6 +2265,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 oauth_scopes: None,
                 mailbox: None,
                 reach: None,
+                calendar: None,
             },
             grants: Vec::new(),
             created_at: now,
@@ -2379,6 +2427,39 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 binding.metadata.label = address.clone();
                 binding.metadata.external_account_id = Some(address);
                 binding.metadata.mailbox = Some(settings);
+            }
+
+            // AEGIS ADR-138 K4 and K5: a binding granted the calendar scope
+            // is a calendar account. Its address is the id_token's email,
+            // else the userinfo's; it takes the CalDAV settings of that
+            // scope and its address as label; and its principal must answer
+            // a PROPFIND with its token, naming a calendar home set, before
+            // anything is stored. A refusal stores nothing and leaves the
+            // binding pending.
+            if grants_calendar_scope(&granted) {
+                let address = match binding.metadata.external_account_id.clone() {
+                    Some(address) => address,
+                    None => match self.userinfo_email(&token_response.access_token).await {
+                        Ok(address) => address,
+                        Err(e) => {
+                            self.repo.delete_oauth_state(state).await?;
+                            return Err(CredentialError::InvalidResponse(format!(
+                                "the calendar account's address could not be read: the token response names no email and the provider's userinfo did not either ({e})"
+                            ))
+                            .into());
+                        }
+                    },
+                };
+                let settings = oauth_calendar_settings(&granted, &address)
+                    .expect("the calendar scope was granted");
+                let auth = CalDavAuth::Bearer(token_response.access_token.clone());
+                if let Err(failure) = self.calendar_probe.check(&settings, &auth).await {
+                    self.repo.delete_oauth_state(state).await?;
+                    return Err(calendar_check_refusal(failure, &address).into());
+                }
+                binding.metadata.label = address.clone();
+                binding.metadata.external_account_id = Some(address);
+                binding.metadata.calendar = Some(settings);
             }
         }
         if binding.credential_type == CredentialType::Mailbox {

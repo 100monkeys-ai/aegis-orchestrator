@@ -260,6 +260,7 @@ impl Vault {
                 oauth_scopes: None,
                 mailbox,
                 reach: None,
+                calendar: None,
             },
             grants: Vec::new(),
             created_at: now,

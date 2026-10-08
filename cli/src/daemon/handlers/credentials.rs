@@ -1249,6 +1249,18 @@ fn oauth_callback_answer(result: anyhow::Result<CredentialBindingId>) -> Respons
                 })),
             )
                 .into_response(),
+            // AEGIS ADR-138 K5: a connect granted the calendar scope whose
+            // principal refused the PROPFIND, or named no calendar home set,
+            // stored nothing.
+            Some(CredentialError::CalendarUnreachable { status, reply }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "calendar_unreachable",
+                    "status": status,
+                    "reply": reply,
+                })),
+            )
+                .into_response(),
             _ => {
                 let msg = e.to_string();
                 if msg.contains("invalid or expired") || msg.contains("not found") {
@@ -2967,5 +2979,34 @@ mod oauth_callback_answer_tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"], "mailbox_host_not_allowed");
         assert_eq!(body["field"], "imap_host");
+    }
+
+    /// AEGIS ADR-138 K5: a calendar connect whose principal refused the
+    /// PROPFIND answers 422 `calendar_unreachable` with the server's status
+    /// and reply, and nothing else: no token, no binding id.
+    #[tokio::test]
+    async fn a_refused_calendar_check_at_the_callback_answers_422_calendar_unreachable() {
+        let (status, body) = answered(CredentialError::CalendarUnreachable {
+            status: Some(401),
+            reply: "Unauthorized: Bearer [REDACTED] is not valid".to_string(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "calendar_unreachable",
+                "status": 401,
+                "reply": "Unauthorized: Bearer [REDACTED] is not valid",
+            })
+        );
+        let (status, body) = answered(CredentialError::CalendarUnreachable {
+            status: None,
+            reply: "the calendar server could not be reached".to_string(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "calendar_unreachable");
+        assert_eq!(body["status"], serde_json::Value::Null);
     }
 }

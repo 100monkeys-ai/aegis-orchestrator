@@ -2566,6 +2566,7 @@ mod tests {
                     oauth_scopes: None,
                     mailbox: None,
                     reach: None,
+                    calendar: None,
                 },
                 grants: Vec::new(),
                 created_at: chrono::Utc::now(),

@@ -26,6 +26,8 @@ const MIGRATION_035: &str =
     include_str!("../../../cli/migrations/035_credential_mailbox_settings.sql");
 const MIGRATION_042: &str =
     include_str!("../../../cli/migrations/042_credential_binding_reach.sql");
+const MIGRATION_047: &str =
+    include_str!("../../../cli/migrations/047_credential_calendar_settings.sql");
 
 async fn pool_in_fresh_schema() -> Option<(PgPool, String)> {
     let url = std::env::var("AEGIS_DATABASE_URL")
@@ -102,6 +104,7 @@ async fn migration_042_keeps_existing_rows_and_stores_a_bindings_reach() {
         "migration 042 changed an existing row"
     );
 
+    pool.execute(MIGRATION_047).await.expect("migration 047");
     let repo = PostgresCredentialBindingRepository::new(pool.clone());
     let existing = repo
         .find_by_id(&CredentialBindingId(existing_id))
@@ -141,6 +144,7 @@ async fn migration_042_keeps_existing_rows_and_stores_a_bindings_reach() {
             oauth_scopes: None,
             mailbox: None,
             reach: Some(reach.clone()),
+            calendar: None,
         },
         grants: Vec::new(),
         created_at: now,

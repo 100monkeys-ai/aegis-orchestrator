@@ -221,6 +221,22 @@ impl MailboxSettings {
     }
 }
 
+/// The non-secret settings of a calendar account reached over CalDAV (AEGIS
+/// ADR-138 K4), stored in `credential_bindings.calendar_settings` (migration
+/// 047). No secret is here: an OAuth binding's token lives in OpenBao at the
+/// binding's secret path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarSettings {
+    /// The CalDAV service root, an absolute URL ending in `/`; every other
+    /// URL of the account is resolved against it and must keep its origin.
+    pub server: String,
+    /// The account's principal as a URI reference resolved against
+    /// `server`: `<address>/user` for a Google calendar.
+    pub principal: String,
+    /// The account's email address.
+    pub address: String,
+}
+
 /// Ownership scope of a credential binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -292,6 +308,11 @@ pub struct CredentialMetadata {
     /// whose provider is not a remote server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<BindingReach>,
+    /// The CalDAV settings of a calendar account (AEGIS ADR-138 K4): set by
+    /// the OAuth callback on a binding granted the calendar scope; `None`
+    /// for every other binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<CalendarSettings>,
 }
 
 /// What kind of reach a remote server's grounding reports for a token:
@@ -529,6 +550,7 @@ mod tests {
                 oauth_scopes: None,
                 mailbox: None,
                 reach: None,
+                calendar: None,
             },
             grants: Vec::new(),
             created_at: Utc::now(),
