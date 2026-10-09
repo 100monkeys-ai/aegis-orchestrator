@@ -532,11 +532,24 @@ impl FuseFsal {
 impl FuseFsal {
     /// Get or create the root file handle for this volume.
     fn root_handle(&self) -> AegisFileHandle {
-        if let Some(wf_id) = self.context.workflow_execution_id {
-            AegisFileHandle::new_for_workflow(wf_id, self.context.volume_id, "/")
-        } else {
-            AegisFileHandle::new(self.context.execution_id, self.context.volume_id, "/")
-        }
+        self.handle_for("/")
+    }
+
+    /// The FSAL handle this mount allocates for `path`: it names the
+    /// execution the mount serves, as the handle `AegisFSAL::create_file`
+    /// returns does.
+    ///
+    /// The FSAL authorises a handle by the one execution context it carries.
+    /// An execution-named handle is authorised on a volume its execution owns
+    /// and, through the registered volume context, on a workflow's workspace
+    /// the execution was registered for; a workflow-named one only on a volume
+    /// the workflow owns. A workflow's Agent state mounts its own volume, owned
+    /// by its execution, with the workflow's id in the context, so a
+    /// workflow-named handle was refused and every LOOKUP of a file the mount
+    /// did not create answered ENOENT (`clerk-fs-write-not-visible-to-cmd-run`).
+    /// The workflow's id still travels with every call that takes one.
+    fn handle_for(&self, path: &str) -> AegisFileHandle {
+        AegisFileHandle::new(self.context.execution_id, self.context.volume_id, path)
     }
 
     /// Resolve an inode to its (AegisFileHandle, path) pair.
@@ -623,6 +636,170 @@ impl FuseFsal {
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
         self.runtime.block_on(f)
     }
+
+    /// LOOKUP of `name` under the inode `parent`: the child's inode is
+    /// allocated with the handle the FSAL returns, and its attributes read.
+    fn lookup_entry(&self, parent: u64, name: &str) -> Result<FileAttr, Errno> {
+        debug!(parent = parent, name = %name, "FUSE LOOKUP");
+
+        let (parent_handle, parent_path) = self.resolve_inode(parent).ok_or(Errno::ENOENT)?;
+
+        // Perform FSAL lookup to get a child handle
+        let child_handle = self
+            .block_on(self.backend.lookup(&parent_handle, &parent_path, name))
+            .map_err(|e| {
+                debug!(error = %e, "FUSE lookup failed");
+                Errno::ENOENT
+            })?;
+
+        let child_path = Self::child_path(&parent_path, name);
+        let child_ino = self.inode_table.allocate(child_handle, child_path.clone());
+
+        // Get attributes for the child
+        match self.block_on(self.backend.getattr(
+            self.context.execution_id,
+            self.context.volume_id,
+            &child_path,
+            self.context.container_uid,
+            self.context.container_gid,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(attrs) => {
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "lookup", "result" => "success").increment(1);
+                Ok(self.convert_attrs(&attrs, child_ino))
+            }
+            Err(e) => {
+                // Path exists (lookup succeeded) but stat failed — may be a race
+                // or the storage backend is lazily creating entries. Return ENOENT
+                // rather than EIO to allow retries.
+                debug!(error = %e, path = %child_path, "FUSE lookup getattr failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "lookup", "result" => "error").increment(1);
+                Err(Errno::ENOENT)
+            }
+        }
+    }
+
+    /// MKDIR of `name` under the inode `parent`: the directory's inode is
+    /// allocated with this mount's handle for its path.
+    fn make_directory(&self, parent: u64, name: &str) -> Result<FileAttr, Errno> {
+        debug!(parent = parent, name = %name, "FUSE MKDIR");
+
+        let (_parent_handle, parent_path) = self.resolve_inode(parent).ok_or(Errno::ENOENT)?;
+
+        let dir_path = Self::child_path(&parent_path, name);
+
+        match self.block_on(self.backend.create_directory(
+            self.context.execution_id,
+            self.context.volume_id,
+            &dir_path,
+            &self.context.policy,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(()) => {
+                let handle = self.handle_for(&dir_path);
+                let child_ino = self.inode_table.allocate(handle, dir_path.clone());
+
+                let attr = FileAttr {
+                    ino: INodeNo(child_ino),
+                    size: 4096,
+                    blocks: 8,
+                    atime: SystemTime::now(),
+                    mtime: SystemTime::now(),
+                    ctime: SystemTime::now(),
+                    crtime: SystemTime::now(),
+                    kind: FuseFileType::Directory,
+                    perm: 0o755,
+                    nlink: 2,
+                    uid: self.owner().uid,
+                    gid: self.owner().gid,
+                    rdev: 0,
+                    blksize: 4096,
+                    flags: 0,
+                };
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "mkdir", "result" => "success").increment(1);
+                Ok(attr)
+            }
+            Err(e) => {
+                error!(error = %e, "FUSE mkdir failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "mkdir", "result" => "error").increment(1);
+                Err(fsal_error_to_errno(&e))
+            }
+        }
+    }
+
+    /// READ of `size` bytes at `offset` from the inode `ino`, by the handle
+    /// the inode was allocated with.
+    fn read_data(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
+        debug!(ino = ino, offset = offset, size = size, "FUSE READ");
+
+        let (handle, path) = self.resolve_inode(ino).ok_or(Errno::ENOENT)?;
+
+        match self.block_on(self.backend.read(
+            &handle,
+            &path,
+            &self.context.policy,
+            offset,
+            size as usize,
+        )) {
+            Ok(data) => {
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "read", "result" => "success").increment(1);
+                metrics::counter!("aegis_fuse_bytes_read_total").increment(data.len() as u64);
+                Ok(data)
+            }
+            Err(e) => {
+                error!(error = %e, ino = ino, "FUSE read failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "read", "result" => "error").increment(1);
+                Err(fsal_error_to_errno(&e))
+            }
+        }
+    }
+
+    /// READDIR of the inode `ino`: ".", "..", then each entry with the inode
+    /// allocated for it.
+    fn list_directory(&self, ino: u64) -> Result<Vec<(u64, FuseFileType, String)>, Errno> {
+        debug!(ino = ino, "FUSE READDIR");
+
+        let (_handle, dir_path) = self.resolve_inode(ino).ok_or(Errno::ENOENT)?;
+
+        let entries = match self.block_on(self.backend.readdir(
+            self.context.execution_id,
+            self.context.volume_id,
+            &dir_path,
+            &self.context.policy,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(e) => e,
+            Err(e) => {
+                error!(error = %e, ino = ino, "FUSE readdir failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "readdir", "result" => "error").increment(1);
+                return Err(fsal_error_to_errno(&e));
+            }
+        };
+
+        metrics::counter!("aegis_fuse_operations_total", "operation" => "readdir", "result" => "success").increment(1);
+
+        // Build the full entry list: ".", "..", then directory contents
+        let mut full_entries: Vec<(u64, FuseFileType, String)> =
+            Vec::with_capacity(entries.len() + 2);
+        full_entries.push((ino, FuseFileType::Directory, ".".to_string()));
+        // Parent is self for root, otherwise we'd need parent tracking.
+        // Using ino for ".." is a safe approximation — the kernel handles it.
+        full_entries.push((ino, FuseFileType::Directory, "..".to_string()));
+
+        for entry in &entries {
+            let entry_path = Self::child_path(&dir_path, &entry.name);
+            let child_handle = self.handle_for(&entry_path);
+            let child_ino = self.inode_table.allocate(child_handle, entry_path);
+            let kind = match entry.file_type {
+                FileType::File => FuseFileType::RegularFile,
+                FileType::Directory => FuseFileType::Directory,
+                FileType::Symlink => FuseFileType::Symlink,
+            };
+            full_entries.push((child_ino, kind, entry.name.clone()));
+        }
+
+        Ok(full_entries)
+    }
 }
 
 impl Filesystem for FuseFsal {
@@ -640,53 +817,9 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let parent_u64: u64 = parent.into();
-        debug!(parent = parent_u64, name = %name_str, "FUSE LOOKUP");
-
-        let (parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        // Perform FSAL lookup to get a child handle
-        let child_handle =
-            match self.block_on(self.backend.lookup(&parent_handle, &parent_path, name_str)) {
-                Ok(h) => h,
-                Err(e) => {
-                    debug!(error = %e, "FUSE lookup failed");
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            };
-
-        let child_path = Self::child_path(&parent_path, name_str);
-        let child_ino = self.inode_table.allocate(child_handle, child_path.clone());
-
-        // Get attributes for the child
-        match self.block_on(self.backend.getattr(
-            self.context.execution_id,
-            self.context.volume_id,
-            &child_path,
-            self.context.container_uid,
-            self.context.container_gid,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(attrs) => {
-                let fuse_attr = self.convert_attrs(&attrs, child_ino);
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "lookup", "result" => "success").increment(1);
-                reply.entry(&FUSE_TTL, &fuse_attr, Generation(0));
-            }
-            Err(e) => {
-                // Path exists (lookup succeeded) but stat failed — may be a race
-                // or the storage backend is lazily creating entries. Return ENOENT
-                // rather than EIO to allow retries.
-                debug!(error = %e, path = %child_path, "FUSE lookup getattr failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "lookup", "result" => "error").increment(1);
-                reply.error(Errno::ENOENT);
-            }
+        match self.lookup_entry(parent.into(), name_str) {
+            Ok(fuse_attr) => reply.entry(&FUSE_TTL, &fuse_attr, Generation(0)),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -751,34 +884,9 @@ impl Filesystem for FuseFsal {
             return;
         }
         let _guard = OpGuard::enter(self);
-        let ino: u64 = ino.into();
-        debug!(ino = ino, offset = offset, size = size, "FUSE READ");
-
-        let (handle, path) = match self.resolve_inode(ino) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        match self.block_on(self.backend.read(
-            &handle,
-            &path,
-            &self.context.policy,
-            offset,
-            size as usize,
-        )) {
-            Ok(data) => {
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "read", "result" => "success").increment(1);
-                metrics::counter!("aegis_fuse_bytes_read_total").increment(data.len() as u64);
-                reply.data(&data);
-            }
-            Err(e) => {
-                error!(error = %e, ino = ino, "FUSE read failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "read", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-            }
+        match self.read_data(ino.into(), offset, size) {
+            Ok(data) => reply.data(&data),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -841,61 +949,13 @@ impl Filesystem for FuseFsal {
         }
         let _guard = OpGuard::enter(self);
         let ino: u64 = ino.into();
-        debug!(ino = ino, offset = offset, "FUSE READDIR");
-
-        let (_handle, dir_path) = match self.resolve_inode(ino) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
+        let full_entries = match self.list_directory(ino) {
+            Ok(entries) => entries,
+            Err(errno) => {
+                reply.error(errno);
                 return;
             }
         };
-
-        let entries = match self.block_on(self.backend.readdir(
-            self.context.execution_id,
-            self.context.volume_id,
-            &dir_path,
-            &self.context.policy,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(e) => e,
-            Err(e) => {
-                error!(error = %e, ino = ino, "FUSE readdir failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "readdir", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-                return;
-            }
-        };
-
-        metrics::counter!("aegis_fuse_operations_total", "operation" => "readdir", "result" => "success").increment(1);
-
-        // Build the full entry list: ".", "..", then directory contents
-        let mut full_entries: Vec<(u64, FuseFileType, String)> =
-            Vec::with_capacity(entries.len() + 2);
-        full_entries.push((ino, FuseFileType::Directory, ".".to_string()));
-        // Parent is self for root, otherwise we'd need parent tracking.
-        // Using ino for ".." is a safe approximation — the kernel handles it.
-        full_entries.push((ino, FuseFileType::Directory, "..".to_string()));
-
-        for entry in &entries {
-            let entry_path = Self::child_path(&dir_path, &entry.name);
-            let child_handle = if let Some(wf_id) = self.context.workflow_execution_id {
-                AegisFileHandle::new_for_workflow(wf_id, self.context.volume_id, &entry_path)
-            } else {
-                AegisFileHandle::new(
-                    self.context.execution_id,
-                    self.context.volume_id,
-                    &entry_path,
-                )
-            };
-            let child_ino = self.inode_table.allocate(child_handle, entry_path);
-            let kind = match entry.file_type {
-                FileType::File => FuseFileType::RegularFile,
-                FileType::Directory => FuseFileType::Directory,
-                FileType::Symlink => FuseFileType::Symlink,
-            };
-            full_entries.push((child_ino, kind, entry.name.clone()));
-        }
 
         // Skip entries before offset and add remaining
         for (i, (child_ino, kind, name)) in full_entries.iter().enumerate().skip(offset as usize) {
@@ -1036,63 +1096,9 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let parent_u64: u64 = parent.into();
-        debug!(parent = parent_u64, name = %name_str, "FUSE MKDIR");
-
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let dir_path = Self::child_path(&parent_path, name_str);
-
-        match self.block_on(self.backend.create_directory(
-            self.context.execution_id,
-            self.context.volume_id,
-            &dir_path,
-            &self.context.policy,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(()) => {
-                let handle = if let Some(wf_id) = self.context.workflow_execution_id {
-                    AegisFileHandle::new_for_workflow(wf_id, self.context.volume_id, &dir_path)
-                } else {
-                    AegisFileHandle::new(
-                        self.context.execution_id,
-                        self.context.volume_id,
-                        &dir_path,
-                    )
-                };
-                let child_ino = self.inode_table.allocate(handle, dir_path.clone());
-
-                let attr = FileAttr {
-                    ino: INodeNo(child_ino),
-                    size: 4096,
-                    blocks: 8,
-                    atime: SystemTime::now(),
-                    mtime: SystemTime::now(),
-                    ctime: SystemTime::now(),
-                    crtime: SystemTime::now(),
-                    kind: FuseFileType::Directory,
-                    perm: 0o755,
-                    nlink: 2,
-                    uid: self.owner().uid,
-                    gid: self.owner().gid,
-                    rdev: 0,
-                    blksize: 4096,
-                    flags: 0,
-                };
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "mkdir", "result" => "success").increment(1);
-                reply.entry(&FUSE_TTL, &attr, Generation(0));
-            }
-            Err(e) => {
-                error!(error = %e, "FUSE mkdir failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "mkdir", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-            }
+        match self.make_directory(parent.into(), name_str) {
+            Ok(attr) => reply.entry(&FUSE_TTL, &attr, Generation(0)),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1765,5 +1771,268 @@ mod tests {
 
         assert_eq!(registry.read().await.len(), 1);
         assert!(registry.read().await.contains_key(&key));
+    }
+}
+
+/// Regression (`clerk-fs-write-not-visible-to-cmd-run`, the triage run's
+/// RECORD clerk `c9995957` on 2026-10-09): a workflow's Agent state mounts its
+/// own volume, owned by its execution, with the workflow's id in the mount's
+/// context. The mount's handles named the workflow, which the FSAL authorises
+/// only against a volume the workflow owns, so every LOOKUP of a file the
+/// mount did not create was refused and answered ENOENT: the shell could not
+/// see what `fs.write` wrote to the same volume.
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use crate::domain::events::StorageEvent;
+    use crate::domain::fsal::{CreateFsalFileRequest, EventPublisher, VolumeContextLookup};
+    use crate::domain::repository::VolumeRepository;
+    use crate::domain::volume::{
+        FilerEndpoint, StorageClass, TenantId, Volume, VolumeBackend, VolumeOwnership, VolumeStatus,
+    };
+    use crate::infrastructure::repositories::InMemoryVolumeRepository;
+    use crate::infrastructure::storage::local_host_provider::LocalHostStorageProvider;
+
+    const THREAD_IDS: &[u8] = b"<a@example.com>\n<b@example.com>\n";
+
+    struct NoEvents;
+
+    #[async_trait::async_trait]
+    impl EventPublisher for NoEvents {
+        async fn publish_storage_event(&self, _: StorageEvent) {}
+    }
+
+    /// The orchestrator's volume registry as the FSAL reads it: the workflow
+    /// a volume was registered for.
+    struct Registered(Option<(VolumeId, uuid::Uuid)>);
+
+    impl VolumeContextLookup for Registered {
+        fn lookup_workflow_execution_id(&self, volume_id: VolumeId) -> Option<uuid::Uuid> {
+            self.0
+                .filter(|(registered, _)| *registered == volume_id)
+                .map(|(_, workflow)| workflow)
+        }
+    }
+
+    fn all_paths() -> FsalAccessPolicy {
+        FsalAccessPolicy {
+            read: vec!["/*".to_string()],
+            write: vec!["/*".to_string()],
+        }
+    }
+
+    /// One volume on a scratch directory, the FSAL over it, and a mount of it.
+    struct Fixture {
+        _root: tempfile::TempDir,
+        storage_root: std::path::PathBuf,
+        rt: tokio::runtime::Runtime,
+        fsal: Arc<AegisFSAL>,
+        volume: Volume,
+        mount: FuseFsal,
+    }
+
+    impl Fixture {
+        /// `ownership` owns the volume; the mount serves `execution_id` in
+        /// `workflow_execution_id`, as the runtime's mount request names them.
+        fn new(
+            ownership: VolumeOwnership,
+            registered: Option<uuid::Uuid>,
+            execution_id: ExecutionId,
+            workflow_execution_id: Option<uuid::Uuid>,
+        ) -> Self {
+            let root = tempfile::tempdir().expect("scratch root");
+            let storage_root = root.path().to_path_buf();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("runtime");
+
+            let volume_id = VolumeId::new();
+            let volume = Volume {
+                id: volume_id,
+                name: "workspace".to_string(),
+                tenant_id: TenantId::consumer(),
+                storage_class: StorageClass::persistent(),
+                backend: VolumeBackend::SeaweedFS {
+                    filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                    remote_path: format!("/volumes/{volume_id}"),
+                },
+                size_limit_bytes: 1_000_000,
+                status: VolumeStatus::Available,
+                ownership,
+                created_at: chrono::Utc::now(),
+                attached_at: None,
+                detached_at: None,
+                expires_at: None,
+                host_node_id: None,
+            };
+
+            let repo = Arc::new(InMemoryVolumeRepository::new());
+            rt.block_on(repo.save(&volume)).expect("volume saved");
+            let fsal = Arc::new(
+                AegisFSAL::new(
+                    Arc::new(LocalHostStorageProvider::new(&storage_root).expect("storage")),
+                    repo as Arc<dyn VolumeRepository>,
+                    Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                    Arc::new(NoEvents),
+                )
+                .with_volume_context_lookup(Arc::new(Registered(
+                    registered.map(|workflow| (volume_id, workflow)),
+                ))),
+            );
+
+            let mount = FuseFsal {
+                backend: Arc::new(DirectFsalBackend(fsal.clone())),
+                context: FuseVolumeContext {
+                    execution_id,
+                    volume_id,
+                    workflow_execution_id,
+                    container_uid: 0,
+                    container_gid: 0,
+                    policy: all_paths(),
+                },
+                inode_table: Arc::new(InodeTable::new()),
+                runtime: rt.handle().clone(),
+                last_completed_op_at: Arc::new(AtomicU64::new(0)),
+                in_flight_ops: Arc::new(AtomicU32::new(0)),
+                degraded: Arc::new(AtomicBool::new(false)),
+            };
+
+            Self {
+                _root: root,
+                storage_root,
+                rt,
+                fsal,
+                volume,
+                mount,
+            }
+        }
+
+        /// What the orchestrator's `fs.write` does for `execution_id`
+        /// (`builtin_fsal::invoke_fs_tool`): create, then write through an
+        /// execution handle, outside the mount.
+        fn fs_write(&self, execution_id: ExecutionId, path: &str, content: &[u8]) {
+            let policy = all_paths();
+            self.rt
+                .block_on(async {
+                    self.fsal
+                        .create_file(CreateFsalFileRequest {
+                            execution_id,
+                            volume_id: self.volume.id,
+                            path,
+                            policy: &policy,
+                            emit_event: false,
+                            caller_node_id: None,
+                            host_node_id: None,
+                            workflow_execution_id: None,
+                        })
+                        .await?;
+                    self.fsal
+                        .write(
+                            &AegisFileHandle::new(execution_id, self.volume.id, "/"),
+                            path,
+                            &policy,
+                            0,
+                            content,
+                        )
+                        .await
+                })
+                .expect("fs.write");
+        }
+
+        /// The shell's `cat <path>` through the mount: LOOKUP of each
+        /// component from the root, then READ.
+        fn cat(&self, path: &str) -> Result<Vec<u8>, String> {
+            let mut ino = ROOT_INODE;
+            for name in path.trim_start_matches('/').split('/') {
+                ino = self
+                    .mount
+                    .lookup_entry(ino, name)
+                    .map_err(|errno| format!("LOOKUP {name}: {errno:?}"))?
+                    .ino
+                    .into();
+            }
+            self.mount
+                .read_data(ino, 0, 4096)
+                .map_err(|errno| format!("READ {path}: {errno:?}"))
+        }
+    }
+
+    /// RECORD's case: its own volume, owned by its execution, mounted with the
+    /// workflow's id. What `fs.write` wrote is found and read through the
+    /// mount.
+    #[test]
+    fn a_workflow_steps_mount_reads_what_fs_write_wrote_to_the_steps_own_volume() {
+        let step = ExecutionId::new();
+        let workflow = uuid::Uuid::new_v4();
+        let fixture = Fixture::new(VolumeOwnership::execution(step), None, step, Some(workflow));
+
+        fixture.fs_write(step, "/thread-ids.txt", THREAD_IDS);
+
+        assert_eq!(
+            fixture.cat("/thread-ids.txt"),
+            Ok(THREAD_IDS.to_vec()),
+            "the step's mount did not find or read the file fs.write wrote to its own volume"
+        );
+    }
+
+    /// The workflow's workspace, owned by the workflow and registered for it,
+    /// still reads through a step's mount.
+    #[test]
+    fn a_workflow_steps_mount_reads_what_fs_write_wrote_to_the_workflows_workspace() {
+        let step = ExecutionId::new();
+        let workflow = uuid::Uuid::new_v4();
+        let fixture = Fixture::new(
+            VolumeOwnership::workflow(workflow),
+            Some(workflow),
+            step,
+            Some(workflow),
+        );
+
+        fixture.fs_write(step, "/thread-ids.txt", THREAD_IDS);
+
+        assert_eq!(
+            fixture.cat("/thread-ids.txt"),
+            Ok(THREAD_IDS.to_vec()),
+            "the step's mount did not find or read the file fs.write wrote to the workflow's workspace"
+        );
+    }
+
+    /// A directory the shell made through the mount (`mkdir out`): a file
+    /// written into it outside the mount is found under the directory's own
+    /// inode, which the kernel keeps from the MKDIR reply.
+    #[test]
+    fn a_file_written_into_a_directory_the_shell_made_reads_through_the_directorys_inode() {
+        let step = ExecutionId::new();
+        let workflow = uuid::Uuid::new_v4();
+        let fixture = Fixture::new(VolumeOwnership::execution(step), None, step, Some(workflow));
+
+        let out: u64 = fixture
+            .mount
+            .make_directory(ROOT_INODE, "out")
+            .expect("mkdir out")
+            .ino
+            .into();
+        let on_disk = fixture
+            .storage_root
+            .join(format!("volumes/{}/out/report.txt", fixture.volume.id));
+        std::fs::write(&on_disk, THREAD_IDS).expect("report written");
+
+        let report = fixture
+            .mount
+            .lookup_entry(out, "report.txt")
+            .map(|attr| u64::from(attr.ino));
+        assert!(
+            report.is_ok(),
+            "LOOKUP of report.txt under the directory the shell made was refused: {report:?}"
+        );
+        assert_eq!(
+            fixture
+                .mount
+                .read_data(report.unwrap(), 0, 4096)
+                .map_err(|errno| format!("{errno:?}")),
+            Ok(THREAD_IDS.to_vec())
+        );
     }
 }
