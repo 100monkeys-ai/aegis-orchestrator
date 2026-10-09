@@ -23,7 +23,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::domain::execution::{
-    check_contexts_shape, AttachmentRef, ExecutionId, CONTEXTS_INPUT_KEY, CONVERSATION_INPUT_KEY,
+    check_contexts_shape, contexts_chosen, read_profile_value, AttachmentRef, ExecutionId,
+    CONTEXTS_INPUT_KEY, CONVERSATION_INPUT_KEY, PROFILE_INPUT_KEY, PROFILE_WITH_CONTEXTS,
 };
 use crate::domain::git_repo::{parse_run_repositories, REPOSITORIES_INPUT_KEY, REPOSITORIES_SHAPE};
 use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
@@ -583,6 +584,10 @@ pub struct Schedule {
     pub attachments: Vec<AttachmentRef>,
     pub repositories: Option<Value>,
     pub contexts: Option<Value>,
+    /// The person's profile its runs start on (AEGIS ADR-140 D8), read as
+    /// the owner's at each fire; never beside a non-empty `contexts` (D10).
+    #[serde(default)]
+    pub profile_id: Option<Uuid>,
     pub timing: Timing,
     pub state: ScheduleState,
     /// Why the schedule paused itself, when it did (N7).
@@ -605,8 +610,19 @@ pub struct ScheduleDraft {
     pub attachments: Option<Value>,
     pub repositories: Option<Value>,
     pub contexts: Option<Value>,
+    /// One profile id (AEGIS ADR-140 D8), or none.
+    pub profile: Option<Value>,
     pub at: Option<String>,
     pub recurrence: Option<RecurrenceInput>,
+}
+
+/// A field that was sent, `null` included: `Some(Value::Null)` for `null`,
+/// `None` (by `default`) when it was not sent.
+fn sent<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// What a person sends to change a schedule: any settable field, and the
@@ -622,6 +638,10 @@ pub struct SchedulePatch {
     pub attachments: Option<Value>,
     pub repositories: Option<Value>,
     pub contexts: Option<Value>,
+    /// One profile id, or `null` to carry none (AEGIS ADR-140 D8); not sent,
+    /// unchanged.
+    #[serde(default, deserialize_with = "sent")]
+    pub profile: Option<Value>,
     pub at: Option<String>,
     pub recurrence: Option<RecurrenceInput>,
 }
@@ -660,6 +680,24 @@ fn check_contexts(raw: Option<Value>) -> Result<Option<Value>, String> {
     }
 }
 
+/// A schedule's `profile` (AEGIS ADR-140 D8): `null` or absent is none, a
+/// string holding a UUID is that profile; anything else is refused.
+fn check_profile(raw: Option<Value>) -> Result<Option<Uuid>, String> {
+    match raw {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => read_profile_value(&value).map(Some).map_err(str::to_string),
+    }
+}
+
+/// AEGIS ADR-140 D10: a schedule carries one profile or raw bindings,
+/// never a profile with bindings beside it.
+fn check_one_choice(profile_id: Option<Uuid>, contexts: Option<&Value>) -> Result<(), String> {
+    if profile_id.is_some() && contexts_chosen(contexts) {
+        return Err(PROFILE_WITH_CONTEXTS.to_string());
+    }
+    Ok(())
+}
+
 fn check_repositories(raw: Option<Value>) -> Result<Option<Value>, String> {
     match raw {
         None | Some(Value::Null) => Ok(None),
@@ -692,6 +730,8 @@ impl Schedule {
         let target = check_target(draft.target.as_deref().unwrap_or_default())?;
         let attachments = check_attachments(draft.attachments)?;
         let contexts = check_contexts(draft.contexts)?;
+        let profile_id = check_profile(draft.profile)?;
+        check_one_choice(profile_id, contexts.as_ref())?;
         let repositories = check_repositories(draft.repositories)?;
         let timing = parse_timing(draft.at.as_deref(), draft.recurrence, now)?;
         let id = ScheduleId::new();
@@ -708,6 +748,7 @@ impl Schedule {
             attachments,
             repositories,
             contexts,
+            profile_id,
             timing,
             state: ScheduleState::Active,
             paused_reason: None,
@@ -755,6 +796,10 @@ impl Schedule {
         if patch.contexts.is_some() {
             next.contexts = check_contexts(patch.contexts)?;
         }
+        if patch.profile.is_some() {
+            next.profile_id = check_profile(patch.profile)?;
+        }
+        check_one_choice(next.profile_id, next.contexts.as_ref())?;
         if patch.repositories.is_some() {
             next.repositories = check_repositories(patch.repositories)?;
         }
@@ -769,9 +814,9 @@ impl Schedule {
         Ok(())
     }
 
-    /// The input a run starts with: the schedule's input, its `contexts`
-    /// and `repositories` in the input's reserved keys, and no
-    /// conversation (N7). A non-object input is wrapped as
+    /// The input a run starts with: the schedule's input, its `contexts`,
+    /// `profile` (AEGIS ADR-140 D8) and `repositories` in the input's
+    /// reserved keys, and no conversation (N7). A non-object input is wrapped as
     /// `{"input": <value>}`, as the starting tools wrap it.
     pub fn start_input(&self) -> Value {
         let mut input = self.input.clone();
@@ -783,8 +828,15 @@ impl Schedule {
             map.remove(CONTEXTS_INPUT_KEY);
             map.remove(REPOSITORIES_INPUT_KEY);
             map.remove(CONVERSATION_INPUT_KEY);
+            map.remove(PROFILE_INPUT_KEY);
             if let Some(contexts) = &self.contexts {
                 map.insert(CONTEXTS_INPUT_KEY.to_string(), contexts.clone());
+            }
+            if let Some(profile) = &self.profile_id {
+                map.insert(
+                    PROFILE_INPUT_KEY.to_string(),
+                    Value::String(profile.to_string()),
+                );
             }
             if let Some(repositories) = &self.repositories {
                 map.insert(REPOSITORIES_INPUT_KEY.to_string(), repositories.clone());
@@ -1020,6 +1072,81 @@ mod tests {
         ] {
             assert_eq!(parse_at(&bad, now), Err(AT_REFUSAL.to_string()), "{bad}");
         }
+    }
+
+    /// AEGIS ADR-140 D8 and D10: a schedule saved with a profile starts its
+    /// runs on it (the reserved key, any `profile` of the input replaced);
+    /// one saved or changed to carry a profile beside chosen contexts is
+    /// refused with D10's sentence; `null` clears the profile.
+    #[test]
+    fn a_schedule_carries_one_profile_into_its_runs_and_never_beside_contexts() {
+        let owner = crate::domain::iam::UserIdentity {
+            sub: "owner".into(),
+            realm_slug: "zaru-consumer".into(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Pro,
+                tenant_id: TenantId::for_consumer_user("owner").unwrap(),
+            },
+        };
+        let tenant = TenantId::for_consumer_user("owner").unwrap();
+        let profile = "2b7e4c1a-9d3f-4e5a-8b6c-7d8e9f0a1b2c";
+        let binding = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+        let draft = |profile: Option<Value>, contexts: Option<Value>| ScheduleDraft {
+            name: Some("triage".into()),
+            target_kind: Some("agent".into()),
+            target: Some("mail-triage".into()),
+            input: Some(serde_json::json!({"q": 1, "profile": "someone-elses"})),
+            contexts,
+            profile,
+            recurrence: Some(RecurrenceInput {
+                cron: Some("0 15 * * 1-5".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut complaints = Vec::new();
+        let mut schedule = Schedule::create(
+            draft(Some(serde_json::json!(profile)), None),
+            &owner,
+            tenant.clone(),
+            Utc::now(),
+        )
+        .expect("creates");
+        if schedule.start_input() != serde_json::json!({ "q": 1, "profile": profile }) {
+            complaints.push(format!("the run's input was {}", schedule.start_input()));
+        }
+        let both = Schedule::create(
+            draft(
+                Some(serde_json::json!(profile)),
+                Some(serde_json::json!({ "imap": binding })),
+            ),
+            &owner,
+            tenant.clone(),
+            Utc::now(),
+        );
+        if both.as_ref().err().map(String::as_str) != Some(PROFILE_WITH_CONTEXTS) {
+            complaints.push(format!("a profile beside contexts was {both:?}"));
+        }
+        let changed: SchedulePatch =
+            serde_json::from_value(serde_json::json!({ "contexts": { "imap": binding } })).unwrap();
+        let refused = schedule.apply(changed, &owner, Utc::now());
+        if refused.as_ref().err().map(String::as_str) != Some(PROFILE_WITH_CONTEXTS) {
+            complaints.push(format!("contexts added beside the profile was {refused:?}"));
+        }
+        let switched: SchedulePatch = serde_json::from_value(
+            serde_json::json!({ "profile": null, "contexts": { "imap": binding } }),
+        )
+        .unwrap();
+        if let Err(e) = schedule.apply(switched, &owner, Utc::now()) {
+            complaints.push(format!("switching to raw bindings was refused: {e}"));
+        }
+        if schedule.profile_id.is_some() {
+            complaints.push("`profile: null` left the profile".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 
     #[test]

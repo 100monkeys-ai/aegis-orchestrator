@@ -66,6 +66,7 @@ pub fn schedule_view(view: &ScheduleView) -> Value {
         "input": s.input,
         "attachments": s.attachments,
         "contexts": s.contexts,
+        "profile_id": s.profile_id.map(|p| p.to_string()),
         "repositories": s.repositories,
         "at": at,
         "recurrence": recurrence,
@@ -133,6 +134,7 @@ impl ToolInvocationService {
     }
 
     /// Run one `aegis.schedule.*` tool for the call's person.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn invoke_aegis_schedule_tool(
         &self,
         tool_name: &str,
@@ -141,18 +143,28 @@ impl ToolInvocationService {
         caller_identity: Option<&UserIdentity>,
         scope: &TenantScope,
         call_contexts: Option<&ExecutionContexts>,
+        // The call's `_meta.profile` (AEGIS ADR-140 D12), which a `create`
+        // carrying neither `profile` nor `contexts` takes before the
+        // contexts it resolved into.
+        call_profile: Option<uuid::Uuid>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant = Self::enforce_tenant_arg(args, scope)?;
-        if tool_name == "aegis.schedule.create" && args.get("contexts").is_none() {
-            if let Some(contexts) = call_contexts {
-                // S7: a session whose execution has a record ignores the
-                // call's `_meta.contexts`.
-                let has_record = self
-                    .execution_service
-                    .get_execution_unscoped(execution_id)
-                    .await
-                    .is_ok();
-                if !has_record {
+        if tool_name == "aegis.schedule.create"
+            && args.get("contexts").is_none()
+            && args.get("profile").is_none()
+            && (call_contexts.is_some() || call_profile.is_some())
+        {
+            // S7: a session whose execution has a record ignores the
+            // call's `_meta.contexts`, and its `_meta.profile`.
+            let has_record = self
+                .execution_service
+                .get_execution_unscoped(execution_id)
+                .await
+                .is_ok();
+            if !has_record {
+                if let Some(profile) = call_profile {
+                    args["profile"] = json!(profile.to_string());
+                } else if let Some(contexts) = call_contexts {
                     args["contexts"] = contexts_value(contexts);
                 }
             }

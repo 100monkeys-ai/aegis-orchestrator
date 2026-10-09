@@ -142,6 +142,10 @@ pub struct StandardStartWorkflowExecutionUseCase {
     /// unset, a start that names repositories is refused.
     run_repositories:
         std::sync::OnceLock<Arc<dyn crate::application::git_repo_service::RunRepositories>>,
+    /// Where a start reads the profile its input names (AEGIS ADR-140 D6).
+    /// Set once at the composition root via `set_profiles()`; unset, a
+    /// start that names a profile is refused.
+    run_profiles: std::sync::OnceLock<Arc<dyn crate::application::profile_service::RunProfiles>>,
 }
 
 impl StandardStartWorkflowExecutionUseCase {
@@ -168,6 +172,7 @@ impl StandardStartWorkflowExecutionUseCase {
             rate_limit_enforcer: None,
             rate_limit_resolver: None,
             run_repositories: std::sync::OnceLock::new(),
+            run_profiles: std::sync::OnceLock::new(),
         }
     }
 
@@ -180,6 +185,66 @@ impl StandardStartWorkflowExecutionUseCase {
     ) {
         // OnceLock silently ignores a second set; the service is wired once at startup.
         let _ = self.run_repositories.set(repositories);
+    }
+
+    /// Read the profile a start's input names through `profiles` (AEGIS
+    /// ADR-140 D6). Wired once at startup, after the profile service exists.
+    pub fn set_profiles(
+        &self,
+        profiles: Arc<dyn crate::application::profile_service::RunProfiles>,
+    ) {
+        // OnceLock silently ignores a second set; the source is wired once at startup.
+        let _ = self.run_profiles.set(profiles);
+    }
+
+    /// AEGIS ADR-140 D6, D10: a workflow started on a profile carries it
+    /// alone, never beside chosen bindings; the profile is read as the
+    /// starting person's (another person's, or one deleted, refuses with
+    /// "The profile chosen for this run no longer exists.") and its active
+    /// bindings are written into `contexts` for the agent states to inherit.
+    async fn resolve_profile(
+        &self,
+        tenant_id: &TenantId,
+        identity: Option<&UserIdentity>,
+        input: &mut serde_json::Value,
+    ) -> Result<()> {
+        let refused = |sentence: &str| {
+            anyhow::anyhow!(
+                "{}",
+                crate::domain::execution::ExecutionError::Refused(sentence.to_string())
+            )
+        };
+        crate::domain::execution::check_profile_choice(input).map_err(refused)?;
+        let Some(profile) = input
+            .get(crate::domain::execution::PROFILE_INPUT_KEY)
+            .map(crate::domain::execution::read_profile_value)
+            .transpose()
+            .map_err(refused)?
+        else {
+            return Ok(());
+        };
+        let profiles = self
+            .run_profiles
+            .get()
+            .ok_or_else(|| refused(crate::domain::profile::UNAVAILABLE_REFUSAL))?;
+        let person = crate::application::execution::person_sub(identity);
+        let contexts = match profiles
+            .contexts_of(tenant_id, person.as_deref(), profile)
+            .await
+        {
+            Ok(contexts) => contexts,
+            Err(crate::application::profile_service::ProfileError::NotFound) => {
+                return Err(refused(crate::domain::execution::PROFILE_GONE))
+            }
+            Err(e) => return Err(anyhow::anyhow!("reading the profile a start names: {e}")),
+        };
+        if let serde_json::Value::Object(map) = input {
+            map.insert(
+                crate::domain::execution::CONTEXTS_INPUT_KEY.to_string(),
+                serde_json::Value::Object(contexts),
+            );
+        }
+        Ok(())
     }
 
     /// AEGIS ADR-136 G3 to G5: a workflow execution is its run. Before
@@ -412,19 +477,21 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         // The dispatch's binding choices (Zaru ADR-0055 D14) are the
         // platform's: the workflow's schema and its Temporal input never see
         // them; the persisted execution keeps them for its agent states.
-        // So are the run's repositories (AEGIS ADR-136 G3), and the
+        // So are the run's repositories (AEGIS ADR-136 G3), the
         // conversation it was started from (AEGIS ADR-126, Update of
-        // 2026-10-07 (2), clause 3).
+        // 2026-10-07 (2), clause 3) and its profile (AEGIS ADR-140 D6).
         let input_without_contexts = match &request.input {
             serde_json::Value::Object(map)
                 if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
                     || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
-                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY)
+                    || map.contains_key(crate::domain::execution::PROFILE_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
                 map.remove(crate::domain::execution::CONVERSATION_INPUT_KEY);
+                map.remove(crate::domain::execution::PROFILE_INPUT_KEY);
                 serde_json::Value::Object(map)
             }
             other => other.clone(),
@@ -458,6 +525,8 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         // Step 2: Create workflow execution aggregate
         let execution_id = ExecutionId(uuid::Uuid::new_v4());
         let mut persisted_input = request.input.clone();
+        self.resolve_profile(tenant_id, identity, &mut persisted_input)
+            .await?;
         let hold = self
             .prepare_repositories(tenant_id, identity, execution_id, &mut persisted_input)
             .await?;

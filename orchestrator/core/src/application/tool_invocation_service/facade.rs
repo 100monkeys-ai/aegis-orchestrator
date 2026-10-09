@@ -135,6 +135,7 @@ impl ToolInvocationService {
             edge_fleet_dispatcher: None,
             edge_fleet_cancel: None,
             tool_approval_service: None,
+            run_profiles: None,
             operator_escalations: None,
             execution_repository: None,
             goal_service: None,
@@ -169,6 +170,16 @@ impl ToolInvocationService {
         service: Arc<crate::application::tool_approval_service::ToolApprovalService>,
     ) -> Self {
         self.tool_approval_service = Some(service);
+        self
+    }
+
+    /// AEGIS ADR-140: read the profile a run or a conversation's call
+    /// carries, at its start's tools and at each call of a governed tool.
+    pub fn with_profiles(
+        mut self,
+        profiles: Arc<dyn crate::application::profile_service::RunProfiles>,
+    ) -> Self {
+        self.run_profiles = Some(profiles);
         self
     }
 
@@ -584,6 +595,12 @@ impl ToolInvocationService {
             Some(meta) => super::context_args::parse_conversation_id(meta)?,
             None => None,
         };
+        // 2b4. AEGIS ADR-140 D12, D10: the conversation's profile, one id,
+        // never beside chosen contexts; refused before anything runs.
+        let call_profile = match meta {
+            Some(meta) => super::context_args::parse_meta_profile(meta)?,
+            None => None,
+        };
 
         // 2c. AEGIS ADR-129 D19: a session attested under an operator
         // escalation runs a call only while that escalation is active,
@@ -597,6 +614,17 @@ impl ToolInvocationService {
 
         // 4. Tenant is already carried on the session — no DB lookup needed.
         let tenant_id = session.tenant_id.clone();
+
+        // 4b. AEGIS ADR-140 D6, D12: a conversation's call on a profile acts
+        // with the profile's active bindings, read as the session's person,
+        // as a run on it does with those written at its start.
+        let call_contexts = match call_profile {
+            Some(profile) => Some(
+                self.profile_contexts(&tenant_id, session.user_id.as_deref(), profile)
+                    .await?,
+            ),
+            None => call_contexts,
+        };
 
         // 5. Build caller identity from the session's user_id, if present.
         let seal_caller_identity: Option<crate::domain::iam::UserIdentity> = session
@@ -654,6 +682,7 @@ impl ToolInvocationService {
                 seal_caller_identity.as_ref(),
                 call_contexts.as_ref(),
                 call_conversation.as_deref(),
+                call_profile,
             )
             .await?;
 
@@ -864,6 +893,7 @@ impl ToolInvocationService {
             caller_identity.as_ref(),
             None,
             None,
+            None,
         )
         .await
     }
@@ -895,6 +925,9 @@ impl ToolInvocationService {
         // `_meta.conversation_id` (AEGIS ADR-126, Update of 2026-10-07 (2),
         // clause 2); `None` on every path but the invoke route's.
         call_conversation: Option<&str>,
+        // The profile the call names in its payload's `_meta.profile` (AEGIS
+        // ADR-140 D12); `None` on every path but the invoke route's.
+        call_profile: Option<uuid::Uuid>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         // Convenience binding for code paths that only need the authenticated
         // tenant — agent lookups, judge spawning, gateway forwarding, etc.
@@ -972,6 +1005,57 @@ impl ToolInvocationService {
             );
             return Err(SealSessionError::PolicyViolation(violation));
         }
+
+        // --- The run's profile (AEGIS ADR-140 D7) ---
+        // After the security context allowed the call and before the mail
+        // tools' mailbox admission and the gate: a governed tool the
+        // profile does not admit is refused, read from the profile as it
+        // stands now, and nothing is written for it.
+        let run_profile = self
+            .profile_of_call(execution_id, call_profile, caller_identity)
+            .await;
+        if let Some((profile, person)) = &run_profile {
+            if let Err(refusal) = self
+                .admit_by_profile(
+                    tenant_id,
+                    person.as_deref(),
+                    *profile,
+                    &tool_name,
+                    execution_id,
+                    call_contexts,
+                )
+                .await
+            {
+                self.event_bus
+                    .publish_mcp_event(MCPToolEvent::PolicyViolation {
+                        execution_id,
+                        agent_id: *agent_id,
+                        tool_name: tool_name.clone(),
+                        violation_type: crate::domain::events::ViolationType::ToolNotAllowed,
+                        details: refusal.clone(),
+                        blocked_at: Utc::now(),
+                    });
+                if let Err(e) = self
+                    .execution_service
+                    .store_policy_violation(execution_id, tool_name.clone())
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "Failed to record policy violation on iteration"
+                    );
+                }
+                self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    format!("Policy violation: {refusal}"),
+                );
+                return Err(SealSessionError::InvalidArguments(refusal));
+            }
+        }
+        let run_profile = run_profile.map(|(profile, _)| profile);
 
         // --- A gated mail tool's mailbox, admitted before the gate (AEGIS
         // ADR-125's Update of 2026-10-07 (3) clause 11) ---
@@ -1080,6 +1164,7 @@ impl ToolInvocationService {
                         arguments: &args,
                         security_context_name: &security_context.name,
                         conversation_id,
+                        profile_id: run_profile,
                         contract: self.tool_router.approval_contract(&tool_name),
                     })
                     .await;
@@ -1137,6 +1222,8 @@ impl ToolInvocationService {
                 started_at,
                 call_contexts,
                 started_conversation.as_deref(),
+                run_profile,
+                call_profile,
             )
             .await;
         if let (Some(approval_id), Some(approvals)) = (auto_allowed, &self.tool_approval_service) {
@@ -1195,6 +1282,10 @@ impl ToolInvocationService {
             // ADR-126, Update of 2026-10-07 (2), clause 3c: a stored call
             // run on its user's approval starts with no conversation.
             None,
+            // A stored call carries no `_meta`, and a starting tool is
+            // not gated: no profile is given.
+            None,
+            None,
         )
         .await
     }
@@ -1221,6 +1312,13 @@ impl ToolInvocationService {
         // Update of 2026-10-07 (2), clauses 3 and 3b); `None` for every other
         // tool, inside an execution with a record, and on an approved re-run.
         started_conversation: Option<&str>,
+        // The profile the call carries (the run's, else its `_meta.profile`),
+        // which a starting tool choosing nothing itself starts its run on
+        // (AEGIS ADR-140 D6).
+        run_profile: Option<uuid::Uuid>,
+        // The call's own `_meta.profile` (D12), which `aegis.schedule.create`
+        // takes as it takes `_meta.contexts`.
+        call_profile: Option<uuid::Uuid>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = &tenant_scope.authenticated_tenant;
 
@@ -1515,6 +1613,8 @@ impl ToolInvocationService {
                 tenant_scope,
                 started_conversation,
                 call_contexts,
+                run_profile,
+                call_profile,
             )
             .await;
         if let Some(result) = aegis_result {
@@ -1746,6 +1846,109 @@ impl ToolInvocationService {
         }
     }
 
+    /// The profile a call carries and its person (AEGIS ADR-140 D7): for an
+    /// execution with a record, the record's `profile` and initiating
+    /// person; for a session with no record, the call's `_meta.profile` and
+    /// the caller.
+    async fn profile_of_call(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+        call_profile: Option<uuid::Uuid>,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Option<(uuid::Uuid, Option<String>)> {
+        match self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+        {
+            Ok(execution) => execution
+                .input
+                .profile()
+                .map(|profile| (profile, execution.initiating_user_sub.clone())),
+            Err(_) => call_profile.map(|profile| {
+                (
+                    profile,
+                    crate::application::execution::person_sub(caller_identity),
+                )
+            }),
+        }
+    }
+
+    /// A conversation call's `contexts` from its profile (AEGIS ADR-140 D6,
+    /// D12): the profile's active bindings, read as `person`'s.
+    pub(super) async fn profile_contexts(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        profile: uuid::Uuid,
+    ) -> Result<crate::domain::execution::ExecutionContexts, SealSessionError> {
+        use crate::application::profile_service::ProfileError;
+        let profiles = self.run_profiles.as_ref().ok_or_else(|| {
+            SealSessionError::InvalidArguments(
+                crate::domain::profile::UNAVAILABLE_REFUSAL.to_string(),
+            )
+        })?;
+        match profiles.contexts_of(tenant_id, person, profile).await {
+            Ok(map) => Ok(crate::domain::execution::ExecutionContexts::from_value(
+                Some(&Value::Object(map)),
+            )),
+            Err(ProfileError::NotFound) => Err(SealSessionError::InvalidArguments(
+                crate::domain::execution::PROFILE_GONE.to_string(),
+            )),
+            Err(e) => Err(SealSessionError::InternalError(format!(
+                "reading the call's profile failed: {e}"
+            ))),
+        }
+    }
+
+    /// AEGIS ADR-140 D2, D7: whether the run's profile lets `tool_name`
+    /// through, read now; `Err` carries the refusal's sentence. A profile
+    /// that can no longer be read (deleted, or not the person's) refuses
+    /// every tool of `mail`, `calendar` and of each server the run chose
+    /// bindings for (the reading R2).
+    async fn admit_by_profile(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        profile: uuid::Uuid,
+        tool_name: &str,
+        execution_id: crate::domain::execution::ExecutionId,
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+    ) -> Result<(), String> {
+        use crate::application::profile_service::ProfileError;
+        let read = match self.run_profiles.as_ref() {
+            Some(profiles) => profiles.admission_of(tenant_id, person, profile).await,
+            None => Err(ProfileError::Refused(
+                crate::domain::profile::UNAVAILABLE_REFUSAL.to_string(),
+            )),
+        };
+        let unreadable = match read {
+            Ok(admission) if admission.admits(tool_name) => return Ok(()),
+            Ok(_) => return Err(crate::domain::execution::PROFILE_NOT_ADMITTED.to_string()),
+            Err(ProfileError::NotFound) => crate::domain::execution::PROFILE_GONE.to_string(),
+            Err(ProfileError::Refused(sentence)) => sentence,
+            Err(e) => format!("reading the run's profile failed: {e}"),
+        };
+        let family = tool_name.split('.').next().unwrap_or(tool_name);
+        let contexts = match self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+        {
+            Ok(execution) => execution.input.contexts(),
+            Err(_) => call_contexts.cloned().unwrap_or_default(),
+        };
+        let governed = tool_name.contains('.')
+            && (family == crate::application::profile_service::MAIL_FAMILY
+                || family == crate::application::profile_service::CALENDAR_FAMILY
+                || contexts.servers().any(|(server, _)| server == family));
+        if governed {
+            Err(unreadable)
+        } else {
+            Ok(())
+        }
+    }
+
     /// The conversation of a call (AEGIS ADR-126, Update of 2026-10-07 (2),
     /// clauses 2, 3, 3a, 3b and 3d). For an execution with a record, the
     /// gate takes the record's `conversation_id` (a UUID string only) and a
@@ -1796,12 +1999,17 @@ impl ToolInvocationService {
         // A conversation's choices from the call's payload (AEGIS ADR-132
         // S7), which `aegis.schedule.create` takes when it carries none.
         call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+        run_profile: Option<uuid::Uuid>,
+        call_profile: Option<uuid::Uuid>,
     ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
         // ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: a starting
         // tool's handler keeps, from its `args`, only the conversation
         // written here; whatever the call itself wrote there is removed.
         if STARTING_TOOLS.contains(&tool_name) {
             super::context_args::put_conversation(args, started_conversation);
+            // AEGIS ADR-140 D6: a start that chooses nothing itself starts
+            // its run on the profile the call carries.
+            super::context_args::give_profile(args, run_profile);
         }
         // AEGIS ADR-139 N11: the person's schedules.
         if super::schedules::SCHEDULE_TOOLS.contains(&tool_name) {
@@ -1813,6 +2021,7 @@ impl ToolInvocationService {
                     caller_identity,
                     tenant_scope,
                     call_contexts,
+                    call_profile,
                 )
                 .await,
             );

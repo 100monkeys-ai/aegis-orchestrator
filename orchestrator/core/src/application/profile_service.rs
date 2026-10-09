@@ -27,14 +27,21 @@
 //! `tool_capabilities` names in it that the security context admits, gated
 //! the same way, and one `<family>.*` entry, `gated: false`, when the
 //! security context admits some tool of it.
+//!
+//! **A run on a profile** (D6, D7, D9; the trait [`RunProfiles`]): at a
+//! start the profile is read as its owner's and its active bindings become
+//! the run's `contexts` (mailboxes under `imap`, calendar accounts under
+//! `caldav`, every other binding under its provider); at each call of a
+//! governed tool its allow-list is read again. Deleting a profile revokes
+//! its standing choices through [`ProfileStandingChoices`].
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::application::credential_service::{
@@ -99,6 +106,101 @@ impl ProfileBindingSource for Arc<dyn CredentialManagementService> {
     ) -> anyhow::Result<Vec<UserCredentialBinding>> {
         self.list_bindings(tenant_id, user_sub).await
     }
+}
+
+/// What a run's dispatch reads of its profile at a call (AEGIS ADR-140 D2,
+/// D7): the allow-list as it stands now, and the families it governs (those
+/// of the profile's active bindings).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileAdmission {
+    pub tools: ToolAllowList,
+    pub families: Vec<String>,
+}
+
+impl ProfileAdmission {
+    /// Whether the profile governs `tool_name`: its family (the name before
+    /// the first dot) is one of the profile's bindings' families (D2).
+    pub fn governs(&self, tool_name: &str) -> bool {
+        let family = tool_name.split('.').next().unwrap_or(tool_name);
+        tool_name.contains('.') && self.families.iter().any(|f| f == family)
+    }
+
+    /// Whether the profile lets `tool_name` through to the security
+    /// context's and the gate's own checks: a tool it does not govern
+    /// always, a governed one when its list admits it (D2, D7).
+    pub fn admits(&self, tool_name: &str) -> bool {
+        !self.governs(tool_name) || self.tools.admits(tool_name)
+    }
+}
+
+/// A run's profile, as a start and a call read it (AEGIS ADR-140 D6, D7).
+/// `ProfileError::NotFound` answers a profile that is not `person`'s in
+/// `tenant`, or that was deleted; the caller refuses with
+/// [`PROFILE_GONE`](crate::domain::execution::PROFILE_GONE).
+#[async_trait]
+pub trait RunProfiles: Send + Sync {
+    /// D6: the profile's active bindings as the run's per-server
+    /// `contexts` map, read at its start.
+    async fn contexts_of(
+        &self,
+        tenant: &TenantId,
+        person: Option<&str>,
+        id: Uuid,
+    ) -> Result<Map<String, Value>, ProfileError>;
+
+    /// D7: the profile's allow-list and governed families, read at a call.
+    async fn admission_of(
+        &self,
+        tenant: &TenantId,
+        person: Option<&str>,
+        id: Uuid,
+    ) -> Result<ProfileAdmission, ProfileError>;
+}
+
+/// Where deleting a profile revokes the standing choices made in it
+/// (AEGIS ADR-140 D9): the approval gate's service.
+#[async_trait]
+pub trait ProfileStandingChoices: Send + Sync {
+    async fn revoke_profile_choices(
+        &self,
+        tenant: &TenantId,
+        user_sub: &str,
+        profile_id: Uuid,
+    ) -> anyhow::Result<u64>;
+}
+
+#[async_trait]
+impl ProfileStandingChoices for crate::application::tool_approval_service::ToolApprovalService {
+    async fn revoke_profile_choices(
+        &self,
+        tenant: &TenantId,
+        user_sub: &str,
+        profile_id: Uuid,
+    ) -> anyhow::Result<u64> {
+        self.revoke_profile_policies(tenant, user_sub, profile_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// The `contexts` keys a binding is chosen under at a run's start (D6): a
+/// mailbox under `imap` and a calendar account under `caldav` (one OAuth
+/// binding with both settings under both), every other binding under its
+/// provider.
+pub fn context_keys(binding: &UserCredentialBinding) -> Vec<String> {
+    let mut keys = Vec::new();
+    if is_mailbox_binding(binding) {
+        keys.push(crate::application::tools::builtin_mail::MailActing::choice_key().to_string());
+    }
+    if is_calendar_binding(binding) {
+        keys.push(
+            crate::application::tools::builtin_calendar::CalendarActing::choice_key().to_string(),
+        );
+    }
+    if keys.is_empty() {
+        keys.push(binding.provider.as_str().to_string());
+    }
+    keys
 }
 
 /// What the profile pages are offered: the builtin tools, the node
@@ -254,6 +356,9 @@ pub struct ProfileService {
     security_contexts: Arc<dyn SecurityContextRepository>,
     catalogue: Arc<dyn ProfileToolCatalogue>,
     repositories: Option<Arc<dyn GitRepoBindingRepository>>,
+    /// Where a deleted profile's standing choices are revoked (D9); wired
+    /// once at startup, after the approval gate exists.
+    standing_choices: OnceLock<Arc<dyn ProfileStandingChoices>>,
 }
 
 impl ProfileService {
@@ -270,6 +375,32 @@ impl ProfileService {
             security_contexts,
             catalogue,
             repositories,
+            standing_choices: OnceLock::new(),
+        }
+    }
+
+    /// Revoke a deleted profile's standing choices through `choices`
+    /// (AEGIS ADR-140 D9). Wired once at startup.
+    pub fn set_standing_choices(&self, choices: Arc<dyn ProfileStandingChoices>) {
+        // OnceLock silently ignores a second set; wired once at startup.
+        let _ = self.standing_choices.set(choices);
+    }
+
+    /// The person's own profile, not deleted (D6); `NotFound` otherwise.
+    async fn of_person(
+        &self,
+        tenant: &TenantId,
+        person: Option<&str>,
+        id: Uuid,
+    ) -> Result<Profile, ProfileError> {
+        let person = person
+            .filter(|p| !p.is_empty())
+            .ok_or(ProfileError::NotFound)?;
+        match self.repo.find(&ProfileId(id)).await? {
+            Some(p) if p.user_sub == person && &p.tenant_id == tenant && p.deleted_at.is_none() => {
+                Ok(p)
+            }
+            _ => Err(ProfileError::NotFound),
         }
     }
 
@@ -647,6 +778,16 @@ impl ProfileService {
         id: &ProfileId,
     ) -> Result<(), ProfileError> {
         let profile = self.owned(owner, tenant, id).await?;
+        // D9: the profile's standing choices are revoked first, so a
+        // failure leaves the profile and its choices as they were.
+        if let Some(choices) = self.standing_choices.get() {
+            choices
+                .revoke_profile_choices(tenant, &owner.sub, profile.id.0)
+                .await
+                .map_err(|e| {
+                    ProfileError::Repository(format!("revoking the profile's choices failed: {e}"))
+                })?;
+        }
         if self.repo.delete(&profile.id, Utc::now()).await? {
             Ok(())
         } else {
@@ -713,6 +854,52 @@ impl ProfileService {
             }
         }
         Ok(answered)
+    }
+}
+
+#[async_trait]
+impl RunProfiles for ProfileService {
+    async fn contexts_of(
+        &self,
+        tenant: &TenantId,
+        person: Option<&str>,
+        id: Uuid,
+    ) -> Result<Map<String, Value>, ProfileError> {
+        let profile = self.of_person(tenant, person, id).await?;
+        let owned = self.owner_bindings(tenant, &profile.user_sub).await?;
+        let mut contexts: Map<String, Value> = Map::new();
+        for binding_id in &profile.bindings {
+            // D4: a removed binding stays in the profile and is not used.
+            let Some(binding) = owned
+                .iter()
+                .find(|b| &b.id == binding_id && b.status == CredentialStatus::Active)
+            else {
+                continue;
+            };
+            for key in context_keys(binding) {
+                let entry = contexts
+                    .entry(key)
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(ids) = entry {
+                    ids.push(Value::String(binding_id.0.to_string()));
+                }
+            }
+        }
+        Ok(contexts)
+    }
+
+    async fn admission_of(
+        &self,
+        tenant: &TenantId,
+        person: Option<&str>,
+        id: Uuid,
+    ) -> Result<ProfileAdmission, ProfileError> {
+        let profile = self.of_person(tenant, person, id).await?;
+        let owned = self.owner_bindings(tenant, &profile.user_sub).await?;
+        Ok(ProfileAdmission {
+            families: Self::active_families(&profile.bindings, &owned),
+            tools: profile.tools,
+        })
     }
 }
 

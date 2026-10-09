@@ -1349,3 +1349,450 @@ async fn a_scheduled_runs_gated_call_is_stored_with_its_schedule_and_its_name() 
          or an unscheduled one was given a schedule"
     );
 }
+
+/// AEGIS ADR-140 D6, D7, D9 at dispatch: a run carrying a profile, driven
+/// through `invoke_tool_internal` on a real `ToolInvocationService` with the
+/// real gate over the in-memory store and the built-in gating of the mail
+/// tools (`mail.send` and `mail.reply` require approval in code, keyed on
+/// `mailbox`). The profile's mailbox and allow-list are a test's to change.
+mod profiles {
+    use super::*;
+    use crate::application::profile_service::{ProfileAdmission, ProfileError, RunProfiles};
+    use crate::domain::execution::{PROFILE_GONE, PROFILE_NOT_ADMITTED};
+    use crate::domain::profile::{ToolAllowList, ToolPattern};
+    use crate::domain::tool_approval::ToolApprovalPolicy;
+
+    const MAILBOX: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+
+    /// `USER`'s one profile over one mailbox; its list and whether it still
+    /// exists are changed by a test.
+    struct Profiles {
+        id: uuid::Uuid,
+        tools: StdMutex<Vec<ToolPattern>>,
+        deleted: StdMutex<bool>,
+    }
+
+    impl Profiles {
+        fn live(&self, person: Option<&str>, id: uuid::Uuid) -> Result<(), ProfileError> {
+            if id == self.id && person == Some(USER) && !*self.deleted.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(ProfileError::NotFound)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RunProfiles for Profiles {
+        async fn contexts_of(
+            &self,
+            _: &TenantId,
+            person: Option<&str>,
+            id: uuid::Uuid,
+        ) -> Result<serde_json::Map<String, Value>, ProfileError> {
+            self.live(person, id)?;
+            Ok(json!({ "imap": [MAILBOX] }).as_object().unwrap().clone())
+        }
+        async fn admission_of(
+            &self,
+            _: &TenantId,
+            person: Option<&str>,
+            id: uuid::Uuid,
+        ) -> Result<ProfileAdmission, ProfileError> {
+            self.live(person, id)?;
+            Ok(ProfileAdmission {
+                tools: ToolAllowList(self.tools.lock().unwrap().clone()),
+                families: vec!["mail".to_string(), "imap".to_string()],
+            })
+        }
+    }
+
+    struct ProfileHarness {
+        service: ToolInvocationService,
+        approvals: Arc<ToolApprovalService>,
+        repo: Arc<InMemoryToolApprovalRepository>,
+        profiles: Arc<Profiles>,
+        started: Arc<StdMutex<Vec<Started>>>,
+        tenant: TenantId,
+        agent_id: AgentId,
+        target_agent: String,
+        /// `USER`'s run on the profile, its bindings written at its start.
+        on_profile: ExecutionId,
+        /// `USER`'s run on the same mailbox as a raw binding.
+        raw: ExecutionId,
+    }
+
+    fn context_of(patterns: &[&str]) -> SecurityContext {
+        let mut context = security_context(patterns[0]);
+        context.capabilities = patterns
+            .iter()
+            .map(|pattern| crate::domain::security_context::Capability {
+                tool_pattern: pattern.to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                max_response_size: None,
+                rate_limit: None,
+                max_concurrent: None,
+            })
+            .collect();
+        context
+    }
+
+    async fn profile_harness(tools: &[&str]) -> ProfileHarness {
+        let tenant = TenantId::for_consumer_user(USER).unwrap();
+        let agent = agent();
+        let agent_id = agent.id;
+        let profiles = Arc::new(Profiles {
+            id: uuid::Uuid::new_v4(),
+            tools: StdMutex::new(
+                tools
+                    .iter()
+                    .map(|t| ToolPattern::parse(t).unwrap())
+                    .collect(),
+            ),
+            deleted: StdMutex::new(false),
+        });
+        let run = |input: Value| {
+            let mut e = Execution::new_with_id(
+                ExecutionId::new(),
+                agent_id,
+                ExecutionInput {
+                    intent: None,
+                    input,
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                    attachments: Vec::new(),
+                },
+                5,
+                "gate-test-context".to_string(),
+            );
+            e.tenant_id = tenant.clone();
+            e.initiating_user_sub = Some(USER.to_string());
+            e
+        };
+        let on_profile = run(json!({
+            "profile": profiles.id.to_string(),
+            "contexts": { "imap": [MAILBOX] }
+        }));
+        let raw = run(json!({ "contexts": { "imap": [MAILBOX] } }));
+        let (on_profile_id, raw_id) = (on_profile.id, raw.id);
+        let started = Arc::new(StdMutex::new(Vec::new()));
+        let exec_service = Arc::new(RecordingExecutionService {
+            executions: [on_profile, raw].into_iter().map(|e| (e.id, e)).collect(),
+            started: started.clone(),
+        });
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        security_context_repo
+            .save(context_of(&["mail.*", "web.*", "aegis.*"]))
+            .await
+            .unwrap();
+        let storage_root =
+            std::env::temp_dir().join(format!("aegis-profile-tests-{}", uuid::Uuid::new_v4()));
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+            Arc::new(InMemoryVolumeRepository::new()),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoOpPublisher),
+        ));
+        let event_bus = Arc::new(EventBus::new(1024));
+        let repo = Arc::new(InMemoryToolApprovalRepository::new());
+        let approvals = Arc::new(ToolApprovalService::new(repo.clone(), event_bus.clone()));
+        let service = ToolInvocationService::new(
+            Arc::new(InMemorySealSessionRepository::new()),
+            security_context_repo,
+            Arc::new(SealMiddleware::new()),
+            Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers())),
+            fsal,
+            NfsVolumeRegistry::new(),
+            Arc::new(OneAgent(agent.clone())),
+            exec_service,
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+            event_bus,
+            None,
+        )
+        .with_tool_approvals(approvals.clone())
+        .with_profiles(profiles.clone());
+        ProfileHarness {
+            service,
+            approvals,
+            repo,
+            profiles,
+            started,
+            tenant,
+            agent_id,
+            target_agent: agent.id.to_string(),
+            on_profile: on_profile_id,
+            raw: raw_id,
+        }
+    }
+
+    fn send() -> Value {
+        json!({ "mailbox": MAILBOX, "to": ["ann@example.test"], "subject": "Hi", "body": "Hello." })
+    }
+
+    fn reply() -> Value {
+        json!({ "mailbox": MAILBOX, "thread_id": "t-1", "body": "Thanks." })
+    }
+
+    impl ProfileHarness {
+        async fn call(
+            &self,
+            execution: ExecutionId,
+            tool: &str,
+            args: Value,
+        ) -> Result<ToolInvocationResult, SealSessionError> {
+            self.service
+                .invoke_tool_internal(
+                    &self.agent_id,
+                    execution,
+                    self.tenant.clone(),
+                    1,
+                    vec![],
+                    tool.to_string(),
+                    args,
+                )
+                .await
+        }
+
+        fn narrow_to(&self, tools: &[&str]) {
+            *self.profiles.tools.lock().unwrap() = tools
+                .iter()
+                .map(|t| ToolPattern::parse(t).unwrap())
+                .collect();
+        }
+
+        async fn statuses(&self, execution: ExecutionId) -> Vec<ToolApprovalStatus> {
+            let mut rows = self.repo.list_requests(None).await.unwrap();
+            rows.retain(|r| r.execution_id == execution);
+            rows.reverse();
+            rows.into_iter().map(|r| r.status).collect()
+        }
+    }
+
+    /// What a call answered, as a sentence a complaint can carry.
+    fn outcome(result: &Result<ToolInvocationResult, SealSessionError>) -> String {
+        match result {
+            Ok(ToolInvocationResult::Direct(v)) => format!("{}", v["status"]),
+            Ok(other) => format!("{other:?}"),
+            Err(SealSessionError::InvalidArguments(sentence)) => sentence.clone(),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    /// D7: a profile without `mail.send` refuses it before the gate with
+    /// D7's sentence and writes no approval request; `mail.reply`, in its
+    /// list, reaches the gate and waits for the person.
+    #[tokio::test]
+    async fn a_tool_not_in_the_profile_is_refused_before_the_gate_and_one_in_it_reaches_the_gate() {
+        let h = profile_harness(&["mail.reply"]).await;
+        let mut complaints = Vec::new();
+        let sent = h.call(h.on_profile, "mail.send", send()).await;
+        if outcome(&sent) != PROFILE_NOT_ADMITTED {
+            complaints.push(format!("mail.send answered {}", outcome(&sent)));
+        }
+        if !h.statuses(h.on_profile).await.is_empty() {
+            complaints.push("a refused call wrote an approval request".to_string());
+        }
+        let replied = h.call(h.on_profile, "mail.reply", reply()).await;
+        if outcome(&replied) != "\"approval_pending\"" {
+            complaints.push(format!("mail.reply answered {}", outcome(&replied)));
+        }
+        let rows = h.repo.list_requests(None).await.unwrap();
+        if rows.iter().map(|r| r.profile_id).collect::<Vec<_>>() != vec![Some(h.profiles.id)] {
+            complaints.push("the gated call did not record its profile".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// D2, D7: the empty list admits what the security context admits; a
+    /// narrowing made while the run goes refuses its next call; a deleted
+    /// profile refuses the tools it governed; a tool the profile does not
+    /// govern (`web.search`) is never refused by it.
+    #[tokio::test]
+    async fn the_profile_is_read_at_each_call_and_governs_only_its_families() {
+        let h = profile_harness(&[]).await;
+        let mut complaints = Vec::new();
+        let first = h.call(h.on_profile, "mail.send", send()).await;
+        if outcome(&first) != "\"approval_pending\"" {
+            complaints.push(format!(
+                "the empty list: mail.send answered {}",
+                outcome(&first)
+            ));
+        }
+        h.narrow_to(&["mail.reply"]);
+        let next = h.call(h.on_profile, "mail.send", send()).await;
+        if outcome(&next) != PROFILE_NOT_ADMITTED {
+            complaints.push(format!(
+                "after the narrowing: mail.send answered {}",
+                outcome(&next)
+            ));
+        }
+        let search = h
+            .call(h.on_profile, "web.search", json!({ "query": "x" }))
+            .await;
+        if [PROFILE_NOT_ADMITTED, PROFILE_GONE].contains(&outcome(&search).as_str()) {
+            complaints.push(format!(
+                "web.search was refused by the profile: {}",
+                outcome(&search)
+            ));
+        }
+        *h.profiles.deleted.lock().unwrap() = true;
+        let gone = h.call(h.on_profile, "mail.reply", reply()).await;
+        if outcome(&gone) != PROFILE_GONE {
+            complaints.push(format!(
+                "a deleted profile: mail.reply answered {}",
+                outcome(&gone)
+            ));
+        }
+        let search = h
+            .call(h.on_profile, "web.search", json!({ "query": "x" }))
+            .await;
+        if [PROFILE_NOT_ADMITTED, PROFILE_GONE].contains(&outcome(&search).as_str()) {
+            complaints.push(format!(
+                "a deleted profile refused web.search: {}",
+                outcome(&search)
+            ));
+        }
+        let raw = h.call(h.raw, "mail.send", send()).await;
+        if outcome(&raw) != "\"approval_pending\"" {
+            complaints.push(format!(
+                "a raw-binding run: mail.send answered {}",
+                outcome(&raw)
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// D9: \"always\" on a call of the profile's run is stored with the
+    /// profile and lets only that profile's calls through; one on raw
+    /// bindings lets only raw-binding calls through; a choice stored before
+    /// profiles (no profile) keeps matching raw-binding calls.
+    #[tokio::test]
+    async fn a_standing_choice_matches_only_the_profile_or_the_raw_bindings_it_was_made_on() {
+        let h = profile_harness(&[]).await;
+        let mut complaints = Vec::new();
+        let id = pending_id(h.call(h.on_profile, "mail.send", send()).await);
+        h.approvals
+            .decide(
+                id,
+                &h.tenant,
+                USER,
+                ToolApprovalDecision::Always,
+                &h.service,
+            )
+            .await
+            .unwrap();
+        let _ = h.call(h.on_profile, "mail.send", send()).await;
+        let _ = h.call(h.raw, "mail.send", send()).await;
+        if h.statuses(h.on_profile).await
+            != vec![
+                ToolApprovalStatus::ApprovedAlways,
+                ToolApprovalStatus::AutoAllowed,
+            ]
+        {
+            complaints.push(format!(
+                "the profile's run after its choice: {:?}",
+                h.statuses(h.on_profile).await
+            ));
+        }
+        if h.statuses(h.raw).await != vec![ToolApprovalStatus::Pending] {
+            complaints.push(format!(
+                "the profile's choice reached a raw-binding call: {:?}",
+                h.statuses(h.raw).await
+            ));
+        }
+        h.repo
+            .insert_policy(&ToolApprovalPolicy {
+                id: crate::domain::tool_approval::ToolApprovalPolicyId::new(),
+                tenant_id: h.tenant.clone(),
+                user_sub: USER.to_string(),
+                tool_name: "mail.reply".to_string(),
+                binding_id: Some(MAILBOX.to_string()),
+                profile_id: None,
+                effect: ToolApprovalPolicyEffect::Allow,
+                created_at: chrono::Utc::now(),
+                created_by: USER.to_string(),
+                revoked_at: None,
+            })
+            .await
+            .unwrap();
+        let _ = h.call(h.raw, "mail.reply", reply()).await;
+        let _ = h.call(h.on_profile, "mail.reply", reply()).await;
+        let last = |rows: Vec<ToolApprovalStatus>| rows.last().copied();
+        if last(h.statuses(h.raw).await) != Some(ToolApprovalStatus::AutoAllowed) {
+            complaints
+                .push("a choice stored before profiles stopped matching a raw call".to_string());
+        }
+        if last(h.statuses(h.on_profile).await) != Some(ToolApprovalStatus::Pending) {
+            complaints.push("a raw-binding choice reached the profile's call".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// D6 (the reading R5): a starting tool called in a run on a profile,
+    /// choosing nothing itself, starts its run on the same profile; one that
+    /// names its own contexts starts on those.
+    #[tokio::test]
+    async fn a_start_inside_a_run_on_a_profile_starts_on_the_same_profile() {
+        let h = profile_harness(&[]).await;
+        let start = |extra: Value| {
+            let mut args = json!({ "agent_id": h.target_agent, "input": { "note": "x" } });
+            if let (Value::Object(args), Value::Object(extra)) = (&mut args, extra) {
+                args.extend(extra);
+            }
+            args
+        };
+        h.call(h.on_profile, "aegis.task.execute", start(json!({})))
+            .await
+            .expect("the start runs");
+        h.call(
+            h.on_profile,
+            "aegis.task.execute",
+            start(json!({ "contexts": { "imap": MAILBOX } })),
+        )
+        .await
+        .expect("the start runs");
+        let started: Vec<Value> = h
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, input)| input.get("profile").cloned().unwrap_or(Value::Null))
+            .collect();
+        assert_eq!(
+            started,
+            vec![json!(h.profiles.id.to_string()), Value::Null],
+            "the run's profile was not given to the start choosing nothing, or was given beside contexts"
+        );
+    }
+
+    /// D7: the tools a run or a conversation on a profile is offered are
+    /// only those the profile admits.
+    #[tokio::test]
+    async fn the_listing_omits_a_tool_the_profile_does_not_admit() {
+        let h = profile_harness(&["mail.reply"]).await;
+        let mut tools: Vec<_> = ToolRouter::new(ToolRouter::builtin_dispatchers())
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| ["mail.send", "mail.reply", "web.search"].contains(&t.name.as_str()))
+            .collect();
+        h.service
+            .narrow_by_profile(&h.tenant, Some(USER), h.profiles.id, &mut tools)
+            .await;
+        let mut names: Vec<_> = tools.into_iter().map(|t| t.name).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["mail.reply".to_string(), "web.search".to_string()],
+            "the listing offered a tool the profile does not admit, or dropped one it does not govern"
+        );
+    }
+}

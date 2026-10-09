@@ -218,3 +218,150 @@ async fn the_conversation_reaches_the_persisted_execution_and_never_the_schema_o
         "the persisted workflow execution lost the conversation its agent states inherit"
     );
 }
+
+/// One profile of `PERSON`'s over one mailbox, for the starts of AEGIS
+/// ADR-140 D6.
+struct OneProfile(uuid::Uuid);
+
+const PERSON: &str = "profile-person";
+
+#[async_trait]
+impl aegis_orchestrator_core::application::profile_service::RunProfiles for OneProfile {
+    async fn contexts_of(
+        &self,
+        _: &TenantId,
+        person: Option<&str>,
+        id: uuid::Uuid,
+    ) -> Result<
+        serde_json::Map<String, Value>,
+        aegis_orchestrator_core::application::profile_service::ProfileError,
+    > {
+        if id == self.0 && person == Some(PERSON) {
+            Ok(json!({ "imap": [BINDING] }).as_object().unwrap().clone())
+        } else {
+            Err(aegis_orchestrator_core::application::profile_service::ProfileError::NotFound)
+        }
+    }
+    async fn admission_of(
+        &self,
+        _: &TenantId,
+        _: Option<&str>,
+        _: uuid::Uuid,
+    ) -> Result<
+        aegis_orchestrator_core::application::profile_service::ProfileAdmission,
+        aegis_orchestrator_core::application::profile_service::ProfileError,
+    > {
+        Err(aegis_orchestrator_core::application::profile_service::ProfileError::NotFound)
+    }
+}
+
+/// AEGIS ADR-140 D6, D10: a workflow started on a profile reaches the
+/// persisted execution with the profile and the profile's bindings written
+/// into `contexts` for its agent states, and neither reaches the schema or
+/// Temporal; a profile not the person's, and one beside chosen contexts,
+/// refuse the start with their sentences.
+#[tokio::test]
+async fn a_workflow_on_a_profile_keeps_it_and_its_bindings_for_its_agent_states() {
+    use aegis_orchestrator_core::domain::execution::{PROFILE_GONE, PROFILE_WITH_CONTEXTS};
+    use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+    let workflow = closed_schema_workflow();
+    let tenant = TenantId::consumer();
+    let workflows = Arc::new(InMemoryWorkflowRepository::new());
+    workflows.save_for_tenant(&tenant, &workflow).await.unwrap();
+    let executions = Arc::new(InMemoryWorkflowExecutionRepository::new());
+    let engine = Arc::new(RecordingEngine::default());
+    let use_case = StandardStartWorkflowExecutionUseCase::new(
+        workflows,
+        executions.clone(),
+        Arc::new(tokio::sync::RwLock::new(Some(
+            engine.clone() as Arc<dyn WorkflowEnginePort>
+        ))),
+        Arc::new(EventBus::new(8)),
+    );
+    let profile = uuid::Uuid::new_v4();
+    use_case.set_profiles(Arc::new(OneProfile(profile)));
+    let person = |sub: &str| UserIdentity {
+        sub: sub.to_string(),
+        realm_slug: "zaru-consumer".to_string(),
+        email: None,
+        email_verified: false,
+        name: None,
+        identity_kind: IdentityKind::ConsumerUser {
+            zaru_tier: ZaruTier::Pro,
+            tenant_id: tenant.clone(),
+        },
+    };
+    let start = |input: Value, sub: &'static str| {
+        let use_case = &use_case;
+        let tenant = tenant.clone();
+        let name = workflow.metadata.name.clone();
+        let identity = person(sub);
+        async move {
+            use_case
+                .start_execution_for_tenant(
+                    &tenant,
+                    StartWorkflowExecutionRequest {
+                        workflow_id: name,
+                        input,
+                        blackboard: None,
+                        version: None,
+                        tenant_id: Some(tenant.clone()),
+                        security_context_name: None,
+                        intent: None,
+                    },
+                    Some(&identity),
+                )
+                .await
+        }
+    };
+    let mut complaints = Vec::new();
+    match start(
+        json!({ "topic": "units", "profile": profile.to_string() }),
+        PERSON,
+    )
+    .await
+    {
+        Ok(started) => {
+            let id = ExecutionId(uuid::Uuid::parse_str(&started.execution_id).unwrap());
+            let persisted = executions
+                .find_by_id_for_tenant(&tenant, id)
+                .await
+                .unwrap()
+                .expect("persisted");
+            if persisted.input.get("contexts") != Some(&json!({ "imap": [BINDING] }))
+                || persisted.input.get("profile") != Some(&json!(profile.to_string()))
+            {
+                complaints.push(format!("the persisted input was {}", persisted.input));
+            }
+            let temporal = engine.inputs.lock().unwrap().clone();
+            if temporal
+                .iter()
+                .any(|i| i.contains_key("profile") || i.contains_key("contexts"))
+            {
+                complaints.push(format!("Temporal's input carried them: {temporal:?}"));
+            }
+        }
+        Err(e) => complaints.push(format!("the person's own profile was refused: {e:#}")),
+    }
+    for (case, input, sub, sentence) in [
+        (
+            "another person's profile",
+            json!({ "topic": "x", "profile": profile.to_string() }),
+            "someone-else",
+            PROFILE_GONE,
+        ),
+        (
+            "a profile beside chosen contexts",
+            json!({ "topic": "x", "profile": profile.to_string(), "contexts": { "imap": BINDING } }),
+            PERSON,
+            PROFILE_WITH_CONTEXTS,
+        ),
+    ] {
+        match start(input, sub).await {
+            Ok(_) => complaints.push(format!("{case}: started")),
+            Err(e) if format!("{e:#}").contains(sentence) => {}
+            Err(e) => complaints.push(format!("{case}: answered {e:#}")),
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}

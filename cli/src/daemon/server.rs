@@ -2056,6 +2056,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ),
         )
     });
+    // A start reads the profile its input names, and writes its bindings
+    // into the run's contexts (AEGIS ADR-140 D6).
+    if let Some(profiles) = &profile_service {
+        execution_service.set_profiles(profiles.clone());
+        start_workflow_execution_use_case.set_profiles(profiles.clone());
+    }
 
     // Initialize user volume service (Gap 079); built before the tool
     // service so the mail tools save attachments to the same
@@ -2228,6 +2234,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tool_approval_service.clone().spawn_expiry_sweep(
         aegis_orchestrator_core::application::tool_approval_service::EXPIRY_SWEEP_INTERVAL,
     );
+    // Deleting a profile revokes the standing choices made in it (AEGIS
+    // ADR-140 D9); a call carrying a profile is admitted by it (D7).
+    if let Some(profiles) = &profile_service {
+        profiles.set_standing_choices(tool_approval_service.clone());
+        tool_invocation_service_builder =
+            tool_invocation_service_builder.with_profiles(profiles.clone());
+    }
     tool_invocation_service_builder =
         tool_invocation_service_builder.with_tool_approvals(tool_approval_service);
 

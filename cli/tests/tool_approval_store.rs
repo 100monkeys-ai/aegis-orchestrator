@@ -37,6 +37,13 @@
 //! The schedule a gated call's run belongs to (AEGIS ADR-139 N9): the gate
 //! stores it from the run's record (an agent run's own, else its workflow
 //! run's), and every read answers the schedule's name, a deleted one's too.
+//!
+//! The profile a standing choice was made in (AEGIS ADR-140 D9): migration
+//! 050 over a policy stored before it leaves that policy with no profile,
+//! still matching raw-binding calls, and run again changes nothing; a choice
+//! made in a profile matches only that profile's calls and one made on raw
+//! bindings only raw-binding calls, each replacing only its own key; deleting
+//! the profile revokes its choices and no other.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -326,6 +333,7 @@ async fn gate_declaring(
         arguments: args,
         security_context_name: "zaru-pro",
         conversation_id: None,
+        profile_id: None,
         contract,
     })
     .await
@@ -601,6 +609,7 @@ fn request_in(conversation: Option<&str>) -> ToolApprovalRequest {
         conversation_id: conversation.map(str::to_string),
         schedule_id: None,
         schedule_name: None,
+        profile_id: None,
         policy_id: None,
         status: ToolApprovalStatus::Pending,
         created_at: chrono::Utc::now(),
@@ -812,6 +821,7 @@ async fn a_gated_call_of_a_scheduled_run_stores_its_schedule_and_reads_its_name(
                 arguments: &json!({"account": "b-1"}),
                 security_context_name: "zaru-pro",
                 conversation_id: None,
+                profile_id: None,
                 contract: contract(),
             })
             .await
@@ -903,6 +913,7 @@ async fn gate_for(svc: &ToolApprovalService, sub: &str, args: &Value) -> GateOut
         arguments: args,
         security_context_name: "zaru-pro",
         conversation_id: None,
+        profile_id: None,
         contract: contract(),
     })
     .await
@@ -1170,6 +1181,7 @@ async fn a_refused_seal_stores_nothing() {
             arguments: &planted_args(),
             security_context_name: "zaru-pro",
             conversation_id: None,
+            profile_id: None,
             contract: contract(),
         })
         .await;
@@ -1194,6 +1206,7 @@ fn policy_on(binding: &str, effect: ToolApprovalPolicyEffect) -> ToolApprovalPol
         user_sub: USER.to_string(),
         tool_name: "outbound.send".to_string(),
         binding_id: Some(binding.to_string()),
+        profile_id: None,
         effect,
         created_at: chrono::Utc::now(),
         created_by: USER.to_string(),
@@ -1262,6 +1275,13 @@ async fn migration_046_run_again_changes_nothing_and_a_policy_stored_before_it_r
             after_first.2
         ));
     }
+    // The store reads the columns of every migration it ships (050 adds
+    // `profile_id`): the later migrations are applied before it reads, as
+    // the 045 test applies them.
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("apply the migrations after 046");
     match repo(&db.pool).list_active_policies(&tenant(), USER).await {
         Ok(policies) => {
             if policies.len() != 1 || policies[0].effect != ToolApprovalPolicyEffect::Allow {
@@ -1316,6 +1336,7 @@ async fn a_call_matching_a_deny_policy_is_stored_auto_denied() {
             arguments: &args,
             security_context_name: "zaru-pro",
             conversation_id: None,
+            profile_id: None,
             contract: contract(),
         })
         .await
@@ -1408,5 +1429,129 @@ async fn an_allow_and_a_deny_policy_never_coexist_for_one_key() {
         ));
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+    db.remove().await;
+}
+
+// ─── Profiles (AEGIS ADR-140 D9) ──────────────────────────────────────────
+
+/// Migration 050 over a database holding a policy stored before it: the
+/// policy has no profile and keeps matching raw-binding calls, the three
+/// tables gain `profile_id`, and the migration run again changes nothing.
+#[tokio::test]
+async fn migration_050_run_again_changes_nothing_and_a_policy_stored_before_it_matches_raw_calls() {
+    let Some(db) = TestDb::create_before(50).await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO tool_approval_policies \
+         (id, tenant_id, user_sub, tool_name, binding_id, created_at, created_by) \
+         VALUES ($1, $2, $3, 'outbound.send', 'b-1', now(), $3)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tenant().as_str())
+    .bind(USER)
+    .execute(&db.pool)
+    .await
+    .expect("store a policy before migration 050");
+    let snapshot = || async {
+        sqlx::query(
+            "SELECT (SELECT count(*) FROM tool_approval_policies) AS policies, \
+                    (SELECT count(*) FROM information_schema.columns \
+                      WHERE column_name = 'profile_id' AND table_name IN \
+                      ('tool_approval_policies', 'tool_approval_requests', 'schedules')) \
+                      AS profile_columns, \
+                    (SELECT count(*) FROM pg_indexes \
+                      WHERE tablename = 'tool_approval_policies') AS indexes",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map(|row| {
+            (
+                row.get::<i64, _>("policies"),
+                row.get::<i64, _>("profile_columns"),
+                row.get::<i64, _>("indexes"),
+            )
+        })
+        .unwrap()
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 50)
+        .expect("migration 050 ships");
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 050 over a policy stored before it");
+    let once = snapshot().await;
+    sqlx::raw_sql(&migration.sql)
+        .execute(&db.pool)
+        .await
+        .expect("migration 050 run again");
+    let twice = snapshot().await;
+    let found = repo(&db.pool)
+        .find_active_policy(&tenant(), USER, "outbound.send", Some("b-1"), None)
+        .await
+        .unwrap();
+    let mut wrong = Vec::new();
+    if once.1 != 3 {
+        wrong.push(format!("{} of three tables gained profile_id", once.1));
+    }
+    if once != twice {
+        wrong.push(format!("run again it changed {once:?} to {twice:?}"));
+    }
+    if found.map(|p| p.profile_id) != Some(None) {
+        wrong.push("the policy stored before it no longer matches a raw call".to_string());
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    db.remove().await;
+}
+
+/// A choice made in a profile and one made on raw bindings, on one tool and
+/// binding, coexist and each matches only its own calls; deleting the
+/// profile revokes its choice and leaves the raw one.
+#[tokio::test]
+async fn a_choice_made_in_a_profile_matches_only_that_profiles_calls() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let store = repo(&db.pool);
+    let profile = uuid::Uuid::new_v4();
+    let mut in_profile = policy_on("b-1", ToolApprovalPolicyEffect::Allow);
+    in_profile.profile_id = Some(profile);
+    let raw = policy_on("b-1", ToolApprovalPolicyEffect::Deny);
+    store.insert_policy(&in_profile).await.unwrap();
+    store.insert_policy(&raw).await.unwrap();
+    let find = |profile_id: Option<uuid::Uuid>| {
+        let store = &store;
+        async move {
+            store
+                .find_active_policy(&tenant(), USER, "outbound.send", Some("b-1"), profile_id)
+                .await
+                .unwrap()
+                .map(|p| p.id)
+        }
+    };
+    let mut wrong = Vec::new();
+    if find(Some(profile)).await != Some(in_profile.id) {
+        wrong.push("the profile's call did not find the profile's choice".to_string());
+    }
+    if find(None).await != Some(raw.id) {
+        wrong.push(
+            "a raw call did not find the raw choice, or the profile's replaced it".to_string(),
+        );
+    }
+    if find(Some(uuid::Uuid::new_v4())).await.is_some() {
+        wrong.push("another profile's call found a choice".to_string());
+    }
+    let revoked = store
+        .revoke_profile_policies(&tenant(), USER, profile, chrono::Utc::now())
+        .await
+        .unwrap();
+    if revoked != 1 || find(Some(profile)).await.is_some() || find(None).await != Some(raw.id) {
+        wrong.push(format!(
+            "deleting the profile revoked {revoked}, or left its choice, or took the raw one"
+        ));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     db.remove().await;
 }

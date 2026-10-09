@@ -6,13 +6,15 @@
 //! `tool_approval_requests` and `tool_approval_policies` tables of migration
 //! `036_tool_approvals.sql`, with the `conversation_id` column of
 //! `044_tool_approval_conversation.sql` and the policies' `effect` of
-//! `046_tool_approval_policy_effect.sql`; [`InMemoryToolApprovalRepository`] keeps them in
+//! `046_tool_approval_policy_effect.sql` and the `profile_id` columns of
+//! `050_profile_scoping.sql`; [`InMemoryToolApprovalRepository`] keeps them in
 //! process, for tests and for a daemon run without a database.
 //!
 //! ## One standing choice per key (ADR-126, Update of 2026-10-08 (2))
 //!
 //! [`ToolApprovalRepository::insert_policy`] revokes every unrevoked policy of
-//! the same tenant, user, tool and binding and inserts the new one in one
+//! the same tenant, user, tool, binding and profile (AEGIS ADR-140 D9) and
+//! inserts the new one in one
 //! transaction, holding a transaction-scoped advisory lock on that key, so
 //! two writers of one key run one after the other and an allow and a deny
 //! never coexist.
@@ -58,30 +60,35 @@ use crate::infrastructure::secrets_manager::SecretsManager;
 
 const REQUEST_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
      arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
-     decided_at, decided_by, result, error, conversation_id, schedule_id, sealed";
+     decided_at, decided_by, result, error, conversation_id, schedule_id, profile_id, sealed";
 
 /// What a read answers: the stored columns and the name of the schedule
 /// whose run made the call (AEGIS ADR-139 N9). A deleted schedule keeps its
 /// row, so its name is still answered.
 const READ_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
      arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
-     decided_at, decided_by, result, error, conversation_id, schedule_id, sealed, \
+     decided_at, decided_by, result, error, conversation_id, schedule_id, profile_id, sealed, \
      (SELECT s.name FROM schedules s WHERE s.id = tool_approval_requests.schedule_id) \
      AS schedule_name";
 
 const POLICY_COLUMNS: &str =
-    "id, tenant_id, user_sub, tool_name, binding_id, effect, created_at, created_by, revoked_at";
+    "id, tenant_id, user_sub, tool_name, binding_id, effect, created_at, created_by, revoked_at, \
+     profile_id";
 
-/// The text a policy's advisory lock is keyed on: its tenant, user, tool and
-/// binding (`=<binding>`, or `-` for none), separated by a byte none of them
-/// holds.
+/// The text a policy's advisory lock is keyed on: its tenant, user, tool,
+/// binding (`=<binding>`, or `-` for none) and profile (likewise), separated
+/// by a byte none of them holds.
 fn policy_lock_key(policy: &ToolApprovalPolicy) -> String {
     let binding = match &policy.binding_id {
         Some(binding) => format!("={binding}"),
         None => "-".to_string(),
     };
+    let profile = match &policy.profile_id {
+        Some(profile) => format!("={profile}"),
+        None => "-".to_string(),
+    };
     format!(
-        "tool_approval_policy\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{binding}",
+        "tool_approval_policy\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{binding}\u{1f}{profile}",
         policy.tenant_id.as_str(),
         policy.user_sub,
         policy.tool_name,
@@ -239,6 +246,7 @@ fn hydrate_request(row: &PgRow) -> Result<StoredRequest, RepositoryError> {
         conversation_id: column(row, "conversation_id")?,
         schedule_id: column(row, "schedule_id")?,
         schedule_name: column(row, "schedule_name")?,
+        profile_id: column(row, "profile_id")?,
         policy_id: policy_id.map(ToolApprovalPolicyId),
         status,
         created_at: column(row, "created_at")?,
@@ -264,6 +272,7 @@ fn hydrate_policy(row: &PgRow) -> Result<ToolApprovalPolicy, RepositoryError> {
         user_sub: column(row, "user_sub")?,
         tool_name: column(row, "tool_name")?,
         binding_id: column(row, "binding_id")?,
+        profile_id: column(row, "profile_id")?,
         effect,
         created_at: column(row, "created_at")?,
         created_by: column(row, "created_by")?,
@@ -287,7 +296,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         };
         sqlx::query(&format!(
             "INSERT INTO tool_approval_requests ({REQUEST_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, TRUE)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, TRUE)"
         ))
         .bind(request.id.0)
         .bind(request.tenant_id.as_str())
@@ -308,6 +317,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(&error)
         .bind(&request.conversation_id)
         .bind(request.schedule_id)
+        .bind(request.profile_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -456,18 +466,20 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         sqlx::query(
             "UPDATE tool_approval_policies SET revoked_at = $5 \
              WHERE tenant_id = $1 AND user_sub = $2 AND tool_name = $3 \
-             AND binding_id IS NOT DISTINCT FROM $4 AND revoked_at IS NULL",
+             AND binding_id IS NOT DISTINCT FROM $4 AND profile_id IS NOT DISTINCT FROM $6 \
+             AND revoked_at IS NULL",
         )
         .bind(policy.tenant_id.as_str())
         .bind(&policy.user_sub)
         .bind(&policy.tool_name)
         .bind(&policy.binding_id)
         .bind(policy.created_at)
+        .bind(policy.profile_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(&format!(
             "INSERT INTO tool_approval_policies ({POLICY_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
         ))
         .bind(policy.id.0)
         .bind(policy.tenant_id.as_str())
@@ -478,6 +490,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(policy.created_at)
         .bind(&policy.created_by)
         .bind(policy.revoked_at)
+        .bind(policy.profile_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -490,20 +503,43 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         user_sub: &str,
         tool_name: &str,
         binding_id: Option<&str>,
+        profile_id: Option<Uuid>,
     ) -> Result<Option<ToolApprovalPolicy>, RepositoryError> {
         let row = sqlx::query(&format!(
             "SELECT {POLICY_COLUMNS} FROM tool_approval_policies \
              WHERE tenant_id = $1 AND user_sub = $2 AND tool_name = $3 \
-             AND binding_id IS NOT DISTINCT FROM $4 AND revoked_at IS NULL \
+             AND binding_id IS NOT DISTINCT FROM $4 AND profile_id IS NOT DISTINCT FROM $5 \
+             AND revoked_at IS NULL \
              ORDER BY created_at DESC LIMIT 1"
         ))
         .bind(tenant_id.as_str())
         .bind(user_sub)
         .bind(tool_name)
         .bind(binding_id)
+        .bind(profile_id)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(hydrate_policy).transpose()
+    }
+
+    async fn revoke_profile_policies(
+        &self,
+        tenant_id: &TenantId,
+        user_sub: &str,
+        profile_id: Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<u64, RepositoryError> {
+        let done = sqlx::query(
+            "UPDATE tool_approval_policies SET revoked_at = $4 \
+             WHERE tenant_id = $1 AND user_sub = $2 AND profile_id = $3 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id.as_str())
+        .bind(user_sub)
+        .bind(profile_id)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
     }
 
     async fn schedule_of_run(
@@ -722,6 +758,7 @@ impl ToolApprovalRepository for InMemoryToolApprovalRepository {
                 && other.user_sub == policy.user_sub
                 && other.tool_name == policy.tool_name
                 && other.binding_id == policy.binding_id
+                && other.profile_id == policy.profile_id
                 && other.revoked_at.is_none()
             {
                 other.revoked_at = Some(policy.created_at);
@@ -737,6 +774,7 @@ impl ToolApprovalRepository for InMemoryToolApprovalRepository {
         user_sub: &str,
         tool_name: &str,
         binding_id: Option<&str>,
+        profile_id: Option<Uuid>,
     ) -> Result<Option<ToolApprovalPolicy>, RepositoryError> {
         Ok(self
             .policies
@@ -748,10 +786,32 @@ impl ToolApprovalRepository for InMemoryToolApprovalRepository {
                     && p.user_sub == user_sub
                     && p.tool_name == tool_name
                     && p.binding_id.as_deref() == binding_id
+                    && p.profile_id == profile_id
                     && p.revoked_at.is_none()
             })
             .max_by_key(|p| p.created_at)
             .cloned())
+    }
+
+    async fn revoke_profile_policies(
+        &self,
+        tenant_id: &TenantId,
+        user_sub: &str,
+        profile_id: Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<u64, RepositoryError> {
+        let mut revoked = 0;
+        for policy in self.policies.write().await.values_mut() {
+            if &policy.tenant_id == tenant_id
+                && policy.user_sub == user_sub
+                && policy.profile_id == Some(profile_id)
+                && policy.revoked_at.is_none()
+            {
+                policy.revoked_at = Some(revoked_at);
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
     }
 
     async fn schedule_of_run(

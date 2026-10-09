@@ -327,9 +327,44 @@ impl ToolInvocationService {
         let person = execution
             .as_ref()
             .and_then(|execution| execution.initiating_user_sub.as_deref());
+        // AEGIS ADR-140 D7: a run on a profile is offered only what the
+        // profile admits, so the model is not offered what it cannot call.
+        if let Some(profile) = execution
+            .as_ref()
+            .and_then(|execution| execution.input.profile())
+        {
+            self.narrow_by_profile(tenant_id, person, profile, &mut tools)
+                .await;
+        }
         self.name_chosen_mailboxes(tenant_id, person, &contexts_of_run, &mut tools)
             .await;
         Ok(tools)
+    }
+
+    /// AEGIS ADR-140 D7: keep only the tools `profile` admits, read now as
+    /// `person`'s; a profile that cannot be read admits no tool it would
+    /// govern, so every tool of `mail`, `calendar` or a remote server is
+    /// left out.
+    pub(super) async fn narrow_by_profile(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        profile: uuid::Uuid,
+        tools: &mut Vec<crate::infrastructure::tool_router::ToolMetadata>,
+    ) {
+        let admission = match self.run_profiles.as_ref() {
+            Some(profiles) => profiles.admission_of(tenant_id, person, profile).await.ok(),
+            None => None,
+        };
+        tools.retain(|tool| match &admission {
+            Some(admission) => admission.admits(&tool.name),
+            None => {
+                let family = tool.name.split('.').next().unwrap_or(&tool.name);
+                !(family == crate::application::profile_service::MAIL_FAMILY
+                    || family == crate::application::profile_service::CALENDAR_FAMILY
+                    || self.remote_tool_of(&tool.name).is_some())
+            }
+        });
     }
 
     /// AEGIS ADR-125's Update of 2026-10-07 (2) clause 2, ADR-132 Update
@@ -911,6 +946,12 @@ impl ToolInvocationService {
             None => None,
         }
         .unwrap_or_default();
+        // AEGIS ADR-140 D12, D10: the conversation's profile, one id, never
+        // beside chosen contexts; its active bindings are the choices.
+        let profile = match meta {
+            Some(meta) => super::context_args::parse_meta_profile(meta)?,
+            None => None,
+        };
         if self
             .execution_service
             .get_execution_unscoped(session.execution_id)
@@ -922,6 +963,28 @@ impl ToolInvocationService {
             )
             .answered(CallerAnswer::ExecutionBoundSession));
         }
+        let choices = match profile {
+            Some(profile) => {
+                let contexts = self
+                    .profile_contexts(&session.tenant_id, session.user_id.as_deref(), profile)
+                    .await?;
+                let mut map = serde_json::Map::new();
+                for (server, choice) in contexts.servers() {
+                    if let crate::domain::execution::ServerChoice::Bindings(ids) = choice {
+                        map.insert(
+                            server.to_string(),
+                            Value::Array(
+                                ids.iter()
+                                    .map(|id| Value::String(id.0.to_string()))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                }
+                map
+            }
+            None => choices,
+        };
         // Every server the node knows: the bindings the call chose, else none.
         let mut every_server = serde_json::Map::new();
         for server in &self.remote_tool_servers {
@@ -965,14 +1028,25 @@ impl ToolInvocationService {
             );
         }
         listed.extend(self.listed_per_binding(&session.tenant_id, &acting).await);
-        Ok(listed
+        let mut listed: Vec<_> = listed
             .into_iter()
             .filter(|tool| {
                 self.remote_tool_of(&tool.name)
                     .is_some_and(|(server, _)| chosen.contains(&server))
                     && session.security_context.permits_tool_name(&tool.name)
             })
-            .collect())
+            .collect();
+        // AEGIS ADR-140 D7: and only those the profile admits.
+        if let Some(profile) = profile {
+            self.narrow_by_profile(
+                &session.tenant_id,
+                session.user_id.as_deref(),
+                profile,
+                &mut listed,
+            )
+            .await;
+        }
+        Ok(listed)
     }
 
     /// The workflow whose run `execution_id` is a state of, if any.

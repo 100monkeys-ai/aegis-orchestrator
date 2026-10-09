@@ -3,7 +3,8 @@
 //! # Schedule repositories (AEGIS ADR-139 N1, N6, N7)
 //!
 //! [`PostgresScheduleRepository`] stores schedules and their fires in the
-//! `schedules` and `schedule_fires` tables of migration `048_schedules.sql`,
+//! `schedules` and `schedule_fires` tables of migration `048_schedules.sql`
+//! (with the `profile_id` column of `050_profile_scoping.sql`),
 //! and records a started run's schedule by the `schedule_id` column that
 //! migration adds to `executions` and `workflow_executions` (as a goal's id
 //! is recorded). [`InMemoryScheduleRepository`] keeps them in process, for
@@ -29,7 +30,7 @@ use crate::domain::tenant::TenantId;
 const SCHEDULE_COLUMNS: &str = "id, tenant_id, owner_sub, owner_realm, owner_kind, \
      owner_zaru_tier, name, target_kind, target, target_version, intent, input, attachments, \
      repositories, contexts, run_at, cron, timezone, jitter_seconds, state, paused_reason, \
-     temporal_schedule_id, created_at, updated_at, deleted_at";
+     temporal_schedule_id, created_at, updated_at, deleted_at, profile_id";
 
 const FIRE_COLUMNS: &str =
     "id, schedule_id, scheduled_time, fired_at, outcome, execution_id, detail";
@@ -98,6 +99,7 @@ fn hydrate_schedule(row: &PgRow) -> Result<Schedule, RepositoryError> {
             .map_err(|e| RepositoryError::Serialization(format!("attachments: {e}")))?,
         repositories: column(row, "repositories")?,
         contexts: column(row, "contexts")?,
+        profile_id: column(row, "profile_id")?,
         timing,
         state: ScheduleState::parse(&state).ok_or_else(|| unknown("state", &state))?,
         paused_reason: column(row, "paused_reason")?,
@@ -152,7 +154,7 @@ impl ScheduleRepository for PostgresScheduleRepository {
         let (run_at, cron, timezone, jitter) = timing_columns(&s.timing);
         sqlx::query(&format!(
             "INSERT INTO schedules ({SCHEDULE_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
-             $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)"
+             $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)"
         ))
         .bind(s.id.0)
         .bind(s.tenant_id.as_str())
@@ -179,6 +181,7 @@ impl ScheduleRepository for PostgresScheduleRepository {
         .bind(s.created_at)
         .bind(s.updated_at)
         .bind(s.deleted_at)
+        .bind(s.profile_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -191,7 +194,8 @@ impl ScheduleRepository for PostgresScheduleRepository {
              owner_zaru_tier = $5, name = $6, target_kind = $7, target = $8, target_version = $9, \
              intent = $10, input = $11, attachments = $12, repositories = $13, contexts = $14, \
              run_at = $15, cron = $16, timezone = $17, jitter_seconds = $18, state = $19, \
-             paused_reason = $20, updated_at = $21, deleted_at = $22 WHERE id = $1",
+             paused_reason = $20, updated_at = $21, deleted_at = $22, profile_id = $23 \
+             WHERE id = $1",
         )
         .bind(s.id.0)
         .bind(&s.owner.sub)
@@ -215,6 +219,7 @@ impl ScheduleRepository for PostgresScheduleRepository {
         .bind(&s.paused_reason)
         .bind(s.updated_at)
         .bind(s.deleted_at)
+        .bind(s.profile_id)
         .execute(&self.pool)
         .await?;
         if done.rows_affected() == 0 {

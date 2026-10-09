@@ -512,6 +512,10 @@ pub struct StandardExecutionService {
     /// time only.
     context_bindings:
         std::sync::OnceLock<Arc<dyn crate::application::credential_service::ToolCredentialSource>>,
+    /// Where a start reads the profile its input names (AEGIS ADR-140 D6).
+    /// Set once at the composition root via `set_profiles()`; unset, a
+    /// start that names a profile is refused.
+    run_profiles: std::sync::OnceLock<Arc<dyn crate::application::profile_service::RunProfiles>>,
     /// Where a run's repositories are prepared, mounted and released (AEGIS
     /// ADR-136 G3 to G5). Set once at the composition root via
     /// `set_repositories()`; unset, a start that names repositories is
@@ -858,6 +862,7 @@ impl StandardExecutionService {
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             child_executor: std::sync::OnceLock::new(),
             context_bindings: std::sync::OnceLock::new(),
+            run_profiles: std::sync::OnceLock::new(),
             run_repositories: std::sync::OnceLock::new(),
             tool_router: None,
             cortex_client: None,
@@ -1005,6 +1010,16 @@ impl StandardExecutionService {
     ) {
         // OnceLock silently ignores a second set; the source is wired once at startup.
         let _ = self.context_bindings.set(source);
+    }
+
+    /// Read the profile a start's input names through `profiles` (AEGIS
+    /// ADR-140 D6). Wired once at startup, after the profile service exists.
+    pub fn set_profiles(
+        &self,
+        profiles: Arc<dyn crate::application::profile_service::RunProfiles>,
+    ) {
+        // OnceLock silently ignores a second set; the source is wired once at startup.
+        let _ = self.run_profiles.set(profiles);
     }
 
     /// Prepare, mount and release a run's repositories through `repositories`
@@ -4596,6 +4611,184 @@ mod tests {
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 
+    /// One profile of `PERSON`'s, for the starts of AEGIS ADR-140 D6.
+    struct OneProfile {
+        id: uuid::Uuid,
+        contexts: serde_json::Map<String, serde_json::Value>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::application::profile_service::RunProfiles for OneProfile {
+        async fn contexts_of(
+            &self,
+            _: &CoreTenantId,
+            person: Option<&str>,
+            id: uuid::Uuid,
+        ) -> std::result::Result<
+            serde_json::Map<String, serde_json::Value>,
+            crate::application::profile_service::ProfileError,
+        > {
+            if id == self.id && person == Some(PERSON) {
+                Ok(self.contexts.clone())
+            } else {
+                Err(crate::application::profile_service::ProfileError::NotFound)
+            }
+        }
+        async fn admission_of(
+            &self,
+            _: &CoreTenantId,
+            _: Option<&str>,
+            _: uuid::Uuid,
+        ) -> std::result::Result<
+            crate::application::profile_service::ProfileAdmission,
+            crate::application::profile_service::ProfileError,
+        > {
+            Err(crate::application::profile_service::ProfileError::NotFound)
+        }
+    }
+
+    /// AEGIS ADR-140 D6, D10: a start on a profile is read as the person's
+    /// and its two mailboxes are written into `contexts` as the per-server
+    /// map, the profile kept from the input schema and the prompt; another
+    /// person's profile, an unknown one, and a profile beside chosen
+    /// contexts each refuse the start with their sentence; a child inherits
+    /// the profile and the bindings written at its parent's start.
+    #[tokio::test]
+    async fn a_start_on_a_profile_takes_its_bindings_and_a_child_inherits_it() {
+        let tenant_id = CoreTenantId::consumer();
+        let mut agent = make_agent("schema-closed-profile", None, None);
+        agent.manifest.spec.input_schema = Some(serde_json::json!({
+            "type": "object",
+            "required": ["topic"],
+            "properties": {
+                "topic": { "type": "string" },
+                "tenant_id": { "type": "string" }
+            },
+            "additionalProperties": false
+        }));
+        let profile = uuid::Uuid::new_v4();
+        let (mailbox_a, mailbox_b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let contexts =
+            serde_json::json!({ "imap": [mailbox_a.to_string(), mailbox_b.to_string()] });
+        let (service, _runtime, _repo, _bus) = refusal_service(&tenant_id, &[&agent], &[]).await;
+        service.set_profiles(Arc::new(OneProfile {
+            id: profile,
+            contexts: contexts.as_object().unwrap().clone(),
+        }));
+        let start = |input: serde_json::Value, identity: UserIdentity| {
+            let service = &service;
+            let agent_id = agent.id;
+            async move {
+                service
+                    .start_execution(
+                        agent_id,
+                        input_with(input),
+                        "test-ctx".to_string(),
+                        Some(&identity),
+                    )
+                    .await
+            }
+        };
+        let mut complaints = Vec::new();
+        let id = match start(
+            serde_json::json!({
+                "topic": "units",
+                "tenant_id": tenant_id.as_str(),
+                "profile": profile.to_string()
+            }),
+            the_person(&tenant_id),
+        )
+        .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                complaints.push(format!("the person's own profile was refused: {e}"));
+                None
+            }
+        };
+        if let Some(id) = id {
+            let execution = service.get_execution_unscoped(id).await.unwrap();
+            if execution.input.input.get("contexts") != Some(&contexts) {
+                complaints.push(format!(
+                    "the profile's bindings were not written: {}",
+                    execution.input.input
+                ));
+            }
+            if execution.input.profile() != Some(profile) {
+                complaints.push("the run lost its profile".to_string());
+            }
+            let prompt = StandardExecutionService::render_task(&execution.input, &agent)
+                .unwrap()
+                .unwrap_or_default();
+            if prompt.contains(&profile.to_string()) {
+                complaints.push(format!("the prompt carries the profile: {prompt}"));
+            }
+            let child = service
+                .start_child_execution(
+                    agent.id,
+                    input_with(serde_json::json!({ "topic": "child" })),
+                    id,
+                )
+                .await;
+            match child {
+                Ok(child) => {
+                    let child = service.get_execution_unscoped(child).await.unwrap();
+                    if child.input.profile() != Some(profile)
+                        || child.input.input.get("contexts") != Some(&contexts)
+                    {
+                        complaints.push(format!(
+                            "the child did not inherit the profile: {}",
+                            child.input.input
+                        ));
+                    }
+                }
+                Err(e) => complaints.push(format!("the child was refused: {e}")),
+            }
+        }
+        let mut someone_else = the_person(&tenant_id);
+        someone_else.sub = "someone-else".to_string();
+        let gone = format!(
+            "Execution refused: {}",
+            crate::domain::execution::PROFILE_GONE
+        );
+        let both = format!(
+            "Execution refused: {}",
+            crate::domain::execution::PROFILE_WITH_CONTEXTS
+        );
+        for (case, input, identity, expected) in [
+            (
+                "another person's profile",
+                serde_json::json!({ "topic": "x", "tenant_id": tenant_id.as_str(), "profile": profile.to_string() }),
+                someone_else,
+                gone.clone(),
+            ),
+            (
+                "a deleted or unknown profile",
+                serde_json::json!({ "topic": "x", "tenant_id": tenant_id.as_str(), "profile": uuid::Uuid::new_v4().to_string() }),
+                the_person(&tenant_id),
+                gone.clone(),
+            ),
+            (
+                "a profile beside chosen contexts",
+                serde_json::json!({
+                    "topic": "x",
+                    "tenant_id": tenant_id.as_str(),
+                    "profile": profile.to_string(),
+                    "contexts": { "imap": mailbox_a.to_string() }
+                }),
+                the_person(&tenant_id),
+                both.clone(),
+            ),
+        ] {
+            match start(input, identity).await {
+                Ok(id) => complaints.push(format!("{case}: started as {id}")),
+                Err(e) if e.to_string() == expected => {}
+                Err(e) => complaints.push(format!("{case}: answered \"{e}\"")),
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
     /// D14: the agent's input schema and its rendered prompt never see the
     /// reserved `contexts`; the persisted input keeps it.
     #[tokio::test]
@@ -6266,22 +6459,25 @@ impl StandardExecutionService {
     }
 
     /// The input as the agent's `input_schema` sees it: without the caller's
-    /// reserved `outputs`, `contexts` and `conversation_id`, which are the
-    /// platform's, not the agent's (Zaru ADR-0055 D14 for `contexts`; AEGIS
-    /// ADR-126, Update of 2026-10-07 (2), clause 3 for `conversation_id`).
+    /// reserved `outputs`, `contexts`, `conversation_id` and `profile`, which
+    /// are the platform's, not the agent's (Zaru ADR-0055 D14 for
+    /// `contexts`; AEGIS ADR-126, Update of 2026-10-07 (2), clause 3 for
+    /// `conversation_id`; AEGIS ADR-140 D6 for `profile`).
     fn without_caller_outputs(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
         match payload {
             JsonValue::Object(map)
                 if map.contains_key("outputs")
                     || map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
                     || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
-                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY)
+                    || map.contains_key(crate::domain::execution::PROFILE_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove("outputs");
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
                 map.remove(crate::domain::execution::CONVERSATION_INPUT_KEY);
+                map.remove(crate::domain::execution::PROFILE_INPUT_KEY);
                 std::borrow::Cow::Owned(JsonValue::Object(map))
             }
             _ => std::borrow::Cow::Borrowed(payload),
@@ -6290,20 +6486,23 @@ impl StandardExecutionService {
 
     /// The input without the reserved `contexts` (Zaru ADR-0055 D14),
     /// `repositories` (AEGIS ADR-136 G3) and `conversation_id` (AEGIS
-    /// ADR-126, Update of 2026-10-07 (2), clause 3): the rendered prompt never
-    /// carries the dispatch's binding choices, the run's repositories or the
-    /// conversation it was started from.
+    /// ADR-126, Update of 2026-10-07 (2), clause 3) and `profile` (AEGIS
+    /// ADR-140 D6): the rendered prompt never carries the dispatch's binding
+    /// choices, the run's repositories, the conversation it was started from
+    /// or its profile.
     fn without_contexts(payload: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
         match payload {
             JsonValue::Object(map)
                 if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
                     || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
-                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY)
+                    || map.contains_key(crate::domain::execution::PROFILE_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
                 map.remove(crate::domain::execution::CONVERSATION_INPUT_KEY);
+                map.remove(crate::domain::execution::PROFILE_INPUT_KEY);
                 std::borrow::Cow::Owned(JsonValue::Object(map))
             }
             _ => std::borrow::Cow::Borrowed(payload),
@@ -6645,6 +6844,66 @@ impl StandardExecutionService {
         }
     }
 
+    /// Keep `from`'s profile on `input` when it carries none of its own
+    /// (AEGIS ADR-140 D6): an agent state takes its workflow execution's, a
+    /// child its parent's, as each takes its contexts.
+    fn inherit_profile(input: &mut ExecutionInput, from: Option<&JsonValue>) {
+        let key = crate::domain::execution::PROFILE_INPUT_KEY;
+        let Some(profile) = from.and_then(|from| from.get(key)) else {
+            return;
+        };
+        if let JsonValue::Object(map) = &mut input.input {
+            map.entry(key.to_string())
+                .or_insert_with(|| profile.clone());
+        }
+    }
+
+    /// AEGIS ADR-140 D6, D10: a start that names a profile and no `contexts`
+    /// reads the profile as `person`'s (one of another person's, or one
+    /// deleted, refuses the start with "The profile chosen for this run no
+    /// longer exists.") and writes its active bindings into `contexts` as
+    /// the per-server map. A start that inherited both from its workflow or
+    /// its parent keeps the bindings written at that start.
+    async fn resolve_profile(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        input: &mut ExecutionInput,
+    ) -> Result<()> {
+        let Some(raw) = input.input.get(crate::domain::execution::PROFILE_INPUT_KEY) else {
+            return Ok(());
+        };
+        let profile = crate::domain::execution::read_profile_value(raw)
+            .map_err(|sentence| ExecutionError::Refused(sentence.to_string()))?;
+        if input
+            .input
+            .get(crate::domain::execution::CONTEXTS_INPUT_KEY)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let profiles = self.run_profiles.get().ok_or_else(|| {
+            ExecutionError::Refused(crate::domain::profile::UNAVAILABLE_REFUSAL.to_string())
+        })?;
+        let contexts = match profiles.contexts_of(tenant_id, person, profile).await {
+            Ok(contexts) => contexts,
+            Err(crate::application::profile_service::ProfileError::NotFound) => {
+                return Err(ExecutionError::Refused(
+                    crate::domain::execution::PROFILE_GONE.to_string(),
+                )
+                .into())
+            }
+            Err(e) => return Err(anyhow!("reading the profile a start names: {e}")),
+        };
+        if let JsonValue::Object(map) = &mut input.input {
+            map.insert(
+                crate::domain::execution::CONTEXTS_INPUT_KEY.to_string(),
+                JsonValue::Object(contexts),
+            );
+        }
+        Ok(())
+    }
+
     /// Keep `from`'s repositories on `input` when it carries none of its own
     /// (AEGIS ADR-136 G3): an agent state takes its workflow execution's, a
     /// child its parent's, as each takes its contexts.
@@ -6949,6 +7208,13 @@ impl StandardExecutionService {
         // AEGIS ADR-136 G3: so does it take its workflow execution's
         // repositories.
         let mut input = input;
+        // AEGIS ADR-140 D10: a run started on its own carries one profile or
+        // raw bindings, never both; an agent state takes both from its
+        // workflow execution and is not asked again.
+        if input.workflow_execution_id.is_none() {
+            crate::domain::execution::check_profile_choice(&input.input)
+                .map_err(|sentence| ExecutionError::Refused(sentence.to_string()))?;
+        }
         if input
             .input
             .get(crate::domain::execution::CONTEXTS_INPUT_KEY)
@@ -6961,6 +7227,10 @@ impl StandardExecutionService {
                 .input
                 .get(crate::domain::execution::CONVERSATION_INPUT_KEY)
                 .is_none()
+            || input
+                .input
+                .get(crate::domain::execution::PROFILE_INPUT_KEY)
+                .is_none()
         {
             let workflow_input = self
                 .workflow_execution_input(&tenant_id, input.workflow_execution_id)
@@ -6970,6 +7240,21 @@ impl StandardExecutionService {
             // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and so does
             // it take the conversation its workflow was started from.
             Self::inherit_conversation(&mut input, workflow_input.as_ref());
+            // AEGIS ADR-140 D6: and its profile.
+            Self::inherit_profile(&mut input, workflow_input.as_ref());
+        }
+        // AEGIS ADR-140 D6: a profile named and no bindings yet written:
+        // the profile's, read as the acting person's.
+        if input
+            .input
+            .get(crate::domain::execution::PROFILE_INPUT_KEY)
+            .is_some()
+        {
+            let person = self
+                .acting_user_sub(identity, &tenant_id, input.workflow_execution_id)
+                .await?;
+            self.resolve_profile(&tenant_id, person.as_deref(), &mut input)
+                .await?;
         }
         Self::refuse_malformed_contexts(&input)?;
         Self::refuse_malformed_repositories(&input)?;
@@ -8093,6 +8378,14 @@ impl ExecutionService for StandardExecutionService {
         // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and its
         // parent's conversation.
         Self::inherit_conversation(&mut input, Some(&parent.input.input));
+        // AEGIS ADR-140 D6: and its parent's profile.
+        Self::inherit_profile(&mut input, Some(&parent.input.input));
+        self.resolve_profile(
+            &tenant_id,
+            parent.initiating_user_sub.as_deref(),
+            &mut input,
+        )
+        .await?;
         Self::refuse_malformed_contexts(&input)?;
         Self::refuse_unfilled_context(&agent, &input)?;
         // AEGIS ADR-132 Update (13) S11f: a child acts for its parent's

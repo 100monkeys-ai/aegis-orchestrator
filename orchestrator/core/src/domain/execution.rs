@@ -256,6 +256,58 @@ pub const CONTEXTS_INPUT_KEY: &str = "contexts";
 /// schema and the rendered prompt never see it.
 pub const CONVERSATION_INPUT_KEY: &str = "conversation_id";
 
+/// The reserved key of an execution's `input` that names the person's
+/// profile the run carries (AEGIS ADR-140 D6): one profile id. Like
+/// `contexts`, it is the platform's and never the agent's: the input schema
+/// and the rendered prompt never see it; an agent state and a child inherit
+/// it as they inherit `contexts`, and a starting tool takes it from its
+/// call's `profile`, else its `_meta.profile`.
+pub const PROFILE_INPUT_KEY: &str = "profile";
+
+/// The refusal of a `profile` that is not one profile id (AEGIS ADR-140 D6,
+/// D10: one profile, never two).
+pub const PROFILE_SHAPE: &str = "'profile' must be one profile id";
+
+/// The refusal of a profile chosen beside raw bindings, or of two profiles
+/// (AEGIS ADR-140 D10).
+pub const PROFILE_WITH_CONTEXTS: &str =
+    "Choose one profile, or choose connections without a profile; not both.";
+
+/// The refusal of a start whose profile is not the person's or was deleted
+/// (AEGIS ADR-140 D6), and of a call of a governed tool on such a profile.
+pub const PROFILE_GONE: &str = "The profile chosen for this run no longer exists.";
+
+/// The refusal of a call of a governed tool the run's profile does not
+/// admit (AEGIS ADR-140 D7).
+pub const PROFILE_NOT_ADMITTED: &str = "This tool is not in the profile chosen for this run.";
+
+/// Read a `profile` value (AEGIS ADR-140 D6): a string holding a UUID is
+/// that profile; anything else is refused with [`PROFILE_SHAPE`].
+pub fn read_profile_value(value: &serde_json::Value) -> Result<uuid::Uuid, &'static str> {
+    match value {
+        serde_json::Value::String(id) => uuid::Uuid::parse_str(id).map_err(|_| PROFILE_SHAPE),
+        _ => Err(PROFILE_SHAPE),
+    }
+}
+
+/// Whether `contexts` chooses anything: an object with at least one server.
+pub fn contexts_chosen(contexts: Option<&serde_json::Value>) -> bool {
+    matches!(contexts, Some(serde_json::Value::Object(map)) if !map.is_empty())
+}
+
+/// AEGIS ADR-140 D10 over an input object: a `profile` must be one profile
+/// id, and is never carried beside a non-empty `contexts`.
+pub fn check_profile_choice(input: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(profile) = input.get(PROFILE_INPUT_KEY) else {
+        return Ok(());
+    };
+    read_profile_value(profile)?;
+    if contexts_chosen(input.get(CONTEXTS_INPUT_KEY)) {
+        return Err(PROFILE_WITH_CONTEXTS);
+    }
+    Ok(())
+}
+
 /// The refusal of a `contexts` value of any shape but S11a's, before
 /// anything starts or is called (AEGIS ADR-132 Update (13) S11a).
 pub const CONTEXTS_SHAPE: &str = "'contexts' must be an object naming, for each server, a binding id, a list of binding ids, or null";
@@ -399,6 +451,15 @@ impl ExecutionInput {
     /// The dispatch's credential choices (Zaru ADR-0055 D14).
     pub fn contexts(&self) -> ExecutionContexts {
         ExecutionContexts::from_value(self.input.get(CONTEXTS_INPUT_KEY))
+    }
+
+    /// The profile the run carries (AEGIS ADR-140 D6), read from the
+    /// reserved key [`PROFILE_INPUT_KEY`]: only a string holding a UUID
+    /// names one.
+    pub fn profile(&self) -> Option<uuid::Uuid> {
+        self.input
+            .get(PROFILE_INPUT_KEY)
+            .and_then(|value| read_profile_value(value).ok())
     }
 
     /// The conversation the run was started from, read from the reserved
@@ -1088,6 +1149,54 @@ mod tests {
             let read = input_of(value.clone());
             if let Some(id) = read.conversation_id() {
                 complaints.push(format!("{value} named the conversation {id}"));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// AEGIS ADR-140 D6 and D10: a profile is one profile id, read only as
+    /// a UUID string, and never carried beside a non-empty `contexts`.
+    #[test]
+    fn a_profile_is_one_id_and_never_rides_beside_chosen_contexts() {
+        const PROFILE: &str = "2b7e4c1a-9d3f-4e5a-8b6c-7d8e9f0a1b2c";
+        const BINDING: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+        let input_of = |value: serde_json::Value| ExecutionInput {
+            intent: None,
+            input: value,
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+        let mut complaints = Vec::new();
+        let named = input_of(serde_json::json!({ PROFILE_INPUT_KEY: PROFILE }));
+        if named.profile().map(|p| p.to_string()).as_deref() != Some(PROFILE) {
+            complaints.push(format!("a UUID string read {:?}", named.profile()));
+        }
+        for value in [
+            serde_json::json!({ PROFILE_INPUT_KEY: [PROFILE] }),
+            serde_json::json!({ PROFILE_INPUT_KEY: "fundraising" }),
+            serde_json::json!({ PROFILE_INPUT_KEY: null }),
+        ] {
+            if input_of(value.clone()).profile().is_some() {
+                complaints.push(format!("{value} named a profile"));
+            }
+            if check_profile_choice(&value) != Err(PROFILE_SHAPE) {
+                complaints.push(format!("{value} was not refused with the shape sentence"));
+            }
+        }
+        let both = serde_json::json!({ PROFILE_INPUT_KEY: PROFILE, CONTEXTS_INPUT_KEY: { "imap": BINDING } });
+        if check_profile_choice(&both) != Err(PROFILE_WITH_CONTEXTS) {
+            complaints.push("a profile beside chosen contexts was not refused".to_string());
+        }
+        for alone in [
+            serde_json::json!({ PROFILE_INPUT_KEY: PROFILE }),
+            serde_json::json!({ PROFILE_INPUT_KEY: PROFILE, CONTEXTS_INPUT_KEY: {} }),
+            serde_json::json!({ CONTEXTS_INPUT_KEY: { "imap": BINDING } }),
+        ] {
+            if let Err(sentence) = check_profile_choice(&alone) {
+                complaints.push(format!("{alone} was refused: {sentence}"));
             }
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));

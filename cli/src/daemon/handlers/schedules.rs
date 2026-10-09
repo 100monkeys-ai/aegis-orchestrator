@@ -191,6 +191,7 @@ fn schedule_view(view: &ScheduleView) -> Value {
         "input": s.input,
         "attachments": s.attachments,
         "contexts": s.contexts,
+        "profile_id": s.profile_id.map(|p| p.to_string()),
         "repositories": s.repositories,
         "at": at,
         "recurrence": recurrence,

@@ -640,3 +640,146 @@ async fn a_repository_not_the_owners_is_refused() {
     );
     assert_eq!(sentence, REPOSITORY_REFUSAL);
 }
+
+/// AEGIS ADR-140 D6: a run on a profile is given its active bindings as the
+/// per-server map, mailboxes under `imap` (two of one profile told apart per
+/// call by `mailbox`), calendar accounts under `caldav`, every other binding
+/// under its provider; a removed binding is left out; another person's
+/// profile, or one deleted, is answered as none.
+#[tokio::test]
+async fn a_run_on_a_profile_is_given_its_active_bindings_per_server() {
+    use super::RunProfiles;
+    let h = harness().await;
+    let (owner, tenant) = (person(OWNER), tenant_of(OWNER));
+    let made = h
+        .service
+        .create(
+            &owner,
+            &tenant,
+            draft(json!({
+                "name": "Fundraising",
+                "bindings": [id_of(&h.b.gmail), id_of(&h.b.imap), id_of(&h.b.github)],
+                "tools": ["mail.reply"],
+            })),
+        )
+        .await
+        .expect("made");
+    let id = made.profile.id.0;
+    let mut complaints = Vec::new();
+    let contexts = h
+        .service
+        .contexts_of(&tenant, Some(OWNER), id)
+        .await
+        .expect("the owner's profile is read");
+    let expected = json!({
+        "imap": [id_of(&h.b.gmail), id_of(&h.b.imap)],
+        "caldav": [id_of(&h.b.gmail)],
+        "github": [id_of(&h.b.github)],
+    });
+    if Value::Object(contexts) != expected {
+        complaints.push("the profile's bindings were not written per server".to_string());
+    }
+    let admission = h
+        .service
+        .admission_of(&tenant, Some(OWNER), id)
+        .await
+        .expect("admission read");
+    for (tool, admitted) in [
+        ("mail.reply", true),
+        ("mail.send", false),
+        ("calendar.create", false),
+        ("github.create_issue", false),
+        ("web.search", true),
+        ("aegis.task.execute", true),
+    ] {
+        if admission.admits(tool) != admitted {
+            complaints.push(format!("{tool} admitted: {}", admission.admits(tool)));
+        }
+    }
+    h.held.0.lock().unwrap().iter_mut().for_each(|b| {
+        if b.id == h.b.imap.id {
+            b.status = CredentialStatus::Revoked;
+        }
+    });
+    let after = h
+        .service
+        .contexts_of(&tenant, Some(OWNER), id)
+        .await
+        .unwrap();
+    if after.get("imap") != Some(&json!([id_of(&h.b.gmail)])) {
+        complaints.push(format!("a removed mailbox stayed in the run: {after:?}"));
+    }
+    if h.service
+        .contexts_of(&tenant_of(OTHER), Some(OTHER), id)
+        .await
+        != Err(ProfileError::NotFound)
+    {
+        complaints.push("another person's run was given the profile".to_string());
+    }
+    h.service
+        .delete(&owner, &tenant, &made.profile.id)
+        .await
+        .unwrap();
+    if h.service.contexts_of(&tenant, Some(OWNER), id).await != Err(ProfileError::NotFound) {
+        complaints.push("a deleted profile was still given".to_string());
+    }
+    if h.service.admission_of(&tenant, Some(OWNER), id).await != Err(ProfileError::NotFound) {
+        complaints.push("a deleted profile still admitted".to_string());
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-140 D9: deleting a profile revokes the standing choices made
+/// in it, and only those.
+#[tokio::test]
+async fn deleting_a_profile_revokes_its_standing_choices() {
+    use crate::application::tool_approval_service::ToolApprovalService;
+    use crate::domain::tool_approval::{
+        ToolApprovalPolicy, ToolApprovalPolicyEffect, ToolApprovalPolicyId, ToolApprovalRepository,
+    };
+    use crate::infrastructure::event_bus::EventBus;
+    use crate::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository;
+    let h = harness().await;
+    let (owner, tenant) = (person(OWNER), tenant_of(OWNER));
+    let repo = Arc::new(InMemoryToolApprovalRepository::new());
+    h.service
+        .set_standing_choices(Arc::new(ToolApprovalService::new(
+            repo.clone(),
+            Arc::new(EventBus::new(16)),
+        )));
+    let made = h
+        .service
+        .create(
+            &owner,
+            &tenant,
+            draft(json!({ "name": "Fundraising", "bindings": [id_of(&h.b.gmail)], "tools": [] })),
+        )
+        .await
+        .unwrap();
+    let policy = |profile_id: Option<uuid::Uuid>| ToolApprovalPolicy {
+        id: ToolApprovalPolicyId::new(),
+        tenant_id: tenant.clone(),
+        user_sub: OWNER.to_string(),
+        tool_name: "mail.reply".to_string(),
+        binding_id: Some(id_of(&h.b.gmail)),
+        profile_id,
+        effect: ToolApprovalPolicyEffect::Allow,
+        created_at: Utc::now(),
+        created_by: OWNER.to_string(),
+        revoked_at: None,
+    };
+    repo.insert_policy(&policy(Some(made.profile.id.0)))
+        .await
+        .unwrap();
+    repo.insert_policy(&policy(None)).await.unwrap();
+    h.service
+        .delete(&owner, &tenant, &made.profile.id)
+        .await
+        .unwrap();
+    let left = repo.list_active_policies(&tenant, OWNER).await.unwrap();
+    assert_eq!(
+        left.iter().map(|p| p.profile_id).collect::<Vec<_>>(),
+        vec![None],
+        "the profile's choice was not revoked, or the raw-binding choice went with it"
+    );
+}

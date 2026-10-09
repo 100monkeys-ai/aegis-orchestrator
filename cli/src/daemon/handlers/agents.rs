@@ -57,17 +57,23 @@ pub(crate) struct ExecuteRequest {
     /// start refuses any other shape.
     #[serde(default)]
     repositories: Option<serde_json::Value>,
+    /// The person's profile the run carries, one profile id (AEGIS ADR-140
+    /// D6), carried unchanged into the reserved key `profile`; the start
+    /// reads it as the person's and refuses it beside chosen `contexts`.
+    #[serde(default)]
+    profile: Option<serde_json::Value>,
 }
 
 /// The execution input the execute route builds: the caller's input, its
-/// overrides and the tenant, with `contexts` and `repositories` carried
-/// unchanged into their reserved keys.
+/// overrides and the tenant, with `contexts`, `repositories` and `profile`
+/// carried unchanged into their reserved keys.
 fn execute_input_value(
     input: serde_json::Value,
     context_overrides: Option<serde_json::Value>,
     tenant_id: &TenantId,
     contexts: Option<serde_json::Value>,
     repositories: Option<serde_json::Value>,
+    profile: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let mut value = serde_json::json!({
         "input": input,
@@ -85,6 +91,12 @@ fn execute_input_value(
             map.insert(
                 aegis_orchestrator_core::domain::git_repo::REPOSITORIES_INPUT_KEY.to_string(),
                 repositories,
+            );
+        }
+        if let Some(profile) = profile {
+            map.insert(
+                aegis_orchestrator_core::domain::execution::PROFILE_INPUT_KEY.to_string(),
+                profile,
             );
         }
     }
@@ -217,6 +229,7 @@ pub(crate) async fn execute_agent_handler(
             &tenant_id,
             request.contexts,
             request.repositories,
+            request.profile,
         ),
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
@@ -944,11 +957,37 @@ mod tests {
             &TenantId::consumer(),
             request.contexts,
             request.repositories,
+            request.profile,
         );
         assert_eq!(
             input.get("repositories"),
             Some(&repositories),
             "the execute route dropped the caller's repositories"
+        );
+    }
+
+    /// AEGIS ADR-140 D6: the execute route keeps the caller's `profile` in
+    /// the execution input's reserved key, beside `contexts`.
+    #[test]
+    fn execute_route_keeps_the_profile_in_the_reserved_key() {
+        let profile = "2b7e4c1a-9d3f-4e5a-8b6c-7d8e9f0a1b2c";
+        let request: ExecuteRequest = serde_json::from_value(serde_json::json!({
+            "input": "triage my inbox",
+            "profile": profile,
+        }))
+        .unwrap();
+        let input = execute_input_value(
+            request.input,
+            request.context_overrides,
+            &TenantId::consumer(),
+            request.contexts,
+            request.repositories,
+            request.profile,
+        );
+        assert_eq!(
+            input.get("profile"),
+            Some(&serde_json::json!(profile)),
+            "the execute route dropped the caller's profile"
         );
     }
 

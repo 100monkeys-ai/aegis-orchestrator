@@ -201,6 +201,10 @@ pub struct ToolInvocationService {
     /// ADR-126: the approval gate; `None` leaves every tool ungated.
     tool_approval_service:
         Option<Arc<crate::application::tool_approval_service::ToolApprovalService>>,
+    /// A run's or a conversation call's profile, read at each call of a
+    /// governed tool (AEGIS ADR-140 D6, D7); unset, a call carrying a profile
+    /// is refused.
+    run_profiles: Option<Arc<dyn crate::application::profile_service::RunProfiles>>,
     /// AEGIS ADR-129: the operator escalation, re-checked at every call on a
     /// session attested under one (D19) and audited (D18). A session bound
     /// to an escalation is refused when this is `None`.

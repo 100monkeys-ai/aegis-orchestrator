@@ -1248,6 +1248,7 @@ mod postgres {
 
     const MIGRATION_036: &str = include_str!("../../../cli/migrations/036_tool_approvals.sql");
     const MIGRATION_048: &str = include_str!("../../../cli/migrations/048_schedules.sql");
+    const MIGRATION_050: &str = include_str!("../../../cli/migrations/050_profile_scoping.sql");
 
     /// The two run tables as migration 001 made them, in the columns this
     /// migration touches.
@@ -1351,6 +1352,9 @@ mod postgres {
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
 
+        // The store reads and writes the columns of every migration it
+        // ships: 050 adds `schedules.profile_id` (AEGIS ADR-140 D8).
+        pool.execute(MIGRATION_050).await.expect("migration 050");
         let store = PostgresScheduleRepository::new(pool.clone());
         // Times at a whole second, as PostgreSQL keeps microseconds.
         let mut schedule = scheduled("agent", "mail-triage");
@@ -1384,4 +1388,61 @@ mod postgres {
                 .get("schedule_id");
         assert_eq!(bound, Some(schedule.id.0));
     }
+}
+
+/// AEGIS ADR-140 D8, D10: a schedule saved with a profile fires a run whose
+/// input carries the profile and no contexts of its own (the start reads
+/// the profile as the owner's); one saved with a profile and contexts is
+/// refused with D10's sentence and nothing is stored.
+#[tokio::test]
+async fn a_schedule_on_a_profile_fires_a_run_on_it_and_one_with_both_is_refused() {
+    const PROFILE: &str = "2b7e4c1a-9d3f-4e5a-8b6c-7d8e9f0a1b2c";
+    let f = fixture();
+    let both = f
+        .service
+        .create(
+            &consumer("owner"),
+            &tenant_of("owner"),
+            ScheduleDraft {
+                profile: Some(json!(PROFILE)),
+                ..recurring("both", "0 15 * * *")
+            },
+        )
+        .await;
+    let refused = match both {
+        Err(e) => e.to_string(),
+        Ok(_) => "stored".to_string(),
+    };
+    let schedule = create(
+        &f,
+        "owner",
+        ScheduleDraft {
+            profile: Some(json!(PROFILE)),
+            contexts: None,
+            ..recurring("on a profile", "0 15 * * *")
+        },
+    )
+    .await;
+    let executions = Arc::new(RecordingExecutions::default());
+    let starter = ServiceRunStarter::new(
+        executions.clone(),
+        Arc::new(OneAgent(AgentId::new())),
+        None,
+        None,
+    );
+    let owner = schedule.owner.to_identity(&schedule.tenant_id).unwrap();
+    starter.start(&schedule, &owner).await.expect("started");
+    let started = executions.started.lock().unwrap();
+    assert_eq!(
+        (refused.contains(aegis_orchestrator_core::domain::execution::PROFILE_WITH_CONTEXTS), started[0].1.input.clone()),
+        (
+            true,
+            json!({
+                "folder": "inbox",
+                "profile": PROFILE,
+                "tenant_id": tenant_of("owner").as_str(),
+            })
+        ),
+        "a schedule with both was {refused}, or the fired run's input did not carry the profile alone"
+    );
 }

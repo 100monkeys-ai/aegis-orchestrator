@@ -235,6 +235,11 @@ pub struct ToolApprovalRequest {
     /// never written by the gate.
     #[serde(default)]
     pub schedule_name: Option<String>,
+    /// The profile the gated call carried; absent for a call on raw
+    /// bindings (AEGIS ADR-140 D9). An "always" answer stores its policy
+    /// with it.
+    #[serde(default)]
+    pub profile_id: Option<Uuid>,
     /// The policy an `auto_allowed` call matched.
     pub policy_id: Option<ToolApprovalPolicyId>,
     pub status: ToolApprovalStatus,
@@ -258,8 +263,9 @@ impl ToolApprovalRequest {
     }
 }
 
-/// A user's standing choice for one tool on one binding
-/// (`tool_approval_policies`): "always allow" or "always deny".
+/// A user's standing choice for one tool on one binding, within one profile
+/// or on raw bindings (`tool_approval_policies`): "always allow" or "always
+/// deny".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolApprovalPolicy {
     pub id: ToolApprovalPolicyId,
@@ -267,6 +273,11 @@ pub struct ToolApprovalPolicy {
     pub user_sub: String,
     pub tool_name: String,
     pub binding_id: Option<String>,
+    /// The profile the choice was made in: it matches only calls carrying
+    /// that profile; none matches only raw-binding calls (AEGIS ADR-140
+    /// D9). Every choice stored before profiles has none.
+    #[serde(default)]
+    pub profile_id: Option<Uuid>,
     pub effect: ToolApprovalPolicyEffect,
     pub created_at: DateTime<Utc>,
     pub created_by: String,
@@ -410,19 +421,31 @@ pub trait ToolApprovalRepository: Send + Sync {
     ) -> Result<Vec<ToolApprovalRequest>, RepositoryError>;
 
     /// Store a standing choice, revoking (at its `created_at`) every
-    /// unrevoked policy of the same user, tool and binding in the same
+    /// unrevoked policy of the same user, tool, binding and profile in the same
     /// atomic step, so a user holds at most one unrevoked choice per key and
     /// an allow and a deny never coexist.
     async fn insert_policy(&self, policy: &ToolApprovalPolicy) -> Result<(), RepositoryError>;
 
-    /// The user's unrevoked policy for this tool on this binding.
+    /// The user's unrevoked policy for this tool on this binding, made in
+    /// `profile_id` (none: made on raw bindings), AEGIS ADR-140 D9.
     async fn find_active_policy(
         &self,
         tenant_id: &TenantId,
         user_sub: &str,
         tool_name: &str,
         binding_id: Option<&str>,
+        profile_id: Option<Uuid>,
     ) -> Result<Option<ToolApprovalPolicy>, RepositoryError>;
+
+    /// Revoke every unrevoked policy of the user made in `profile_id`, as
+    /// deleting the profile does (AEGIS ADR-140 D9); the number revoked.
+    async fn revoke_profile_policies(
+        &self,
+        tenant_id: &TenantId,
+        user_sub: &str,
+        profile_id: Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<u64, RepositoryError>;
 
     /// The schedule whose run `execution_id` is: the schedule the
     /// execution's record names, else the one its workflow execution's

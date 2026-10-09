@@ -163,6 +163,7 @@ fn request_view(request: &ToolApprovalRequest) -> Value {
         "conversation_id": request.conversation_id,
         "schedule_id": request.schedule_id.map(|id| id.to_string()),
         "schedule_name": request.schedule_name,
+        "profile_id": request.profile_id.map(|id| id.to_string()),
         "status": request.status.as_str(),
         "created_at": request.created_at,
         "decided_at": request.decided_at,
@@ -177,6 +178,7 @@ fn policy_view(policy: &ToolApprovalPolicy) -> Value {
         "id": policy.id.to_string(),
         "tool_name": policy.tool_name,
         "binding_id": policy.binding_id,
+        "profile_id": policy.profile_id.map(|id| id.to_string()),
         "effect": policy.effect.as_str(),
         "created_at": policy.created_at,
         "created_by": policy.created_by,
@@ -395,6 +397,7 @@ mod tests {
                 arguments: &args,
                 security_context_name: "zaru-pro",
                 conversation_id: conversation,
+                profile_id: None,
                 contract: ApprovalContract {
                     binding_argument: Some("mailbox".into()),
                     approval_summary: Some(vec![

@@ -82,6 +82,11 @@ pub struct GatedCall<'a> {
     /// none for a call no conversation started (ADR-126, Update of
     /// 2026-10-07 (2), clauses 1 and 2).
     pub conversation_id: Option<&'a str>,
+    /// The profile the call carries: the run's, or a conversation call's
+    /// `_meta.profile`; none for a call on raw bindings (AEGIS ADR-140 D9).
+    /// A standing choice matches only calls carrying the profile it was made
+    /// in, and one made on raw bindings only raw-binding calls.
+    pub profile_id: Option<uuid::Uuid>,
     /// What the tool declares to the gate: its binding argument and its
     /// summary's arguments (ADR-126, Update of 2026-10-04, clause 1).
     pub contract: ApprovalContract,
@@ -133,6 +138,7 @@ impl ToolApprovalService {
                 user_sub,
                 call.tool_name,
                 binding_id.as_deref(),
+                call.profile_id,
             )
             .await?;
         // AEGIS ADR-139 N9: the schedule whose run made the call, from the
@@ -152,6 +158,7 @@ impl ToolApprovalService {
             conversation_id: call.conversation_id.map(str::to_string),
             schedule_id,
             schedule_name: None,
+            profile_id: call.profile_id,
             policy_id: None,
             status: ToolApprovalStatus::Pending,
             created_at: now,
@@ -320,6 +327,9 @@ impl ToolApprovalService {
                 user_sub: decided.user_sub.clone(),
                 tool_name: decided.tool_name.clone(),
                 binding_id: decided.binding_id.clone(),
+                // AEGIS ADR-140 D9: the choice is the profile's the call
+                // carried, or the raw bindings' when it carried none.
+                profile_id: decided.profile_id,
                 effect,
                 created_at: now,
                 created_by: user_sub.to_string(),
@@ -362,6 +372,20 @@ impl ToolApprovalService {
         } else {
             Err(ToolApprovalError::NotFound)
         }
+    }
+
+    /// Revoke every standing choice the user made in `profile_id`, as
+    /// deleting that profile does (AEGIS ADR-140 D9); how many were revoked.
+    pub async fn revoke_profile_policies(
+        &self,
+        tenant_id: &TenantId,
+        user_sub: &str,
+        profile_id: uuid::Uuid,
+    ) -> Result<u64, ToolApprovalError> {
+        Ok(self
+            .repo
+            .revoke_profile_policies(tenant_id, user_sub, profile_id, Utc::now())
+            .await?)
     }
 
     /// Expire every request pending since before `now` minus 72 hours;

@@ -56,6 +56,7 @@ async fn the_mail_send_contract_keys_the_request_and_the_policy_on_mailbox_and_l
                 arguments: &args,
                 security_context_name: "zaru-pro",
                 conversation_id: None,
+                profile_id: None,
                 contract: router.approval_contract("mail.send"),
             })
             .await
@@ -90,6 +91,7 @@ async fn the_mail_send_contract_keys_the_request_and_the_policy_on_mailbox_and_l
         user_sub: USER.to_string(),
         tool_name: "mail.send".to_string(),
         binding_id: Some("b-1".to_string()),
+        profile_id: None,
         effect: ToolApprovalPolicyEffect::Allow,
         created_at: chrono::Utc::now(),
         created_by: USER.to_string(),

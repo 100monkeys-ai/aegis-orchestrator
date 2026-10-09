@@ -12,10 +12,19 @@
 //! a caller's `outputs` is, where the starts read it, an agent state or a
 //! child inherits it, and the credential path selects by it. The tools'
 //! model-facing schemas do not list it: a model never picks a binding (D10).
+//!
+//! Beside it, a starting tool takes `profile` (one profile id, AEGIS ADR-140
+//! D6), kept in the reserved key [`PROFILE_INPUT_KEY`]; with neither in its
+//! arguments, the facade writes the call's `_meta.profile`, or the profile
+//! of the run the call is made in. A profile beside a non-empty `contexts`
+//! is refused (D10).
 
 use serde_json::{Map, Value};
 
-use crate::domain::execution::{check_contexts_shape, CONTEXTS_INPUT_KEY, CONVERSATION_INPUT_KEY};
+use crate::domain::execution::{
+    check_contexts_shape, check_profile_choice, contexts_chosen, read_profile_value,
+    CONTEXTS_INPUT_KEY, CONVERSATION_INPUT_KEY, PROFILE_INPUT_KEY, PROFILE_WITH_CONTEXTS,
+};
 use crate::domain::seal_session::SealSessionError;
 
 /// Parse the `contexts` argument of a starting tool's call, or a call's
@@ -59,6 +68,46 @@ pub(super) fn parse_conversation_id(meta: &Value) -> Result<Option<String>, Seal
         _ => Err(SealSessionError::InvalidArguments(
             CONVERSATION_ID_SHAPE.to_string(),
         )),
+    }
+}
+
+/// Parse a call's `_meta.profile` (AEGIS ADR-140 D12): `Ok(None)` when
+/// absent, the profile when it is one profile id; anything else refused, and
+/// so is a profile beside a non-empty `_meta.contexts` (D10).
+pub(super) fn parse_meta_profile(meta: &Value) -> Result<Option<uuid::Uuid>, SealSessionError> {
+    let refused = |sentence: &str| SealSessionError::InvalidArguments(sentence.to_string());
+    let Some(raw) = meta.get(PROFILE_INPUT_KEY) else {
+        return Ok(None);
+    };
+    let profile = read_profile_value(raw).map_err(refused)?;
+    if contexts_chosen(meta.get(CONTEXTS_INPUT_KEY)) {
+        return Err(refused(PROFILE_WITH_CONTEXTS));
+    }
+    Ok(Some(profile))
+}
+
+/// Whether a starting call's `args` choose for themselves: a `profile`, or
+/// a non-empty `contexts`. Only a call that chooses neither takes the
+/// profile the facade gives it.
+pub(super) fn chooses_for_itself(args: &Value) -> bool {
+    args.get(PROFILE_INPUT_KEY).is_some() || contexts_chosen(args.get(CONTEXTS_INPUT_KEY))
+}
+
+/// Write `profile` into a starting call's `args` when they choose nothing
+/// of their own (AEGIS ADR-140 D6): the call's `_meta.profile`, or the
+/// profile of the run the call is made in.
+pub(super) fn give_profile(args: &mut Value, profile: Option<uuid::Uuid>) {
+    let Some(profile) = profile else {
+        return;
+    };
+    if chooses_for_itself(args) {
+        return;
+    }
+    if let Value::Object(map) = args {
+        map.insert(
+            PROFILE_INPUT_KEY.to_string(),
+            Value::String(profile.to_string()),
+        );
     }
 }
 
@@ -112,11 +161,27 @@ pub(super) fn carry_conversation(args: &Value, input: &mut Value) {
     put_conversation(input, conversation.as_deref());
 }
 
-/// Parse the call's `contexts` and keep it in `input`, as every starting
-/// tool does before anything starts.
+/// Parse the call's `contexts` and `profile` and keep them in `input`, as
+/// every starting tool does before anything starts. A profile beside a
+/// non-empty `contexts` is refused (AEGIS ADR-140 D10); any `profile` the
+/// input itself carries is removed, so only the call names a run's profile.
 pub(super) fn carry_contexts(args: &Value, input: &mut Value) -> Result<(), SealSessionError> {
+    let refused = |sentence: &str| SealSessionError::InvalidArguments(sentence.to_string());
+    check_profile_choice(args).map_err(refused)?;
     if let Some(contexts) = parse_contexts(args)? {
         put_contexts(input, contexts);
+    }
+    if let Value::Object(map) = input {
+        map.remove(PROFILE_INPUT_KEY);
+    }
+    if let Some(profile) = args.get(PROFILE_INPUT_KEY) {
+        if !input.is_object() {
+            let original = std::mem::replace(input, Value::Null);
+            *input = serde_json::json!({ "input": original });
+        }
+        if let Value::Object(map) = input {
+            map.insert(PROFILE_INPUT_KEY.to_string(), profile.clone());
+        }
     }
     Ok(())
 }
@@ -218,6 +283,67 @@ mod tests {
     }
 
     const SECOND: &str = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+    const PROFILE: &str = "2b7e4c1a-9d3f-4e5a-8b6c-7d8e9f0a1b2c";
+
+    /// AEGIS ADR-140 D6, D10: a starting call's `profile` is kept in the
+    /// reserved key (any the input planted replaced); beside a non-empty
+    /// `contexts`, or anything but one profile id, it is refused before
+    /// anything starts; `_meta.profile` is read the same way; the facade's
+    /// profile is given only to a call that chooses nothing itself.
+    #[test]
+    fn a_starting_call_carries_one_profile_and_never_beside_contexts() {
+        let mut complaints = Vec::new();
+        let mut input = json!({ "topic": "x", "profile": SECOND });
+        match carry_contexts(&json!({ "profile": PROFILE }), &mut input) {
+            Ok(()) if input == json!({ "topic": "x", "profile": PROFILE }) => {}
+            other => complaints.push(format!("the profile was kept as {other:?}: {input}")),
+        }
+        let mut planted = json!({ "topic": "x", "profile": SECOND });
+        carry_contexts(&json!({}), &mut planted).unwrap();
+        if planted != json!({ "topic": "x" }) {
+            complaints.push(format!("a planted profile stayed: {planted}"));
+        }
+        for (args, sentence) in [
+            (
+                json!({ "profile": PROFILE, "contexts": { "imap": BINDING } }),
+                crate::domain::execution::PROFILE_WITH_CONTEXTS,
+            ),
+            (
+                json!({ "profile": [PROFILE, SECOND] }),
+                crate::domain::execution::PROFILE_SHAPE,
+            ),
+        ] {
+            match carry_contexts(&args, &mut json!({})) {
+                Err(SealSessionError::InvalidArguments(m)) if m == sentence => {}
+                other => complaints.push(format!("{args} was {other:?}, not {sentence:?}")),
+            }
+            match parse_meta_profile(&args) {
+                Err(SealSessionError::InvalidArguments(m)) if m == sentence => {}
+                other => complaints.push(format!("_meta {args} was {other:?}, not {sentence:?}")),
+            }
+        }
+        if parse_meta_profile(&json!({ "profile": PROFILE, "contexts": {} }))
+            .ok()
+            .flatten()
+            .map(|p| p.to_string())
+            .as_deref()
+            != Some(PROFILE)
+        {
+            complaints.push("_meta.profile beside empty contexts was not read".to_string());
+        }
+        let profile = uuid::Uuid::parse_str(PROFILE).unwrap();
+        let mut bare = json!({ "agent_id": "a" });
+        give_profile(&mut bare, Some(profile));
+        if bare["profile"] != json!(PROFILE) {
+            complaints.push(format!("a call choosing nothing was not given it: {bare}"));
+        }
+        let mut own = json!({ "contexts": { "imap": BINDING } });
+        give_profile(&mut own, Some(profile));
+        if own.get("profile").is_some() {
+            complaints.push(format!("a call with its own contexts was given it: {own}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 
     /// AEGIS ADR-132 Update (13) S11a: the refusal's words.
     const SENTENCE: &str =
