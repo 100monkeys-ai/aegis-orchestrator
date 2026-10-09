@@ -306,12 +306,12 @@ pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
     ApprovalDeclaration {
         tool: "mail.send",
         binding_argument: Some("mailbox"),
-        approval_summary: Some(&["mailbox", "to", "cc", "subject", "body"]),
+        approval_summary: Some(&["mailbox", "to", "cc", "subject", "body", "attachment_names"]),
     },
     ApprovalDeclaration {
         tool: "mail.reply",
         binding_argument: Some("mailbox"),
-        approval_summary: Some(&["mailbox", "to", "cc", "subject", "body"]),
+        approval_summary: Some(&["mailbox", "to", "cc", "subject", "body", "attachment_names"]),
     },
     ApprovalDeclaration {
         tool: "mail.delete",

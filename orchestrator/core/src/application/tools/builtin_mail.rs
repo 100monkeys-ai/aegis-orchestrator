@@ -79,6 +79,17 @@
 //! person's tier allows a file to be, or than 20 MiB, is refused with
 //! nothing written.
 //!
+//! **Attachments going out** (its Update of 2026-10-08 (5), clause 32).
+//! `mail.send` and `mail.reply` take `attachments`, at most 10 references
+//! `{volume_id, path}` to files in the acting person's own volumes, read
+//! as that person (`FileOperationsService::read_file` with the person as
+//! owner, never by tenant alone), at most 20 MiB together; the message
+//! becomes `multipart/mixed`. Before the gate the admission reads each
+//! file and answers `attachment_names` (each name and size) and
+//! `attachment_sha256`, which the caller writes over any value the model
+//! gave; at the run each file is read again, and one whose digest is not
+//! the admitted one refuses the send with nothing sent.
+//!
 //! **Threads.** A thread's id is the root `Message-ID` of its messages (the
 //! first `References` entry, else `In-Reply-To`, else the message's own); a
 //! message with no `Message-ID` is its own thread `uid:<UIDVALIDITY>:<uid>`.
@@ -94,7 +105,10 @@ use crate::domain::execution::{ContextChoice, ServerChoice};
 use crate::domain::iam::ZaruTier;
 use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
 use crate::domain::tenant::TenantId;
-use crate::infrastructure::mail::message::{is_address, mint_message_id, OutgoingMessage};
+use crate::domain::volume::VolumeId;
+use crate::infrastructure::mail::message::{
+    is_address, mint_message_id, OutgoingAttachment, OutgoingMessage,
+};
 use crate::infrastructure::mail::session::{
     attachment_part, decode_text, parse_headers, parse_message, Arg, Fetched, FolderStatus,
     Headers, ImapSession, ListedFolder, StoreOp,
@@ -202,6 +216,22 @@ pub const BAD_SUBJECT: &str = "'subject' must be one line of at most 998 charact
 /// The refusal for a body that is not plain text of at most
 /// [`SEND_BODY_MAX_CHARS`] characters.
 pub const BAD_BODY: &str = "'body' must be plain text of at most 100000 characters.";
+/// The most files one `mail.send` or `mail.reply` attaches.
+pub const ATTACHMENTS_MAX_FILES: usize = 10;
+/// The most bytes the files one message attaches come to together.
+pub const ATTACHMENTS_MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// The refusal of more than [`ATTACHMENTS_MAX_FILES`] files.
+pub const TOO_MANY_ATTACHMENTS: &str = "'attachments' holds at most 10 files.";
+/// The refusal of files coming to more than [`ATTACHMENTS_MAX_BYTES`].
+pub const ATTACHMENTS_TOO_LARGE: &str =
+    "The attachments come to more than 20 MiB; nothing was sent.";
+/// The refusal at the run of a file whose bytes are not the ones the
+/// person approved.
+pub const ATTACHMENT_CHANGED: &str =
+    "A file to attach changed after it was approved; nothing was sent.";
+/// The shape `attachments` must have.
+const BAD_ATTACHMENTS: &str =
+    "'attachments' must be a list of files, each given by its volume_id and path.";
 
 /// Whether `tool_name` is one of the mail tools this module serves.
 pub fn is_mail_tool(tool_name: &str) -> bool {
@@ -221,8 +251,9 @@ pub fn is_mail_tool(tool_name: &str) -> bool {
 
 /// What [`MailTools::admit_mailbox`] admitted: the binding the call names,
 /// and the arguments the admission read for the person (`subject` and
-/// `from` for `mail.delete` and `mail.archive`; none for another tool),
-/// which the caller writes into the call before the gate.
+/// `from` for `mail.delete` and `mail.archive`; `attachment_names` and
+/// `attachment_sha256` for `mail.send` and `mail.reply`; none for another
+/// tool), which the caller writes into the call before the gate.
 #[derive(Debug, Clone)]
 pub struct Admitted {
     pub binding: CredentialBindingId,
@@ -325,7 +356,18 @@ impl MailTools {
                 Err(_) => Err(timed_out()),
             };
         }
-        let run = run(self.connector.as_ref(), &mailbox, &request);
+        let run = async {
+            let attached = match outbound_files(&request) {
+                [] => Vec::new(),
+                refs => {
+                    let Some(files) = self.files.as_ref() else {
+                        return Err(not_configured());
+                    };
+                    attachments_at_run(files, acting, refs, args).await?
+                }
+            };
+            run(self.connector.as_ref(), &mailbox, &request, attached).await
+        };
         match tokio::time::timeout(CALL_TIMEOUT, run).await {
             Ok(result) => result,
             Err(_) => Err(timed_out()),
@@ -347,6 +389,14 @@ impl MailTools {
     /// safely is refused here, so no person is asked about it. `mail.archive`
     /// is admitted the same way, its Archive folder in place of Trash (the
     /// Update of 2026-10-08 (5) clause 29).
+    ///
+    /// For `mail.send` and `mail.reply` (the Update of 2026-10-08 (5) clause
+    /// 32) it reads each file of `attachments` as the person and answers
+    /// `attachment_names` (each name and size) and `attachment_sha256`, the
+    /// files' digests in order, both empty when the call attaches nothing,
+    /// so no value the model gave reaches the person. A file not the
+    /// person's, more than 10 files, or more than 20 MiB together is
+    /// refused here.
     pub async fn admit_mailbox(
         &self,
         tool_name: &str,
@@ -362,6 +412,34 @@ impl MailTools {
                     Ok(shown) => shown?,
                     Err(_) => return Err(timed_out()),
                 }
+            }
+            Request::Send { message } | Request::Reply { message, .. } => {
+                let read = match message.attachments.as_slice() {
+                    [] => Vec::new(),
+                    refs => {
+                        let Some(files) = self.files.as_ref() else {
+                            return Err(not_configured());
+                        };
+                        let read = read_attachments(files, acting, refs);
+                        match tokio::time::timeout(CALL_TIMEOUT, read).await {
+                            Ok(read) => read.map_err(NotAttached::refusal)?,
+                            Err(_) => return Err(timed_out()),
+                        }
+                    }
+                };
+                vec![
+                    (
+                        "attachment_names",
+                        json!(read
+                            .iter()
+                            .map(|f| format!("{} ({} bytes)", f.name, f.data.len()))
+                            .collect::<Vec<_>>()),
+                    ),
+                    (
+                        "attachment_sha256",
+                        json!(read.iter().map(|f| f.sha256.clone()).collect::<Vec<_>>()),
+                    ),
+                ]
             }
             _ => Vec::new(),
         };
@@ -656,18 +734,36 @@ fn inbox_only(args: &Value) -> Result<(), SealSessionError> {
     }
 }
 
-/// What an outbound call gives: the recipients, subject and body.
+/// What an outbound call gives: the recipients, subject and body, and
+/// for `mail.send` and `mail.reply` the files to attach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Outbound {
     to: Vec<String>,
     cc: Vec<String>,
     subject: String,
     body: String,
+    attachments: Vec<FileRef>,
+}
+
+/// A file of the acting person's to attach: a volume and a path in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileRef {
+    volume_id: String,
+    path: String,
+}
+
+/// A file read for a message: its name, its bytes and their digest.
+struct ReadFile {
+    name: String,
+    content_type: String,
+    data: Vec<u8>,
+    sha256: String,
 }
 
 impl Outbound {
     /// Parse an outbound call's message. `to` and `subject` are required
-    /// unless `drafting`; the body always is.
+    /// unless `drafting`; the body always is. `attachments` is read unless
+    /// `drafting` (a draft attaches nothing).
     fn parse(args: &Value, drafting: bool) -> Result<Self, SealSessionError> {
         let to = addresses(args, "to")?;
         let cc = addresses(args, "cc")?;
@@ -690,13 +786,182 @@ impl Outbound {
             Some(Value::String(b)) if b.chars().count() <= SEND_BODY_MAX_CHARS => b.clone(),
             _ => return Err(invalid(BAD_BODY)),
         };
+        let attachments = if drafting {
+            Vec::new()
+        } else {
+            file_refs(args)?
+        };
         Ok(Self {
             to,
             cc,
             subject,
             body,
+            attachments,
         })
     }
+}
+
+/// The files of `attachments`: absent is none; at most
+/// [`ATTACHMENTS_MAX_FILES`].
+fn file_refs(args: &Value) -> Result<Vec<FileRef>, SealSessionError> {
+    let list = match args.get("attachments") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err(invalid(BAD_ATTACHMENTS)),
+    };
+    if list.len() > ATTACHMENTS_MAX_FILES {
+        return Err(invalid(TOO_MANY_ATTACHMENTS));
+    }
+    list.iter()
+        .map(|item| {
+            match (
+                item.get("volume_id").and_then(Value::as_str),
+                item.get("path").and_then(Value::as_str),
+            ) {
+                (Some(volume_id), Some(path)) if !path.trim().is_empty() => Ok(FileRef {
+                    volume_id: volume_id.to_string(),
+                    path: path.to_string(),
+                }),
+                _ => Err(invalid(BAD_ATTACHMENTS)),
+            }
+        })
+        .collect()
+}
+
+/// The refusal of a file that is not the person's, or no file at all.
+fn not_attachable(path: &str) -> SealSessionError {
+    let shown: String = path.chars().filter(|c| !c.is_control()).take(200).collect();
+    invalid(format!(
+        "'{shown}' is not a file of yours this tool can attach."
+    ))
+}
+
+/// The files an outbound request attaches; none for any other request.
+fn outbound_files(request: &Request) -> &[FileRef] {
+    match request {
+        Request::Send { message } | Request::Reply { message, .. } => &message.attachments,
+        _ => &[],
+    }
+}
+
+/// Why the files to attach were not read.
+enum NotAttached {
+    /// The file at this path is not a file of the person's.
+    NotYours(String),
+    /// The files come to more than [`ATTACHMENTS_MAX_BYTES`].
+    TooLarge,
+    /// The read itself failed.
+    Failed(SealSessionError),
+}
+
+impl NotAttached {
+    /// The refusal as the admission answers it.
+    fn refusal(self) -> SealSessionError {
+        match self {
+            NotAttached::NotYours(path) => not_attachable(&path),
+            NotAttached::TooLarge => invalid(ATTACHMENTS_TOO_LARGE),
+            NotAttached::Failed(e) => e,
+        }
+    }
+}
+
+/// Read `refs` as the acting person: each must be a file in one of their
+/// own volumes (`read_file` with the person as owner), and together at
+/// most [`ATTACHMENTS_MAX_BYTES`], which is checked on their sizes before
+/// any is read and again on the bytes read.
+async fn read_attachments(
+    files: &MailFiles,
+    acting: &MailActing,
+    refs: &[FileRef],
+) -> Result<Vec<ReadFile>, NotAttached> {
+    let Some(user_id) = acting.user_id.as_deref() else {
+        return Err(NotAttached::Failed(binding_required(NO_PERSON.to_string())));
+    };
+    let failed = |path: &str, e: FileOperationsError| match e {
+        FileOperationsError::Fsal(_) | FileOperationsError::Repository(_) => NotAttached::Failed(
+            SealSessionError::InternalError(format!("reading a file to attach failed: {e}"))
+                .answered(CallerAnswer::Internal(InternalFailure::Server)),
+        ),
+        _ => NotAttached::NotYours(path.to_string()),
+    };
+    let mut located = Vec::with_capacity(refs.len());
+    let mut total: u64 = 0;
+    for file in refs {
+        let volume_id = VolumeId::from_string(&file.volume_id)
+            .map_err(|_| NotAttached::NotYours(file.path.clone()))?;
+        let attributes = files
+            .file_operations
+            .get_attributes(&volume_id, &acting.tenant_id, user_id, &file.path)
+            .await
+            .map_err(|e| failed(&file.path, e))?;
+        if attributes.is_dir {
+            return Err(NotAttached::NotYours(file.path.clone()));
+        }
+        total = total.saturating_add(attributes.size_bytes);
+        located.push((volume_id, file, attributes.name));
+    }
+    if total > ATTACHMENTS_MAX_BYTES {
+        return Err(NotAttached::TooLarge);
+    }
+    let mut read = Vec::with_capacity(located.len());
+    let mut total: u64 = 0;
+    for (volume_id, file, name) in located {
+        let content = files
+            .file_operations
+            .read_file(&volume_id, &acting.tenant_id, user_id, &file.path)
+            .await
+            .map_err(|e| failed(&file.path, e))?;
+        total = total.saturating_add(content.data.len() as u64);
+        if total > ATTACHMENTS_MAX_BYTES {
+            return Err(NotAttached::TooLarge);
+        }
+        let content_type = infer::get(&content.data)
+            .map(|k| k.mime_type().to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let sha256 = format!("{:x}", sha2::Sha256::digest(&content.data));
+        read.push(ReadFile {
+            name,
+            content_type,
+            data: content.data,
+            sha256,
+        });
+    }
+    Ok(read)
+}
+
+/// The files to attach at the run: read again as the person, each digest
+/// compared with the one the admission wrote into the call's
+/// `attachment_sha256` before the person approved it. A file gone, or one
+/// whose bytes differ, refuses the send with nothing sent.
+async fn attachments_at_run(
+    files: &MailFiles,
+    acting: &MailActing,
+    refs: &[FileRef],
+    args: &Value,
+) -> Result<Vec<OutgoingAttachment>, SealSessionError> {
+    let approved: Vec<&str> = args
+        .get("attachment_sha256")
+        .and_then(Value::as_array)
+        .map(|digests| digests.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let read = match read_attachments(files, acting, refs).await {
+        Ok(read) => read,
+        // A file approved and now gone, or no longer the person's, is a
+        // file changed since the approval.
+        Err(NotAttached::NotYours(_)) => return Err(invalid(ATTACHMENT_CHANGED)),
+        Err(other) => return Err(other.refusal()),
+    };
+    if read.len() != approved.len() || read.iter().zip(&approved).any(|(f, d)| f.sha256 != *d) {
+        return Err(invalid(ATTACHMENT_CHANGED));
+    }
+    Ok(read
+        .into_iter()
+        .map(|f| OutgoingAttachment {
+            name: f.name,
+            content_type: f.content_type,
+            data: f.data,
+        })
+        .collect())
 }
 
 /// The addresses of the list argument `name`: absent is none.
@@ -909,14 +1174,24 @@ async fn run(
     connector: &dyn MailConnector,
     mailbox: &ToolMailbox,
     request: &Request,
+    attached: Vec<OutgoingAttachment>,
 ) -> Result<Value, SealSessionError> {
     match request {
         Request::Draft { message, thread_id } => {
             return draft(connector, mailbox, message, thread_id.as_deref()).await
         }
-        Request::Send { message } => return send(connector, mailbox, message, None).await,
+        Request::Send { message } => {
+            return send(connector, mailbox, message, None, attached).await
+        }
         Request::Reply { message, thread_id } => {
-            return send(connector, mailbox, message, Some(thread_id.as_str())).await
+            return send(
+                connector,
+                mailbox,
+                message,
+                Some(thread_id.as_str()),
+                attached,
+            )
+            .await
         }
         Request::Move { thread_id, to } => {
             return move_thread(connector, mailbox, thread_id, *to).await
@@ -1083,6 +1358,7 @@ fn compose(
     given: &Outbound,
     message_id: &str,
     threading: &Threading,
+    attachments: Vec<OutgoingAttachment>,
 ) -> OutgoingMessage {
     OutgoingMessage {
         from_address: mailbox.settings.address.clone(),
@@ -1095,6 +1371,7 @@ fn compose(
         in_reply_to: threading.in_reply_to.clone(),
         references: threading.references.clone(),
         date: chrono::Utc::now(),
+        attachments,
     }
 }
 
@@ -1119,7 +1396,7 @@ async fn draft(
             return Err(invalid(NO_DRAFTS));
         };
         let message_id = mint_message_id(&mailbox.settings.address);
-        let raw = compose(mailbox, given, &message_id, &threading).render();
+        let raw = compose(mailbox, given, &message_id, &threading, Vec::new()).render();
         session
             .append(&drafts, &["\\Draft", "\\Seen"], &raw)
             .await
@@ -1151,14 +1428,16 @@ enum SentCopy {
     Failed { reply: String },
 }
 
-/// `mail.send` and `mail.reply`: the message submitted over SMTP, then its
-/// copy saved to the Sent folder. A failure to save after the send is in
-/// the result, never an error.
+/// `mail.send` and `mail.reply`: the message, with the files `attached`
+/// after its text, submitted over SMTP, then its copy saved to the Sent
+/// folder. A failure to save after the send is in the result, never an
+/// error.
 async fn send(
     connector: &dyn MailConnector,
     mailbox: &ToolMailbox,
     given: &Outbound,
     thread_id: Option<&str>,
+    attached: Vec<OutgoingAttachment>,
 ) -> Result<Value, SealSessionError> {
     let threading = match thread_id {
         Some(thread_id) => {
@@ -1172,7 +1451,11 @@ async fn send(
         None => Threading::default(),
     };
     let message_id = mint_message_id(&mailbox.settings.address);
-    let raw = compose(mailbox, given, &message_id, &threading).render();
+    let attached_shown: Vec<Value> = attached
+        .iter()
+        .map(|f| json!({"name": f.name, "mime_type": f.content_type, "size": f.data.len()}))
+        .collect();
+    let raw = compose(mailbox, given, &message_id, &threading, attached).render();
     let recipients: Vec<String> = given.to.iter().chain(given.cc.iter()).cloned().collect();
     submission::submit(
         connector,
@@ -1202,6 +1485,9 @@ async fn send(
     if let Some(thread_id) = thread_id {
         answer["thread_id"] = json!(thread_id);
         answer["in_reply_to"] = json!(threading.in_reply_to);
+    }
+    if !attached_shown.is_empty() {
+        answer["attachments"] = Value::Array(attached_shown);
     }
     Ok(answer)
 }

@@ -252,6 +252,24 @@ impl ToolInvocationService {
         self
     }
 
+    /// The mail tools over another connector with the file services an
+    /// attachment is read and saved through (tests: loopback stand-ins and a
+    /// file service on a scratch directory).
+    pub fn with_mail_tools_and_files_over(
+        mut self,
+        mailboxes: Arc<dyn crate::application::credential_service::ToolMailboxSource>,
+        connector: Arc<dyn crate::infrastructure::mail::MailConnector>,
+        files: crate::application::tools::builtin_mail::MailFiles,
+    ) -> Self {
+        self.mail_tools = Some(Arc::new(
+            crate::application::tools::builtin_mail::MailTools::with_connector(
+                mailboxes, connector,
+            )
+            .with_files(files),
+        ));
+        self
+    }
+
     /// The calendar tools, resolving the acting person's calendar account
     /// through `accounts` and sending their requests over `https` with no
     /// redirect followed (AEGIS ADR-138 K1, K6).

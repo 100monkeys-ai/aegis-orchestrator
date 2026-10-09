@@ -66,7 +66,7 @@ async fn the_mail_send_contract_keys_the_request_and_the_policy_on_mailbox_and_l
     let mut wrong = Vec::new();
     match call(&send_args("b-1")).await {
         GateOutcome::Pending { result } => {
-            let expected = "mail.send\nmailbox: b-1\nto: ann@example.test, bob@example.test\ncc: accounts@example.test\nsubject: Invoice paid\nbody: Paid today.";
+            let expected = "mail.send\nmailbox: b-1\nto: ann@example.test, bob@example.test\ncc: accounts@example.test\nsubject: Invoice paid\nbody: Paid today.\nattachment_names: ";
             if result["summary"] != expected {
                 wrong.push(format!("the summary is {:?}", result["summary"]));
             }

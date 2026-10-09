@@ -45,7 +45,7 @@ use aegis_orchestrator_core::application::tool_invocation_service::{
     ToolInvocationResult, ToolInvocationService,
 };
 use aegis_orchestrator_core::application::tools::builtin_mail::{
-    MailActing, MailTools, NOT_GRANTED,
+    MailActing, MailFiles, MailTools, NOT_GRANTED,
 };
 use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
 use aegis_orchestrator_core::domain::credential::{
@@ -150,7 +150,7 @@ async fn the_eight_mail_tools_list_with_contracts_declaring_mailbox_and_four_are
         let summary: &[&str] = if matches!(name, "mail.delete" | "mail.archive") {
             &["mailbox", "thread_id", "subject", "from"]
         } else {
-            &["mailbox", "to", "cc", "subject", "body"]
+            &["mailbox", "to", "cc", "subject", "body", "attachment_names"]
         };
         let expected = if gated {
             ApprovalContract {
@@ -442,6 +442,16 @@ struct Harness {
 /// A tool service with `mailboxes`, the approval gate and one execution per
 /// entry of `runs` (its `contexts` input), each initiated by [`USER`].
 async fn harness(mailboxes: Vec<Owned>, runs: &[Option<Value>]) -> Harness {
+    harness_over(mailboxes, runs, None).await
+}
+
+/// [`harness`] whose mail tools hold `files`, the file services an
+/// attachment is read through.
+async fn harness_over(
+    mailboxes: Vec<Owned>,
+    runs: &[Option<Value>],
+    files: Option<MailFiles>,
+) -> Harness {
     let agent = agent();
     let agent_id = agent.id;
     let tenant = TenantId::default();
@@ -506,8 +516,17 @@ async fn harness(mailboxes: Vec<Owned>, runs: &[Option<Value>]) -> Harness {
         event_bus.clone(),
         None,
     )
-    .with_tool_approvals(approvals.clone())
-    .with_mail_tools_over(Arc::new(Mailboxes(mailboxes)), Arc::new(PlainConnector));
+    .with_tool_approvals(approvals.clone());
+    let service = match files {
+        Some(files) => service.with_mail_tools_and_files_over(
+            Arc::new(Mailboxes(mailboxes)),
+            Arc::new(PlainConnector),
+            files,
+        ),
+        None => {
+            service.with_mail_tools_over(Arc::new(Mailboxes(mailboxes)), Arc::new(PlainConnector))
+        }
+    };
     Harness {
         service: Arc::new(service),
         approvals,
@@ -602,12 +621,12 @@ async fn send_and_reply_answer_approval_pending_with_the_declared_summary_and_dr
         (
             "mail.send",
             json!({"mailbox": id, "to": [ANN], "subject": "Hello", "body": "Hi."}),
-            format!("mail.send\nmailbox: {id}\nto: {ANN}\ncc: \nsubject: Hello\nbody: Hi."),
+            format!("mail.send\nmailbox: {id}\nto: {ANN}\ncc: \nsubject: Hello\nbody: Hi.\nattachment_names: "),
         ),
         (
             "mail.reply",
             json!({"mailbox": id, "thread_id": "<a1@x>", "to": [ANN], "cc": ["b@example.test"], "subject": "Re: Invoice", "body": "Got it."}),
-            format!("mail.reply\nmailbox: {id}\nto: {ANN}\ncc: b@example.test\nsubject: Re: Invoice\nbody: Got it."),
+            format!("mail.reply\nmailbox: {id}\nto: {ANN}\ncc: b@example.test\nsubject: Re: Invoice\nbody: Got it.\nattachment_names: "),
         ),
     ] {
         let result = h.call(0, tool, args).await;
@@ -1892,4 +1911,596 @@ async fn an_archive_its_admission_would_refuse_is_refused_before_the_gate_with_n
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// Attachments going out (the Update of 2026-10-08 (5) clause 32)
+// ---------------------------------------------------------------------------
+
+mod attachments_out {
+    use super::*;
+    use aegis_orchestrator_core::application::file_operations_service::FileOperationsService;
+    use aegis_orchestrator_core::application::tools::builtin_mail::{
+        ATTACHMENTS_TOO_LARGE, ATTACHMENT_CHANGED, TOO_MANY_ATTACHMENTS,
+    };
+    use aegis_orchestrator_core::application::user_volume_service::UserVolumeService;
+    use aegis_orchestrator_core::application::volume_manager::VolumeService;
+    use aegis_orchestrator_core::domain::events::StorageEvent;
+    use aegis_orchestrator_core::domain::fsal::EventPublisher;
+    use aegis_orchestrator_core::domain::iam::ZaruTier;
+    use aegis_orchestrator_core::domain::repository::VolumeRepository;
+    use aegis_orchestrator_core::domain::runtime::InstanceId;
+    use aegis_orchestrator_core::domain::volume::{
+        AccessMode, StorageClass, StorageTierLimits, Volume, VolumeBackend, VolumeId, VolumeMount,
+        VolumeOwnership,
+    };
+    use aegis_orchestrator_core::infrastructure::repositories::{
+        InMemoryAgentRepository, InMemoryExecutionRepository,
+    };
+    use sha2::Digest;
+    use std::path::PathBuf;
+
+    struct NoOpStorageEvents;
+
+    #[async_trait]
+    impl EventPublisher for NoOpStorageEvents {
+        async fn publish_storage_event(&self, _event: StorageEvent) {}
+    }
+
+    /// Volumes as the storage layer makes them: host directories under
+    /// `/hosts/<id>` in the scratch root the file service serves.
+    struct HostVolumes {
+        repo: Arc<InMemoryVolumeRepository>,
+    }
+
+    #[async_trait]
+    impl VolumeService for HostVolumes {
+        async fn create_volume(
+            &self,
+            name: String,
+            tenant_id: TenantId,
+            storage_class: StorageClass,
+            size_limit_mb: u64,
+            ownership: VolumeOwnership,
+        ) -> anyhow::Result<VolumeId> {
+            let id = VolumeId::new();
+            let mut volume = Volume::new(
+                name,
+                tenant_id,
+                storage_class,
+                VolumeBackend::HostPath {
+                    path: PathBuf::from(format!("/hosts/{id}")),
+                },
+                size_limit_mb * 1024 * 1024,
+                ownership,
+            )?;
+            volume.id = id;
+            volume.mark_available()?;
+            self.repo.save(&volume).await?;
+            Ok(id)
+        }
+        async fn get_volume(&self, id: VolumeId) -> anyhow::Result<Volume> {
+            self.repo
+                .find_by_id(id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("not found"))
+        }
+        async fn list_volumes_by_tenant(&self, tenant_id: TenantId) -> anyhow::Result<Vec<Volume>> {
+            Ok(self.repo.find_by_tenant(tenant_id).await?)
+        }
+        async fn list_volumes_by_ownership(
+            &self,
+            ownership: &VolumeOwnership,
+        ) -> anyhow::Result<Vec<Volume>> {
+            Ok(self.repo.find_by_ownership(ownership).await?)
+        }
+        async fn attach_volume(
+            &self,
+            _vid: VolumeId,
+            _iid: InstanceId,
+            _m: PathBuf,
+            _a: AccessMode,
+        ) -> anyhow::Result<VolumeMount> {
+            unimplemented!()
+        }
+        async fn detach_volume(&self, _vid: VolumeId, _iid: InstanceId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_volume(&self, _volume_id: VolumeId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn get_volume_usage(&self, _v: VolumeId) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn cleanup_expired_volumes(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn create_volumes_for_execution(
+            &self,
+            _eid: ExecutionId,
+            _tid: TenantId,
+            _vs: &[aegis_orchestrator_core::domain::agent::VolumeSpec],
+            _m: &str,
+        ) -> anyhow::Result<Vec<Volume>> {
+            Ok(vec![])
+        }
+        async fn persist_external_volume(
+            &self,
+            _vid: VolumeId,
+            _n: String,
+            _t: TenantId,
+            _p: String,
+            _s: u64,
+            _o: VolumeOwnership,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A PDF's first bytes, which content sniffing names `application/pdf`.
+    const PDF: &[u8] =
+        b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj << /Type /Catalog >> endobj\ntrailer << >>\n%%EOF\n";
+    /// A text file, which content sniffing does not name.
+    const NOTES: &[u8] = b"Line one.\nLine two.\n";
+    /// Another person in the same tenant.
+    const OTHER: &str = "someone-else";
+
+    /// A scratch file service with the person's own volume and another
+    /// person's, in the default tenant.
+    struct Files {
+        _root: tempfile::TempDir,
+        files: MailFiles,
+        own: VolumeId,
+        others: VolumeId,
+    }
+
+    async fn files() -> Files {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = Arc::new(InMemoryVolumeRepository::new());
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(dir.path()).unwrap()),
+            volumes.clone(),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoOpStorageEvents),
+        ));
+        let files = MailFiles {
+            file_operations: Arc::new(FileOperationsService::new(
+                fsal,
+                Arc::new(InMemoryExecutionRepository::new()),
+                Arc::new(InMemoryAgentRepository::new()),
+            )),
+            user_volumes: Arc::new(UserVolumeService::new(
+                volumes.clone(),
+                Arc::new(HostVolumes {
+                    repo: volumes.clone(),
+                }),
+                Arc::new(EventBus::new(16)),
+                StorageTierLimits::default(),
+            )),
+        };
+        let tenant = TenantId::default();
+        let own = files
+            .user_volumes
+            .find_or_provision_chat_attachments(&tenant, USER, &ZaruTier::Free)
+            .await
+            .unwrap();
+        let others = files
+            .user_volumes
+            .find_or_provision_chat_attachments(&tenant, OTHER, &ZaruTier::Free)
+            .await
+            .unwrap();
+        Files {
+            _root: dir,
+            files,
+            own,
+            others,
+        }
+    }
+
+    impl Files {
+        async fn put(&self, volume: VolumeId, owner: &str, path: &str, bytes: &[u8]) {
+            self.files
+                .file_operations
+                .write_file(&volume, &TenantId::default(), owner, path, bytes, u64::MAX)
+                .await
+                .unwrap();
+        }
+
+        fn file(&self, volume: VolumeId, path: &str) -> Value {
+            json!({"volume_id": volume.to_string(), "path": path})
+        }
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    /// A header's value in a head block, folded lines joined.
+    fn header(block: &str, name: &str) -> Option<String> {
+        let head = block.split("\r\n\r\n").next().unwrap_or_default();
+        head.replace("\r\n ", " ").split("\r\n").find_map(|line| {
+            let (n, v) = line.split_once(':')?;
+            n.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
+        })
+    }
+
+    /// A message's parts, each its head and its decoded bytes, when it is
+    /// `multipart/mixed`; `None` otherwise.
+    fn parts(raw: &str) -> Option<Vec<(String, Vec<u8>)>> {
+        let boundary = header(raw, "Content-Type")?
+            .strip_prefix("multipart/mixed; boundary=\"")?
+            .strip_suffix('"')?
+            .to_string();
+        let body = raw.split_once("\r\n\r\n")?.1;
+        let closing = format!("--{boundary}--\r\n");
+        Some(
+            body.strip_suffix(&closing)?
+                .split(&format!("--{boundary}\r\n"))
+                .skip(1)
+                .map(|part| {
+                    let (head, b64) = part.split_once("\r\n\r\n").unwrap_or((part, ""));
+                    (
+                        head.to_string(),
+                        STANDARD.decode(b64.replace("\r\n", "")).unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    async fn approve(
+        h: &Harness,
+        pending: &Result<ToolInvocationResult, SealSessionError>,
+    ) -> aegis_orchestrator_core::domain::tool_approval::ToolApprovalRequest {
+        let approval_id = direct(pending)
+            .and_then(|v| v["approval_id"].as_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("the call did not wait for approval: {}", told(pending)));
+        h.approvals
+            .decide(
+                aegis_orchestrator_core::domain::tool_approval::ToolApprovalId::from_string(
+                    &approval_id,
+                )
+                .unwrap(),
+                &TenantId::default(),
+                USER,
+                ToolApprovalDecision::Once,
+                h.service.as_ref(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// `mail.send` and `mail.reply` offer `attachments` (at most 10 files,
+    /// each a `volume_id` and a `path`) and say what they attach; the
+    /// draft offers none, and the summary's `attachment_names` is written
+    /// by the admission, never offered to the model.
+    #[tokio::test]
+    async fn send_and_reply_offer_attachments_and_say_so_and_the_draft_does_not() {
+        let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+        let tools = router.list_tools().await.unwrap();
+        let mut wrong = Vec::new();
+        for name in ["mail.send", "mail.reply", "mail.draft"] {
+            let Some(tool) = tools.iter().find(|t| t.name == name) else {
+                wrong.push(format!("{name} is not listed"));
+                continue;
+            };
+            let offered = &tool.input_schema["properties"]["attachments"];
+            for written in ["attachment_names", "attachment_sha256"] {
+                if tool.input_schema["properties"].get(written).is_some() {
+                    wrong.push(format!("{name} offers {written}"));
+                }
+            }
+            if name == "mail.draft" {
+                if !offered.is_null() {
+                    wrong.push("mail.draft offers attachments".to_string());
+                }
+                continue;
+            }
+            if offered["type"] != "array"
+                || offered["maxItems"] != 10
+                || offered["items"]["required"] != json!(["volume_id", "path"])
+            {
+                wrong.push(format!("{name}'s attachments are {offered}"));
+            }
+            if !tool
+                .description
+                .contains("with up to 10 of the person's own files attached (20 MiB together)")
+                || !tool
+                    .description
+                    .contains("which shows each attached file's name and size")
+            {
+                wrong.push(format!("{name}'s description: {}", tool.description));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The admission reads both files as the person and writes their names
+    /// and sizes and their digests over the model's values; the person
+    /// reads the names before answering; on approval the message goes out
+    /// `multipart/mixed`, the text first, then each file with its sniffed
+    /// type and its RFC 2231 name, and its copy is saved to Sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_with_two_files_is_approved_on_their_names_and_goes_out_multipart_mixed() {
+        let f = files().await;
+        f.put(f.own, USER, "report.pdf", PDF).await;
+        f.put(f.own, USER, "notes été.txt", NOTES).await;
+        let (mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+        let id = owned.id.0.to_string();
+        let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+        let pending = h
+            .call(
+                0,
+                "mail.send",
+                json!({
+                    "mailbox": id, "to": [ANN], "subject": "The report", "body": "Attached.",
+                    "attachments": [f.file(f.own, "report.pdf"), f.file(f.own, "notes été.txt")],
+                    "attachment_names": ["invoice.pdf (1 bytes)"],
+                    "attachment_sha256": ["00"],
+                }),
+            )
+            .await;
+        let mut wrong = Vec::new();
+        let names = format!(
+            "report.pdf ({} bytes), notes été.txt ({} bytes)",
+            PDF.len(),
+            NOTES.len()
+        );
+        match direct(&pending) {
+            Some(value) if value["status"] == "approval_pending" => {
+                let expected = format!("mail.send\nmailbox: {id}\nto: {ANN}\ncc: \nsubject: The report\nbody: Attached.\nattachment_names: {names}");
+                if value["summary"] != expected.as_str() {
+                    wrong.push(format!("the summary is {:?}", value["summary"]));
+                }
+            }
+            _ => wrong.push(format!(
+                "mail.send did not wait for approval: {}",
+                told(&pending)
+            )),
+        }
+        let rows = h.rows().await;
+        match rows.as_slice() {
+            [row] => {
+                if row.arguments["attachment_sha256"] != json!([sha256(PDF), sha256(NOTES)]) {
+                    wrong.push(format!(
+                        "the stored digests are {}",
+                        row.arguments["attachment_sha256"]
+                    ));
+                }
+            }
+            other => wrong.push(format!("{} rows were written, not 1", other.len())),
+        }
+        if smtp.standin.connections() != 0 {
+            wrong.push("a pending send reached the SMTP server".to_string());
+        }
+        let decided = approve(&h, &pending).await;
+        let result = decided.result.clone().unwrap_or(Value::Null);
+        if result["attachments"]
+            != json!([
+                {"name": "report.pdf", "mime_type": "application/pdf", "size": PDF.len()},
+                {"name": "notes été.txt", "mime_type": "application/octet-stream", "size": NOTES.len()},
+            ])
+        {
+            wrong.push(format!(
+                "the approved send does not answer its files: {result} {:?}",
+                decided.error
+            ));
+        }
+        match smtp.submitted().as_slice() {
+            [message] => match parts(&message.data).as_deref() {
+                Some([(text, body), (pdf, pdf_bytes), (notes, notes_bytes)]) => {
+                    if header(text, "Content-Type").as_deref() != Some("text/plain; charset=utf-8")
+                        || body != b"Attached."
+                    {
+                        wrong.push(format!("the first part is not the text: {text}"));
+                    }
+                    if header(pdf, "Content-Type").as_deref() != Some("application/pdf")
+                        || header(pdf, "Content-Disposition").as_deref()
+                            != Some("attachment; filename*=utf-8''report.pdf")
+                        || pdf_bytes != PDF
+                    {
+                        wrong.push(format!("the PDF part is {pdf}"));
+                    }
+                    if header(notes, "Content-Type").as_deref() != Some("application/octet-stream")
+                        || header(notes, "Content-Disposition").as_deref()
+                            != Some("attachment; filename*=utf-8''notes%20%C3%A9t%C3%A9.txt")
+                        || notes_bytes != NOTES
+                    {
+                        wrong.push(format!("the text file's part is {notes}"));
+                    }
+                }
+                other => wrong.push(format!(
+                    "the message is not multipart/mixed with the text and two files: {other:?} {}",
+                    message.data
+                )),
+            },
+            other => wrong.push(format!("{} messages were submitted, not 1", other.len())),
+        }
+        match mailbox.folder_messages("Sent").as_slice() {
+            [copy] if parts(&copy.raw).map(|p| p.len()) == Some(3) => {}
+            other => wrong.push(format!(
+                "Sent holds {} messages, or not the files",
+                other.len()
+            )),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A send that attaches nothing shows an empty `attachment_names` over
+    /// any value the model wrote, and its message stays plain text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_attaching_nothing_shows_no_names_the_model_wrote_and_stays_plain_text() {
+        let f = files().await;
+        let (_mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+        let id = owned.id.0.to_string();
+        let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+        let pending = h
+            .call(
+                0,
+                "mail.send",
+                json!({
+                    "mailbox": id, "to": [ANN], "subject": "Hello", "body": "Hi.",
+                    "attachment_names": ["invoice.pdf (1 bytes)"],
+                    "attachment_sha256": ["00"],
+                }),
+            )
+            .await;
+        let mut wrong = Vec::new();
+        let expected = format!(
+            "mail.send\nmailbox: {id}\nto: {ANN}\ncc: \nsubject: Hello\nbody: Hi.\nattachment_names: "
+        );
+        if direct(&pending).map(|v| v["summary"].clone()) != Some(json!(expected)) {
+            wrong.push(format!(
+                "the summary is not empty of names: {}",
+                told(&pending)
+            ));
+        }
+        let decided = approve(&h, &pending).await;
+        match smtp.submitted().as_slice() {
+            [message] => {
+                if header(&message.data, "Content-Type").as_deref()
+                    != Some("text/plain; charset=utf-8")
+                {
+                    wrong.push(format!("the message is not plain text: {}", message.data));
+                }
+            }
+            other => wrong.push(format!(
+                "{} messages were submitted, not 1: {:?}",
+                other.len(),
+                decided.error
+            )),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A file changed, or gone, after the person approved the send refuses
+    /// it at the run with nothing sent and nothing saved to Sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_changed_or_gone_after_approval_refuses_the_send_and_nothing_is_sent() {
+        let mut wrong = Vec::new();
+        for gone in [false, true] {
+            let f = files().await;
+            f.put(f.own, USER, "report.pdf", PDF).await;
+            let (mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+            let id = owned.id.0.to_string();
+            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            let pending = h
+                .call(
+                    0,
+                    "mail.reply",
+                    json!({
+                        "mailbox": id, "thread_id": "<a1@x>", "to": [ANN],
+                        "subject": "Re: Invoice", "body": "The report.",
+                        "attachments": [f.file(f.own, "report.pdf")],
+                    }),
+                )
+                .await;
+            if gone {
+                f.files
+                    .file_operations
+                    .delete_path(&f.own, &TenantId::default(), USER, "report.pdf")
+                    .await
+                    .unwrap();
+            } else {
+                f.put(f.own, USER, "report.pdf", b"%PDF-1.4 another document")
+                    .await;
+            }
+            let decided = approve(&h, &pending).await;
+            let said = format!("{:?} {:?}", decided.error, decided.result);
+            if !said.contains(ATTACHMENT_CHANGED) {
+                wrong.push(format!(
+                    "a file {} after approval did not refuse the send: {said}",
+                    if gone { "deleted" } else { "changed" }
+                ));
+            }
+            if !smtp.submitted().is_empty() || smtp.standin.connections() != 0 {
+                wrong.push(format!(
+                    "a send whose file {} reached the SMTP server",
+                    if gone { "went" } else { "changed" }
+                ));
+            }
+            if !mailbox.folder_messages("Sent").is_empty() {
+                wrong.push("a refused send was saved to Sent".to_string());
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Another person's file, a path that is no file, a volume id that is
+    /// none, eleven files, and files coming to more than 20 MiB are each
+    /// refused before the gate with its sentence: no row is written and no
+    /// mail server is reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attachments_not_the_persons_too_many_or_too_large_are_refused_before_the_gate() {
+        let f = files().await;
+        f.put(f.others, OTHER, "plan.pdf", PDF).await;
+        f.put(f.own, USER, "report.pdf", PDF).await;
+        let half = vec![b'x'; 10 * 1024 * 1024 + 512 * 1024];
+        f.put(f.own, USER, "big-one.bin", &half).await;
+        f.put(f.own, USER, "big-two.bin", &half).await;
+        let (mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+        let id = owned.id.0.to_string();
+        let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+        let eleven: Vec<Value> = (0..11).map(|_| f.file(f.own, "report.pdf")).collect();
+        let mut wrong = Vec::new();
+        for (case, tool, attachments, expected) in [
+            (
+                "another person's file",
+                "mail.send",
+                json!([f.file(f.own, "report.pdf"), f.file(f.others, "plan.pdf")]),
+                "'plan.pdf' is not a file of yours this tool can attach.".to_string(),
+            ),
+            (
+                "another person's file in a reply",
+                "mail.reply",
+                json!([f.file(f.others, "plan.pdf")]),
+                "'plan.pdf' is not a file of yours this tool can attach.".to_string(),
+            ),
+            (
+                "a path that is no file",
+                "mail.send",
+                json!([f.file(f.own, "missing.pdf")]),
+                "'missing.pdf' is not a file of yours this tool can attach.".to_string(),
+            ),
+            (
+                "a volume id that is none",
+                "mail.send",
+                json!([{"volume_id": "not-a-volume", "path": "report.pdf"}]),
+                "'report.pdf' is not a file of yours this tool can attach.".to_string(),
+            ),
+            (
+                "eleven files",
+                "mail.send",
+                json!(eleven),
+                TOO_MANY_ATTACHMENTS.to_string(),
+            ),
+            (
+                "files over 20 MiB together",
+                "mail.send",
+                json!([f.file(f.own, "big-one.bin"), f.file(f.own, "big-two.bin")]),
+                ATTACHMENTS_TOO_LARGE.to_string(),
+            ),
+        ] {
+            let mut args = json!({"mailbox": id, "to": [ANN], "subject": "Re: Invoice", "body": "Files.", "attachments": attachments});
+            if tool == "mail.reply" {
+                args["thread_id"] = json!("<a1@x>");
+            }
+            let result = h.call(0, tool, args).await;
+            if told(&result) != expected {
+                wrong.push(format!("{case}: {}", told(&result)));
+            }
+        }
+        if !h.rows().await.is_empty() {
+            wrong.push(format!(
+                "{} approval rows were written",
+                h.rows().await.len()
+            ));
+        }
+        if smtp.standin.connections() != 0 || !mailbox.folder_messages("Sent").is_empty() {
+            wrong.push("a refused call reached a mail server".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }

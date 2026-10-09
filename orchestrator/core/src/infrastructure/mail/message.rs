@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! An outgoing message (RFC 5322, RFC 2045, RFC 2047) for the outbound mail
 //! tools (AEGIS ADR-125 D4, its Update of 2026-10-07 (3) clauses 13 and 14):
-//! plain text only, `text/plain; charset=utf-8` in base64, with a
-//! `Message-ID` the orchestrator mints as `<uuid@domain of the address>`.
+//! the text as `text/plain; charset=utf-8` in base64, with a `Message-ID`
+//! the orchestrator mints as `<uuid@domain of the address>`. A message
+//! carrying files (the Update of 2026-10-08 (5) clause 32) is
+//! `multipart/mixed`: the text first, then each file in base64 with its
+//! sniffed type and its name as an RFC 2231 `filename`. A message with no
+//! file is written exactly as before.
 //!
 //! Every header value is checked or encoded here, so no argument can add a
 //! header: an address is plain ASCII with no whitespace or special
@@ -41,6 +45,17 @@ pub fn mint_message_id(address: &str) -> String {
     format!("<{}@{domain}>", uuid::Uuid::new_v4())
 }
 
+/// A file a message carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    /// The file's name, written as an RFC 2231 `filename`.
+    pub name: String,
+    /// The type sniffed from the bytes; `application/octet-stream` when
+    /// nothing is recognised.
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
 /// The message the tools write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutgoingMessage {
@@ -56,6 +71,9 @@ pub struct OutgoingMessage {
     /// The `References` ids, in order.
     pub references: Vec<String>,
     pub date: chrono::DateTime<chrono::Utc>,
+    /// The files after the text, in order; none makes a `text/plain`
+    /// message.
+    pub attachments: Vec<OutgoingAttachment>,
 }
 
 impl OutgoingMessage {
@@ -85,19 +103,105 @@ impl OutgoingMessage {
             head.push(format!("References: {}", self.references.join(" ")));
         }
         head.push("MIME-Version: 1.0".to_string());
-        head.push("Content-Type: text/plain; charset=utf-8".to_string());
-        head.push("Content-Transfer-Encoding: base64".to_string());
 
         let text = self.body.replace("\r\n", "\n").replace('\n', "\r\n");
-        let encoded = STANDARD.encode(text.as_bytes());
         let mut out = head.join("\r\n");
-        out.push_str("\r\n\r\n");
-        for chunk in encoded.as_bytes().chunks(76) {
-            out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
-            out.push_str("\r\n");
+        out.push_str("\r\n");
+        if self.attachments.is_empty() {
+            out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+            out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+            push_base64(&mut out, text.as_bytes());
+            return out.into_bytes();
         }
+        // Base64 lines hold no `_`, so this boundary cannot occur in a part.
+        let boundary = format!("=_aegis_{}", uuid::Uuid::new_v4().simple());
+        out.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
+        ));
+        out.push_str(&format!("--{boundary}\r\n"));
+        out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+        out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+        push_base64(&mut out, text.as_bytes());
+        for attachment in &self.attachments {
+            out.push_str(&format!("--{boundary}\r\n"));
+            out.push_str(&format!(
+                "Content-Type: {}\r\n",
+                media_type(&attachment.content_type)
+            ));
+            out.push_str(&format!(
+                "Content-Disposition: attachment;{}\r\n",
+                rfc2231_filename(&attachment.name)
+            ));
+            out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+            push_base64(&mut out, &attachment.data);
+        }
+        out.push_str(&format!("--{boundary}--\r\n"));
         out.into_bytes()
     }
+}
+
+/// `data` in base64, in lines of 76 characters, each ended by CRLF.
+fn push_base64(out: &mut String, data: &[u8]) {
+    let encoded = STANDARD.encode(data);
+    for chunk in encoded.as_bytes().chunks(76) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        out.push_str("\r\n");
+    }
+}
+
+/// A media type as a header carries it: `type/subtype` of RFC 2045 token
+/// characters, else `application/octet-stream`.
+fn media_type(s: &str) -> &str {
+    let token = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    match s.split_once('/') {
+        Some((kind, sub)) if token(kind) && token(sub) => s,
+        _ => "application/octet-stream",
+    }
+}
+
+/// The longest run of encoded characters one `filename*` segment carries.
+const FILENAME_SEGMENT_CHARS: usize = 60;
+
+/// `name` as the RFC 2231 `filename` parameter of a `Content-Disposition`,
+/// with its leading space: UTF-8, every byte but an `attr-char`
+/// percent-encoded, as one `filename*=` or, when long, as continuations
+/// `filename*0*=`, `filename*1*=`, ... each folded onto a line of its own.
+fn rfc2231_filename(name: &str) -> String {
+    let attr_char = |b: u8| b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b);
+    let mut pieces: Vec<String> = Vec::new();
+    for b in name.bytes() {
+        if attr_char(b) {
+            pieces.push((b as char).to_string());
+        } else {
+            pieces.push(format!("%{b:02X}"));
+        }
+    }
+    let mut segments: Vec<String> = Vec::new();
+    let mut segment = String::new();
+    for piece in pieces {
+        if segment.len() + piece.len() > FILENAME_SEGMENT_CHARS {
+            segments.push(std::mem::take(&mut segment));
+        }
+        segment.push_str(&piece);
+    }
+    segments.push(segment);
+    if segments.len() == 1 {
+        return format!(" filename*=utf-8''{}", segments[0]);
+    }
+    segments
+        .iter()
+        .enumerate()
+        .map(|(i, segment)| {
+            let charset = if i == 0 { "utf-8''" } else { "" };
+            format!("\r\n filename*{i}*={charset}{segment}")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 /// Whether `s` can be written in a header as it is: printable ASCII and
@@ -193,6 +297,7 @@ mod tests {
             in_reply_to: None,
             references: Vec::new(),
             date: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            attachments: Vec::new(),
         };
         let raw = String::from_utf8(message.render()).unwrap();
         assert!(raw.is_ascii(), "{raw}");
@@ -203,5 +308,190 @@ mod tests {
             String::from_utf8(STANDARD.decode(body).unwrap()).unwrap(),
             "Line one\r\nLine two"
         );
+    }
+
+    fn message(attachments: Vec<OutgoingAttachment>) -> OutgoingMessage {
+        OutgoingMessage {
+            from_address: "owner@example.test".to_string(),
+            from_name: Some("Mailbox Owner".to_string()),
+            to: vec!["ann@example.test".to_string()],
+            cc: vec!["bob@example.test".to_string()],
+            subject: "Invoice".to_string(),
+            body: "Paid.\nThanks.".to_string(),
+            message_id: "<id@example.test>".to_string(),
+            in_reply_to: Some("<parent@example.test>".to_string()),
+            references: vec![
+                "<root@example.test>".to_string(),
+                "<parent@example.test>".to_string(),
+            ],
+            date: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            attachments,
+        }
+    }
+
+    /// A header's value in `block` (a part's or the message's head),
+    /// unfolded.
+    fn header(block: &str, name: &str) -> Option<String> {
+        let head = block.split("\r\n\r\n").next().unwrap_or_default();
+        head.replace("\r\n ", " ").split("\r\n").find_map(|line| {
+            let (n, v) = line.split_once(':')?;
+            n.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+        })
+    }
+
+    #[test]
+    fn a_message_with_no_file_is_written_exactly_as_a_plain_text_message() {
+        let raw = String::from_utf8(message(Vec::new()).render()).unwrap();
+        let expected = "From: Mailbox Owner <owner@example.test>\r\n\
+To: ann@example.test\r\n\
+Cc: bob@example.test\r\n\
+Subject: Invoice\r\n\
+Date: Thu, 1 Jan 1970 00:00:00 +0000\r\n\
+Message-ID: <id@example.test>\r\n\
+In-Reply-To: <parent@example.test>\r\n\
+References: <root@example.test> <parent@example.test>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+UGFpZC4NClRoYW5rcy4=\r\n";
+        assert_eq!(raw, expected, "a message with no file changed its bytes");
+    }
+
+    #[test]
+    fn a_message_with_two_files_is_multipart_mixed_with_the_text_first_then_each_file() {
+        let pdf = b"%PDF-1.4 a small document".to_vec();
+        let png: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        let raw = String::from_utf8(
+            message(vec![
+                OutgoingAttachment {
+                    name: "report.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    data: pdf.clone(),
+                },
+                OutgoingAttachment {
+                    name: "été photo.png".to_string(),
+                    content_type: "image/png".to_string(),
+                    data: png.clone(),
+                },
+            ])
+            .render(),
+        )
+        .unwrap();
+        let mut wrong = Vec::new();
+        if !raw.is_ascii() {
+            wrong.push("the message is not ASCII".to_string());
+        }
+        let content_type = header(&raw, "Content-Type").unwrap_or_default();
+        let boundary = content_type
+            .strip_prefix("multipart/mixed; boundary=\"")
+            .and_then(|b| b.strip_suffix('"'))
+            .unwrap_or_default()
+            .to_string();
+        if boundary.is_empty() {
+            wrong.push(format!(
+                "the message is not multipart/mixed: {content_type:?}"
+            ));
+        }
+        if header(&raw, "Message-ID").as_deref() != Some("<id@example.test>")
+            || header(&raw, "In-Reply-To").as_deref() != Some("<parent@example.test>")
+        {
+            wrong.push("the message's own headers are not the call's".to_string());
+        }
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or_default();
+        let closing = format!("--{boundary}--\r\n");
+        if !body.ends_with(&closing) {
+            wrong.push("the multipart body is not closed by its boundary".to_string());
+        }
+        let parts: Vec<&str> = body
+            .trim_end_matches(&closing)
+            .split(&format!("--{boundary}\r\n"))
+            .skip(1)
+            .collect();
+        let decoded = |part: &str| {
+            let b64 = part
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b)
+                .unwrap_or_default();
+            STANDARD.decode(b64.replace("\r\n", "")).unwrap_or_default()
+        };
+        match parts.as_slice() {
+            [text, first, second] => {
+                if header(text, "Content-Type").as_deref() != Some("text/plain; charset=utf-8")
+                    || decoded(text) != b"Paid.\r\nThanks."
+                {
+                    wrong.push(format!("the first part is not the text: {text:?}"));
+                }
+                for (part, kind, disposition, data) in [
+                    (
+                        first,
+                        "application/pdf",
+                        "attachment; filename*=utf-8''report.pdf",
+                        &pdf,
+                    ),
+                    (
+                        second,
+                        "image/png",
+                        "attachment; filename*=utf-8''%C3%A9t%C3%A9%20photo.png",
+                        &png,
+                    ),
+                ] {
+                    if header(part, "Content-Type").as_deref() != Some(kind)
+                        || header(part, "Content-Disposition").as_deref() != Some(disposition)
+                        || header(part, "Content-Transfer-Encoding").as_deref() != Some("base64")
+                    {
+                        wrong.push(format!(
+                            "a file's part is not {kind} named by RFC 2231: {:?}",
+                            part.split("\r\n\r\n").next().unwrap_or_default()
+                        ));
+                    }
+                    if &decoded(part) != data {
+                        wrong.push(format!("the {kind} file did not survive its base64"));
+                    }
+                }
+            }
+            other => wrong.push(format!(
+                "the message holds {} parts, not the text and two files",
+                other.len()
+            )),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn a_files_name_is_percent_encoded_and_a_long_one_continued_so_no_name_writes_a_header() {
+        assert_eq!(
+            rfc2231_filename("a\"b\r\nBcc: x@y.pdf"),
+            " filename*=utf-8''a%22b%0D%0ABcc%3A%20x%40y.pdf"
+        );
+        let long = format!("{}.txt", "n".repeat(130));
+        let written = rfc2231_filename(&long);
+        let segments: Vec<&str> = written.split(";\r\n ").collect();
+        assert!(
+            written.starts_with("\r\n filename*0*=utf-8''nnn")
+                && segments.len() == 3
+                && segments[1].starts_with("filename*1*=nnn")
+                && segments[2].starts_with("filename*2*=")
+                && written.ends_with(".txt"),
+            "a long name is not continued: {written:?}"
+        );
+        let rejoined: String = segments
+            .iter()
+            .map(|s| s.trim_start_matches("\r\n ").split_once('=').unwrap().1)
+            .collect::<String>()
+            .trim_start_matches("utf-8''")
+            .to_string();
+        assert_eq!(
+            rejoined, long,
+            "the continued name does not rejoin to the name"
+        );
+        assert_eq!(
+            media_type("text/plain\r\nBcc: x@y"),
+            "application/octet-stream"
+        );
+        assert_eq!(media_type("image/png"), "image/png");
     }
 }

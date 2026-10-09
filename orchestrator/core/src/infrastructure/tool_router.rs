@@ -142,8 +142,8 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("web.search", "Performs an internet search query.").skip_judge(),
     BuiltinToolDefinition::new("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown. Returns at most 50,000 characters of the page per call: a longer page comes back cut, with truncated, total_chars, next_offset and a notice, and the offset argument reads on.").skip_judge(),
     BuiltinToolDefinition::new("mail.draft", "Saves a plain-text message as a draft in a connected mailbox's Drafts folder, optionally as a reply in a thread. Sends nothing."),
-    BuiltinToolDefinition::new("mail.send", "Sends a plain-text message from a connected mailbox to the addresses in to and cc, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
-    BuiltinToolDefinition::new("mail.reply", "Replies in a thread of a connected mailbox: sends a plain-text message to the addresses in to and cc, threaded to the thread's newest message, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
+    BuiltinToolDefinition::new("mail.send", "Sends a plain-text message from a connected mailbox to the addresses in to and cc, with up to 10 of the person's own files attached (20 MiB together), then saves a copy in its Sent folder. Waits for the person's approval, which shows each attached file's name and size, before anything is sent; a file changed after the approval is not sent.").requires_approval(),
+    BuiltinToolDefinition::new("mail.reply", "Replies in a thread of a connected mailbox: sends a plain-text message to the addresses in to and cc, threaded to the thread's newest message, with up to 10 of the person's own files attached (20 MiB together), then saves a copy in its Sent folder. Waits for the person's approval, which shows each attached file's name and size, before anything is sent; a file changed after the approval is not sent.").requires_approval(),
     BuiltinToolDefinition::new("mail.list", "Lists threads in one folder of a connected mailbox that match a query, newest first: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers each thread's id, subject, participants, latest date, message count, unread count, flag and labels, and the folder read. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.read", "Reads one thread in one folder of a connected mailbox: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers every message of the thread in that folder, oldest first, with its uid, headers, flags, labels, plain-text body and attachments (each by name, type, size and part number, which mail.attachment saves), and the folder read; a thread's id is the same in every folder. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.attachment", "Saves one attachment of a message in a connected mailbox to your files: the message by its uid in one folder (the inbox by default) and the attachment by its part number, both as mail.read answered them. Answers the saved file's volume, path, name, type, size and SHA-256, and the text of a short text attachment. Marks nothing as read and changes nothing in the mailbox.").skip_judge(),
@@ -799,6 +799,24 @@ impl ToolRouter {
                 "description": "The message as plain text, at most 100000 characters."
             }),
         );
+        if shape != OutboundShape::Draft {
+            properties.insert(
+                "attachments".to_string(),
+                json!({
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "volume_id": {"type": "string", "description": "The id of one of the person's own volumes holding the file."},
+                            "path": {"type": "string", "description": "The file's path in that volume."}
+                        },
+                        "required": ["volume_id", "path"]
+                    },
+                    "description": "Files of the person's own to attach, at most 10 and 20 MiB together, each by its volume_id and path, such as an uploaded file's reference or one mail.attachment saved."
+                }),
+            );
+        }
         let required: Vec<&str> = match shape {
             OutboundShape::Draft => vec!["mailbox", "body"],
             OutboundShape::Send => vec!["mailbox", "to", "subject", "body"],
@@ -3260,7 +3278,7 @@ mod tests {
             ApprovalContract {
                 binding_argument: Some("mailbox".to_string()),
                 approval_summary: Some(
-                    ["mailbox", "to", "cc", "subject", "body"]
+                    ["mailbox", "to", "cc", "subject", "body", "attachment_names"]
                         .iter()
                         .map(|s| s.to_string())
                         .collect()
