@@ -200,6 +200,7 @@ fn conversation() -> MailActing {
         workflow_id: None,
         choice: ServerChoice::NotGiven,
         has_execution_record: false,
+        tier: None,
     }
 }
 
@@ -342,7 +343,7 @@ async fn mail_read_answers_a_threads_messages_oldest_first_and_marks_nothing_rea
     );
     assert_eq!(
         reply["attachments"],
-        json!([{"filename": "receipt.pdf", "content_type": "application/pdf", "size": 3}]),
+        json!([{"part": "2", "filename": "receipt.pdf", "content_type": "application/pdf", "size": 3}]),
         "{answer}"
     );
 

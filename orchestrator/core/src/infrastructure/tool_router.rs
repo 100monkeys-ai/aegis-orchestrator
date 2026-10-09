@@ -145,7 +145,8 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.send", "Sends a plain-text message from a connected mailbox to the addresses in to and cc, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
     BuiltinToolDefinition::new("mail.reply", "Replies in a thread of a connected mailbox: sends a plain-text message to the addresses in to and cc, threaded to the thread's newest message, then saves a copy in its Sent folder. Waits for the person's approval before anything is sent.").requires_approval(),
     BuiltinToolDefinition::new("mail.list", "Lists threads in one folder of a connected mailbox that match a query, newest first: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers each thread's id, subject, participants, latest date, message count, unread count, flag and labels, and the folder read. Marks nothing as read.").skip_judge(),
-    BuiltinToolDefinition::new("mail.read", "Reads one thread in one folder of a connected mailbox: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers every message of the thread in that folder, oldest first, with its headers, flags, labels and plain-text body, and the folder read; a thread's id is the same in every folder. Marks nothing as read.").skip_judge(),
+    BuiltinToolDefinition::new("mail.read", "Reads one thread in one folder of a connected mailbox: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers every message of the thread in that folder, oldest first, with its uid, headers, flags, labels, plain-text body and attachments (each by name, type, size and part number, which mail.attachment saves), and the folder read; a thread's id is the same in every folder. Marks nothing as read.").skip_judge(),
+    BuiltinToolDefinition::new("mail.attachment", "Saves one attachment of a message in a connected mailbox to your files: the message by its uid in one folder (the inbox by default) and the attachment by its part number, both as mail.read answered them. Answers the saved file's volume, path, name, type, size and SHA-256, and the text of a short text attachment. Marks nothing as read and changes nothing in the mailbox.").skip_judge(),
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox's inbox, flags or unflags it, and marks it read or unread."),
     BuiltinToolDefinition::new("mail.delete", "Moves every message of a thread in a connected mailbox's inbox to its Trash folder; deletes nothing permanently. Waits for the person's approval before anything is moved.").requires_approval(),
     BuiltinToolDefinition::new("mail.archive", "Archives a thread of a connected mailbox: moves every message of the thread in its inbox to its Archive folder (on a server that keeps all mail in one folder, to that folder), so the thread leaves the inbox and stays in the mailbox; deletes nothing. Waits for the person's approval before anything is moved.").requires_approval(),
@@ -362,6 +363,7 @@ impl ToolRouter {
             "mail.label" => Self::schema_mail_label(),
             "mail.delete" => Self::schema_mail_delete(),
             "mail.archive" => Self::schema_mail_archive(),
+            "mail.attachment" => Self::schema_mail_attachment(),
             "calendar.calendars" => Self::schema_calendar(CalendarShape::Calendars),
             "calendar.list" => Self::schema_calendar(CalendarShape::List),
             "calendar.read" => Self::schema_calendar(CalendarShape::Read),
@@ -1040,6 +1042,36 @@ impl ToolRouter {
                 }
             },
             "required": ["mailbox", "thread_id"]
+        })
+    }
+
+    /// JSON schema for the `mail.attachment` builtin tool (AEGIS ADR-125's
+    /// Update of 2026-10-08 (5) clause 31).
+    fn schema_mail_attachment() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mailbox": {
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                },
+                "folder": {
+                    "type": "string",
+                    "enum": ["inbox", "sent", "drafts", "trash", "archive", "all"],
+                    "description": "Which folder the message is in: inbox (the default), sent, drafts, trash, archive, or all your mail where the server keeps such a folder."
+                },
+                "uid": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The message's uid as mail.read answered it in that folder."
+                },
+                "part": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]*(\\.[1-9][0-9]*)*$",
+                    "description": "The attachment's part number as mail.read answered it, such as 2 or 1.2."
+                }
+            },
+            "required": ["mailbox", "uid", "part"]
         })
     }
 
@@ -2790,6 +2822,7 @@ mod tests {
         "web.fetch",
         "mail.list",
         "mail.read",
+        "mail.attachment",
         "calendar.calendars",
         "calendar.list",
         "calendar.read",

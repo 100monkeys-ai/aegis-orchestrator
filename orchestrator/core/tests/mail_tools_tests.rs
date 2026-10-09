@@ -214,6 +214,74 @@ async fn the_eight_mail_tools_list_with_contracts_declaring_mailbox_and_four_are
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// `mail.attachment` (the Update of 2026-10-08 (5) clause 31) is listed
+/// with `mailbox`, `uid` and `part` required and `folder` offered, is not
+/// gated, declares no approval contract, and skips the judge as `mail.read`
+/// does; its description says what it does, and `mail.read`'s says each
+/// attachment comes with the part number it takes (clause 30).
+#[tokio::test]
+async fn mail_attachment_is_listed_ungated_skipping_the_judge_and_mail_read_names_its_part() {
+    let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+    let tools = router.list_tools().await.unwrap();
+    let mut wrong = Vec::new();
+    let name = "mail.attachment";
+    let required = ["mailbox", "uid", "part"];
+    match tools.iter().find(|t| t.name == name) {
+        Some(tool) => {
+            let schema_required: Vec<&str> = tool.input_schema["required"]
+                .as_array()
+                .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if schema_required != required {
+                wrong.push(format!("{name}'s schema requires {schema_required:?}"));
+            }
+            if tool.input_schema["properties"]["folder"]["enum"]
+                != json!(["inbox", "sent", "drafts", "trash", "archive", "all"])
+            {
+                wrong.push(format!("{name} does not offer the six folders"));
+            }
+            if tool.input_schema["properties"]["uid"]["type"] != "integer"
+                || tool.input_schema["properties"]["part"]["type"] != "string"
+            {
+                wrong.push(format!("{name}'s uid and part: {}", tool.input_schema));
+            }
+            if !tool.description.starts_with(
+                "Saves one attachment of a message in a connected mailbox to your files",
+            ) {
+                wrong.push(format!("{name}'s description: {}", tool.description));
+            }
+        }
+        None => wrong.push(format!("{name} is not listed")),
+    }
+    if ToolInputContract::required_fields(name) != required.as_slice() {
+        wrong.push(format!(
+            "{name}'s input contract requires {:?}",
+            ToolInputContract::required_fields(name)
+        ));
+    }
+    if router.requires_approval(name) {
+        wrong.push(format!("{name} is gated"));
+    }
+    if router.approval_contract(name) != ApprovalContract::default() {
+        wrong.push(format!(
+            "{name}'s approval contract is {:?}",
+            router.approval_contract(name)
+        ));
+    }
+    if !router.is_skip_judge(name).await {
+        wrong.push(format!("{name} does not skip the judge"));
+    }
+    match tools.iter().find(|t| t.name == "mail.read") {
+        Some(tool)
+            if tool
+                .description
+                .contains("part number, which mail.attachment saves") => {}
+        Some(tool) => wrong.push(format!("mail.read's description: {}", tool.description)),
+        None => wrong.push("mail.read is not listed".to_string()),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 // ---------------------------------------------------------------------------
 // The tool service with mail tools and the approval gate
 // ---------------------------------------------------------------------------
@@ -618,6 +686,44 @@ async fn an_ungranted_mailbox_is_refused_before_the_gate_and_no_row_is_written()
     }
     if smtp.standin.connections() != 0 {
         wrong.push("the refused call reached the SMTP server".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `mail.attachment` (the Update of 2026-10-08 (5) clause 31) reaches the
+/// mail tools through the tool service and is not gated: no approval is
+/// asked and no row is written. A node whose mail tools hold no file
+/// services refuses it before any mail server is reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mail_attachment_reaches_the_mail_tools_ungated_and_needs_their_file_services() {
+    let (mailbox, _smtp, owned) = password_mailbox("Inbox", true).await;
+    let id = owned.id.0.to_string();
+    let h = harness(vec![owned], &[None]).await;
+    let mut events = h.event_bus.subscribe();
+    let result = h
+        .call(
+            0,
+            "mail.attachment",
+            json!({"mailbox": id, "uid": 1, "part": "2"}),
+        )
+        .await;
+    let mut wrong = Vec::new();
+    if !told(&result).contains("the mail tools are not configured on this node") {
+        wrong.push(format!(
+            "mail.attachment did not reach the mail tools: {}",
+            told(&result)
+        ));
+    }
+    if !h.rows().await.is_empty() {
+        wrong.push("an approval row was written".to_string());
+    }
+    while let Ok(event) = events.try_recv() {
+        if format!("{event:?}").contains("ApprovalRequested") {
+            wrong.push("an approval was requested".to_string());
+        }
+    }
+    if mailbox.connections() != 0 {
+        wrong.push("a mail server was reached with no file services".to_string());
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -1376,6 +1482,7 @@ fn owner_in_conversation() -> MailActing {
         workflow_id: None,
         choice: ServerChoice::NotGiven,
         has_execution_record: false,
+        tier: None,
     }
 }
 

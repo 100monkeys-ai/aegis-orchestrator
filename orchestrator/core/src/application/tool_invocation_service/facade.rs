@@ -223,16 +223,18 @@ impl ToolInvocationService {
     }
 
     /// The mail tools, resolving the acting person's mailbox through
-    /// `mailboxes` and opening their sessions with the production connector
-    /// (TLS and the address guard; AEGIS ADR-125 D4).
+    /// `mailboxes`, opening their sessions with the production connector
+    /// (TLS and the address guard; AEGIS ADR-125 D4), and saving an
+    /// attachment through `files` (its Update of 2026-10-08 (5) clause 31).
     pub fn with_mail_tools(
-        self,
+        mut self,
         mailboxes: Arc<dyn crate::application::credential_service::ToolMailboxSource>,
+        files: crate::application::tools::builtin_mail::MailFiles,
     ) -> Self {
-        self.with_mail_tools_over(
-            mailboxes,
-            Arc::new(crate::infrastructure::mail::RustlsMailConnector::new()),
-        )
+        self.mail_tools = Some(Arc::new(
+            crate::application::tools::builtin_mail::MailTools::new(mailboxes).with_files(files),
+        ));
+        self
     }
 
     /// The mail tools over another connector (tests: a plaintext one to
@@ -1678,6 +1680,12 @@ impl ToolInvocationService {
                 .contexts
                 .server(crate::application::tools::builtin_mail::MailActing::choice_key()),
             has_execution_record,
+            tier: caller_identity.and_then(|identity| match &identity.identity_kind {
+                crate::domain::iam::IdentityKind::ConsumerUser { zaru_tier, .. } => {
+                    Some(zaru_tier.clone())
+                }
+                _ => None,
+            }),
         }
     }
 

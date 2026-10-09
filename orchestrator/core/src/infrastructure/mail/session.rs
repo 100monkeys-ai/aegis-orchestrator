@@ -111,6 +111,9 @@ pub enum StoreOp {
 pub struct ImapSession {
     wire: Wire,
     next_tag: u32,
+    /// The largest literal this session reads ([`MAX_LITERAL`] unless
+    /// raised by [`ImapSession::read_literals_up_to`]).
+    max_literal: u64,
 }
 
 impl ImapSession {
@@ -136,7 +139,19 @@ impl ImapSession {
                 )
             })?;
         let wire = imap::open(connector, &admitted, settings, auth).await?;
-        Ok(Self { wire, next_tag: 1 })
+        Ok(Self {
+            wire,
+            next_tag: 1,
+            max_literal: MAX_LITERAL,
+        })
+    }
+
+    /// Read literals of up to `max` bytes from here on: a fetch of one
+    /// whole message whose attachment is itself bounded (`mail.attachment`)
+    /// reads a message larger than [`MAX_LITERAL`], since an attachment
+    /// encoded in base64 takes about a third more bytes than it holds.
+    pub fn read_literals_up_to(&mut self, max: u64) {
+        self.max_literal = max;
     }
 
     /// `EXAMINE <folder>`: open the folder read-only.
@@ -452,7 +467,7 @@ impl ImapSession {
                 Some(n) => {
                     let open = line.rfind('{').unwrap_or(line.len());
                     segments.push(Segment::Text(line[..open].to_string()));
-                    let bytes = self.wire.literal(n, MAX_LITERAL).await?;
+                    let bytes = self.wire.literal(n, self.max_literal).await?;
                     segments.push(Segment::Literal(bytes));
                 }
                 None => {
@@ -822,10 +837,13 @@ pub fn parse_headers(raw: &[u8]) -> Headers {
     Headers(headers)
 }
 
-/// An attachment of a message: what it is called, its type and its size
-/// in bytes once decoded.
+/// An attachment of a message: its section number as RFC 9051 numbers a
+/// message's body parts (`1` for a message that is not multipart, `2`, `1.2`
+/// within one; AEGIS ADR-125's Update of 2026-10-08 (5) clause 30), what it
+/// is called, its type and its size in bytes once decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
+    pub part: String,
     pub filename: Option<String>,
     pub content_type: String,
     pub size: usize,
@@ -843,14 +861,41 @@ pub struct Message {
 /// Read a whole message (`BODY[]`).
 pub fn parse_message(raw: &[u8]) -> Message {
     let headers = parse_headers(raw);
-    let mut text: Option<String> = None;
-    let mut attachments = Vec::new();
-    walk_part(raw, 0, &mut text, &mut attachments);
+    let mut walk = Walk::default();
+    walk_part(raw, "", 0, &mut walk);
     Message {
         headers,
-        text: text.unwrap_or_default(),
-        attachments,
+        text: walk.text.unwrap_or_default(),
+        attachments: walk.attachments,
     }
+}
+
+/// One attachment of a message, decoded: what [`parse_message`] answers
+/// for it, its bytes once its transfer encoding (base64, quoted-printable)
+/// is undone, and the `charset` its `Content-Type` names, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentPart {
+    pub attachment: Attachment,
+    pub bytes: Vec<u8>,
+    pub charset: Option<String>,
+}
+
+/// The attachment numbered `part` of a whole message (`BODY[]`), found by
+/// the walk that numbers [`parse_message`]'s attachments, so a number
+/// `mail.read` answered names the same part here; `None` when no
+/// attachment has that number (the message's own text body is not one).
+pub fn attachment_part(raw: &[u8], part: &str) -> Option<AttachmentPart> {
+    let mut walk = Walk {
+        want: Some(part.to_string()),
+        ..Walk::default()
+    };
+    walk_part(raw, "", 0, &mut walk);
+    walk.found
+}
+
+/// Bytes in `charset` as text, as a message's text body is read.
+pub fn decode_text(bytes: &[u8], charset: Option<&str>) -> String {
+    decode_charset(bytes, charset)
 }
 
 /// A `Content-Type` or `Content-Disposition` value: the value and its
@@ -877,12 +922,21 @@ fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-fn walk_part(
-    raw: &[u8],
-    depth: usize,
-    text: &mut Option<String>,
-    attachments: &mut Vec<Attachment>,
-) {
+/// What a walk over a message's parts gathers: its first `text/plain` body,
+/// its attachments, and, when `want` names a part, that part decoded.
+#[derive(Default)]
+struct Walk {
+    text: Option<String>,
+    attachments: Vec<Attachment>,
+    want: Option<String>,
+    found: Option<AttachmentPart>,
+}
+
+/// Walk the part `raw`, numbered `section` (empty for the message itself):
+/// a multipart's children are numbered `1`, `2`, ... under it (`1.2` for the
+/// second child of its first), and a message that is not multipart is its
+/// own part `1` (RFC 9051 6.4.5).
+fn walk_part(raw: &[u8], section: &str, depth: usize, walk: &mut Walk) {
     let headers = parse_headers(raw);
     let (_, body) = split_head(raw);
     let (content_type, params) = headers
@@ -891,8 +945,13 @@ fn walk_part(
         .unwrap_or_else(|| ("text/plain".to_string(), Vec::new()));
     if content_type.starts_with("multipart/") && depth < 8 {
         if let Some(boundary) = param(&params, "boundary") {
-            for part in split_multipart(body, boundary) {
-                walk_part(part, depth + 1, text, attachments);
+            for (i, part) in split_multipart(body, boundary).into_iter().enumerate() {
+                let child = if section.is_empty() {
+                    (i + 1).to_string()
+                } else {
+                    format!("{section}.{}", i + 1)
+                };
+                walk_part(part, &child, depth + 1, walk);
             }
             return;
         }
@@ -911,18 +970,31 @@ fn walk_part(
         .or_else(|| param(&params, "name"))
         .map(decode_words);
     let is_attachment = disposition == "attachment" || filename.is_some();
-    if content_type == "text/plain" && !is_attachment && text.is_none() {
-        *text = Some(decode_charset(&decoded, param(&params, "charset")));
+    if content_type == "text/plain" && !is_attachment && walk.text.is_none() {
+        walk.text = Some(decode_charset(&decoded, param(&params, "charset")));
     } else if !content_type.starts_with("multipart/") && (is_attachment || depth > 0) {
         if content_type == "text/html" && !is_attachment {
             // The alternative of a text body: not an attachment.
             return;
         }
-        attachments.push(Attachment {
+        let attachment = Attachment {
+            part: if section.is_empty() {
+                "1".to_string()
+            } else {
+                section.to_string()
+            },
             filename,
             content_type,
             size: decoded.len(),
-        });
+        };
+        if walk.found.is_none() && walk.want.as_deref() == Some(attachment.part.as_str()) {
+            walk.found = Some(AttachmentPart {
+                attachment: attachment.clone(),
+                bytes: decoded,
+                charset: param(&params, "charset").map(str::to_string),
+            });
+        }
+        walk.attachments.push(attachment);
     }
 }
 
@@ -1156,10 +1228,33 @@ mod tests {
         assert_eq!(
             m.attachments,
             vec![Attachment {
+                part: "2".to_string(),
                 filename: Some("a.pdf".to_string()),
                 content_type: "application/pdf".to_string(),
                 size: 3,
             }]
         );
+    }
+
+    #[test]
+    fn parts_are_numbered_as_rfc_9051_numbers_them_and_one_is_found_decoded() {
+        let raw = b"Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n--M\r\nContent-Type: multipart/alternative; boundary=\"A\"\r\n\r\n--A\r\nContent-Type: text/plain\r\n\r\nhi\r\n--A\r\nContent-Type: multipart/mixed; boundary=\"I\"\r\n\r\n--I\r\nContent-Type: text/html\r\n\r\n<p>hi</p>\r\n--I\r\nContent-Type: image/gif\r\nContent-Transfer-Encoding: base64\r\n\r\nR0lG\r\n--I--\r\n--A--\r\n--M\r\nContent-Type: text/plain; charset=iso-8859-1; name=\"n.txt\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ncaf=E9\r\n--M--\r\n";
+        let parts: Vec<String> = parse_message(raw)
+            .attachments
+            .into_iter()
+            .map(|a| a.part)
+            .collect();
+        assert_eq!(parts, vec!["1.2.2", "2"]);
+        let gif = attachment_part(raw, "1.2.2").expect("part 1.2.2");
+        assert_eq!(gif.bytes, b"GIF");
+        let text = attachment_part(raw, "2").expect("part 2");
+        assert_eq!(text.bytes, b"caf\xe9");
+        assert_eq!(text.charset.as_deref(), Some("iso-8859-1"));
+        assert!(
+            attachment_part(raw, "1.1").is_none(),
+            "the text body is no attachment"
+        );
+        let single = b"Content-Type: application/pdf; name=\"a.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n";
+        assert_eq!(parse_message(single).attachments[0].part, "1");
     }
 }

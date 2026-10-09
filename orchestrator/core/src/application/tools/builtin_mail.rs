@@ -69,6 +69,16 @@
 //! never by a provider's folder name or extension. It is gated, and its
 //! admission reads the thread's subject and senders as `mail.delete`'s does.
 //!
+//! **Attachments** (its Update of 2026-10-08 (5), clauses 30 and 31).
+//! `mail.read` answers each attachment's `part`, its section number as RFC
+//! 9051 numbers a message's body parts. `mail.attachment` fetches one
+//! message by uid from a folder, decodes that part and saves it to the
+//! acting person's own `chat-attachments` volume (provisioned as an upload
+//! provisions it) at `mail/<UTC date>/<uuid>/<name>`, answering the file's
+//! reference and, for a short text part, its text. A part larger than the
+//! person's tier allows a file to be, or than 20 MiB, is refused with
+//! nothing written.
+//!
 //! **Threads.** A thread's id is the root `Message-ID` of its messages (the
 //! first `References` entry, else `In-Reply-To`, else the message's own); a
 //! message with no `Message-ID` is its own thread `uid:<UIDVALIDITY>:<uid>`.
@@ -76,21 +86,25 @@
 //! `References` and `In-Reply-To`: plain IMAP, no server extension.
 
 use crate::application::credential_service::{ToolCallActor, ToolMailbox, ToolMailboxSource};
+use crate::application::file_operations_service::{FileOperationsError, FileOperationsService};
+use crate::application::user_volume_service::UserVolumeService;
 use crate::domain::agent::AgentId;
 use crate::domain::credential::{CredentialBindingId, CredentialProvider};
 use crate::domain::execution::{ContextChoice, ServerChoice};
+use crate::domain::iam::ZaruTier;
 use crate::domain::seal_session::{CallerAnswer, InternalFailure, SealSessionError};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::mail::message::{is_address, mint_message_id, OutgoingMessage};
 use crate::infrastructure::mail::session::{
-    parse_headers, parse_message, Arg, Fetched, FolderStatus, Headers, ImapSession, ListedFolder,
-    StoreOp,
+    attachment_part, decode_text, parse_headers, parse_message, Arg, Fetched, FolderStatus,
+    Headers, ImapSession, ListedFolder, StoreOp,
 };
 use crate::infrastructure::mail::submission;
 use crate::infrastructure::mail::{
     CheckFailureKind, MailConnector, MailboxCheckFailure, RustlsMailConnector,
 };
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,6 +121,16 @@ pub const LIST_MAX_LIMIT: u64 = 50;
 pub const READ_MAX_MESSAGES: usize = 50;
 /// The most characters of one message's body `mail.read` answers.
 pub const BODY_MAX_CHARS: usize = 32_000;
+/// The largest attachment `mail.attachment` saves, whatever the person's
+/// tier allows (the Update of 2026-10-08 (5) clause 31).
+pub const ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
+/// The largest message `mail.attachment` fetches whole: room for an
+/// attachment of [`ATTACHMENT_MAX_BYTES`] in base64 (about 27.4 MiB with its
+/// line breaks) beside the rest of the message.
+pub const ATTACHMENT_MESSAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// The most characters of a `text/*` attachment `mail.attachment` answers
+/// as `text`; a longer one is answered by its file alone.
+pub const ATTACHMENT_TEXT_MAX_CHARS: usize = 32_000;
 /// The longest a label may be.
 pub const KEYWORD_MAX_CHARS: usize = 64;
 /// The longest one tool call's session may take.
@@ -156,6 +180,13 @@ pub const UNKNOWN_FOLDER: &str =
 pub const INBOX_ONLY: &str =
     "This tool works on threads in the inbox only; leave out 'folder' or set it to inbox.";
 
+/// The refusal of `mail.attachment` for a part larger than the person's
+/// files may be, or than [`ATTACHMENT_MAX_BYTES`] (its clause 31).
+pub const ATTACHMENT_TOO_LARGE: &str =
+    "This attachment is larger than your files allow; nothing was saved.";
+/// What a saved attachment is named when its part names no file.
+pub const ATTACHMENT_DEFAULT_NAME: &str = "attachment";
+
 /// The most recipients one message has, `to` and `cc` together.
 pub const MAX_RECIPIENTS: usize = 50;
 /// The longest a subject may be, in characters.
@@ -184,6 +215,7 @@ pub fn is_mail_tool(tool_name: &str) -> bool {
             | "mail.reply"
             | "mail.delete"
             | "mail.archive"
+            | "mail.attachment"
     )
 }
 
@@ -210,6 +242,10 @@ pub struct MailActing {
     /// Whether the call's execution has a record (an agent's run), as
     /// opposed to a conversation's session.
     pub has_execution_record: bool,
+    /// The acting person's tier, which bounds a file `mail.attachment`
+    /// saves; `None` where the caller is no consumer, read as the Free
+    /// tier's limits.
+    pub tier: Option<ZaruTier>,
 }
 
 impl MailActing {
@@ -219,11 +255,21 @@ impl MailActing {
     }
 }
 
-/// The mail tools: the mailbox source and the connector their sessions
-/// open over.
+/// The file services `mail.attachment` saves through: the person's
+/// `chat-attachments` volume found or provisioned, and the file written
+/// under their tier's limit.
+#[derive(Clone)]
+pub struct MailFiles {
+    pub file_operations: Arc<FileOperationsService>,
+    pub user_volumes: Arc<UserVolumeService>,
+}
+
+/// The mail tools: the mailbox source, the connector their sessions open
+/// over, and the file services an attachment is saved through.
 pub struct MailTools {
     mailboxes: Arc<dyn ToolMailboxSource>,
     connector: Arc<dyn MailConnector>,
+    files: Option<MailFiles>,
 }
 
 impl MailTools {
@@ -241,7 +287,15 @@ impl MailTools {
         Self {
             mailboxes,
             connector,
+            files: None,
         }
+    }
+
+    /// The tools with the file services `mail.attachment` saves through;
+    /// without them it is refused as not configured.
+    pub fn with_files(mut self, files: MailFiles) -> Self {
+        self.files = Some(files);
+        self
     }
 
     /// Run `tool_name` with `args` for `acting`.
@@ -253,6 +307,24 @@ impl MailTools {
     ) -> Result<Value, SealSessionError> {
         let mailbox = self.mailbox_for(args, acting).await?;
         let request = Request::parse(tool_name, args)?;
+        if let Request::Attachment { folder, uid, part } = &request {
+            let Some(files) = self.files.as_ref() else {
+                return Err(not_configured());
+            };
+            let save = save_attachment(
+                self.connector.as_ref(),
+                files,
+                &mailbox,
+                acting,
+                *folder,
+                *uid,
+                part,
+            );
+            return match tokio::time::timeout(CALL_TIMEOUT, save).await {
+                Ok(result) => result,
+                Err(_) => Err(timed_out()),
+            };
+        }
         let run = run(self.connector.as_ref(), &mailbox, &request);
         match tokio::time::timeout(CALL_TIMEOUT, run).await {
             Ok(result) => result,
@@ -456,6 +528,13 @@ enum Request {
     Move {
         thread_id: String,
         to: MoveTo,
+    },
+    /// `mail.attachment`: one part of one message, saved to the person's
+    /// files.
+    Attachment {
+        folder: FolderKind,
+        uid: u32,
+        part: String,
     },
 }
 
@@ -798,6 +877,25 @@ impl Request {
                 thread_id: thread_id(args)?,
                 to: MoveTo::Archive,
             }),
+            "mail.attachment" => Ok(Request::Attachment {
+                folder: FolderKind::parse(args)?,
+                uid: match args.get("uid").and_then(Value::as_u64) {
+                    Some(uid) if (1..=u64::from(u32::MAX)).contains(&uid) => uid as u32,
+                    _ => {
+                        return Err(invalid(
+                            "'uid' must be the uid of a message mail.read answered.",
+                        ))
+                    }
+                },
+                part: match args.get("part").and_then(Value::as_str) {
+                    Some(part) if is_part_number(part) => part.to_string(),
+                    _ => {
+                        return Err(invalid(
+                            "'part' must be an attachment's part number as mail.read answered it, such as 2 or 1.2.",
+                        ))
+                    }
+                },
+            }),
             other => Err(invalid(format!("'{other}' is not a mail tool."))),
         }
     }
@@ -822,6 +920,9 @@ async fn run(
         }
         Request::Move { thread_id, to } => {
             return move_thread(connector, mailbox, thread_id, *to).await
+        }
+        Request::Attachment { .. } => {
+            unreachable!("an attachment is saved by MailTools::invoke, with its file services")
         }
         Request::List { .. } | Request::Read { .. } | Request::Label { .. } => {}
     }
@@ -851,7 +952,8 @@ async fn run(
         Request::Draft { .. }
         | Request::Send { .. }
         | Request::Reply { .. }
-        | Request::Move { .. } => {
+        | Request::Move { .. }
+        | Request::Attachment { .. } => {
             unreachable!("an outbound or move request is run before the session opens")
         }
     };
@@ -1596,6 +1698,7 @@ async fn read(
                 "body_text": body,
                 "body_truncated": body_truncated,
                 "attachments": message.attachments.iter().map(|a| json!({
+                    "part": a.part,
                     "filename": a.filename,
                     "content_type": a.content_type,
                     "size": a.size,
@@ -1612,6 +1715,143 @@ async fn read(
         "truncated": truncated,
         "messages": answered,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Attachments (the Update of 2026-10-08 (5), clause 31)
+// ---------------------------------------------------------------------------
+
+/// A part number as RFC 9051 writes one: numbers from 1, joined by dots.
+fn is_part_number(part: &str) -> bool {
+    part.len() <= 64
+        && part
+            .split('.')
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0'))
+}
+
+/// The refusal for a part no attachment of the message carries.
+fn no_attachment(part: &str, uid: u32) -> SealSessionError {
+    let message = format!("There is no attachment '{part}' on message {uid} in this folder.");
+    SealSessionError::NotFound(message.clone()).answered(CallerAnswer::NotFound(message))
+}
+
+/// A saved attachment's name: its part's file name with path separators
+/// and control characters removed, `attachment` when nothing is left.
+pub fn attachment_name(filename: Option<&str>) -> String {
+    let cleaned: String = filename
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .take(200)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        ATTACHMENT_DEFAULT_NAME.to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// Fetch message `uid` of the folder of `folder` read-only, decode its
+/// attachment `part`, and write it to the acting person's `chat-attachments`
+/// volume. The size is refused before the volume is found or anything is
+/// written.
+async fn save_attachment(
+    connector: &dyn MailConnector,
+    files: &MailFiles,
+    mailbox: &ToolMailbox,
+    acting: &MailActing,
+    folder: FolderKind,
+    uid: u32,
+    part: &str,
+) -> Result<Value, SealSessionError> {
+    let Some(user_id) = acting.user_id.as_deref() else {
+        return Err(binding_required(NO_PERSON.to_string()));
+    };
+    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
+        .await
+        .map_err(session_error)?;
+    session.read_literals_up_to(ATTACHMENT_MESSAGE_MAX_BYTES);
+    let fetched = async {
+        examine_kind(&mut session, folder).await?;
+        session
+            .uid_fetch(&[uid], "UID BODY.PEEK[]")
+            .await
+            .map_err(session_error)
+    }
+    .await;
+    session.logout().await;
+    let raw = fetched?
+        .into_iter()
+        .find(|f| f.uid == uid)
+        .and_then(|f| f.full)
+        .ok_or_else(|| no_attachment(part, uid))?;
+    let found = attachment_part(&raw, part).ok_or_else(|| no_attachment(part, uid))?;
+
+    let tier = acting.tier.clone().unwrap_or(ZaruTier::Free);
+    let tier_max = crate::domain::volume::StorageTierLimits::default()
+        .limits
+        .get(&tier)
+        .map(|l| l.max_file_size_bytes)
+        .unwrap_or(0);
+    let size = found.bytes.len();
+    if size > ATTACHMENT_MAX_BYTES || size as u64 > tier_max {
+        return Err(invalid(ATTACHMENT_TOO_LARGE));
+    }
+
+    let volume_id = files
+        .user_volumes
+        .find_or_provision_chat_attachments(&acting.tenant_id, user_id, &tier)
+        .await
+        .map_err(|e| {
+            SealSessionError::InternalError(format!("the attachments volume failed: {e}"))
+                .answered(CallerAnswer::Internal(InternalFailure::Server))
+        })?;
+    let name = attachment_name(found.attachment.filename.as_deref());
+    let path = format!(
+        "mail/{}/{}/{}",
+        chrono::Utc::now().format("%Y-%m-%d"),
+        uuid::Uuid::new_v4(),
+        name
+    );
+    files
+        .file_operations
+        .write_file_for_tier(
+            &volume_id,
+            &acting.tenant_id,
+            user_id,
+            &path,
+            &found.bytes,
+            &tier,
+        )
+        .await
+        .map_err(|e| match e {
+            FileOperationsError::FileTooLarge => invalid(ATTACHMENT_TOO_LARGE),
+            other => {
+                SealSessionError::InternalError(format!("saving the attachment failed: {other}"))
+                    .answered(CallerAnswer::Internal(InternalFailure::Server))
+            }
+        })?;
+
+    let mime_type = infer::get(&found.bytes)
+        .map(|k| k.mime_type().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let sha256 = format!("{:x}", sha2::Sha256::digest(&found.bytes));
+    let mut answer = json!({
+        "volume_id": volume_id.to_string(),
+        "path": path,
+        "name": name,
+        "mime_type": mime_type,
+        "size": size,
+        "sha256": sha256,
+    });
+    if found.attachment.content_type.starts_with("text/") {
+        let text = decode_text(&found.bytes, found.charset.as_deref());
+        if text.chars().count() <= ATTACHMENT_TEXT_MAX_CHARS {
+            answer["text"] = Value::String(text);
+        }
+    }
+    Ok(answer)
 }
 
 /// What `mail.label` changes on every message of a thread: keywords added

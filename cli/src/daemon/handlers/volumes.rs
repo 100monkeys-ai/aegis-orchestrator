@@ -13,7 +13,9 @@ use sha2::Digest;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::application::file_operations_service::FileOperationsError;
-use aegis_orchestrator_core::application::user_volume_service::UserVolumeError;
+use aegis_orchestrator_core::application::user_volume_service::{
+    UserVolumeError, CHAT_ATTACHMENTS_VOLUME_NAME,
+};
 use aegis_orchestrator_core::application::volume_manager::CreateUserVolumeCommand;
 use aegis_orchestrator_core::domain::iam::{UserIdentity, ZaruTier};
 use aegis_orchestrator_core::domain::volume::VolumeId;
@@ -341,21 +343,6 @@ pub(crate) async fn download_file(
         .into_response())
 }
 
-/// Reserved volume name used for chat attachments (ADR-113).
-///
-/// When the URL path uses this literal in place of a UUID, the upload handler
-/// lazy-provisions a persistent user volume of this name on first upload and
-/// reuses it on subsequent uploads. The name is reserved per ADR-079 and
-/// counts against the user's `ZaruTier` storage quota like any other volume.
-const CHAT_ATTACHMENTS_VOLUME_NAME: &str = "chat-attachments";
-
-/// Hard ceiling for the lazy-provisioned `chat-attachments` volume on tiers
-/// whose `total_storage_bytes` is unbounded (Enterprise = `u64::MAX`). A raw
-/// `u64::MAX` allocation is nonsensical at the storage layer; clamp to a
-/// sensible per-volume default that still leaves room for additional volumes
-/// within the same tier budget.
-const CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-
 /// Reject paths containing `..`, absolute prefixes, or control characters.
 /// Path-sanitization downstream is the source of truth, but we fail fast at
 /// the edge so multipart parsing isn't even attempted on a hostile filename.
@@ -420,47 +407,24 @@ async fn resolve_or_provision_upload_volume(
         ));
     }
 
-    // Look up the chat-attachments volume by name within (tenant, owner). If
-    // it exists, return it; otherwise lazy-provision.
-    let existing = state
-        .user_volume_service
-        .list_volumes(&tenant_id, owner)
-        .await
-        .map_err(user_volume_error_response)?;
-    if let Some(v) = existing
-        .into_iter()
-        .find(|v| v.name == CHAT_ATTACHMENTS_VOLUME_NAME)
-    {
-        return Ok(v.id);
-    }
-
-    // Tier-aware sizing: respect the caller's `total_storage_bytes` budget
-    // so the very first upload doesn't trip `StorageQuotaExceeded` on Free
-    // (500 MiB tier ceiling) by requesting more than the tier allows. An
-    // unrecognized tier fails closed (403) rather than falling back to a
-    // hardcoded ceiling — same posture as `resolve_max_file_size_bytes`.
-    let size_limit_bytes = chat_attachments_volume_size_for_tier(tier).ok_or_else(|| {
-        (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "no chat-attachments volume size configured for caller tier"
-            })),
-        )
-    })?;
-
-    let cmd = CreateUserVolumeCommand {
-        tenant_id,
-        owner_user_id: owner.to_string(),
-        label: CHAT_ATTACHMENTS_VOLUME_NAME.to_string(),
-        size_limit_bytes,
-        zaru_tier: tier.clone(),
-    };
+    // The chat-attachments volume, found by name within (tenant, owner) or
+    // lazy-provisioned at the tier's size: one rule shared with the mail
+    // tools. An unrecognized tier fails closed (403) rather than falling
+    // back to a hardcoded ceiling, the same posture as
+    // `resolve_max_file_size_bytes`.
     state
         .user_volume_service
-        .create_volume(cmd)
+        .find_or_provision_chat_attachments(&tenant_id, owner, tier)
         .await
-        .map(|v| v.id)
-        .map_err(user_volume_error_response)
+        .map_err(|e| match e {
+            UserVolumeError::UnknownTier => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "no chat-attachments volume size configured for caller tier"
+                })),
+            ),
+            other => user_volume_error_response(other),
+        })
 }
 
 /// Reject filenames containing path separators, `..`, control chars, NUL,
@@ -498,38 +462,6 @@ fn resolve_max_file_size_bytes(tier: &ZaruTier) -> Option<u64> {
         .limits
         .get(tier)
         .map(|l| l.max_file_size_bytes)
-}
-
-/// Resolve the size to allocate for a lazy-provisioned `chat-attachments`
-/// volume from the caller's tier. The volume's allocation must fit under the
-/// tier's `total_storage_bytes` budget; otherwise `UserVolumeService::create_volume`
-/// rejects the request with `StorageQuotaExceeded` even for an empty volume.
-///
-/// We allocate the full tier `total_storage_bytes` so the user gets as much
-/// chat-attachment headroom as their tier permits without exceeding it.
-/// (Free users can still create one extra volume because `max_volumes >= 2`,
-/// but that volume will compete with chat-attachments for the storage
-/// budget — a deliberate trade chosen over fragmenting the budget across
-/// volumes the user may never create.)
-///
-/// Unbounded tiers (Enterprise = `u64::MAX`) are clamped to
-/// `CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES` because a raw `u64::MAX` is
-/// nonsensical at the storage backend.
-///
-/// Returns `None` for an unrecognized tier so callers fail closed rather than
-/// admitting the volume creation under an unbounded cap, mirroring
-/// `resolve_max_file_size_bytes`.
-fn chat_attachments_volume_size_for_tier(tier: &ZaruTier) -> Option<u64> {
-    aegis_orchestrator_core::domain::volume::StorageTierLimits::default()
-        .limits
-        .get(tier)
-        .map(|l| {
-            if l.total_storage_bytes == u64::MAX {
-                CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES
-            } else {
-                l.total_storage_bytes
-            }
-        })
 }
 
 /// 413 response builder used by the streaming upload paths. The body has been
@@ -1192,6 +1124,15 @@ mod tests {
     // ========================================================================
     // ADR-113 regression: chat-attachments lazy-provision must respect tier
     // ========================================================================
+
+    /// The sizing the upload route provisions by, over the default limits
+    /// (`UserVolumeService::find_or_provision_chat_attachments`).
+    fn chat_attachments_volume_size_for_tier(tier: &ZaruTier) -> Option<u64> {
+        aegis_orchestrator_core::application::user_volume_service::chat_attachments_volume_size_for_tier(
+            &aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
+            tier,
+        )
+    }
 
     /// The lazy-provision branch of `resolve_or_provision_upload_volume` used
     /// a hardcoded 1 GiB allocation regardless of caller tier. For Free users

@@ -420,6 +420,7 @@ impl ToolInputContract {
             "mail.draft" => &["mailbox", "body"],
             "mail.send" => &["mailbox", "to", "subject", "body"],
             "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],
+            "mail.attachment" => &["mailbox", "uid", "part"],
             "calendar.calendars" => &["account"],
             "calendar.list" => &["account", "calendar_id"],
             "calendar.read" | "calendar.update" | "calendar.delete" => {

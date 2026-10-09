@@ -254,6 +254,7 @@ fn conversation() -> MailActing {
         workflow_id: None,
         choice: ServerChoice::NotGiven,
         has_execution_record: false,
+        tier: None,
     }
 }
 
@@ -1002,4 +1003,601 @@ async fn mail_label_seen_sets_and_clears_seen_on_every_message_of_the_thread() {
         other => wrong.push(format!("seen \"yes\": {other:?}")),
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// Clauses 30 and 31: an attachment's part number, and `mail.attachment`
+// ---------------------------------------------------------------------------
+
+mod attachments {
+    use super::*;
+    use aegis_orchestrator_core::application::file_operations_service::FileOperationsService;
+    use aegis_orchestrator_core::application::tools::builtin_mail::{
+        MailFiles, ATTACHMENT_TOO_LARGE, NO_PERSON,
+    };
+    use aegis_orchestrator_core::application::user_volume_service::UserVolumeService;
+    use aegis_orchestrator_core::application::volume_manager::VolumeService;
+    use aegis_orchestrator_core::domain::events::StorageEvent;
+    use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
+    use aegis_orchestrator_core::domain::iam::ZaruTier;
+    use aegis_orchestrator_core::domain::repository::VolumeRepository;
+    use aegis_orchestrator_core::domain::runtime::InstanceId;
+    use aegis_orchestrator_core::domain::volume::{
+        AccessMode, StorageClass, StorageTierLimits, Volume, VolumeBackend, VolumeId, VolumeMount,
+        VolumeOwnership,
+    };
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::repositories::{
+        InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryVolumeRepository,
+    };
+    use aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider;
+    use base64::Engine;
+    use sha2::Digest;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    struct NoOpPublisher;
+
+    #[async_trait]
+    impl EventPublisher for NoOpPublisher {
+        async fn publish_storage_event(&self, _event: StorageEvent) {}
+    }
+
+    /// Volumes as the storage layer makes them: host directories under
+    /// `/hosts/<id>` in the scratch root the FSAL serves.
+    struct HostVolumes {
+        repo: Arc<InMemoryVolumeRepository>,
+    }
+
+    #[async_trait]
+    impl VolumeService for HostVolumes {
+        async fn create_volume(
+            &self,
+            name: String,
+            tenant_id: TenantId,
+            storage_class: StorageClass,
+            size_limit_mb: u64,
+            ownership: VolumeOwnership,
+        ) -> anyhow::Result<VolumeId> {
+            let id = VolumeId::new();
+            let mut volume = Volume::new(
+                name,
+                tenant_id,
+                storage_class,
+                VolumeBackend::HostPath {
+                    path: PathBuf::from(format!("/hosts/{id}")),
+                },
+                size_limit_mb * 1024 * 1024,
+                ownership,
+            )?;
+            volume.id = id;
+            volume.mark_available()?;
+            self.repo.save(&volume).await?;
+            Ok(id)
+        }
+        async fn get_volume(&self, id: VolumeId) -> anyhow::Result<Volume> {
+            self.repo
+                .find_by_id(id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("not found"))
+        }
+        async fn list_volumes_by_tenant(&self, tenant_id: TenantId) -> anyhow::Result<Vec<Volume>> {
+            Ok(self.repo.find_by_tenant(tenant_id).await?)
+        }
+        async fn list_volumes_by_ownership(
+            &self,
+            ownership: &VolumeOwnership,
+        ) -> anyhow::Result<Vec<Volume>> {
+            Ok(self.repo.find_by_ownership(ownership).await?)
+        }
+        async fn attach_volume(
+            &self,
+            _vid: VolumeId,
+            _iid: InstanceId,
+            _m: PathBuf,
+            _a: AccessMode,
+        ) -> anyhow::Result<VolumeMount> {
+            unimplemented!()
+        }
+        async fn detach_volume(&self, _vid: VolumeId, _iid: InstanceId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_volume(&self, _volume_id: VolumeId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn get_volume_usage(&self, _v: VolumeId) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn cleanup_expired_volumes(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn create_volumes_for_execution(
+            &self,
+            _eid: aegis_orchestrator_core::domain::execution::ExecutionId,
+            _tid: TenantId,
+            _vs: &[aegis_orchestrator_core::domain::agent::VolumeSpec],
+            _m: &str,
+        ) -> anyhow::Result<Vec<Volume>> {
+            Ok(vec![])
+        }
+        async fn persist_external_volume(
+            &self,
+            _vid: VolumeId,
+            _n: String,
+            _t: TenantId,
+            _p: String,
+            _s: u64,
+            _o: VolumeOwnership,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A PDF's first bytes, which content sniffing names `application/pdf`.
+    const PDF: &[u8] =
+        b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj << /Type /Catalog >> endobj\ntrailer << >>\n%%EOF\n";
+    /// A PNG's signature and header chunk, sniffed as `image/png`.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00";
+
+    fn b64(bytes: &[u8]) -> String {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    /// Inbox uid 1, thread `<att@x>`: a `multipart/mixed` whose first part
+    /// is a `multipart/alternative` holding the text body and a nested
+    /// `multipart/mixed` (an HTML alternative and an unnamed PNG, part
+    /// `1.2.2`), then a PDF (part `2`) and a quoted-printable Latin-1 text
+    /// file (part `3`).
+    fn nested() -> StoredMessage {
+        let body = format!(
+            "--MIX\r\n\
+Content-Type: multipart/alternative; boundary=\"ALT\"\r\n\
+\r\n\
+--ALT\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+See the attached report.\r\n\
+--ALT\r\n\
+Content-Type: multipart/mixed; boundary=\"INNER\"\r\n\
+\r\n\
+--INNER\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>See the attached report.</p>\r\n\
+--INNER\r\n\
+Content-Type: image/png\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+{png}\r\n\
+--INNER--\r\n\
+--ALT--\r\n\
+--MIX\r\n\
+Content-Type: application/pdf; name=\"report.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+{pdf}\r\n\
+--MIX\r\n\
+Content-Type: text/plain; charset=iso-8859-1\r\n\
+Content-Disposition: attachment; filename=\"../notes\t.txt\"\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+caf=E9 au =\r\n\
+lait\r\n\
+--MIX--\r\n",
+            png = b64(PNG),
+            pdf = b64(PDF),
+        );
+        message(
+            1,
+            &[],
+            &[
+                "Message-ID: <att@x>",
+                "From: Ann <ann@example.test>",
+                "Subject: The report",
+                "Date: Tue, 06 Oct 2026 09:00:00 +0000",
+                "MIME-Version: 1.0",
+                "Content-Type: multipart/mixed; boundary=\"MIX\"",
+            ],
+            &body,
+        )
+    }
+
+    /// A message (uid `uid`) whose one attachment `name` is `bytes`, base64.
+    fn one_attachment(uid: u32, id: &str, name: &str, kind: &str, bytes: &[u8]) -> StoredMessage {
+        let body = format!(
+            "--B\r\nContent-Type: text/plain\r\n\r\nAttached.\r\n--B\r\n\
+Content-Type: {kind}; name=\"{name}\"\r\n\
+Content-Disposition: attachment; filename=\"{name}\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{data}\r\n--B--\r\n",
+            data = b64(bytes)
+        );
+        message(
+            uid,
+            &[],
+            &[
+                &format!("Message-ID: {id}"),
+                "From: owner@example.test",
+                "Subject: Attached",
+                "Date: Tue, 06 Oct 2026 10:00:00 +0000",
+                "Content-Type: multipart/mixed; boundary=\"B\"",
+            ],
+            &body,
+        )
+    }
+
+    /// Sent uid 7: a CSV, attachment part `2`.
+    const CSV: &[u8] = b"name,amount\nann,12\n";
+
+    struct World {
+        _root: tempfile::TempDir,
+        root: PathBuf,
+        mailbox: MailboxStandIn,
+        tools: MailTools,
+        volumes: Arc<InMemoryVolumeRepository>,
+        id: CredentialBindingId,
+    }
+
+    async fn world(inbox: Vec<StoredMessage>) -> World {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let volumes = Arc::new(InMemoryVolumeRepository::new());
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(&root).unwrap()),
+            volumes.clone(),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoOpPublisher),
+        ));
+        let files = MailFiles {
+            file_operations: Arc::new(FileOperationsService::new(
+                fsal,
+                Arc::new(InMemoryExecutionRepository::new()),
+                Arc::new(InMemoryAgentRepository::new()),
+            )),
+            user_volumes: Arc::new(UserVolumeService::new(
+                volumes.clone(),
+                Arc::new(HostVolumes {
+                    repo: volumes.clone(),
+                }),
+                Arc::new(EventBus::new(16)),
+                StorageTierLimits::default(),
+            )),
+        };
+        let folders = vec![
+            StandInFolder::new(SENT, "\\Sent").holding(vec![one_attachment(
+                7, "<s7@x>", "sums.csv", "text/csv", CSV,
+            )]),
+        ];
+        let mailbox =
+            imap_mailbox_standin_with_capabilities(LOGIN, PASSWORD, inbox, folders, "IMAP4rev1")
+                .await;
+        let id = CredentialBindingId::new();
+        let source = Arc::new(OneMailbox {
+            id,
+            port: mailbox.port(),
+        });
+        World {
+            _root: dir,
+            root,
+            tools: MailTools::with_connector(source, Arc::new(PlainConnector)).with_files(files),
+            mailbox,
+            volumes,
+            id,
+        }
+    }
+
+    fn person() -> MailActing {
+        MailActing {
+            tier: Some(ZaruTier::Free),
+            ..conversation()
+        }
+    }
+
+    async fn save(w: &World, args: Value) -> Result<Value, SealSessionError> {
+        let mut args = args;
+        args["mailbox"] = json!(w.id.0.to_string());
+        w.tools.invoke("mail.attachment", &args, &person()).await
+    }
+
+    /// The person's volumes.
+    async fn owned(w: &World) -> Vec<Volume> {
+        w.volumes
+            .find_by_owner(&TenantId::default(), USER)
+            .await
+            .unwrap()
+    }
+
+    /// The bytes a saved reference points at, read from the volume's host
+    /// directory.
+    fn saved_bytes(w: &World, answer: &Value) -> Option<Vec<u8>> {
+        let volume = answer["volume_id"].as_str()?;
+        let path = answer["path"].as_str()?;
+        std::fs::read(w.root.join(format!("hosts/{volume}")).join(path)).ok()
+    }
+
+    /// Every file under the scratch root.
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    /// Clause 30: `mail.read` numbers each attachment as RFC 9051 numbers
+    /// body parts, nested ones included.
+    #[tokio::test]
+    async fn mail_read_answers_each_attachment_with_its_rfc_9051_part_number() {
+        let w = world(vec![nested()]).await;
+        let mut args = json!({"thread_id": "<att@x>"});
+        args["mailbox"] = json!(w.id.0.to_string());
+        let answer = w
+            .tools
+            .invoke("mail.read", &args, &person())
+            .await
+            .expect("mail.read");
+        let attachments: Vec<(Value, Value, Value)> = answer["messages"][0]["attachments"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| {
+                (
+                    a["part"].clone(),
+                    a["filename"].clone(),
+                    a["content_type"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            attachments,
+            vec![
+                (json!("1.2.2"), Value::Null, json!("image/png")),
+                (json!("2"), json!("report.pdf"), json!("application/pdf")),
+                (json!("3"), json!("../notes\t.txt"), json!("text/plain")),
+            ],
+            "the attachments mail.read answered: {answer}"
+        );
+        assert_eq!(
+            answer["messages"][0]["body_text"],
+            "See the attached report."
+        );
+    }
+
+    /// Clause 31: a part is fetched read-only, decoded from base64 and
+    /// written to the person's `chat-attachments` volume, provisioned on
+    /// first use and reused after; its reference is answered with the bytes'
+    /// type, size and SHA-256, and a PDF answers no `text`.
+    #[tokio::test]
+    async fn an_attachment_is_saved_to_the_persons_chat_attachments_volume_provisioned_on_first_use(
+    ) {
+        let w = world(vec![nested()]).await;
+        let mut wrong = Vec::new();
+        if !owned(&w).await.is_empty() {
+            wrong.push("the person had a volume before the call".to_string());
+        }
+        let from = w.mailbox.commands().len();
+        let pdf = save(&w, json!({"uid": 1, "part": "2"})).await;
+        let pdf = match pdf {
+            Ok(answer) => answer,
+            Err(e) => panic!("mail.attachment failed: {}", sentence(&e)),
+        };
+        let volumes = owned(&w).await;
+        match volumes.as_slice() {
+            [v] if v.name == "chat-attachments"
+                && v.ownership == VolumeOwnership::persistent(USER.to_string())
+                && pdf["volume_id"] == v.id.to_string() => {}
+            other => wrong.push(format!(
+                "the person's volumes after the call: {:?}, the answer's {}",
+                other.iter().map(|v| (&v.name, v.id)).collect::<Vec<_>>(),
+                pdf["volume_id"]
+            )),
+        }
+        let path = pdf["path"].as_str().unwrap_or_default().to_string();
+        let segments: Vec<&str> = path.split('/').collect();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        if segments.len() != 4
+            || segments[0] != "mail"
+            || segments[1] != today
+            || uuid::Uuid::parse_str(segments[2]).is_err()
+            || segments[3] != "report.pdf"
+        {
+            wrong.push(format!(
+                "the path is not mail/{today}/<uuid>/report.pdf: {path}"
+            ));
+        }
+        for (key, expected) in [
+            ("name", json!("report.pdf")),
+            ("mime_type", json!("application/pdf")),
+            ("size", json!(PDF.len())),
+            ("sha256", json!(sha(PDF))),
+        ] {
+            if pdf[key] != expected {
+                wrong.push(format!("{key} is {}, not {expected}", pdf[key]));
+            }
+        }
+        if pdf.get("text").is_some() {
+            wrong.push(format!("a PDF answered text: {}", pdf["text"]));
+        }
+        if saved_bytes(&w, &pdf).as_deref() != Some(PDF) {
+            wrong.push("the saved file is not the PDF's decoded bytes".to_string());
+        }
+        let commands = sent_since(&w.mailbox, from);
+        wrong.extend(not_read_only(&commands, "INBOX"));
+        if !commands
+            .iter()
+            .any(|c| c.to_ascii_uppercase() == "UID FETCH 1 (UID BODY.PEEK[])")
+        {
+            wrong.push(format!(
+                "the message was not fetched whole by uid: {commands:?}"
+            ));
+        }
+
+        // A second save reuses the volume; an unnamed part is `attachment`.
+        match save(&w, json!({"uid": 1, "part": "1.2.2"})).await {
+            Ok(png) => {
+                if png["volume_id"] != pdf["volume_id"] || owned(&w).await.len() != 1 {
+                    wrong.push(format!("a second volume: {}", png["volume_id"]));
+                }
+                if png["name"] != "attachment" || png["mime_type"] != "image/png" {
+                    wrong.push(format!("the unnamed PNG: {png}"));
+                }
+                if saved_bytes(&w, &png).as_deref() != Some(PNG) {
+                    wrong.push("the saved file is not the PNG's decoded bytes".to_string());
+                }
+            }
+            Err(e) => wrong.push(format!("the PNG: {}", sentence(&e))),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Clause 31: a quoted-printable `text/*` part is decoded, saved as its
+    /// bytes, named with path separators and control characters removed,
+    /// and answered with its text in its charset.
+    #[tokio::test]
+    async fn a_short_text_attachment_is_decoded_from_quoted_printable_and_answers_its_text() {
+        let w = world(vec![nested()]).await;
+        let answer = match save(&w, json!({"uid": 1, "part": "3"})).await {
+            Ok(answer) => answer,
+            Err(e) => panic!("mail.attachment failed: {}", sentence(&e)),
+        };
+        let latin1 = b"caf\xe9 au lait";
+        let mut wrong = Vec::new();
+        if answer["text"] != "café au lait" {
+            wrong.push(format!("text: {}", answer["text"]));
+        }
+        if answer["name"] != "..notes.txt" {
+            wrong.push(format!("name: {}", answer["name"]));
+        }
+        if answer["size"] != json!(latin1.len()) || answer["sha256"] != json!(sha(latin1)) {
+            wrong.push(format!("size and sha256: {answer}"));
+        }
+        if saved_bytes(&w, &answer).as_deref() != Some(&latin1[..]) {
+            wrong.push("the saved file is not the decoded bytes".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Clause 31 with clause 22: a message in another folder is saved by
+    /// `folder`; its uid names nothing in the inbox.
+    #[tokio::test]
+    async fn an_attachment_of_a_message_in_another_folder_is_saved_by_folder() {
+        let w = world(vec![nested()]).await;
+        let mut wrong = Vec::new();
+        let from = w.mailbox.commands().len();
+        match save(&w, json!({"folder": "sent", "uid": 7, "part": "2"})).await {
+            Ok(answer) => {
+                if answer["name"] != "sums.csv"
+                    || answer["text"] != "name,amount\nann,12\n"
+                    || saved_bytes(&w, &answer).as_deref() != Some(CSV)
+                {
+                    wrong.push(format!("the CSV from Sent: {answer}"));
+                }
+            }
+            Err(e) => wrong.push(format!("Sent: {}", sentence(&e))),
+        }
+        wrong.extend(not_read_only(&sent_since(&w.mailbox, from), SENT));
+        match save(&w, json!({"uid": 7, "part": "2"})).await {
+            Err(e) if sentence(&e) == "There is no attachment '2' on message 7 in this folder." => {
+            }
+            other => wrong.push(format!("uid 7 in the inbox: {other:?}")),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Clause 31: a part the message does not carry as an attachment (none
+    /// numbered so, or its text body) is refused with nothing provisioned or
+    /// written.
+    #[tokio::test]
+    async fn a_part_that_is_no_attachment_is_refused_with_nothing_written() {
+        let w = world(vec![nested()]).await;
+        let mut wrong = Vec::new();
+        for part in ["4", "1.1", "1.2.1"] {
+            match save(&w, json!({"uid": 1, "part": part})).await {
+                Err(e)
+                    if sentence(&e)
+                        == format!(
+                            "There is no attachment '{part}' on message 1 in this folder."
+                        ) => {}
+                other => wrong.push(format!("part {part}: {other:?}")),
+            }
+        }
+        if !owned(&w).await.is_empty() || !files_under(&w.root).is_empty() {
+            wrong.push("a volume or a file was made for a missing part".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Clause 31: a part larger than 20 MiB is refused with its sentence,
+    /// nothing provisioned and nothing written, though the Free tier's
+    /// files may be larger; a part of 20 MiB exactly, whose message is about
+    /// 27 MiB in base64, is fetched whole and saved.
+    #[tokio::test]
+    async fn an_attachment_larger_than_20_mib_is_refused_with_nothing_written() {
+        let limit = 20 * 1024 * 1024;
+        let over = vec![b'x'; limit + 1];
+        let at = vec![b'y'; limit];
+        let w = world(vec![
+            one_attachment(1, "<over@x>", "over.bin", "application/octet-stream", &over),
+            one_attachment(2, "<at@x>", "at.bin", "application/octet-stream", &at),
+        ])
+        .await;
+        let tier_max = StorageTierLimits::default().limits[&ZaruTier::Free].max_file_size_bytes;
+        assert!(
+            tier_max > over.len() as u64,
+            "the Free tier allows {tier_max}"
+        );
+        let mut wrong = Vec::new();
+        match save(&w, json!({"uid": 1, "part": "2"})).await {
+            Err(e) if sentence(&e) == ATTACHMENT_TOO_LARGE => {}
+            Err(e) => wrong.push(format!("20 MiB and a byte: {}", sentence(&e))),
+            Ok(v) => wrong.push(format!("20 MiB and a byte was saved: {}", v["size"])),
+        }
+        if !owned(&w).await.is_empty() || !files_under(&w.root).is_empty() {
+            wrong.push("a volume or a file was made for a refused part".to_string());
+        }
+        match save(&w, json!({"uid": 2, "part": "2"})).await {
+            Ok(v)
+                if v["size"] == json!(limit) && saved_bytes(&w, &v).as_deref() == Some(&at[..]) => {
+            }
+            Ok(v) => wrong.push(format!("20 MiB exactly: {v}")),
+            Err(e) => wrong.push(format!("20 MiB exactly: {}", sentence(&e))),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A run with no person is refused as every mail tool refuses it, before
+    /// any connection.
+    #[tokio::test]
+    async fn a_run_with_no_person_is_refused_before_any_connection() {
+        let w = world(vec![nested()]).await;
+        let acting = MailActing {
+            user_id: None,
+            ..person()
+        };
+        let args = json!({"mailbox": w.id.0.to_string(), "uid": 1, "part": "2"});
+        match w.tools.invoke("mail.attachment", &args, &acting).await {
+            Err(e) if sentence(&e) == NO_PERSON => {}
+            other => panic!("no person: {other:?}"),
+        }
+        assert_eq!(w.mailbox.connections(), 0, "a connection was opened");
+    }
 }

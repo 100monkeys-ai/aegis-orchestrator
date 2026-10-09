@@ -2017,6 +2017,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         });
     }
 
+    // Initialize user volume service (Gap 079); built before the tool
+    // service so the mail tools save attachments to the same
+    // `chat-attachments` volume uploads provision.
+    let user_volume_service = Arc::new(
+        aegis_orchestrator_core::application::user_volume_service::UserVolumeService::new(
+            volume_repo.clone(),
+            volume_service.clone(),
+            event_bus.clone(),
+            aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
+        ),
+    );
+
     let mut tool_invocation_service_builder =
         aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
             seal_session_repo.clone(),
@@ -2068,7 +2080,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     )?;
     // The mail tools resolve the acting person's mailbox from the same store.
     if let Some(source) = mailbox_source {
-        tool_invocation_service_builder = tool_invocation_service_builder.with_mail_tools(source);
+        tool_invocation_service_builder = tool_invocation_service_builder.with_mail_tools(
+            source,
+            aegis_orchestrator_core::application::tools::builtin_mail::MailFiles {
+                file_operations: file_operations_service.clone(),
+                user_volumes: user_volume_service.clone(),
+            },
+        );
     }
     // The calendar tools resolve the acting person's calendar account from
     // the same store (AEGIS ADR-138 K5a).
@@ -2392,16 +2410,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // EffectiveTierService below, because provisioning delegates the
     // `zaru_tier` Keycloak attribute write to it. Placeholder binding kept
     // here so the variable is in scope for the AppState assembly below.
-
-    // Initialize user volume service and file operations service (Gap 079)
-    let user_volume_service = Arc::new(
-        aegis_orchestrator_core::application::user_volume_service::UserVolumeService::new(
-            volume_repo.clone(),
-            volume_service.clone(),
-            event_bus.clone(),
-            aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
-        ),
-    );
 
     // Initialize git repo service (ADR-081 Waves A2 / A3). Requires a
     // Postgres pool for the binding repository; left as `None` when the

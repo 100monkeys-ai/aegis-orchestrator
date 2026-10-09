@@ -68,6 +68,58 @@ pub struct VolumeWithUsage {
 }
 
 // ============================================================================
+// The chat-attachments volume
+// ============================================================================
+
+/// Reserved volume name used for chat attachments (ADR-113).
+///
+/// A person's `chat-attachments` volume is provisioned on first use (an
+/// upload naming this literal in place of a volume id, or a mail attachment
+/// saved by `mail.attachment`) and reused afterwards. The name is reserved
+/// per ADR-079 and counts against the person's `ZaruTier` storage quota like
+/// any other volume.
+pub const CHAT_ATTACHMENTS_VOLUME_NAME: &str = "chat-attachments";
+
+/// Hard ceiling for the lazy-provisioned `chat-attachments` volume on tiers
+/// whose `total_storage_bytes` is unbounded (Enterprise = `u64::MAX`). A raw
+/// `u64::MAX` allocation is nonsensical at the storage layer; clamp to a
+/// sensible per-volume default that still leaves room for additional volumes
+/// within the same tier budget.
+pub const CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Resolve the size to allocate for a lazy-provisioned `chat-attachments`
+/// volume from the person's tier. The volume's allocation must fit under the
+/// tier's `total_storage_bytes` budget; otherwise
+/// [`UserVolumeService::create_volume`] rejects the request with
+/// `StorageQuotaExceeded` even for an empty volume.
+///
+/// We allocate the full tier `total_storage_bytes` so the user gets as much
+/// chat-attachment headroom as their tier permits without exceeding it.
+/// (Free users can still create one extra volume because `max_volumes >= 2`,
+/// but that volume will compete with chat-attachments for the storage
+/// budget — a deliberate trade chosen over fragmenting the budget across
+/// volumes the user may never create.)
+///
+/// Unbounded tiers (Enterprise = `u64::MAX`) are clamped to
+/// [`CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES`] because a raw `u64::MAX` is
+/// nonsensical at the storage backend.
+///
+/// Returns `None` for an unrecognized tier so callers fail closed rather than
+/// admitting the volume creation under an unbounded cap.
+pub fn chat_attachments_volume_size_for_tier(
+    limits: &StorageTierLimits,
+    tier: &ZaruTier,
+) -> Option<u64> {
+    limits.limits.get(tier).map(|l| {
+        if l.total_storage_bytes == u64::MAX {
+            CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES
+        } else {
+            l.total_storage_bytes
+        }
+    })
+}
+
+// ============================================================================
 // Service
 // ============================================================================
 
@@ -165,6 +217,39 @@ impl UserVolumeService {
             });
 
         Ok(volume)
+    }
+
+    /// The person's `chat-attachments` volume (ADR-113): found by name within
+    /// (tenant, owner), else provisioned at the size
+    /// [`chat_attachments_volume_size_for_tier`] gives `tier`. One rule for
+    /// the upload route and the mail tools (AEGIS ADR-125's Update of
+    /// 2026-10-08 (5) clause 31: "provisioned as uploads provision it").
+    /// An unrecognized tier provisions nothing (`UnknownTier`).
+    pub async fn find_or_provision_chat_attachments(
+        &self,
+        tenant_id: &TenantId,
+        owner: &str,
+        tier: &ZaruTier,
+    ) -> Result<VolumeId, UserVolumeError> {
+        if let Some(existing) = self
+            .list_volumes(tenant_id, owner)
+            .await?
+            .into_iter()
+            .find(|v| v.name == CHAT_ATTACHMENTS_VOLUME_NAME)
+        {
+            return Ok(existing.id);
+        }
+        let size_limit_bytes = chat_attachments_volume_size_for_tier(&self.tier_limits, tier)
+            .ok_or(UserVolumeError::UnknownTier)?;
+        self.create_volume(CreateUserVolumeCommand {
+            tenant_id: tenant_id.clone(),
+            owner_user_id: owner.to_string(),
+            label: CHAT_ATTACHMENTS_VOLUME_NAME.to_string(),
+            size_limit_bytes,
+            zaru_tier: tier.clone(),
+        })
+        .await
+        .map(|v| v.id)
     }
 
     pub async fn list_volumes(
@@ -512,6 +597,41 @@ mod tests {
             StorageTierLimits::default(),
         );
         (svc, repo, mock_svc)
+    }
+
+    /// The `chat-attachments` volume is provisioned once, at the size its
+    /// tier gives, owned by the person, and found by name afterwards; another
+    /// person gets their own.
+    #[tokio::test]
+    async fn chat_attachments_is_provisioned_once_at_the_tiers_size_and_reused() {
+        let (svc, repo) = make_svc();
+        let tenant = TenantId::consumer();
+        let first = svc
+            .find_or_provision_chat_attachments(&tenant, "user-1", &ZaruTier::Free)
+            .await
+            .expect("provisioned");
+        let again = svc
+            .find_or_provision_chat_attachments(&tenant, "user-1", &ZaruTier::Free)
+            .await;
+        assert!(
+            matches!(&again, Ok(id) if *id == first),
+            "the second call did not answer the person's chat-attachments volume {first}: {again:?}"
+        );
+        let owned = repo.find_by_owner(&tenant, "user-1").await.unwrap();
+        assert_eq!(owned.len(), 1, "{owned:?}");
+        assert_eq!(owned[0].name, CHAT_ATTACHMENTS_VOLUME_NAME);
+        assert_eq!(
+            Some(owned[0].size_limit_bytes),
+            chat_attachments_volume_size_for_tier(&StorageTierLimits::default(), &ZaruTier::Free)
+        );
+        let other = svc
+            .find_or_provision_chat_attachments(&tenant, "user-2", &ZaruTier::Free)
+            .await
+            .expect("another person's");
+        assert_ne!(
+            other, first,
+            "another person was given the first person's volume"
+        );
     }
 
     #[tokio::test]
