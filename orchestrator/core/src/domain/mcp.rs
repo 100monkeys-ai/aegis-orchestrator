@@ -296,7 +296,10 @@ pub struct ApprovalDeclaration {
 /// argument and shows the mailbox, the thread, and the thread's subject and
 /// senders, which its admission reads before the gate (its Update of
 /// 2026-10-08 (4) clause 20); `mail.archive` declares the same (its Update
-/// of 2026-10-08 (5) clause 29). The four calendar writes act through the
+/// of 2026-10-08 (5) clause 29). `mail.forward` acts through `mailbox` and
+/// shows the recipients, the subject, the note, each forwarded message's
+/// sender, subject and date, and the files, which its admission reads
+/// before the gate (its Update of 2026-10-08 (5) clause 35). The four calendar writes act through the
 /// calendar account their `account` argument names, and a person reads the
 /// event, its time and its attendees before answering; for update, delete
 /// and respond the admission reads those values from the event before the
@@ -322,6 +325,19 @@ pub const APPROVAL_DECLARATIONS: &[ApprovalDeclaration] = &[
         tool: "mail.archive",
         binding_argument: Some("mailbox"),
         approval_summary: Some(&["mailbox", "thread_id", "subject", "from"]),
+    },
+    ApprovalDeclaration {
+        tool: "mail.forward",
+        binding_argument: Some("mailbox"),
+        approval_summary: Some(&[
+            "mailbox",
+            "to",
+            "cc",
+            "subject",
+            "note",
+            "forwarded",
+            "attachment_names",
+        ]),
     },
     ApprovalDeclaration {
         tool: "calendar.create",
@@ -421,6 +437,7 @@ impl ToolInputContract {
             "mail.send" => &["mailbox", "to", "subject", "body"],
             "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],
             "mail.attachment" => &["mailbox", "uid", "part"],
+            "mail.forward" => &["mailbox", "thread_id", "to"],
             "calendar.calendars" => &["account"],
             "calendar.list" => &["account", "calendar_id"],
             "calendar.read" | "calendar.update" | "calendar.delete" => {

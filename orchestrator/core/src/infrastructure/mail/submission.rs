@@ -75,15 +75,23 @@ pub async fn submit(
 }
 
 /// `message` as `DATA` carries it: CRLF line endings, each line beginning
-/// with `.` given a second one, ended by `.` on a line of its own.
+/// with `.` given a second one, ended by `.` on a line of its own. It works
+/// on bytes, so a forwarded message's bytes that are not UTF-8 go out as
+/// they are.
 fn dot_stuffed(message: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(message).replace("\r\n", "\n");
+    let mut lines: Vec<&[u8]> = message
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
     let mut out = Vec::with_capacity(message.len() + 8);
-    for line in text.trim_end_matches('\n').split('\n') {
-        if line.starts_with('.') {
+    for line in lines {
+        if line.first() == Some(&b'.') {
             out.push(b'.');
         }
-        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(line);
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b".\r\n");
@@ -99,6 +107,18 @@ mod tests {
         assert_eq!(
             dot_stuffed(b"Subject: x\r\n\r\n.\r\n..two\r\nend\r\n"),
             b"Subject: x\r\n\r\n..\r\n...two\r\nend\r\n.\r\n".to_vec()
+        );
+    }
+
+    /// A forwarded message's bytes go out as they are: a byte that is not
+    /// UTF-8 (0xE9, `é` in Latin-1) is carried through unchanged, beside a
+    /// line beginning with a dot.
+    #[test]
+    fn a_byte_that_is_not_utf8_is_carried_through_unchanged() {
+        assert_eq!(
+            dot_stuffed(b"Subject: caf\xe9\r\n\r\n.caf\xe9\r\n\xe9t\xe9\r\n"),
+            b"Subject: caf\xe9\r\n\r\n..caf\xe9\r\n\xe9t\xe9\r\n.\r\n".to_vec(),
+            "the 0xE9 bytes did not go out unchanged"
         );
     }
 }

@@ -20,7 +20,7 @@
 //! [`imap_mailbox_standin`] is a second IMAP stand-in holding an in-memory
 //! `INBOX`, for the mail tools (AEGIS ADR-125 D4): `EXAMINE`, `SELECT`,
 //! `UID SEARCH` (ALL, SEEN, UNSEEN, FLAGGED, TEXT, FROM, SINCE, HEADER, OR,
-//! UID, CHARSET, and a sequence set such as `151:200`), `UID FETCH` (UID, FLAGS, INTERNALDATE, `BODY[]`,
+//! UID, CHARSET, and a sequence set such as `151:200`), `UID FETCH` (UID, FLAGS, INTERNALDATE, `RFC822.SIZE`, `BODY[]`,
 //! `BODY.PEEK[]`, `BODY.PEEK[HEADER.FIELDS (...)]`; a `BODY[]` without
 //! `PEEK` sets `\Seen`, as a server does) and `UID STORE` (`+FLAGS`,
 //! `-FLAGS`; a keyword its `PERMANENTFLAGS` does not keep is dropped, as a
@@ -1320,6 +1320,11 @@ async fn mailbox_standin(
                                             reply.extend(
                                                 format!(" INTERNALDATE \"{}\"", m.internal_date)
                                                     .bytes(),
+                                            );
+                                        }
+                                        if upper.contains("RFC822.SIZE") {
+                                            reply.extend(
+                                                format!(" RFC822.SIZE {}", m.raw.len()).bytes(),
                                             );
                                         }
                                         if upper.contains("BODY.PEEK[]") || whole_unpeeked {

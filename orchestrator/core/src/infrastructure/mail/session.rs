@@ -98,6 +98,8 @@ pub struct Fetched {
     pub header: Option<Vec<u8>>,
     /// The bytes of `BODY[]`, if fetched.
     pub full: Option<Vec<u8>>,
+    /// The message's `RFC822.SIZE`, if fetched.
+    pub size: Option<u64>,
 }
 
 /// How `UID STORE` changes flags.
@@ -713,6 +715,10 @@ fn parse_fetch(response: &Response) -> Option<Fetched> {
         } else if upper == "INTERNALDATE" {
             if let Item::Str(s) = value {
                 fetched.internal_date = Some(s);
+            }
+        } else if upper == "RFC822.SIZE" {
+            if let Item::Atom(n) = value {
+                fetched.size = n.parse().ok();
             }
         } else if upper.starts_with("BODY[HEADER") || upper.starts_with("RFC822.HEADER") {
             fetched.header = bytes(value);

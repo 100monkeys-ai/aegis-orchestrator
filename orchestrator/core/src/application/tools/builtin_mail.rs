@@ -90,6 +90,18 @@
 //! gave; at the run each file is read again, and one whose digest is not
 //! the admitted one refuses the send with nothing sent.
 //!
+//! **Forwarding** (its Update of 2026-10-08 (5), clauses 33 to 35).
+//! `mail.forward` sends a thread of one folder, or one message of it, to
+//! `to` and `cc`: an optional plain-text `note`, then each message byte for
+//! byte as a `message/rfc822` part, then the person's files as `mail.send`
+//! attaches them, with a minted `Message-ID` and no `In-Reply-To`, by the
+//! same submission and Sent copy. At most 20 messages and 20 MiB of them.
+//! It is gated; before the gate its admission reads the messages' headers
+//! and sizes and writes `subject` (the one given, else `Fwd: ` and the
+//! oldest message's), `forwarded` (each message's sender, subject and date)
+//! and `message_uids` into the call; the run forwards exactly those uids,
+//! and refuses with nothing sent when one is no longer in the folder.
+//!
 //! **Threads.** A thread's id is the root `Message-ID` of its messages (the
 //! first `References` entry, else `In-Reply-To`, else the message's own); a
 //! message with no `Message-ID` is its own thread `uid:<UIDVALIDITY>:<uid>`.
@@ -229,6 +241,29 @@ pub const ATTACHMENTS_TOO_LARGE: &str =
 /// person approved.
 pub const ATTACHMENT_CHANGED: &str =
     "A file to attach changed after it was approved; nothing was sent.";
+/// The most messages one forward carries.
+pub const FORWARD_MAX_MESSAGES: usize = 20;
+/// The most bytes the messages one forward carries come to.
+pub const FORWARD_MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// The refusal of a forward of more than [`FORWARD_MAX_MESSAGES`].
+pub const TOO_MANY_TO_FORWARD: &str = "A forward carries at most 20 messages.";
+/// The refusal of a forward whose messages come to more than
+/// [`FORWARD_MAX_BYTES`].
+pub const FORWARD_TOO_LARGE: &str =
+    "The messages to forward come to more than 20 MiB; nothing was sent.";
+/// The refusal at the run of a forward one of whose messages is gone.
+pub const FORWARD_GONE: &str =
+    "A message to forward is no longer in this folder; nothing was sent.";
+/// The shape `note` must have.
+const BAD_NOTE: &str = "'note' must be plain text of at most 100000 characters.";
+/// The refusal at the run of a forward whose messages were never read
+/// before the gate.
+const FORWARD_NOT_ADMITTED: &str =
+    "This forward names no messages read for it before it was approved; nothing was sent.";
+/// The header fields, size and arrival date the admission reads of each
+/// message to forward (a message with no `Date` is dated by its arrival).
+const FORWARD_FIELDS: &str = "UID RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)]";
+
 /// The shape `attachments` must have.
 const BAD_ATTACHMENTS: &str =
     "'attachments' must be a list of files, each given by its volume_id and path.";
@@ -246,14 +281,17 @@ pub fn is_mail_tool(tool_name: &str) -> bool {
             | "mail.delete"
             | "mail.archive"
             | "mail.attachment"
+            | "mail.forward"
     )
 }
 
 /// What [`MailTools::admit_mailbox`] admitted: the binding the call names,
 /// and the arguments the admission read for the person (`subject` and
 /// `from` for `mail.delete` and `mail.archive`; `attachment_names` and
-/// `attachment_sha256` for `mail.send` and `mail.reply`; none for another
-/// tool), which the caller writes into the call before the gate.
+/// `attachment_sha256` for `mail.send` and `mail.reply`; `subject`,
+/// `forwarded` and `message_uids` beside those two for `mail.forward`;
+/// none for another tool), which the caller writes into the call before the
+/// gate.
 #[derive(Debug, Clone)]
 pub struct Admitted {
     pub binding: CredentialBindingId,
@@ -397,6 +435,12 @@ impl MailTools {
     /// so no value the model gave reaches the person. A file not the
     /// person's, more than 10 files, or more than 20 MiB together is
     /// refused here.
+    ///
+    /// For `mail.forward` (the Update of 2026-10-08 (5) clause 35) it reads
+    /// the thread's messages in the named folder, read-only, and answers
+    /// `subject`, `forwarded` and `message_uids`, beside the files' names
+    /// and digests; more than 20 messages, more than 20 MiB of them, or a
+    /// `message_uid` not of the thread there is refused here.
     pub async fn admit_mailbox(
         &self,
         tool_name: &str,
@@ -414,32 +458,30 @@ impl MailTools {
                 }
             }
             Request::Send { message } | Request::Reply { message, .. } => {
-                let read = match message.attachments.as_slice() {
-                    [] => Vec::new(),
-                    refs => {
-                        let Some(files) = self.files.as_ref() else {
-                            return Err(not_configured());
-                        };
-                        let read = read_attachments(files, acting, refs);
-                        match tokio::time::timeout(CALL_TIMEOUT, read).await {
-                            Ok(read) => read.map_err(NotAttached::refusal)?,
-                            Err(_) => return Err(timed_out()),
-                        }
-                    }
+                self.shown_attachments(acting, &message.attachments).await?
+            }
+            Request::Forward {
+                folder,
+                thread_id,
+                message_uid,
+                subject,
+                message,
+                ..
+            } => {
+                let read = shown_for_forward(
+                    self.connector.as_ref(),
+                    &mailbox,
+                    *folder,
+                    thread_id,
+                    *message_uid,
+                    subject.as_deref(),
+                );
+                let mut shown = match tokio::time::timeout(CALL_TIMEOUT, read).await {
+                    Ok(shown) => shown?,
+                    Err(_) => return Err(timed_out()),
                 };
-                vec![
-                    (
-                        "attachment_names",
-                        json!(read
-                            .iter()
-                            .map(|f| format!("{} ({} bytes)", f.name, f.data.len()))
-                            .collect::<Vec<_>>()),
-                    ),
-                    (
-                        "attachment_sha256",
-                        json!(read.iter().map(|f| f.sha256.clone()).collect::<Vec<_>>()),
-                    ),
-                ]
+                shown.extend(self.shown_attachments(acting, &message.attachments).await?);
+                shown
             }
             _ => Vec::new(),
         };
@@ -447,6 +489,42 @@ impl MailTools {
             binding: mailbox.binding_id,
             shown,
         })
+    }
+
+    /// The files of `refs` read as the person, as the admission answers
+    /// them: `attachment_names` (each name and size) and
+    /// `attachment_sha256`, both empty when nothing is attached.
+    async fn shown_attachments(
+        &self,
+        acting: &MailActing,
+        refs: &[FileRef],
+    ) -> Result<Vec<(&'static str, Value)>, SealSessionError> {
+        let read = match refs {
+            [] => Vec::new(),
+            refs => {
+                let Some(files) = self.files.as_ref() else {
+                    return Err(not_configured());
+                };
+                let read = read_attachments(files, acting, refs);
+                match tokio::time::timeout(CALL_TIMEOUT, read).await {
+                    Ok(read) => read.map_err(NotAttached::refusal)?,
+                    Err(_) => return Err(timed_out()),
+                }
+            }
+        };
+        Ok(vec![
+            (
+                "attachment_names",
+                json!(read
+                    .iter()
+                    .map(|f| format!("{} ({} bytes)", f.name, f.data.len()))
+                    .collect::<Vec<_>>()),
+            ),
+            (
+                "attachment_sha256",
+                json!(read.iter().map(|f| f.sha256.clone()).collect::<Vec<_>>()),
+            ),
+        ])
     }
 
     /// The mailbox the call may use, or its refusal.
@@ -613,6 +691,18 @@ enum Request {
         folder: FolderKind,
         uid: u32,
         part: String,
+    },
+    /// `mail.forward`: a thread of a folder, or one message of it, sent
+    /// whole after the note in `message.body`, with `message`'s recipients
+    /// and files. `message_uids` are the uids the admission read, which
+    /// the run forwards.
+    Forward {
+        folder: FolderKind,
+        thread_id: String,
+        message_uid: Option<u32>,
+        subject: Option<String>,
+        message: Outbound,
+        message_uids: Option<Vec<u32>>,
     },
 }
 
@@ -839,7 +929,9 @@ fn not_attachable(path: &str) -> SealSessionError {
 /// The files an outbound request attaches; none for any other request.
 fn outbound_files(request: &Request) -> &[FileRef] {
     match request {
-        Request::Send { message } | Request::Reply { message, .. } => &message.attachments,
+        Request::Send { message }
+        | Request::Reply { message, .. }
+        | Request::Forward { message, .. } => &message.attachments,
         _ => &[],
     }
 }
@@ -1161,8 +1253,80 @@ impl Request {
                     }
                 },
             }),
+            "mail.forward" => Request::forward(args),
             other => Err(invalid(format!("'{other}' is not a mail tool."))),
         }
+    }
+
+    /// A `mail.forward` call: `to` (at least one) and `cc` as the outbound
+    /// tools take them, an optional one-line `subject`, an optional plain
+    /// `note`, `attachments`, an optional `message_uid`, and the
+    /// `message_uids` the admission wrote (none when it has not run).
+    fn forward(args: &Value) -> Result<Self, SealSessionError> {
+        let folder = FolderKind::parse(args)?;
+        let thread_id = thread_id(args)?;
+        let to = addresses(args, "to")?;
+        let cc = addresses(args, "cc")?;
+        if to.is_empty() {
+            return Err(invalid("'to' must list at least one email address."));
+        }
+        if to.len() + cc.len() > MAX_RECIPIENTS {
+            return Err(invalid(TOO_MANY_RECIPIENTS));
+        }
+        let subject = match args.get("subject") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s))
+                if !s.contains(['\r', '\n']) && s.chars().count() <= SUBJECT_MAX_CHARS =>
+            {
+                Some(s.clone())
+            }
+            _ => return Err(invalid(BAD_SUBJECT)),
+        };
+        let note = match args.get("note") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(n)) if n.chars().count() <= SEND_BODY_MAX_CHARS => n.clone(),
+            _ => return Err(invalid(BAD_NOTE)),
+        };
+        let message_uid = match args.get("message_uid") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_u64() {
+                Some(uid) if (1..=u64::from(u32::MAX)).contains(&uid) => Some(uid as u32),
+                _ => {
+                    return Err(invalid(
+                        "'message_uid' must be the uid of a message of the thread as mail.read answered it.",
+                    ))
+                }
+            },
+        };
+        // Written by the admission over anything the model gave; a value
+        // that is not a list of uids is as good as none, and the run then
+        // refuses.
+        let message_uids = args
+            .get("message_uids")
+            .and_then(Value::as_array)
+            .and_then(|uids| {
+                uids.iter()
+                    .map(|uid| {
+                        uid.as_u64()
+                            .filter(|uid| (1..=u64::from(u32::MAX)).contains(uid))
+                            .map(|uid| uid as u32)
+                    })
+                    .collect::<Option<Vec<u32>>>()
+            });
+        Ok(Request::Forward {
+            folder,
+            thread_id,
+            message_uid,
+            subject,
+            message: Outbound {
+                to,
+                cc,
+                subject: String::new(),
+                body: note,
+                attachments: file_refs(args)?,
+            },
+            message_uids,
+        })
     }
 }
 
@@ -1199,6 +1363,28 @@ async fn run(
         Request::Attachment { .. } => {
             unreachable!("an attachment is saved by MailTools::invoke, with its file services")
         }
+        Request::Forward {
+            folder,
+            thread_id,
+            subject,
+            message,
+            message_uids,
+            ..
+        } => {
+            let Some(uids) = message_uids.as_deref().filter(|uids| !uids.is_empty()) else {
+                return Err(invalid(FORWARD_NOT_ADMITTED));
+            };
+            if uids.len() > FORWARD_MAX_MESSAGES {
+                return Err(invalid(TOO_MANY_TO_FORWARD));
+            }
+            let forwarding = Forwarding {
+                folder: *folder,
+                thread_id,
+                subject: subject.as_deref(),
+                uids,
+            };
+            return forward(connector, mailbox, message, &forwarding, attached).await;
+        }
         Request::List { .. } | Request::Read { .. } | Request::Label { .. } => {}
     }
     let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
@@ -1228,7 +1414,8 @@ async fn run(
         | Request::Send { .. }
         | Request::Reply { .. }
         | Request::Move { .. }
-        | Request::Attachment { .. } => {
+        | Request::Attachment { .. }
+        | Request::Forward { .. } => {
             unreachable!("an outbound or move request is run before the session opens")
         }
     };
@@ -1372,6 +1559,7 @@ fn compose(
         references: threading.references.clone(),
         date: chrono::Utc::now(),
         attachments,
+        forwarded: Vec::new(),
     }
 }
 
@@ -1456,22 +1644,7 @@ async fn send(
         .map(|f| json!({"name": f.name, "mime_type": f.content_type, "size": f.data.len()}))
         .collect();
     let raw = compose(mailbox, given, &message_id, &threading, attached).render();
-    let recipients: Vec<String> = given.to.iter().chain(given.cc.iter()).cloned().collect();
-    submission::submit(
-        connector,
-        &mailbox.settings,
-        &mailbox.auth,
-        &mailbox.settings.address,
-        &recipients,
-        &raw,
-    )
-    .await
-    .map_err(session_error)?;
-    let (saved, folder, reply) = match save_to_sent(connector, mailbox, &message_id, &raw).await {
-        SentCopy::Saved { folder } => (true, Some(folder), None),
-        SentCopy::NoFolder => (false, None, Some(NO_SENT.to_string())),
-        SentCopy::Failed { reply } => (false, None, Some(reply)),
-    };
+    let (saved, folder, reply) = deliver(connector, mailbox, given, &message_id, &raw).await?;
     let mut answer = json!({
         "mailbox": mailbox.binding_id.0.to_string(),
         "message_id": message_id,
@@ -1486,6 +1659,242 @@ async fn send(
         answer["thread_id"] = json!(thread_id);
         answer["in_reply_to"] = json!(threading.in_reply_to);
     }
+    if !attached_shown.is_empty() {
+        answer["attachments"] = Value::Array(attached_shown);
+    }
+    Ok(answer)
+}
+
+/// Submit `raw` (the message `given`, minted `message_id`) over SMTP to
+/// `given`'s recipients, then save its copy to the Sent folder: whether it
+/// was saved, the folder, and the reply when it was not. A failure to save
+/// is in the answer, never an error.
+async fn deliver(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    given: &Outbound,
+    message_id: &str,
+    raw: &[u8],
+) -> Result<(bool, Option<String>, Option<String>), SealSessionError> {
+    let recipients: Vec<String> = given.to.iter().chain(given.cc.iter()).cloned().collect();
+    submission::submit(
+        connector,
+        &mailbox.settings,
+        &mailbox.auth,
+        &mailbox.settings.address,
+        &recipients,
+        raw,
+    )
+    .await
+    .map_err(session_error)?;
+    Ok(
+        match save_to_sent(connector, mailbox, message_id, raw).await {
+            SentCopy::Saved { folder } => (true, Some(folder), None),
+            SentCopy::NoFolder => (false, None, Some(NO_SENT.to_string())),
+            SentCopy::Failed { reply } => (false, None, Some(reply)),
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Forwarding (the Update of 2026-10-08 (5), clauses 33 to 35)
+// ---------------------------------------------------------------------------
+
+/// The subject of a forward given none: `Fwd: ` and the oldest forwarded
+/// message's subject, one line of at most [`SUBJECT_MAX_CHARS`].
+fn forwarded_subject(oldest: &str) -> String {
+    format!("Fwd: {}", shown_text(oldest))
+        .chars()
+        .take(SUBJECT_MAX_CHARS)
+        .collect()
+}
+
+/// The refusal of a `message_uid` that is no message of the thread in the
+/// folder.
+fn no_message(uid: u32, thread_id: &str, folder: FolderKind) -> SealSessionError {
+    let shown: String = thread_id
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let message = format!(
+        "There is no message {uid} of thread '{shown}' in this mailbox's {}.",
+        folder.place()
+    );
+    SealSessionError::NotFound(message.clone()).answered(CallerAnswer::NotFound(message))
+}
+
+/// The admission's read for `mail.forward` before the gate: the thread's
+/// messages in the folder of `folder` (or the one `message_uid` names), at
+/// most [`FORWARD_MAX_MESSAGES`] and [`FORWARD_MAX_BYTES`] by their
+/// `RFC822.SIZE`, and what the person reads: `subject` (the one given,
+/// else `Fwd: ` and the oldest message's), `forwarded` (each message's
+/// sender, subject and date, oldest first) and `message_uids`. Read-only:
+/// `EXAMINE`, headers by `BODY.PEEK`.
+async fn shown_for_forward(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    folder: FolderKind,
+    thread_id: &str,
+    message_uid: Option<u32>,
+    subject: Option<&str>,
+) -> Result<Vec<(&'static str, Value)>, SealSessionError> {
+    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
+        .await
+        .map_err(session_error)?;
+    let shown = async {
+        let (_, status) = examine_kind(&mut session, folder).await?;
+        let mut messages =
+            thread_messages(&mut session, &status, thread_id, FORWARD_FIELDS, folder).await?;
+        if let Some(uid) = message_uid {
+            messages.retain(|m| m.uid == uid);
+            if messages.is_empty() {
+                return Err(no_message(uid, thread_id, folder));
+            }
+        }
+        if messages.len() > FORWARD_MAX_MESSAGES {
+            return Err(invalid(TOO_MANY_TO_FORWARD));
+        }
+        let size: u64 = messages.iter().map(|m| m.size.unwrap_or(0)).sum();
+        if size > FORWARD_MAX_BYTES {
+            return Err(invalid(FORWARD_TOO_LARGE));
+        }
+        let mut oldest: Option<String> = None;
+        let forwarded: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                let headers = parse_headers(m.header.as_deref().unwrap_or_default());
+                let subject = shown_text(&headers.get("Subject").unwrap_or_default());
+                oldest.get_or_insert_with(|| subject.clone());
+                format!(
+                    "{} · {} · {}",
+                    shown_text(&headers.get("From").unwrap_or_default()),
+                    subject,
+                    date_of(&headers, m).unwrap_or_default()
+                )
+            })
+            .collect();
+        let subject = match subject {
+            Some(given) => given.to_string(),
+            None => forwarded_subject(&oldest.unwrap_or_default()),
+        };
+        let uids: Vec<u32> = messages.iter().map(|m| m.uid).collect();
+        Ok(vec![
+            ("subject", json!(subject)),
+            ("forwarded", json!(forwarded)),
+            ("message_uids", json!(uids)),
+        ])
+    }
+    .await;
+    session.logout().await;
+    shown
+}
+
+/// What a forward's run forwards: the folder, the thread, the subject the
+/// admission wrote, and the uids it read.
+struct Forwarding<'a> {
+    folder: FolderKind,
+    thread_id: &'a str,
+    subject: Option<&'a str>,
+    uids: &'a [u32],
+}
+
+/// `mail.forward` at the run: exactly the admitted uids fetched whole from
+/// the folder (`EXAMINE`, `BODY.PEEK[]`), refused with nothing sent when
+/// one is gone or together they come to more than [`FORWARD_MAX_BYTES`];
+/// then the note, the messages as `message/rfc822` parts and the files
+/// `attached`, with a minted `Message-ID` and no threading, submitted and
+/// saved to Sent as `mail.send` does.
+async fn forward(
+    connector: &dyn MailConnector,
+    mailbox: &ToolMailbox,
+    given: &Outbound,
+    forwarding: &Forwarding<'_>,
+    attached: Vec<OutgoingAttachment>,
+) -> Result<Value, SealSessionError> {
+    let uids = forwarding.uids;
+    let mut session = ImapSession::open(connector, &mailbox.settings, &mailbox.auth)
+        .await
+        .map_err(session_error)?;
+    let fetched = async {
+        let (name, _) = examine_kind(&mut session, forwarding.folder).await?;
+        let sizes = session
+            .uid_fetch(uids, "UID RFC822.SIZE")
+            .await
+            .map_err(session_error)?;
+        if uids.iter().any(|uid| !sizes.iter().any(|f| f.uid == *uid)) {
+            return Err(invalid(FORWARD_GONE));
+        }
+        if sizes.iter().map(|f| f.size.unwrap_or(0)).sum::<u64>() > FORWARD_MAX_BYTES {
+            return Err(invalid(FORWARD_TOO_LARGE));
+        }
+        let whole = session
+            .uid_fetch(uids, "UID BODY.PEEK[]")
+            .await
+            .map_err(session_error)?;
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(uids.len());
+        let mut total: u64 = 0;
+        for uid in uids {
+            let Some(raw) = whole
+                .iter()
+                .find(|f| f.uid == *uid)
+                .and_then(|f| f.full.clone())
+            else {
+                return Err(invalid(FORWARD_GONE));
+            };
+            total = total.saturating_add(raw.len() as u64);
+            if total > FORWARD_MAX_BYTES {
+                return Err(invalid(FORWARD_TOO_LARGE));
+            }
+            messages.push(raw);
+        }
+        Ok((name, messages))
+    }
+    .await;
+    session.logout().await;
+    let (folder, messages) = fetched?;
+    let subject = match forwarding.subject {
+        Some(subject) => subject.to_string(),
+        None => forwarded_subject(
+            &parse_headers(messages.first().map(Vec::as_slice).unwrap_or_default())
+                .get("Subject")
+                .unwrap_or_default(),
+        ),
+    };
+    let given = Outbound {
+        subject,
+        ..given.clone()
+    };
+    let message_id = mint_message_id(&mailbox.settings.address);
+    let attached_shown: Vec<Value> = attached
+        .iter()
+        .map(|f| json!({"name": f.name, "mime_type": f.content_type, "size": f.data.len()}))
+        .collect();
+    let mut message = compose(
+        mailbox,
+        &given,
+        &message_id,
+        &Threading::default(),
+        attached,
+    );
+    message.forwarded = messages;
+    let raw = message.render();
+    let (saved, sent_folder, reply) =
+        deliver(connector, mailbox, &given, &message_id, &raw).await?;
+    let mut answer = json!({
+        "mailbox": mailbox.binding_id.0.to_string(),
+        "message_id": message_id,
+        "to": given.to,
+        "cc": given.cc,
+        "subject": given.subject,
+        "folder": folder,
+        "folder_kind": forwarding.folder.as_str(),
+        "thread_id": forwarding.thread_id,
+        "message_uids": uids,
+        "saved_to_sent": saved,
+        "sent_folder": sent_folder,
+        "sent_folder_reply": reply,
+    });
     if !attached_shown.is_empty() {
         answer["attachments"] = Value::Array(attached_shown);
     }

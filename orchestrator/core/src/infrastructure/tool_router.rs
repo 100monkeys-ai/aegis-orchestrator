@@ -75,8 +75,8 @@ pub struct ToolRouter {
 /// capability entry may gate further tools; it cannot clear this mark.
 /// `mail.send` and `mail.reply` carry it (AEGIS ADR-125's Update of
 /// 2026-10-07 (3) clause 12), as do `mail.delete` (its Update of
-/// 2026-10-08 (4) clause 20) and `mail.archive` (its Update of 2026-10-08
-/// (5) clause 29).
+/// 2026-10-08 (4) clause 20), `mail.archive` (its Update of 2026-10-08
+/// (5) clause 29) and `mail.forward` (its clause 35).
 struct BuiltinToolDefinition {
     name: &'static str,
     description: &'static str,
@@ -150,6 +150,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox's inbox, flags or unflags it, and marks it read or unread."),
     BuiltinToolDefinition::new("mail.delete", "Moves every message of a thread in a connected mailbox's inbox to its Trash folder; deletes nothing permanently. Waits for the person's approval before anything is moved.").requires_approval(),
     BuiltinToolDefinition::new("mail.archive", "Archives a thread of a connected mailbox: moves every message of the thread in its inbox to its Archive folder (on a server that keeps all mail in one folder, to that folder), so the thread leaves the inbox and stays in the mailbox; deletes nothing. Waits for the person's approval before anything is moved.").requires_approval(),
+    BuiltinToolDefinition::new("mail.forward", "Forwards a thread of a connected mailbox, or one message of it, from one folder (the inbox by default): sends the messages as attachments, each whole as it arrived, after an optional plain-text note, to the addresses in to and cc, with up to 10 of the person's own files attached (20 MiB together), then saves a copy in its Sent folder. At most 20 messages, 20 MiB together. Waits for the person's approval, which shows the recipients, the subject, the note and each forwarded message's sender, subject and date, before anything is sent.").requires_approval(),
     BuiltinToolDefinition::new("calendar.calendars", "Lists the calendars of a connected calendar account: each calendar's id, name, description, colour where given, and whether the account may write to it. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("calendar.list", "Lists the events of one calendar of a connected calendar account in a window of at most 92 days (by default now and the seven days on), by start: repeating events as their occurrences, each with its id, title, times, location, organiser, attendees and their answers, and status. Changes nothing.").skip_judge(),
     BuiltinToolDefinition::new("calendar.read", "Reads one event of a calendar of a connected calendar account: everything calendar.list answers, its description, its start and end as written with their time zone, and its etag. Changes nothing.").skip_judge(),
@@ -364,6 +365,7 @@ impl ToolRouter {
             "mail.delete" => Self::schema_mail_delete(),
             "mail.archive" => Self::schema_mail_archive(),
             "mail.attachment" => Self::schema_mail_attachment(),
+            "mail.forward" => Self::schema_mail_forward(),
             "calendar.calendars" => Self::schema_calendar(CalendarShape::Calendars),
             "calendar.list" => Self::schema_calendar(CalendarShape::List),
             "calendar.read" => Self::schema_calendar(CalendarShape::Read),
@@ -800,22 +802,7 @@ impl ToolRouter {
             }),
         );
         if shape != OutboundShape::Draft {
-            properties.insert(
-                "attachments".to_string(),
-                json!({
-                    "type": "array",
-                    "maxItems": 10,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "volume_id": {"type": "string", "description": "The id of one of the person's own volumes holding the file."},
-                            "path": {"type": "string", "description": "The file's path in that volume."}
-                        },
-                        "required": ["volume_id", "path"]
-                    },
-                    "description": "Files of the person's own to attach, at most 10 and 20 MiB together, each by its volume_id and path, such as an uploaded file's reference or one mail.attachment saved."
-                }),
-            );
+            properties.insert("attachments".to_string(), Self::schema_mail_files());
         }
         let required: Vec<&str> = match shape {
             OutboundShape::Draft => vec!["mailbox", "body"],
@@ -823,6 +810,78 @@ impl ToolRouter {
             OutboundShape::Reply => vec!["mailbox", "thread_id", "to", "subject", "body"],
         };
         json!({"type": "object", "properties": properties, "required": required})
+    }
+
+    /// The `attachments` the tools that send take (AEGIS ADR-125's Update
+    /// of 2026-10-08 (5) clause 32).
+    fn schema_mail_files() -> Value {
+        json!({
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "volume_id": {"type": "string", "description": "The id of one of the person's own volumes holding the file."},
+                    "path": {"type": "string", "description": "The file's path in that volume."}
+                },
+                "required": ["volume_id", "path"]
+            },
+            "description": "Files of the person's own to attach, at most 10 and 20 MiB together, each by its volume_id and path, such as an uploaded file's reference or one mail.attachment saved."
+        })
+    }
+
+    /// JSON schema for the `mail.forward` builtin tool (AEGIS ADR-125's
+    /// Update of 2026-10-08 (5) clause 34). `forwarded` and `message_uids`
+    /// are not offered: the admission writes them before the gate.
+    fn schema_mail_forward() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mailbox": {
+                    "type": "string",
+                    "description": "The id of one of your mailbox connections."
+                },
+                "folder": {
+                    "type": "string",
+                    "enum": ["inbox", "sent", "drafts", "trash", "archive", "all"],
+                    "description": "Which folder the thread is in: inbox (the default), sent, drafts, trash, archive, or all your mail where the server keeps such a folder."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "A thread id mail.list answered; every message of it in that folder is forwarded, at most 20."
+                },
+                "message_uid": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "One message of the thread to forward alone, by its uid as mail.read answered it in that folder."
+                },
+                "to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "description": "The recipients' email addresses, such as ann@example.com; to and cc together hold at most 50."
+                },
+                "cc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 50,
+                    "description": "Further recipients' email addresses, copied; to and cc together hold at most 50."
+                },
+                "subject": {
+                    "type": "string",
+                    "maxLength": 998,
+                    "description": "One line of at most 998 characters; without it the subject is Fwd: and the oldest forwarded message's subject."
+                },
+                "note": {
+                    "type": "string",
+                    "maxLength": 100000,
+                    "description": "A note as plain text before the forwarded messages, at most 100000 characters."
+                },
+                "attachments": Self::schema_mail_files()
+            },
+            "required": ["mailbox", "thread_id", "to"]
+        })
     }
 
     /// JSON schema for the calendar read tools (AEGIS ADR-138 K6). Every
@@ -3163,8 +3222,8 @@ mod tests {
     /// whose pattern matches; with no entry only the catalogue's marked
     /// tools, `mail.send` and `mail.reply` (AEGIS ADR-125's Update of
     /// 2026-10-07 (3) clause 12), `mail.delete` (its Update of 2026-10-08
-    /// (4) clause 20), `mail.archive` (its Update of 2026-10-08 (5) clause
-    /// 29) and the four calendar writes (AEGIS ADR-138 K7), are gated, and
+    /// (4) clause 20), `mail.archive` and `mail.forward` (its Update of
+    /// 2026-10-08 (5) clauses 29 and 35) and the four calendar writes (AEGIS ADR-138 K7), are gated, and
     /// an entry without the flag does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
@@ -3176,6 +3235,7 @@ mod tests {
                     | "mail.reply"
                     | "mail.delete"
                     | "mail.archive"
+                    | "mail.forward"
                     | "calendar.create"
                     | "calendar.update"
                     | "calendar.delete"

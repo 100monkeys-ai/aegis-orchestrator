@@ -103,7 +103,7 @@ const ANN: &str = "ann@example.test";
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_eight_mail_tools_list_with_contracts_declaring_mailbox_and_four_are_gated() {
+async fn the_nine_mail_tools_list_with_contracts_declaring_mailbox_and_five_are_gated() {
     let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
     let tools = router.list_tools().await.unwrap();
     let mut wrong = Vec::new();
@@ -120,6 +120,7 @@ async fn the_eight_mail_tools_list_with_contracts_declaring_mailbox_and_four_are
         ),
         ("mail.delete", vec!["mailbox", "thread_id"], true),
         ("mail.archive", vec!["mailbox", "thread_id"], true),
+        ("mail.forward", vec!["mailbox", "thread_id", "to"], true),
     ] {
         let Some(tool) = tools.iter().find(|t| t.name == name) else {
             wrong.push(format!("{name} is not listed"));
@@ -149,6 +150,16 @@ async fn the_eight_mail_tools_list_with_contracts_declaring_mailbox_and_four_are
         }
         let summary: &[&str] = if matches!(name, "mail.delete" | "mail.archive") {
             &["mailbox", "thread_id", "subject", "from"]
+        } else if name == "mail.forward" {
+            &[
+                "mailbox",
+                "to",
+                "cc",
+                "subject",
+                "note",
+                "forwarded",
+                "attachment_names",
+            ]
         } else {
             &["mailbox", "to", "cc", "subject", "body", "attachment_names"]
         };
@@ -173,6 +184,7 @@ async fn the_eight_mail_tools_list_with_contracts_declaring_mailbox_and_four_are
         "mail.reply",
         "mail.delete",
         "mail.archive",
+        "mail.forward",
     ] {
         if router.is_skip_judge(name).await {
             wrong.push(format!("{name} skips the judge"));
@@ -2502,5 +2514,625 @@ mod attachments_out {
             wrong.push("a refused call reached a mail server".to_string());
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Forwarding (the Update of 2026-10-08 (5) clauses 33 to 35, and clause
+    // 32's share for `mail.forward`)
+    // -----------------------------------------------------------------------
+
+    mod forward {
+        use super::*;
+
+        /// The forward's three refusals, word for word.
+        const TOO_MANY: &str = "A forward carries at most 20 messages.";
+        const TOO_LARGE: &str =
+            "The messages to forward come to more than 20 MiB; nothing was sent.";
+        const GONE: &str = "A message to forward is no longer in this folder; nothing was sent.";
+
+        /// A thread of two messages in the inbox, the first with a line
+        /// beginning with a dot and a word that is not ASCII, and a message
+        /// of another thread.
+        fn plans_inbox() -> Vec<StoredMessage> {
+            vec![
+                StoredMessage::new(
+                    1,
+                    &["\\Seen"],
+                    "05-Oct-2026 09:00:00 +0000",
+                    &[
+                        "Message-ID: <f1@x>",
+                        "Date: Mon, 05 Oct 2026 09:00:00 +0000",
+                        "From: Ann <ann@example.test>",
+                        "To: owner@example.test",
+                        "Subject: Plans",
+                    ],
+                    "The plans for the café.\n.a line beginning with a dot\n--=_aegis_not_a_boundary\nAnn",
+                ),
+                StoredMessage::new(
+                    2,
+                    &[],
+                    "06-Oct-2026 10:30:00 +0000",
+                    &[
+                        "Message-ID: <f2@x>",
+                        "Date: Tue, 06 Oct 2026 10:30:00 +0000",
+                        "From: Bob <bob@example.test>",
+                        "To: owner@example.test",
+                        "Subject: Re: Plans",
+                        "In-Reply-To: <f1@x>",
+                        "References: <f1@x>",
+                    ],
+                    "Looks good to me.",
+                ),
+                StoredMessage::new(
+                    3,
+                    &[],
+                    "07-Oct-2026 08:00:00 +0000",
+                    &[
+                        "Message-ID: <other@x>",
+                        "Date: Wed, 07 Oct 2026 08:00:00 +0000",
+                        "From: Carol <carol@example.test>",
+                        "Subject: Something else",
+                    ],
+                    "Unrelated.",
+                ),
+            ]
+        }
+
+        /// A mailbox over `inbox` and the folders `Sent` (holding `sent`)
+        /// and `Drafts`, with a submission stand-in.
+        async fn forward_mailbox(
+            inbox: Vec<StoredMessage>,
+            sent: Vec<StoredMessage>,
+        ) -> (MailboxStandIn, SmtpSubmission, Owned) {
+            let mailbox = imap_mailbox_standin_with_folders(
+                ADDRESS,
+                PASSWORD,
+                inbox,
+                vec![
+                    StandInFolder::new("Sent", "\\Sent").holding(sent),
+                    StandInFolder::new("Drafts", "\\Drafts"),
+                ],
+            )
+            .await;
+            let smtp = smtp_submission_standin(
+                SubmitAuth::Plain {
+                    user: ADDRESS.to_string(),
+                    password: PASSWORD.to_string(),
+                },
+                None,
+            )
+            .await;
+            let owned = Owned {
+                id: CredentialBindingId::new(),
+                name: "Inbox".to_string(),
+                granted: true,
+                imap_port: mailbox.port(),
+                smtp_port: smtp.port(),
+                auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
+            };
+            (mailbox, smtp, owned)
+        }
+
+        /// A `multipart/mixed` message's parts as sent: each part's head and
+        /// its content exactly as written between the boundaries (the CRLF
+        /// before a boundary belongs to the boundary).
+        fn raw_parts(raw: &str) -> Option<Vec<(String, String)>> {
+            let boundary = header(raw, "Content-Type")?
+                .strip_prefix("multipart/mixed; boundary=\"")?
+                .strip_suffix('"')?
+                .to_string();
+            let body = raw.split_once("\r\n\r\n")?.1;
+            let closing = format!("\r\n--{boundary}--\r\n");
+            let body = body.strip_suffix(&closing)?;
+            let opening = format!("--{boundary}\r\n");
+            let body = body.strip_prefix(&opening)?;
+            Some(
+                body.split(&format!("\r\n--{boundary}\r\n"))
+                    .map(|part| {
+                        let (head, content) = part.split_once("\r\n\r\n").unwrap_or((part, ""));
+                        (head.to_string(), content.to_string())
+                    })
+                    .collect(),
+            )
+        }
+
+        fn decoded(content: &str) -> Vec<u8> {
+            STANDARD
+                .decode(content.replace("\r\n", ""))
+                .unwrap_or_default()
+        }
+
+        /// A thread forwarded with a note and a file: the admission writes
+        /// the subject (`Fwd: ` and the oldest message's), what is
+        /// forwarded and its uids over the model's values, and the person
+        /// reads them before answering; nothing is sent before approval.
+        /// Approved, the message goes out `multipart/mixed`: the note, each
+        /// original byte for byte as `message/rfc822`, then the file; it
+        /// carries a fresh `Message-ID`, no `In-Reply-To` and no
+        /// `References`, and its copy is saved to Sent.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_thread_is_forwarded_whole_as_message_rfc822_parts_after_the_note_once_approved()
+        {
+            let f = files().await;
+            f.put(f.own, USER, "report.pdf", PDF).await;
+            let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), Vec::new()).await;
+            let id = owned.id.0.to_string();
+            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            let originals: Vec<String> = mailbox
+                .folder_messages("INBOX")
+                .iter()
+                .map(|m| m.raw.clone())
+                .collect();
+            let pending = h
+                .call(
+                    0,
+                    "mail.forward",
+                    json!({
+                        "mailbox": id, "thread_id": "<f1@x>", "to": [ANN],
+                        "note": "See below.\nAnn's plans.",
+                        "attachments": [f.file(f.own, "report.pdf")],
+                        "forwarded": ["Mallory <m@evil.test> · Nothing · never"],
+                        "message_uids": [3],
+                    }),
+                )
+                .await;
+            let mut wrong = Vec::new();
+            let forwarded = "Ann <ann@example.test> · Plans · 2026-10-05T09:00:00Z, Bob <bob@example.test> · Re: Plans · 2026-10-06T10:30:00Z";
+            match direct(&pending) {
+                Some(value) if value["status"] == "approval_pending" => {
+                    let expected = format!(
+                        "mail.forward\nmailbox: {id}\nto: {ANN}\ncc: \nsubject: Fwd: Plans\nnote: See below.\nAnn's plans.\nforwarded: {forwarded}\nattachment_names: report.pdf ({} bytes)",
+                        PDF.len()
+                    );
+                    if value["summary"] != expected.as_str() {
+                        wrong.push(format!("the summary is {:?}", value["summary"]));
+                    }
+                }
+                _ => wrong.push(format!(
+                    "mail.forward did not wait for approval: {}",
+                    told(&pending)
+                )),
+            }
+            match h.rows().await.as_slice() {
+                [row] => {
+                    if row.arguments["message_uids"] != json!([1, 2])
+                        || row.arguments["subject"] != "Fwd: Plans"
+                    {
+                        wrong.push(format!("the stored call is {}", row.arguments));
+                    }
+                }
+                other => wrong.push(format!("{} rows were written, not 1", other.len())),
+            }
+            if smtp.standin.connections() != 0 {
+                wrong.push("a pending forward reached the SMTP server".to_string());
+            }
+            if pending.is_ok() {
+                let decided = approve(&h, &pending).await;
+                let result = decided.result.clone().unwrap_or(Value::Null);
+                if result["message_uids"] != json!([1, 2]) || result["saved_to_sent"] != true {
+                    wrong.push(format!(
+                        "the approved forward answered {result} {:?}",
+                        decided.error
+                    ));
+                }
+                match smtp.submitted().as_slice() {
+                    [message] => {
+                        let data = &message.data;
+                        if header(data, "Subject").as_deref() != Some("Fwd: Plans")
+                            || header(data, "To").as_deref() != Some(ANN)
+                            || header(data, "In-Reply-To").is_some()
+                            || header(data, "References").is_some()
+                            || header(data, "Message-ID")
+                                != result["message_id"].as_str().map(str::to_string)
+                        {
+                            wrong.push(format!("the forward's headers are wrong: {data}"));
+                        }
+                        match raw_parts(data).as_deref() {
+                            Some([(note, note_body), (first, first_body), (second, second_body), (file, file_body)]) => {
+                                if header(note, "Content-Type").as_deref() != Some("text/plain; charset=utf-8")
+                                    || decoded(note_body) != b"See below.\r\nAnn's plans."
+                                {
+                                    wrong.push(format!("the first part is not the note: {note}"));
+                                }
+                                for (head, body, original) in [
+                                    (first, first_body, &originals[0]),
+                                    (second, second_body, &originals[1]),
+                                ] {
+                                    if header(head, "Content-Type").as_deref() != Some("message/rfc822")
+                                        || body != original
+                                    {
+                                        wrong.push(format!(
+                                            "a forwarded part is not the original byte for byte: {head:?} {body:?}"
+                                        ));
+                                    }
+                                }
+                                if header(file, "Content-Type").as_deref() != Some("application/pdf")
+                                    || decoded(file_body) != PDF
+                                {
+                                    wrong.push(format!("the last part is not the file: {file}"));
+                                }
+                            }
+                            other => wrong.push(format!(
+                                "the forward is not the note, two messages and the file: {other:?} {data}"
+                            )),
+                        }
+                    }
+                    other => wrong.push(format!("{} messages were submitted, not 1", other.len())),
+                }
+                match mailbox.folder_messages("Sent").as_slice() {
+                    [copy]
+                        if header(&copy.raw, "Message-ID")
+                            == result["message_id"].as_str().map(str::to_string) => {}
+                    other => wrong.push(format!(
+                        "Sent holds {} messages, not the forward",
+                        other.len()
+                    )),
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// One message of a thread in Sent, by `folder` and `message_uid`,
+        /// is forwarded alone under the subject given.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn one_message_of_a_thread_in_sent_is_forwarded_alone_under_the_subject_given() {
+            let f = files().await;
+            let sent = vec![
+                StoredMessage::new(
+                    1,
+                    &["\\Seen"],
+                    "05-Oct-2026 09:00:00 +0000",
+                    &[
+                        "Message-ID: <s1@x>",
+                        "Date: Mon, 05 Oct 2026 09:00:00 +0000",
+                        "From: owner@example.test",
+                        "To: ann@example.test",
+                        "Subject: Proposal",
+                    ],
+                    "The proposal.",
+                ),
+                StoredMessage::new(
+                    2,
+                    &["\\Seen"],
+                    "06-Oct-2026 09:00:00 +0000",
+                    &[
+                        "Message-ID: <s2@x>",
+                        "Date: Tue, 06 Oct 2026 09:00:00 +0000",
+                        "From: owner@example.test",
+                        "To: ann@example.test",
+                        "Subject: Re: Proposal",
+                        "In-Reply-To: <s1@x>",
+                        "References: <s1@x>",
+                    ],
+                    "The revised proposal.",
+                ),
+            ];
+            let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), sent).await;
+            let original = mailbox.folder_messages("Sent")[1].raw.clone();
+            let id = owned.id.0.to_string();
+            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            let pending = h
+                .call(
+                    0,
+                    "mail.forward",
+                    json!({
+                        "mailbox": id, "folder": "sent", "thread_id": "<s1@x>",
+                        "message_uid": 2, "to": [ANN], "cc": ["bob@example.test"],
+                        "subject": "Have a look",
+                    }),
+                )
+                .await;
+            let mut wrong = Vec::new();
+            let expected = format!(
+                "mail.forward\nmailbox: {id}\nto: {ANN}\ncc: bob@example.test\nsubject: Have a look\nnote: \nforwarded: owner@example.test · Re: Proposal · 2026-10-06T09:00:00Z\nattachment_names: "
+            );
+            if direct(&pending).map(|v| v["summary"].clone()) != Some(json!(expected)) {
+                wrong.push(format!(
+                    "the summary is not one message: {}",
+                    told(&pending)
+                ));
+            }
+            if pending.is_ok() {
+                let decided = approve(&h, &pending).await;
+                match smtp.submitted().as_slice() {
+                    [message] => {
+                        if header(&message.data, "Subject").as_deref() != Some("Have a look")
+                            || message.recipients
+                                != vec![ANN.to_string(), "bob@example.test".to_string()]
+                        {
+                            wrong.push(format!(
+                                "the forward's subject or recipients: {:?} {}",
+                                message.recipients, message.data
+                            ));
+                        }
+                        match raw_parts(&message.data).as_deref() {
+                            Some([_note, (head, body)])
+                                if header(head, "Content-Type").as_deref()
+                                    == Some("message/rfc822")
+                                    && *body == original => {}
+                            other => wrong.push(format!(
+                                "the forward is not the note and message 2: {other:?}"
+                            )),
+                        }
+                    }
+                    other => wrong.push(format!(
+                        "{} messages were submitted, not 1: {:?}",
+                        other.len(),
+                        decided.error
+                    )),
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// The run forwards exactly the uids the admission read: a message
+        /// that joins the thread between the ask and the approval is not
+        /// forwarded.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_run_forwards_exactly_the_admitted_uids_and_not_a_message_that_joined_since() {
+            let f = files().await;
+            let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), Vec::new()).await;
+            let id = owned.id.0.to_string();
+            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            let pending = h
+                .call(
+                    0,
+                    "mail.forward",
+                    json!({"mailbox": id, "thread_id": "<f1@x>", "to": [ANN]}),
+                )
+                .await;
+            mailbox.messages.lock().unwrap().push(StoredMessage::new(
+                4,
+                &[],
+                "08-Oct-2026 08:00:00 +0000",
+                &[
+                    "Message-ID: <f4@x>",
+                    "From: Ann <ann@example.test>",
+                    "Subject: Re: Plans",
+                    "In-Reply-To: <f2@x>",
+                    "References: <f1@x> <f2@x>",
+                ],
+                "One more thing.",
+            ));
+            let mut wrong = Vec::new();
+            if direct(&pending).map(|v| v["status"].clone()) != Some(json!("approval_pending")) {
+                wrong.push(format!("mail.forward did not wait: {}", told(&pending)));
+            } else {
+                let decided = approve(&h, &pending).await;
+                match smtp.submitted().as_slice() {
+                    [message] => {
+                        let forwarded = raw_parts(&message.data)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|(head, _)| {
+                                header(head, "Content-Type").as_deref() == Some("message/rfc822")
+                            })
+                            .filter_map(|(_, body)| header(&body, "Message-ID"))
+                            .collect::<Vec<_>>();
+                        if forwarded != ["<f1@x>", "<f2@x>"] {
+                            wrong.push(format!("the run forwarded {forwarded:?}"));
+                        }
+                    }
+                    other => wrong.push(format!(
+                        "{} messages were submitted, not 1: {:?}",
+                        other.len(),
+                        decided.error
+                    )),
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// More than 20 messages, more than 20 MiB of them, and a
+        /// `message_uid` not of the thread are each refused before the gate
+        /// with its sentence: no row is written and nothing is sent.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn too_many_too_large_or_a_message_not_of_the_thread_is_refused_before_the_gate() {
+            let f = files().await;
+            let mut inbox = plans_inbox();
+            for uid in 10..31 {
+                inbox.push(StoredMessage::new(
+                    uid,
+                    &[],
+                    "05-Oct-2026 09:00:00 +0000",
+                    &[
+                        &format!("Message-ID: <many{uid}@x>"),
+                        "From: Ann <ann@example.test>",
+                        "Subject: Many",
+                        "References: <many10@x>",
+                    ],
+                    "One of many.",
+                ));
+            }
+            let half = "y".repeat(10 * 1024 * 1024 + 512 * 1024);
+            for (uid, references) in [(40, ""), (41, "References: <big40@x>")] {
+                let mut headers = vec![
+                    format!("Message-ID: <big{uid}@x>"),
+                    "From: Ann <ann@example.test>".to_string(),
+                    "Subject: Big".to_string(),
+                ];
+                if !references.is_empty() {
+                    headers.push(references.to_string());
+                }
+                let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+                inbox.push(StoredMessage::new(
+                    uid,
+                    &[],
+                    "05-Oct-2026 09:00:00 +0000",
+                    &headers,
+                    &half,
+                ));
+            }
+            let (mailbox, smtp, owned) = forward_mailbox(inbox, Vec::new()).await;
+            let id = owned.id.0.to_string();
+            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            let mut wrong = Vec::new();
+            for (case, args, expected) in [
+                (
+                    "a thread of 21 messages",
+                    json!({"mailbox": id, "thread_id": "<many10@x>", "to": [ANN]}),
+                    TOO_MANY.to_string(),
+                ),
+                (
+                    "two messages of 10.5 MiB",
+                    json!({"mailbox": id, "thread_id": "<big40@x>", "to": [ANN]}),
+                    TOO_LARGE.to_string(),
+                ),
+                (
+                    "a message of another thread",
+                    json!({"mailbox": id, "thread_id": "<f1@x>", "message_uid": 3, "to": [ANN]}),
+                    "There is no message 3 of thread '<f1@x>' in this mailbox's inbox.".to_string(),
+                ),
+            ] {
+                let result = h.call(0, "mail.forward", args).await;
+                let said = match &result {
+                    Err(SealSessionError::Answered {
+                        answer: CallerAnswer::NotFound(message),
+                        ..
+                    }) => message.clone(),
+                    _ => told(&result),
+                };
+                if said != expected {
+                    wrong.push(format!("{case}: {said}"));
+                }
+            }
+            if !h.rows().await.is_empty() {
+                wrong.push(format!(
+                    "{} approval rows were written",
+                    h.rows().await.len()
+                ));
+            }
+            if smtp.standin.connections() != 0 || !mailbox.folder_messages("Sent").is_empty() {
+                wrong.push("a refused forward reached the SMTP server or Sent".to_string());
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// A message the admission read and that is gone from the folder at
+        /// the run refuses the forward with nothing sent and nothing saved.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_message_gone_from_the_folder_by_the_run_refuses_the_forward_and_nothing_is_sent()
+        {
+            let f = files().await;
+            let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), Vec::new()).await;
+            let id = owned.id.0.to_string();
+            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            let pending = h
+                .call(
+                    0,
+                    "mail.forward",
+                    json!({"mailbox": id, "thread_id": "<f1@x>", "to": [ANN]}),
+                )
+                .await;
+            mailbox.messages.lock().unwrap().retain(|m| m.uid != 2);
+            let mut wrong = Vec::new();
+            if direct(&pending).map(|v| v["status"].clone()) != Some(json!("approval_pending")) {
+                wrong.push(format!("mail.forward did not wait: {}", told(&pending)));
+            } else {
+                let decided = approve(&h, &pending).await;
+                let said = format!("{:?} {:?}", decided.error, decided.result);
+                if !said.contains(GONE) {
+                    wrong.push(format!("a message gone did not refuse the forward: {said}"));
+                }
+            }
+            if !smtp.submitted().is_empty() || smtp.standin.connections() != 0 {
+                wrong.push("a refused forward reached the SMTP server".to_string());
+            }
+            if !mailbox.folder_messages("Sent").is_empty() {
+                wrong.push("a refused forward was saved to Sent".to_string());
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// `mail.forward` is listed gated with its contract, says what it
+        /// does and that it waits; it offers `folder` (the six), one
+        /// `message_uid`, a `note`, an optional `subject` and `attachments`,
+        /// never what the admission writes or a `bcc`; a capability entry
+        /// at `false` does not clear the catalogue's mark.
+        #[tokio::test]
+        async fn mail_forward_is_listed_gated_with_its_contract_and_offers_only_what_the_model_gives(
+        ) {
+            let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+            let tools = router.list_tools().await.unwrap();
+            let mut wrong = Vec::new();
+            match tools.iter().find(|t| t.name == "mail.forward") {
+                Some(tool) => {
+                    let p = &tool.input_schema["properties"];
+                    if p["folder"]["enum"]
+                        != json!(["inbox", "sent", "drafts", "trash", "archive", "all"])
+                        || p["message_uid"]["type"] != "integer"
+                        || p["note"]["maxLength"] != 100000
+                        || p["subject"]["maxLength"] != 998
+                        || p["attachments"]["maxItems"] != 10
+                        || p["to"]["minItems"] != 1
+                        || tool.input_schema["required"] != json!(["mailbox", "thread_id", "to"])
+                    {
+                        wrong.push(format!("mail.forward's schema is {}", tool.input_schema));
+                    }
+                    for written in [
+                        "forwarded",
+                        "message_uids",
+                        "attachment_names",
+                        "attachment_sha256",
+                        "bcc",
+                        "body",
+                    ] {
+                        if p.get(written).is_some() {
+                            wrong.push(format!("mail.forward offers {written}"));
+                        }
+                    }
+                    if !tool.description.contains("as attachments, each whole")
+                        || !tool.description.contains("Waits for the person's approval")
+                    {
+                        wrong.push(format!("mail.forward's description: {}", tool.description));
+                    }
+                }
+                None => wrong.push("mail.forward is not listed".to_string()),
+            }
+            if !router.requires_approval("mail.forward")
+                || router.is_skip_judge("mail.forward").await
+            {
+                wrong.push("mail.forward is not gated, or skips the judge".to_string());
+            }
+            let expected = ApprovalContract {
+                binding_argument: Some("mailbox".to_string()),
+                approval_summary: Some(
+                    [
+                        "mailbox",
+                        "to",
+                        "cc",
+                        "subject",
+                        "note",
+                        "forwarded",
+                        "attachment_names",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                ),
+            };
+            if router.approval_contract("mail.forward") != expected {
+                wrong.push(format!(
+                    "the contract is {:?}",
+                    router.approval_contract("mail.forward")
+                ));
+            }
+            if ToolInputContract::required_fields("mail.forward") != ["mailbox", "thread_id", "to"]
+            {
+                wrong.push(format!(
+                    "the input contract requires {:?}",
+                    ToolInputContract::required_fields("mail.forward")
+                ));
+            }
+            let entries: Vec<ToolCapabilityConfig> =
+                serde_yaml::from_str("- tool_pattern: mail.forward\n  requires_approval: false\n")
+                    .unwrap();
+            let configured =
+                ToolRouter::new(ToolRouter::builtin_dispatchers()).with_tool_capabilities(&entries);
+            if !configured.requires_approval("mail.forward") {
+                wrong.push("a capability entry at false cleared mail.forward's mark".to_string());
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
     }
 }

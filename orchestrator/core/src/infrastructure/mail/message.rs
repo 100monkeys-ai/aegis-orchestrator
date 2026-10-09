@@ -6,8 +6,10 @@
 //! the orchestrator mints as `<uuid@domain of the address>`. A message
 //! carrying files (the Update of 2026-10-08 (5) clause 32) is
 //! `multipart/mixed`: the text first, then each file in base64 with its
-//! sniffed type and its name as an RFC 2231 `filename`. A message with no
-//! file is written exactly as before.
+//! sniffed type and its name as an RFC 2231 `filename`. A forward (clause
+//! 34) is `multipart/mixed` too: the note, then each forwarded message byte
+//! for byte as a `message/rfc822` part, then the files. A message with no
+//! file and nothing forwarded is written exactly as before.
 //!
 //! Every header value is checked or encoded here, so no argument can add a
 //! header: an address is plain ASCII with no whitespace or special
@@ -71,9 +73,12 @@ pub struct OutgoingMessage {
     /// The `References` ids, in order.
     pub references: Vec<String>,
     pub date: chrono::DateTime<chrono::Utc>,
-    /// The files after the text, in order; none makes a `text/plain`
-    /// message.
+    /// The files after the text and the forwarded messages, in order;
+    /// none, with nothing forwarded, makes a `text/plain` message.
     pub attachments: Vec<OutgoingAttachment>,
+    /// Whole messages forwarded after the text, each written byte for byte
+    /// as a `message/rfc822` part, in order.
+    pub forwarded: Vec<Vec<u8>>,
 }
 
 impl OutgoingMessage {
@@ -107,37 +112,73 @@ impl OutgoingMessage {
         let text = self.body.replace("\r\n", "\n").replace('\n', "\r\n");
         let mut out = head.join("\r\n");
         out.push_str("\r\n");
-        if self.attachments.is_empty() {
+        if self.attachments.is_empty() && self.forwarded.is_empty() {
             out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
             out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
             push_base64(&mut out, text.as_bytes());
             return out.into_bytes();
         }
-        // Base64 lines hold no `_`, so this boundary cannot occur in a part.
-        let boundary = format!("=_aegis_{}", uuid::Uuid::new_v4().simple());
+        // Base64 lines hold no `_`, so this boundary cannot occur in a part
+        // the orchestrator encodes; a forwarded message is written as it is,
+        // so a boundary one happens to hold is drawn again.
+        let boundary = loop {
+            let boundary = format!("=_aegis_{}", uuid::Uuid::new_v4().simple());
+            let delimiter = format!("--{boundary}");
+            if !self
+                .forwarded
+                .iter()
+                .any(|m| contains(m, delimiter.as_bytes()))
+            {
+                break boundary;
+            }
+        };
         out.push_str(&format!(
-            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n"
         ));
+        if self.forwarded.iter().any(|m| !m.is_ascii()) {
+            out.push_str("Content-Transfer-Encoding: 8bit\r\n");
+        }
+        out.push_str("\r\n");
         out.push_str(&format!("--{boundary}\r\n"));
         out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
         out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
         push_base64(&mut out, text.as_bytes());
+        let mut out = out.into_bytes();
+        for message in &self.forwarded {
+            let encoding = if message.is_ascii() { "7bit" } else { "8bit" };
+            out.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Type: message/rfc822\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(message);
+            // The CRLF before a boundary belongs to the boundary (RFC 2046),
+            // so the part's content is the message's bytes exactly.
+            out.extend_from_slice(b"\r\n");
+        }
         for attachment in &self.attachments {
-            out.push_str(&format!("--{boundary}\r\n"));
-            out.push_str(&format!(
+            let mut part = format!("--{boundary}\r\n");
+            part.push_str(&format!(
                 "Content-Type: {}\r\n",
                 media_type(&attachment.content_type)
             ));
-            out.push_str(&format!(
+            part.push_str(&format!(
                 "Content-Disposition: attachment;{}\r\n",
                 rfc2231_filename(&attachment.name)
             ));
-            out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
-            push_base64(&mut out, &attachment.data);
+            part.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+            push_base64(&mut part, &attachment.data);
+            out.extend_from_slice(part.as_bytes());
         }
-        out.push_str(&format!("--{boundary}--\r\n"));
-        out.into_bytes()
+        out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        out
     }
+}
+
+/// Whether `needle` occurs in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// `data` in base64, in lines of 76 characters, each ended by CRLF.
@@ -298,6 +339,7 @@ mod tests {
             references: Vec::new(),
             date: chrono::DateTime::from_timestamp(0, 0).unwrap(),
             attachments: Vec::new(),
+            forwarded: Vec::new(),
         };
         let raw = String::from_utf8(message.render()).unwrap();
         assert!(raw.is_ascii(), "{raw}");
@@ -326,6 +368,7 @@ mod tests {
             ],
             date: chrono::DateTime::from_timestamp(0, 0).unwrap(),
             attachments,
+            forwarded: Vec::new(),
         }
     }
 
@@ -455,6 +498,118 @@ UGFpZC4NClRoYW5rcy4=\r\n";
             }
             other => wrong.push(format!(
                 "the message holds {} parts, not the text and two files",
+                other.len()
+            )),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The parts of a rendered `multipart/mixed` message, as bytes: each
+    /// part's head and its content exactly as written between boundaries.
+    fn byte_parts(raw: &[u8]) -> (String, Vec<(String, Vec<u8>)>) {
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("a head");
+        let head = String::from_utf8(raw[..split].to_vec()).unwrap();
+        let boundary = header(&head, "Content-Type")
+            .and_then(|c| {
+                c.strip_prefix("multipart/mixed; boundary=\"")
+                    .and_then(|b| b.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let mut body = raw[split + 4..].to_vec();
+        let closing = format!("\r\n--{boundary}--\r\n").into_bytes();
+        assert!(body.ends_with(&closing), "the message is not closed");
+        body.truncate(body.len() - closing.len());
+        let opening = format!("--{boundary}\r\n").into_bytes();
+        assert!(body.starts_with(&opening), "the message does not open");
+        let body = &body[opening.len()..];
+        let between = format!("\r\n--{boundary}\r\n").into_bytes();
+        let mut parts = Vec::new();
+        let mut rest = body;
+        loop {
+            let at = rest.windows(between.len()).position(|w| w == between);
+            let part = &rest[..at.unwrap_or(rest.len())];
+            let cut = part
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap_or(part.len());
+            parts.push((
+                String::from_utf8_lossy(&part[..cut]).to_string(),
+                part.get(cut + 4..).unwrap_or_default().to_vec(),
+            ));
+            match at {
+                Some(at) => rest = &rest[at + between.len()..],
+                None => break,
+            }
+        }
+        (head, parts)
+    }
+
+    /// A forward (clause 34) is the note, then each forwarded message byte
+    /// for byte as a `message/rfc822` part (7bit, or 8bit for one holding a
+    /// byte that is not ASCII, even one that is not UTF-8), then the files;
+    /// a message holding an 8bit part says so at the top, and a line that
+    /// looks like the start of a boundary is carried as it is.
+    #[test]
+    fn a_forward_is_the_note_then_each_message_byte_for_byte_then_the_files() {
+        let first =
+            b"Message-ID: <f1@x>\r\nSubject: Plans\r\n\r\n.a dot line\r\n--=_aegis_x\r\nAnn\r\n"
+                .to_vec();
+        let second = b"Message-ID: <f2@x>\r\nSubject: Caf\xe9\r\n\r\nLatin-1: caf\xe9".to_vec();
+        let pdf = b"%PDF-1.4 a small document".to_vec();
+        let mut forward = message(vec![OutgoingAttachment {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            data: pdf.clone(),
+        }]);
+        forward.in_reply_to = None;
+        forward.references = Vec::new();
+        forward.forwarded = vec![first.clone(), second.clone()];
+        let raw = forward.render();
+        let (head, parts) = byte_parts(&raw);
+        let mut wrong = Vec::new();
+        if header(&head, "Content-Transfer-Encoding").as_deref() != Some("8bit")
+            || header(&head, "In-Reply-To").is_some()
+        {
+            wrong.push(format!("the forward's head is {head:?}"));
+        }
+        match parts.as_slice() {
+            [(note, note_body), (a, a_body), (b, b_body), (file, file_body)] => {
+                if header(note, "Content-Type").as_deref() != Some("text/plain; charset=utf-8")
+                    || STANDARD
+                        .decode(String::from_utf8_lossy(note_body).replace("\r\n", ""))
+                        .unwrap_or_default()
+                        != b"Paid.\r\nThanks."
+                {
+                    wrong.push(format!("the first part is not the note: {note:?}"));
+                }
+                for (part, content, original, encoding) in
+                    [(a, a_body, &first, "7bit"), (b, b_body, &second, "8bit")]
+                {
+                    if header(part, "Content-Type").as_deref() != Some("message/rfc822")
+                        || header(part, "Content-Transfer-Encoding").as_deref() != Some(encoding)
+                        || content != original
+                    {
+                        wrong.push(format!(
+                            "a forwarded part is not its message byte for byte: {part:?} {:?}",
+                            String::from_utf8_lossy(content)
+                        ));
+                    }
+                }
+                if header(file, "Content-Type").as_deref() != Some("application/pdf")
+                    || STANDARD
+                        .decode(String::from_utf8_lossy(file_body).replace("\r\n", ""))
+                        .unwrap_or_default()
+                        != pdf
+                {
+                    wrong.push(format!("the last part is not the file: {file:?}"));
+                }
+            }
+            other => wrong.push(format!(
+                "the forward holds {} parts, not the note, two messages and the file",
                 other.len()
             )),
         }
