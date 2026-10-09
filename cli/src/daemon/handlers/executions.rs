@@ -137,33 +137,56 @@ pub(crate) async fn cancel_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(execution_id): Path<Uuid>,
 ) -> Result<
     impl axum::response::IntoResponse,
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("execution:cancel")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    match cancel_execution_ending_its_goal(
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    Ok(execution_cancel(
         state.execution_service.as_ref(),
         state
             .tool_invocation_service
             .goal_service()
             .map(|goals| goals.as_ref()),
-        &tenant_id,
-        ExecutionId(execution_id),
+        identity.as_ref().map(|identity| &identity.0),
+        delegation,
+        execution_id,
     )
-    .await
+    .await)
+}
+
+/// The cancel route's answer for `execution_id` as `identity` asks it.
+///
+/// The tenant is resolved as on the status route ([`tenant_id_from_request`],
+/// ADR-100): a service account takes the tenant it names in `X-Tenant-Id` —
+/// the Temporal worker's cancel of a user's agent execution — and every other
+/// identity keeps its own tenant whatever the header says. An execution
+/// outside that tenant is not cancelled.
+pub(crate) async fn execution_cancel(
+    executions: &dyn ExecutionService,
+    goals: Option<&GoalService>,
+    identity: Option<&UserIdentity>,
+    delegation: Option<&str>,
+    execution_id: Uuid,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    let tenant_id = tenant_id_from_request(identity, delegation);
+    match cancel_execution_ending_its_goal(executions, goals, &tenant_id, ExecutionId(execution_id))
+        .await
     {
-        Ok(_) => Ok((
+        Ok(_) => (
             StatusCode::OK,
             axum::Json(serde_json::json!({"success": true})),
-        )),
+        ),
         // Audit 002 §4.37.6 — return 500 on backend error instead of 200.
-        Err(e) => Ok((
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(serde_json::json!({"error": e.to_string()})),
-        )),
+        ),
     }
 }
 
@@ -600,7 +623,7 @@ mod cancel_ends_goal_tests {
 
     /// One running execution per id; a cancel ends it as the real service does.
     #[derive(Default)]
-    struct Executions(Mutex<HashMap<ExecutionId, Execution>>);
+    pub(super) struct Executions(pub(super) Mutex<HashMap<ExecutionId, Execution>>);
 
     #[async_trait::async_trait]
     impl ExecutionService for Executions {
@@ -775,5 +798,180 @@ mod cancel_ends_goal_tests {
             "goal_not_open",
             "a following starting call is refused"
         );
+    }
+}
+
+#[cfg(test)]
+mod cancel_tenant_tests {
+    //! The cancel route `POST /v1/executions/{id}/cancel` resolves its tenant
+    //! as the status route does (ADR-100): a service account that names a
+    //! tenant in `X-Tenant-Id` cancels that tenant's execution — the Temporal
+    //! worker's cancel of a user's agent execution — and any other caller
+    //! stays in its own tenant. Driven through the daemon's real
+    //! authentication stack (`test_support::serve`).
+
+    use super::cancel_ends_goal_tests::Executions;
+    use super::execution_cancel;
+    use crate::daemon::handlers::test_support::{
+        consumer, identity_provider, serve, service_account,
+    };
+    use aegis_orchestrator_core::domain::agent::AgentId;
+    use aegis_orchestrator_core::domain::execution::{
+        Execution, ExecutionId, ExecutionInput, ExecutionStatus,
+    };
+    use aegis_orchestrator_core::domain::iam::UserIdentity;
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use axum::extract::{Extension, Path, State};
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const SCOPES: &str = "execution:cancel";
+
+    async fn cancel_route(
+        State(executions): State<Arc<Executions>>,
+        identity: Option<Extension<UserIdentity>>,
+        headers: HeaderMap,
+        Path(execution_id): Path<Uuid>,
+    ) -> impl axum::response::IntoResponse {
+        let delegation = headers
+            .get(super::TENANT_DELEGATION_HEADER)
+            .and_then(|v| v.to_str().ok());
+        execution_cancel(
+            executions.as_ref(),
+            None,
+            identity.as_ref().map(|identity| &identity.0),
+            delegation,
+            execution_id,
+        )
+        .await
+    }
+
+    /// One running execution in the tenant of the consumer `owner-sub`.
+    fn owner_execution(executions: &Executions) -> (TenantId, ExecutionId) {
+        let tenant = TenantId::for_consumer_user("owner-sub").expect("owner tenant");
+        let mut execution = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("work".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        execution.tenant_id = tenant.clone();
+        execution.start();
+        let id = execution.id;
+        executions.0.lock().unwrap().insert(id, execution);
+        (tenant, id)
+    }
+
+    fn status_of(executions: &Executions, id: ExecutionId) -> ExecutionStatus {
+        executions.0.lock().unwrap()[&id].status.clone()
+    }
+
+    async fn post_cancel(
+        executions: Arc<Executions>,
+        caller: UserIdentity,
+        execution_id: ExecutionId,
+        tenant_header: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        let router = Router::new()
+            .route("/v1/executions/{execution_id}/cancel", post(cancel_route))
+            .with_state(executions);
+        let base = serve(
+            router,
+            Some(identity_provider(&[("caller", caller, SCOPES)])),
+            None,
+        )
+        .await;
+        let mut request = reqwest::Client::new()
+            .post(format!("{base}/v1/executions/{}/cancel", execution_id.0))
+            .bearer_auth("caller");
+        if let Some(tenant) = tenant_header {
+            request = request.header("x-tenant-id", tenant);
+        }
+        let response = request.send().await.expect("loopback request");
+        let status = response.status().as_u16();
+        let body = response.json().await.unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// The Temporal worker's cancel: a service account naming the
+    /// execution's tenant cancels it (before: 500, "Execution not found",
+    /// the tenant taken from the service account alone).
+    #[tokio::test]
+    async fn a_service_account_naming_the_tenant_cancels_its_execution() {
+        let executions = Arc::new(Executions::default());
+        let (tenant, id) = owner_execution(&executions);
+        let (status, body) = post_cancel(
+            executions.clone(),
+            service_account(),
+            id,
+            Some(tenant.as_str()),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a service account naming the tenant was not let cancel its execution; body: {body}"
+        );
+        assert_eq!(body["success"], true);
+        assert_eq!(status_of(&executions, id), ExecutionStatus::Cancelled);
+    }
+
+    /// A service account that names no tenant stays in the system tenant,
+    /// as before: another tenant's execution is not found and keeps running.
+    #[tokio::test]
+    async fn a_service_account_without_the_header_keeps_its_answer() {
+        let executions = Arc::new(Executions::default());
+        let (_tenant, id) = owner_execution(&executions);
+        let (status, body) = post_cancel(executions.clone(), service_account(), id, None).await;
+        assert_eq!(status, 500, "body: {body}");
+        assert_eq!(body["error"], "Execution not found");
+        assert_eq!(status_of(&executions, id), ExecutionStatus::Running);
+    }
+
+    /// A user naming another user's tenant is refused by the tenant
+    /// middleware (`forbidden_tenant_switch`), and the execution keeps
+    /// running.
+    #[tokio::test]
+    async fn a_user_naming_another_tenant_is_refused() {
+        let executions = Arc::new(Executions::default());
+        let (tenant, id) = owner_execution(&executions);
+        let (status, body) = post_cancel(
+            executions.clone(),
+            consumer("intruder-sub"),
+            id,
+            Some(tenant.as_str()),
+        )
+        .await;
+        assert_eq!(status, 403, "body: {body}");
+        assert_eq!(status_of(&executions, id), ExecutionStatus::Running);
+    }
+
+    /// Past the middleware, the cancel itself ignores the header for a
+    /// caller that may not delegate (`resolve_effective_tenant`): a user
+    /// naming another tenant is scoped to its own and cancels nothing.
+    #[tokio::test]
+    async fn the_cancel_scopes_a_user_naming_another_tenant_to_its_own() {
+        let executions = Executions::default();
+        let (tenant, id) = owner_execution(&executions);
+        let (status, _) = execution_cancel(
+            &executions,
+            None,
+            Some(&consumer("intruder-sub")),
+            Some(tenant.as_str()),
+            id.0,
+        )
+        .await;
+        assert_eq!(status.as_u16(), 500);
+        assert_eq!(status_of(&executions, id), ExecutionStatus::Running);
     }
 }

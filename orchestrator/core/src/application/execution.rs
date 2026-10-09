@@ -763,11 +763,12 @@ impl StandardExecutionService {
         tenant_id: &TenantId,
         id: ExecutionId,
     ) -> Result<()> {
+        // The tenant is checked before the run is touched: a cancel naming a
+        // tenant the execution is not in trips no other tenant's run.
+        let mut execution = self.get_execution_for_tenant(tenant_id, id).await?;
         if let Some(token) = self.cancellation_tokens.get(&id) {
             token.cancel();
         }
-
-        let mut execution = self.get_execution_for_tenant(tenant_id, id).await?;
         // An execution that has already ended (completed, failed — by the
         // restart pass among others — or cancelled) keeps its terminal state
         // and reason, and a read after this cancel answers with them.
@@ -3437,6 +3438,45 @@ mod tests {
                 .all(|e| !matches!(e, ExecutionEvent::ExecutionCancelled { .. })),
             "no ExecutionCancelled for an execution that had already ended"
         );
+    }
+
+    /// A cancel naming a tenant the execution is not in is refused before it
+    /// touches the run: the running execution's cancellation token is not
+    /// tripped, so its supervisor loop goes on, and its state is unchanged.
+    /// The owner's own cancel then trips it.
+    #[tokio::test]
+    async fn a_cancel_from_another_tenant_leaves_the_run_going() {
+        let owner = CoreTenantId::for_consumer_user("cancel-owner").unwrap();
+        let other = CoreTenantId::for_consumer_user("cancel-other").unwrap();
+        let agent = make_agent("worker", None, None);
+        let running = execution_left_running(agent.id, &owner, Utc::now());
+        let (service, _runtime, _gw) =
+            workspace_mount_service(&owner, &[&agent], HashMap::new(), &[&running]).await;
+        let token = CancellationToken::new();
+        service
+            .cancellation_tokens
+            .insert(running.id, token.clone());
+
+        let refused = service
+            .cancel_execution_for_tenant(&other, running.id)
+            .await
+            .expect_err("another tenant's cancel is refused");
+        println!("another tenant's cancel: {refused}");
+        assert!(
+            !token.is_cancelled(),
+            "a cancel from another tenant tripped the run's cancellation token"
+        );
+        let after = service
+            .get_execution_for_tenant(&owner, running.id)
+            .await
+            .unwrap();
+        assert_eq!(after.status, ExecutionStatus::Running);
+
+        service
+            .cancel_execution_for_tenant(&owner, running.id)
+            .await
+            .expect("the owner's cancel");
+        assert!(token.is_cancelled(), "the owner's cancel trips the token");
     }
 
     // ── The container reaper's ending (ADR-040, Update of 2026-10-04) ───────
