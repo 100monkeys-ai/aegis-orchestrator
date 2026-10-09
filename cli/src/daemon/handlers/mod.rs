@@ -26,6 +26,7 @@ pub(crate) mod health;
 pub(crate) mod llm;
 pub(crate) mod observability;
 pub(crate) mod operator_escalations;
+pub(crate) mod profiles;
 pub(crate) mod schedules;
 pub(crate) mod script;
 pub(crate) mod seal;

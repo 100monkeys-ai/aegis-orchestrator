@@ -73,6 +73,7 @@ use crate::daemon::handlers::observability::{
 use crate::daemon::handlers::operator_escalations::{
     operator_escalations_router, OperatorEscalationsState,
 };
+use crate::daemon::handlers::profiles::{profiles_router, ProfilesState};
 use crate::daemon::handlers::schedules::{schedules_router, SchedulesState};
 use crate::daemon::handlers::script::{
     create_script, delete_script, get_script, list_scripts, update_script,
@@ -409,6 +410,13 @@ pub(crate) fn create_router(
         service: app_state.schedule_service.clone(),
         agents: app_state.agent_service.clone(),
         workflows: app_state.workflow_repo.clone(),
+    }));
+
+    // Profiles (AEGIS ADR-140 D3): a person's named sets of their own
+    // bindings with an allow-list that only narrows, over their own narrow
+    // state.
+    let router = router.merge(profiles_router(ProfilesState {
+        service: app_state.profile_service.clone(),
     }));
 
     // Credential bindings by id (ADR-078; security audit 003 F-1), over

@@ -155,4 +155,9 @@ pub(crate) struct AppState {
     /// A person's schedules and their fires (AEGIS ADR-139); `None` on a
     /// node without one, where every schedule route answers 503.
     pub(crate) schedule_service: Option<Arc<ScheduleService>>,
+    /// A person's profiles (AEGIS ADR-140); `None` on a node without a
+    /// credential service, where every profile route answers 503.
+    pub(crate) profile_service: Option<
+        Arc<aegis_orchestrator_core::application::profile_service::ProfileService>,
+    >,
 }

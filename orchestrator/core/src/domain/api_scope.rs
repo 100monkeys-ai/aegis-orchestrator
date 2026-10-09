@@ -59,6 +59,9 @@ pub enum ApiScope {
     // schedule (a person's own schedules)
     ScheduleRead,
     ScheduleWrite,
+    // profile (a person's own profiles)
+    ProfileRead,
+    ProfileWrite,
     // stimulus
     StimulusIngest,
     // node
@@ -134,6 +137,8 @@ impl ApiScope {
             Self::ToolApprovalRead => "tool_approval:read",
             Self::ScheduleRead => "schedule:read",
             Self::ScheduleWrite => "schedule:write",
+            Self::ProfileRead => "profile:read",
+            Self::ProfileWrite => "profile:write",
             Self::ToolApprovalDecide => "tool_approval:decide",
             Self::StimulusIngest => "stimulus:ingest",
             Self::NodeRead => "node:read",
@@ -205,6 +210,8 @@ impl ApiScope {
             "tool_approval:read" => Some(Self::ToolApprovalRead),
             "schedule:read" => Some(Self::ScheduleRead),
             "schedule:write" => Some(Self::ScheduleWrite),
+            "profile:read" => Some(Self::ProfileRead),
+            "profile:write" => Some(Self::ProfileWrite),
             "tool_approval:decide" => Some(Self::ToolApprovalDecide),
             "stimulus:ingest" => Some(Self::StimulusIngest),
             "node:read" => Some(Self::NodeRead),
@@ -267,6 +274,8 @@ impl ApiScope {
             Self::ToolApprovalDecide,
             Self::ScheduleRead,
             Self::ScheduleWrite,
+            Self::ProfileRead,
+            Self::ProfileWrite,
         ]);
         scopes
     }
@@ -341,6 +350,8 @@ impl ApiScope {
             Self::ToolApprovalDecide,
             Self::ScheduleRead,
             Self::ScheduleWrite,
+            Self::ProfileRead,
+            Self::ProfileWrite,
             Self::StimulusIngest,
             Self::NodeRead,
             Self::NodeList,
@@ -413,6 +424,31 @@ mod tests {
         let all = ApiScope::all();
         let execution = ApiScope::preset_execution();
         for scope in [ApiScope::ScheduleRead, ApiScope::ScheduleWrite] {
+            assert!(all.contains(&scope), "{scope} is not among every scope");
+            assert!(
+                execution.contains(&scope),
+                "{scope} is not in an execution key"
+            );
+            assert_eq!(ApiScope::parse(scope.as_str()), Some(scope.clone()));
+        }
+    }
+
+    /// The two profile scopes (AEGIS ADR-140 D3) parse, are named in every
+    /// scope's list, and an execution key holds both.
+    #[test]
+    fn profile_scopes_parse_and_are_granted_with_execution() {
+        let parsed = (
+            ApiScope::parse("profile:read"),
+            ApiScope::parse("profile:write"),
+        );
+        assert_eq!(
+            parsed,
+            (Some(ApiScope::ProfileRead), Some(ApiScope::ProfileWrite)),
+            "the profile scopes did not parse"
+        );
+        let all = ApiScope::all();
+        let execution = ApiScope::preset_execution();
+        for scope in [ApiScope::ProfileRead, ApiScope::ProfileWrite] {
             assert!(all.contains(&scope), "{scope} is not among every scope");
             assert!(
                 execution.contains(&scope),

@@ -2017,6 +2017,46 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         });
     }
 
+    // ─── Profiles (AEGIS ADR-140) ───────────────────────────────────────────
+    // A person's profiles live in PostgreSQL (migration 049); a node without
+    // a database keeps them in process. The service reads the person's
+    // bindings through the credential service, so a node without one has no
+    // profile service and every profile route answers 503. What a profile
+    // may be narrowed to is read from the security contexts and the tool
+    // router with its configured tool capabilities.
+    let profile_service = credential_service.clone().map(|credentials| {
+        let repo: Arc<dyn aegis_orchestrator_core::domain::profile::ProfileRepository> =
+            match db_pool.as_ref() {
+                Some(pool) => Arc::new(
+                    aegis_orchestrator_core::infrastructure::repositories::postgres_profile::PostgresProfileRepository::new(pool.clone()),
+                ),
+                None => Arc::new(
+                    aegis_orchestrator_core::infrastructure::repositories::postgres_profile::InMemoryProfileRepository::new(),
+                ),
+            };
+        let repositories = db_pool.as_ref().map(|pool| {
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PostgresGitRepoBindingRepository::new(
+                    pool.clone(),
+                ),
+            ) as Arc<dyn aegis_orchestrator_core::domain::git_repo::GitRepoBindingRepository>
+        });
+        Arc::new(
+            aegis_orchestrator_core::application::profile_service::ProfileService::new(
+                repo,
+                Arc::new(credentials),
+                security_context_repo.clone(),
+                Arc::new(
+                    aegis_orchestrator_core::application::profile_service::RouterToolCatalogue::new(
+                        tool_router.clone(),
+                        config.spec.tool_capabilities.as_deref().unwrap_or_default(),
+                    ),
+                ),
+                repositories,
+            ),
+        )
+    });
+
     // Initialize user volume service (Gap 079); built before the tool
     // service so the mail tools save attachments to the same
     // `chat-attachments` volume uploads provision.
@@ -2943,6 +2983,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .and_then(|cfg| resolve_env_value(cfg.internal_secret.expose()).ok()),
         edge_api: edge_api_state,
         schedule_service: Some(schedule_service),
+        profile_service,
     };
 
     info!("Building router...");

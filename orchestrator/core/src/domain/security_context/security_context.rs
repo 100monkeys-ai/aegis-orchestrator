@@ -224,6 +224,30 @@ impl SecurityContext {
             .any(|capability| capability.matches_tool_name(tool_name))
     }
 
+    /// Whether this context may invoke some tool named `<family>.<tool>` by
+    /// name (AEGIS ADR-140 D2's check of a profile's `<family>.*` pattern):
+    /// a capability pattern of `*`, a `<prefix>.*` pattern overlapping the
+    /// family, or an exact name in the family that the deny list does not
+    /// name. Read-only; the dispatch's own check is [`Self::evaluate`].
+    pub fn admits_some_tool_of(&self, family: &str) -> bool {
+        let family_prefix = format!("{family}.");
+        self.capabilities.iter().any(|capability| {
+            let pattern = capability.tool_pattern.as_str();
+            if pattern == "*" {
+                return true;
+            }
+            match pattern.strip_suffix(".*") {
+                // The capability matches every name starting with `stem`.
+                Some(stem) => family_prefix.starts_with(stem) || stem.starts_with(&family_prefix),
+                None => {
+                    pattern.len() > family_prefix.len()
+                        && pattern.starts_with(&family_prefix)
+                        && !self.deny_list.iter().any(|denied| denied == pattern)
+                }
+            }
+        })
+    }
+
     /// Evaluate whether a tool call is permitted by this `SecurityContext`.
     ///
     /// Applies the three-step policy algorithm:
@@ -652,5 +676,42 @@ mod tests {
         assert!(ctx.permits_tool_name("fs.read"));
         assert!(!ctx.permits_tool_name("fs.delete"));
         assert!(!ctx.permits_tool_name("cmd.run"));
+    }
+
+    /// A family is admitted by a wildcard over it, or by an exact name in
+    /// it that is not denied; a family no capability reaches is not.
+    #[test]
+    fn admits_some_tool_of_a_family_by_pattern_or_undenied_name() {
+        let capability = |pattern: &str| Capability {
+            tool_pattern: pattern.to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        };
+        let ctx = SecurityContext {
+            name: "zaru-test".to_string(),
+            description: "Testing context".to_string(),
+            capabilities: vec![
+                capability("github.*"),
+                capability("mail.reply"),
+                capability("calendar.list"),
+            ],
+            deny_list: vec!["calendar.list".to_string()],
+            metadata: test_metadata(),
+        };
+        let wrong: Vec<(&str, bool)> = [
+            ("github", true),
+            ("mail", true),
+            ("calendar", false),
+            ("nuclear-notes", false),
+        ]
+        .into_iter()
+        .filter(|(family, admitted)| ctx.admits_some_tool_of(family) != *admitted)
+        .collect();
+        assert!(wrong.is_empty(), "families answered wrongly: {wrong:?}");
     }
 }
