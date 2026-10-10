@@ -164,22 +164,6 @@ impl ToolInvocationService {
         Ok(llm_timeout_seconds_of(&agent))
     }
 
-    /// The class of data the agent's model calls carry, from its manifest
-    /// labels (`data: private`).
-    pub(crate) async fn agent_data_class(
-        &self,
-        tenant_id: &TenantId,
-        agent_id: AgentId,
-    ) -> anyhow::Result<crate::domain::node_config::DataClass> {
-        let agent = self
-            .agent_lifecycle
-            .get_agent_visible(tenant_id, agent_id)
-            .await?;
-        Ok(crate::domain::node_config::DataClass::of_labels(
-            &agent.manifest.metadata.labels,
-        ))
-    }
-
     /// The agent's iteration bound as the supervisor reads it.
     pub(crate) async fn agent_iteration_timeout(
         &self,

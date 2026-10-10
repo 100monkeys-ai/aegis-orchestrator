@@ -506,52 +506,6 @@ pub struct ModelConfig {
     /// itself names a fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_alias: Option<String>,
-
-    /// The AI Gateway id used for agents whose manifest labels carry
-    /// `data: private`: their calls on this alias are sent with the
-    /// provider's headers and `cf-aig-gateway-id` set to this value, and
-    /// every other agent's calls keep the provider's headers unchanged. A
-    /// `data: private` agent on an alias that names none is refused, and no
-    /// request is sent. Sent by the `openai` and `openai-compatible`
-    /// adapters; `validate` refuses an empty value and a provider of any
-    /// other type.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private_gateway: Option<String>,
-}
-
-/// The manifest label that classes the data an agent's model calls carry.
-pub const DATA_CLASS_LABEL: &str = "data";
-
-/// The value of [`DATA_CLASS_LABEL`] that makes an agent private.
-pub const PRIVATE_DATA_LABEL_VALUE: &str = "private";
-
-/// The class of data a model call carries, chosen on the orchestrator's side
-/// from the executing agent's manifest labels: a call of an agent labelled
-/// `data: private`, or of a child execution of one (a judge reads the output
-/// it grades), is `Private` and goes only through its alias's
-/// `private_gateway`; every other call is `Standard`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DataClass {
-    /// The alias's adapter as the provider configures it.
-    #[default]
-    Standard,
-    /// The alias's adapter sent through its `private_gateway`, never the
-    /// provider's own gateway.
-    Private,
-}
-
-impl DataClass {
-    /// The class an agent's manifest labels give it: `Private` when the
-    /// label `data` reads `private` (letter case and surrounding blanks
-    /// aside), else `Standard`.
-    pub fn of_labels(labels: &HashMap<String, String>) -> Self {
-        match labels.get(DATA_CLASS_LABEL) {
-            Some(value) if value.trim().eq_ignore_ascii_case(PRIVATE_DATA_LABEL_VALUE) => {
-                DataClass::Private
-            }
-            _ => DataClass::Standard,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2805,26 +2759,6 @@ impl NodeConfigManifest {
                         model.alias
                     );
                 }
-
-                if let Some(gateway) = model.private_gateway.as_deref() {
-                    if gateway.trim().is_empty() {
-                        anyhow::bail!(
-                            "model alias '{}' names an empty private_gateway",
-                            model.alias
-                        );
-                    }
-                    if !matches!(
-                        provider.provider_type.as_str(),
-                        "openai" | "openai-compatible"
-                    ) {
-                        anyhow::bail!(
-                            "model alias '{}' names private_gateway '{gateway}' on provider '{}' of type '{}', whose adapter sends no request headers",
-                            model.alias,
-                            provider.name,
-                            provider.provider_type
-                        );
-                    }
-                }
             }
         }
 
@@ -3109,7 +3043,6 @@ mod tests {
                         max_output_tokens: None,
                         temperature: None,
                         fallback_alias: None,
-                        private_gateway: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),
@@ -3580,7 +3513,6 @@ path: "/metrics"
                 max_output_tokens: None,
                 temperature: None,
                 fallback_alias: None,
-                private_gateway: None,
             }],
         }];
         manifest
