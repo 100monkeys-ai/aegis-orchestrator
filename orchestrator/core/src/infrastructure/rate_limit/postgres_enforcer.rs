@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 
 use crate::domain::rate_limit::{
@@ -17,9 +17,10 @@ use crate::domain::rate_limit::{
 
 /// Persistent sliding-window enforcer backed by PostgreSQL.
 ///
-/// Uses atomic upsert (INSERT ... ON CONFLICT UPDATE ... RETURNING) to
-/// check-and-increment in a single round trip. If the new counter exceeds
-/// the window limit, the increment is rolled back immediately.
+/// Each charge is stored as a row keyed by its scope, resource, bucket and
+/// `window_start`; a window's usage is the sum of its rows inside the window,
+/// and `check_and_increment` compares that sum plus the new charge against
+/// the limit before storing anything.
 pub struct PostgresWindowEnforcer {
     pool: PgPool,
 }
@@ -64,16 +65,63 @@ impl PostgresWindowEnforcer {
         }
     }
 
-    fn window_start(bucket: &RateLimitBucket) -> chrono::DateTime<Utc> {
-        let now = Utc::now();
-        let dur = Duration::seconds(bucket.window_seconds() as i64);
-        now - dur
+    /// The `window_start` a charge made at `now` is stored with: the charge's
+    /// time minus the bucket's window. It is part of the counters' unique
+    /// key, so each charge is a row of its own.
+    fn window_start(now: DateTime<Utc>, bucket: &RateLimitBucket) -> DateTime<Utc> {
+        now - Duration::seconds(bucket.window_seconds() as i64)
+    }
+
+    /// The lowest `window_start` a row inside the bucket's window carries at
+    /// `now` (Zaru ADR-0064 U1).
+    ///
+    /// A row's charge time is its `window_start` plus the window, and the
+    /// charge is inside the window when that time is at or after
+    /// `now - window`, which is `window_start >= now - 2 * window`.
+    pub fn window_lower_bound(now: DateTime<Utc>, bucket: &RateLimitBucket) -> DateTime<Utc> {
+        now - Duration::seconds(2 * bucket.window_seconds() as i64)
+    }
+
+    /// The sum of the scope's charges inside the bucket's window at `now`.
+    async fn window_sum<'e, E>(
+        executor: E,
+        (scope_type, scope_id): (&str, &str),
+        resource_type: &str,
+        bucket: &RateLimitBucket,
+        now: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let (sum,) = sqlx::query_as::<_, (i64,)>(
+            r#"
+            SELECT COALESCE(SUM(counter), 0)::BIGINT
+            FROM rate_limit_counters
+            WHERE scope_type = $1 AND scope_id = $2 AND resource_type = $3
+              AND bucket = $4 AND window_start >= $5
+            "#,
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(resource_type)
+        .bind(Self::bucket_str(bucket))
+        .bind(Self::window_lower_bound(now, bucket))
+        .fetch_one(executor)
+        .await?;
+        Ok(sum.max(0) as u64)
     }
 
     /// Check and increment counters for all non-PerMinute windows.
     ///
+    /// Each window's limit bounds the sum of the charges inside the window
+    /// (ADR-072). In one transaction, holding a transaction-scoped advisory
+    /// lock on the scope and resource so that two concurrent charges are
+    /// summed one after the other, every window's sum plus `cost` is
+    /// compared against its limit; the charge is stored in every window only
+    /// if all of them admit it, and in none otherwise.
+    ///
     /// Returns remaining quota per bucket on success, or the first exceeded
-    /// bucket (with its remaining count) on failure.
+    /// bucket (with its remaining count before this charge) on failure.
     pub async fn check_and_increment(
         &self,
         scope: &RateLimitScope,
@@ -82,18 +130,50 @@ impl PostgresWindowEnforcer {
     ) -> Result<HashMap<RateLimitBucket, u64>, (RateLimitBucket, u64)> {
         let (scope_type, scope_id) = Self::scope_parts(scope);
         let resource_type = Self::resource_type_str(&policy.resource_type);
+        let windows: Vec<_> = policy
+            .windows
+            .iter()
+            .filter(|(bucket, _)| **bucket != RateLimitBucket::PerMinute) // GovernorBurstEnforcer's
+            .collect();
         let mut remaining = HashMap::new();
+        let Some((first_bucket, _)) = windows.first() else {
+            return Ok(remaining);
+        };
+        let storage_failed = |e: sqlx::Error| {
+            tracing::error!(error = %e, "rate limit window check failed");
+            (**first_bucket, 0u64)
+        };
 
-        for (bucket, window) in &policy.windows {
-            if *bucket == RateLimitBucket::PerMinute {
-                continue; // Handled by GovernorBurstEnforcer
+        let mut tx = self.pool.begin().await.map_err(storage_failed)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "rate_limit:{scope_type}:{scope_id}:{resource_type}"
+            ))
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_failed)?;
+
+        let now = Utc::now();
+        for (bucket, window) in &windows {
+            let used = Self::window_sum(
+                &mut *tx,
+                (scope_type, &scope_id),
+                &resource_type,
+                bucket,
+                now,
+            )
+            .await
+            .map_err(storage_failed)?;
+            let after = used.saturating_add(cost);
+            if after > window.limit {
+                // Nothing was written; dropping the transaction releases the lock.
+                return Err((**bucket, window.limit.saturating_sub(used)));
             }
+            remaining.insert(**bucket, window.limit - after);
+        }
 
-            let bucket_str = Self::bucket_str(bucket);
-            let window_start = Self::window_start(bucket);
-
-            // Atomic upsert and return new counter value
-            let row = sqlx::query_as::<_, (i64,)>(
+        for (bucket, _) in &windows {
+            sqlx::query(
                 r#"
                 INSERT INTO rate_limit_counters
                     (scope_type, scope_id, resource_type, bucket, window_start, counter)
@@ -101,56 +181,26 @@ impl PostgresWindowEnforcer {
                 ON CONFLICT (scope_type, scope_id, resource_type, bucket, window_start)
                 DO UPDATE SET counter = rate_limit_counters.counter + $6,
                               updated_at = NOW()
-                RETURNING counter
                 "#,
             )
             .bind(scope_type)
             .bind(&scope_id)
             .bind(&resource_type)
-            .bind(bucket_str)
-            .bind(window_start)
+            .bind(Self::bucket_str(bucket))
+            .bind(Self::window_start(now, bucket))
             .bind(cost as i64)
-            .fetch_one(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "rate limit counter upsert failed");
-                (*bucket, 0u64)
-            })?;
-
-            let current = row.0 as u64;
-            if current > window.limit {
-                // Over limit — roll back the increment
-                let _ = sqlx::query(
-                    r#"
-                    UPDATE rate_limit_counters
-                    SET counter = counter - $1, updated_at = NOW()
-                    WHERE scope_type = $2 AND scope_id = $3 AND resource_type = $4
-                      AND bucket = $5 AND window_start = $6
-                    "#,
-                )
-                .bind(cost as i64)
-                .bind(scope_type)
-                .bind(&scope_id)
-                .bind(&resource_type)
-                .bind(bucket_str)
-                .bind(window_start)
-                .execute(&self.pool)
-                .await;
-
-                return Err((
-                    *bucket,
-                    window.limit.saturating_sub(current.saturating_sub(cost)),
-                ));
-            }
-
-            remaining.insert(*bucket, window.limit.saturating_sub(current));
+            .map_err(storage_failed)?;
         }
+        tx.commit().await.map_err(storage_failed)?;
 
         Ok(remaining)
     }
 
     /// Query current remaining quota for all non-PerMinute windows without
-    /// incrementing counters.
+    /// incrementing counters: each window's limit less the sum of the
+    /// charges inside it.
     pub async fn remaining(
         &self,
         scope: &RateLimitScope,
@@ -158,6 +208,7 @@ impl PostgresWindowEnforcer {
     ) -> Result<HashMap<RateLimitBucket, u64>, RateLimitError> {
         let (scope_type, scope_id) = Self::scope_parts(scope);
         let resource_type = Self::resource_type_str(&policy.resource_type);
+        let now = Utc::now();
         let mut result = HashMap::new();
 
         for (bucket, window) in &policy.windows {
@@ -165,28 +216,16 @@ impl PostgresWindowEnforcer {
                 continue;
             }
 
-            let bucket_str = Self::bucket_str(bucket);
-            let window_start = Self::window_start(bucket);
-
-            let row = sqlx::query_as::<_, (i64,)>(
-                r#"
-                SELECT COALESCE(SUM(counter), 0)
-                FROM rate_limit_counters
-                WHERE scope_type = $1 AND scope_id = $2 AND resource_type = $3
-                  AND bucket = $4 AND window_start >= $5
-                "#,
+            let used = Self::window_sum(
+                &self.pool,
+                (scope_type, &scope_id),
+                &resource_type,
+                bucket,
+                now,
             )
-            .bind(scope_type)
-            .bind(&scope_id)
-            .bind(&resource_type)
-            .bind(bucket_str)
-            .bind(window_start)
-            .fetch_one(&self.pool)
             .await
             .map_err(|e| RateLimitError::StorageError(e.to_string()))?;
-
-            let current = row.0 as u64;
-            result.insert(*bucket, window.limit.saturating_sub(current));
+            result.insert(*bucket, window.limit.saturating_sub(used));
         }
 
         Ok(result)
