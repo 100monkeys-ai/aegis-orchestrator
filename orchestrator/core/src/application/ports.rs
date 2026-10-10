@@ -29,6 +29,7 @@ pub struct StartWorkflowParams<'a> {
     pub blackboard: Option<HashMap<String, Value>>,
     pub security_context_name: Option<String>,
     pub intent: Option<String>,
+    pub repositories: Option<serde_json::Value>,
 }
 
 #[async_trait]

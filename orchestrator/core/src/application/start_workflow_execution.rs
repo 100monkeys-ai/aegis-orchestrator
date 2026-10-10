@@ -619,6 +619,10 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 blackboard: normalized_blackboard,
                 security_context_name: request.security_context_name.clone(),
                 intent: request.intent.clone(),
+                repositories: workflow_execution
+                    .input
+                    .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+                    .cloned(),
             })
             .await
             .context("Failed to start workflow execution in Temporal")?;

@@ -786,6 +786,7 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
                 blackboard: None,
                 security_context_name: None,
                 intent: None,
+                repositories: None,
             },
         )
         .await

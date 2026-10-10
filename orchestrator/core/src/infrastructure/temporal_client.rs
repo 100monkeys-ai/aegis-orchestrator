@@ -145,6 +145,9 @@ impl TemporalClient {
         if let Some(intent_val) = params.intent {
             input_obj["intent"] = serde_json::Value::String(intent_val);
         }
+        if let Some(repositories) = params.repositories {
+            input_obj["repositories"] = repositories;
+        }
 
         // Serialize to JSON payload
         let json_bytes = serde_json::to_vec(&input_obj)?;
