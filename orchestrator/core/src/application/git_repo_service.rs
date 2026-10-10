@@ -1041,7 +1041,19 @@ impl GitRepoService {
                 .await
                 .map_err(|e| GitRepoError::GitFailed(format!("land task panicked: {e}")))??
             }
-            Tree::Volume(_) => return Err(GitRepoError::NotYetImplemented(LANDING_FROM_A_VOLUME)),
+            Tree::Volume(volume) => match self
+                .clone_executor
+                .land_ephemeral(&binding, &volume, branch, &git_ref, credential)
+                .await
+            {
+                Ok(crate::application::git_clone_executor::VolumeLanding::Landed(commit_sha)) => {
+                    commit_sha
+                }
+                Ok(crate::application::git_clone_executor::VolumeLanding::RefAhead(git_ref)) => {
+                    return Err(GitRepoError::RefAhead { git_ref })
+                }
+                Err(e) => return Err(step_error(e)),
+            },
         };
         let now = Utc::now();
         for ref_name in [branch.to_string(), git_ref.clone()] {

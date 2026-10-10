@@ -1957,7 +1957,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let run_container_step_use_case = Arc::new(
         aegis_orchestrator_core::application::run_container_step::RunContainerStepUseCase::new(
             container_step_runner.clone(),
-        ),
+        )
+        .with_egress_network(git_step_network.clone()),
     );
     info!("Container step runner initialized");
 
@@ -2556,6 +2557,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     if let Some(service) = git_repo_service.as_ref() {
         execution_service.set_repositories(service.clone());
         start_workflow_execution_use_case.set_repositories(service.clone());
+        run_container_step_use_case.set_run_repositories(
+            Arc::new(
+                aegis_orchestrator_core::application::run_container_step::WorkflowRunRepositories::new(
+                    workflow_execution_repo.clone(),
+                    service.clone(),
+                ),
+            ),
+            nfs_gateway.volume_registry().clone(),
+        );
         service.clone().release_runs_on_end();
     }
 

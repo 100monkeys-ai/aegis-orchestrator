@@ -117,6 +117,22 @@ const NOTHING_TO_COMMIT_EXIT: i32 = 3;
 /// ADR-136 G8a).
 const PUSH_REJECTED_EXIT: i32 = 4;
 
+/// The exit status the landing step uses when the remote refuses the push
+/// of the work branch's HEAD to the binding's branch as not a fast-forward:
+/// the branch moved on the remote (AEGIS ADR-141 F8). The work branch was
+/// pushed; the binding's branch is unchanged.
+const LAND_REF_REJECTED_EXIT: i32 = 5;
+
+/// What a landing from a tree on a volume answers (AEGIS ADR-141 F8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeLanding {
+    /// The work branch and the binding's branch are both at this commit.
+    Landed(String),
+    /// The binding's branch, named here, moved on the remote: the work
+    /// branch was pushed and the binding's branch is unchanged.
+    RefAhead(String),
+}
+
 /// Where the clone step works inside its container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EphemeralCliPaths {
@@ -380,6 +396,56 @@ impl EphemeralCliEngine {
             ));
         }
         Ok(pushed)
+    }
+
+    /// Land the work branch `branch` of the tree on `volume` on the
+    /// binding's branch `git_ref` (AEGIS ADR-141 F8): `origin` pointed at
+    /// the binding's URL, the work branch pushed to `origin`, then its HEAD
+    /// pushed to `refs/heads/<git_ref>`, neither with force. A refusal of
+    /// the first push answers [`CloneError::RemoteAhead`] and lands nothing;
+    /// of the second, [`VolumeLanding::RefAhead`] with the ref unchanged.
+    async fn land_in_volume(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        branch: &str,
+        git_ref: &str,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<VolumeLanding, CloneError> {
+        let (url, credential) = clone_credential(binding.repo_url.expose(), credential);
+        let secrets = credential_secrets(credential.as_ref());
+        let host_keys = host_keys_for(&url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
+        let step = land_step(
+            &self.paths,
+            &url,
+            branch,
+            git_ref,
+            credential.as_ref(),
+            host_keys.as_deref(),
+        )?;
+        let result = self
+            .run_git_step(
+                volume,
+                &format!("git-land-{}", binding.id),
+                "land",
+                "GIT_LAND",
+                step,
+                &secrets,
+            )
+            .await?;
+        let last_line = || {
+            result
+                .stdout
+                .lines()
+                .last()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        match result.exit_code {
+            PUSH_REJECTED_EXIT => Err(CloneError::RemoteAhead(last_line())),
+            LAND_REF_REJECTED_EXIT => Ok(VolumeLanding::RefAhead(last_line())),
+            _ => head_sha(&result, &secrets).map(VolumeLanding::Landed),
+        }
     }
 
     /// The unified diff of the tree on `volume`: index to working tree, or
@@ -935,6 +1001,56 @@ fn push_step(
     Ok(GitStep { script: s, stdin })
 }
 
+/// Build the landing step (AEGIS ADR-141 F8): `origin` pointed at `url`,
+/// then `refs/heads/$branch:refs/heads/$branch` and
+/// `refs/heads/$branch:refs/heads/$ref` pushed there in turn, each with
+/// `--porcelain --no-verify` and never with force. A refusal of the first
+/// as not a fast-forward exits [`PUSH_REJECTED_EXIT`] with the branch as its
+/// last line; of the second, [`LAND_REF_REJECTED_EXIT`] with the ref; any
+/// other failure exits with git's status and what git printed on standard
+/// error. Prints the work branch's HEAD, the commit landed, as its last
+/// line.
+fn land_step(
+    paths: &EphemeralCliPaths,
+    url: &str,
+    branch: &str,
+    git_ref: &str,
+    credential: Option<&ResolvedCredential>,
+    host_keys: Option<&[SshHostKey]>,
+) -> Result<GitStep, CloneError> {
+    let (mut s, stdin, git_options) = step_prelude(paths, url, credential, host_keys)?;
+    s.push_str(&format!("cd {}\n", tree_path(paths)));
+    s.push_str(&point_origin_script(url));
+    s.push_str(&format!("branch={}\n", shell_escape(branch)));
+    s.push_str(&format!("ref={}\n", shell_escape(git_ref)));
+    for (refspec, refused_name, refused_exit) in [
+        (
+            "refs/heads/$branch:refs/heads/$branch",
+            "$branch",
+            PUSH_REJECTED_EXIT,
+        ),
+        (
+            "refs/heads/$branch:refs/heads/$ref",
+            "$ref",
+            LAND_REF_REJECTED_EXIT,
+        ),
+    ] {
+        s.push_str(&format!(
+            "if out=$(g{git_options} push --porcelain --no-verify origin \"{refspec}\" 2>&1); then :; else\n\
+             rc=$?\n\
+             if printf '%s\\n' \"$out\" | grep -Eq '^!.*\\[rejected\\] \\((non-fast-forward|fetch first)\\)'; then\n\
+             printf '%s\\n' \"{refused_name}\"\n\
+             exit {refused_exit}\n\
+             fi\n\
+             printf '%s\\n' \"$out\" >&2\n\
+             exit \"$rc\"\n\
+             fi\n"
+        ));
+    }
+    s.push_str("g rev-parse --verify \"refs/heads/$branch^{commit}\"\n");
+    Ok(GitStep { script: s, stdin })
+}
+
 /// Build the step that reads the tree's HEAD and whether it holds changes:
 /// its last two lines are `clean` or `changed`, then the HEAD sha (AEGIS
 /// ADR-136 G7c). It is handed no credential.
@@ -1383,6 +1499,23 @@ impl GitCloneExecutor {
     ) -> Result<String, CloneError> {
         self.engine()?
             .push_in_volume(binding, volume, ref_name, credential)
+            .await
+    }
+
+    /// Land the work branch `branch` of the tree on a non-HostPath `volume`
+    /// on the binding's branch `git_ref`, through one git step (AEGIS
+    /// ADR-141 F8).
+    #[instrument(skip(self, volume, credential), fields(binding_id = %binding.id, volume_id = %volume.id))]
+    pub async fn land_ephemeral(
+        &self,
+        binding: &GitRepoBinding,
+        volume: &Volume,
+        branch: &str,
+        git_ref: &str,
+        credential: Option<ResolvedCredential>,
+    ) -> Result<VolumeLanding, CloneError> {
+        self.engine()?
+            .land_in_volume(binding, volume, branch, git_ref, credential)
             .await
     }
 

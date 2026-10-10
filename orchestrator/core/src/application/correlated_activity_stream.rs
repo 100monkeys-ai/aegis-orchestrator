@@ -687,6 +687,13 @@ fn event_message(event: &DomainEvent) -> String {
             branch_url,
             ..
         }) => format!("Pushed branch {branch} of repository {label} to {branch_url}"),
+        // AEGIS ADR-141 F8: a workflow's landing on its repository's branch.
+        DomainEvent::Execution(ExecutionEvent::RepositoryLanded {
+            commit_sha,
+            label,
+            git_ref,
+            ..
+        }) => crate::domain::events::repository_landed_line(commit_sha, label, git_ref),
         DomainEvent::Execution(ExecutionEvent::Validation(
             ValidationEvent::GradientValidationPerformed {
                 iteration_number,

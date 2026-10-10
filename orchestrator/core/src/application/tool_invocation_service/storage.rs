@@ -1578,6 +1578,23 @@ impl ToolInvocationService {
             },
         }
     }
+
+    /// `aegis.git.land` (AEGIS ADR-141 F8): answered only for a workflow's
+    /// own landing step, which the approval gate runs in the workflow
+    /// execution once its person approved; any other caller is refused.
+    pub(super) async fn invoke_aegis_git_land(
+        &self,
+        args: &mut Value,
+        caller: Option<&UserIdentity>,
+        scope: &crate::domain::iam::TenantScope,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> ToolResult {
+        let tenant_id = Self::enforce_tenant_arg(args, scope)?;
+        let person = caller.map(|c| c.sub.as_str()).unwrap_or_default();
+        self.land_for_interpreter(&tenant_id, execution_id, person)
+            .await
+            .map(ToolInvocationResult::Direct)
+    }
 }
 
 /// The gate's refusal of a landing its person did not approve: nothing was

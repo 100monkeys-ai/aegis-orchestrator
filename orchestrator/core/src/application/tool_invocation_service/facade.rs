@@ -2310,6 +2310,10 @@ impl ToolInvocationService {
                 self.invoke_aegis_git_diff(args, caller_identity, tenant_scope, execution_id)
                     .await,
             ),
+            "aegis.git.land" => Some(
+                self.invoke_aegis_git_land(args, caller_identity, tenant_scope, execution_id)
+                    .await,
+            ),
             "aegis.git.list" => Some(
                 self.invoke_aegis_git_list(args, caller_identity, tenant_scope)
                     .await,
