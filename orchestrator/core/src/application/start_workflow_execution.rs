@@ -22,7 +22,7 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::iam::UserIdentity;
 use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::{WorkflowExecution, WorkflowId};
+use crate::domain::workflow::{Workflow, WorkflowExecution, WorkflowId};
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -299,6 +299,30 @@ impl StandardStartWorkflowExecutionUseCase {
         Ok(RunHoldGuard::new(Some(repositories.clone()), run.0))
     }
 
+    /// AEGIS ADR-141 F2: the number of repositories a run names against
+    /// the number its workflow works on, when the workflow declares one.
+    fn refuse_repository_count(workflow: &Workflow, input: &serde_json::Value) -> Result<()> {
+        let Some(count) = workflow.spec.repositories else {
+            return Ok(());
+        };
+        let named = match input.get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY) {
+            None => 0,
+            Some(serde_json::Value::Array(entries)) => entries.len(),
+            Some(_) => return Ok(()),
+        };
+        if named == count as usize {
+            return Ok(());
+        }
+        Err(crate::domain::execution::ExecutionError::Refused(
+            crate::domain::workflow::repository_count_refusal(
+                &workflow.metadata.name,
+                count,
+                named,
+            ),
+        )
+        .into())
+    }
+
     /// Attach rate limiting enforcement for workflow execution quotas (ADR-072).
     pub fn with_rate_limiting(
         mut self,
@@ -473,6 +497,12 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         }
         .context("Failed to query workflow repository")?
         .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.workflow_id))?;
+
+        // AEGIS ADR-141 F2: a workflow that works on a fixed number of
+        // repositories refuses a run naming another number, before anything
+        // is held. A `repositories` of another shape is refused by its own
+        // sentence when the run's repositories are prepared.
+        Self::refuse_repository_count(&workflow, &request.input)?;
 
         // The dispatch's binding choices (Zaru ADR-0055 D14) are the
         // platform's: the workflow's schema and its Temporal input never see
@@ -905,6 +935,7 @@ mod tests {
                 storage: Default::default(),
                 max_total_transitions: None,
                 default_schedule: None,
+                repositories: None,
             },
         )
         .unwrap()
@@ -1451,6 +1482,7 @@ mod tests {
                 storage: Default::default(),
                 max_total_transitions: None,
                 default_schedule: None,
+                repositories: None,
             },
         )
         .unwrap()

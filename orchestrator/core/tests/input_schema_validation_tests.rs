@@ -112,6 +112,7 @@ fn workflow_with_schema(name: &str, schema: serde_json::Value) -> Workflow {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap()

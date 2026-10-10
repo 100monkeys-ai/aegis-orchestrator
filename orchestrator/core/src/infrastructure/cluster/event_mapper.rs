@@ -229,6 +229,7 @@ pub fn domain_to_proto(event: DomainEvent) -> Option<ExecutionEvent> {
         | DomainEvent::OutputHandlerFailed { .. }
         | DomainEvent::RepositoryPrepared { .. }
         | DomainEvent::RepositoryCommitted { .. }
-        | DomainEvent::RepositoryPushed { .. } => None,
+        | DomainEvent::RepositoryPushed { .. }
+        | DomainEvent::RepositoryLanded { .. } => None,
     }
 }

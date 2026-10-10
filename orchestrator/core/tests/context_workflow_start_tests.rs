@@ -105,6 +105,7 @@ fn closed_schema_workflow() -> Workflow {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap()

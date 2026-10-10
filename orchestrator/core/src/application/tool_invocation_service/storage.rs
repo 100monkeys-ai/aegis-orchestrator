@@ -5,7 +5,10 @@
 use serde_json::{json, Value};
 
 use crate::application::file_operations_service::FileOperationsError;
-use crate::application::git_repo_service::GitRepoError;
+use crate::application::git_repo_service::{
+    GitRepoError, RepositoryActionAnswer, RepositoryActionError, LAND_IS_THE_WORKFLOWS,
+    RUN_HOLDS_NO_REPOSITORY,
+};
 use crate::application::script_service::ScriptServiceError;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::application::user_volume_service::UserVolumeError;
@@ -171,6 +174,11 @@ impl IntoRefusal for GitRepoError {
             // AEGIS ADR-136 G7c, G8a: a clean tree and a push the remote
             // refused as not a fast-forward, each in its own sentence alone.
             GitRepoError::NothingToCommit | GitRepoError::RemoteAhead { .. } => {
+                CallerAnswer::Conflict(self.to_string())
+            }
+            // AEGIS ADR-141 F8: a landing's ref moved on the remote, or is
+            // a tag or a commit, each in its own sentence alone.
+            GitRepoError::RefAhead { .. } | GitRepoError::NotABranch { .. } => {
                 CallerAnswer::Conflict(self.to_string())
             }
             GitRepoError::BindingBusy(_) | GitRepoError::NoHeadBranch => {
@@ -1173,6 +1181,409 @@ fn script_dto(s: &crate::domain::script::Script) -> Value {
 fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+// ============================================================================
+// The workflow interpreter's repository steps (AEGIS ADR-141 F5, F8)
+// ============================================================================
+
+/// The security context a workflow's landing is stored at the approval gate
+/// under: the interpreter's call carries none of an agent's, and the
+/// context an identity-less interpreter call runs under elsewhere is this.
+const LANDING_SECURITY_CONTEXT: &str = "aegis-system-operator";
+
+/// How often a landing waiting at the gate reads its request's answer.
+const LANDING_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The repository a workflow run holds, as its steps act on it: its first,
+/// as the blackboard names it (AEGIS ADR-141 F3).
+struct WorkflowRunRepository {
+    run: uuid::Uuid,
+    person: String,
+    label: String,
+    binding_id: crate::domain::git_repo::GitRepoBindingId,
+    branch: String,
+    git_ref: String,
+    /// The binding's ref as it was bound: a landing goes only to a branch.
+    binding_ref: crate::domain::git_repo::GitRef,
+    author: Option<crate::domain::git_repo::RunAuthor>,
+}
+
+/// The sentence a repository step answers for a refusal of the git path,
+/// or `None` for a failure.
+fn step_sentence(e: &GitRepoError) -> Option<String> {
+    match e {
+        GitRepoError::NothingToCommit
+        | GitRepoError::RemoteAhead { .. }
+        | GitRepoError::RefAhead { .. }
+        | GitRepoError::NotABranch { .. }
+        | GitRepoError::HeldByRun { .. }
+        | GitRepoError::CredentialNotYours
+        | GitRepoError::BindingBusy(_)
+        | GitRepoError::NotYetImplemented(_) => Some(e.to_string()),
+        GitRepoError::GitFailed(text)
+            if text.contains(crate::application::git_clone_executor::DIFF_TOO_LARGE) =>
+        {
+            Some(crate::application::git_clone_executor::DIFF_TOO_LARGE.to_string())
+        }
+        _ => None,
+    }
+}
+
+impl ToolInvocationService {
+    /// The repository the workflow run `run` holds, read from its record in
+    /// `tenant_id`; `Err` of `Ok` a refusal's sentence.
+    async fn workflow_run_repository(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        run: uuid::Uuid,
+    ) -> Result<Result<WorkflowRunRepository, String>, RepositoryActionError> {
+        let executions =
+            self.workflow_execution_repo
+                .as_ref()
+                .ok_or(RepositoryActionError::NotConfigured(
+                    "the workflow execution store",
+                ))?;
+        let svc = self
+            .git_repo_service
+            .as_ref()
+            .ok_or(RepositoryActionError::NotConfigured(
+                "the git repository service",
+            ))?;
+        let execution = executions
+            .find_by_id_for_tenant(tenant_id, crate::domain::execution::ExecutionId(run))
+            .await
+            .map_err(|e| RepositoryActionError::Failed(e.to_string()))?
+            .ok_or(RepositoryActionError::RunNotFound(run))?;
+        let entries = match execution
+            .input
+            .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+        {
+            None => Vec::new(),
+            Some(value) => match crate::domain::git_repo::parse_run_repositories(value) {
+                Ok(entries) => entries,
+                Err(sentence) => return Ok(Err(sentence.to_string())),
+            },
+        };
+        let Some(entry) = entries.into_iter().next() else {
+            return Ok(Err(RUN_HOLDS_NO_REPOSITORY.to_string()));
+        };
+        let person = execution.initiating_user_sub.clone().unwrap_or_default();
+        let binding = match svc.get_binding(&entry.binding_id, tenant_id, &person).await {
+            Ok(binding) => binding,
+            Err(GitRepoError::BindingNotFound | GitRepoError::NotOwned) => {
+                return Ok(Err(RUN_HOLDS_NO_REPOSITORY.to_string()))
+            }
+            Err(e) => return Err(RepositoryActionError::Failed(e.to_string())),
+        };
+        let git_ref = match &binding.git_ref {
+            crate::domain::git_repo::GitRef::Branch(name)
+            | crate::domain::git_repo::GitRef::Tag(name)
+            | crate::domain::git_repo::GitRef::Commit(name) => name.clone(),
+        };
+        Ok(Ok(WorkflowRunRepository {
+            run,
+            person,
+            label: binding.label.clone(),
+            binding_id: binding.id,
+            branch: entry
+                .branch
+                .unwrap_or_else(|| crate::domain::git_repo::default_work_branch(run)),
+            git_ref,
+            binding_ref: binding.git_ref.clone(),
+            author: entry.author,
+        }))
+    }
+
+    /// One of the workflow interpreter's own repository steps on the
+    /// repository the workflow run `run` holds (AEGIS ADR-141 F5): `diff`
+    /// (unstaged changes, as `aegis.git.diff` answers them), `commit` (every
+    /// change on the work branch, as the run's person) or `land` (through
+    /// the person's approval, F8). A refusal answers its sentence; a run
+    /// holding no repository answers "this run holds no repository".
+    pub async fn run_repository_action(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        run: uuid::Uuid,
+        action: &str,
+        message: Option<&str>,
+    ) -> Result<RepositoryActionAnswer, RepositoryActionError> {
+        if !matches!(action, "diff" | "commit" | "land") {
+            return Err(RepositoryActionError::UnknownAction(action.to_string()));
+        }
+        let repository = match self.workflow_run_repository(tenant_id, run).await? {
+            Ok(repository) => repository,
+            Err(sentence) => return Ok(RepositoryActionAnswer::refused(sentence)),
+        };
+        let svc = self
+            .git_repo_service
+            .as_ref()
+            .ok_or(RepositoryActionError::NotConfigured(
+                "the git repository service",
+            ))?;
+        let answer = RepositoryActionAnswer {
+            branch: repository.branch.clone(),
+            git_ref: repository.git_ref.clone(),
+            ..RepositoryActionAnswer::default()
+        };
+        let refused_or_failed =
+            |e: GitRepoError, answer: RepositoryActionAnswer| match step_sentence(&e) {
+                Some(sentence) => Ok(RepositoryActionAnswer {
+                    sentence: Some(sentence),
+                    ..answer
+                }),
+                None => Err(RepositoryActionError::Failed(e.to_string())),
+            };
+        match action {
+            "diff" => match svc
+                .diff_for_run(
+                    repository.run,
+                    &repository.binding_id,
+                    tenant_id,
+                    &repository.person,
+                    false,
+                )
+                .await
+            {
+                Ok(diff) => Ok(RepositoryActionAnswer {
+                    diff: Some(diff),
+                    ..answer
+                }),
+                Err(e) => refused_or_failed(e, answer),
+            },
+            "commit" => {
+                let message = message
+                    .filter(|m| !m.trim().is_empty())
+                    .ok_or(RepositoryActionError::NoMessage)?;
+                let (author_name, author_email) = match &repository.author {
+                    Some(author) => (author.name.clone(), author.email.clone()),
+                    None => commit_author(None),
+                };
+                match svc
+                    .commit_for_run(
+                        repository.run,
+                        &repository.binding_id,
+                        tenant_id,
+                        &repository.person,
+                        message,
+                        &author_name,
+                        &author_email,
+                    )
+                    .await
+                {
+                    Ok(commit_sha) => Ok(RepositoryActionAnswer {
+                        commit_sha: Some(commit_sha),
+                        ..answer
+                    }),
+                    Err(e) => refused_or_failed(e, answer),
+                }
+            }
+            _ => self.land_through_gate(tenant_id, repository, answer).await,
+        }
+    }
+
+    /// A workflow's landing (AEGIS ADR-141 F8): a ref that is not a branch
+    /// refused before anything; the call `aegis.git.land` asked of the run's
+    /// person at the approval gate, in the run's own execution, as
+    /// `aegis.git.push` is; answered with what the landing returned once the
+    /// person approved, or the gate's refusal when they did not, nothing
+    /// pushed.
+    async fn land_through_gate(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        repository: WorkflowRunRepository,
+        answer: RepositoryActionAnswer,
+    ) -> Result<RepositoryActionAnswer, RepositoryActionError> {
+        use crate::application::tool_approval_service::{GateOutcome, GatedCall};
+        use crate::domain::tool_approval::ToolApprovalStatus;
+
+        if let Err(e) = crate::application::git_repo_service::landing_ref(&repository.binding_ref) {
+            return Ok(RepositoryActionAnswer {
+                sentence: Some(e.to_string()),
+                ..answer
+            });
+        }
+        let land_tool = crate::infrastructure::tool_router::LAND_TOOL;
+        let arguments = json!({ "repository": repository.label });
+        let execution_id = crate::domain::execution::ExecutionId(repository.run);
+        let outcome = match &self.tool_approval_service {
+            None => None,
+            Some(approvals) if self.tool_router.requires_approval(land_tool) => Some(
+                approvals
+                    .gate(GatedCall {
+                        tenant_id,
+                        user_sub: Some(repository.person.as_str()).filter(|p| !p.is_empty()),
+                        execution_id,
+                        agent_id: crate::domain::agent::AgentId(uuid::Uuid::nil()),
+                        tool_name: land_tool,
+                        arguments: &arguments,
+                        security_context_name: LANDING_SECURITY_CONTEXT,
+                        conversation_id: None,
+                        profile_id: None,
+                        contract: self.tool_router.approval_contract(land_tool),
+                    })
+                    .await
+                    .map_err(|e| RepositoryActionError::Failed(e.to_string()))?,
+            ),
+            Some(_) => None,
+        };
+        let landed = match outcome {
+            // No gate on this node, or the tool is not gated: the landing
+            // runs at once, as an ungated push does.
+            None => {
+                self.land_for_interpreter(tenant_id, execution_id, &repository.person)
+                    .await
+            }
+            Some(GateOutcome::Proceed { approval_id }) => {
+                let landed = self
+                    .land_for_interpreter(tenant_id, execution_id, &repository.person)
+                    .await;
+                if let Some(approvals) = &self.tool_approval_service {
+                    let recorded = landed.clone().map_err(|e| e.to_string());
+                    if let Err(e) = approvals.record_outcome(approval_id, &recorded).await {
+                        tracing::warn!(approval_id = %approval_id, error = %e, "Failed to record the outcome of an auto-allowed landing");
+                    }
+                }
+                landed
+            }
+            Some(GateOutcome::Denied { .. }) => {
+                return Ok(RepositoryActionAnswer {
+                    sentence: Some(landing_not_approved(ToolApprovalStatus::AutoDenied)),
+                    ..answer
+                })
+            }
+            Some(GateOutcome::Pending { result }) => {
+                let approval_id = result
+                    .get("approval_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| {
+                        crate::domain::tool_approval::ToolApprovalId::from_string(id).ok()
+                    })
+                    .ok_or_else(|| {
+                        RepositoryActionError::Failed(
+                            "the approval gate answered no approval id".to_string(),
+                        )
+                    })?;
+                let approvals = self
+                    .tool_approval_service
+                    .as_ref()
+                    .ok_or(RepositoryActionError::NotConfigured("the approval gate"))?;
+                loop {
+                    let request = approvals
+                        .get_for_user(approval_id, tenant_id, &repository.person)
+                        .await
+                        .map_err(|e| RepositoryActionError::Failed(e.to_string()))?;
+                    match request.status {
+                        ToolApprovalStatus::Pending => {}
+                        ToolApprovalStatus::ApprovedOnce
+                        | ToolApprovalStatus::ApprovedAlways
+                        | ToolApprovalStatus::AutoAllowed => {
+                            if let Some(result) = request.result {
+                                break Ok(result);
+                            }
+                            if let Some(error) = request.error {
+                                break Err(RepositoryActionError::Failed(error));
+                            }
+                        }
+                        status => {
+                            return Ok(RepositoryActionAnswer {
+                                sentence: Some(landing_not_approved(status)),
+                                ..answer
+                            })
+                        }
+                    }
+                    tokio::time::sleep(LANDING_POLL).await;
+                }
+                .map(Ok)?
+            }
+        };
+        let landed = landed.map_err(|e| RepositoryActionError::Failed(e.to_string()))?;
+        Ok(RepositoryActionAnswer {
+            commit_sha: landed
+                .get("commit_sha")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            sentence: landed
+                .get("sentence")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ..answer
+        })
+    }
+
+    /// The landing itself, for the workflow execution `execution_id`'s own
+    /// step and its person `person` only (AEGIS ADR-141 F8): what
+    /// `aegis.git.land` runs once the person approved. Answers the landed
+    /// commit, the branch, the ref and the ref's page; a refusal of the git
+    /// path answers its sentence under `sentence`, nothing landed.
+    pub async fn land_for_interpreter(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        execution_id: crate::domain::execution::ExecutionId,
+        person: &str,
+    ) -> Result<Value, SealSessionError> {
+        let not_the_workflows =
+            || SealSessionError::InvalidArguments(LAND_IS_THE_WORKFLOWS.to_string());
+        let repository = match self
+            .workflow_run_repository(tenant_id, execution_id.0)
+            .await
+        {
+            Ok(Ok(repository)) => repository,
+            Ok(Err(sentence)) => return Ok(json!({ "sentence": sentence })),
+            Err(RepositoryActionError::RunNotFound(_)) => return Err(not_the_workflows()),
+            Err(e) => return Err(SealSessionError::InternalError(e.to_string())),
+        };
+        if repository.person.is_empty() || repository.person != person {
+            return Err(not_the_workflows());
+        }
+        let svc = self.git_repo_service.as_ref().ok_or_else(|| {
+            SealSessionError::InternalError("git repo service not configured".to_string())
+        })?;
+        match svc
+            .land_for_run(
+                repository.run,
+                &repository.binding_id,
+                tenant_id,
+                &repository.person,
+                &repository.branch,
+            )
+            .await
+        {
+            Ok(landed) => {
+                self.event_bus.publish_execution_event(
+                    crate::domain::events::ExecutionEvent::RepositoryLanded {
+                        execution_id,
+                        label: landed.label.clone(),
+                        branch: landed.branch.clone(),
+                        git_ref: landed.git_ref.clone(),
+                        commit_sha: landed.commit_sha.clone(),
+                        branch_url: crate::domain::secrets::RedactedUrl::new(&landed.branch_url),
+                        landed_at: chrono::Utc::now(),
+                    },
+                );
+                Ok(json!({
+                    "commit_sha": landed.commit_sha,
+                    "branch": landed.branch,
+                    "ref": landed.git_ref,
+                    "branch_url": landed.branch_url,
+                }))
+            }
+            Err(e) => match step_sentence(&e) {
+                Some(sentence) => Ok(json!({
+                    "sentence": sentence,
+                    "branch": repository.branch,
+                    "ref": repository.git_ref,
+                })),
+                None => Err(e.into_refusal()),
+            },
+        }
+    }
+}
+
+/// The gate's refusal of a landing its person did not approve: nothing was
+/// pushed (AEGIS ADR-141 F8).
+fn landing_not_approved(status: crate::domain::tool_approval::ToolApprovalStatus) -> String {
+    format!("approval request {}; nothing was landed", status.as_str())
 }
 
 #[cfg(test)]

@@ -249,6 +249,20 @@ pub enum GitRepoError {
     /// pushed. Maps to HTTP `409 Conflict` and the tool path's Conflict.
     #[error("the remote branch '{branch}' has commits this run does not have; nothing was pushed")]
     RemoteAhead { branch: String },
+
+    /// A landing's ref moved on the remote: its branch has commits the
+    /// run's work branch does not (AEGIS ADR-141 F8). The work branch may
+    /// have been pushed; the ref is unchanged. Maps to the tool path's
+    /// Conflict.
+    #[error(
+        "the remote branch '{git_ref}' has commits this run does not have; nothing was landed"
+    )]
+    RefAhead { git_ref: String },
+
+    /// A landing on a binding whose ref is a tag or a commit, refused before
+    /// any push (AEGIS ADR-141 F8).
+    #[error("a run lands only on a branch; '{git_ref}' is not one")]
+    NotABranch { git_ref: String },
 }
 
 impl From<UserVolumeError> for GitRepoError {
@@ -983,6 +997,74 @@ impl GitRepoService {
             branch: pushed,
             remote_url,
             branch_url,
+        })
+    }
+
+    /// Land the work branch `branch` of a binding the run `run` holds on
+    /// the binding's ref (AEGIS ADR-141 F8): in one git step with the
+    /// person's credential, push the work branch to `origin` as
+    /// [`Self::push_for_run`] does, then push its HEAD to
+    /// `refs/heads/<the binding's ref>`, neither with force. A ref that is a
+    /// tag or a commit is refused before any push. A landing is never a
+    /// merge, a rebase or a squash.
+    #[instrument(skip(self), fields(binding_id = %id, owner = %owner, run = %run))]
+    pub async fn land_for_run(
+        &self,
+        run: uuid::Uuid,
+        id: &GitRepoBindingId,
+        tenant_id: &TenantId,
+        owner: &str,
+        branch: &str,
+    ) -> Result<RunLanding, GitRepoError> {
+        let mut binding = self.get_binding(id, tenant_id, owner).await?;
+        ensure_binding_ready(&binding)?;
+        self.refuse_if_held(&binding, Some(run))?;
+        let git_ref = landing_ref(&binding.git_ref)?.to_string();
+        let tree = self.resolve_tree(&binding).await?;
+        let credential = self.resolve_credential(&binding, Some(owner)).await?;
+        let commit_sha = match tree {
+            Tree::Host(target_dir) => {
+                let repo_url = binding.repo_url.clone();
+                let ssh_host_keys = binding.ssh_host_keys.clone();
+                let branch = branch.to_string();
+                let git_ref = git_ref.clone();
+                tokio::task::spawn_blocking(move || -> Result<String, GitRepoError> {
+                    land_to_remote(
+                        &target_dir,
+                        &repo_url,
+                        &branch,
+                        &git_ref,
+                        credential,
+                        &ssh_host_keys,
+                    )
+                })
+                .await
+                .map_err(|e| GitRepoError::GitFailed(format!("land task panicked: {e}")))??
+            }
+            Tree::Volume(_) => return Err(GitRepoError::NotYetImplemented(LANDING_FROM_A_VOLUME)),
+        };
+        let now = Utc::now();
+        for ref_name in [branch.to_string(), git_ref.clone()] {
+            binding.domain_events.push(GitRepoEvent::PushCompleted {
+                id: binding.id,
+                remote: "origin".to_string(),
+                ref_name,
+                pushed_at: now,
+            });
+        }
+        self.repo.save(&binding).await?;
+        self.drain_and_publish(&mut binding);
+        info!(%commit_sha, git_ref = %git_ref, "a run's work branch landed on its binding's ref");
+        let remote_url = crate::domain::secrets::RedactedUrl::new(binding.repo_url.expose())
+            .as_str()
+            .to_string();
+        Ok(RunLanding {
+            label: binding.label.clone(),
+            branch: branch.to_string(),
+            branch_url: branch_url(&remote_url, &git_ref),
+            git_ref,
+            commit_sha,
+            remote_url,
         })
     }
 
@@ -1802,6 +1884,85 @@ pub struct RunPush {
     pub branch_url: String,
 }
 
+// ============================================================================
+// The workflow interpreter's repository steps (AEGIS ADR-141 F5)
+// ============================================================================
+
+/// The refusal of a repository step in a workflow run that holds no
+/// repository (AEGIS ADR-141 F5).
+pub const RUN_HOLDS_NO_REPOSITORY: &str = "this run holds no repository";
+
+/// The refusal of `aegis.git.land` called by anything but a workflow's own
+/// landing step (AEGIS ADR-141 F8).
+pub const LAND_IS_THE_WORKFLOWS: &str =
+    "aegis.git.land is answered only for a workflow's own landing step";
+
+/// What one of the workflow interpreter's repository steps answers (AEGIS
+/// ADR-141 F5): the commit made or landed, the run's work branch, the
+/// binding's ref, the diff, and, when the step did not act, the sentence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryActionAnswer {
+    pub commit_sha: Option<String>,
+    pub branch: String,
+    pub git_ref: String,
+    pub diff: Option<String>,
+    pub sentence: Option<String>,
+}
+
+impl RepositoryActionAnswer {
+    pub fn refused(sentence: impl Into<String>) -> Self {
+        Self {
+            sentence: Some(sentence.into()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Why a repository step could not be answered at all.
+#[derive(Debug, thiserror::Error)]
+pub enum RepositoryActionError {
+    #[error("unknown repository action '{0}': expected diff, commit or land")]
+    UnknownAction(String),
+    #[error("a repository commit needs a message")]
+    NoMessage,
+    #[error("workflow execution {0} not found")]
+    RunNotFound(uuid::Uuid),
+    #[error("{0} is not configured on this node")]
+    NotConfigured(&'static str),
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// What a run's landing answers (AEGIS ADR-141 F8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLanding {
+    pub label: String,
+    pub branch: String,
+    /// The binding's ref, the branch the landing fast-forwarded.
+    pub git_ref: String,
+    /// The work branch's HEAD, now the ref's.
+    pub commit_sha: String,
+    /// The binding's URL, with no user info.
+    pub remote_url: String,
+    /// The host's page of the ref.
+    pub branch_url: String,
+}
+
+/// The refusal of a landing from a tree on a volume a git step mounts: the
+/// step's script for a landing is not part of the git step engine.
+pub const LANDING_FROM_A_VOLUME: &str = "a landing from a repository on a volume a git step mounts";
+
+/// The branch a binding's ref lands on, or the refusal of a tag or a commit
+/// (AEGIS ADR-141 F8).
+pub fn landing_ref(git_ref: &GitRef) -> Result<&str, GitRepoError> {
+    match git_ref {
+        GitRef::Branch(name) => Ok(name),
+        GitRef::Tag(name) | GitRef::Commit(name) => Err(GitRepoError::NotABranch {
+            git_ref: name.clone(),
+        }),
+    }
+}
+
 /// A run's tree as `aegis.git.status` reads it (AEGIS ADR-136 G7c).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunTreeStatus {
@@ -2361,9 +2522,8 @@ fn blocking_push(
     credential: Option<ResolvedCredential>,
     ssh_host_keys: Option<Vec<crate::domain::git_host_keys::SshHostKey>>,
 ) -> Result<String, GitRepoError> {
-    use git2::{PushOptions, RemoteCallbacks, Repository};
-
-    let repo = Repository::open(target_dir).map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+    let repo =
+        git2::Repository::open(target_dir).map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
 
     // Resolve the ref to push: explicit value wins, else the shorthand of
     // whatever HEAD resolves to.
@@ -2388,7 +2548,46 @@ fn blocking_push(
                 .to_string()
         }
     };
+    drop(repo);
 
+    match blocking_push_refs(
+        target_dir,
+        remote_name,
+        &[(resolved_ref.clone(), resolved_ref.clone())],
+        credential,
+        ssh_host_keys,
+    )? {
+        Pushed::All => Ok(resolved_ref),
+        Pushed::RefusedAt(_) => Err(GitRepoError::RemoteAhead {
+            branch: resolved_ref,
+        }),
+    }
+}
+
+/// How far a sequence of pushes went.
+enum Pushed {
+    /// Every push was accepted.
+    All,
+    /// The push at this index was refused as not a fast-forward; none after
+    /// it was attempted.
+    RefusedAt(usize),
+}
+
+/// Blocking libgit2 pushes against `target_dir`, in order, each of
+/// `refs/heads/<source>` to `refs/heads/<destination>`, never with force,
+/// one connection's credentials for all. A push the remote refuses as not a
+/// fast-forward stops the sequence and answers its index (AEGIS ADR-136
+/// G8a, ADR-141 F8); any other refusal is a git failure.
+fn blocking_push_refs(
+    target_dir: &std::path::Path,
+    remote_name: &str,
+    refs: &[(String, String)],
+    credential: Option<ResolvedCredential>,
+    ssh_host_keys: Option<Vec<crate::domain::git_host_keys::SshHostKey>>,
+) -> Result<Pushed, GitRepoError> {
+    use git2::{PushOptions, RemoteCallbacks, Repository};
+
+    let repo = Repository::open(target_dir).map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
     let mut remote = repo
         .find_remote(remote_name)
         .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
@@ -2397,7 +2596,7 @@ fn blocking_push(
     if let Some(keys) = ssh_host_keys {
         check_ssh_host_key(&mut callbacks, keys);
     }
-    // SSH guard must outlive the `remote.push()` call — libgit2 reads
+    // SSH guard must outlive the `remote.push()` calls — libgit2 reads
     // the key tempfile from inside `push`. Dropping the guard before
     // then zeros the file and would break auth. Bind it into this
     // outer scope so it lives until the function returns.
@@ -2441,29 +2640,87 @@ fn blocking_push(
     let mut push_opts = PushOptions::new();
     push_opts.remote_callbacks(callbacks);
 
-    let refspec = format!("refs/heads/{resolved_ref}:refs/heads/{resolved_ref}");
-    if let Err(e) = remote.push(&[refspec.as_str()], Some(&mut push_opts)) {
-        if e.code() == git2::ErrorCode::NotFastForward {
-            return Err(GitRepoError::RemoteAhead {
-                branch: resolved_ref,
-            });
+    for (index, (source, destination)) in refs.iter().enumerate() {
+        refused.borrow_mut().take();
+        let refspec = format!("refs/heads/{source}:refs/heads/{destination}");
+        if let Err(e) = remote.push(&[refspec.as_str()], Some(&mut push_opts)) {
+            if e.code() == git2::ErrorCode::NotFastForward {
+                return Ok(Pushed::RefusedAt(index));
+            }
+            return Err(GitRepoError::GitFailed(e.to_string()));
         }
-        return Err(GitRepoError::GitFailed(e.to_string()));
-    }
-    drop(push_opts);
-    let refused = refused.borrow_mut().take();
-    if let Some(status) = refused {
-        if status.contains("non-fast-forward") || status.contains("fetch first") {
-            return Err(GitRepoError::RemoteAhead {
-                branch: resolved_ref,
-            });
+        let status = refused.borrow_mut().take();
+        if let Some(status) = status {
+            if status.contains("non-fast-forward") || status.contains("fetch first") {
+                return Ok(Pushed::RefusedAt(index));
+            }
+            return Err(GitRepoError::GitFailed(format!(
+                "the remote refused the push of {source} to {destination}: {status}"
+            )));
         }
-        return Err(GitRepoError::GitFailed(format!(
-            "the remote refused the push of {resolved_ref}: {status}"
-        )));
     }
+    Ok(Pushed::All)
+}
 
-    Ok(resolved_ref)
+/// Land the work branch `branch` of the working tree at `target_dir` on the
+/// binding's branch `git_ref` (AEGIS ADR-141 F8): push the work branch to
+/// `origin`, then its HEAD to `refs/heads/<git_ref>`, neither with force,
+/// with the credential a push takes ([`push_to_remote`]). Answers the commit
+/// landed. A refusal of the first push answers G8's sentence and lands
+/// nothing; of the second, [`GitRepoError::RefAhead`] with the ref unchanged.
+pub(crate) fn land_to_remote(
+    target_dir: &std::path::Path,
+    repo_url: &SensitiveUrl,
+    branch: &str,
+    git_ref: &str,
+    credential: Option<ResolvedCredential>,
+    ssh_host_keys: &[crate::domain::git_host_keys::SshHostKey],
+) -> Result<String, GitRepoError> {
+    let (_, credential) = clone_credential(repo_url.expose(), credential);
+    let secrets = credential_secrets(credential.as_ref());
+    let landed = (|| {
+        let repo = git2::Repository::open(target_dir)
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+        strip_remote_user_info(&repo, "origin")
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?;
+        let commit_sha = repo
+            .refname_to_id(&format!("refs/heads/{branch}"))
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+            .to_string();
+        let remote_url = repo
+            .find_remote("origin")
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+            .url()
+            .map_err(|e| GitRepoError::GitFailed(e.to_string()))?
+            .to_string();
+        drop(repo);
+        let same_host = ssh_remote(&remote_url).map(|(host, _)| host)
+            == ssh_remote(repo_url.expose()).map(|(host, _)| host);
+        let keys = host_keys_for(&remote_url, if same_host { ssh_host_keys } else { &[] })
+            .map_err(GitRepoError::GitFailed)?;
+        match blocking_push_refs(
+            target_dir,
+            "origin",
+            &[
+                (branch.to_string(), branch.to_string()),
+                (branch.to_string(), git_ref.to_string()),
+            ],
+            credential,
+            keys,
+        )? {
+            Pushed::All => Ok(commit_sha),
+            Pushed::RefusedAt(0) => Err(GitRepoError::RemoteAhead {
+                branch: branch.to_string(),
+            }),
+            Pushed::RefusedAt(_) => Err(GitRepoError::RefAhead {
+                git_ref: git_ref.to_string(),
+            }),
+        }
+    })();
+    landed.map_err(|e| match e {
+        GitRepoError::GitFailed(m) => GitRepoError::GitFailed(redact_git_output(&m, &secrets)),
+        other => other,
+    })
 }
 
 /// Whether the tree at `target_dir` is clean (no change, staged or not, and

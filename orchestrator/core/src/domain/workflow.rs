@@ -354,6 +354,11 @@ impl Workflow {
                 };
 
                 for mount_name in mounts {
+                    // The run's repository is the run's, never a declared
+                    // volume (AEGIS ADR-141 F6).
+                    if run_repository_volume(mount_name).is_some() {
+                        continue;
+                    }
                     if !declared.contains(mount_name) {
                         return Err(WorkflowError::UndeclaredVolume {
                             state: state_name.clone(),
@@ -677,6 +682,39 @@ pub struct WorkflowSpec {
     /// N12): offered when a person makes one, never acted on by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_schedule: Option<crate::domain::schedule::DefaultSchedule>,
+
+    /// The number of repositories every run of this workflow must name by
+    /// the dispatch key `repositories` (AEGIS ADR-141 F2); a start naming
+    /// another number is refused before anything is held. `None`: any number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<u32>,
+}
+
+/// The volume name by which a ContainerRun step mounts its run's repository
+/// (AEGIS ADR-141 F6): `repository` for the run's first, `repository:<label>`
+/// for the one of that label.
+pub const RUN_REPOSITORY_VOLUME: &str = "repository";
+
+/// Whether a ContainerRun volume entry names the run's repository rather
+/// than a declared volume (AEGIS ADR-141 F6), and the label it names, if any.
+pub fn run_repository_volume(name: &str) -> Option<Option<&str>> {
+    if name == RUN_REPOSITORY_VOLUME {
+        return Some(None);
+    }
+    name.strip_prefix("repository:")
+        .filter(|label| !label.is_empty())
+        .map(Some)
+}
+
+/// The sentence refusing a start whose run names `named` repositories when
+/// the workflow `workflow` works on exactly `count` (AEGIS ADR-141 F2).
+pub fn repository_count_refusal(workflow: &str, count: u32, named: usize) -> String {
+    let noun = if count == 1 {
+        "repository"
+    } else {
+        "repositories"
+    };
+    format!("workflow '{workflow}' works on exactly {count} {noun}; this run names {named}")
 }
 
 fn is_default_storage(s: &WorkflowStorageSpec) -> bool {
@@ -1737,6 +1775,7 @@ mod tests {
                 storage: Default::default(),
                 max_total_transitions: None,
                 default_schedule: None,
+                repositories: None,
             },
             created_at: Utc::now(),
             updated_at: None,
@@ -1773,6 +1812,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1814,6 +1854,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1868,6 +1909,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1932,6 +1974,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1990,6 +2033,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -2033,6 +2077,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -2077,6 +2122,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -2121,6 +2167,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -2160,6 +2207,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -2204,6 +2252,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let workflow = Workflow::new(metadata, spec).expect("valid workflow");
@@ -2254,6 +2303,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let workflow = Workflow::new(metadata, spec).expect("valid workflow");

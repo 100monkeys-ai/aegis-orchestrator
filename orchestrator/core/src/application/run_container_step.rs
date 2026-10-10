@@ -6,10 +6,16 @@
 //! workflow states. Delegates execution to the [`ContainerStepRunner`] domain trait
 //! and applies retry logic and parallel completion strategies.
 
+use crate::application::git_repo_service::{RunMount, RunRepositories, RunRepositoryError};
+use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
 use crate::domain::agent::ImagePullPolicy;
 use crate::domain::events::ContainerRunEvent;
 use crate::domain::execution::ExecutionId;
+use crate::domain::fsal::FsalAccessPolicy;
+use crate::domain::repository::WorkflowExecutionRepository;
 use crate::domain::runtime::{ContainerStepConfig, ContainerStepError, ContainerStepRunner};
+use crate::domain::shared_kernel::VolumeId;
+use crate::domain::workflow::{run_repository_volume, RUN_REPOSITORY_VOLUME};
 use crate::domain::workflow::{ContainerRunConfig, ParallelCompletionStrategy, StateName};
 use crate::infrastructure::event_bus::EventBus;
 use chrono::Utc;
@@ -44,6 +50,9 @@ pub struct RunContainerStepInput {
     pub network_mode: Option<String>,
     /// Workflow execution UUID that owns the workspace volume.
     pub workflow_execution_id: Option<uuid::Uuid>,
+    /// The tenant of the workflow execution the step runs in, in which its
+    /// repositories are read (AEGIS ADR-141 F6).
+    pub tenant_id: crate::domain::tenant::TenantId,
 }
 
 /// Output from a single container step execution.
@@ -63,11 +72,276 @@ pub struct RunContainerStepOutput {
 /// for the aggregated parallel completion event.
 pub struct RunContainerStepUseCase {
     runner: Arc<dyn ContainerStepRunner>,
+    /// The runs' repositories a step may mount, and the gateway's registry
+    /// it mounts them through (AEGIS ADR-141 F6). Unset: no step may.
+    repositories: std::sync::OnceLock<(Arc<dyn StepRepositories>, NfsVolumeRegistry)>,
+    /// The node's network for steps that reach public hosts (core's
+    /// `spec.storage.git.step_network`, AEGIS ADR-141 F7, ADR-136 G12).
+    egress_network: Option<String>,
 }
+
+/// The network mode a ContainerRun state names to reach package registries
+/// (AEGIS ADR-141 F7).
+pub const EGRESS_NETWORK_MODE: &str = "egress";
+
+/// The refusal of `network_mode: egress` on a node with no step network
+/// (AEGIS ADR-141 F7).
+pub const NO_EGRESS_NETWORK: &str = "this node has no egress network for steps";
+
+/// Why a step was not run: a refusal before any container, in its own
+/// sentence (AEGIS ADR-141 F6, F7), or the step's own failure.
+#[derive(Debug, thiserror::Error)]
+pub enum RunContainerStepError {
+    #[error("{0}")]
+    Refused(String),
+    #[error(transparent)]
+    Step(#[from] ContainerStepError),
+}
+
+/// The repositories a workflow run holds, as a ContainerRun step of it
+/// mounts them (AEGIS ADR-141 F6).
+#[async_trait::async_trait]
+pub trait StepRepositories: Send + Sync {
+    /// The working-tree mounts of the repositories the workflow execution
+    /// `run` of `tenant_id` holds, in the order its start named them.
+    async fn mounts_of_run(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        run: uuid::Uuid,
+    ) -> Result<Vec<RunMount>, RunRepositoryError>;
+}
+
+/// [`StepRepositories`] read from the workflow execution's record: its
+/// `repositories`, as its person, through the git repository service's
+/// [`RunRepositories`], which checks and holds them as for an agent state.
+pub struct WorkflowRunRepositories {
+    workflow_executions: Arc<dyn WorkflowExecutionRepository>,
+    repositories: Arc<dyn RunRepositories>,
+}
+
+impl WorkflowRunRepositories {
+    pub fn new(
+        workflow_executions: Arc<dyn WorkflowExecutionRepository>,
+        repositories: Arc<dyn RunRepositories>,
+    ) -> Self {
+        Self {
+            workflow_executions,
+            repositories,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StepRepositories for WorkflowRunRepositories {
+    async fn mounts_of_run(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        run: uuid::Uuid,
+    ) -> Result<Vec<RunMount>, RunRepositoryError> {
+        use crate::domain::git_repo::{parse_run_repositories, REPOSITORIES_INPUT_KEY};
+        let Some(execution) = self
+            .workflow_executions
+            .find_by_id_for_tenant(tenant_id, ExecutionId(run))
+            .await
+            .map_err(|e| RunRepositoryError::Failed(e.into()))?
+        else {
+            return Ok(Vec::new());
+        };
+        let entries = match execution.input.get(REPOSITORIES_INPUT_KEY) {
+            None => Vec::new(),
+            Some(value) => parse_run_repositories(value)
+                .map_err(|sentence| RunRepositoryError::Refused(sentence.to_string()))?,
+        };
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.repositories
+            .mounts_for_run(
+                tenant_id,
+                execution.initiating_user_sub.as_deref(),
+                run,
+                &entries,
+            )
+            .await
+    }
+}
+
+/// The refusal of a step naming the run's repository when its run holds
+/// none (AEGIS ADR-141 F6).
+pub const STEP_RUN_HOLDS_NONE: &str = "this step names the run's repository and the run holds none";
+
+/// The refusal of a step naming a repository by a label its run does not
+/// hold (AEGIS ADR-141 F6).
+pub fn step_run_holds_no_label(label: &str) -> String {
+    format!("this step names the run's repository and the run holds no repository '{label}'")
+}
+
+/// The refusal of a step naming the run's repository on a node with no git
+/// repository service: the sentence a run's start answers there.
+const NO_GIT_REPOSITORY_SERVICE: &str =
+    "this node has no git repository service, so a run cannot be given repositories";
+
+/// A volume registration the step replaced, put back when the step ends.
+type Replaced = (
+    VolumeId,
+    Option<crate::infrastructure::nfs::server::NfsVolumeContext>,
+);
 
 impl RunContainerStepUseCase {
     pub fn new(runner: Arc<dyn ContainerStepRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            repositories: std::sync::OnceLock::new(),
+            egress_network: None,
+        }
+    }
+
+    /// Let a step mount its run's repository (AEGIS ADR-141 F6), registered
+    /// with `registry`, the gateway agent states mount through. Wired once
+    /// at startup, after the git repository service exists; a second call
+    /// is ignored.
+    pub fn set_run_repositories(
+        &self,
+        repositories: Arc<dyn StepRepositories>,
+        registry: NfsVolumeRegistry,
+    ) {
+        let _ = self.repositories.set((repositories, registry));
+    }
+
+    /// The node's network for `network_mode: egress` steps (AEGIS ADR-141
+    /// F7); `None` refuses them.
+    pub fn with_egress_network(mut self, network: Option<String>) -> Self {
+        self.egress_network = network;
+        self
+    }
+
+    /// Run one ContainerRun state's step: its run's repository resolved to
+    /// a mount through the gateway (F6) and `network_mode: egress` to the
+    /// node's step network (F7), each refused before any container when it
+    /// cannot be, then [`Self::execute`].
+    pub async fn run(
+        &self,
+        mut input: RunContainerStepInput,
+    ) -> Result<RunContainerStepOutput, RunContainerStepError> {
+        if input.network_mode.as_deref() == Some(EGRESS_NETWORK_MODE) {
+            let Some(network) = &self.egress_network else {
+                return Err(RunContainerStepError::Refused(
+                    NO_EGRESS_NETWORK.to_string(),
+                ));
+            };
+            input.network_mode = Some(network.clone());
+        }
+        let replaced = self.mount_run_repositories(&mut input).await?;
+        let result = self.execute(input).await;
+        if let Some((_, registry)) = self.repositories.get() {
+            for (volume_id, found) in replaced {
+                match found {
+                    Some(context) => registry.register(VolumeRegistration {
+                        volume_id: context.volume_id,
+                        execution_id: context.execution_id,
+                        workflow_execution_id: context.workflow_execution_id,
+                        container_uid: context.container_uid,
+                        container_gid: context.container_gid,
+                        policy: context.policy,
+                        mount_point: context.mount_point,
+                        remote_path: context.remote_path,
+                    }),
+                    None => registry.deregister(volume_id),
+                }
+            }
+        }
+        Ok(result?)
+    }
+
+    /// Each volume entry naming the run's repository (AEGIS ADR-141 F6)
+    /// becomes its working tree's volume, registered with the gateway agent
+    /// states mount through at the entry's `mount_path`, for the step's
+    /// length. Answers the registrations replaced, to be put back.
+    async fn mount_run_repositories(
+        &self,
+        input: &mut RunContainerStepInput,
+    ) -> Result<Vec<Replaced>, RunContainerStepError> {
+        if !input
+            .volumes
+            .iter()
+            .any(|v| run_repository_volume(&v.name).is_some())
+        {
+            return Ok(Vec::new());
+        }
+        let Some((repositories, registry)) = self.repositories.get() else {
+            return Err(RunContainerStepError::Refused(
+                NO_GIT_REPOSITORY_SERVICE.to_string(),
+            ));
+        };
+        let Some(run) = input.workflow_execution_id else {
+            return Err(RunContainerStepError::Refused(
+                STEP_RUN_HOLDS_NONE.to_string(),
+            ));
+        };
+        let mounts = repositories
+            .mounts_of_run(&input.tenant_id, run)
+            .await
+            .map_err(|e| match e {
+                RunRepositoryError::Refused(sentence) => RunContainerStepError::Refused(sentence),
+                RunRepositoryError::Failed(e) => {
+                    RunContainerStepError::Step(ContainerStepError::VolumeMountFailed {
+                        volume: RUN_REPOSITORY_VOLUME.to_string(),
+                        error: e.to_string(),
+                    })
+                }
+            })?;
+        // Every entry is resolved before any is registered: a refusal
+        // leaves the gateway as it was.
+        let mut chosen = Vec::new();
+        for (index, volume) in input.volumes.iter().enumerate() {
+            let Some(label) = run_repository_volume(&volume.name) else {
+                continue;
+            };
+            let mount = match label {
+                None => mounts.first().ok_or_else(|| {
+                    RunContainerStepError::Refused(STEP_RUN_HOLDS_NONE.to_string())
+                })?,
+                Some(label) => mounts.iter().find(|m| m.label == label).ok_or_else(|| {
+                    RunContainerStepError::Refused(if mounts.is_empty() {
+                        STEP_RUN_HOLDS_NONE.to_string()
+                    } else {
+                        step_run_holds_no_label(label)
+                    })
+                })?,
+            };
+            chosen.push((index, mount.mount.clone()));
+        }
+        let mut replaced = Vec::with_capacity(chosen.len());
+        for (index, mount) in chosen {
+            let volume = &mut input.volumes[index];
+            replaced.push((mount.volume_id, registry.lookup(mount.volume_id)));
+            registry.register(VolumeRegistration {
+                volume_id: mount.volume_id,
+                execution_id: input.execution_id,
+                workflow_execution_id: Some(run),
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: FsalAccessPolicy {
+                    read: vec!["/*".to_string()],
+                    write: if volume.read_only {
+                        Vec::new()
+                    } else {
+                        vec!["/*".to_string()]
+                    },
+                },
+                mount_point: std::path::PathBuf::from(&volume.mount_path),
+                remote_path: mount.remote_path.clone(),
+            });
+            info!(
+                execution_id = %input.execution_id,
+                step_name = %input.name,
+                volume_id = %mount.volume_id,
+                mount_path = %volume.mount_path,
+                "A step mounts its run's repository"
+            );
+            volume.name = mount.volume_id.0.to_string();
+        }
+        Ok(replaced)
     }
 
     pub async fn execute(
@@ -252,6 +526,7 @@ impl RunParallelContainerStepsUseCase {
                         run_as_user: None,
                         network_mode: None,
                         workflow_execution_id: None,
+                        tenant_id: crate::domain::tenant::TenantId::default(),
                     };
                     let outcome = uc.execute(input).await;
                     ParallelStepResult { name, outcome }
@@ -435,6 +710,7 @@ mod tests {
             run_as_user: None,
             network_mode: None,
             workflow_execution_id: None,
+            tenant_id: crate::domain::tenant::TenantId::default(),
         }
     }
 

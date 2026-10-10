@@ -131,6 +131,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap()

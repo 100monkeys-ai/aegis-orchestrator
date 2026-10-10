@@ -98,6 +98,7 @@ fn test_map_100monkeys_workflow() {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap();
@@ -165,6 +166,7 @@ fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap();
@@ -219,6 +221,7 @@ fn test_spec_storage_is_mapped_to_temporal_definition() {
             },
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap();
@@ -301,6 +304,7 @@ fn test_scope_mapped_to_temporal_definition() {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap();
@@ -331,6 +335,7 @@ fn test_scope_mapped_to_temporal_definition() {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap();

@@ -125,6 +125,11 @@ impl BuiltinToolDefinition {
     }
 }
 
+/// The builtin tool a workflow's landing step is dispatched as (AEGIS
+/// ADR-141 F8): gated by the person's approval as `aegis.git.push` is, and
+/// listed to no agent.
+pub const LAND_TOOL: &str = "aegis.git.land";
+
 /// Canonical registry of all builtin tool dispatchers. Single source of
 /// truth — the daemon startup and every other consumer derives its data
 /// from this slice.
@@ -162,6 +167,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.git.diff", "Shows the changes in one of your run's repositories as a unified diff: unstaged by default, or what is staged.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
     BuiltinToolDefinition::new("aegis.git.push", "Pushes the run's work branch of one of your run's repositories to its origin, never with force. Only that branch is pushed."),
+    BuiltinToolDefinition::new("aegis.git.land", "Lands a workflow run's work branch on its repository's branch as a fast-forward: pushes the work branch to its origin, then the branch, never with force. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
     BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
@@ -266,6 +272,11 @@ impl ToolRouter {
     }
 
     fn should_advertise_builtin_tool(tool_name: &str) -> bool {
+        // AEGIS ADR-141 F8: a landing is a workflow's own step, listed to
+        // no agent.
+        if tool_name == LAND_TOOL {
+            return false;
+        }
         if tool_name.starts_with("aegis.workflow.") || tool_name.starts_with("aegis.execute.") {
             return Self::is_supported_builtin_workflow_tool(tool_name);
         }
@@ -378,6 +389,7 @@ impl ToolRouter {
             "aegis.git.diff" => Self::schema_aegis_git(false, true),
             "aegis.git.commit" => Self::schema_aegis_git(true, false),
             "aegis.git.push" => Self::schema_aegis_git(false, false),
+            "aegis.git.land" => Self::schema_aegis_git(false, false),
             "aegis.schema.get" => Self::schema_aegis_schema_get(),
             "aegis.schema.validate" => Self::schema_aegis_schema_validate(),
             "aegis.agent.create" => Self::schema_aegis_agent_create(),
@@ -3225,7 +3237,8 @@ mod tests {
     /// tools, `mail.send` and `mail.reply` (AEGIS ADR-125's Update of
     /// 2026-10-07 (3) clause 12), `mail.delete` (its Update of 2026-10-08
     /// (4) clause 20), `mail.archive` and `mail.forward` (its Update of
-    /// 2026-10-08 (5) clauses 29 and 35) and the four calendar writes (AEGIS ADR-138 K7), are gated, and
+    /// 2026-10-08 (5) clauses 29 and 35), the four calendar writes (AEGIS ADR-138 K7) and a
+    /// workflow's landing, `aegis.git.land` (AEGIS ADR-141 F8), are gated, and
     /// an entry without the flag does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
@@ -3242,6 +3255,7 @@ mod tests {
                     | "calendar.update"
                     | "calendar.delete"
                     | "calendar.respond"
+                    | "aegis.git.land"
             );
             assert_eq!(
                 plain.requires_approval(def.name),

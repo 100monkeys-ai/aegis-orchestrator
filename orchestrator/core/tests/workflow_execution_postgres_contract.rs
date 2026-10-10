@@ -82,6 +82,7 @@ fn build_workflow(name: &str) -> Workflow {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         },
     )
     .unwrap()

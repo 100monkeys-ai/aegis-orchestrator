@@ -199,7 +199,8 @@ impl DomainEvent {
                 | ExecutionEvent::OutputHandlerFailed { execution_id, .. } => *execution_id,
                 ExecutionEvent::RepositoryPrepared { execution_id, .. }
                 | ExecutionEvent::RepositoryCommitted { execution_id, .. }
-                | ExecutionEvent::RepositoryPushed { execution_id, .. } => *execution_id,
+                | ExecutionEvent::RepositoryPushed { execution_id, .. }
+                | ExecutionEvent::RepositoryLanded { execution_id, .. } => *execution_id,
             }),
             DomainEvent::Workflow(event) => Some(match event {
                 WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
@@ -368,6 +369,8 @@ impl DomainEvent {
                 ExecutionEvent::RepositoryPrepared { agent_id, .. }
                 | ExecutionEvent::RepositoryCommitted { agent_id, .. }
                 | ExecutionEvent::RepositoryPushed { agent_id, .. } => Some(*agent_id),
+                // The workflow interpreter's own step: no agent made it.
+                ExecutionEvent::RepositoryLanded { .. } => None,
             },
             DomainEvent::Workflow(_)
             | DomainEvent::Volume(_)
@@ -464,6 +467,7 @@ impl DomainEvent {
                 ExecutionEvent::RepositoryPrepared { prepared_at, .. } => *prepared_at,
                 ExecutionEvent::RepositoryCommitted { committed_at, .. } => *committed_at,
                 ExecutionEvent::RepositoryPushed { pushed_at, .. } => *pushed_at,
+                ExecutionEvent::RepositoryLanded { landed_at, .. } => *landed_at,
             },
             DomainEvent::Workflow(event) => match event {
                 WorkflowEvent::WorkflowRegistered { registered_at, .. } => *registered_at,
@@ -720,6 +724,7 @@ impl DomainEvent {
                 ExecutionEvent::RepositoryPrepared { .. } => "repository_prepared",
                 ExecutionEvent::RepositoryCommitted { .. } => "repository_committed",
                 ExecutionEvent::RepositoryPushed { .. } => "repository_pushed",
+                ExecutionEvent::RepositoryLanded { .. } => "repository_landed",
             },
             DomainEvent::Workflow(event) => match event {
                 WorkflowEvent::WorkflowRegistered { .. } => "workflow_registered",
@@ -1022,7 +1027,8 @@ impl DomainEvent {
                 | ExecutionEvent::OutputHandlerFailed { .. }
                 | ExecutionEvent::RepositoryPrepared { .. }
                 | ExecutionEvent::RepositoryCommitted { .. }
-                | ExecutionEvent::RepositoryPushed { .. } => None,
+                | ExecutionEvent::RepositoryPushed { .. }
+                | ExecutionEvent::RepositoryLanded { .. } => None,
             },
             DomainEvent::Workflow(WorkflowEvent::WorkflowIterationStarted {
                 iteration_number,
@@ -1069,7 +1075,8 @@ impl DomainEvent {
                 | ExecutionEvent::OutputHandlerFailed { .. } => "output_handler",
                 ExecutionEvent::RepositoryPrepared { .. }
                 | ExecutionEvent::RepositoryCommitted { .. }
-                | ExecutionEvent::RepositoryPushed { .. } => "repository",
+                | ExecutionEvent::RepositoryPushed { .. }
+                | ExecutionEvent::RepositoryLanded { .. } => "repository",
             }),
             DomainEvent::Workflow(_) => Some("workflow"),
             DomainEvent::Learning(_) => Some("learning"),
@@ -1480,7 +1487,8 @@ impl ExecutionEventReceiver {
             }
             ExecutionEvent::RepositoryPrepared { execution_id, .. }
             | ExecutionEvent::RepositoryCommitted { execution_id, .. }
-            | ExecutionEvent::RepositoryPushed { execution_id, .. } => {
+            | ExecutionEvent::RepositoryPushed { execution_id, .. }
+            | ExecutionEvent::RepositoryLanded { execution_id, .. } => {
                 execution_id == &self.execution_id
             }
         }
@@ -1612,6 +1620,8 @@ impl AgentEventReceiver {
                 ExecutionEvent::RepositoryPrepared { agent_id, .. }
                 | ExecutionEvent::RepositoryCommitted { agent_id, .. }
                 | ExecutionEvent::RepositoryPushed { agent_id, .. } => agent_id == &self.agent_id,
+                // The workflow interpreter's own step: no agent's.
+                ExecutionEvent::RepositoryLanded { .. } => false,
             },
             DomainEvent::Learning(e) => match e {
                 LearningEvent::PatternDiscovered { agent_id, .. } => agent_id == &self.agent_id,

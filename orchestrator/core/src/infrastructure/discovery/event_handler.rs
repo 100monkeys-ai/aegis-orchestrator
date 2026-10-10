@@ -915,6 +915,7 @@ mod tests {
             storage: Default::default(),
             max_total_transitions: None,
             default_schedule: None,
+            repositories: None,
         };
 
         let mut wf = Workflow::new(metadata, spec).expect("valid workflow");

@@ -609,6 +609,28 @@ pub enum ExecutionEvent {
         branch_url: crate::domain::secrets::RedactedUrl,
         pushed_at: DateTime<Utc>,
     },
+
+    /// A workflow run landed the work branch of its repository on the
+    /// binding's branch as a fast-forward, after its person's approval
+    /// (AEGIS ADR-141 F8). Published by the workflow interpreter's own step,
+    /// so no agent made it. `branch_url` holds no user info; nothing of the
+    /// credential is in any field.
+    RepositoryLanded {
+        execution_id: ExecutionId,
+        label: String,
+        branch: String,
+        /// The binding's branch the landing fast-forwarded.
+        #[serde(rename = "ref")]
+        git_ref: String,
+        commit_sha: String,
+        branch_url: crate::domain::secrets::RedactedUrl,
+        landed_at: DateTime<Utc>,
+    },
+}
+
+/// The narrative line of a landing (AEGIS ADR-141 F8).
+pub fn repository_landed_line(commit_sha: &str, label: &str, git_ref: &str) -> String {
+    format!("Landed {commit_sha} of repository {label} on {git_ref}")
 }
 
 /// Structured classification of an LLM upstream failure.

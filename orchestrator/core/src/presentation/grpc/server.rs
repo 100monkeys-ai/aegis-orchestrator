@@ -17,7 +17,7 @@ use tonic::{Request, Response, Status};
 use crate::application::agent::AgentLifecycleService;
 use crate::application::discovery_service::DiscoveryService;
 use crate::application::execution::ExecutionService;
-use crate::application::run_container_step::RunContainerStepUseCase;
+use crate::application::run_container_step::{RunContainerStepError, RunContainerStepUseCase};
 use crate::application::stimulus::StimulusService;
 use crate::application::validation_service::ValidationService;
 use crate::application::volume_manager::VolumeService;
@@ -104,6 +104,31 @@ impl AegisRuntimeService {
             .get("x-tenant-id")
             .and_then(|v| v.to_str().ok());
         resolve_effective_tenant(identity, delegation)
+    }
+
+    /// The tenant a workflow interpreter's call acts in: for a service
+    /// account, the tenant it delegates to by `x-tenant-id`, else by the
+    /// request's own `body_tenant`; for any other caller, its own tenant.
+    fn step_tenant<T>(
+        auth: Option<(UserIdentity, TenantId, ScopeGuard)>,
+        request: &Request<T>,
+        body_tenant: &str,
+    ) -> TenantId {
+        let delegation = request
+            .metadata()
+            .get("x-tenant-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .or(Some(body_tenant).filter(|s| !s.is_empty()));
+        match auth {
+            Some((identity, _, _))
+                if matches!(identity.identity_kind, IdentityKind::ServiceAccount { .. }) =>
+            {
+                resolve_effective_tenant(Some(&identity), delegation)
+            }
+            Some((_, tenant_id, _)) => tenant_id,
+            None => resolve_effective_tenant(None, delegation),
+        }
     }
 
     fn zaru_tier_from_identity(identity: Option<&UserIdentity>) -> ZaruTier {
@@ -240,6 +265,31 @@ impl AegisRuntimeService {
         }
 
         Ok(None)
+    }
+}
+
+/// A repository step's answer as the worker reads it (AEGIS ADR-141 F5).
+fn repository_action_response(
+    answered: Result<
+        crate::application::git_repo_service::RepositoryActionAnswer,
+        crate::application::git_repo_service::RepositoryActionError,
+    >,
+) -> Result<Response<RunRepositoryActionResponse>, Status> {
+    use crate::application::git_repo_service::RepositoryActionError;
+    match answered {
+        Ok(answer) => Ok(Response::new(RunRepositoryActionResponse {
+            commit_sha: answer.commit_sha,
+            branch: answer.branch,
+            r#ref: answer.git_ref,
+            diff: answer.diff,
+            sentence: answer.sentence,
+        })),
+        Err(e @ (RepositoryActionError::UnknownAction(_) | RepositoryActionError::NoMessage)) => {
+            Err(Status::invalid_argument(e.to_string()))
+        }
+        Err(e @ RepositoryActionError::RunNotFound(_)) => Err(Status::not_found(e.to_string())),
+        Err(e @ RepositoryActionError::NotConfigured(_)) => Err(Status::unavailable(e.to_string())),
+        Err(e @ RepositoryActionError::Failed(_)) => Err(Status::internal(e.to_string())),
     }
 }
 
@@ -860,9 +910,13 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ExecuteContainerRunRequest>,
     ) -> Result<Response<ExecuteContainerRunResponse>, Status> {
-        let _identity = self
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/ExecuteContainerRun")
             .await?;
+        // The tenant the step's run is read in (AEGIS ADR-141 F6): a
+        // service account's delegation, by `x-tenant-id` or else the
+        // request's own `tenant_id`; any other caller's own tenant.
+        let tenant_id = Self::step_tenant(auth, &request, &request.get_ref().tenant_id);
         let req = request.into_inner();
 
         let use_case = self
@@ -961,15 +1015,16 @@ impl AegisRuntime for AegisRuntimeService {
             // which flows through a separate execution path.
             read_only_root_filesystem: false,
             run_as_user: None,
-            network_mode: None,
+            network_mode: Some(req.network_mode).filter(|mode| !mode.is_empty()),
             workflow_execution_id: if req.workflow_execution_id.is_empty() {
                 None
             } else {
                 uuid::Uuid::parse_str(&req.workflow_execution_id).ok()
             },
+            tenant_id,
         };
 
-        match use_case.execute(input).await {
+        match use_case.run(input).await {
             Ok(output) => Ok(Response::new(ExecuteContainerRunResponse {
                 exit_code: output.exit_code,
                 stdout: output.stdout,
@@ -977,7 +1032,12 @@ impl AegisRuntime for AegisRuntimeService {
                 duration_ms: output.duration_ms,
                 attempts: output.attempts,
             })),
-            Err(e) => {
+            // A step refused before any container (AEGIS ADR-141 F6, F7)
+            // answers its sentence alone.
+            Err(RunContainerStepError::Refused(sentence)) => {
+                Err(Status::failed_precondition(sentence))
+            }
+            Err(RunContainerStepError::Step(e)) => {
                 use crate::domain::runtime::ContainerStepError;
                 let status = match &e {
                     ContainerStepError::ImagePullFailed { image, error } => {
@@ -1001,6 +1061,36 @@ impl AegisRuntime for AegisRuntimeService {
                 Err(status)
             }
         }
+    }
+
+    /// One of the workflow interpreter's own repository steps on the
+    /// repository its run holds (AEGIS ADR-141 F5): `diff`, `commit` or
+    /// `land`, through the tool invocation service, which acts only on that
+    /// repository and gates a landing on its person's approval (F8). A
+    /// refusal is answered in the response's `sentence`.
+    async fn run_repository_action(
+        &self,
+        request: Request<RunRepositoryActionRequest>,
+    ) -> Result<Response<RunRepositoryActionResponse>, Status> {
+        let auth = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/RunRepositoryAction")
+            .await?;
+        let tenant_id = Self::step_tenant(auth, &request, "");
+        let req = request.into_inner();
+        let run = uuid::Uuid::parse_str(&req.workflow_execution_id).map_err(|e| {
+            Status::invalid_argument(format!(
+                "invalid workflow_execution_id '{}': {e}",
+                req.workflow_execution_id
+            ))
+        })?;
+        let service = self.tool_invocation_service.as_ref().ok_or_else(|| {
+            Status::unavailable("repository steps are not configured on this node")
+        })?;
+        repository_action_response(
+            service
+                .run_repository_action(&tenant_id, run, &req.action, req.message.as_deref())
+                .await,
+        )
     }
 
     /// Search for agents matching a natural-language query (ADR-075).
@@ -2855,6 +2945,102 @@ mod tests {
             "error message should mention non-negative: {}",
             status.message()
         );
+    }
+
+    /// AEGIS ADR-141 F5: a node with no tool invocation service answers a
+    /// repository step unavailable, and a workflow execution id that is not
+    /// one is refused before anything is read.
+    #[tokio::test]
+    async fn run_repository_action_needs_the_service_and_a_workflow_execution_id() {
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service);
+
+        let unconfigured = service
+            .run_repository_action(Request::new(RunRepositoryActionRequest {
+                workflow_execution_id: uuid::Uuid::new_v4().to_string(),
+                action: "diff".to_string(),
+                message: None,
+            }))
+            .await
+            .expect_err("a node with no tool invocation service answered a step");
+        assert_eq!(unconfigured.code(), tonic::Code::Unavailable);
+
+        let malformed = service
+            .run_repository_action(Request::new(RunRepositoryActionRequest {
+                workflow_execution_id: "not-a-run".to_string(),
+                action: "diff".to_string(),
+                message: None,
+            }))
+            .await
+            .expect_err("a malformed workflow execution id was accepted");
+        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// AEGIS ADR-141 F5: what a step answers reaches the worker field by
+    /// field, a refusal as its sentence, and each failure by its code.
+    #[test]
+    fn a_repository_step_answer_reaches_the_response_field_by_field() {
+        use crate::application::git_repo_service::{RepositoryActionAnswer, RepositoryActionError};
+        let landed = repository_action_response(Ok(RepositoryActionAnswer {
+            commit_sha: Some("eaa80dc2".to_string()),
+            branch: "aegis/0b6f4c1e".to_string(),
+            git_ref: "main".to_string(),
+            diff: None,
+            sentence: None,
+        }))
+        .expect("an answer is a response")
+        .into_inner();
+        assert_eq!(
+            landed,
+            RunRepositoryActionResponse {
+                commit_sha: Some("eaa80dc2".to_string()),
+                branch: "aegis/0b6f4c1e".to_string(),
+                r#ref: "main".to_string(),
+                diff: None,
+                sentence: None,
+            }
+        );
+        let refused = repository_action_response(Ok(RepositoryActionAnswer::refused(
+            "this run holds no repository",
+        )))
+        .expect("a refusal is a response")
+        .into_inner();
+        assert_eq!(
+            refused.sentence.as_deref(),
+            Some("this run holds no repository")
+        );
+        assert_eq!(refused.commit_sha, None);
+        for (error, code) in [
+            (
+                RepositoryActionError::UnknownAction("push".to_string()),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                RepositoryActionError::NoMessage,
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                RepositoryActionError::RunNotFound(uuid::Uuid::nil()),
+                tonic::Code::NotFound,
+            ),
+            (
+                RepositoryActionError::NotConfigured("the approval gate"),
+                tonic::Code::Unavailable,
+            ),
+            (
+                RepositoryActionError::Failed("git".to_string()),
+                tonic::Code::Internal,
+            ),
+        ] {
+            let status = repository_action_response(Err(error)).expect_err("a failure");
+            assert_eq!(status.code(), code, "{status:?}");
+        }
     }
 
     #[tokio::test]
