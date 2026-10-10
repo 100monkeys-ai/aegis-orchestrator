@@ -1767,12 +1767,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     info!("Temporal event listener initialized");
 
-    let register_workflow_use_case = Arc::new(StandardRegisterWorkflowUseCase::new(
-        workflow_repo.clone(),
-        workflow_engine_container.clone(),
-        event_bus.clone(),
-        agent_service.clone(),
-    ));
+    let register_workflow_use_case = Arc::new(
+        StandardRegisterWorkflowUseCase::new(
+            workflow_repo.clone(),
+            workflow_engine_container.clone(),
+            event_bus.clone(),
+            agent_service.clone(),
+        )
+        .with_runtime_registry(runtime_registry.clone()),
+    );
 
     let start_workflow_execution_use_case = {
         let mut uc = StandardStartWorkflowExecutionUseCase::new(

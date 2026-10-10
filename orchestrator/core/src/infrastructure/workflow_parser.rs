@@ -50,6 +50,7 @@
 //!       transitions: []
 //! ```
 
+use crate::domain::runtime_registry::MODEL_IMAGE_PREFIX;
 use crate::domain::workflow::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -579,23 +580,32 @@ impl WorkflowParser {
                 run_as_user,
                 network_mode,
                 output_handler,
-            } => StateKind::ContainerRun {
-                name,
-                image,
-                image_pull_policy,
-                command,
-                env,
-                workdir,
-                volumes,
-                resources,
-                registry_credentials,
-                retry,
-                shell,
-                read_only_root_filesystem,
-                run_as_user,
-                network_mode,
-                output_handler,
-            },
+            } => {
+                // A model step runs with no network (ADR-143 M5): absent reads
+                // `none`; any other value is refused by the domain invariant.
+                let network_mode = if image.starts_with(MODEL_IMAGE_PREFIX) {
+                    network_mode.or_else(|| Some("none".to_string()))
+                } else {
+                    network_mode
+                };
+                StateKind::ContainerRun {
+                    name,
+                    image,
+                    image_pull_policy,
+                    command,
+                    env,
+                    workdir,
+                    volumes,
+                    resources,
+                    registry_credentials,
+                    retry,
+                    shell,
+                    read_only_root_filesystem,
+                    run_as_user,
+                    network_mode,
+                    output_handler,
+                }
+            }
             StateKindYaml::ParallelContainerRun { steps, completion } => {
                 StateKind::ParallelContainerRun { steps, completion }
             }

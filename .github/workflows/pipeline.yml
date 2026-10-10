@@ -317,6 +317,32 @@ jobs:
           podman push "${RENDERER_IMAGE}:${version_tag}"
           podman push "${RENDERER_IMAGE}:sha-${GITHUB_SHA::7}"
 
+      # The speech-to-text model image (docker/Dockerfile.model-whisper), the
+      # image a model step naming "model:speech-to-text/whisper-base" runs. Its
+      # version tag is read from the Dockerfile's WHISPER_CPP_VERSION and
+      # WHISPER_MODEL, the tag the StandardRuntime registry's spec.models names
+      # with the digest this push gives.
+      - name: Build and push whisper model image
+        env:
+          WHISPER_IMAGE: ${{ env.REGISTRY }}/100monkeys-ai/aegis-model-whisper
+        run: |
+          dockerfile=aegis-orchestrator/docker/Dockerfile.model-whisper
+          engine_version="$(sed -n 's/^ARG WHISPER_CPP_VERSION=//p' "$dockerfile")"
+          model="$(sed -n 's/^ARG WHISPER_MODEL=//p' "$dockerfile")"
+          if [ -z "$engine_version" ] || [ -z "$model" ]; then
+            echo "::error::$dockerfile names no WHISPER_CPP_VERSION or WHISPER_MODEL"
+            exit 1
+          fi
+          version_tag="whisper-cpp-${engine_version}-${model}"
+          podman build \
+            -f "$dockerfile" \
+            -t "${WHISPER_IMAGE}:${version_tag}" \
+            -t "${WHISPER_IMAGE}:sha-${GITHUB_SHA::7}" \
+            .
+          podman push --digestfile whisper.digest "${WHISPER_IMAGE}:${version_tag}"
+          podman push "${WHISPER_IMAGE}:sha-${GITHUB_SHA::7}"
+          echo "${WHISPER_IMAGE}:${version_tag}@$(cat whisper.digest)"
+
       # Semver tags for release pushes
       - name: Tag and push semver (release only)
         if: startsWith(github.ref, 'refs/tags/')

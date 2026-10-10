@@ -75,3 +75,22 @@ spec:
       "1":
         image: "ghcr.io/100monkeys-ai/aegis-document-renderer:pandoc-3.12-typst-0.15.1"
         description: "Document rendering: pandoc 3.12 and typst 0.15.1 with the Noto CJK fonts on the Python 3.11 slim Debian base"
+
+  # Model images: model class → name → a pinned image, named by a workflow's
+  # ContainerRun as image: "model:<class>/<name>". Each image is named by its
+  # tag and its @sha256: digest; an entry without a digest is refused when the
+  # registry loads. Each is a CPU build from docker/Dockerfile.model-<name>,
+  # published by pipeline.yml under the tag its Dockerfile's versions give.
+  #
+  # speech-to-text/whisper-base: whisper.cpp with the whisper base model, from
+  # docker/Dockerfile.model-whisper. The entry is a comment until the image's
+  # first publish gives it a digest: digest filled after the first publish.
+  # models:
+  #   speech-to-text:
+  #     whisper-base:
+  #       image: "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:<digest>"
+  #       description: "Speech to text: whisper.cpp 1.9.4 with the whisper base model (multilingual), on the CPU, with ffmpeg to decode the audio"
+  #       resources:
+  #         cpu: 2000
+  #         memory: "1Gi"
+  #         timeout: "15m"

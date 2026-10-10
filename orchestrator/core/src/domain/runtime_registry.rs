@@ -15,7 +15,16 @@
 //! CustomRuntime (`spec.runtime.image`) bypasses the registry entirely and accepts
 //! user-supplied image references at user risk.
 //!
-//! See Also: ADR-043 (AEGIS Agent Runtimes), ADR-045 (Container Registry & Image Management)
+//! ## Model images
+//!
+//! `spec.models` maps a model class and name to a model image (ADR-143 M4): a
+//! workflow's `ContainerRun` names one as `image: "model:<class>/<name>"` and
+//! the registry resolves it. Every model image is named by a tag and an
+//! `@sha256:` digest; an entry without one is refused when the registry loads,
+//! because pulling by digest is what verifies the weights that run.
+//!
+//! See Also: ADR-043 (AEGIS Agent Runtimes), ADR-045 (Container Registry & Image Management),
+//! ADR-143 (non-language models)
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,6 +32,11 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::domain::cluster::MergedConfig;
+use crate::domain::runtime::ContainerResources;
+
+/// The prefix of a `ContainerRun` image that names a model image of the
+/// registry rather than a container image (ADR-143 M3).
+pub const MODEL_IMAGE_PREFIX: &str = "model:";
 
 /// Errors returned by the StandardRuntime registry.
 #[derive(Debug, Error, Clone)]
@@ -49,6 +63,89 @@ pub enum RegistryError {
     /// The registry was accessed before being initialized.
     #[error("Registry not initialized")]
     NotInitialized,
+    /// A model image is not named by a tag and an `@sha256:` digest (ADR-143 M4).
+    #[error("model '{model}' must name its image by digest")]
+    ModelImageNotPinned { model: String },
+    /// A `model:` reference names no model of the registry (ADR-143 M6).
+    #[error("unknown model '{model}'; the models are {available}", available = list_or_none(.available))]
+    UnknownModel {
+        model: String,
+        available: Vec<String>,
+    },
+    /// A `model:` image is not of the form `model:<class>/<name>`.
+    #[error("a model image is named model:<class>/<name>, not '{0}'")]
+    InvalidModelReference(String),
+}
+
+fn list_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// A `model:<class>/<name>` reference, as a `ContainerRun` image names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelReference {
+    pub class: String,
+    pub name: String,
+}
+
+impl ModelReference {
+    /// Read an image string. `None` when the image is not a `model:` reference;
+    /// an error when it is one and is not `model:<class>/<name>`.
+    pub fn from_image(image: &str) -> Option<Result<Self, RegistryError>> {
+        let rest = image.strip_prefix(MODEL_IMAGE_PREFIX)?;
+        let parsed = match rest.split_once('/') {
+            Some((class, name)) if is_model_segment(class) && is_model_segment(name) => Ok(Self {
+                class: class.to_string(),
+                name: name.to_string(),
+            }),
+            _ => Err(RegistryError::InvalidModelReference(image.to_string())),
+        };
+        Some(parsed)
+    }
+
+    /// `<class>/<name>`, as the refusals name a model.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.class, self.name)
+    }
+}
+
+fn is_model_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.'
+        })
+}
+
+/// True when `image` is a full reference with a tag and an `@sha256:` digest
+/// of 64 hexadecimal characters.
+fn is_pinned_by_digest(image: &str) -> bool {
+    let Some((name_and_tag, digest)) = image.split_once("@sha256:") else {
+        return false;
+    };
+    let last_segment = name_and_tag.rsplit('/').next().unwrap_or_default();
+    let has_tag = matches!(last_segment.split_once(':'), Some((repo, tag)) if !repo.is_empty() && !tag.is_empty());
+    has_tag && digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A model image of the registry (ADR-143 M4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    /// The image, by tag and digest
+    /// (`ghcr.io/org/image:tag@sha256:<64 hex>`).
+    pub image: String,
+    /// Human-readable description of the model.
+    #[serde(default)]
+    pub description: String,
+    /// The command a model step runs when its state sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// The CPU, memory and timeout a model step gets when its state sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ContainerResources>,
 }
 
 /// Runtime metadata from the registry (optional bootstrapping info, etc.)
@@ -99,6 +196,9 @@ pub struct RegistrySpec {
     pub registry_url: String,
     /// Language → version → RuntimeEntry mappings.
     pub runtimes: HashMap<String, HashMap<String, RuntimeEntry>>,
+    /// Model class → name → ModelEntry mappings (ADR-143 M4).
+    #[serde(default)]
+    pub models: HashMap<String, HashMap<String, ModelEntry>>,
     /// Optional metadata (version constraints, supported isolation modes, etc.).
     #[serde(default)]
     pub metadata: serde_yaml::Mapping,
@@ -135,9 +235,7 @@ impl StandardRuntimeRegistry {
         let manifest: RegistryManifest = serde_yaml::from_str(&content)
             .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {e}")))?;
 
-        Ok(Self {
-            spec: manifest.spec,
-        })
+        Self::from_spec(manifest.spec)
     }
 
     /// Load the registry from a YAML string (useful for testing).
@@ -149,9 +247,7 @@ impl StandardRuntimeRegistry {
         let manifest: RegistryManifest = serde_yaml::from_str(content)
             .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {e}")))?;
 
-        Ok(Self {
-            spec: manifest.spec,
-        })
+        Self::from_spec(manifest.spec)
     }
 
     /// Load the registry from a merged database configuration (ADR-060).
@@ -170,9 +266,62 @@ impl StandardRuntimeRegistry {
             })?;
         let manifest: RegistryManifest = serde_json::from_value(runtime_value.clone())
             .map_err(|e| RegistryError::ParseError(format!("JSON parse error: {e}")))?;
-        Ok(Self {
-            spec: manifest.spec,
-        })
+        Self::from_spec(manifest.spec)
+    }
+
+    /// Every load ends here: a model image not named by digest is refused
+    /// (ADR-143 M4), in sorted order so the refusal names the same model on
+    /// every load.
+    fn from_spec(spec: RegistrySpec) -> Result<Self, RegistryError> {
+        let mut models: Vec<(String, &ModelEntry)> = spec
+            .models
+            .iter()
+            .flat_map(|(class, names)| {
+                names
+                    .iter()
+                    .map(move |(name, entry)| (format!("{class}/{name}"), entry))
+            })
+            .collect();
+        models.sort_by(|a, b| a.0.cmp(&b.0));
+        for (model, entry) in models {
+            if !is_pinned_by_digest(&entry.image) {
+                return Err(RegistryError::ModelImageNotPinned { model });
+            }
+        }
+        Ok(Self { spec })
+    }
+
+    /// Resolve a `model:<class>/<name>` reference to its model entry (ADR-143 M3).
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::InvalidModelReference`] for an image that is not of
+    /// that form, [`RegistryError::UnknownModel`] for a model the registry
+    /// does not hold.
+    pub fn resolve_model(&self, reference: &str) -> Result<ModelEntry, RegistryError> {
+        let parsed = ModelReference::from_image(reference)
+            .unwrap_or_else(|| Err(RegistryError::InvalidModelReference(reference.to_string())))?;
+        self.spec
+            .models
+            .get(&parsed.class)
+            .and_then(|names| names.get(&parsed.name))
+            .cloned()
+            .ok_or_else(|| RegistryError::UnknownModel {
+                model: parsed.key(),
+                available: self.model_names(),
+            })
+    }
+
+    /// Every model of the registry as `<class>/<name>`, sorted.
+    pub fn model_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .spec
+            .models
+            .iter()
+            .flat_map(|(class, names)| names.keys().map(move |name| format!("{class}/{name}")))
+            .collect();
+        names.sort();
+        names
     }
 
     /// Resolve a language+version to a fully-qualified Docker image.

@@ -34,12 +34,20 @@ pub use crate::domain::shared_kernel::WorkflowId;
 
 use crate::domain::agent::ImagePullPolicy;
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
+use crate::domain::runtime_registry::{
+    ModelReference, RegistryError, StandardRuntimeRegistry, MODEL_IMAGE_PREFIX,
+};
 use crate::domain::tenant::TenantId;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
+
+/// The refusal of a model step given a network (ADR-143 M5): its weights are in
+/// its image, so it fetches nothing at run time.
+pub const MODEL_STEP_NETWORK_REFUSAL: &str =
+    "a model step runs with no network; remove network_mode or set it to none";
 
 /// Unique name for a state within a workflow (e.g., "GENERATE", "VALIDATE")
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -183,8 +191,29 @@ impl Workflow {
                     image,
                     command,
                     volumes,
+                    network_mode,
                     ..
                 } => {
+                    // A model step (ADR-143 M3, M5): its image is a
+                    // `model:<class>/<name>` reference the registry resolves at
+                    // registration, it runs with no network, and its command may
+                    // come from the registry's entry.
+                    let is_model_step = match ModelReference::from_image(image) {
+                        None => false,
+                        Some(Ok(_)) => true,
+                        Some(Err(refusal)) => {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: refusal.to_string(),
+                            });
+                        }
+                    };
+                    if is_model_step && network_mode.as_deref().is_some_and(|mode| mode != "none") {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: MODEL_STEP_NETWORK_REFUSAL.to_string(),
+                        });
+                    }
                     if name.trim().is_empty() {
                         return Err(WorkflowError::InvalidContainerState {
                             state: state_name.clone(),
@@ -197,7 +226,7 @@ impl Workflow {
                             detail: "ContainerRun.image cannot be empty".to_string(),
                         });
                     }
-                    if command.is_empty() {
+                    if command.is_empty() && !is_model_step {
                         return Err(WorkflowError::InvalidContainerState {
                             state: state_name.clone(),
                             detail: "ContainerRun.command must contain at least one token"
@@ -256,6 +285,15 @@ impl Workflow {
                                 state: state_name.clone(),
                                 detail: format!(
                                     "ParallelContainerRun step '{}' has empty image",
+                                    step.name
+                                ),
+                            });
+                        }
+                        if step.image.starts_with(MODEL_IMAGE_PREFIX) {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "step '{}' names a model image; a model runs in a ContainerRun state",
                                     step.name
                                 ),
                             });
@@ -403,6 +441,66 @@ impl Workflow {
     ///
     /// The different judge roles are *not* distinguished in the result; callers only
     /// get the unique set of agent IDs, sorted to keep dependency checks deterministic.
+    /// Resolve every model step's `model:<class>/<name>` image through the
+    /// runtime registry (ADR-143 M3, M4, M6): the step gets the registry's
+    /// pinned image, and the entry's command and resources where the state
+    /// sets none. With no registry, a model step is refused as an unknown
+    /// model.
+    pub fn resolve_model_images(
+        &mut self,
+        registry: Option<&StandardRuntimeRegistry>,
+    ) -> Result<(), WorkflowError> {
+        for (state_name, state) in self.spec.states.iter_mut() {
+            let StateKind::ContainerRun {
+                image,
+                command,
+                resources,
+                network_mode,
+                ..
+            } = &mut state.kind
+            else {
+                continue;
+            };
+            let Some(reference) = ModelReference::from_image(image) else {
+                continue;
+            };
+            let refuse = |refusal: RegistryError| WorkflowError::InvalidContainerState {
+                state: state_name.clone(),
+                detail: refusal.to_string(),
+            };
+            let reference = reference.map_err(refuse)?;
+            let entry = match registry {
+                Some(registry) => registry.resolve_model(image).map_err(refuse)?,
+                None => {
+                    return Err(refuse(RegistryError::UnknownModel {
+                        model: reference.key(),
+                        available: Vec::new(),
+                    }))
+                }
+            };
+            if command.is_empty() {
+                match entry.command {
+                    Some(model_command) if !model_command.is_empty() => *command = model_command,
+                    _ => {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: format!(
+                                "model '{}' names no command; set command on the step",
+                                reference.key()
+                            ),
+                        })
+                    }
+                }
+            }
+            if resources.is_none() {
+                *resources = entry.resources;
+            }
+            *network_mode = Some("none".to_string());
+            *image = entry.image;
+        }
+        Ok(())
+    }
+
     pub fn referenced_judge_agents(&self) -> Vec<String> {
         let mut judge_names = BTreeSet::new();
 

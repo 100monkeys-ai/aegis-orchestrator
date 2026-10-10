@@ -1,0 +1,92 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+#
+# The speech-to-text model image: the image a workflow's model step runs when
+# it names image "model:speech-to-text/whisper-base", which the runtime
+# registry's spec.models resolves to this image by tag and digest.
+#
+# It carries one engine and one model's weights, and runs on the CPU only:
+#   - whisper.cpp (MIT), the C++ port of whisper, built from its release
+#     source, checked by sha256, for any x86-64 CPU with AVX2 and FMA (no
+#     tuning to the build machine's CPU, no GPU backend);
+#   - the whisper base model (MIT; multilingual, 74M parameters), as
+#     whisper.cpp's ggml-base.bin, checked by sha256 and baked in, so a step
+#     fetches nothing and runs with no network;
+#   - ffmpeg (Debian's), to decode the common audio containers.
+# whisper.cpp rather than the reference Python package: one static binary
+# with no Python, no PyTorch and no download at run time, a much smaller image,
+# and faster on a CPU. base rather than tiny or small: tiny's errors are
+# frequent on ordinary speech, and small runs about three times slower than
+# base on a CPU, past what a step should take for a recording of minutes.
+#
+# The program is transcribe:
+#   transcribe <audio file> --out <transcript path>
+# It decodes the file to 16 kHz mono, transcribes it with sampling fixed
+# (temperature 0, no temperature fallback) so the same file gives the same
+# text, writes the transcript as UTF-8 text to the path, and prints it on
+# stdout. On failure it exits non-zero with one sentence on stderr.
+#
+# Published by pipeline.yml as ghcr.io/100monkeys-ai/aegis-model-whisper,
+# tagged whisper-cpp-<WHISPER_CPP_VERSION>-<WHISPER_MODEL> and sha-<commit>.
+# A change of either changes that tag and the registry entry that names it.
+#
+# Build (from the directory holding aegis-orchestrator, as CI does; the image
+# needs nothing from the context):
+#   podman build -f aegis-orchestrator/docker/Dockerfile.model-whisper .
+
+ARG BASE_IMAGE=docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+
+FROM ${BASE_IMAGE} AS build
+ARG WHISPER_CPP_VERSION=1.9.4
+ARG WHISPER_CPP_SHA256=57e280cee375ab02425b806ad5146b99f6eb9357e3c2b31357c8a6af2e2e44ae
+ARG WHISPER_MODEL=base
+ARG WHISPER_MODEL_SHA256=60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe
+ADD https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v${WHISPER_CPP_VERSION}.tar.gz /tmp/whisper-cpp.tar.gz
+ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${WHISPER_MODEL}.bin /tmp/ggml-model.bin
+RUN echo "${WHISPER_CPP_SHA256}  /tmp/whisper-cpp.tar.gz" | sha256sum -c - \
+    && echo "${WHISPER_MODEL_SHA256}  /tmp/ggml-model.bin" | sha256sum -c -
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential cmake \
+    && rm -rf /var/lib/apt/lists/*
+# The archive is unpacked with no owner or mode taken from it, so nothing
+# changes an owner or a directory's mode (the CI runner's build refuses that).
+RUN mkdir /src \
+    && tar --no-same-owner --no-same-permissions -xzf /tmp/whisper-cpp.tar.gz -C /src \
+    && cmake -S /src/whisper.cpp-${WHISPER_CPP_VERSION} -B /src/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DWHISPER_BUILD_TESTS=OFF \
+        -DWHISPER_BUILD_SERVER=OFF \
+        -DGGML_NATIVE=OFF \
+        -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+        -DGGML_AVX512=OFF \
+        -DGGML_OPENMP=OFF \
+    && cmake --build /src/build --config Release --target whisper-cli -j "$(nproc)" \
+    && mkdir /out \
+    && cp /src/build/bin/whisper-cli /out/whisper-cli \
+    && cp /tmp/ggml-model.bin /out/ggml-model.bin
+
+FROM ${BASE_IMAGE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/whisper-cli /usr/local/bin/whisper-cli
+COPY --from=build /out/ggml-model.bin /opt/whisper/ggml-model.bin
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    '# transcribe <audio file> --out <transcript path>' \
+    'set -u' \
+    'if [ "$#" -ne 3 ] || [ "$2" != "--out" ]; then echo "usage: transcribe <audio file> --out <transcript path>" >&2; exit 2; fi' \
+    'in=$1' \
+    'out=$3' \
+    'if [ ! -f "$in" ]; then echo "transcribe: there is no audio file at $in" >&2; exit 1; fi' \
+    'work=$(mktemp -d) || { echo "transcribe: no working directory could be made" >&2; exit 1; }' \
+    'trap "rm -rf \"$work\"" EXIT' \
+    'if ! ffmpeg -nostdin -hide_banner -loglevel error -i "$in" -vn -ar 16000 -ac 1 -c:a pcm_s16le "$work/audio.wav"; then echo "transcribe: $in could not be decoded as audio" >&2; exit 1; fi' \
+    'if ! whisper-cli --model /opt/whisper/ggml-model.bin --file "$work/audio.wav" --language auto --temperature 0 --no-fallback --no-timestamps --no-prints --output-txt --output-file "$work/transcript" > "$work/whisper.log" 2>&1; then cat "$work/whisper.log" >&2; echo "transcribe: the model could not transcribe $in" >&2; exit 1; fi' \
+    'if ! mkdir -p "$(dirname "$out")" || ! sed -e "s/^[[:space:]]*//" "$work/transcript.txt" > "$out"; then echo "transcribe: the transcript could not be written to $out" >&2; exit 1; fi' \
+    'cat "$out"' \
+    > /usr/local/bin/transcribe \
+    && chmod 0755 /usr/local/bin/transcribe \
+    && whisper-cli --help > /dev/null 2>&1 \
+    && ffmpeg -hide_banner -version | head -n 1

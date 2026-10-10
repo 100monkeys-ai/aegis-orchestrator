@@ -40,6 +40,7 @@ use crate::application::agent::AgentLifecycleService;
 use crate::application::ports::WorkflowEnginePort;
 use crate::application::temporal_mapper::DEFAULT_WORKFLOW_VERSION;
 use crate::domain::repository::WorkflowRepository;
+use crate::domain::runtime_registry::StandardRuntimeRegistry;
 use crate::domain::tenant::TenantId;
 use crate::domain::workflow::WorkflowScope;
 use crate::infrastructure::event_bus::EventBus;
@@ -110,9 +111,18 @@ pub struct StandardRegisterWorkflowUseCase {
     /// Agent lifecycle service used to resolve agent name references to UUIDs at
     /// workflow deploy time, ensuring execution-time failures are surfaced early.
     agent_service: Arc<dyn AgentLifecycleService>,
+    /// The runtime registry a model step's `model:` image resolves through
+    /// (ADR-143 M3). Without one, a model step is refused.
+    runtime_registry: Option<Arc<StandardRuntimeRegistry>>,
 }
 
 impl StandardRegisterWorkflowUseCase {
+    /// Attach the runtime registry that resolves model steps' images.
+    pub fn with_runtime_registry(mut self, registry: Arc<StandardRuntimeRegistry>) -> Self {
+        self.runtime_registry = Some(registry);
+        self
+    }
+
     pub fn new(
         workflow_repository: Arc<dyn WorkflowRepository>,
         workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
@@ -124,6 +134,7 @@ impl StandardRegisterWorkflowUseCase {
             workflow_engine,
             event_bus,
             agent_service,
+            runtime_registry: None,
         }
     }
 }
@@ -142,6 +153,14 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         // Step 1: Parse YAML → Workflow domain aggregate
         let mut workflow = WorkflowParser::parse_yaml(yaml_manifest)
             .map_err(|e| anyhow::anyhow!("Failed to parse workflow YAML manifest: {e}"))?;
+
+        // Step 1b: a model step's `model:<class>/<name>` image becomes the
+        // registry's pinned image before anything is stored or sent to the
+        // worker, so the step container and its ContainerRunStarted event name
+        // the digest that runs (ADR-143 M3, M7).
+        workflow
+            .resolve_model_images(self.runtime_registry.as_deref())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Validate max_total_transitions ceiling
         if let Some(max_tt) = workflow.spec.max_total_transitions {
@@ -998,5 +1017,113 @@ spec:
         let calls = engine.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].version, "1.0.0");
+    }
+
+    const MODEL_STEP_WORKFLOW_YAML: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: model-step-registration
+  version: "1.0.0"
+spec:
+  initial_state: TRANSCRIBE
+  states:
+    TRANSCRIBE:
+      kind: ContainerRun
+      name: "Transcribe"
+      image: "model:speech-to-text/whisper-base"
+      command: ["transcribe", "/input/a.wav", "--out", "/output/transcript.txt"]
+      transitions: []
+"#;
+
+    const PINNED_WHISPER: &str = "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:5f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    fn whisper_registry() -> Arc<crate::domain::runtime_registry::StandardRuntimeRegistry> {
+        let yaml = format!(
+            r#"
+apiVersion: aegis.ai/v1
+kind: RuntimeRegistry
+metadata:
+  name: test-registry
+spec:
+  registry_url: docker.io
+  runtimes: {{}}
+  models:
+    speech-to-text:
+      whisper-base:
+        image: "{PINNED_WHISPER}"
+"#
+        );
+        Arc::new(
+            crate::domain::runtime_registry::StandardRuntimeRegistry::from_yaml_str(&yaml)
+                .expect("the test registry loads"),
+        )
+    }
+
+    /// ADR-143 M3: registration resolves a `model:` image through the
+    /// registry, so the stored workflow and the definition the worker
+    /// receives carry the pinned reference.
+    #[tokio::test]
+    async fn registration_resolves_a_model_image_through_the_registry() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingEngine::new());
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            Arc::new(EventBus::new(8)),
+            test_agent_service(),
+        )
+        .with_runtime_registry(whisper_registry());
+
+        service
+            .register_workflow(MODEL_STEP_WORKFLOW_YAML, false)
+            .await
+            .expect("the model step registers");
+
+        let persisted = repo
+            .find_by_name_visible(&TenantId::consumer(), "model-step-registration")
+            .await
+            .unwrap()
+            .unwrap();
+        let state =
+            &persisted.spec.states[&crate::domain::workflow::StateName::new("TRANSCRIBE").unwrap()];
+        match &state.kind {
+            crate::domain::workflow::StateKind::ContainerRun { image, .. } => {
+                assert_eq!(image, PINNED_WHISPER)
+            }
+            other => panic!("expected a ContainerRun, got {other:?}"),
+        }
+        let sent = serde_json::to_string(&engine.calls()[0]).unwrap();
+        assert!(
+            sent.contains(PINNED_WHISPER),
+            "the worker's definition is {sent}"
+        );
+        assert!(
+            !sent.contains("model:speech-to-text"),
+            "the worker's definition is {sent}"
+        );
+    }
+
+    /// ADR-143 M6: with no registry set, a `model:` image is refused.
+    #[tokio::test]
+    async fn registration_without_a_registry_refuses_a_model_image() {
+        let engine = Arc::new(RecordingEngine::new());
+        let service = StandardRegisterWorkflowUseCase::new(
+            Arc::new(InMemoryWorkflowRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            Arc::new(EventBus::new(8)),
+            test_agent_service(),
+        );
+
+        let message = service
+            .register_workflow(MODEL_STEP_WORKFLOW_YAML, false)
+            .await
+            .expect_err("no registry, no model")
+            .to_string();
+        assert!(
+            message.contains("unknown model 'speech-to-text/whisper-base'; the models are none"),
+            "refusal was: {message}"
+        );
+        assert!(engine.calls().is_empty());
     }
 }
