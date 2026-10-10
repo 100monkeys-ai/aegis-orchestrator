@@ -75,6 +75,9 @@ pub const NAME_REFUSAL: &str = "'name' must be 1 to 80 characters.";
 pub const TARGET_KIND_REFUSAL: &str = "'target_kind' must be agent or workflow.";
 pub const TARGET_REFUSAL: &str = "'target' must name an agent or a workflow.";
 pub const ATTACHMENTS_REFUSAL: &str = "'attachments' must be a list of attachment references.";
+/// A run asked for now while the schedule's last run is still running: the
+/// sentence a skipped-overlap fire is shown with, word for word.
+pub const OVERLAP_REFUSAL: &str = "Skipped: the last run was still running";
 
 /// `A schedule runs at most once every <n> minutes.` (N2)
 pub fn gap_refusal() -> String {
@@ -886,12 +889,15 @@ impl FireOutcome {
     }
 }
 
-/// One fire of a schedule: one row per (schedule, scheduled time).
+/// One fire of a schedule: one row per (schedule, scheduled time), and one
+/// per run its owner asked for now, which has no scheduled time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleFire {
     pub id: Uuid,
     pub schedule_id: ScheduleId,
-    pub scheduled_time: DateTime<Utc>,
+    /// The time Temporal scheduled the fire for; `None` for a run its owner
+    /// asked for now.
+    pub scheduled_time: Option<DateTime<Utc>>,
     pub fired_at: DateTime<Utc>,
     pub outcome: FireOutcome,
     pub execution_id: Option<ExecutionId>,
@@ -926,16 +932,18 @@ pub trait ScheduleRepository: Send + Sync {
     /// re-creation, N5).
     async fn list_live(&self) -> Result<Vec<Schedule>, RepositoryError>;
     /// Insert a `starting` fire for (schedule, scheduled time), or answer
-    /// the row a fire of that time already wrote.
+    /// the row a fire of that time already wrote. A fire with no scheduled
+    /// time (a run asked for now) is always inserted.
     async fn claim_fire(
         &self,
         schedule_id: ScheduleId,
-        scheduled_time: DateTime<Utc>,
+        scheduled_time: Option<DateTime<Utc>>,
         fired_at: DateTime<Utc>,
     ) -> Result<FireClaim, RepositoryError>;
     /// Write a decided fire's outcome.
     async fn finish_fire(&self, fire: &ScheduleFire) -> Result<(), RepositoryError>;
-    /// The schedule's fires, newest scheduled time first.
+    /// The schedule's fires, newest first: by scheduled time, or by the
+    /// time it fired for a run asked for now.
     async fn fires(
         &self,
         schedule_id: ScheduleId,

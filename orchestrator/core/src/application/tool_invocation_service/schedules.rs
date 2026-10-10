@@ -1,8 +1,8 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 //! The `aegis.schedule.*` tools (AEGIS ADR-139 N11): a person makes, reads,
-//! changes, pauses, resumes and deletes their schedules, and reads a
-//! schedule's runs, through the schedule service the `/v1/schedules` routes
+//! changes, pauses, resumes, runs now and deletes their schedules, and reads
+//! a schedule's runs, through the schedule service the `/v1/schedules` routes
 //! use, each tool answering its route's body.
 //!
 //! `contexts` and `repositories` are reserved dispatch keys, in no
@@ -20,19 +20,20 @@ use crate::application::schedule_service::{
 use crate::domain::execution::{ExecutionContexts, ServerChoice};
 use crate::domain::iam::{IdentityKind, TenantScope, UserIdentity};
 use crate::domain::schedule::{
-    ScheduleDraft, ScheduleFire, ScheduleId, SchedulePatch, Timing, OWNER_REFUSAL,
+    ScheduleDraft, ScheduleFire, ScheduleId, SchedulePatch, Timing, OVERLAP_REFUSAL, OWNER_REFUSAL,
     UNAVAILABLE_REFUSAL,
 };
 use serde_json::json;
 
-/// The eight schedule tools.
-pub(super) const SCHEDULE_TOOLS: [&str; 8] = [
+/// The schedule tools.
+pub(super) const SCHEDULE_TOOLS: [&str; 9] = [
     "aegis.schedule.create",
     "aegis.schedule.list",
     "aegis.schedule.get",
     "aegis.schedule.update",
     "aegis.schedule.pause",
     "aegis.schedule.resume",
+    "aegis.schedule.run_now",
     "aegis.schedule.delete",
     "aegis.schedule.runs",
 ];
@@ -74,7 +75,7 @@ pub fn schedule_view(view: &ScheduleView) -> Value {
         "paused_reason": s.paused_reason,
         "next_run_at": view.next_run_at,
         "last_run": view.last_run.as_ref().map(|fire| json!({
-            "time": fire.scheduled_time,
+            "time": fire.scheduled_time.unwrap_or(fire.fired_at),
             "outcome": fire.outcome.as_str(),
             "execution_id": fire.execution_id.map(|e| e.to_string()),
         })),
@@ -235,6 +236,14 @@ impl ToolInvocationService {
                     .map_err(sentence)?;
                 Ok(json!({ "schedule": schedule_view(&view) }))
             }
+            "aegis.schedule.run_now" => {
+                let owner = person(caller_identity)?;
+                let run = service
+                    .run_now(tenant, owner, schedule_id(args)?)
+                    .await
+                    .map_err(sentence)?;
+                Ok(json!({ "run": schedule_run_view(&run) }))
+            }
             "aegis.schedule.delete" => {
                 let owner = person(caller_identity)?;
                 let id = schedule_id(args)?;
@@ -272,6 +281,7 @@ fn sentence(e: ScheduleError) -> String {
         ScheduleError::Refused(sentence) | ScheduleError::Forbidden(sentence) => sentence,
         ScheduleError::NotFound => NOT_FOUND.to_string(),
         ScheduleError::Unavailable => UNAVAILABLE_REFUSAL.to_string(),
+        ScheduleError::Overlap => OVERLAP_REFUSAL.to_string(),
         ScheduleError::Repository(detail) => {
             tracing::error!(error = %detail, "Schedule store failed");
             "Schedule store failed".to_string()
@@ -330,7 +340,7 @@ mod tests {
     };
     use crate::application::schedule_service::ScheduledRunPort;
     use crate::domain::execution::{ExecutionId, ExecutionStatus};
-    use crate::domain::schedule::{Schedule, TargetKind, TIMING_REFUSAL};
+    use crate::domain::schedule::{Schedule, TargetKind, OVERLAP_REFUSAL, TIMING_REFUSAL};
     use crate::infrastructure::repositories::postgres_schedule::InMemoryScheduleRepository;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
@@ -412,6 +422,31 @@ mod tests {
         ));
         h.service = h.service.with_schedule_service(schedules.clone());
         (h, schedules)
+    }
+
+    /// Starts every run it is asked to; each reads `Running` while
+    /// `running` is set, else `Completed`.
+    #[derive(Default)]
+    struct StartingRuns(StdMutex<Vec<String>>, std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl ScheduledRunPort for StartingRuns {
+        async fn start(&self, _: &Schedule, owner: &UserIdentity) -> Result<ExecutionId, String> {
+            self.0.lock().unwrap().push(owner.sub.clone());
+            Ok(ExecutionId::new())
+        }
+        async fn run_status(
+            &self,
+            _: TargetKind,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> anyhow::Result<Option<ExecutionStatus>> {
+            Ok(Some(if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                ExecutionStatus::Running
+            } else {
+                ExecutionStatus::Completed
+            }))
+        }
     }
 
     fn draft(extra: Value) -> Value {
@@ -635,6 +670,84 @@ mod tests {
                 json!({ "tool": "aegis.schedule.list", "error": UNAVAILABLE_REFUSAL }),
             ),
             "a refusal was not answered with its sentence"
+        );
+    }
+
+    /// Run now: `aegis.schedule.run_now` starts one run of the caller's own
+    /// paused schedule and answers the run as the runs route lists it
+    /// (outcome `started`, no scheduled time); pressed again while that run
+    /// is still running it is refused with the overlap sentence.
+    #[tokio::test]
+    async fn run_now_starts_the_callers_schedule_and_answers_the_run_view() {
+        let mut h = harness().await;
+        let runs = Arc::new(StartingRuns::default());
+        let schedules = Arc::new(ScheduleService::new(
+            Arc::new(InMemoryScheduleRepository::new()),
+            Arc::new(HeldSchedules::default()),
+            runs.clone(),
+        ));
+        h.service = h.service.with_schedule_service(schedules.clone());
+        let token = h.session_for(ExecutionId::new()).await;
+        let made = h
+            .route_tool(&token, "aegis.schedule.create", draft(json!({})), None)
+            .await
+            .expect("create answers");
+        let id = made["schedule"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        h.route_tool(
+            &token,
+            "aegis.schedule.pause",
+            json!({ "schedule_id": id }),
+            None,
+        )
+        .await
+        .expect("pause answers");
+
+        let pressed = h
+            .route_tool(
+                &token,
+                "aegis.schedule.run_now",
+                json!({ "schedule_id": id }),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| json!({ "refused": e.to_string() }));
+        let listed = schedules
+            .runs(
+                &ScheduleReader::Owner { sub: USER.into() },
+                ScheduleId::parse(&id).unwrap_or_else(ScheduleId::new),
+                20,
+            )
+            .await
+            .unwrap_or_default();
+        runs.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        let again = h
+            .route_tool(
+                &token,
+                "aegis.schedule.run_now",
+                json!({ "schedule_id": id }),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| json!({ "refused": e.to_string() }));
+        assert_eq!(
+            (
+                pressed["run"]["outcome"].clone(),
+                pressed["run"]["scheduled_time"].clone(),
+                pressed.clone(),
+                again,
+                runs.0.lock().unwrap().clone(),
+            ),
+            (
+                json!("started"),
+                Value::Null,
+                json!({ "run": listed.first().map(schedule_run_view) }),
+                json!({ "tool": "aegis.schedule.run_now", "error": OVERLAP_REFUSAL }),
+                vec![USER.to_string()],
+            ),
+            "aegis.schedule.run_now did not start the caller's schedule and answer its run"
         );
     }
 

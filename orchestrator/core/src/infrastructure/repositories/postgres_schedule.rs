@@ -4,7 +4,8 @@
 //!
 //! [`PostgresScheduleRepository`] stores schedules and their fires in the
 //! `schedules` and `schedule_fires` tables of migration `048_schedules.sql`
-//! (with the `profile_id` column of `050_profile_scoping.sql`),
+//! (with the `profile_id` column of `050_profile_scoping.sql`, and the
+//! nullable `scheduled_time` of `051_schedule_run_now.sql`),
 //! and records a started run's schedule by the `schedule_id` column that
 //! migration adds to `executions` and `workflow_executions` (as a goal's id
 //! is recorded). [`InMemoryScheduleRepository`] keeps them in process, for
@@ -281,9 +282,11 @@ impl ScheduleRepository for PostgresScheduleRepository {
     async fn claim_fire(
         &self,
         schedule_id: ScheduleId,
-        scheduled_time: DateTime<Utc>,
+        scheduled_time: Option<DateTime<Utc>>,
         fired_at: DateTime<Utc>,
     ) -> Result<FireClaim, RepositoryError> {
+        // A null scheduled time never conflicts (NULLs are distinct in the
+        // unique constraint): a run asked for now is always inserted.
         let inserted = sqlx::query(&format!(
             "INSERT INTO schedule_fires ({FIRE_COLUMNS}) VALUES ($1, $2, $3, $4, 'starting', NULL, NULL) \
              ON CONFLICT (schedule_id, scheduled_time) DO NOTHING RETURNING {FIRE_COLUMNS}"
@@ -327,7 +330,7 @@ impl ScheduleRepository for PostgresScheduleRepository {
     ) -> Result<Vec<ScheduleFire>, RepositoryError> {
         let rows = sqlx::query(&format!(
             "SELECT {FIRE_COLUMNS} FROM schedule_fires WHERE schedule_id = $1 \
-             ORDER BY scheduled_time DESC LIMIT $2"
+             ORDER BY COALESCE(scheduled_time, fired_at) DESC, fired_at DESC LIMIT $2"
         ))
         .bind(schedule_id.0)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -451,14 +454,15 @@ impl ScheduleRepository for InMemoryScheduleRepository {
     async fn claim_fire(
         &self,
         schedule_id: ScheduleId,
-        scheduled_time: DateTime<Utc>,
+        scheduled_time: Option<DateTime<Utc>>,
         fired_at: DateTime<Utc>,
     ) -> Result<FireClaim, RepositoryError> {
         let mut fires = self.fires.write().await;
-        if let Some(first) = fires
-            .iter()
-            .find(|f| f.schedule_id == schedule_id && f.scheduled_time == scheduled_time)
-        {
+        if let Some(first) = fires.iter().find(|f| {
+            scheduled_time.is_some()
+                && f.schedule_id == schedule_id
+                && f.scheduled_time == scheduled_time
+        }) {
             return Ok(FireClaim::Repeated(first.clone()));
         }
         let fire = ScheduleFire {
@@ -495,7 +499,9 @@ impl ScheduleRepository for InMemoryScheduleRepository {
             .filter(|f| f.schedule_id == schedule_id)
             .cloned()
             .collect();
-        fires.sort_by_key(|f| std::cmp::Reverse(f.scheduled_time));
+        fires.sort_by_key(|f| {
+            std::cmp::Reverse((f.scheduled_time.unwrap_or(f.fired_at), f.fired_at))
+        });
         fires.truncate(limit);
         Ok(fires)
     }

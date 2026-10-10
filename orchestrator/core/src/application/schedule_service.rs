@@ -30,8 +30,8 @@ use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
 use crate::domain::schedule::{
     count_refusal, paused_after_refusals, FireClaim, FireOutcome, Schedule, ScheduleDraft,
     ScheduleFire, ScheduleId, SchedulePatch, ScheduleRepository, ScheduleState, TargetKind,
-    MAX_SCHEDULES_PER_OWNER, REFUSALS_BEFORE_PAUSE, SCHEDULED_RUN_SECURITY_CONTEXT,
-    UNAVAILABLE_REFUSAL,
+    MAX_SCHEDULES_PER_OWNER, OVERLAP_REFUSAL, REFUSALS_BEFORE_PAUSE,
+    SCHEDULED_RUN_SECURITY_CONTEXT, UNAVAILABLE_REFUSAL,
 };
 use crate::domain::tenant::TenantId;
 
@@ -50,6 +50,9 @@ pub enum ScheduleError {
     /// Temporal could not be reached; nothing was saved (N5).
     #[error("{}", UNAVAILABLE_REFUSAL)]
     Unavailable,
+    /// A run asked for now while the schedule's last run is still running.
+    #[error("{}", OVERLAP_REFUSAL)]
+    Overlap,
     #[error("Schedule store failed: {0}")]
     Repository(String),
 }
@@ -397,7 +400,11 @@ impl ScheduleService {
             .await?
             .filter(|s| s.deleted_at.is_none() && &s.tenant_id == tenant)
             .ok_or(ScheduleError::NotFound)?;
-        let mut fire = match self.repo.claim_fire(id, scheduled_time, Utc::now()).await? {
+        let mut fire = match self
+            .repo
+            .claim_fire(id, Some(scheduled_time), Utc::now())
+            .await?
+        {
             FireClaim::Repeated(first) => return Ok(first),
             FireClaim::Claimed(fire) => fire,
         };
@@ -455,6 +462,72 @@ impl ScheduleService {
             self.repo.update(&schedule).await?;
         }
         Ok(fire)
+    }
+
+    /// `POST /v1/schedules/{id}/run`: one run of the owner's schedule
+    /// started now, on the owner's word, whether the schedule is active or
+    /// paused. It is started exactly as a fire starts it (the owner rebuilt
+    /// from the schedule's row; its target, input, contexts or profile and
+    /// attachments) and recorded among the schedule's fires with no
+    /// scheduled time. A schedule whose last run is still running is
+    /// refused with [`OVERLAP_REFUSAL`], its press recorded as a skipped
+    /// overlap; a refused start is recorded as refused and answered with its
+    /// sentence. Nothing else of the schedule changes: a run asked for now
+    /// never pauses the schedule after refusals and never completes a
+    /// one-time schedule.
+    pub async fn run_now(
+        &self,
+        tenant: &TenantId,
+        owner: &UserIdentity,
+        id: ScheduleId,
+    ) -> Result<ScheduleRunView, ScheduleError> {
+        let schedule = self.owned(owner, id).await?;
+        if &schedule.tenant_id != tenant {
+            return Err(ScheduleError::NotFound);
+        }
+        let mut fire = match self.repo.claim_fire(id, None, Utc::now()).await? {
+            FireClaim::Claimed(fire) | FireClaim::Repeated(fire) => fire,
+        };
+
+        if self.last_run_is_running(&schedule).await {
+            fire.outcome = FireOutcome::SkippedOverlap;
+            self.repo.finish_fire(&fire).await?;
+            return Err(ScheduleError::Overlap);
+        }
+
+        let started = match schedule.owner.to_identity(&schedule.tenant_id) {
+            Ok(owner) => self.runs.start(&schedule, &owner).await,
+            Err(sentence) => Err(sentence),
+        };
+        match started {
+            Ok(execution_id) => {
+                self.repo
+                    .bind_execution(schedule.target_kind, execution_id, schedule.id)
+                    .await?;
+                fire.outcome = FireOutcome::Started;
+                fire.execution_id = Some(execution_id);
+                self.repo.finish_fire(&fire).await?;
+                let status = self
+                    .runs
+                    .run_status(schedule.target_kind, &schedule.tenant_id, execution_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "a scheduled run's status could not be read");
+                        None
+                    });
+                Ok(ScheduleRunView {
+                    fire,
+                    kind: schedule.target_kind,
+                    status,
+                })
+            }
+            Err(sentence) => {
+                fire.outcome = FireOutcome::Refused;
+                fire.detail = Some(sentence.clone());
+                self.repo.finish_fire(&fire).await?;
+                Err(ScheduleError::Refused(sentence))
+            }
+        }
     }
 
     /// Whether the run the newest started fire began is still running.

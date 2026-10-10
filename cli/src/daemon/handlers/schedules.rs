@@ -10,6 +10,7 @@
 //! | `PATCH /v1/schedules/{id}` | the owner | `schedule:write` |
 //! | `POST /v1/schedules/{id}/pause` | the owner | `schedule:write` |
 //! | `POST /v1/schedules/{id}/resume` | the owner | `schedule:write` |
+//! | `POST /v1/schedules/{id}/run` | the owner | `schedule:write` |
 //! | `DELETE /v1/schedules/{id}` | the owner | `schedule:write` |
 //! | `GET /v1/schedules/{id}/runs?limit=` | the owner; an operator (the tenant's) | `schedule:read` |
 //! | `GET /v1/schedules/defaults?target_kind=&target=` | a person; an operator | `schedule:read` |
@@ -30,7 +31,8 @@ use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::repository::WorkflowRepository;
 use aegis_orchestrator_core::domain::schedule::{
     DefaultSchedule, ScheduleDraft, ScheduleFire, ScheduleId, SchedulePatch, Timing,
-    FIRE_CLIENT_ID, OWNER_REFUSAL, TARGET_KIND_REFUSAL, TARGET_REFUSAL, UNAVAILABLE_REFUSAL,
+    FIRE_CLIENT_ID, OVERLAP_REFUSAL, OWNER_REFUSAL, TARGET_KIND_REFUSAL, TARGET_REFUSAL,
+    UNAVAILABLE_REFUSAL,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
@@ -78,6 +80,7 @@ pub(crate) fn schedules_router(state: SchedulesState) -> Router {
         )
         .route("/v1/schedules/{id}/pause", post(pause_schedule_handler))
         .route("/v1/schedules/{id}/resume", post(resume_schedule_handler))
+        .route("/v1/schedules/{id}/run", post(run_schedule_now_handler))
         .route("/v1/schedules/{id}/runs", get(list_schedule_runs_handler))
         .route("/v1/schedules/defaults", get(schedule_defaults_handler))
         .route(
@@ -104,6 +107,7 @@ fn from_service_error(e: ScheduleError) -> Refusal {
         ScheduleError::NotFound => refusal(StatusCode::NOT_FOUND, "Not found"),
         ScheduleError::Forbidden(sentence) => refusal(StatusCode::FORBIDDEN, &sentence),
         ScheduleError::Unavailable => refusal(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_REFUSAL),
+        ScheduleError::Overlap => refusal(StatusCode::CONFLICT, OVERLAP_REFUSAL),
         ScheduleError::Repository(detail) => {
             tracing::error!(error = %detail, "Schedule store failed");
             refusal(StatusCode::INTERNAL_SERVER_ERROR, "Schedule store failed")
@@ -199,7 +203,7 @@ fn schedule_view(view: &ScheduleView) -> Value {
         "paused_reason": s.paused_reason,
         "next_run_at": view.next_run_at,
         "last_run": view.last_run.as_ref().map(|fire| json!({
-            "time": fire.scheduled_time,
+            "time": fire.scheduled_time.unwrap_or(fire.fired_at),
             "outcome": fire.outcome.as_str(),
             "execution_id": fire.execution_id.map(|e| e.to_string()),
         })),
@@ -327,6 +331,24 @@ pub(crate) async fn resume_schedule_handler(
         .await
         .map_err(from_service_error)?;
     Ok(Json(json!({ "schedule": schedule_view(&view) })))
+}
+
+/// `POST /v1/schedules/{id}/run`: one run of the owner's schedule started
+/// now, active or paused, answered as the runs route lists it.
+pub(crate) async fn run_schedule_now_handler(
+    State(state): State<SchedulesState>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    tenant: Option<Extension<TenantId>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Refusal> {
+    scope_guard.require("schedule:write")?;
+    let (owner, tenant_id) = person(identity.as_deref(), tenant.as_deref())?;
+    let run = service(&state)?
+        .run_now(&tenant_id, owner, parse_id(&id)?)
+        .await
+        .map_err(from_service_error)?;
+    Ok(Json(json!({ "run": run_view(&run) })))
 }
 
 /// `DELETE /v1/schedules/{id}`.
@@ -525,7 +547,9 @@ mod tests {
     use aegis_orchestrator_core::domain::execution::{ExecutionId, ExecutionStatus};
     use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity};
     use aegis_orchestrator_core::domain::repository::{AgentRepository, WorkflowRepository};
-    use aegis_orchestrator_core::domain::schedule::{Schedule, TargetKind, OWNER_REFUSAL};
+    use aegis_orchestrator_core::domain::schedule::{
+        Schedule, TargetKind, OVERLAP_REFUSAL, OWNER_REFUSAL,
+    };
     use aegis_orchestrator_core::domain::schedule::{ScheduleId, TARGET_KIND_REFUSAL};
     use aegis_orchestrator_core::domain::shared_kernel::TenantId;
     use aegis_orchestrator_core::infrastructure::agent_manifest_parser::AgentManifestParser;
@@ -586,8 +610,19 @@ mod tests {
         }
     }
 
+    /// Records each start's person; every run it started reads `Running`
+    /// while `running` is set, else `Completed`.
     #[derive(Default)]
-    struct RecordedStarts(Mutex<Vec<String>>);
+    struct RecordedStarts(Mutex<Vec<String>>, std::sync::atomic::AtomicBool);
+
+    impl RecordedStarts {
+        fn started(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+        fn set_running(&self, running: bool) {
+            self.1.store(running, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     #[async_trait::async_trait]
     impl ScheduledRunPort for RecordedStarts {
@@ -601,7 +636,11 @@ mod tests {
             _: &TenantId,
             _: ExecutionId,
         ) -> anyhow::Result<Option<ExecutionStatus>> {
-            Ok(Some(ExecutionStatus::Completed))
+            Ok(Some(if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                ExecutionStatus::Running
+            } else {
+                ExecutionStatus::Completed
+            }))
         }
     }
 
@@ -856,10 +895,7 @@ mod tests {
             (200, &first),
             "a repeated fire answered otherwise"
         );
-        assert_eq!(
-            f.starts.0.lock().unwrap().clone(),
-            vec!["owner-sub".to_string()]
-        );
+        assert_eq!(f.starts.started(), vec!["owner-sub".to_string()]);
         assert_eq!(first["fire"]["outcome"], "started");
 
         let (status, body) = send(
@@ -1010,6 +1046,156 @@ mod tests {
                 Value::Array(runs.iter().map(schedule_run_view).collect())
             ),
             "the route and the tool answer a schedule or its runs in different shapes"
+        );
+    }
+
+    async fn run_now(f: &Fixture, id: &str, token: &str) -> (u16, Value) {
+        send(
+            &f.base,
+            &Method::POST,
+            &format!("/v1/schedules/{id}/run"),
+            &None,
+            Some(token),
+        )
+        .await
+    }
+
+    async fn runs_of(f: &Fixture, id: &str) -> Value {
+        let (status, body) = send(
+            &f.base,
+            &Method::GET,
+            &format!("/v1/schedules/{id}/runs"),
+            &None,
+            Some("owner"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
+    /// Run now: the owner's press on a paused schedule starts one run as
+    /// the owner, answers it, and lists it under the schedule's runs with
+    /// outcome `started`, `fired_at` the press's time and no scheduled
+    /// time; the schedule stays paused.
+    #[tokio::test]
+    async fn the_owner_runs_a_paused_schedule_now_and_it_is_listed_started_with_no_scheduled_time()
+    {
+        let f = fixture().await;
+        let id = create(&f).await;
+        let (status, body) = send(
+            &f.base,
+            &Method::POST,
+            &format!("/v1/schedules/{id}/pause"),
+            &None,
+            Some("owner"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let before = chrono::Utc::now();
+        let (status, pressed) = run_now(&f, &id, "owner").await;
+        let after = chrono::Utc::now();
+        assert_eq!(status, 200, "the run-now press was not answered: {pressed}");
+        let listed = runs_of(&f, &id).await;
+        let run = &listed["runs"][0];
+        let fired_at = run["fired_at"]
+            .as_str()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+        assert_eq!(
+            (
+                listed["count"].clone(),
+                run["outcome"].clone(),
+                run["scheduled_time"].clone(),
+                run["execution"]["kind"].clone(),
+                fired_at.is_some_and(|t| t >= before && t <= after),
+                pressed["run"].clone(),
+                f.starts.started(),
+            ),
+            (
+                json!(1),
+                json!("started"),
+                Value::Null,
+                json!("agent"),
+                true,
+                run.clone(),
+                vec!["owner-sub".to_string()],
+            ),
+            "a run-now press on a paused schedule did not start one run listed as started with \
+             no scheduled time: {listed}"
+        );
+        let (_, got) = send(
+            &f.base,
+            &Method::GET,
+            &format!("/v1/schedules/{id}"),
+            &None,
+            Some("owner"),
+        )
+        .await;
+        assert_eq!(
+            got["schedule"]["state"], "paused",
+            "running a paused schedule now changed its state: {got}"
+        );
+    }
+
+    /// Run now: a schedule whose last run is still running is refused with
+    /// the overlap sentence, and nothing more is started.
+    #[tokio::test]
+    async fn run_now_while_the_last_run_is_still_running_is_refused_with_the_overlap_sentence() {
+        let f = fixture().await;
+        let id = create(&f).await;
+        let (status, fired) =
+            fire(&f, "worker", &id, &owner_tenant(), "2026-10-09T15:00:00Z").await;
+        assert_eq!(status, 200, "{fired}");
+        f.starts.set_running(true);
+        let (status, body) = run_now(&f, &id, "owner").await;
+        assert_eq!(
+            (status, body, f.starts.started().len()),
+            (409, json!({ "error": OVERLAP_REFUSAL }), 1),
+            "a run-now press while the last run was running was not refused with the overlap \
+             sentence"
+        );
+    }
+
+    /// Run now answers only the owner, as pause does: another person's
+    /// schedule is 404, an operator and a service account are refused with
+    /// N3's sentence, and none of them starts anything.
+    #[tokio::test]
+    async fn run_now_on_another_persons_schedule_is_refused_as_pause_refuses_it() {
+        let f = fixture().await;
+        let id = create(&f).await;
+        let mut answered = Vec::new();
+        for (token, path) in [("stranger", "run"), ("stranger", "pause")] {
+            let (status, body) = send(
+                &f.base,
+                &Method::POST,
+                &format!("/v1/schedules/{id}/{path}"),
+                &None,
+                Some(token),
+            )
+            .await;
+            answered.push((token, path, status, body));
+        }
+        for token in ["operator", "sdk"] {
+            let (status, body) = run_now(&f, &id, token).await;
+            answered.push((token, "run", status, body));
+        }
+        assert_eq!(
+            answered,
+            vec![
+                ("stranger", "run", 404, json!({ "error": "Not found" })),
+                ("stranger", "pause", 404, json!({ "error": "Not found" })),
+                ("operator", "run", 403, json!({ "error": OWNER_REFUSAL })),
+                ("sdk", "run", 403, json!({ "error": OWNER_REFUSAL })),
+            ],
+            "run now did not refuse another person's schedule as pause does"
+        );
+        assert_eq!(
+            (
+                f.starts.started().len(),
+                runs_of(&f, &id).await["count"].clone()
+            ),
+            (0, json!(0)),
+            "a refused run-now press started or recorded a run"
         );
     }
 }

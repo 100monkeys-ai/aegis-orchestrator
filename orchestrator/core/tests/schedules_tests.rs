@@ -674,7 +674,7 @@ async fn a_schedule_answers_its_next_run_and_its_last_run() {
     let last = view.last_run.expect("no last run");
     assert_eq!(
         (last.scheduled_time, last.outcome),
-        (at(0), FireOutcome::Started)
+        (Some(at(0)), FireOutcome::Started)
     );
 }
 
@@ -1366,11 +1366,19 @@ mod postgres {
             Some(schedule.clone())
         );
         let fired = Utc::now();
-        let first = match store.claim_fire(schedule.id, at(0), fired).await.unwrap() {
+        let first = match store
+            .claim_fire(schedule.id, Some(at(0)), fired)
+            .await
+            .unwrap()
+        {
             FireClaim::Claimed(fire) => fire,
             other => panic!("expected a claim, got {other:?}"),
         };
-        match store.claim_fire(schedule.id, at(0), fired).await.unwrap() {
+        match store
+            .claim_fire(schedule.id, Some(at(0)), fired)
+            .await
+            .unwrap()
+        {
             FireClaim::Repeated(fire) => assert_eq!(fire.id, first.id),
             other => panic!("expected the first fire's row, got {other:?}"),
         }
