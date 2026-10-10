@@ -77,7 +77,7 @@ pub struct TemporalWorkflowDefinition {
 /// Individual state in Temporal workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalWorkflowState {
-    pub kind: String, // "Agent" | "System" | "Human" | "ParallelAgents"
+    pub kind: String, // "Agent" | "System" | "Action" | "Human" | "ParallelAgents" | ...
 
     // Agent-specific fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,6 +106,13 @@ pub struct TemporalWorkflowState {
     pub env: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+
+    // Action-specific fields (AEGIS ADR-142 A7): the action's literal and its
+    // argument templates, rendered by the worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<HashMap<String, String>>,
 
     // Human-specific fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -345,6 +352,8 @@ impl TemporalWorkflowMapper {
                     command: None,
                     env: None,
                     workdir: None,
+                    action: None,
+                    args: None,
                     prompt: None,
                     default_response: None,
                     agents: None,
@@ -395,6 +404,55 @@ impl TemporalWorkflowMapper {
                 command: Some(command.clone()),
                 env: Some(env.clone()),
                 workdir: workdir.clone(),
+                action: None,
+                args: None,
+                prompt: None,
+                default_response: None,
+                agents: None,
+                consensus: None,
+                judges_for_parallel: None,
+                container_run_name: None,
+                container_run_image: None,
+                container_run_image_pull_policy: None,
+                container_run_command: None,
+                container_run_env: None,
+                container_run_workdir: None,
+                container_run_volumes: None,
+                container_run_resources: None,
+                container_run_registry_credentials: None,
+                container_run_retry: None,
+                container_run_shell: None,
+                container_run_read_only_root_filesystem: None,
+                container_run_run_as_user: None,
+                container_run_network_mode: None,
+                parallel_container_steps: None,
+                parallel_container_completion: None,
+                subworkflow_id: None,
+                subworkflow_mode: None,
+                subworkflow_result_key: None,
+                subworkflow_input: None,
+                output_handler: None,
+                max_state_visits: state.max_state_visits,
+                transitions,
+            }),
+
+            // The worker dispatches on `action` and renders `args`
+            // (AEGIS ADR-142 A7).
+            StateKind::Action { action, args } => Ok(TemporalWorkflowState {
+                kind: "Action".to_string(),
+                agent: None,
+                input: None,
+                intent: None,
+                isolation: None,
+                timeout,
+                judges: None,
+                max_iterations: None,
+                pre_execution_validator: None,
+                command: None,
+                env: None,
+                workdir: None,
+                action: Some(action.as_str().to_string()),
+                args: Some(args.clone()),
                 prompt: None,
                 default_response: None,
                 agents: None,
@@ -441,6 +499,8 @@ impl TemporalWorkflowMapper {
                 command: None,
                 env: None,
                 workdir: None,
+                action: None,
+                args: None,
                 prompt: Some(prompt.clone()),
                 default_response: default_response.clone(),
                 agents: None,
@@ -521,6 +581,8 @@ impl TemporalWorkflowMapper {
                     command: None,
                     env: None,
                     workdir: None,
+                    action: None,
+                    args: None,
                     prompt: None,
                     default_response: None,
                     agents: Some(temporal_agents),
@@ -592,6 +654,8 @@ impl TemporalWorkflowMapper {
                     command: None,
                     env: None,
                     workdir: None,
+                    action: None,
+                    args: None,
                     prompt: None,
                     default_response: None,
                     agents: None,
@@ -652,6 +716,8 @@ impl TemporalWorkflowMapper {
                     command: None,
                     env: None,
                     workdir: None,
+                    action: None,
+                    args: None,
                     prompt: None,
                     default_response: None,
                     agents: None,
@@ -710,6 +776,8 @@ impl TemporalWorkflowMapper {
                     command: None,
                     env: None,
                     workdir: None,
+                    action: None,
+                    args: None,
                     // Human fields
                     prompt: None,
                     default_response: None,
@@ -956,6 +1024,17 @@ impl TemporalWorkflowMapper {
                             .render_template(value, &serde_json::json!({}))
                             .with_context(|| {
                                 format!("Invalid template in state {state_name} env {key}: {value}")
+                            })?;
+                    }
+                }
+                StateKind::Action { args, .. } => {
+                    for (key, value) in args {
+                        handlebars
+                            .render_template(value, &serde_json::json!({}))
+                            .with_context(|| {
+                                format!(
+                                    "Invalid template in state {state_name} args {key}: {value}"
+                                )
                             })?;
                     }
                 }

@@ -331,6 +331,20 @@ impl Workflow {
             }
         }
 
+        // Validate: an action that works on the run's repository needs a
+        // workflow that declares one (AEGIS ADR-142 A6).
+        if spec.repositories.unwrap_or(0) == 0 {
+            let mut names: Vec<&StateName> = spec.states.keys().collect();
+            names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            for state_name in names {
+                if let StateKind::Action { action, .. } = &spec.states[state_name].kind {
+                    if action.needs() == ActionNeed::RunRepository {
+                        return Err(WorkflowError::ActionWithoutRepository { action: *action });
+                    }
+                }
+            }
+        }
+
         // Validate: All ContainerVolumeMount names resolve to declared spec.storage.shared_volumes
         // (only enforced when spec.storage.shared_volumes is non-empty — opt-in per ADR-050)
         if !spec.storage.shared_volumes.is_empty() {
@@ -879,6 +893,21 @@ pub enum StateKind {
         workdir: Option<String>,
     },
 
+    /// One of the workflow's own deterministic operations, run by the state
+    /// machine itself with no model in the loop (AEGIS ADR-142 A1).
+    ///
+    /// `action` is fixed when the manifest is parsed; `args` are templates
+    /// rendered against the blackboard when the state runs.
+    Action {
+        /// Which operation this state performs.
+        action: ActionName,
+
+        /// The operation's arguments (Handlebars templates), checked against
+        /// the action's declared arguments at parse.
+        #[serde(default)]
+        args: HashMap<String, String>,
+    },
+
     /// Pause for human input
     Human {
         /// Prompt shown to human
@@ -1004,6 +1033,138 @@ pub enum StateKind {
         #[serde(default)]
         input: Option<String>,
     },
+}
+
+// The closed set of actions (AEGIS ADR-142 A2): each is declared once, with
+// its arguments, what it needs and whether it touches the world. A later action
+// joins by a record that writes its row here.
+
+/// The name of an `Action` state's operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionName {
+    /// Writes each rendered argument onto the blackboard under its key.
+    UpdateBlackboard,
+    /// The diff of the run's repository.
+    RepositoryDiff,
+    /// Commits the run's repository with the argument `message`.
+    RepositoryCommit,
+    /// Lands the run's commit on its repository's branch; gated.
+    RepositoryLand,
+}
+
+/// The arguments an action takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionArguments {
+    /// Any keys (each one a blackboard key).
+    Any,
+    /// Exactly these keys, each of them required.
+    Required(&'static [&'static str]),
+}
+
+/// What an action needs from the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionNeed {
+    /// Nothing beyond the blackboard.
+    Nothing,
+    /// The run's repository (`spec.repositories` at least 1).
+    RunRepository,
+}
+
+impl ActionName {
+    /// Every action, in the order the refusal lists them.
+    pub const ALL: [ActionName; 4] = [
+        ActionName::UpdateBlackboard,
+        ActionName::RepositoryDiff,
+        ActionName::RepositoryCommit,
+        ActionName::RepositoryLand,
+    ];
+
+    /// The literal a manifest writes.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActionName::UpdateBlackboard => "update_blackboard",
+            ActionName::RepositoryDiff => "repository_diff",
+            ActionName::RepositoryCommit => "repository_commit",
+            ActionName::RepositoryLand => "repository_land",
+        }
+    }
+
+    /// The action a manifest's literal names, or the sentence refusing it.
+    pub fn from_literal(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|action| action.as_str() == name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(ActionName::as_str).collect();
+                format!(
+                    "unknown action '{name}'; the actions are {}",
+                    names.join(", ")
+                )
+            })
+    }
+
+    /// The arguments this action takes.
+    pub fn arguments(&self) -> ActionArguments {
+        match self {
+            ActionName::UpdateBlackboard => ActionArguments::Any,
+            ActionName::RepositoryDiff | ActionName::RepositoryLand => {
+                ActionArguments::Required(&[])
+            }
+            ActionName::RepositoryCommit => ActionArguments::Required(&["message"]),
+        }
+    }
+
+    /// What this action needs from the run.
+    pub fn needs(&self) -> ActionNeed {
+        match self {
+            ActionName::UpdateBlackboard => ActionNeed::Nothing,
+            ActionName::RepositoryDiff
+            | ActionName::RepositoryCommit
+            | ActionName::RepositoryLand => ActionNeed::RunRepository,
+        }
+    }
+
+    /// Whether this action touches the world, and so waits at the approval
+    /// gate.
+    pub fn touches_the_world(&self) -> bool {
+        matches!(self, ActionName::RepositoryLand)
+    }
+
+    /// Checks a state's `args` against the declared arguments: an argument
+    /// the action does not declare, or a required one missing, is refused
+    /// with its sentence.
+    pub fn check_args(&self, args: &HashMap<String, String>) -> Result<(), String> {
+        let ActionArguments::Required(declared) = self.arguments() else {
+            return Ok(());
+        };
+        let mut keys: Vec<&String> = args.keys().collect();
+        keys.sort();
+        if let Some(key) = keys.into_iter().find(|k| !declared.contains(&k.as_str())) {
+            let takes = if declared.is_empty() {
+                "no arguments".to_string()
+            } else {
+                declared.join(", ")
+            };
+            return Err(format!(
+                "action '{}' takes {takes}; '{key}' is not one",
+                self.as_str()
+            ));
+        }
+        if let Some(missing) = declared.iter().find(|d| !args.contains_key(**d)) {
+            return Err(format!(
+                "action '{}' needs the argument '{missing}'",
+                self.as_str()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ActionName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Isolation mode for agent execution
@@ -1510,6 +1671,9 @@ pub enum WorkflowError {
 
     #[error("Invalid workflow scope: {0}")]
     InvalidScope(String),
+
+    #[error("action '{action}' works on the run's repository; this workflow declares none")]
+    ActionWithoutRepository { action: ActionName },
 }
 
 // ============================================================================

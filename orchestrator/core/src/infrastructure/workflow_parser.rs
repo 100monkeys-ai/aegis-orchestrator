@@ -162,6 +162,16 @@ pub enum StateKindYaml {
         #[serde(default)]
         workdir: Option<String>,
     },
+    /// One of the workflow's own operations, run by the state machine itself.
+    Action {
+        /// The operation, a literal: update_blackboard, repository_diff,
+        /// repository_commit or repository_land.
+        action: String,
+        /// The operation's arguments, templates rendered against the
+        /// blackboard when the state runs.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        args: HashMap<String, String>,
+    },
     Human {
         prompt: String,
         #[serde(default)]
@@ -494,6 +504,16 @@ impl WorkflowParser {
                 env,
                 workdir,
             },
+            // The action is a literal and its arguments are declared
+            // (AEGIS ADR-142 A1, A2).
+            StateKindYaml::Action { action, args } => {
+                let action = ActionName::from_literal(&action)
+                    .map_err(WorkflowParseError::ValidationError)?;
+                action
+                    .check_args(&args)
+                    .map_err(WorkflowParseError::ValidationError)?;
+                StateKind::Action { action, args }
+            }
             StateKindYaml::Human {
                 prompt,
                 default_response,
@@ -752,6 +772,10 @@ impl WorkflowParser {
                 command: command.clone(),
                 env: env.clone(),
                 workdir: workdir.clone(),
+            },
+            StateKind::Action { action, args } => StateKindYaml::Action {
+                action: action.as_str().to_string(),
+                args: args.clone(),
             },
             StateKind::Human {
                 prompt,
