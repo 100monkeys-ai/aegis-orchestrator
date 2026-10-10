@@ -18,12 +18,12 @@ use crate::domain::dispatch::{
     AgentMessage, ConversationMessage, DispatchAction, DispatchId, OrchestratorMessage, ToolCall,
 };
 use crate::domain::events::{ExecutionEvent, RefusalLayer};
-use crate::domain::execution::{ExecutionId, Iteration, TrajectoryStep};
+use crate::domain::execution::{Execution, ExecutionId, Iteration, TrajectoryStep};
 use crate::domain::goal::{judge_context_or_default, JudgeContextSource};
 use crate::domain::iam::UserIdentity;
 use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
 use crate::domain::tenant::TenantId;
-use crate::infrastructure::llm::registry::{ApiKeySource, ProviderRegistry};
+use crate::infrastructure::llm::registry::{ApiKeySource, DataClass, ProviderRegistry};
 
 /// The share of the alias's prompt limit one command's output may take in
 /// the conversation: an eighth.
@@ -88,6 +88,10 @@ struct ExecutionContext {
     /// The agent's `llm_timeout_seconds`, read once at Generate: the bound on
     /// each model call of this loop.
     llm_timeout_seconds: u64,
+    /// The class of data this loop's model calls carry, read once at
+    /// Generate from the manifests of the execution's agent and its
+    /// ancestors on the orchestrator's side ([`DataClass`]).
+    data_class: DataClass,
     /// Count of in-flight `cmd.run` dispatches for this execution.
     /// Used to enforce `Capability.max_concurrent`.
     active_dispatch_count: u32,
@@ -392,6 +396,58 @@ impl InnerLoopService {
             .await;
     }
 
+    /// The class of data `execution`'s model calls carry: `Private` when the
+    /// manifest of its agent, or of the agent of any execution above it in
+    /// its hierarchy, carries the label `data: private` (a judge, a child
+    /// execution, reads the output it grades), else `Standard`. Read on the
+    /// orchestrator's side from the execution records and the agents'
+    /// manifests; an agent or a parent execution that cannot be read is an
+    /// error, never a standard class.
+    async fn data_class_of(&self, execution: &Execution) -> anyhow::Result<DataClass> {
+        let mut seen = std::collections::HashSet::new();
+        let mut id = execution.id;
+        let mut agent_id = execution.agent_id;
+        let mut tenant_id = execution.tenant_id.clone();
+        let mut parent = execution.hierarchy.parent_execution_id;
+        loop {
+            let class = self
+                .tool_invocation_service
+                .agent_data_class(&tenant_id, agent_id)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "execution {id}: loading agent {} for the class of data its model calls carry: {e}",
+                        agent_id.0
+                    )
+                })?;
+            if class == DataClass::Private {
+                return Ok(DataClass::Private);
+            }
+            seen.insert(id);
+            let Some(parent_id) = parent else {
+                return Ok(DataClass::Standard);
+            };
+            if !seen.insert(parent_id) {
+                anyhow::bail!(
+                    "execution {id}: its hierarchy names execution {parent_id} twice, so the class of data its model calls carry is unknown"
+                );
+            }
+            let above = self
+                .execution_service
+                .get_execution_unscoped(parent_id)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "execution {id}: reading its parent execution {parent_id} for the class of data its model calls carry: {e}"
+                    )
+                })?;
+            id = above.id;
+            agent_id = above.agent_id;
+            tenant_id = above.tenant_id;
+            parent = above.hierarchy.parent_execution_id;
+        }
+    }
+
     /// Attach rate limiting enforcement for LLM call and token quotas (ADR-072).
     pub fn with_rate_limiting(
         mut self,
@@ -472,6 +528,16 @@ impl InnerLoopService {
                     Err(_) => (
                         "aegis-system-agent-runtime".to_string(),
                         tenant_id_hint.unwrap_or_else(TenantId::system),
+                    ),
+                };
+
+                // The class of data this loop's model calls carry, read on the
+                // orchestrator's side from the execution record's agent and its
+                // ancestors, never from what the container sent.
+                let data_class = match exec_record {
+                    Ok(ref e) => self.data_class_of(e).await?,
+                    Err(ref e) => anyhow::bail!(
+                        "execution {execution_id}: its record could not be read, so the class of data its model calls carry is unknown and no model call is made: {e}"
                     ),
                 };
 
@@ -564,6 +630,7 @@ impl InnerLoopService {
                         tenant_id,
                         security_context_name,
                         llm_timeout_seconds,
+                        data_class,
                         active_dispatch_count: 0,
                         deadline: Some(deadline),
                         command_margin_secs: command_margin_secs(
@@ -723,6 +790,7 @@ impl InnerLoopService {
             let llm_output = match self
                 .call_llm(
                     &ctx.model_alias,
+                    ctx.data_class,
                     &ctx.conversation,
                     &tool_schemas,
                     ctx.user_identity.as_ref(),
@@ -1191,6 +1259,7 @@ impl InnerLoopService {
     async fn call_llm(
         &self,
         model_alias: &str,
+        data_class: DataClass,
         conversation: &[ConversationMessage],
         tool_schemas: &[Value],
         user_identity: Option<&UserIdentity>,
@@ -1347,6 +1416,7 @@ impl InnerLoopService {
         let llm_result = generate_within_llm_timeout(
             &self.provider_registry,
             model_alias,
+            data_class,
             &chat_messages,
             &schemas,
             &options,
@@ -1498,9 +1568,11 @@ fn try_time_left(
 /// answered by then is ended with an error naming the field and the seconds;
 /// on an alias that names a fallback, the fallback is then tried once where
 /// `try_left` holds its bound (AEGIS ADR-130, Update of 2026-10-05, D2a).
+#[allow(clippy::too_many_arguments)]
 async fn generate_within_llm_timeout(
     registry: &ProviderRegistry,
     model_alias: &str,
+    data_class: DataClass,
     messages: &[ChatMessage],
     schemas: &[ToolSchema],
     options: &GenerationOptions,
@@ -1511,6 +1583,7 @@ async fn generate_within_llm_timeout(
     registry
         .generate_chat_within(
             model_alias,
+            data_class,
             messages,
             schemas,
             options,
@@ -2024,6 +2097,7 @@ mod tests {
         let result = generate_within_llm_timeout(
             &registry,
             "default",
+            DataClass::Standard,
             &[],
             &[],
             &GenerationOptions::default(),
@@ -2055,6 +2129,7 @@ mod tests {
         let result = generate_within_llm_timeout(
             &registry,
             "default",
+            DataClass::Standard,
             &[],
             &[],
             &GenerationOptions::default(),

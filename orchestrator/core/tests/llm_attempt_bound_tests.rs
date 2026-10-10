@@ -135,7 +135,13 @@ async fn chat(registry: &ProviderRegistry) -> Result<ChatResponse, LLMError> {
         tool_calls: None,
     }];
     registry
-        .generate_chat("default", &messages, &[], &GenerationOptions::default())
+        .generate_chat(
+            "default",
+            aegis_orchestrator_core::infrastructure::llm::registry::DataClass::Standard,
+            &messages,
+            &[],
+            &GenerationOptions::default(),
+        )
         .await
 }
 

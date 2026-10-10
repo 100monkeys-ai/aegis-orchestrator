@@ -150,6 +150,11 @@ spec:
     #       capabilities: ["chat", "code", "reasoning"]
     #       context_window: 1048576
     #       cost_per_1k_tokens: 0.00015
+    #       # private_gateway: Optional. The gateway an agent labelled
+    #       # `data: private` is sent through on this alias: its requests carry
+    #       # cf-aig-gateway-id set to this value. A `data: private` agent on an
+    #       # alias without one is refused and nothing is sent.
+    #       private_gateway: "<gateway name without logs>"
 
   # --------------------------------------------------------------------------
   # LLM Selection Strategy

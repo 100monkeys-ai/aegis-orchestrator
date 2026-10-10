@@ -12,6 +12,7 @@ use crate::domain::llm::{
     ChatMessage, ChatResponse, GenerationOptions, GenerationResponse, LLMError, LLMProvider,
     ToolSchema,
 };
+pub use crate::domain::node_config::DataClass;
 use crate::domain::node_config::{
     resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, NodeConfigManifest,
 };
@@ -102,6 +103,55 @@ pub struct ProviderRegistry {
     /// "attempt timeout after Ns: ...")`, retryable like an HTTP 408. `None`:
     /// no bound. Sourced from `LLMSelection::llm_attempt_timeout_secs`.
     llm_attempt_timeout_secs: Option<u64>,
+    /// The adapters of [`DataClass::Private`]: for every alias whose winning
+    /// entry names a `private_gateway`, an adapter built with the provider's
+    /// headers and `cf-aig-gateway-id` set to that gateway; their fallback
+    /// aliases resolved in the same class. `None` inside the private registry
+    /// itself.
+    private: Option<Box<ProviderRegistry>>,
+}
+
+/// The header that routes a Workers AI request through a Cloudflare AI
+/// Gateway.
+const GATEWAY_ID_HEADER: &str = "cf-aig-gateway-id";
+
+/// The refusal of a private call on `alias`, which names no
+/// `private_gateway`: no request is sent.
+fn private_gateway_refusal(alias: &str) -> LLMError {
+    LLMError::InvalidInput(format!(
+        "alias '{alias}' names no private_gateway: a call of an agent labelled data: private is sent only through its alias's private gateway, so no request was sent"
+    ))
+}
+
+/// The adapter a private call meets where its fallback alias names no
+/// `private_gateway`: it sends nothing and answers the refusal naming that
+/// alias.
+struct PrivateGatewayRefusal {
+    alias: String,
+}
+
+#[async_trait]
+impl LLMProvider for PrivateGatewayRefusal {
+    async fn generate(
+        &self,
+        _prompt: &str,
+        _options: &GenerationOptions,
+    ) -> Result<GenerationResponse, LLMError> {
+        Err(private_gateway_refusal(&self.alias))
+    }
+
+    async fn generate_chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolSchema],
+        _options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        Err(private_gateway_refusal(&self.alias))
+    }
+
+    async fn health_check(&self) -> Result<(), LLMError> {
+        Err(private_gateway_refusal(&self.alias))
+    }
 }
 
 /// Returns true for `LLMError` variants that are deterministic upstream
@@ -513,6 +563,8 @@ impl ProviderRegistry {
         let mut fallback_alias_names: Vec<(String, String)> = Vec::new();
         // alias → its winning entry's window for a request in bytes (ADR-131 U16a).
         let mut alias_window_bytes: HashMap<String, u64> = HashMap::new();
+        // alias → its adapter through the winning entry's `private_gateway`.
+        let mut private_alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)> = HashMap::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -548,6 +600,29 @@ impl ProviderRegistry {
                                 if let Some(fallback) = &model_config.fallback_alias {
                                     fallback_alias_names.push((alias.clone(), fallback.clone()));
                                 }
+                                if let Some(gateway) = &model_config.private_gateway {
+                                    match Self::create_adapter(
+                                        &Self::through_gateway(provider_config, gateway),
+                                        winner_model,
+                                    ) {
+                                        Ok(private) => {
+                                            info!(
+                                                "Alias '{}' sends private calls through gateway '{}'",
+                                                alias, gateway
+                                            );
+                                            private_alias_map.insert(
+                                                alias.clone(),
+                                                (winner_model.clone(), private),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to create the private adapter for alias '{}' ({}): {}",
+                                                alias, winner_model, e
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -566,6 +641,36 @@ impl ProviderRegistry {
         // the registry: the node never runs with a fallback configured and
         // silently absent.
         let mut alias_fallbacks: HashMap<String, AliasFallback> = HashMap::new();
+        // The same in the private class: the named alias's private adapter,
+        // or, where it names no `private_gateway`, an adapter that refuses
+        // naming it and sends nothing.
+        let mut private_alias_fallbacks: HashMap<String, AliasFallback> = HashMap::new();
+        for (alias, fallback) in &fallback_alias_names {
+            if !private_alias_map.contains_key(alias) {
+                continue;
+            }
+            let window_bytes = alias_window_bytes.get(fallback).copied().unwrap_or(0);
+            let entry = match private_alias_map.get(fallback) {
+                Some((model, adapter)) => AliasFallback {
+                    alias: fallback.clone(),
+                    model: model.clone(),
+                    adapter: adapter.clone(),
+                    window_bytes,
+                },
+                None => AliasFallback {
+                    alias: fallback.clone(),
+                    model: alias_map
+                        .get(fallback)
+                        .map(|(model, _)| model.clone())
+                        .unwrap_or_default(),
+                    adapter: Arc::new(PrivateGatewayRefusal {
+                        alias: fallback.clone(),
+                    }),
+                    window_bytes,
+                },
+            };
+            private_alias_fallbacks.insert(alias.clone(), entry);
+        }
         for (alias, fallback) in fallback_alias_names {
             let Some((model, adapter)) = alias_map.get(&fallback) else {
                 anyhow::bail!(
@@ -601,6 +706,51 @@ impl ProviderRegistry {
                 Some((first_model, adapter))
             });
 
+        // The node-wide fallback in the private class: the same provider's
+        // first model through its own `private_gateway`, else none.
+        let private_fallback_provider = config
+            .spec
+            .llm_selection
+            .fallback_provider
+            .as_deref()
+            .and_then(|name| {
+                let provider_config = config
+                    .spec
+                    .llm_providers
+                    .iter()
+                    .find(|p| p.name == name && p.enabled)?;
+                let first_model = provider_config.models.first()?;
+                let gateway = first_model.private_gateway.as_deref()?;
+                match Self::create_adapter(
+                    &Self::through_gateway(provider_config, gateway),
+                    &first_model.model,
+                ) {
+                    Ok(adapter) => Some((first_model.model.clone(), adapter)),
+                    Err(e) => {
+                        warn!(
+                            "Failed to create the private adapter of fallback provider '{}': {}",
+                            name, e
+                        );
+                        None
+                    }
+                }
+            });
+
+        let private = ProviderRegistry {
+            alias_map: private_alias_map,
+            providers: HashMap::new(),
+            fallback_provider: private_fallback_provider,
+            alias_fallbacks: private_alias_fallbacks,
+            raw_api_keys: raw_api_keys.clone(),
+            alias_max_output_tokens: alias_max_output_tokens.clone(),
+            alias_temperatures: alias_temperatures.clone(),
+            max_retries: config.spec.llm_selection.max_retries,
+            retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
+            llm_overall_timeout_secs: config.spec.llm_selection.llm_overall_timeout_secs,
+            llm_attempt_timeout_secs: config.spec.llm_selection.llm_attempt_timeout_secs,
+            private: None,
+        };
+
         Ok(Self {
             alias_map,
             providers,
@@ -613,7 +763,20 @@ impl ProviderRegistry {
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
             llm_overall_timeout_secs: config.spec.llm_selection.llm_overall_timeout_secs,
             llm_attempt_timeout_secs: config.spec.llm_selection.llm_attempt_timeout_secs,
+            private: Some(Box::new(private)),
         })
+    }
+
+    /// `config` with `cf-aig-gateway-id` set to `gateway` in its headers, in
+    /// place of any it carries in whatever letter case; every other header
+    /// kept.
+    fn through_gateway(config: &LLMProviderConfig, gateway: &str) -> LLMProviderConfig {
+        let mut config = config.clone();
+        let mut headers = config.headers.take().unwrap_or_default();
+        headers.retain(|name, _| !name.eq_ignore_ascii_case(GATEWAY_ID_HEADER));
+        headers.insert(GATEWAY_ID_HEADER.to_string(), gateway.to_string());
+        config.headers = Some(headers);
+        config
     }
 
     /// Create an adapter for the given provider config initialized with a specific model name.
@@ -935,12 +1098,50 @@ impl ProviderRegistry {
         )
     }
 
-    /// Generate a chat response for the given model alias.
+    /// The registry a call of `class` on `alias` is made in: this one for a
+    /// standard call; for a private call the private adapters, and a refusal
+    /// naming the alias, before any request, where it names no
+    /// `private_gateway`.
+    fn class_registry(&self, alias: &str, class: DataClass) -> Result<&Self, LLMError> {
+        match class {
+            DataClass::Standard => Ok(self),
+            DataClass::Private => match self.private.as_deref() {
+                Some(private) if private.alias_map.contains_key(alias) => Ok(private),
+                _ if !self.alias_map.contains_key(alias) => Err(LLMError::ModelNotFound(format!(
+                    "Model alias '{alias}' not found"
+                ))),
+                _ => {
+                    warn!(
+                        "Private call refused: alias='{}' names no private_gateway",
+                        alias
+                    );
+                    Err(private_gateway_refusal(alias))
+                }
+            },
+        }
+    }
+
+    /// Generate a chat response for the given model alias, in the adapters
+    /// of `class`.
     ///
     /// Resolves the alias directly to a pre-configured `Arc<dyn LLMProvider>` adapter;
     /// no model name override is needed at call time.
     /// Includes retry-with-exponential-backoff and one-level fallback.
     pub async fn generate_chat(
+        &self,
+        alias: &str,
+        class: DataClass,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        self.class_registry(alias, class)?
+            .chat_in_class(alias, messages, tools, options)
+            .await
+    }
+
+    /// [`Self::generate_chat`] within one class's adapters.
+    async fn chat_in_class(
         &self,
         alias: &str,
         messages: &[ChatMessage],
@@ -1051,7 +1252,27 @@ impl ProviderRegistry {
     /// `try_left` (the time to the try's deadline at the call's start) when
     /// that is shorter but at least half the bound (D2a), and where its window
     /// holds the request (D2b); a failure carries the registry's report (D10).
+    ///
+    /// The call is made in the adapters of `class`, its fallback alias too.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_chat_within(
+        &self,
+        alias: &str,
+        class: DataClass,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+        llm_timeout: std::time::Duration,
+        try_left: Option<std::time::Duration>,
+    ) -> Result<ChatResponse, ModelCallFailure> {
+        self.class_registry(alias, class)
+            .map_err(ModelCallFailure::unreported)?
+            .chat_within_in_class(alias, messages, tools, options, llm_timeout, try_left)
+            .await
+    }
+
+    /// [`Self::generate_chat_within`] within one class's adapters.
+    async fn chat_within_in_class(
         &self,
         alias: &str,
         messages: &[ChatMessage],
@@ -1065,7 +1286,7 @@ impl ProviderRegistry {
         else {
             return match tokio::time::timeout(
                 llm_timeout,
-                self.generate_chat(alias, messages, tools, options),
+                self.chat_in_class(alias, messages, tools, options),
             )
             .await
             {
@@ -1258,12 +1479,25 @@ impl ProviderRegistry {
         })
     }
 
-    /// Generate text for the given model alias.
+    /// Generate text for the given model alias, in the adapters of `class`.
     ///
     /// Resolves the alias directly to a pre-configured `Arc<dyn LLMProvider>` adapter;
     /// no model name override is needed at call time.
     /// Includes retry-with-exponential-backoff and one-level fallback.
     pub async fn generate(
+        &self,
+        alias: &str,
+        class: DataClass,
+        prompt: &str,
+        options: &GenerationOptions,
+    ) -> Result<GenerationResponse, LLMError> {
+        self.class_registry(alias, class)?
+            .generate_in_class(alias, prompt, options)
+            .await
+    }
+
+    /// [`Self::generate`] within one class's adapters.
+    async fn generate_in_class(
         &self,
         alias: &str,
         prompt: &str,
@@ -1429,7 +1663,8 @@ impl LLMProvider for ProviderRegistry {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<GenerationResponse, LLMError> {
-        self.generate("default", prompt, options).await
+        self.generate("default", DataClass::Standard, prompt, options)
+            .await
     }
 
     async fn generate_chat(
@@ -1438,7 +1673,7 @@ impl LLMProvider for ProviderRegistry {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
-        self.generate_chat("default", messages, tools, options)
+        self.generate_chat("default", DataClass::Standard, messages, tools, options)
             .await
     }
 
@@ -1485,6 +1720,7 @@ impl ProviderRegistry {
             retry_delay_ms,
             llm_overall_timeout_secs,
             llm_attempt_timeout_secs: None,
+            private: None,
         }
     }
 }
@@ -1637,7 +1873,13 @@ mod tests {
 
         let start = std::time::Instant::now();
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         let elapsed = start.elapsed();
 
@@ -1666,7 +1908,13 @@ mod tests {
         );
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert!(matches!(res, Err(LLMError::ModelNotFound(_))));
         assert_eq!(primary.call_count(), 1);
@@ -1684,7 +1932,13 @@ mod tests {
         );
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert!(matches!(res, Err(LLMError::InvalidInput(_))));
         assert_eq!(primary.call_count(), 1);
@@ -1700,7 +1954,13 @@ mod tests {
         let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert!(res.is_ok(), "expected success after retries: {res:?}");
         assert_eq!(primary.call_count(), 3);
@@ -1713,7 +1973,13 @@ mod tests {
 
         let start = std::time::Instant::now();
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         let elapsed = start.elapsed();
 
@@ -1742,7 +2008,13 @@ mod tests {
         );
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert!(matches!(res, Err(LLMError::Authentication(_))));
         assert_eq!(primary.call_count(), 1);
@@ -1762,7 +2034,13 @@ mod tests {
         let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert!(
             res.is_ok(),
@@ -1793,7 +2071,13 @@ mod tests {
         );
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert!(
             res.is_ok(),
@@ -1831,7 +2115,13 @@ mod tests {
         );
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert!(
             matches!(res, Err(LLMError::ServiceUnavailable(_))),
@@ -1908,6 +2198,7 @@ mod tests {
                         max_output_tokens: None,
                         temperature: None,
                         fallback_alias: None,
+                        private_gateway: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),
@@ -1966,7 +2257,13 @@ mod tests {
         let primary = MockProvider::with_responses(vec![Ok(empty_response()), Ok(ok_response())]);
         let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert_eq!(
             primary.call_count(),
@@ -1993,7 +2290,13 @@ mod tests {
             30,
         );
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert_eq!(primary.call_count(), 3, "every retry is spent");
         assert_eq!(fallback.call_count(), 1, "the fallback is tried once");
@@ -2016,7 +2319,13 @@ mod tests {
         let primary = MockProvider::with_responses(vec![Ok(calls)]);
         let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 30);
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
         assert_eq!(primary.call_count(), 1);
         assert!(matches!(res, Ok(ChatResponse::ToolCalls(_))));
@@ -2058,7 +2367,13 @@ mod tests {
         let registry = openai_registry(server.url(), 3);
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         mock.assert_async().await;
@@ -2099,7 +2414,12 @@ mod tests {
         let registry = openai_registry(server.url(), 3);
 
         let res = registry
-            .generate("default", "hello", &GenerationOptions::default())
+            .generate(
+                "default",
+                DataClass::Standard,
+                "hello",
+                &GenerationOptions::default(),
+            )
             .await;
 
         mock.assert_async().await;
@@ -2156,7 +2476,13 @@ mod tests {
         let registry = openai_registry_with_fallback(primary.url(), fallback.url());
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         primary_mock.assert_async().await;
@@ -2190,7 +2516,12 @@ mod tests {
         let registry = openai_registry_with_fallback(primary.url(), fallback.url());
 
         let res = registry
-            .generate("default", "hello", &GenerationOptions::default())
+            .generate(
+                "default",
+                DataClass::Standard,
+                "hello",
+                &GenerationOptions::default(),
+            )
             .await;
 
         primary_mock.assert_async().await;
@@ -2224,7 +2555,13 @@ mod tests {
         let registry = openai_registry_with_fallback(primary.url(), fallback.url());
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         primary_mock.assert_async().await;
@@ -2256,7 +2593,13 @@ mod tests {
         let registry = openai_registry(server.url(), 3);
 
         let res = registry
-            .generate_chat("default", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "default",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         mock.assert_async().await;
@@ -2401,7 +2744,13 @@ mod tests {
         let registry = alias_fallback_registry(&manifest);
 
         let res = registry
-            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "smart",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         smart_mock.assert_async().await;
@@ -2445,7 +2794,12 @@ mod tests {
         let registry = alias_fallback_registry(&manifest);
 
         let res = registry
-            .generate("smart", "hello", &GenerationOptions::default())
+            .generate(
+                "smart",
+                DataClass::Standard,
+                "hello",
+                &GenerationOptions::default(),
+            )
             .await;
 
         smart_mock.assert_async().await;
@@ -2494,7 +2848,13 @@ mod tests {
         let registry = alias_fallback_registry(&manifest);
 
         let res = registry
-            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "smart",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         smart_mock.assert_async().await;
@@ -2545,7 +2905,13 @@ mod tests {
         let registry = alias_fallback_registry(&manifest);
 
         let res = registry
-            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "smart",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         smart_mock.assert_async().await;
@@ -2586,7 +2952,13 @@ mod tests {
         let registry = alias_fallback_registry(&manifest);
 
         let res = registry
-            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "smart",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         smart_mock.assert_async().await;
@@ -2630,7 +3002,13 @@ mod tests {
         let registry = alias_fallback_registry(&manifest);
 
         let res = registry
-            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "smart",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         smart_mock.assert_async().await;
@@ -2676,7 +3054,13 @@ mod tests {
         let registry = alias_fallback_registry(&manifest);
 
         let res = registry
-            .generate_chat("smart", &[], &[], &GenerationOptions::default())
+            .generate_chat(
+                "smart",
+                DataClass::Standard,
+                &[],
+                &[],
+                &GenerationOptions::default(),
+            )
             .await;
 
         smart_mock.assert_async().await;
@@ -2789,6 +3173,7 @@ mod tests {
         let res = registry
             .generate_chat_within(
                 "smart",
+                DataClass::Standard,
                 &[],
                 &[],
                 &GenerationOptions::default(),
@@ -2844,6 +3229,7 @@ mod tests {
         let res = registry
             .generate_chat_within(
                 "smart",
+                DataClass::Standard,
                 &[],
                 &[],
                 &GenerationOptions::default(),
@@ -2884,6 +3270,7 @@ mod tests {
         let failure = registry
             .generate_chat_within(
                 "smart",
+                DataClass::Standard,
                 &[],
                 &[],
                 &GenerationOptions::default(),
@@ -2918,6 +3305,7 @@ mod tests {
         let failure = registry
             .generate_chat_within(
                 "smart",
+                DataClass::Standard,
                 &[],
                 &[],
                 &GenerationOptions::default(),
@@ -2963,6 +3351,7 @@ mod tests {
         let failure = registry
             .generate_chat_within(
                 "smart",
+                DataClass::Standard,
                 &messages,
                 &[],
                 &GenerationOptions::default(),
@@ -3022,6 +3411,7 @@ mod tests {
         let err = registry
             .generate_chat(
                 "smart",
+                DataClass::Standard,
                 &user_message("x".repeat(5_000)),
                 &[],
                 &GenerationOptions::default(),
@@ -3054,6 +3444,7 @@ mod tests {
         let failure = registry
             .generate_chat_within(
                 "smart",
+                DataClass::Standard,
                 &[],
                 &[],
                 &GenerationOptions::default(),

@@ -93,7 +93,13 @@ async fn chat(registry: &ProviderRegistry) {
         tool_calls: None,
     }];
     match registry
-        .generate_chat("default", &messages, &[], &GenerationOptions::default())
+        .generate_chat(
+            "default",
+            aegis_orchestrator_core::infrastructure::llm::registry::DataClass::Standard,
+            &messages,
+            &[],
+            &GenerationOptions::default(),
+        )
         .await
     {
         Ok(ChatResponse::FinalText(r)) => assert_eq!(r.text, "ok"),
