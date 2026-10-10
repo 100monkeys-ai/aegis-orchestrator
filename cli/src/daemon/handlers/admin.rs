@@ -16,7 +16,8 @@ use aegis_orchestrator_core::domain::iam::{
     resolve_effective_tenant, AegisRole, IdentityKind, UserIdentity, ZaruTier,
 };
 use aegis_orchestrator_core::domain::rate_limit::{
-    tier_defaults, RateLimitBucket, RateLimitPolicyResolver, RateLimitResourceType, RateLimitScope,
+    tier_defaults, RateLimitBucket, RateLimitEnforcer, RateLimitPolicyResolver,
+    RateLimitResourceType, RateLimitScope,
 };
 use aegis_orchestrator_core::infrastructure::rate_limit::override_repository::{
     CreateOverrideRequest, RateLimitOverrideRow, UsageRow,
@@ -517,14 +518,6 @@ pub(crate) struct UserUsageRecordRequest {
     pub llm_tokens: u64,
 }
 
-/// A window that refused a charge. A refused charge is stored in no window
-/// of its resource.
-#[derive(Debug, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct RefusedWindow {
-    pub resource_type: String,
-    pub bucket: String,
-}
-
 /// `POST /v1/user/rate-limits/usage`: record model usage for the caller.
 pub(crate) async fn record_user_rate_limit_usage_handler(
     State(state): State<Arc<AppState>>,
@@ -533,6 +526,7 @@ pub(crate) async fn record_user_rate_limit_usage_handler(
 ) -> axum::response::Response {
     user_usage_record_response(
         state.rate_limit_override_repo.as_deref(),
+        state.rate_limit_enforcer.as_deref(),
         identity.map(|Extension(id)| id),
         body,
     )
@@ -543,11 +537,13 @@ pub(crate) async fn record_user_rate_limit_usage_handler(
 ///
 /// The caller is the identity its own access token resolved to, as for the
 /// GET: none, or one with an empty `sub`, is refused 401. A body over the
-/// request bound is refused 400. Otherwise the calls and tokens are charged
+/// request bound is refused 400. Otherwise the calls and tokens are recorded
 /// for the caller and the answer is 200 with the GET's usage view after the
-/// write, and the windows that refused a charge under `refused`.
+/// write. `refused` is always empty: a record is stored past any limit, so
+/// no window refuses it.
 pub(crate) async fn user_usage_record_response(
     repo: Option<&RateLimitOverrideRepository>,
+    enforcer: Option<&dyn RateLimitEnforcer>,
     identity: Option<UserIdentity>,
     body: Result<Json<UserUsageRecordRequest>, JsonRejection>,
 ) -> axum::response::Response {
@@ -571,7 +567,7 @@ pub(crate) async fn user_usage_record_response(
         )
             .into_response();
     }
-    let Some(repo) = repo else {
+    let (Some(repo), Some(enforcer)) = (repo, enforcer) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "Rate-limit override repository not configured"})),
@@ -579,16 +575,13 @@ pub(crate) async fn user_usage_record_response(
             .into_response();
     };
 
-    let refused = match record_user_usage(repo, &identity, &request).await {
-        Ok(refused) => refused,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
+    if let Err(e) = record_user_usage(repo, enforcer, &identity, &request).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     match user_rate_limit_usage(repo, &identity).await {
         Ok(items) => {
             let count = items.len();
@@ -597,7 +590,7 @@ pub(crate) async fn user_usage_record_response(
                 Json(serde_json::json!({
                     "usage": items,
                     "count": count,
-                    "refused": refused,
+                    "refused": [],
                 })),
             )
                 .into_response()
@@ -615,25 +608,24 @@ pub(crate) async fn user_usage_record_response(
 /// identity's own tenant claim and its `sub`, through
 /// [`PostgresWindowEnforcer::scope_parts`].
 ///
-/// Each charge goes through the policy the writers resolve and the Postgres
-/// window enforcer's `check_and_increment`, the stored half of the writers'
-/// enforcer. A window that refuses a charge stores it in no window of its
-/// resource, and is returned. Per-minute is the burst enforcer's, counted in
-/// memory where the writers run and never stored, and is not charged here.
+/// Each charge goes through the policy the writers resolve and the writers'
+/// enforcer's `record`, which stores it in every stored window without
+/// comparing it against the limit: the usage was already spent. Per-minute is
+/// the burst enforcer's, counted in memory where the writers run and never
+/// stored, and is not charged here.
 pub(crate) async fn record_user_usage(
     repo: &RateLimitOverrideRepository,
+    enforcer: &dyn RateLimitEnforcer,
     identity: &UserIdentity,
     request: &UserUsageRecordRequest,
-) -> Result<Vec<RefusedWindow>, aegis_orchestrator_core::domain::rate_limit::RateLimitError> {
+) -> Result<(), aegis_orchestrator_core::domain::rate_limit::RateLimitError> {
     let tenant_id = resolve_effective_tenant(Some(identity), None);
     let scope = RateLimitScope::User {
         tenant_id: tenant_id.clone(),
         user_id: identity.sub.clone(),
     };
     let resolver = HierarchicalPolicyResolver::new(repo.pool().clone());
-    let enforcer = PostgresWindowEnforcer::new(repo.pool().clone());
 
-    let mut refused = Vec::new();
     for (resource_type, cost) in [
         (RateLimitResourceType::LlmCall, request.llm_calls),
         (RateLimitResourceType::LlmToken, request.llm_tokens),
@@ -644,14 +636,9 @@ pub(crate) async fn record_user_usage(
         let policy = resolver
             .resolve_policy(identity, &tenant_id, &resource_type)
             .await?;
-        if let Err((bucket, _)) = enforcer.check_and_increment(&scope, &policy, cost).await {
-            refused.push(RefusedWindow {
-                resource_type: resource_type_to_db_str(&resource_type),
-                bucket: bucket_to_str(&bucket),
-            });
-        }
+        enforcer.record(&scope, &policy, cost).await?;
     }
-    Ok(refused)
+    Ok(())
 }
 
 /// The buckets the Postgres window enforcer stores; per-minute is not one.

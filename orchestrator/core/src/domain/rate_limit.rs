@@ -157,6 +157,18 @@ pub trait RateLimitEnforcer: Send + Sync {
         scope: &RateLimitScope,
         policy: &RateLimitPolicy,
     ) -> Result<HashMap<RateLimitBucket, u64>, RateLimitError>;
+
+    /// Store `cost` in every stored window of `policy` for `scope` without
+    /// comparing it against the limit: usage already spent elsewhere is
+    /// recorded whatever the windows hold. The per-minute window is counted
+    /// in memory by the process that charges it, and a record neither
+    /// charges nor stores it.
+    async fn record(
+        &self,
+        scope: &RateLimitScope,
+        policy: &RateLimitPolicy,
+        cost: u64,
+    ) -> Result<(), RateLimitError>;
 }
 
 // ---------------------------------------------------------------------------

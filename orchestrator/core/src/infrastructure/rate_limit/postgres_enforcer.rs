@@ -198,6 +198,66 @@ impl PostgresWindowEnforcer {
         Ok(remaining)
     }
 
+    /// Store `cost` in every non-PerMinute window of `policy` for `scope`
+    /// without comparing it against the limit.
+    ///
+    /// The charge is stored as [`Self::check_and_increment`] stores an
+    /// admitted one, in one transaction under the same advisory lock, so a
+    /// concurrent check sums either none or all of the record's windows.
+    pub async fn record(
+        &self,
+        scope: &RateLimitScope,
+        policy: &RateLimitPolicy,
+        cost: u64,
+    ) -> Result<(), RateLimitError> {
+        let (scope_type, scope_id) = Self::scope_parts(scope);
+        let resource_type = Self::resource_type_str(&policy.resource_type);
+        let buckets: Vec<_> = policy
+            .windows
+            .keys()
+            .filter(|bucket| **bucket != RateLimitBucket::PerMinute) // GovernorBurstEnforcer's
+            .collect();
+        if buckets.is_empty() {
+            return Ok(());
+        }
+        let storage_failed = |e: sqlx::Error| RateLimitError::StorageError(e.to_string());
+
+        let mut tx = self.pool.begin().await.map_err(storage_failed)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "rate_limit:{scope_type}:{scope_id}:{resource_type}"
+            ))
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_failed)?;
+
+        let now = Utc::now();
+        for bucket in buckets {
+            sqlx::query(
+                r#"
+                INSERT INTO rate_limit_counters
+                    (scope_type, scope_id, resource_type, bucket, window_start, counter)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (scope_type, scope_id, resource_type, bucket, window_start)
+                DO UPDATE SET counter = rate_limit_counters.counter + $6,
+                              updated_at = NOW()
+                "#,
+            )
+            .bind(scope_type)
+            .bind(&scope_id)
+            .bind(&resource_type)
+            .bind(Self::bucket_str(bucket))
+            .bind(Self::window_start(now, bucket))
+            .bind(cost as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_failed)?;
+        }
+        tx.commit().await.map_err(storage_failed)?;
+
+        Ok(())
+    }
+
     /// Query current remaining quota for all non-PerMinute windows without
     /// incrementing counters: each window's limit less the sum of the
     /// charges inside it.

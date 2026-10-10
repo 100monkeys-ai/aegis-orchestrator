@@ -420,3 +420,58 @@ async fn the_cleanup_keeps_a_daily_charge_inside_its_day() {
 
     db.remove().await;
 }
+
+/// The sum of the counters stored in one bucket.
+async fn sum_in(pool: &PgPool, bucket: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(counter), 0)::BIGINT FROM rate_limit_counters WHERE bucket = $1",
+    )
+    .bind(bucket)
+    .fetch_one(pool)
+    .await
+    .expect("sum a bucket's counters")
+}
+
+#[tokio::test]
+async fn a_record_is_stored_hourly_to_monthly_past_the_limit_and_not_per_minute() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let enforcer = PostgresWindowEnforcer::new(db.pool.clone());
+    let policy = policy(&[
+        (RateLimitBucket::PerMinute, 3),
+        (RateLimitBucket::Hourly, 3),
+        (RateLimitBucket::Daily, 3),
+        (RateLimitBucket::Weekly, 3),
+        (RateLimitBucket::Monthly, 3),
+    ]);
+
+    // Twice, five each time: over every window's limit of 3 from the first.
+    for _ in 0..2 {
+        enforcer
+            .record(&scope(), &policy, 5)
+            .await
+            .expect("a record compares nothing against the limit");
+    }
+
+    for bucket in ["hourly", "daily", "weekly", "monthly"] {
+        assert_eq!(
+            sum_in(&db.pool, bucket).await,
+            10,
+            "two records of 5 are stored in the {bucket} window past its limit of 3"
+        );
+    }
+    assert_eq!(
+        rows_in(&db.pool, "per_minute").await,
+        0,
+        "per-minute is counted in memory and a record stores no row of it"
+    );
+    let remaining = enforcer.remaining(&scope(), &policy).await.unwrap();
+    assert_eq!(
+        remaining.get(&RateLimitBucket::Monthly),
+        Some(&0),
+        "the window's reader sums the recorded charges"
+    );
+
+    db.remove().await;
+}

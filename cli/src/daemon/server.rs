@@ -2956,6 +2956,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         rate_limit_override_repo: db_pool.as_ref().map(|pool| {
             Arc::new(aegis_orchestrator_core::infrastructure::rate_limit::RateLimitOverrideRepository::new(pool.clone()))
         }),
+        rate_limit_enforcer: rate_limit_enforcer.clone(),
         api_key_repo: db_pool.as_ref().map(|pool| {
             Arc::new(aegis_orchestrator_core::infrastructure::repositories::PostgresApiKeyRepository::new(pool.clone()))
         }),

@@ -71,6 +71,10 @@ pub(crate) struct AppState {
     pub(crate) rate_limit_override_repo: Option<
         Arc<aegis_orchestrator_core::infrastructure::rate_limit::RateLimitOverrideRepository>,
     >,
+    /// The daemon's rate-limit enforcer (ADR-072), the one the writers
+    /// charge; `POST /v1/user/rate-limits/usage` records through it.
+    pub(crate) rate_limit_enforcer:
+        Option<Arc<dyn aegis_orchestrator_core::domain::rate_limit::RateLimitEnforcer>>,
     pub(crate) api_key_repo: Option<
         Arc<aegis_orchestrator_core::infrastructure::repositories::PostgresApiKeyRepository>,
     >,

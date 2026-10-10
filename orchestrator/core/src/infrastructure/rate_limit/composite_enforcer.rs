@@ -207,6 +207,17 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
 
         Ok(result)
     }
+
+    /// Delegates to the stored half: the PostgreSQL windows keep the record,
+    /// and the in-memory per-minute bucket is neither charged nor stored.
+    async fn record(
+        &self,
+        scope: &RateLimitScope,
+        policy: &RateLimitPolicy,
+        cost: u64,
+    ) -> Result<(), RateLimitError> {
+        self.postgres.record(scope, policy, cost).await
+    }
 }
 
 /// Extract `(user_id, tenant_id)` from a [`RateLimitScope`] for event payloads.

@@ -356,5 +356,14 @@ mod tests {
         > {
             Ok(Default::default())
         }
+
+        async fn record(
+            &self,
+            _scope: &RateLimitScope,
+            _policy: &crate::domain::rate_limit::RateLimitPolicy,
+            _cost: u64,
+        ) -> Result<(), RateLimitError> {
+            Ok(())
+        }
     }
 }

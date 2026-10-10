@@ -241,19 +241,32 @@ async fn a_charge_older_than_the_window_is_not_counted() {
 // ----------------------------------------------------------------------
 
 use super::{user_usage_record_response, UserUsageRecordRequest};
+use aegis_orchestrator_core::domain::rate_limit::RateLimitEnforcer;
+use aegis_orchestrator_core::infrastructure::rate_limit::{
+    CompositeRateLimitEnforcer, GovernorBurstEnforcer,
+};
 use axum::http::StatusCode;
 use axum::Json;
+use std::sync::Arc;
 
 /// Record `llm_calls` and `llm_tokens` for `identity` through the route's
-/// answer and return its status and JSON body.
+/// answer and return its status and JSON body. The enforcer is the daemon's
+/// composite, as `AppState` carries it, on the repository's database.
 async fn record(
     repo: Option<&RateLimitOverrideRepository>,
     identity: Option<UserIdentity>,
     llm_calls: u64,
     llm_tokens: u64,
 ) -> (StatusCode, serde_json::Value) {
+    let enforcer = repo.map(|repo| {
+        CompositeRateLimitEnforcer::new(
+            Arc::new(GovernorBurstEnforcer::new()),
+            Arc::new(PostgresWindowEnforcer::new(repo.pool().clone())),
+        )
+    });
     let response = user_usage_record_response(
         repo,
+        enforcer.as_ref().map(|e| e as &dyn RateLimitEnforcer),
         identity,
         Ok(Json(UserUsageRecordRequest {
             llm_calls,
@@ -428,7 +441,7 @@ async fn the_route_leaves_the_per_minute_burst_as_the_writers_leave_it() {
 }
 
 #[tokio::test]
-async fn a_refused_window_answers_200_with_the_refusal_and_stores_nothing() {
+async fn a_record_over_the_hourly_limit_is_stored_and_the_get_reads_it() {
     let Some(db) = TestDb::create().await else {
         return;
     };
@@ -436,13 +449,15 @@ async fn a_refused_window_answers_200_with_the_refusal_and_stores_nothing() {
     let alice = consumer("record-alice");
 
     // 101 calls are over the Free tier's hourly limit of 100 and within its
-    // daily, weekly and monthly ones; the 50 tokens are within every window.
+    // daily, weekly and monthly ones. The route records usage the client has
+    // already spent, so it compares nothing against the limit: every stored
+    // window keeps the charge, and no window is named as refusing it.
     let (status, body) = record(Some(&repo), Some(alice.clone()), 101, 50).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["refused"],
-        serde_json::json!([{ "resource_type": "llm_call", "bucket": "hourly" }]),
-        "the hourly call window refuses"
+        serde_json::json!([]),
+        "a record refuses nothing, over the hourly limit or not"
     );
 
     let items = user_rate_limit_usage(&repo, &alice)
@@ -451,13 +466,13 @@ async fn a_refused_window_answers_200_with_the_refusal_and_stores_nothing() {
     for bucket in ["hourly", "daily", "weekly", "monthly"] {
         assert_eq!(
             count(&items, "llm_call", bucket),
-            0,
-            "a refused charge is stored in no {bucket} window"
+            101,
+            "101 recorded calls read as 101 in the {bucket} window"
         );
         assert_eq!(
             count(&items, "llm_token", bucket),
             50,
-            "the tokens no window refused are stored in the {bucket} window"
+            "50 recorded tokens read as 50 in the {bucket} window"
         );
     }
     db.remove().await;
