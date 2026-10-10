@@ -389,6 +389,28 @@ fn the_forges_states_are_f4s_table() {
         }
     }
 
+    // F4 and F11: a gate's "no, with feedback" re-enters ANALYZE or ARCHITECT
+    // with the person's words, right after the line naming their answer.
+    for name in ["ANALYZE", "ARCHITECT"] {
+        if let StateKind::Agent { input, .. } = &state(&workflow, name).kind {
+            let lines: Vec<&str> = input.lines().collect();
+            let after_answer = lines
+                .iter()
+                .position(|l| l.starts_with("The person answered "))
+                .map(|i| lines[i + 1..].iter().take(3).copied().collect::<Vec<_>>());
+            let expected = [
+                "{{#if human.feedback}}",
+                "Their words: {{{human.feedback}}}",
+                "{{/if}}",
+            ];
+            if after_answer.as_deref() != Some(&expected[..]) {
+                complaints.push(format!(
+                    "{name}'s input does not read human.feedback after the person's answer: {after_answer:?}"
+                ));
+            }
+        }
+    }
+
     match &state(&workflow, "EXECUTE_TESTS").kind {
         StateKind::ContainerRun {
             image,

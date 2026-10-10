@@ -1835,6 +1835,7 @@ mod cancel_path_tests {
             _: &TenantId,
             _: ExecutionId,
             _: &str,
+            _: Option<&str>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("not exercised".into())
         }

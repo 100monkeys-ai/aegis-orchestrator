@@ -891,6 +891,10 @@ impl ToolInvocationService {
                 )
             })?
             .to_string();
+        let feedback = args
+            .get("feedback")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         // Pre-flight tenant validation against the workflow execution
         // repository — a foreign-tenant execution must not receive a signal.
@@ -925,7 +929,7 @@ impl ToolInvocationService {
         };
 
         match port
-            .signal_workflow_execution(&tenant_id, exec_id, &response)
+            .signal_workflow_execution(&tenant_id, exec_id, &response, feedback.as_deref())
             .await
         {
             Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({

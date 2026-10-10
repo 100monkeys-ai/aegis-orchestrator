@@ -92,6 +92,9 @@ spec:
 
         # Your last requirements were sent back
         The person answered "{{AWAIT_REQUIREMENTS_APPROVAL.response}}" to them. Write them again, closer to the task.
+        {{#if human.feedback}}
+        Their words: {{{human.feedback}}}
+        {{/if}}
         {{/if}}
 
         Answer with the functional requirements, the non-functional requirements and the acceptance criteria, each numbered and each checkable by a test.
@@ -137,6 +140,9 @@ spec:
 
         # Your last design was sent back
         The person answered "{{AWAIT_ARCH_APPROVAL.response}}" to it. Design it again, closer to the requirements.
+        {{#if human.feedback}}
+        Their words: {{{human.feedback}}}
+        {{/if}}
         {{/if}}
 
         Design the change against the requirements and the repository's own conventions. Name every file to change or create, by its path under {{repository.path}}, with what changes in it, and name the tests that will show each acceptance criterion met.

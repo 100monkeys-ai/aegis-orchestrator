@@ -649,6 +649,10 @@ pub(crate) async fn get_workflow_execution_handler(
 #[derive(serde::Deserialize)]
 pub(crate) struct WorkflowSignalRequest {
     response: String,
+    /// The person's feedback with the response, read by the workflow as
+    /// `{{human.feedback}}`.
+    #[serde(default)]
+    feedback: Option<String>,
 }
 
 /// POST /v1/workflows/executions/:execution_id/signal
@@ -713,7 +717,7 @@ pub(crate) async fn signal_workflow_execution_handler(
     drop(guard);
 
     match client
-        .send_human_signal(&execution_id, request.response)
+        .send_human_signal(&execution_id, request.response, request.feedback.as_deref())
         .await
     {
         Ok(()) => Ok((
@@ -729,6 +733,32 @@ pub(crate) async fn signal_workflow_execution_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response()),
+    }
+}
+
+#[cfg(test)]
+mod signal_request_tests {
+    use super::WorkflowSignalRequest;
+
+    /// The person's feedback travels with the response, read by the workflow
+    /// as `{{human.feedback}}`.
+    #[test]
+    fn a_signal_request_reads_the_persons_feedback() {
+        let request: WorkflowSignalRequest = serde_json::from_value(
+            serde_json::json!({"response": "no", "feedback": "their words"}),
+        )
+        .unwrap();
+        assert_eq!(request.response, "no");
+        assert_eq!(request.feedback.as_deref(), Some("their words"));
+    }
+
+    /// A request with no feedback is the response alone.
+    #[test]
+    fn a_signal_request_without_feedback_carries_none() {
+        let request: WorkflowSignalRequest =
+            serde_json::from_value(serde_json::json!({"response": "yes"})).unwrap();
+        assert_eq!(request.response, "yes");
+        assert_eq!(request.feedback, None);
     }
 }
 

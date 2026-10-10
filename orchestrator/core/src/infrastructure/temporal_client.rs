@@ -242,25 +242,37 @@ impl TemporalClient {
     ///
     /// Workflows using `StateKind::Human` call `defineSignal('humanInput')` and
     /// `await condition(...)` — they resume only when this signal arrives.
-    /// The `response` string is JSON-encoded and forwarded as the signal payload.
+    /// The `response` string is JSON-encoded and forwarded as the signal's first
+    /// payload; the person's `feedback`, when there is one, follows it as a
+    /// second JSON-encoded payload, read by the worker's
+    /// `defineSignal<[string, string?]>('humanInput')` as `{{human.feedback}}`.
     ///
     /// # gRPC Endpoint
     ///
     /// `WorkflowService.SignalWorkflowExecution` — the signal is sent directly to
     /// Temporal Server without an extra HTTP hop through the TypeScript worker.
-    pub async fn send_human_signal(&self, execution_id: &str, response: String) -> Result<()> {
+    pub async fn send_human_signal(
+        &self,
+        execution_id: &str,
+        response: String,
+        feedback: Option<&str>,
+    ) -> Result<()> {
         use crate::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution;
         use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::SignalWorkflowExecutionRequest;
 
-        let json_bytes = serde_json::to_vec(&response)?;
-        let mut metadata = HashMap::new();
-        metadata.insert("encoding".to_string(), "json/plain".as_bytes().to_vec());
-
-        let payload = Payload {
-            metadata,
-            data: json_bytes,
-            ..Default::default()
+        let json_payload = |value: &str| -> Result<Payload> {
+            let mut metadata = HashMap::new();
+            metadata.insert("encoding".to_string(), "json/plain".as_bytes().to_vec());
+            Ok(Payload {
+                metadata,
+                data: serde_json::to_vec(value)?,
+                ..Default::default()
+            })
         };
+        let mut payloads = vec![json_payload(&response)?];
+        if let Some(feedback) = feedback {
+            payloads.push(json_payload(feedback)?);
+        }
 
         let request = SignalWorkflowExecutionRequest {
             namespace: self.namespace.clone(),
@@ -269,9 +281,7 @@ impl TemporalClient {
                 run_id: String::new(),
             }),
             signal_name: "humanInput".to_string(),
-            input: Some(Payloads {
-                payloads: vec![payload],
-            }),
+            input: Some(Payloads { payloads }),
             identity: "aegis-orchestrator".to_string(),
             request_id: Uuid::new_v4().to_string(),
             ..Default::default()

@@ -1686,6 +1686,10 @@ impl ToolRouter {
                 "response": {
                     "type": "string",
                     "description": "Human input response text to send to the paused workflow."
+                },
+                "feedback": {
+                    "type": "string",
+                    "description": "The person's feedback with the response, read by the workflow as {{human.feedback}}."
                 }
             },
             "required": ["execution_id", "response"]
