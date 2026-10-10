@@ -129,6 +129,19 @@ pub trait RateLimitPolicyResolver: Send + Sync {
     ) -> Result<RateLimitPolicy, RateLimitError>;
 }
 
+/// Where the policy resolver reads a consumer user's tier (ADR-072 §4,
+/// step 3): the store the `zaru_tier` claim is written from, not the claim
+/// an identity carries. A writer that rebuilds an identity (an execution's
+/// initiating user, a schedule's stored owner) has no live claim, so the
+/// claim it carries is a guess; the store holds the subscriber's tier.
+#[async_trait]
+pub trait ConsumerTierSource: Send + Sync {
+    /// The effective tier of the consumer user `sub`, or `None` when the
+    /// store holds nothing for that user (no subscription and no active
+    /// membership), in which case the identity's own claim stands.
+    async fn consumer_tier(&self, sub: &str) -> Result<Option<ZaruTier>, RateLimitError>;
+}
+
 /// Enforces rate limits by checking and atomically incrementing counters.
 #[async_trait]
 pub trait RateLimitEnforcer: Send + Sync {

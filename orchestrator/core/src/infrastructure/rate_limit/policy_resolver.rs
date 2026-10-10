@@ -10,28 +10,155 @@
 //! 3. **Tier default** — [`tier_defaults`] for the resolved [`ZaruTier`]
 //!
 //! The first level that produces at least one row wins for that resource type.
+//!
+//! A consumer user's tier is read from the store the `zaru_tier` claim is
+//! written from ([`EffectiveTierService::compute_effective_tier`]), through
+//! the [`ConsumerTierSource`] port, because the writers rebuild the
+//! identity they pass (an execution's initiating user, a schedule's stored
+//! owner) and the claim it carries is not the subscriber's live tier.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
+use crate::application::effective_tier_service::{
+    EffectiveTierError, EffectiveTierService, StandardEffectiveTierService, TierSyncPort,
+    UserClaims,
+};
 use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use crate::domain::rate_limit::{
-    tier_defaults, RateLimitBucket, RateLimitError, RateLimitPolicy, RateLimitPolicyResolver,
-    RateLimitResourceType, RateLimitWindow,
+    tier_defaults, ConsumerTierSource, RateLimitBucket, RateLimitError, RateLimitPolicy,
+    RateLimitPolicyResolver, RateLimitResourceType, RateLimitWindow,
 };
+use crate::domain::team::MembershipRepository;
 use crate::domain::tenant::TenantId;
+use crate::infrastructure::repositories::{
+    BillingRepository, PgMembershipRepository, PgTeamRepository, PostgresBillingRepository,
+};
+
+/// A consumer's tier from the orchestrator's database: the effective tier
+/// [`EffectiveTierService::compute_effective_tier`] computes, the value the
+/// Keycloak `zaru_tier` claim is written from. A user the store holds
+/// nothing for (no subscription row, no active membership) answers `None`.
+pub struct EffectiveTierSource {
+    tiers: Arc<dyn EffectiveTierService>,
+    billing: Arc<dyn BillingRepository>,
+    memberships: Arc<dyn MembershipRepository>,
+}
+
+impl EffectiveTierSource {
+    /// The store in `pool`, read only.
+    pub fn from_pool(pool: PgPool) -> Self {
+        let billing: Arc<dyn BillingRepository> =
+            Arc::new(PostgresBillingRepository::new(pool.clone()));
+        let memberships: Arc<dyn MembershipRepository> =
+            Arc::new(PgMembershipRepository::new(pool.clone()));
+        let tiers = Arc::new(StandardEffectiveTierService::new(
+            Arc::new(PgTeamRepository::new(pool)),
+            memberships.clone(),
+            billing.clone(),
+            Arc::new(NoClaimWrites),
+        ));
+        Self {
+            tiers,
+            billing,
+            memberships,
+        }
+    }
+}
+
+/// The resolver computes tiers and writes no claim: the tier service it
+/// reads through is given a sync port that refuses every write.
+struct NoClaimWrites;
+
+#[async_trait]
+impl TierSyncPort for NoClaimWrites {
+    async fn set_claims(&self, _: &str, _: &UserClaims) -> Result<(), EffectiveTierError> {
+        Err(EffectiveTierError::TierSync(
+            "the rate-limit resolver reads tiers and writes no claim".into(),
+        ))
+    }
+}
+
+#[async_trait]
+impl ConsumerTierSource for EffectiveTierSource {
+    async fn consumer_tier(&self, sub: &str) -> Result<Option<ZaruTier>, RateLimitError> {
+        let failed = |e: String| RateLimitError::PolicyResolutionFailed(e);
+        let Ok(personal_tenant) = TenantId::for_consumer_user(sub) else {
+            return Ok(None);
+        };
+        let subscribed = self
+            .billing
+            .get_subscription(&personal_tenant)
+            .await
+            .map_err(|e| failed(format!("get_subscription: {e}")))?
+            .is_some();
+        if !subscribed
+            && self
+                .memberships
+                .find_active_for_user(sub)
+                .await
+                .map_err(|e| failed(format!("find_active_for_user: {e}")))?
+                .is_empty()
+        {
+            return Ok(None);
+        }
+        let tier = self
+            .tiers
+            .compute_effective_tier(sub)
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+        Ok(ZaruTier::from_claim(tier.as_keycloak_str()))
+    }
+}
 
 /// Resolves rate-limit policies using the override hierarchy:
 /// user → tenant → tier defaults.
 pub struct HierarchicalPolicyResolver {
     pool: PgPool,
+    consumer_tiers: Arc<dyn ConsumerTierSource>,
 }
 
 impl HierarchicalPolicyResolver {
+    /// Overrides from `pool`, and a consumer's tier from the effective tier
+    /// the same database holds ([`EffectiveTierSource`]).
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        let consumer_tiers = Arc::new(EffectiveTierSource::from_pool(pool.clone()));
+        Self {
+            pool,
+            consumer_tiers,
+        }
+    }
+
+    /// Read a consumer's tier from `source` instead.
+    pub fn with_consumer_tiers(mut self, source: Arc<dyn ConsumerTierSource>) -> Self {
+        self.consumer_tiers = source;
+        self
+    }
+
+    /// The tier a policy's defaults are taken from: for a consumer user the
+    /// effective tier the store holds, or the identity's claim when the store
+    /// holds nothing for the user or cannot be read; for every other
+    /// identity kind, [`Self::resolve_tier`].
+    async fn tier_for(&self, identity: &UserIdentity) -> ZaruTier {
+        let claimed = Self::resolve_tier(identity);
+        if !matches!(identity.identity_kind, IdentityKind::ConsumerUser { .. }) {
+            return claimed;
+        }
+        match self.consumer_tiers.consumer_tier(&identity.sub).await {
+            Ok(Some(tier)) => tier,
+            Ok(None) => claimed,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %identity.sub,
+                    error = %e,
+                    "effective tier unreadable; the identity's claim stands"
+                );
+                claimed
+            }
+        }
     }
 
     /// Derive the [`ZaruTier`] from the authenticated identity.
@@ -187,7 +314,7 @@ impl RateLimitPolicyResolver for HierarchicalPolicyResolver {
         }
 
         // 3. Tier defaults (lowest priority)
-        let tier = Self::resolve_tier(identity);
+        let tier = self.tier_for(identity).await;
         let defaults = tier_defaults(&tier);
         let policy = defaults
             .into_iter()
@@ -295,6 +422,80 @@ mod tests {
             HierarchicalPolicyResolver::resolve_tier(&identity),
             ZaruTier::Enterprise
         );
+    }
+
+    /// A tier store answering one value for every user.
+    struct FixedTiers(Result<Option<ZaruTier>, ()>);
+
+    #[async_trait]
+    impl ConsumerTierSource for FixedTiers {
+        async fn consumer_tier(&self, _: &str) -> Result<Option<ZaruTier>, RateLimitError> {
+            self.0
+                .clone()
+                .map_err(|_| RateLimitError::PolicyResolutionFailed("unreachable".into()))
+        }
+    }
+
+    /// A resolver whose pool is never connected: `tier_for` reads only the
+    /// tier store.
+    fn resolver_over(tiers: FixedTiers) -> HierarchicalPolicyResolver {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .unwrap();
+        HierarchicalPolicyResolver::new(pool).with_consumer_tiers(Arc::new(tiers))
+    }
+
+    fn consumer_claiming(zaru_tier: ZaruTier) -> UserIdentity {
+        UserIdentity {
+            sub: "u-5".into(),
+            realm_slug: "zaru-consumer".into(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier,
+                tenant_id: crate::domain::tenant::TenantId::consumer(),
+            },
+        }
+    }
+
+    /// A consumer rebuilt at Free whose stored tier is Pro resolves Pro.
+    #[tokio::test]
+    async fn a_consumers_stored_tier_replaces_the_rebuilt_claim() {
+        let resolver = resolver_over(FixedTiers(Ok(Some(ZaruTier::Pro))));
+        assert_eq!(
+            resolver.tier_for(&consumer_claiming(ZaruTier::Free)).await,
+            ZaruTier::Pro
+        );
+    }
+
+    /// With nothing stored, or the store unreadable, the claim stands.
+    #[tokio::test]
+    async fn a_consumer_with_no_stored_tier_or_an_unreadable_store_keeps_the_claim() {
+        for tiers in [FixedTiers(Ok(None)), FixedTiers(Err(()))] {
+            let resolver = resolver_over(tiers);
+            assert_eq!(
+                resolver.tier_for(&consumer_claiming(ZaruTier::Pro)).await,
+                ZaruTier::Pro
+            );
+        }
+    }
+
+    /// The store is read for consumers only: an operator stays Enterprise.
+    #[tokio::test]
+    async fn an_operator_is_not_read_from_the_tier_store() {
+        let resolver = resolver_over(FixedTiers(Ok(Some(ZaruTier::Free))));
+        let operator = UserIdentity {
+            sub: "u-6".into(),
+            realm_slug: "aegis-system".into(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind: IdentityKind::Operator {
+                aegis_role: crate::domain::iam::AegisRole::Admin,
+            },
+        };
+        assert_eq!(resolver.tier_for(&operator).await, ZaruTier::Enterprise);
     }
 
     #[test]
