@@ -6,7 +6,10 @@
 //! `BUILTIN_WORKFLOWS` and `BUILTIN_AGENTS`, parse through the orchestrator's
 //! own parsers, and hold F4's table of states and F10's tool lists.
 
-use aegis_orchestrator::commands::builtins::{BUILTIN_AGENTS, BUILTIN_WORKFLOWS};
+use aegis_orchestrator::commands::builtins::{
+    deploy_all_builtins, BUILTIN_AGENTS, BUILTIN_WORKFLOWS,
+};
+use aegis_orchestrator::daemon::DaemonClient;
 use aegis_orchestrator_core::application::temporal_mapper::TemporalWorkflowMapper;
 use aegis_orchestrator_core::domain::agent::ValidatorSpec;
 use aegis_orchestrator_core::domain::tenant::TenantId;
@@ -318,6 +321,9 @@ fn the_forges_states_are_f4s_table() {
                 "{\"agreement\":0.8,\"condition\":\"consensus\",\"threshold\":0.95} -> COMMIT"
                     .to_string(),
                 "{\"condition\":\"score_below\",\"threshold\":0.95} -> CODE".to_string(),
+                // A score at or over 0.95 with agreement under 0.8 matches
+                // neither: it re-enters CODE rather than ending the run.
+                "{\"condition\":\"always\"} -> CODE".to_string(),
             ],
         ),
         // F9: a failed commit fails the run; a commit with `draft_only` true
@@ -623,4 +629,63 @@ fn the_forges_agents_carry_f10s_tools() {
     }
 
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// The CLI's deploy of the built-ins (`aegis update`, `aegis agent`, `aegis
+/// workflow`) deploys the Forge: its loops are bounded by the engine's visit
+/// limits, so the deploy path refuses no cycle.
+#[tokio::test]
+async fn the_cli_deploy_path_deploys_the_forge() {
+    let mut server = mockito::Server::new_async().await;
+    let agents = server
+        .mock("POST", mockito::Matcher::Regex(r"^/v1/agents".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"agent_id":"00000000-0000-0000-0000-000000000001"}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = received.clone();
+    let workflows = server
+        .mock(
+            "POST",
+            mockito::Matcher::Regex(r"^/v1/workflows".to_string()),
+        )
+        .with_status(200)
+        .with_body_from_request(move |request| {
+            let body = request.body().map(|b| b.clone()).unwrap_or_default();
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&body).into_owned());
+            Vec::new()
+        })
+        .expect(BUILTIN_WORKFLOWS.len())
+        .create_async()
+        .await;
+
+    let url = server.url();
+    let (host, port) = url
+        .rsplit_once(':')
+        .expect("the mock server's url has a port");
+    let client = DaemonClient::new(host, port.parse().expect("a port")).expect("a client");
+    let deployed = deploy_all_builtins(&client, true).await;
+
+    assert!(
+        deployed.is_ok(),
+        "the CLI deploy of the built-ins refused: {:#}",
+        deployed.unwrap_err()
+    );
+    agents.assert_async().await;
+    workflows.assert_async().await;
+    let forges = received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.contains(r#"name: "the-forge""#))
+        .count();
+    assert_eq!(
+        forges, 1,
+        "the Forge's manifest reached the daemon {forges} times"
+    );
 }

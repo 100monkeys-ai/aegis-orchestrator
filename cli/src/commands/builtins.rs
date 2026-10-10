@@ -441,6 +441,13 @@ async fn deploy_builtin_agent(
         .context("Failed to deploy built-in template")
 }
 
+/// Deploy one built-in workflow template through the daemon.
+///
+/// The template is parsed before any request, so a malformed built-in fails
+/// here. A cycle is not refused: a built-in workflow loops by design (a gate
+/// sent back, a failed test run re-entering its coder), and the engine bounds
+/// every loop by its visit limits, `max_state_visits` per state and
+/// `max_total_transitions` per run (ADR-015, FSM Loop Guards).
 async fn deploy_builtin_workflow(
     client: &DaemonClient,
     name: &str,
@@ -449,15 +456,10 @@ async fn deploy_builtin_workflow(
 ) -> Result<()> {
     // Validate template before deployment regardless of branch — a malformed
     // built-in must surface immediately, not silently no-op past drift checks.
-    let parsed_template =
-        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
-            template_yaml,
-        )
-        .context("Failed to parse built-in workflow template YAML")?;
-    aegis_orchestrator_core::domain::workflow::WorkflowValidator::check_for_cycles(
-        &parsed_template,
+    aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+        template_yaml,
     )
-    .context("Built-in workflow template failed cycle validation")?;
+    .context("Failed to parse built-in workflow template YAML")?;
 
     if !force {
         if let Ok(deployed_json) = client.describe_workflow(name).await {

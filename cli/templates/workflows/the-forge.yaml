@@ -348,6 +348,10 @@ spec:
           feedback: |-
             The review scored the change {{AUDIT.consensus.score}}, below 0.95. The three reports:
             {{{json AUDIT.consensus.metadata.individual_outputs}}}
+        # A score at or over 0.95 with agreement under 0.8 matches neither:
+        # the change goes back to CODE rather than the run ending here.
+        - condition: always
+          target: CODE
 
     COMMIT:
       kind: System
