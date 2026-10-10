@@ -875,12 +875,17 @@ impl GitRepoService {
         author_name: &str,
         author_email: &str,
     ) -> Result<String, GitRepoError> {
+        // A run's commit carries a subject of at most 72 characters (AEGIS
+        // ADR-141 F4). An empty one is refused before this call by the
+        // repository step (`RepositoryActionError::NoMessage`); an agent's
+        // `aegis.git.commit` with one commits with an empty message.
+        let message = run_commit_message(message).unwrap_or_default();
         self.commit_as(
             Some(run),
             id,
             tenant_id,
             owner,
-            message,
+            &message,
             author_name,
             author_email,
         )
@@ -1935,7 +1940,7 @@ impl RepositoryActionAnswer {
 pub enum RepositoryActionError {
     #[error("unknown repository action '{0}': expected diff, commit or land")]
     UnknownAction(String),
-    #[error("a repository commit needs a message")]
+    #[error("a commit message needs a subject line")]
     NoMessage,
     #[error("workflow execution {0} not found")]
     RunNotFound(uuid::Uuid),
@@ -2395,6 +2400,47 @@ fn ensure_binding_ready(binding: &GitRepoBinding) -> Result<(), GitRepoError> {
     match &binding.status {
         GitRepoStatus::Ready => Ok(()),
         other => Err(GitRepoError::BindingBusy(format!("{other:?}"))),
+    }
+}
+
+/// The longest subject line a run's commit carries (AEGIS ADR-141 F4).
+pub const COMMIT_SUBJECT_LIMIT: usize = 72;
+
+/// A run's commit message as it is committed (AEGIS ADR-141 F4): the
+/// message trimmed of surrounding whitespace, its first line (the subject)
+/// cut to [`COMMIT_SUBJECT_LIMIT`] characters at the last word boundary
+/// before the limit where one exists (else at the limit), with nothing
+/// appended, and everything after the first line kept as written. An empty
+/// subject is refused with [`RepositoryActionError::NoMessage`].
+pub fn run_commit_message(message: &str) -> Result<String, RepositoryActionError> {
+    let message = message.trim();
+    let (subject, rest) = match message.split_once('\n') {
+        Some((subject, rest)) => (subject, Some(rest)),
+        None => (message, None),
+    };
+    let subject = capped_subject(subject.trim_end());
+    if subject.is_empty() {
+        return Err(RepositoryActionError::NoMessage);
+    }
+    Ok(match rest {
+        Some(rest) => format!("{subject}\n{rest}"),
+        None => subject.to_string(),
+    })
+}
+
+/// `subject` cut to [`COMMIT_SUBJECT_LIMIT`] characters, at the last
+/// whitespace before the limit where one exists.
+fn capped_subject(subject: &str) -> &str {
+    let Some((cut, next)) = subject.char_indices().nth(COMMIT_SUBJECT_LIMIT) else {
+        return subject;
+    };
+    let head = &subject[..cut];
+    if next.is_whitespace() {
+        return head.trim_end();
+    }
+    match head.rfind(char::is_whitespace) {
+        Some(space) if !head[..space].trim_end().is_empty() => head[..space].trim_end(),
+        _ => head,
     }
 }
 
@@ -3082,5 +3128,101 @@ mod tests {
                 // is that `NotYetImplemented` no longer fires.
             }
         }
+    }
+
+    /// A commit through `commit_for_run`'s message rule, on a fresh repository
+    /// with one change; answers HEAD's message as stored.
+    fn committed_message(message: &str) -> String {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        let repo = git2::Repository::init(workdir).expect("git init");
+        {
+            let sig = git2::Signature::now("Tester", "test@aegis.test").unwrap();
+            let mut index = repo.index().unwrap();
+            std::fs::write(workdir.join("README.md"), b"hi\n").unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        std::fs::write(workdir.join("CHANGE.md"), b"a change\n").unwrap();
+        let message = run_commit_message(message).expect("a message with a subject commits");
+        let sha = blocking_commit(workdir, &message, "Tester", "test@aegis.test").expect("commit");
+        let oid = git2::Oid::from_str(&sha).unwrap();
+        let stored = repo
+            .find_commit(oid)
+            .unwrap()
+            .message()
+            .unwrap()
+            .to_string();
+        stored
+    }
+
+    #[test]
+    fn a_long_single_line_message_commits_with_its_subject_cut_at_a_word_boundary() {
+        let message = "the-forge: name the validation judge code-quality-judge in each of the sample agents of the Forge up";
+        assert_eq!(message.chars().count(), 100);
+        let stored = committed_message(message);
+        assert!(
+            stored.chars().count() <= COMMIT_SUBJECT_LIMIT,
+            "the subject is {} characters: {stored:?}",
+            stored.chars().count()
+        );
+        assert!(
+            !stored.contains('\n'),
+            "a single line stays one line: {stored:?}"
+        );
+        assert!(
+            message.starts_with(&stored),
+            "the subject is the message's start: {stored:?}"
+        );
+        assert!(
+            message[stored.len()..].starts_with(' '),
+            "the cut is at a word boundary: {stored:?}"
+        );
+        assert_eq!(
+            stored,
+            "the-forge: name the validation judge code-quality-judge in each of the"
+        );
+    }
+
+    #[test]
+    fn a_message_with_a_body_keeps_its_body_unchanged() {
+        let body = "Body line one.\n\n  An indented line, kept as written.\n- a list item";
+        let message = format!(
+            "  \n the-forge: name the validation judge code-quality-judge in each of the sample agents of the Forge up  \n\n{body}\n\n"
+        );
+        let stored = committed_message(&message);
+        let (subject, kept) = stored.split_once("\n\n").expect("a subject and a body");
+        assert_eq!(
+            subject,
+            "the-forge: name the validation judge code-quality-judge in each of the"
+        );
+        assert_eq!(kept, body);
+    }
+
+    #[test]
+    fn an_empty_subject_is_refused_in_its_sentence() {
+        for message in ["", "   ", " \n\t\n "] {
+            match run_commit_message(message) {
+                Err(e) => assert_eq!(e.to_string(), "a commit message needs a subject line"),
+                Ok(m) => panic!("the message {message:?} committed as {m:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_message_is_committed_as_written_but_trimmed() {
+        assert_eq!(
+            run_commit_message("  the-forge: fix the typo\n").unwrap(),
+            "the-forge: fix the typo"
+        );
+        let word = "x".repeat(80);
+        assert_eq!(
+            run_commit_message(&word).unwrap(),
+            "x".repeat(COMMIT_SUBJECT_LIMIT),
+            "a subject with no word boundary is cut at the limit"
+        );
     }
 }
