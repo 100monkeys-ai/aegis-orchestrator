@@ -498,6 +498,157 @@ pub(crate) async fn user_rate_limit_usage(
     Ok(items)
 }
 
+/// The most model calls one `POST /v1/user/rate-limits/usage` records.
+pub(crate) const USAGE_RECORD_MAX_LLM_CALLS: u64 = 1_000;
+/// The most tokens one `POST /v1/user/rate-limits/usage` records.
+pub(crate) const USAGE_RECORD_MAX_LLM_TOKENS: u64 = 50_000_000;
+
+/// The body of `POST /v1/user/rate-limits/usage`: the model calls a client
+/// made for the caller and the tokens they used (Zaru ADR-0064 D3).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UserUsageRecordRequest {
+    pub llm_calls: u64,
+    pub llm_tokens: u64,
+}
+
+/// A window that refused a charge. A refused charge is stored in no window
+/// of its resource.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RefusedWindow {
+    pub resource_type: String,
+    pub bucket: String,
+}
+
+/// `POST /v1/user/rate-limits/usage`: record model usage for the caller.
+pub(crate) async fn record_user_rate_limit_usage_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    body: Result<Json<UserUsageRecordRequest>, JsonRejection>,
+) -> axum::response::Response {
+    user_usage_record_response(
+        state.rate_limit_override_repo.as_deref(),
+        identity.map(|Extension(id)| id),
+        body,
+    )
+    .await
+}
+
+/// The answer of `POST /v1/user/rate-limits/usage` (Zaru ADR-0064 D3).
+///
+/// The caller is the identity its own access token resolved to, as for the
+/// GET: none, or one with an empty `sub`, is refused 401. A body over the
+/// request bound is refused 400. Otherwise the calls and tokens are charged
+/// for the caller and the answer is 200 with the GET's usage view after the
+/// write, and the windows that refused a charge under `refused`.
+pub(crate) async fn user_usage_record_response(
+    repo: Option<&RateLimitOverrideRepository>,
+    identity: Option<UserIdentity>,
+    body: Result<Json<UserUsageRecordRequest>, JsonRejection>,
+) -> axum::response::Response {
+    let Some(identity) = identity.filter(|id| !id.sub.trim().is_empty()) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Authentication required"})),
+        )
+            .into_response();
+    };
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if request.llm_calls > USAGE_RECORD_MAX_LLM_CALLS
+        || request.llm_tokens > USAGE_RECORD_MAX_LLM_TOKENS
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "usage over the request bound"})),
+        )
+            .into_response();
+    }
+    let Some(repo) = repo else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Rate-limit override repository not configured"})),
+        )
+            .into_response();
+    };
+
+    let refused = match record_user_usage(repo, &identity, &request).await {
+        Ok(refused) => refused,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match user_rate_limit_usage(repo, &identity).await {
+        Ok(items) => {
+            let count = items.len();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "usage": items,
+                    "count": count,
+                    "refused": refused,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Charge the caller's model calls as `llm_call` and their tokens as
+/// `llm_token`, under the key every writer writes and the GET reads: the
+/// identity's own tenant claim and its `sub`, through
+/// [`PostgresWindowEnforcer::scope_parts`].
+///
+/// Each charge goes through the policy the writers resolve and the Postgres
+/// window enforcer's `check_and_increment`, the stored half of the writers'
+/// enforcer. A window that refuses a charge stores it in no window of its
+/// resource, and is returned. Per-minute is the burst enforcer's, counted in
+/// memory where the writers run and never stored, and is not charged here.
+pub(crate) async fn record_user_usage(
+    repo: &RateLimitOverrideRepository,
+    identity: &UserIdentity,
+    request: &UserUsageRecordRequest,
+) -> Result<Vec<RefusedWindow>, aegis_orchestrator_core::domain::rate_limit::RateLimitError> {
+    let tenant_id = resolve_effective_tenant(Some(identity), None);
+    let scope = RateLimitScope::User {
+        tenant_id: tenant_id.clone(),
+        user_id: identity.sub.clone(),
+    };
+    let resolver = HierarchicalPolicyResolver::new(repo.pool().clone());
+    let enforcer = PostgresWindowEnforcer::new(repo.pool().clone());
+
+    let mut refused = Vec::new();
+    for (resource_type, cost) in [
+        (RateLimitResourceType::LlmCall, request.llm_calls),
+        (RateLimitResourceType::LlmToken, request.llm_tokens),
+    ] {
+        if cost == 0 {
+            continue;
+        }
+        let policy = resolver
+            .resolve_policy(identity, &tenant_id, &resource_type)
+            .await?;
+        if let Err((bucket, _)) = enforcer.check_and_increment(&scope, &policy, cost).await {
+            refused.push(RefusedWindow {
+                resource_type: resource_type_to_db_str(&resource_type),
+                bucket: bucket_to_str(&bucket),
+            });
+        }
+    }
+    Ok(refused)
+}
+
 /// The buckets the Postgres window enforcer stores; per-minute is not one.
 const STORED_BUCKETS: [RateLimitBucket; 4] = [
     RateLimitBucket::Hourly,

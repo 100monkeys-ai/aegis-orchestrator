@@ -226,7 +226,8 @@ pub(crate) fn create_router(
         .route("/v1/cortex/metrics", get(get_cortex_metrics_handler))
         .route(
             "/v1/user/rate-limits/usage",
-            get(get_user_rate_limit_usage_handler),
+            get(get_user_rate_limit_usage_handler)
+                .post(crate::daemon::handlers::admin::record_user_rate_limit_usage_handler),
         )
         // API key management (ADR-093)
         .route(

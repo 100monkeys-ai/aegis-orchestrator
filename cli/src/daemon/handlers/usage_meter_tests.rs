@@ -233,3 +233,232 @@ async fn a_charge_older_than_the_window_is_not_counted() {
     );
     db.remove().await;
 }
+
+// ----------------------------------------------------------------------
+// `POST /v1/user/rate-limits/usage` (Zaru ADR-0064 D3): a client records the
+// model calls it made for the caller, under the caller's own token, into
+// the counters the writers write and the GET reads.
+// ----------------------------------------------------------------------
+
+use super::{user_usage_record_response, UserUsageRecordRequest};
+use axum::http::StatusCode;
+use axum::Json;
+
+/// Record `llm_calls` and `llm_tokens` for `identity` through the route's
+/// answer and return its status and JSON body.
+async fn record(
+    repo: Option<&RateLimitOverrideRepository>,
+    identity: Option<UserIdentity>,
+    llm_calls: u64,
+    llm_tokens: u64,
+) -> (StatusCode, serde_json::Value) {
+    let response = user_usage_record_response(
+        repo,
+        identity,
+        Ok(Json(UserUsageRecordRequest {
+            llm_calls,
+            llm_tokens,
+        })),
+    )
+    .await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read the answer's body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn the_route_records_two_calls_and_their_summed_tokens_and_the_get_reads_the_sum() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let alice = consumer("record-alice");
+
+    let (status, body) = record(Some(&repo), Some(alice.clone()), 1, 120).await;
+    assert_eq!(status, StatusCode::OK, "the first step is recorded: {body}");
+    let (status, body) = record(Some(&repo), Some(alice.clone()), 1, 80).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the second step is recorded: {body}"
+    );
+    assert_eq!(
+        body["refused"],
+        serde_json::json!([]),
+        "no window refuses two calls and 200 tokens"
+    );
+    let answered = body["usage"]
+        .as_array()
+        .expect("the answer carries the GET's usage view");
+    let hourly = |resource: &str| {
+        answered
+            .iter()
+            .find(|item| item["resource_type"] == resource && item["bucket"] == "hourly")
+            .unwrap_or_else(|| panic!("the answer carries no {resource} hourly item"))
+            ["current_count"]
+            .clone()
+    };
+    assert_eq!(hourly("llm_call"), 2, "the answer reads the two calls");
+    assert_eq!(
+        hourly("llm_token"),
+        200,
+        "the answer reads 120 and 80 tokens"
+    );
+
+    let items = user_rate_limit_usage(&repo, &alice)
+        .await
+        .expect("read the usage");
+    for bucket in ["hourly", "daily", "weekly", "monthly"] {
+        assert_eq!(
+            count(&items, "llm_call", bucket),
+            2,
+            "two recorded calls read as 2 in the {bucket} window"
+        );
+        assert_eq!(
+            count(&items, "llm_token", bucket),
+            200,
+            "120 and 80 recorded tokens read as 200 in the {bucket} window"
+        );
+    }
+    db.remove().await;
+}
+
+#[tokio::test]
+async fn a_record_over_the_request_bound_is_refused() {
+    let alice = consumer("record-alice");
+    for (calls, tokens) in [(1_001, 0), (0, 50_000_001)] {
+        let (status, body) = record(None, Some(alice.clone()), calls, tokens).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{calls} calls and {tokens} tokens are over the request bound"
+        );
+        assert_eq!(body["error"], "usage over the request bound");
+    }
+    // At the bound the request passes it and reaches the store, which this
+    // node does not have.
+    let (status, _) = record(None, Some(alice), 1_000, 50_000_000).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "1,000 calls and 50,000,000 tokens are within the request bound"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_with_no_identity_or_no_sub_is_refused() {
+    let mut no_sub = consumer("record-alice");
+    no_sub.sub = String::new();
+    for identity in [None, Some(no_sub)] {
+        let (status, body) = record(None, identity, 1, 1).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "Authentication required");
+    }
+}
+
+#[tokio::test]
+async fn recording_for_one_person_leaves_a_second_persons_counters_untouched() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let alice = consumer("record-alice");
+    let bob = consumer("record-bob");
+
+    let (status, body) = record(Some(&repo), Some(alice), 3, 300).await;
+    assert_eq!(status, StatusCode::OK, "alice's usage is recorded: {body}");
+
+    let items = user_rate_limit_usage(&repo, &bob)
+        .await
+        .expect("read the usage");
+    assert!(!items.is_empty(), "the usage carries the policy's windows");
+    for item in &items {
+        assert_eq!(
+            item.current_count, 0,
+            "bob reads 0 on {} {} after alice's record",
+            item.resource_type, item.bucket
+        );
+    }
+    db.remove().await;
+}
+
+#[tokio::test]
+async fn the_route_leaves_the_per_minute_burst_as_the_writers_leave_it() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let alice = consumer("record-alice");
+
+    // Over the Free tier's per-minute limits (20 calls, 20,000 tokens) and
+    // within its hourly ones (100 calls, 100,000 tokens). Per-minute is the
+    // in-memory burst enforcer's, which the writers charge in their own
+    // process and never store.
+    let (status, body) = record(Some(&repo), Some(alice.clone()), 30, 30_000).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["refused"],
+        serde_json::json!([]),
+        "no stored window refuses 30 calls and 30,000 tokens"
+    );
+
+    let (per_minute_rows,) = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM rate_limit_counters WHERE bucket = 'per_minute'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("count the per-minute rows");
+    assert_eq!(per_minute_rows, 0, "the route stores no per-minute row");
+
+    let items = user_rate_limit_usage(&repo, &alice)
+        .await
+        .expect("read the usage");
+    assert_eq!(count(&items, "llm_call", "hourly"), 30);
+    assert_eq!(count(&items, "llm_token", "hourly"), 30_000);
+    assert!(
+        items.iter().all(|item| item.bucket != "per_minute"),
+        "the usage carries no per_minute item"
+    );
+    db.remove().await;
+}
+
+#[tokio::test]
+async fn a_refused_window_answers_200_with_the_refusal_and_stores_nothing() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let alice = consumer("record-alice");
+
+    // 101 calls are over the Free tier's hourly limit of 100 and within its
+    // daily, weekly and monthly ones; the 50 tokens are within every window.
+    let (status, body) = record(Some(&repo), Some(alice.clone()), 101, 50).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["refused"],
+        serde_json::json!([{ "resource_type": "llm_call", "bucket": "hourly" }]),
+        "the hourly call window refuses"
+    );
+
+    let items = user_rate_limit_usage(&repo, &alice)
+        .await
+        .expect("read the usage");
+    for bucket in ["hourly", "daily", "weekly", "monthly"] {
+        assert_eq!(
+            count(&items, "llm_call", bucket),
+            0,
+            "a refused charge is stored in no {bucket} window"
+        );
+        assert_eq!(
+            count(&items, "llm_token", bucket),
+            50,
+            "the tokens no window refused are stored in the {bucket} window"
+        );
+    }
+    db.remove().await;
+}
