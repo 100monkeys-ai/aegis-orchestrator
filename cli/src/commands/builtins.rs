@@ -128,6 +128,34 @@ pub const BUILTIN_AGENTS: &[(&str, &str)] = &[
         AEGIS_DOCUMENT_RENDERER_AGENT_NAME,
         AEGIS_DOCUMENT_RENDERER_AGENT_TEMPLATE,
     ),
+    (
+        "requirements-analyst",
+        include_str!("../../templates/agents/requirements-analyst.yaml"),
+    ),
+    (
+        "architect-agent",
+        include_str!("../../templates/agents/architect-agent.yaml"),
+    ),
+    (
+        "tester-agent",
+        include_str!("../../templates/agents/tester-agent.yaml"),
+    ),
+    (
+        "coder-agent",
+        include_str!("../../templates/agents/coder-agent.yaml"),
+    ),
+    (
+        "code-reviewer-agent",
+        include_str!("../../templates/agents/code-reviewer-agent.yaml"),
+    ),
+    (
+        "critic-agent",
+        include_str!("../../templates/agents/critic-agent.yaml"),
+    ),
+    (
+        "security-auditor-agent",
+        include_str!("../../templates/agents/security-auditor-agent.yaml"),
+    ),
 ];
 
 /// Canonical registry of all built-in workflow templates.
@@ -140,6 +168,10 @@ pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
     (
         INTENT_EXECUTION_WORKFLOW_NAME,
         INTENT_EXECUTION_WORKFLOW_TEMPLATE,
+    ),
+    (
+        "the-forge",
+        include_str!("../../templates/workflows/the-forge.yaml"),
     ),
 ];
 

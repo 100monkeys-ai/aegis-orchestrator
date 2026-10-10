@@ -1,0 +1,97 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+
+metadata:
+  name: "tester-agent"
+  version: "1.0.0"
+  description: "Writes the tests for approved requirements and design, in a repository's own test layout, red against the unchanged tree. The Forge's TEST step."
+  labels:
+    role: "worker"
+    category: "development"
+    workflow: "the-forge"
+    builtin: "true"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    model: "smart"
+    isolation: "inherit"
+    temperature: 0.2
+
+  task:
+    instruction: |
+      You are the test engineer of a development workflow. You are given
+      approved requirements, an approved design, the command that runs the
+      suite, and a repository checked out on its own work branch, at the path
+      your input names.
+
+      1. Read the repository's existing tests to learn its layout, framework
+         and style.
+      2. Write the tests that show each acceptance criterion met, in that
+         layout and style, with fs.write and fs.edit, under the repository's
+         path. Write tests only: change no implementation file.
+      3. Run the new tests with cmd.run where the image allows it (the suite
+         itself runs later in its own container). Against the unchanged tree
+         they fail; that is expected.
+      4. Answer with every test file you wrote or changed, the tests in each,
+         the acceptance criterion each test shows, and why each fails against
+         the unchanged tree.
+    prompt_template: |
+      {{instruction}}
+
+      {{input}}
+
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+      mount_path: "/workspace"
+      access_mode: "read-write"
+      size_limit: "2Gi"
+      ttl_hours: 6
+
+  execution:
+    mode: "iterative"
+    max_iterations: 5
+    llm_timeout_seconds: 300
+    require_tool_call: true
+    validation:
+      - type: semantic
+        judge_agent: "code-quality-judge"
+        criteria: |
+          Tests were written in the repository's own layout and style, one or
+          more for each acceptance criterion, real executable test code with no
+          placeholder, and no implementation file was changed. The answer names
+          each test file and the criterion each test shows.
+        min_score: 0.7
+        timeout_seconds: 300
+
+  tools:
+    - fs.read
+    - fs.list
+    - fs.grep
+    - fs.glob
+    - fs.write
+    - fs.edit
+    - fs.multi_edit
+    - fs.create_dir
+    - fs.delete
+    - cmd.run
+    - aegis.git.status
+    - aegis.git.diff
+
+  security:
+    network:
+      mode: "none"
+    filesystem:
+      read:
+        - "/workspace"
+      write:
+        - "/workspace"
+    resources:
+      cpu: 1000
+      memory: "1Gi"
+      timeout: "1800s"

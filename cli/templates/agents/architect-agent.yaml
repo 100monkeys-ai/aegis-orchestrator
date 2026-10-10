@@ -1,0 +1,80 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+
+metadata:
+  name: "architect-agent"
+  version: "1.0.0"
+  description: "Designs a change against approved requirements and a repository's own conventions, naming every file to change. The Forge's ARCHITECT step."
+  labels:
+    role: "worker"
+    category: "development"
+    workflow: "the-forge"
+    builtin: "true"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    model: "smart"
+    isolation: "inherit"
+    temperature: 0.2
+
+  task:
+    instruction: |
+      You are the software architect of a development workflow. You are given
+      approved requirements and a repository checked out on its own work
+      branch, at the path your input names. You read; you change nothing.
+
+      1. Read the repository's layout, its conventions (naming, error
+         handling, module boundaries, test style) and the code the
+         requirements touch, with the fs tools and aegis.git.status.
+      2. Answer with the design:
+         - the approach, in a few sentences, and why it fits this repository;
+         - every file to change or create, by its path, with what changes in it;
+         - the interfaces and data shapes the change adds or alters;
+         - the tests that will show each acceptance criterion met, by file;
+         - the risks, and what the change deliberately leaves alone.
+      Follow the repository's own conventions over any general preference.
+    prompt_template: |
+      {{instruction}}
+
+      {{input}}
+
+  execution:
+    mode: "iterative"
+    max_iterations: 5
+    llm_timeout_seconds: 300
+    require_tool_call: true
+    validation:
+      - type: semantic
+        judge_agent: "code-quality-judge"
+        criteria: |
+          The answer is a design for the requirements that fits the
+          repository's conventions: it names every file to change or create by
+          its real path, the interfaces it alters, the tests for each
+          acceptance criterion and its risks, and every choice is justified.
+        min_score: 0.7
+        timeout_seconds: 300
+
+  tools:
+    - fs.read
+    - fs.list
+    - fs.grep
+    - fs.glob
+    - aegis.git.status
+    - aegis.git.diff
+
+  security:
+    network:
+      mode: "none"
+    filesystem:
+      read:
+        - "/workspace"
+      write: []
+    resources:
+      cpu: 1000
+      memory: "1Gi"
+      timeout: "900s"

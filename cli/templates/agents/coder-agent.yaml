@@ -1,0 +1,100 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+
+metadata:
+  name: "coder-agent"
+  version: "1.0.0"
+  description: "Changes a repository's implementation so that the tests written for it pass, following the approved design, never changing those tests. The Forge's CODE step."
+  labels:
+    role: "worker"
+    category: "development"
+    workflow: "the-forge"
+    builtin: "true"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    model: "smart"
+    isolation: "inherit"
+    temperature: 0.2
+
+  task:
+    instruction: |
+      You are the implementation engineer of a development workflow. You are
+      given approved requirements, an approved design, the tests written for
+      them, the command that runs the suite, and a repository checked out on
+      its own work branch, at the path your input names. When you are entered
+      again, your input also carries the last run of the suite or the last
+      review's reports.
+
+      1. Read the design, the tests and the code they touch.
+      2. Change the implementation with fs.edit, fs.multi_edit and fs.write,
+         as the design says and in the repository's own conventions. Never
+         change the tests the tester wrote, and never weaken a test to make it
+         pass.
+      3. Run what you can with cmd.run to check your change.
+      4. When your input carries a failed run of the suite, fix what its output
+         names; when it carries a review below 0.95, fix every suggestion the
+         reports make.
+      5. Answer with every file you changed, what changed in each, and how the
+         change meets each acceptance criterion. Commit nothing: the workflow
+         commits.
+    prompt_template: |
+      {{instruction}}
+
+      {{input}}
+
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+      mount_path: "/workspace"
+      access_mode: "read-write"
+      size_limit: "2Gi"
+      ttl_hours: 6
+
+  execution:
+    mode: "iterative"
+    max_iterations: 5
+    llm_timeout_seconds: 300
+    require_tool_call: true
+    validation:
+      - type: semantic
+        judge_agent: "code-quality-judge"
+        criteria: |
+          The implementation was changed as the design says, in the
+          repository's conventions, with errors handled and no placeholder; no
+          test the tester wrote was changed or weakened. The answer names each
+          changed file and how each acceptance criterion is met.
+        min_score: 0.7
+        timeout_seconds: 300
+
+  tools:
+    - fs.read
+    - fs.list
+    - fs.grep
+    - fs.glob
+    - fs.write
+    - fs.edit
+    - fs.multi_edit
+    - fs.create_dir
+    - fs.delete
+    - cmd.run
+    - aegis.git.status
+    - aegis.git.diff
+
+  security:
+    network:
+      mode: "none"
+    filesystem:
+      read:
+        - "/workspace"
+      write:
+        - "/workspace"
+    resources:
+      cpu: 1000
+      memory: "1Gi"
+      timeout: "1800s"

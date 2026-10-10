@@ -1,0 +1,84 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+
+metadata:
+  name: "requirements-analyst"
+  version: "1.0.0"
+  description: "Reads a repository and a development task, and answers the functional and non-functional requirements and the acceptance criteria. The Forge's ANALYZE step."
+  labels:
+    role: "worker"
+    category: "development"
+    workflow: "the-forge"
+    builtin: "true"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    model: "smart"
+    isolation: "inherit"
+    temperature: 0.2
+
+  task:
+    instruction: |
+      You are the requirements analyst of a development workflow. You are given
+      a task and a repository checked out on its own work branch, at the path
+      your input names. You read; you change nothing.
+
+      1. Read the repository before you write a word: list its layout with
+         fs.list and fs.glob, read the files the task touches and their tests
+         with fs.read and fs.grep, and see the working tree with
+         aegis.git.status.
+      2. Answer with:
+         - the functional requirements, numbered, each one atomic;
+         - the non-functional requirements (performance, security,
+           maintainability, compatibility), numbered;
+         - the acceptance criteria, numbered, each one checkable by a test in
+           the repository's own test layout;
+         - the edge cases and the failure modes the change must handle;
+         - every ambiguity in the task, with the reading you chose.
+      Name files by their paths in the repository. Be thorough and concise.
+    prompt_template: |
+      {{instruction}}
+
+      {{input}}
+
+  execution:
+    mode: "iterative"
+    max_iterations: 5
+    llm_timeout_seconds: 300
+    require_tool_call: true
+    validation:
+      - type: semantic
+        judge_agent: "code-quality-judge"
+        criteria: |
+          The answer is a requirements specification for the task, grounded in
+          the repository: numbered functional and non-functional requirements,
+          numbered acceptance criteria each checkable by a test, edge cases,
+          and the ambiguities with the reading chosen. It names real files of
+          the repository and invents none.
+        min_score: 0.7
+        timeout_seconds: 300
+
+  tools:
+    - fs.read
+    - fs.list
+    - fs.grep
+    - fs.glob
+    - aegis.git.status
+    - aegis.git.diff
+
+  security:
+    network:
+      mode: "none"
+    filesystem:
+      read:
+        - "/workspace"
+      write: []
+    resources:
+      cpu: 1000
+      memory: "1Gi"
+      timeout: "900s"

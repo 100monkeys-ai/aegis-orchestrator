@@ -1,0 +1,405 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+#
+# The Forge: a development workflow on one repository of the person's.
+#
+#   ANALYZE ─► AWAIT_REQUIREMENTS_APPROVAL ─yes─► ARCHITECT ─► AWAIT_ARCH_APPROVAL ─yes─► TEST
+#      ▲                 │ no                        ▲                  │ no                │
+#      └─────────────────┘                           └──────────────────┘                   ▼
+#   CODE ◄──────────── exit_code_non_zero ─── EXECUTE_TESTS ◄───────────────────────────── CODE
+#    ▲                                            │ exit_code_zero
+#    │ score_below 0.95                           ▼
+#    └────────────────────────── AUDIT ◄──────── DIFF
+#                                  │ consensus 0.95, agreement 0.8
+#                                  ▼
+#                               COMMIT ─ draft_only (default) ─► COMPLETE
+#                                  │ draft_only false
+#                                  ▼
+#                                LAND ─► COMPLETE, or LAND_REFUSED
+#
+# DIFF, COMMIT and LAND are the workflow interpreter's own repository steps,
+# and COMPLETE, FAILED and LAND_REFUSED its own blackboard writes: no state of
+# this workflow runs a shell command in the core process. The suite runs in a
+# container on the clone (EXECUTE_TESTS). The two Human gates are the only ones.
+
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "the-forge"
+  version: "2.0.0"
+  description: |-
+    Develops one change in one of your repositories: requirements and a design,
+    each approved by you, then tests written first, the implementation, your
+    test suite run in a container on the clone, a review by three judges, and a
+    commit on the run's work branch. With draft_only false, the commit then
+    lands on the repository's branch as a fast-forward after your approval.
+  labels:
+    builtin: "true"
+    category: "development"
+  input_schema:
+    type: object
+    properties:
+      task:
+        type: string
+        description: "What to change. Its first line names the commit."
+      test_command:
+        type: string
+        description: "The test suite, run by /bin/sh -c in the repository's root."
+      test_image:
+        type: string
+        description: "The image the test suite runs in, a reference with a tag."
+      context:
+        type: string
+        description: "Anything else the analyst should know."
+      draft_only:
+        type: boolean
+        default: true
+        description: "True (the default) ends the run with the commit on the work branch and nothing pushed; false lands it on the repository's branch after your approval."
+    required:
+      - task
+      - test_command
+      - test_image
+
+spec:
+  # The run names exactly one repository by the dispatch key `repositories`.
+  repositories: 1
+
+  context:
+    max_code_iterations: 5
+
+  initial_state: ANALYZE
+
+  states:
+
+    ANALYZE:
+      kind: Agent
+      agent: "requirements-analyst"
+      input: |-
+        # The task
+        {{{input.task}}}
+        {{#if input.context}}
+
+        # Context
+        {{{input.context}}}
+        {{/if}}
+
+        # The repository
+        The repository is at {{repository.path}}, on the work branch {{repository.branch}}, which started from {{repository.started_from}} on {{repository.ref}}. Read it before you answer: its layout, its conventions, the code the task touches and its tests. Change nothing.
+
+        The test suite will be run in the repository's root with: {{{input.test_command}}}
+        {{#if AWAIT_REQUIREMENTS_APPROVAL}}
+
+        # Your last requirements were sent back
+        The person answered "{{AWAIT_REQUIREMENTS_APPROVAL.response}}" to them. Write them again, closer to the task.
+        {{/if}}
+
+        Answer with the functional requirements, the non-functional requirements and the acceptance criteria, each numbered and each checkable by a test.
+      transitions:
+        - condition: on_success
+          target: AWAIT_REQUIREMENTS_APPROVAL
+        - condition: on_failure
+          target: FAILED
+
+    AWAIT_REQUIREMENTS_APPROVAL:
+      kind: Human
+      timeout: 3600s
+      prompt: |-
+        # The Forge: approve the requirements
+
+        ## The task
+        {{{input.task}}}
+
+        ## The requirements
+        {{{json ANALYZE.output}}}
+
+        Answer yes to design the change against them, or no with what to change.
+      transitions:
+        - condition: input_equals_yes
+          target: ARCHITECT
+        - condition: input_equals_no
+          target: ANALYZE
+          feedback: "{{human.feedback}}"
+
+    ARCHITECT:
+      kind: Agent
+      agent: "architect-agent"
+      input: |-
+        # The task
+        {{{input.task}}}
+
+        # The approved requirements
+        {{{json ANALYZE.output}}}
+
+        # The repository
+        The repository is at {{repository.path}}, on the work branch {{repository.branch}}. Read its layout and its conventions before you design anything. Change nothing.
+        {{#if AWAIT_ARCH_APPROVAL}}
+
+        # Your last design was sent back
+        The person answered "{{AWAIT_ARCH_APPROVAL.response}}" to it. Design it again, closer to the requirements.
+        {{/if}}
+
+        Design the change against the requirements and the repository's own conventions. Name every file to change or create, by its path under {{repository.path}}, with what changes in it, and name the tests that will show each acceptance criterion met.
+      transitions:
+        - condition: on_success
+          target: AWAIT_ARCH_APPROVAL
+        - condition: on_failure
+          target: FAILED
+
+    AWAIT_ARCH_APPROVAL:
+      kind: Human
+      timeout: 3600s
+      prompt: |-
+        # The Forge: approve the design
+
+        ## The task
+        {{{input.task}}}
+
+        ## The requirements
+        {{{json ANALYZE.output}}}
+
+        ## The design
+        {{{json ARCHITECT.output}}}
+
+        Answer yes to write the tests and the implementation, or no with what to change.
+      transitions:
+        - condition: input_equals_yes
+          target: TEST
+        - condition: input_equals_no
+          target: ARCHITECT
+          feedback: "{{human.feedback}}"
+
+    TEST:
+      kind: Agent
+      agent: "tester-agent"
+      input: |-
+        # The approved requirements
+        {{{json ANALYZE.output}}}
+
+        # The approved design
+        {{{json ARCHITECT.output}}}
+
+        # The repository
+        The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in its root with: {{{input.test_command}}}
+
+        Write the tests that show each acceptance criterion met, in the repository's own test layout and style, under {{repository.path}}. Write tests only: change no implementation file. Against the unchanged tree the new tests fail; say which they are and why each fails.
+      transitions:
+        - condition: on_success
+          target: CODE
+        - condition: on_failure
+          target: FAILED
+
+    CODE:
+      kind: Agent
+      agent: "coder-agent"
+      max_state_visits: 5
+      input: |-
+        # The approved requirements
+        {{{json ANALYZE.output}}}
+
+        # The approved design
+        {{{json ARCHITECT.output}}}
+
+        # The tests written for it
+        {{{json TEST.output}}}
+
+        # The repository
+        The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in its root with: {{{input.test_command}}}
+        {{#if EXECUTE_TESTS}}
+
+        # The last run of the suite
+        Exit code {{EXECUTE_TESTS.output.exit_code}}.
+
+        stderr:
+        {{{EXECUTE_TESTS.output.stderr}}}
+
+        stdout:
+        {{{EXECUTE_TESTS.output.stdout}}}
+        {{/if}}
+        {{#if AUDIT}}
+
+        # The last review
+        The three judges scored the change {{AUDIT.consensus.score}} (0.95 passes). Their reports:
+        {{{json AUDIT.consensus.metadata.individual_outputs}}}
+        {{/if}}
+
+        Change the implementation under {{repository.path}} as the design says, so that the suite passes. Never change the tests the tester wrote. When the suite has failed or the review has scored the change below 0.95, fix what the output and the reports name.
+      transitions:
+        - condition: on_success
+          target: EXECUTE_TESTS
+        - condition: on_failure
+          target: FAILED
+
+    EXECUTE_TESTS:
+      kind: ContainerRun
+      name: "the-forge-tests"
+      image: "{{input.test_image}}"
+      shell: true
+      # The suite reaches the step's shell through its environment, never
+      # spliced into the shell text.
+      command:
+        - "eval \"$FORGE_TEST_COMMAND\""
+      env:
+        FORGE_TEST_COMMAND: "{{{input.test_command}}}"
+      workdir: "/workspace/repository"
+      volumes:
+        - name: repository
+          mount_path: "/workspace/repository"
+      network_mode: egress
+      resources:
+        cpu: 2000
+        memory: "4Gi"
+        timeout: 1800s
+      transitions:
+        - condition: exit_code_zero
+          target: DIFF
+        - condition: exit_code_non_zero
+          target: CODE
+          feedback: |-
+            The test suite failed. Fix the implementation, never the tests.
+
+            stderr:
+            {{{EXECUTE_TESTS.output.stderr}}}
+
+            stdout:
+            {{{EXECUTE_TESTS.output.stdout}}}
+
+    DIFF:
+      kind: System
+      command: "repository_diff"
+      transitions:
+        - condition: on_success
+          target: AUDIT
+        - condition: on_failure
+          target: FAILED
+
+    AUDIT:
+      kind: ParallelAgents
+      agents:
+        - agent: "code-reviewer-agent"
+          weight: 1.0
+          timeout_seconds: 900
+          input: |-
+            Review this change for correctness, completeness and the repository's own conventions.
+
+            # The requirements
+            {{{json ANALYZE.output}}}
+
+            # The design
+            {{{json ARCHITECT.output}}}
+
+            # The change, as a unified diff against the commit the run started from
+            {{{DIFF.output.diff}}}
+
+            # The test output (the suite passed)
+            {{{EXECUTE_TESTS.output.stdout}}}
+
+            The repository is at {{repository.path}}. Answer only with the JSON object {"score", "confidence", "reasoning", "suggestions"}.
+        - agent: "critic-agent"
+          weight: 1.5
+          timeout_seconds: 900
+          input: |-
+            Find every flaw in this change: what it gets wrong, what it misses, what it makes worse.
+
+            # The requirements
+            {{{json ANALYZE.output}}}
+
+            # The design
+            {{{json ARCHITECT.output}}}
+
+            # The change, as a unified diff against the commit the run started from
+            {{{DIFF.output.diff}}}
+
+            # The test output (the suite passed)
+            {{{EXECUTE_TESTS.output.stdout}}}
+
+            The repository is at {{repository.path}}. Answer only with the JSON object {"score", "confidence", "reasoning", "suggestions"}.
+        - agent: "security-auditor-agent"
+          weight: 2.0
+          timeout_seconds: 900
+          input: |-
+            Audit this change for security: injection, unchecked input, exposed secrets, unsafe defaults, risky dependencies.
+
+            # The requirements
+            {{{json ANALYZE.output}}}
+
+            # The design
+            {{{json ARCHITECT.output}}}
+
+            # The change, as a unified diff against the commit the run started from
+            {{{DIFF.output.diff}}}
+
+            # The test output (the suite passed)
+            {{{EXECUTE_TESTS.output.stdout}}}
+
+            The repository is at {{repository.path}}. Answer only with the JSON object {"score", "confidence", "reasoning", "suggestions"}.
+      consensus:
+        strategy: weighted_average
+        threshold: 0.95
+        agreement: 0.8
+      transitions:
+        - condition: consensus
+          threshold: 0.95
+          agreement: 0.8
+          target: COMMIT
+        - condition: score_below
+          threshold: 0.95
+          target: CODE
+          feedback: |-
+            The review scored the change {{AUDIT.consensus.score}}, below 0.95. The three reports:
+            {{{json AUDIT.consensus.metadata.individual_outputs}}}
+
+    COMMIT:
+      kind: System
+      command: "repository_commit"
+      env:
+        message: "the-forge: {{{first_line input.task}}}"
+      transitions:
+        - condition: on_failure
+          target: FAILED
+        # draft_only true, or absent (its default), ends with the commit on
+        # the work branch and nothing pushed.
+        - condition: custom
+          expression: "(default input.draft_only true)"
+          target: COMPLETE
+        - condition: on_success
+          target: LAND
+
+    LAND:
+      kind: System
+      command: "repository_land"
+      transitions:
+        - condition: on_success
+          target: COMPLETE
+        - condition: on_failure
+          target: LAND_REFUSED
+
+    COMPLETE:
+      kind: System
+      command: "update_blackboard"
+      env:
+        outcome: "complete"
+        commit_sha: "{{COMMIT.output.commit_sha}}"
+        branch: "{{COMMIT.output.branch}}"
+        sentence: ""
+      transitions: []
+
+    FAILED:
+      kind: System
+      command: "update_blackboard"
+      env:
+        outcome: "failed"
+        commit_sha: "{{COMMIT.output.commit_sha}}"
+        branch: "{{repository.branch}}"
+        sentence: "{{{DIFF.output.sentence}}}{{{COMMIT.output.sentence}}}"
+      transitions: []
+
+    LAND_REFUSED:
+      kind: System
+      command: "update_blackboard"
+      env:
+        outcome: "land_refused"
+        commit_sha: "{{COMMIT.output.commit_sha}}"
+        branch: "{{COMMIT.output.branch}}"
+        sentence: "{{{LAND.output.sentence}}}"
+      transitions: []

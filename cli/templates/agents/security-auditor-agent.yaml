@@ -1,0 +1,109 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+
+metadata:
+  name: "security-auditor-agent"
+  version: "1.0.0"
+  description: "Audits a change for security, from injection to exposed secrets and risky dependencies, and answers a scored verdict. One of the Forge's three AUDIT judges."
+  labels:
+    role: "judge"
+    category: "development"
+    workflow: "the-forge"
+    builtin: "true"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    model: "smart"
+    isolation: "inherit"
+    temperature: 0.2
+
+  task:
+    instruction: |
+      You are the security auditor of a development workflow: one of three
+      judges of a change. Check it for injection of every kind, unchecked or
+      unsanitised input, broken authentication or authorisation, exposed
+      secrets or credentials, unsafe deserialisation, path traversal, unsafe
+      defaults, and dependencies with known vulnerabilities. Name the risk
+      level of each finding.
+
+      You are given, in your input: the approved requirements, the approved
+      design, the change as a unified diff against the commit the run started
+      from, and the test output of the suite, which passed. The repository is
+      mounted where your input says; read any file the diff touches, and the
+      code around it, with the fs tools, and use aegis.git.status and
+      aegis.git.diff to see the working tree. Change nothing.
+
+      Answer with exactly one JSON object and nothing around it:
+      {
+        "score": <0.0 to 1.0>,
+        "confidence": <0.0 to 1.0, how sure you are of the score>,
+        "reasoning": "<two to four sentences: the verdict and why>",
+        "suggestions": ["<one concrete change, naming the file and the line>", ...]
+      }
+      A score of 0.95 or more passes the change; below it, the change goes back
+      to the coder with your suggestions. "suggestions" is an empty list only
+      when you would change nothing.
+    prompt_template: |
+      {{instruction}}
+
+      {{input}}
+
+  execution:
+    mode: "iterative"
+    max_iterations: 5
+    llm_timeout_seconds: 300
+    require_tool_call: true
+    validation:
+      - type: json_schema
+        schema:
+          type: object
+          required: [score, confidence, reasoning, suggestions]
+          properties:
+            score:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            confidence:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            reasoning:
+              type: string
+              minLength: 1
+            suggestions:
+              type: array
+              items:
+                type: string
+      - type: semantic
+        judge_agent: "code-quality-judge"
+        criteria: |
+          The verdict is a JSON object with score, confidence, reasoning and
+          suggestions; each finding is real in the diff and carries its risk,
+          and each suggestion is concrete and names a file.
+        min_score: 0.7
+        timeout_seconds: 300
+
+  tools:
+    - fs.read
+    - fs.list
+    - fs.grep
+    - fs.glob
+    - aegis.git.status
+    - aegis.git.diff
+
+  security:
+    network:
+      mode: "none"
+    filesystem:
+      read:
+        - "/workspace"
+      write: []
+    resources:
+      cpu: 1000
+      memory: "1Gi"
+      timeout: "900s"
