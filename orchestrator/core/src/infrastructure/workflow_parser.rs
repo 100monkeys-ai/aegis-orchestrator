@@ -110,8 +110,8 @@ pub struct WorkflowSpecYaml {
     /// person makes one, never acted on by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_schedule: Option<crate::domain::schedule::DefaultSchedule>,
-    /// The number of repositories every run of this workflow must name
-    /// (AEGIS ADR-141 F2).
+    /// The number of repositories every run of this workflow must name; a
+    /// start naming another number is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repositories: Option<u32>,
 }
