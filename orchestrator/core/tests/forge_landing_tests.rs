@@ -20,6 +20,8 @@
 //! | A tag binding | `a_landing_from_a_seaweedfs_volume_on_a_tag_is_refused_before_any_push` |
 //! | A declined landing | `a_declined_landing_from_a_seaweedfs_volume_pushes_nothing` |
 //! | The narrative line | `a_landing_has_its_narrative_line` |
+//! | F3's entry fields, read and written back | `an_entrys_label_ref_and_started_from_are_read_and_written_back` |
+//! | F3's entry fields, filled at preparation | `preparation_fills_each_entrys_label_ref_and_started_from` |
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -54,8 +56,8 @@ use aegis_orchestrator_core::domain::execution::{
 };
 use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
 use aegis_orchestrator_core::domain::git_repo::{
-    default_work_branch, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
-    GitRepoBindingRepository, GitRepoStatus, RunRepository,
+    default_work_branch, parse_run_repositories, CloneStrategy, GitRef, GitRepoBinding,
+    GitRepoBindingId, GitRepoBindingRepository, GitRepoStatus,
 };
 use aegis_orchestrator_core::domain::repository::{
     AgentVersion, RepositoryError, VolumeRepository, WorkflowExecutionRepository,
@@ -560,6 +562,8 @@ struct Fixture {
 /// checked out.
 struct Run {
     id: uuid::Uuid,
+    /// The run's `repositories` as its preparation answered them.
+    entries: serde_json::Value,
     binding: GitRepoBindingId,
     tree: PathBuf,
     branch: String,
@@ -776,11 +780,7 @@ impl Fixture {
                 &self.tenant,
                 Some(PERSON),
                 run.0,
-                &[RunRepository {
-                    binding_id: binding,
-                    branch: None,
-                    author: None,
-                }],
+                &parse_run_repositories(&json!([{ "binding_id": binding.0.to_string() }])).unwrap(),
             )
             .await
             .unwrap_or_else(|e| panic!("the run's repository was not prepared: {e}"));
@@ -799,8 +799,9 @@ spec:
 "#,
         )
         .unwrap();
+        let entries = serde_json::to_value(&prepared).unwrap();
         let mut execution =
-            WorkflowExecution::new(&workflow, run, json!({ "repositories": prepared }));
+            WorkflowExecution::new(&workflow, run, json!({ "repositories": entries }));
         execution.tenant_id = self.tenant.clone();
         execution.initiating_user_sub = Some(PERSON.to_string());
         self.executions
@@ -809,6 +810,7 @@ spec:
             .unwrap();
         Run {
             id: run.0,
+            entries,
             binding,
             started_from: git(&tree, &["rev-parse", "HEAD"]),
             branch: default_work_branch(run.0),
@@ -1132,4 +1134,48 @@ fn a_landing_has_its_narrative_line() {
         row.message,
         format!("Landed {sha} of repository app on main")
     );
+}
+
+// ===========================================================================
+// F3: the repository's entry carries its label, ref and starting commit
+// ===========================================================================
+
+/// AEGIS ADR-141 F3: an entry as the platform stores it, with `label`,
+/// `ref` and `started_from`, is read and writes back as it was read.
+#[test]
+fn an_entrys_label_ref_and_started_from_are_read_and_written_back() {
+    let value = json!([{
+        "binding_id": "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e",
+        "branch": "aegis/1234abcd",
+        "label": "app",
+        "ref": "main",
+        "started_from": "0123456789abcdef0123456789abcdef01234567"
+    }]);
+    let entries = parse_run_repositories(&value).unwrap_or_else(|e| {
+        panic!("an entry with its label, ref and started_from was refused: {e}")
+    });
+    assert_eq!(
+        serde_json::to_value(&entries).unwrap(),
+        value,
+        "the entry does not write back as it was read"
+    );
+}
+
+/// AEGIS ADR-141 F3: preparing a run's repositories fills each entry's
+/// `label`, `ref` (the binding's) and `started_from` (the commit the work
+/// branch started from), on a volume and on a host directory.
+#[tokio::test]
+async fn preparation_fills_each_entrys_label_ref_and_started_from() {
+    let fx = fixture().await;
+    for run in [
+        fx.volume_run(GitRef::Branch("main".to_string())).await,
+        fx.host_run().await,
+    ] {
+        let entry = &run.entries[0];
+        assert_eq!(
+            (&entry["label"], &entry["ref"], &entry["started_from"]),
+            (&json!("app"), &json!("main"), &json!(run.started_from)),
+            "the prepared entry is {entry}"
+        );
+    }
 }

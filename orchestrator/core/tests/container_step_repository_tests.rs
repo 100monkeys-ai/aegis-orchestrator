@@ -369,6 +369,9 @@ spec:
                 binding_id: binding,
                 branch: Some("aegis/forge".to_string()),
                 author: None,
+                label: None,
+                git_ref: None,
+                started_from: None,
             }]
         )]
     );

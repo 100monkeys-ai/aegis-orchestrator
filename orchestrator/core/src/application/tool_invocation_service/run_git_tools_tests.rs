@@ -663,6 +663,9 @@ impl Harness {
                     binding_id: binding.id,
                     branch: None,
                     author: None,
+                    label: None,
+                    git_ref: None,
+                    started_from: None,
                 }],
             )
             .await

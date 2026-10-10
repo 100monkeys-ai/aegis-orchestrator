@@ -541,7 +541,9 @@ pub const REPOSITORIES_SHAPE: &str =
 /// `branch` fills in the run's default once (G5a), so every state and child
 /// of the run reads the same branch. `author` is the platform's, written
 /// when the run's repositories are prepared and never taken from a caller
-/// (AEGIS ADR-136 G5d).
+/// (AEGIS ADR-136 G5d); so are `label`, `ref` (the binding's) and
+/// `started_from` (the commit the work branch started from), which the
+/// workflow's repository entry reads (AEGIS ADR-141 F3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRepository {
     pub binding_id: GitRepoBindingId,
@@ -549,6 +551,12 @@ pub struct RunRepository {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<RunAuthor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_from: Option<String>,
 }
 
 /// The person a run's commits are authored as: `name <email>` (AEGIS
@@ -576,8 +584,9 @@ fn is_author_part(part: &str) -> bool {
 
 /// Read a `repositories` value as G3 admits it: a list of objects whose only
 /// keys are `binding_id` (a UUID), optionally `branch` (a name git accepts
-/// for a branch) and, as the platform stores it, `author` (an object of
-/// exactly `name` and `email`, each fit for a commit, G5d). Anything else
+/// for a branch) and, as the platform stores them, `author` (an object of
+/// exactly `name` and `email`, each fit for a commit, G5d) and `label`,
+/// `ref` and `started_from` (strings, AEGIS ADR-141 F3). Anything else
 /// answers [`REPOSITORIES_SHAPE`].
 pub fn parse_run_repositories(
     value: &serde_json::Value,
@@ -590,10 +599,12 @@ pub fn parse_run_repositories(
         let serde_json::Value::Object(map) = item else {
             return Err(REPOSITORIES_SHAPE);
         };
-        if map
-            .keys()
-            .any(|key| key != "binding_id" && key != "branch" && key != "author")
-        {
+        if map.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "binding_id" | "branch" | "author" | "label" | "ref" | "started_from"
+            )
+        }) {
             return Err(REPOSITORIES_SHAPE);
         }
         let binding_id = match map.get("binding_id") {
@@ -628,10 +639,18 @@ pub fn parse_run_repositories(
             }
             Some(_) => return Err(REPOSITORIES_SHAPE),
         };
+        let text = |key: &str| match map.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(REPOSITORIES_SHAPE),
+        };
         entries.push(RunRepository {
             binding_id: GitRepoBindingId(binding_id),
             branch,
             author,
+            label: text("label")?,
+            git_ref: text("ref")?,
+            started_from: text("started_from")?,
         });
     }
     Ok(entries)

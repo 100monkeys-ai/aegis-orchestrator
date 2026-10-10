@@ -1960,10 +1960,6 @@ pub struct RunLanding {
     pub branch_url: String,
 }
 
-/// The refusal of a landing from a tree on a volume a git step mounts: the
-/// step's script for a landing is not part of the git step engine.
-pub const LANDING_FROM_A_VOLUME: &str = "a landing from a repository on a volume a git step mounts";
-
 /// The branch a binding's ref lands on, or the refusal of a tag or a commit
 /// (AEGIS ADR-141 F8).
 pub fn landing_ref(git_ref: &GitRef) -> Result<&str, GitRepoError> {
@@ -2101,10 +2097,18 @@ impl RunRepositories for GitRepoService {
                         created,
                         "a run's repository is prepared"
                     );
+                    let git_ref = match &binding.git_ref {
+                        GitRef::Branch(name) | GitRef::Tag(name) | GitRef::Commit(name) => {
+                            name.clone()
+                        }
+                    };
                     prepared.push(RunRepository {
                         binding_id: binding.id,
                         branch: Some(branch),
                         author: author.clone(),
+                        label: Some(binding.label.clone()),
+                        git_ref: Some(git_ref),
+                        started_from: Some(started_from),
                     });
                 }
                 Err(e) => {

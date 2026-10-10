@@ -5310,6 +5310,9 @@ mod tests {
                             .unwrap_or_else(|| crate::domain::git_repo::default_work_branch(run)),
                     ),
                     author: entry.author.clone(),
+                    label: None,
+                    git_ref: None,
+                    started_from: None,
                 })
                 .collect())
         }

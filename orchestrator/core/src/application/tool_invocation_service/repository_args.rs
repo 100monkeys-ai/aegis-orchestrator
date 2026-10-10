@@ -26,9 +26,15 @@ pub(super) fn parse_repositories(args: &Value) -> Result<Option<Value>, SealSess
     };
     let entries = parse_run_repositories(raw)
         .map_err(|sentence| SealSessionError::InvalidArguments(sentence.to_string()))?;
-    // The author is the platform's, written when the run's repositories are
-    // prepared: a caller never names one (AEGIS ADR-136 G5d).
-    if entries.iter().any(|entry| entry.author.is_some()) {
+    // The author, label, ref and started_from are the platform's, written
+    // when the run's repositories are prepared: a caller never names one
+    // (AEGIS ADR-136 G5d, ADR-141 F3).
+    if entries.iter().any(|entry| {
+        entry.author.is_some()
+            || entry.label.is_some()
+            || entry.git_ref.is_some()
+            || entry.started_from.is_some()
+    }) {
         return Err(SealSessionError::InvalidArguments(
             REPOSITORIES_SHAPE.to_string(),
         ));

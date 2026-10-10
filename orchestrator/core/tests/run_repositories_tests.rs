@@ -623,6 +623,9 @@ fn entry(id: GitRepoBindingId, branch: Option<&str>) -> RunRepository {
         binding_id: id,
         branch: branch.map(str::to_string),
         author: None,
+        label: None,
+        git_ref: None,
+        started_from: None,
     }
 }
 
@@ -794,7 +797,12 @@ async fn on_a_host_directory_the_default_branch_is_created_from_the_ref() {
     assert_eq!(branch, format!("aegis/{}", &run.to_string()[..8]));
     assert_eq!(
         prepared,
-        vec![entry(id, Some(&branch))],
+        vec![RunRepository {
+            label: Some("app".to_string()),
+            git_ref: Some("main".to_string()),
+            started_from: Some(git(&tree, &["rev-parse", "HEAD"])),
+            ..entry(id, Some(&branch))
+        }],
         "the entry's branch is not filled in"
     );
     assert_eq!(git(&tree, &["symbolic-ref", "--short", "HEAD"]), branch);
@@ -850,7 +858,15 @@ async fn on_a_volume_the_default_branch_is_created_from_the_ref_by_a_git_step() 
         .await
         .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
     let branch = default_work_branch(run);
-    assert_eq!(prepared, vec![entry(id, Some(&branch))]);
+    assert_eq!(
+        prepared,
+        vec![RunRepository {
+            label: Some("app".to_string()),
+            git_ref: Some("main".to_string()),
+            started_from: Some(git(&fx.volume_tree(), &["rev-parse", "HEAD"])),
+            ..entry(id, Some(&branch))
+        }]
+    );
     assert_eq!(
         git(&fx.volume_tree(), &["symbolic-ref", "--short", "HEAD"]),
         branch

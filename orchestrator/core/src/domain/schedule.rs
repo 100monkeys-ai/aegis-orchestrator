@@ -706,7 +706,15 @@ fn check_repositories(raw: Option<Value>) -> Result<Option<Value>, String> {
         None | Some(Value::Null) => Ok(None),
         Some(value) => {
             let entries = parse_run_repositories(&value).map_err(str::to_string)?;
-            if entries.iter().any(|entry| entry.author.is_some()) {
+            // The author, label, ref and started_from are the platform's,
+            // written when the run's repositories are prepared (AEGIS
+            // ADR-136 G5d, ADR-141 F3).
+            if entries.iter().any(|entry| {
+                entry.author.is_some()
+                    || entry.label.is_some()
+                    || entry.git_ref.is_some()
+                    || entry.started_from.is_some()
+            }) {
                 return Err(REPOSITORIES_SHAPE.to_string());
             }
             Ok(Some(value))
@@ -1155,6 +1163,56 @@ mod tests {
             complaints.push("`profile: null` left the profile".to_string());
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// AEGIS ADR-141 F3: an entry's `label`, `ref` and `started_from` are
+    /// the platform's, written when the run's repositories are prepared; a
+    /// schedule naming one is refused with G3's sentence, as one naming an
+    /// `author` is.
+    #[test]
+    fn a_schedule_naming_a_platform_written_repository_key_is_refused() {
+        let owner = crate::domain::iam::UserIdentity {
+            sub: "owner".into(),
+            realm_slug: "zaru-consumer".into(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Pro,
+                tenant_id: TenantId::for_consumer_user("owner").unwrap(),
+            },
+        };
+        let binding = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
+        let mut admitted = Vec::new();
+        for (key, value) in [
+            ("ref", "main"),
+            ("label", "app"),
+            ("started_from", "0123456789abcdef0123456789abcdef01234567"),
+        ] {
+            let created = Schedule::create(
+                ScheduleDraft {
+                    name: Some("triage".into()),
+                    target_kind: Some("agent".into()),
+                    target: Some("mail-triage".into()),
+                    repositories: Some(serde_json::json!([{ "binding_id": binding, key: value }])),
+                    recurrence: Some(RecurrenceInput {
+                        cron: Some("0 15 * * 1-5".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &owner,
+                TenantId::for_consumer_user("owner").unwrap(),
+                Utc::now(),
+            );
+            if created.as_ref().err().map(String::as_str) != Some(REPOSITORIES_SHAPE) {
+                admitted.push(format!(
+                    "a schedule naming `{key}` was {:?}",
+                    created.map(|_| ())
+                ));
+            }
+        }
+        assert!(admitted.is_empty(), "{}", admitted.join("\n"));
     }
 
     #[test]
