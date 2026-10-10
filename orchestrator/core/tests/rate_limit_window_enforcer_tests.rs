@@ -291,3 +291,132 @@ async fn the_per_minute_window_is_left_to_the_burst_enforcer() {
 
     db.remove().await;
 }
+
+// The counter cleanup (AEGIS known defect
+// `bananas-month-below-week-2026-10-10`): a row is deleted only when its
+// charge has left its own bucket's window, which is
+// `window_start < PostgresWindowEnforcer::window_lower_bound(now, bucket)`.
+
+const BUCKETS: [(RateLimitBucket, &str); 4] = [
+    (RateLimitBucket::Hourly, "hourly"),
+    (RateLimitBucket::Daily, "daily"),
+    (RateLimitBucket::Weekly, "weekly"),
+    (RateLimitBucket::Monthly, "monthly"),
+];
+
+fn window_of(bucket: RateLimitBucket) -> Duration {
+    Duration::seconds(bucket.window_seconds() as i64)
+}
+
+/// The rows stored under `bucket`, of any scope.
+async fn rows_in(pool: &PgPool, bucket: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_counters WHERE bucket = $1")
+        .bind(bucket)
+        .fetch_one(pool)
+        .await
+        .expect("count a bucket's rows")
+}
+
+#[tokio::test]
+async fn after_the_cleanup_a_month_reads_a_charge_of_six_days_ago_and_at_least_the_week() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let enforcer = PostgresWindowEnforcer::new(db.pool.clone());
+    let limit = 100;
+    let policy = policy(&BUCKETS.map(|(bucket, _)| (bucket, limit)));
+
+    for (bucket, name) in BUCKETS {
+        charge_made(&db.pool, name, window_of(bucket), Duration::days(6)).await;
+    }
+    enforcer
+        .cleanup_expired_counters()
+        .await
+        .expect("the cleanup runs");
+
+    let remaining = enforcer.remaining(&scope(), &policy).await.unwrap();
+    let used = |bucket| limit - remaining[&bucket];
+    assert_eq!(
+        used(RateLimitBucket::Monthly),
+        1,
+        "the month must still read the charge of six days ago after the cleanup"
+    );
+    assert!(
+        used(RateLimitBucket::Monthly) >= used(RateLimitBucket::Weekly),
+        "the month read {} below the week's {}",
+        used(RateLimitBucket::Monthly),
+        used(RateLimitBucket::Weekly)
+    );
+
+    db.remove().await;
+}
+
+#[tokio::test]
+async fn the_cleanup_deletes_a_monthly_charge_of_31_days_ago_and_a_weekly_of_8() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let enforcer = PostgresWindowEnforcer::new(db.pool.clone());
+
+    charge_made(
+        &db.pool,
+        "monthly",
+        window_of(RateLimitBucket::Monthly),
+        Duration::days(31),
+    )
+    .await;
+    charge_made(
+        &db.pool,
+        "weekly",
+        window_of(RateLimitBucket::Weekly),
+        Duration::days(8),
+    )
+    .await;
+    enforcer
+        .cleanup_expired_counters()
+        .await
+        .expect("the cleanup runs");
+
+    assert_eq!(
+        rows_in(&db.pool, "monthly").await,
+        0,
+        "a monthly charge of 31 days ago has left its month and must be deleted"
+    );
+    assert_eq!(
+        rows_in(&db.pool, "weekly").await,
+        0,
+        "a weekly charge of 8 days ago has left its week and must be deleted"
+    );
+
+    db.remove().await;
+}
+
+#[tokio::test]
+async fn the_cleanup_keeps_a_daily_charge_inside_its_day() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let enforcer = PostgresWindowEnforcer::new(db.pool.clone());
+
+    // A day old less an hour: a charge of exactly a day ago has just left
+    // its day by the reader's own bound, so the margin keeps it inside.
+    charge_made(
+        &db.pool,
+        "daily",
+        window_of(RateLimitBucket::Daily),
+        Duration::hours(23),
+    )
+    .await;
+    enforcer
+        .cleanup_expired_counters()
+        .await
+        .expect("the cleanup runs");
+
+    assert_eq!(
+        rows_in(&db.pool, "daily").await,
+        1,
+        "a daily charge inside its day must be kept"
+    );
+
+    db.remove().await;
+}

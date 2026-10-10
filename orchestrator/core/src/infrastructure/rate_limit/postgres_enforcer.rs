@@ -231,12 +231,39 @@ impl PostgresWindowEnforcer {
         Ok(result)
     }
 
-    /// Delete expired counter rows. A counter is expired when its window_start
-    /// is older than the largest window duration (monthly = 30 days) plus a buffer.
+    /// Delete the counter rows whose charge has left its own bucket's window.
+    ///
+    /// A row of an hourly, daily, weekly or monthly bucket is expired when
+    /// its `window_start` is below [`Self::window_lower_bound`] for that
+    /// bucket, the bound the readers sum from, so no row a window still
+    /// counts is deleted. A row of any other bucket (none is stored: the
+    /// per-minute window is counted in memory) keeps the rule of 35 days.
     pub async fn cleanup_expired_counters(&self) -> Result<u64, sqlx::Error> {
-        let cutoff = Utc::now() - Duration::days(35); // monthly (30d) + 5d buffer
-        let result = sqlx::query("DELETE FROM rate_limit_counters WHERE window_start < $1")
-            .bind(cutoff)
+        let now = Utc::now();
+        let mut query = sqlx::query(
+            r#"
+            DELETE FROM rate_limit_counters
+            WHERE window_start < CASE bucket
+                WHEN $1 THEN $2
+                WHEN $3 THEN $4
+                WHEN $5 THEN $6
+                WHEN $7 THEN $8
+                ELSE $9
+            END
+            "#,
+        );
+        for bucket in [
+            RateLimitBucket::Hourly,
+            RateLimitBucket::Daily,
+            RateLimitBucket::Weekly,
+            RateLimitBucket::Monthly,
+        ] {
+            query = query
+                .bind(Self::bucket_str(&bucket))
+                .bind(Self::window_lower_bound(now, &bucket));
+        }
+        let result = query
+            .bind(now - Duration::days(35))
             .execute(&self.pool)
             .await?;
 
