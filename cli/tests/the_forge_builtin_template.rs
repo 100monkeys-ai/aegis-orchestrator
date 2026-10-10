@@ -92,6 +92,7 @@ fn kind(state: &WorkflowState) -> String {
     match &state.kind {
         StateKind::Agent { agent, .. } => format!("Agent {agent}"),
         StateKind::System { command, .. } => format!("System {command}"),
+        StateKind::Action { action, .. } => format!("Action {action}"),
         StateKind::Human { .. } => "Human".to_string(),
         StateKind::ParallelAgents { .. } => "ParallelAgents".to_string(),
         StateKind::ContainerRun { .. } => "ContainerRun".to_string(),
