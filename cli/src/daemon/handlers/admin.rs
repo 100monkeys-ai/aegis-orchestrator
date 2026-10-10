@@ -432,7 +432,12 @@ pub(crate) async fn user_rate_limit_usage(
     let now = Utc::now();
     let windows: Vec<(String, DateTime<Utc>)> = STORED_BUCKETS
         .iter()
-        .map(|bucket| (bucket_to_str(bucket), window_lower_bound(now, bucket)))
+        .map(|bucket| {
+            (
+                bucket_to_str(bucket),
+                PostgresWindowEnforcer::window_lower_bound(now, bucket),
+            )
+        })
         .collect();
     let sums: std::collections::HashMap<(String, String), (i64, DateTime<Utc>)> = repo
         .window_usage(scope_type, &scope_id, &windows)
@@ -656,18 +661,6 @@ const STORED_BUCKETS: [RateLimitBucket; 4] = [
     RateLimitBucket::Weekly,
     RateLimitBucket::Monthly,
 ];
-
-/// The lowest `window_start` a row inside the bucket's window carries at `now`.
-///
-/// The enforcer stores each charge with `window_start` set to the charge's
-/// time minus the bucket's window (`PostgresWindowEnforcer::window_start`),
-/// so a row's charge time is `window_start + window`. The charge is inside
-/// the window when that time is at or after `now - window`, which is
-/// `window_start >= now - 2 * window`. Bounding `window_start` by
-/// `now - window` would count only charges made at or after `now`.
-fn window_lower_bound(now: DateTime<Utc>, bucket: &RateLimitBucket) -> DateTime<Utc> {
-    now - chrono::Duration::seconds(2 * bucket.window_seconds() as i64)
-}
 
 /// When the charge stored with this `window_start` leaves the bucket's
 /// window: its charge time (`window_start + window`) plus the window.

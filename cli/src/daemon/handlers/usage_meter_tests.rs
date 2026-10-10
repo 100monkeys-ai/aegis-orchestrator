@@ -462,3 +462,84 @@ async fn a_refused_window_answers_200_with_the_refusal_and_stores_nothing() {
     }
     db.remove().await;
 }
+
+#[tokio::test]
+async fn the_handlers_window_bound_is_the_enforcers_for_every_stored_bucket() {
+    // The reader and the writers share one bound: the handler calls the
+    // enforcer's `window_lower_bound` and keeps no copy of its own, so the two
+    // cannot drift apart.
+    let handler_source = include_str!("admin.rs");
+    assert!(
+        !handler_source.contains("fn window_lower_bound("),
+        "the usage handler keeps its own copy of the read bound (`fn window_lower_bound` in admin.rs); it must call `PostgresWindowEnforcer::window_lower_bound`"
+    );
+    assert!(
+        handler_source.contains("PostgresWindowEnforcer::window_lower_bound(now, bucket)"),
+        "the usage handler does not call `PostgresWindowEnforcer::window_lower_bound(now, bucket)`"
+    );
+
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let alice = consumer("meters-alice");
+    let tenant_id = resolve_effective_tenant(Some(&alice), None);
+    let scope = RateLimitScope::User {
+        tenant_id: tenant_id.clone(),
+        user_id: alice.sub.clone(),
+    };
+    let (scope_type, scope_id) = PostgresWindowEnforcer::scope_parts(&scope);
+    // For every stored bucket, one charge a minute inside the enforcer's bound
+    // and one a minute outside it.
+    let now = chrono::Utc::now();
+    for bucket in &super::STORED_BUCKETS {
+        let bound = PostgresWindowEnforcer::window_lower_bound(now, bucket);
+        for window_start in [
+            bound + chrono::Duration::minutes(1),
+            bound - chrono::Duration::minutes(1),
+        ] {
+            sqlx::query(
+                "INSERT INTO rate_limit_counters \
+                 (scope_type, scope_id, resource_type, bucket, window_start, counter) \
+                 VALUES ($1, $2, 'llm_call', $3, $4, 1)",
+            )
+            .bind(scope_type)
+            .bind(&scope_id)
+            .bind(super::bucket_to_str(bucket))
+            .bind(window_start)
+            .execute(&db.pool)
+            .await
+            .expect("insert the charge");
+        }
+    }
+
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let items = user_rate_limit_usage(&repo, &alice)
+        .await
+        .expect("read the usage");
+    let policy = HierarchicalPolicyResolver::new(db.pool.clone())
+        .resolve_policy(&alice, &tenant_id, &RateLimitResourceType::LlmCall)
+        .await
+        .expect("resolve the policy");
+    let remaining = PostgresWindowEnforcer::new(db.pool.clone())
+        .remaining(&scope, &policy)
+        .await
+        .expect("read the enforcer's remaining");
+
+    for bucket in &super::STORED_BUCKETS {
+        let name = super::bucket_to_str(bucket);
+        let item = items
+            .iter()
+            .find(|item| item.resource_type == "llm_call" && item.bucket == name)
+            .unwrap_or_else(|| panic!("the usage carries no llm_call {name} item"));
+        assert_eq!(
+            item.current_count, 1,
+            "the {name} read counts the charge inside the enforcer's bound and not the one outside it"
+        );
+        assert_eq!(
+            item.limit_value - remaining[bucket] as i64,
+            item.current_count,
+            "the handler's {name} count is the enforcer's"
+        );
+    }
+    db.remove().await;
+}
