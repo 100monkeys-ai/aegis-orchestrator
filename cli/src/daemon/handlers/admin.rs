@@ -12,17 +12,20 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 
 use crate::daemon::state::AppState;
-use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity, ZaruTier};
+use aegis_orchestrator_core::domain::iam::{
+    resolve_effective_tenant, AegisRole, IdentityKind, UserIdentity, ZaruTier,
+};
 use aegis_orchestrator_core::domain::rate_limit::{
-    tier_defaults, RateLimitBucket, RateLimitPolicyResolver, RateLimitResourceType,
+    tier_defaults, RateLimitBucket, RateLimitPolicyResolver, RateLimitResourceType, RateLimitScope,
 };
 use aegis_orchestrator_core::infrastructure::rate_limit::override_repository::{
     CreateOverrideRequest, RateLimitOverrideRow, UsageRow,
 };
 use aegis_orchestrator_core::infrastructure::rate_limit::policy_resolver::HierarchicalPolicyResolver;
-use aegis_orchestrator_core::infrastructure::rate_limit::RateLimitOverrideRepository;
+use aegis_orchestrator_core::infrastructure::rate_limit::{
+    PostgresWindowEnforcer, RateLimitOverrideRepository,
+};
 
-use super::tenant_id_from_identity;
 use axum::Extension;
 use chrono::{DateTime, Utc};
 
@@ -384,39 +387,66 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         }
     };
 
-    let tenant_id = tenant_id_from_identity(Some(&identity));
+    match user_rate_limit_usage(&repo, &identity).await {
+        Ok(items) => {
+            let count = items.len();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "usage": items, "count": count })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// The caller's usage of every resource and window its policy names
+/// (Zaru ADR-0064 D2).
+///
+/// The counters are read under the key every writer writes for this
+/// identity: the identity's own tenant claim, as the execution, inner-loop
+/// and SEAL writers bind it, through the enforcer's own
+/// [`PostgresWindowEnforcer::scope_parts`]. Each window reads the sum of the
+/// rows inside it. Per-minute is counted only in memory by the burst
+/// enforcer, so no per-minute item is reported.
+pub(crate) async fn user_rate_limit_usage(
+    repo: &RateLimitOverrideRepository,
+    identity: &UserIdentity,
+) -> Result<Vec<UserRateLimitUsageItem>, sqlx::Error> {
+    let tenant_id = resolve_effective_tenant(Some(identity), None);
+    let scope = RateLimitScope::User {
+        tenant_id: tenant_id.clone(),
+        user_id: identity.sub.clone(),
+    };
+    let (scope_type, scope_id) = PostgresWindowEnforcer::scope_parts(&scope);
 
     let tier = match &identity.identity_kind {
         IdentityKind::ConsumerUser { zaru_tier, .. } => zaru_tier.clone(),
         _ => ZaruTier::Enterprise,
     };
 
-    let usage_rows = match repo.get_usage("user", &identity.sub).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
+    let now = Utc::now();
+    let windows: Vec<(String, DateTime<Utc>)> = STORED_BUCKETS
+        .iter()
+        .map(|bucket| (bucket_to_str(bucket), window_lower_bound(now, bucket)))
+        .collect();
+    let sums: std::collections::HashMap<(String, String), (i64, DateTime<Utc>)> = repo
+        .window_usage(scope_type, &scope_id, &windows)
+        .await?
+        .into_iter()
+        .map(|w| {
+            (
+                (w.resource_type, w.bucket),
+                (w.total, w.oldest_window_start),
             )
-                .into_response();
-        }
-    };
-
-    // Build lookup: (resource_type_str, bucket_str) -> (counter, window_start)
-    let mut counter_map: std::collections::HashMap<
-        (String, String),
-        (i64, chrono::DateTime<chrono::Utc>),
-    > = std::collections::HashMap::new();
-    for row in &usage_rows {
-        // Rows are ordered window_start DESC; use or_insert so the first (newest)
-        // entry for each (resource_type, bucket) key wins.
-        counter_map
-            .entry((row.resource_type.clone(), row.bucket.clone()))
-            .or_insert((row.counter, row.window_start));
-    }
+        })
+        .collect();
 
     let resolver = HierarchicalPolicyResolver::new(repo.pool().clone());
-    let now = chrono::Utc::now();
 
     // Seed from full tier policy so new users see all limits at zero
     let all_policies = tier_defaults(&tier);
@@ -426,7 +456,7 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         let resource_type = &default_policy.resource_type;
         let resource_str = resource_type_to_db_str(resource_type);
         let policy = match resolver
-            .resolve_policy(&identity, &tenant_id, resource_type)
+            .resolve_policy(identity, &tenant_id, resource_type)
             .await
         {
             Ok(p) => p,
@@ -440,13 +470,14 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
             }
         };
         for (bucket, window) in &policy.windows {
+            if *bucket == RateLimitBucket::PerMinute {
+                continue;
+            }
             let bucket_str = bucket_to_str(bucket);
             let (current_count, resets_at) =
-                match counter_map.get(&(resource_str.clone(), bucket_str.clone())) {
-                    Some((count, window_start)) => {
-                        let resets_at =
-                            *window_start + chrono::Duration::seconds(window.window_seconds as i64);
-                        (*count, resets_at)
+                match sums.get(&(resource_str.clone(), bucket_str.clone())) {
+                    Some((total, oldest_window_start)) => {
+                        (*total, window_expiry(*oldest_window_start, bucket))
                     }
                     None => (
                         0i64,
@@ -464,12 +495,33 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         }
     }
 
-    let count = items.len();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "usage": items, "count": count })),
-    )
-        .into_response()
+    Ok(items)
+}
+
+/// The buckets the Postgres window enforcer stores; per-minute is not one.
+const STORED_BUCKETS: [RateLimitBucket; 4] = [
+    RateLimitBucket::Hourly,
+    RateLimitBucket::Daily,
+    RateLimitBucket::Weekly,
+    RateLimitBucket::Monthly,
+];
+
+/// The lowest `window_start` a row inside the bucket's window carries at `now`.
+///
+/// The enforcer stores each charge with `window_start` set to the charge's
+/// time minus the bucket's window (`PostgresWindowEnforcer::window_start`),
+/// so a row's charge time is `window_start + window`. The charge is inside
+/// the window when that time is at or after `now - window`, which is
+/// `window_start >= now - 2 * window`. Bounding `window_start` by
+/// `now - window` would count only charges made at or after `now`.
+fn window_lower_bound(now: DateTime<Utc>, bucket: &RateLimitBucket) -> DateTime<Utc> {
+    now - chrono::Duration::seconds(2 * bucket.window_seconds() as i64)
+}
+
+/// When the charge stored with this `window_start` leaves the bucket's
+/// window: its charge time (`window_start + window`) plus the window.
+fn window_expiry(window_start: DateTime<Utc>, bucket: &RateLimitBucket) -> DateTime<Utc> {
+    window_start + chrono::Duration::seconds(2 * bucket.window_seconds() as i64)
 }
 
 fn bucket_to_str(bucket: &RateLimitBucket) -> String {
@@ -495,36 +547,11 @@ fn resource_type_to_db_str(rt: &RateLimitResourceType) -> String {
 }
 
 #[cfg(test)]
+#[path = "usage_meter_tests.rs"]
+mod usage_meter_tests;
+
+#[cfg(test)]
 mod tests {
-    #[test]
-    fn counter_map_dedup_uses_newest_window() {
-        use chrono::{Duration, TimeZone, Utc};
-        use std::collections::HashMap;
-
-        let now = Utc.with_ymd_and_hms(2026, 4, 10, 12, 0, 0).unwrap();
-        let older = now - Duration::days(1);
-        let oldest = now - Duration::days(2);
-
-        // Simulate rows returned ORDER BY window_start DESC (newest first)
-        let rows: Vec<(String, String, i64, chrono::DateTime<Utc>)> = vec![
-            ("agent_execution".into(), "daily".into(), 42, now),
-            ("agent_execution".into(), "daily".into(), 10, older),
-            ("agent_execution".into(), "daily".into(), 5, oldest),
-        ];
-
-        let mut counter_map: HashMap<(String, String), (i64, chrono::DateTime<Utc>)> =
-            HashMap::new();
-        for (resource_type, bucket, counter, window_start) in &rows {
-            counter_map
-                .entry((resource_type.clone(), bucket.clone()))
-                .or_insert((*counter, *window_start));
-        }
-
-        let (count, ws) = counter_map[&("agent_execution".into(), "daily".into())];
-        assert_eq!(count, 42, "must use newest window counter, not stale one");
-        assert_eq!(ws, now, "must use newest window_start");
-    }
-
     // ------------------------------------------------------------------
     // Operator-only gate on `/v1/admin/rate-limits/*` (ADR-072, ADR-073
     // §3d/§3e). These routes read and write overrides and usage for every

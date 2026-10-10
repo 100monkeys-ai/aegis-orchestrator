@@ -38,6 +38,18 @@ pub struct UsageRow {
     pub counter: i64,
 }
 
+/// One resource and bucket's counters summed over a window
+/// ([`RateLimitOverrideRepository::window_usage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowUsage {
+    pub resource_type: String,
+    pub bucket: String,
+    /// The sum of `counter` over the rows inside the window.
+    pub total: i64,
+    /// The oldest `window_start` among those rows.
+    pub oldest_window_start: DateTime<Utc>,
+}
+
 // ── Request Types ────────────────────────────────────────────────────────────
 
 /// Body for `POST /v1/admin/rate-limits/overrides`.
@@ -183,5 +195,48 @@ impl RateLimitOverrideRepository {
         .await?;
 
         Ok(rows.iter().map(Self::map_usage_row).collect())
+    }
+
+    /// Sum one scope's counters per resource and bucket, each bucket over
+    /// the rows whose `window_start` is at or after that bucket's `since`.
+    ///
+    /// `windows` pairs a bucket name with its lower bound; a bucket not
+    /// named is not read. A resource and bucket with no row inside its
+    /// window is absent from the result.
+    pub async fn window_usage(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        windows: &[(String, DateTime<Utc>)],
+    ) -> Result<Vec<WindowUsage>, sqlx::Error> {
+        let (buckets, since): (Vec<String>, Vec<DateTime<Utc>>) = windows.iter().cloned().unzip();
+        let rows = sqlx::query(
+            r#"
+            SELECT c.resource_type, c.bucket,
+                   SUM(c.counter)::BIGINT AS total,
+                   MIN(c.window_start) AS oldest_window_start
+            FROM rate_limit_counters c
+            JOIN UNNEST($3::TEXT[], $4::TIMESTAMPTZ[]) AS w(bucket, since)
+              ON c.bucket = w.bucket AND c.window_start >= w.since
+            WHERE c.scope_type = $1 AND c.scope_id = $2
+            GROUP BY c.resource_type, c.bucket
+            "#,
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(&buckets)
+        .bind(&since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| WindowUsage {
+                resource_type: row.get("resource_type"),
+                bucket: row.get("bucket"),
+                total: row.get("total"),
+                oldest_window_start: row.get("oldest_window_start"),
+            })
+            .collect())
     }
 }

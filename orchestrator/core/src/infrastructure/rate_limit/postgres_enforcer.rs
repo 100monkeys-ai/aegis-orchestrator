@@ -29,7 +29,11 @@ impl PostgresWindowEnforcer {
         Self { pool }
     }
 
-    fn scope_parts(scope: &RateLimitScope) -> (&str, String) {
+    /// The `(scope_type, scope_id)` a scope's counters are stored under.
+    ///
+    /// Every writer keys its counters through this function, and the usage
+    /// a person reads is keyed through it too, so the two cannot drift.
+    pub fn scope_parts(scope: &RateLimitScope) -> (&str, String) {
         match scope {
             RateLimitScope::User { tenant_id, user_id } => {
                 ("user", format!("{}:{}", tenant_id.as_str(), user_id))
