@@ -205,6 +205,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.schedule.update", "Updates a schedule by schedule_id: only the fields given, and its time (at or recurrence) replaced when one is given."),
     BuiltinToolDefinition::new("aegis.schedule.pause", "Pauses a schedule by schedule_id: it starts nothing until it is resumed."),
     BuiltinToolDefinition::new("aegis.schedule.resume", "Resumes a paused schedule by schedule_id."),
+    BuiltinToolDefinition::new("aegis.schedule.run_now", "Starts one run of a schedule now by schedule_id, whether it is active or paused, as its timed runs start; refused while its last run is still running."),
     BuiltinToolDefinition::new("aegis.schedule.delete", "Deletes a schedule by schedule_id. The runs it started are kept."),
     BuiltinToolDefinition::new("aegis.schedule.runs", "Lists a schedule's runs by schedule_id, newest first: each time it fired, its outcome and the execution it started.").skip_judge(),
     BuiltinToolDefinition::new("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
@@ -419,6 +420,7 @@ impl ToolRouter {
             "aegis.schedule.get"
             | "aegis.schedule.pause"
             | "aegis.schedule.resume"
+            | "aegis.schedule.run_now"
             | "aegis.schedule.delete" => Self::schema_aegis_schedule_by_id(),
             "aegis.schedule.runs" => Self::schema_aegis_schedule_runs(),
             "aegis.system.info" => Self::schema_aegis_system_info(),

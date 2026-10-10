@@ -161,3 +161,42 @@ fn a_call_missing_its_required_argument_is_refused() {
         "an empty call of each tool (list needs nothing)"
     );
 }
+
+/// Run now: `aegis.schedule.run_now` is advertised with its description and
+/// a schema requiring `schedule_id`, its input contract requires
+/// `schedule_id`, and it is judged and ungated as pause and resume are.
+#[tokio::test]
+async fn run_now_is_advertised_with_its_description_and_requires_schedule_id() {
+    const NAME: &str = "aegis.schedule.run_now";
+    let router = router();
+    let tools = router.list_tools().await.unwrap();
+    let advertised = tools.iter().find(|t| t.name == NAME).map(|tool| {
+        (
+            tool.description.clone(),
+            tool.input_schema["required"].clone(),
+            tool.input_schema["properties"]["schedule_id"]["type"].clone(),
+        )
+    });
+    assert_eq!(
+        (
+            advertised,
+            ToolInputContract::required_fields(NAME).to_vec(),
+            router.is_skip_judge(NAME).await,
+            router.requires_approval(NAME),
+        ),
+        (
+            Some((
+                "Starts one run of a schedule now by schedule_id, whether it is active or \
+                 paused, as its timed runs start; refused while its last run is still running."
+                    .to_string(),
+                serde_json::json!(["schedule_id"]),
+                serde_json::json!("string"),
+            )),
+            vec!["schedule_id"],
+            false,
+            false,
+        ),
+        "aegis.schedule.run_now is not advertised as (description, schema required, \
+         schedule_id type), with its contract, judged and ungated"
+    );
+}

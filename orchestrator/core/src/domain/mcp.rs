@@ -416,6 +416,7 @@ impl ToolInputContract {
             | "aegis.schedule.update"
             | "aegis.schedule.pause"
             | "aegis.schedule.resume"
+            | "aegis.schedule.run_now"
             | "aegis.schedule.delete"
             | "aegis.schedule.runs" => &["schedule_id"],
             "aegis.document.render" => &["content", "format"],
