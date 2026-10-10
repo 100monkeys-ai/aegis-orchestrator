@@ -10,7 +10,10 @@
 //!
 //! `tool_pattern` supports:
 //! - `"*"` — matches any tool name
-//! - `"fs.*"` — matches any tool starting with `"fs."`
+//! - `"fs.*"` — matches a tool named `fs`, a dot, then at least one character
+//!   (`"fs.read"`, `"fs.dir.list"`); a name that merely starts with `fs` does
+//!   not match (`"fsx.read"`, `"fs"`, `"fs."`), as
+//!   `ToolCapabilityConfig::matches` requires the dot (ADR-137 R9a)
 //! - `"fs.read"` — exact match only
 //!
 //! ## Constraint Evaluation
@@ -204,11 +207,13 @@ impl Capability {
         if self.tool_pattern == "*" {
             return true;
         }
-        if self.tool_pattern.ends_with(".*") {
-            let prefix = self.tool_pattern.trim_end_matches(".*");
-            return tool_name.starts_with(prefix);
+        match self.tool_pattern.strip_suffix(".*") {
+            Some(prefix) => tool_name
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|tool| !tool.is_empty()),
+            None => tool_name == self.tool_pattern,
         }
-        tool_name == self.tool_pattern
     }
 
     fn path_in_allowlist(&self, path: &str, allowlist: &[PathBuf]) -> bool {
@@ -387,5 +392,71 @@ mod tests {
             cap.allows("web.fetch", &json!({"url": "https://evilexample.com/"})),
             Err(PolicyViolation::DomainNotAllowed { .. })
         ));
+    }
+
+    fn tool_only(pattern: &str) -> Capability {
+        Capability {
+            tool_pattern: pattern.to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        }
+    }
+
+    /// ADR-137 R9a: `github.*` is the `github` family and no other; a server
+    /// named `githubx` is not admitted by it.
+    #[test]
+    fn test_family_pattern_refuses_a_name_sharing_its_prefix_without_the_dot() {
+        let github = tool_only("github.*");
+        assert!(!github.matches_tool_name("githubx.list"));
+        let notes = tool_only("nuclear-notes.*");
+        assert!(!notes.matches_tool_name("nuclear-notes-x.read"));
+    }
+
+    #[test]
+    fn test_family_pattern_needs_a_tool_after_the_dot() {
+        let github = tool_only("github.*");
+        assert!(!github.matches_tool_name("github"));
+        assert!(!github.matches_tool_name("github."));
+    }
+
+    #[test]
+    fn test_family_pattern_admits_its_own_tools() {
+        let github = tool_only("github.*");
+        assert!(github.matches_tool_name("github.list"));
+        assert!(github.matches_tool_name("github.issues.list"));
+        let notes = tool_only("nuclear-notes.*");
+        assert!(notes.matches_tool_name("nuclear-notes.read"));
+    }
+
+    #[test]
+    fn test_star_and_exact_patterns_unchanged() {
+        let any = tool_only("*");
+        assert!(any.matches_tool_name("githubx.list"));
+        assert!(any.matches_tool_name("fs.read"));
+        let exact = tool_only("fs.read");
+        assert!(exact.matches_tool_name("fs.read"));
+        assert!(!exact.matches_tool_name("fs.readx"));
+        assert!(!exact.matches_tool_name("fs.write"));
+    }
+
+    #[test]
+    fn test_allows_refusal_carries_the_pattern() {
+        let github = tool_only("github.*");
+        assert!(github.allows("github.list", &json!({})).is_ok());
+        match github.allows("githubx.list", &json!({})) {
+            Err(PolicyViolation::ToolNotAllowed {
+                tool_name,
+                allowed_tools,
+            }) => {
+                assert_eq!(tool_name, "githubx.list");
+                assert_eq!(allowed_tools, vec!["github.*".to_string()]);
+            }
+            other => panic!("expected ToolNotAllowed for githubx.list, got {other:?}"),
+        }
     }
 }
