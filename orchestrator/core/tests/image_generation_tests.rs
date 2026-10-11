@@ -6,8 +6,8 @@
 //! Each test parses a provider block as an operator writes it in
 //! `aegis-config.yaml`, builds the real `ProviderRegistry` from it, and, where
 //! it calls the provider, calls a local stand-in of the OpenAI image
-//! generation endpoint on a loopback port. No request leaves the loopback
-//! interface.
+//! generation endpoint, or of Workers AI's `/ai/run` (ADR-143 Update I1a), on
+//! a loopback port. No request leaves the loopback interface.
 
 use aegis_orchestrator_core::domain::node_config::{LLMProviderConfig, NodeConfigManifest};
 use aegis_orchestrator_core::domain::vision::{ImageOptions, VisionError};
@@ -263,6 +263,382 @@ fn an_agent_whose_model_generates_images_is_refused_at_parse() {
     let manifest = AgentManifestParser::parse_yaml_for_node(&agent_yaml("default"), &image_aliases)
         .expect("a language model's manifest parses");
     assert_eq!(manifest.spec.runtime.model, "default");
+}
+
+// ===========================================================================
+// A Workers AI image model (AEGIS ADR-143 Update I1a)
+// ===========================================================================
+
+mod workers_ai {
+    use super::{node, registry, PNG};
+    use aegis_orchestrator_core::domain::vision::{Image, ImageOptions, VisionError};
+    use aegis_orchestrator_core::infrastructure::llm::workers_ai_image::WorkersAiImageAdapter;
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, Method, StatusCode, Uri};
+    use axum::Router;
+    use base64::Engine;
+    use std::sync::{Arc, Mutex};
+
+    /// Production's alias table names Workers AI in this form.
+    const WORKERS_AI_ENDPOINT: &str = "https://api.cloudflare.com/client/v4/accounts/acct-1/ai/v1";
+
+    /// The first bytes of a JPEG file, then a few more.
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIFfake-image";
+
+    /// The sentences the two adapters answer an edit with, each as
+    /// `Unsupported`. Telling the two adapters apart by them needs no
+    /// request.
+    const NOT_WIRED: &str = "Workers AI image editing is not wired";
+    const OPENAI_NOT_OFFERED: &str = "image editing is not offered by this provider's adapter";
+
+    /// One request the stand-in received.
+    #[derive(Debug, Clone)]
+    struct Request {
+        method: Method,
+        path: String,
+        headers: HeaderMap,
+        body: Bytes,
+    }
+
+    impl Request {
+        fn content_type(&self) -> String {
+            self.headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        /// The multipart form's fields, `(name, value)`, in their order.
+        fn fields(&self) -> Vec<(String, String)> {
+            let content_type = self.content_type();
+            let boundary = content_type
+                .split("boundary=")
+                .nth(1)
+                .unwrap_or_else(|| panic!("no multipart boundary in '{content_type}'"))
+                .trim_matches('"')
+                .to_string();
+            let body = String::from_utf8(self.body.to_vec()).expect("a text form");
+            body.split(&format!("--{boundary}"))
+                .filter_map(|part| {
+                    let (head, value) = part.split_once("\r\n\r\n")?;
+                    let name = head.split("name=\"").nth(1)?.split('"').next()?;
+                    Some((
+                        name.to_string(),
+                        value.strip_suffix("\r\n").unwrap_or(value).to_string(),
+                    ))
+                })
+                .collect()
+        }
+    }
+
+    type Seen = Arc<Mutex<Vec<Request>>>;
+
+    /// What the stand-in answers to every request.
+    #[derive(Clone)]
+    enum Answer {
+        /// `{"result": {"image": <base64 of the bytes>}, "success": true}`.
+        Image(&'static [u8]),
+        /// `{"result": {}, "success": true}`: no image.
+        NoImage,
+        /// The status and the body, as given.
+        Error(u16, &'static str),
+    }
+
+    /// Answer every request on a loopback port with `answer`, recording it.
+    /// Returns a Workers AI `/ai/v1` base on that port and the record.
+    async fn stand_in(answer: Answer) -> (String, Seen) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let app = Router::new().fallback(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+                let record = record.clone();
+                let answer = answer.clone();
+                async move {
+                    record.lock().unwrap().push(Request {
+                        method,
+                        path: uri.path().to_string(),
+                        headers,
+                        body,
+                    });
+                    match answer {
+                        Answer::Image(bytes) => (
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "result": {
+                                    "image": base64::engine::general_purpose::STANDARD.encode(bytes)
+                                },
+                                "success": true,
+                                "errors": [],
+                                "messages": []
+                            })
+                            .to_string(),
+                        ),
+                        Answer::NoImage => (
+                            StatusCode::OK,
+                            serde_json::json!({"result": {}, "success": true}).to_string(),
+                        ),
+                        Answer::Error(status, text) => {
+                            (StatusCode::from_u16(status).unwrap(), text.to_string())
+                        }
+                    }
+                }
+            },
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve stand-in");
+        });
+        (
+            format!("http://{addr}/client/v4/accounts/acct-1/ai/v1"),
+            seen,
+        )
+    }
+
+    /// The adapter against the stand-in, for the flux model, with the
+    /// provider's gateway header.
+    fn adapter(endpoint: &str) -> WorkersAiImageAdapter {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "cf-aig-gateway-id",
+            reqwest::header::HeaderValue::from_static("inference-test"),
+        );
+        WorkersAiImageAdapter::new(
+            endpoint.to_string(),
+            "test-key".to_string(),
+            "@cf/black-forest-labs/flux-2-dev".to_string(),
+            headers,
+        )
+    }
+
+    fn blank() -> Image {
+        Image {
+            bytes: PNG.to_vec(),
+            content_type: "image/png".to_string(),
+        }
+    }
+
+    use aegis_orchestrator_core::domain::vision::VisionProvider;
+
+    #[tokio::test]
+    async fn an_openai_compatible_alias_on_a_workers_ai_endpoint_binds_the_workers_ai_adapter() {
+        for endpoint in [WORKERS_AI_ENDPOINT, &format!("{WORKERS_AI_ENDPOINT}/")] {
+            let registry = registry(&node("openai-compatible", endpoint));
+            let provider = registry
+                .image_provider("artist")
+                .unwrap_or_else(|| panic!("{endpoint}: no image provider"));
+            match provider.edit_image(&blank(), "repaint it", None).await {
+                Err(VisionError::Unsupported(message)) => {
+                    assert_eq!(message, NOT_WIRED, "{endpoint}: not the Workers AI adapter")
+                }
+                other => panic!("{endpoint}: not the Workers AI adapter: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn any_other_endpoint_keeps_the_openai_adapter() {
+        let cases = [
+            ("openai-compatible", "http://127.0.0.1:9/v1"),
+            ("openai-compatible", "https://api.openai.com/v1"),
+            (
+                "openai-compatible",
+                "https://gateway.ai.cloudflare.com/v1/acct-1/inference/workers-ai/v1",
+            ),
+            (
+                "openai-compatible",
+                "https://api.cloudflare.com/client/v4/accounts/acct-1/ai/v1/other",
+            ),
+            ("openai", WORKERS_AI_ENDPOINT),
+        ];
+        for (provider_type, endpoint) in cases {
+            let registry = registry(&node(provider_type, endpoint));
+            let provider = registry
+                .image_provider("artist")
+                .unwrap_or_else(|| panic!("{provider_type} {endpoint}: no image provider"));
+            match provider.edit_image(&blank(), "repaint it", None).await {
+                Err(VisionError::Unsupported(message)) if message == OPENAI_NOT_OFFERED => {}
+                other => panic!("{provider_type} {endpoint}: not the OpenAI adapter: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_adapter_posts_a_multipart_form_to_ai_run_and_decodes_result_image() {
+        let (endpoint, seen) = stand_in(Answer::Image(PNG)).await;
+
+        let answer = adapter(&endpoint)
+            .generate_image(
+                "a lighthouse at dusk",
+                &ImageOptions {
+                    size: Some("1024x768".to_string()),
+                    count: 2,
+                },
+            )
+            .await
+            .expect("the provider answers");
+
+        assert_eq!(answer.images.len(), 2, "one image per request");
+        for image in &answer.images {
+            assert_eq!(image.bytes, PNG);
+            assert_eq!(image.content_type, "image/png");
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "count 2 is two requests");
+        for request in seen.iter() {
+            assert_eq!(request.method, Method::POST);
+            assert_eq!(
+                request.path,
+                "/client/v4/accounts/acct-1/ai/run/@cf/black-forest-labs/flux-2-dev"
+            );
+            assert!(
+                request
+                    .content_type()
+                    .starts_with("multipart/form-data; boundary="),
+                "the content type is {}",
+                request.content_type()
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer test-key")
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get("cf-aig-gateway-id")
+                    .and_then(|v| v.to_str().ok()),
+                Some("inference-test")
+            );
+            assert_eq!(
+                request.fields(),
+                vec![
+                    ("prompt".to_string(), "a lighthouse at dusk".to_string()),
+                    ("width".to_string(), "1024".to_string()),
+                    ("height".to_string(), "768".to_string()),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_no_size_the_form_carries_the_prompt_alone() {
+        let (endpoint, seen) = stand_in(Answer::Image(PNG)).await;
+
+        let answer = adapter(&endpoint)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect("the provider answers");
+
+        assert_eq!(answer.images.len(), 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "count 1 is one request");
+        assert_eq!(
+            seen[0].fields(),
+            vec![("prompt".to_string(), "a red bicycle".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_content_type_is_read_from_the_bytes() {
+        let (endpoint, _) = stand_in(Answer::Image(JPEG)).await;
+
+        let answer = adapter(&endpoint)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect("the provider answers");
+
+        assert_eq!(answer.images[0].bytes, JPEG);
+        assert_eq!(answer.images[0].content_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_result_image_is_a_provider_error_naming_it() {
+        let (endpoint, _) = stand_in(Answer::NoImage).await;
+
+        let error = adapter(&endpoint)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect_err("no image is an error");
+
+        match error {
+            VisionError::Provider(message) => assert!(
+                message.contains("result.image"),
+                "the missing field is not named: {message}"
+            ),
+            other => panic!("not Provider: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workers_ai_400_is_invalid_input_with_its_message() {
+        let (endpoint, _) = stand_in(Answer::Error(
+            400,
+            r#"{"errors":[{"message":"width must be at most 1920"}],"success":false}"#,
+        ))
+        .await;
+
+        let error = adapter(&endpoint)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect_err("the provider refuses");
+
+        match error {
+            VisionError::InvalidInput(message) => assert!(
+                message.starts_with("HTTP 400 Bad Request: ")
+                    && message.contains("width must be at most 1920"),
+                "the provider's message is lost: {message}"
+            ),
+            other => panic!("not InvalidInput: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_other_status_maps_as_the_openai_adapter_maps_it() {
+        for status in [401u16, 403, 429, 500] {
+            let (endpoint, _) = stand_in(Answer::Error(status, "refused")).await;
+            let error = adapter(&endpoint)
+                .generate_image("a red bicycle", &ImageOptions::default())
+                .await
+                .expect_err("the provider refuses");
+            match (status, &error) {
+                (401 | 403, VisionError::Authentication(m)) if m == "refused" => {}
+                (429, VisionError::RateLimit) => {}
+                (500, VisionError::Provider(m)) if m.contains("HTTP 500") => {}
+                _ => panic!("HTTP {status} mapped to {error:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_size_not_of_the_form_width_x_height_is_refused_before_any_request() {
+        let (endpoint, seen) = stand_in(Answer::Image(PNG)).await;
+
+        let error = adapter(&endpoint)
+            .generate_image(
+                "a red bicycle",
+                &ImageOptions {
+                    size: Some("large".to_string()),
+                    count: 1,
+                },
+            )
+            .await
+            .expect_err("the size is refused");
+
+        match error {
+            VisionError::InvalidInput(message) => assert_eq!(
+                message,
+                "size 'large' is not <width>x<height>, for example 1024x1024"
+            ),
+            other => panic!("not InvalidInput: {other:?}"),
+        }
+        assert!(seen.lock().unwrap().is_empty(), "a request was sent");
+    }
 }
 
 // ===========================================================================

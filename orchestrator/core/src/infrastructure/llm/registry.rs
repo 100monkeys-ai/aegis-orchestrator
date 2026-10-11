@@ -27,6 +27,7 @@ use super::anthropic::AnthropicAdapter;
 use super::gemini::GeminiAdapter;
 use super::ollama::OllamaAdapter;
 use super::openai::OpenAIAdapter;
+use super::workers_ai_image::WorkersAiImageAdapter;
 
 /// Indicates whether an API key is platform-managed or user-provided (BYOK).
 ///
@@ -713,8 +714,11 @@ impl ProviderRegistry {
     }
 
     /// Create the image provider for an image generation alias of `config`:
-    /// the `openai` and `openai-compatible` adapters, against the provider's
-    /// image generation endpoint. Any other provider type has none.
+    /// an `openai-compatible` provider whose endpoint is a Workers AI `/ai/v1`
+    /// base is bound to the Workers AI adapter (`/ai/run`, ADR-143 Update
+    /// I1a); every other `openai` and `openai-compatible` provider to the
+    /// OpenAI adapter, against the provider's `/images/generations`. Any
+    /// other provider type has none.
     fn create_image_adapter(
         config: &LLMProviderConfig,
         model: &str,
@@ -726,11 +730,23 @@ impl ProviderRegistry {
                 } else {
                     config.endpoint.expose().to_string()
                 };
+                let api_key = Self::resolve_api_key(&config.api_key)?;
+                let headers = Self::provider_headers(config)?;
+                if config.provider_type == "openai-compatible"
+                    && WorkersAiImageAdapter::serves(&endpoint)
+                {
+                    return Ok(Arc::new(WorkersAiImageAdapter::new(
+                        endpoint,
+                        api_key,
+                        model.to_string(),
+                        headers,
+                    )));
+                }
                 Ok(Arc::new(OpenAIAdapter::new(
                     endpoint,
-                    Self::resolve_api_key(&config.api_key)?,
+                    api_key,
                     model.to_string(),
-                    Self::provider_headers(config)?,
+                    headers,
                 )))
             }
             other => anyhow::bail!("provider type '{other}' has no image generation adapter"),

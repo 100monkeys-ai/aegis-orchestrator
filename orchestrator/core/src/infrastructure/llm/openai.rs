@@ -593,8 +593,9 @@ struct OpenAIImageDatum {
 }
 
 /// The content type of an image's bytes, read from the bytes; `image/png`,
-/// what the endpoint answers by default, when they name none.
-fn image_content_type(bytes: &[u8]) -> String {
+/// what the endpoint answers by default, when they name none. Shared with
+/// [`super::workers_ai_image`].
+pub(super) fn image_content_type(bytes: &[u8]) -> String {
     infer::get(bytes)
         .map(|kind| kind.mime_type().to_string())
         .filter(|mime| mime.starts_with("image/"))

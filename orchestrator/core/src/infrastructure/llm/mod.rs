@@ -14,6 +14,7 @@
 //! | [`anthropic`] | Anthropic `claude-*` | |
 //! | [`gemini`] | Google Gemini `gemini-*` | Native Gemini API |
 //! | [`ollama`] | Ollama local models | Dev/offline use |
+//! | [`workers_ai_image`] | Workers AI image models | `/ai/run`, multipart |
 //! | [`registry`] | `ProviderRegistry` | Selects provider by manifest `spec.runtime.model` |
 //!
 //! See ADR-009 (LLM Provider Strategy).
@@ -28,5 +29,6 @@ pub mod gemini;
 pub mod ollama;
 pub mod openai;
 pub mod registry;
+pub mod workers_ai_image;
 
 pub use registry::ProviderRegistry;
