@@ -1404,8 +1404,62 @@ impl ToolRouter {
     }
 
     /// JSON schema for the `aegis.agent.generate` builtin tool.
+    /// A starting tool's schema with its `repositories`: the person's git
+    /// repositories for the run, each a binding by its id or a repository by
+    /// its URL, whose binding is found or made before the run starts.
+    fn with_repositories(mut schema: Value) -> Value {
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.insert(
+                "repositories".to_string(),
+                json!({
+                    "type": "array",
+                    "description": "Optional: your git repositories for the run, each mounted at /workspace/<label> on a work branch of its own. Name each by the id of one of your git repository bindings (aegis.git.list lists them), or by its URL: the binding of that URL and ref you have is used, else one is made with your GitHub credential before the run starts.",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "binding_id": {
+                                        "type": "string",
+                                        "description": "The id of one of your git repository bindings."
+                                    },
+                                    "branch": {
+                                        "type": "string",
+                                        "description": "Optional work branch for the run."
+                                    }
+                                },
+                                "required": ["binding_id"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "url": {
+                                        "type": "string",
+                                        "description": "The repository's URL, https:// or git@host:path, with no credential in it."
+                                    },
+                                    "ref": {
+                                        "type": "string",
+                                        "description": "Optional branch the run starts from and lands on. Default: main."
+                                    },
+                                    "branch": {
+                                        "type": "string",
+                                        "description": "Optional work branch for the run."
+                                    }
+                                },
+                                "required": ["url"],
+                                "additionalProperties": false
+                            }
+                        ]
+                    }
+                }),
+            );
+        }
+        schema
+    }
+
     fn schema_aegis_agent_generate() -> Value {
-        json!({
+        Self::with_repositories(json!({
             "type": "object",
             "properties": {
                 "input": {
@@ -1430,7 +1484,7 @@ impl ToolRouter {
                 }
             },
             "required": ["input"]
-        })
+        }))
     }
 
     /// JSON schema for the `aegis.agent.logs` builtin tool.
@@ -1541,7 +1595,7 @@ impl ToolRouter {
 
     /// JSON schema for the `aegis.workflow.run` builtin tool.
     fn schema_aegis_workflow_run() -> Value {
-        json!({
+        Self::with_repositories(json!({
             "type": "object",
             "properties": {
                 "name": {
@@ -1564,32 +1618,13 @@ impl ToolRouter {
                     "type": "string",
                     "description": "Optional semantic version of the workflow to execute. When omitted, the latest deployed version is used."
                 },
-                "repositories": {
-                    "type": "array",
-                    "description": "Optional: your git repositories for the run, each by the id of one of your git repository bindings (aegis.git.list lists them), with an optional work branch.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "binding_id": {
-                                "type": "string",
-                                "description": "The id of one of your git repository bindings."
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional work branch for the run."
-                            }
-                        },
-                        "required": ["binding_id"],
-                        "additionalProperties": false
-                    }
-                },
                 "tenant_id": {
                     "type": "string",
                     "description": "Optional tenant identifier. Defaults to the local tenant."
                 }
             },
             "required": ["name"]
-        })
+        }))
     }
 
     /// JSON schema for the `aegis.workflow.executions.list` builtin tool.
@@ -1657,7 +1692,7 @@ impl ToolRouter {
 
     /// JSON schema for the `aegis.workflow.generate` builtin tool.
     fn schema_aegis_workflow_generate() -> Value {
-        json!({
+        Self::with_repositories(json!({
             "type": "object",
             "properties": {
                 "input": {
@@ -1666,7 +1701,7 @@ impl ToolRouter {
                 }
             },
             "required": ["input"]
-        })
+        }))
     }
 
     /// JSON schema for the `aegis.workflow.wait` builtin tool.
@@ -1793,7 +1828,7 @@ impl ToolRouter {
 
     /// JSON schema for the `aegis.execute.intent` builtin tool.
     fn schema_aegis_execute_intent() -> Value {
-        json!({
+        Self::with_repositories(json!({
             "type": "object",
             "properties": {
                 "intent": {
@@ -1839,7 +1874,7 @@ impl ToolRouter {
                 }
             },
             "required": ["intent"]
-        })
+        }))
     }
 
     /// JSON schema for the `aegis.execute.status` builtin tool.
@@ -1884,7 +1919,7 @@ impl ToolRouter {
 
     /// JSON schema for the `aegis.task.execute` builtin tool.
     fn schema_aegis_task_execute() -> Value {
-        json!({
+        Self::with_repositories(json!({
             "type": "object",
             "properties": {
                 "agent_id": {
@@ -1921,7 +1956,7 @@ impl ToolRouter {
                 }
             },
             "required": ["agent_id"]
-        })
+        }))
     }
 
     /// JSON schema for `aegis.schedule.create` (`create`) and
@@ -3131,6 +3166,39 @@ mod tests {
         assert!(!ToolRouter::is_supported_builtin_workflow_tool(
             "totally.unrelated.tool"
         ));
+    }
+
+    /// AEGIS ADR-141 F2a: each starting tool advertises `repositories` in
+    /// both forms, a binding by its id and a repository by its URL.
+    #[test]
+    fn the_starting_tools_advertise_repositories_by_binding_and_by_url() {
+        let mut missing = Vec::new();
+        for tool in [
+            "aegis.task.execute",
+            "aegis.agent.generate",
+            "aegis.execute.intent",
+            "aegis.workflow.generate",
+            "aegis.workflow.run",
+        ] {
+            let schema = ToolRouter::schema_for_builtin(tool);
+            let forms = &schema["properties"]["repositories"]["items"]["oneOf"];
+            let required: Vec<&Value> = forms
+                .as_array()
+                .map(|forms| forms.iter().map(|form| &form["required"]).collect())
+                .unwrap_or_default();
+            if schema["properties"]["repositories"]["type"] != "array"
+                || required != [&json!(["binding_id"]), &json!(["url"])]
+                || forms[1]["properties"]["ref"]["type"] != "string"
+                || forms[1]["properties"]["branch"]["type"] != "string"
+                || forms[0]["properties"]["branch"]["type"] != "string"
+            {
+                missing.push(tool);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these starting tools do not advertise repositories in both forms: {missing:?}"
+        );
     }
 
     #[test]

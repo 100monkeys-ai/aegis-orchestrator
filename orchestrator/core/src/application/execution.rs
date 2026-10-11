@@ -5251,6 +5251,7 @@ mod tests {
         mounted: Mutex<Vec<(Option<String>, uuid::Uuid, serde_json::Value)>>,
         released: Mutex<Vec<uuid::Uuid>>,
         taken: Mutex<Vec<uuid::Uuid>>,
+        resolved: Mutex<Vec<(Option<String>, crate::domain::iam::ZaruTier)>>,
     }
 
     impl RecordingRunRepositories {
@@ -5262,6 +5263,7 @@ mod tests {
                 mounted: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
                 taken: Mutex::new(Vec::new()),
+                resolved: Mutex::new(Vec::new()),
             })
         }
 
@@ -5278,6 +5280,41 @@ mod tests {
 
     #[async_trait]
     impl crate::application::git_repo_service::RunRepositories for RecordingRunRepositories {
+        /// Each repository named by its URL stands for [`REPOSITORY_BINDING`].
+        async fn resolve_requested(
+            &self,
+            _tenant_id: &TenantId,
+            person: Option<&str>,
+            tier: crate::domain::iam::ZaruTier,
+            requested: Vec<crate::domain::git_repo::RequestedRepository>,
+        ) -> std::result::Result<
+            Vec<crate::domain::git_repo::RunRepository>,
+            crate::application::git_repo_service::RunRepositoryError,
+        > {
+            self.resolved
+                .lock()
+                .unwrap()
+                .push((person.map(str::to_string), tier));
+            Ok(requested
+                .into_iter()
+                .map(|entry| match entry {
+                    crate::domain::git_repo::RequestedRepository::Binding(entry) => entry,
+                    crate::domain::git_repo::RequestedRepository::Url(by_url) => {
+                        crate::domain::git_repo::RunRepository {
+                            binding_id: crate::domain::git_repo::GitRepoBindingId(
+                                uuid::Uuid::parse_str(REPOSITORY_BINDING).unwrap(),
+                            ),
+                            branch: by_url.branch,
+                            author: None,
+                            label: None,
+                            git_ref: None,
+                            started_from: None,
+                        }
+                    }
+                })
+                .collect())
+        }
+
         async fn prepare_for_run(
             &self,
             _tenant_id: &TenantId,
@@ -5483,6 +5520,66 @@ mod tests {
             "task": "fix the bug",
             "repositories": [{ "binding_id": REPOSITORY_BINDING }],
         }))
+    }
+
+    /// AEGIS ADR-141 F2a: a root execution naming its repository by URL
+    /// has it resolved to a binding, for its person and their tier, before
+    /// the run is prepared; the persisted input keeps the binding.
+    #[tokio::test]
+    async fn a_root_start_naming_its_repository_by_url_is_resolved_before_it_is_prepared() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("fixer", None, None);
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &agent)
+            .await
+            .unwrap();
+        let runtime = Arc::new(TestRuntime::default());
+        let service = StandardExecutionService::new(
+            agent_repo,
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(runtime.clone())),
+            Arc::new(InMemoryExecutionRepository::new()),
+            Arc::new(EventBus::with_default_capacity()),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+        let repositories = RecordingRunRepositories::new(None);
+        service.set_repositories(repositories.clone());
+
+        let id = service
+            .start_execution(
+                agent.id,
+                input_with(serde_json::json!({
+                    "tenant_id": "zaru-consumer",
+                    "task": "fix the bug",
+                    "repositories": [{ "url": "https://github.com/100monkeys-ai/aegis-examples.git" }],
+                })),
+                "test-ctx".to_string(),
+                Some(&repository_person()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the run naming its repository by URL did not start: {e}"));
+        wait_for_spawn(runtime.as_ref()).await;
+
+        assert_eq!(
+            *repositories.resolved.lock().unwrap(),
+            vec![(
+                Some("u-person".to_string()),
+                crate::domain::iam::ZaruTier::Free
+            )],
+            "the URL was not resolved once, for the run's person and tier"
+        );
+        let execution = service.get_execution_unscoped(id).await.unwrap();
+        assert_eq!(
+            execution.input.input.get("repositories"),
+            Some(&serde_json::json!([{
+                "binding_id": REPOSITORY_BINDING,
+                "branch": crate::domain::git_repo::default_work_branch(id.0),
+            }])),
+            "the persisted input does not keep the binding the URL resolved to"
+        );
     }
 
     /// AEGIS ADR-136 G5b, G13a: the run's preparation is one
@@ -5746,7 +5843,7 @@ mod tests {
     /// starts with the sentence.
     #[tokio::test]
     async fn a_malformed_repositories_is_refused_at_both_starts() {
-        const REFUSAL: &str = "Execution refused: 'repositories' must be a list of objects naming a binding_id and, optionally, a branch";
+        const REFUSAL: &str = "Execution refused: 'repositories' must be a list of objects naming a binding_id or a url and, optionally, a ref and a branch";
         let tenant = CoreTenantId::consumer();
         let parent_agent = make_agent("parent-worker", None, None);
         let child_agent = make_agent("fixer", None, None);
@@ -6925,7 +7022,22 @@ impl StandardExecutionService {
     /// refuses the start, on every path, the HTTP execute route's (which
     /// inserts the value unchecked) included.
     fn refuse_malformed_repositories(input: &ExecutionInput) -> Result<()> {
-        Self::run_repository_entries(input).map(|_| ())
+        Self::requested_repositories(input).map(|_| ())
+    }
+
+    /// The repositories an input carries as a caller may give them: by
+    /// binding, or by URL until the run is prepared (AEGIS ADR-141 F2a).
+    fn requested_repositories(
+        input: &ExecutionInput,
+    ) -> Result<Vec<crate::domain::git_repo::RequestedRepository>> {
+        match input
+            .input
+            .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
+        {
+            None => Ok(Vec::new()),
+            Some(value) => crate::domain::git_repo::parse_requested_repositories(value)
+                .map_err(|sentence| ExecutionError::Refused(sentence.to_string()).into()),
+        }
     }
 
     /// The run's repositories an input carries, read as G3 admits them.
@@ -6965,17 +7077,21 @@ impl StandardExecutionService {
     /// entries are checked, held and their work branches checked out first,
     /// and each entry's branch is written back into `input`, so every state
     /// and child reads the same one (G5a). Every refusal is G3's words.
+    /// Before it is prepared, a repository named by its URL becomes a
+    /// binding of the person's, counted against `identity`'s tier (AEGIS
+    /// ADR-141 F2a); a run already prepared carries bindings only.
     async fn run_repository_mounts(
         &self,
         tenant_id: &TenantId,
         person: Option<&str>,
+        identity: Option<&UserIdentity>,
         run: uuid::Uuid,
         prepare: bool,
         input: &mut ExecutionInput,
     ) -> Result<Vec<VolumeMount>> {
         use crate::application::git_repo_service::RunRepositoryError;
-        let entries = Self::run_repository_entries(input)?;
-        if entries.is_empty() {
+        let requested = Self::requested_repositories(input)?;
+        if requested.is_empty() {
             return Ok(Vec::new());
         }
         let Some(repositories) = self.run_repositories.get() else {
@@ -6994,6 +7110,15 @@ impl StandardExecutionService {
             }
         };
         let entries = if prepare {
+            let entries = repositories
+                .resolve_requested(
+                    tenant_id,
+                    person,
+                    crate::application::git_repo_service::zaru_tier_of(identity),
+                    requested,
+                )
+                .await
+                .map_err(refused)?;
             let filled = repositories
                 .prepare_for_run(tenant_id, person, run, &entries)
                 .await
@@ -7006,7 +7131,8 @@ impl StandardExecutionService {
             }
             filled
         } else {
-            entries
+            // A run already prepared carries bindings only.
+            Self::run_repository_entries(input)?
         };
         match repositories
             .mounts_for_run(tenant_id, person, run, &entries)
@@ -7397,6 +7523,7 @@ impl StandardExecutionService {
             .run_repository_mounts(
                 &tenant_id,
                 person.as_deref(),
+                identity,
                 run,
                 prepares_run,
                 &mut execution.input,
@@ -8404,6 +8531,7 @@ impl ExecutionService for StandardExecutionService {
             .run_repository_mounts(
                 &tenant_id,
                 parent.initiating_user_sub.as_deref(),
+                None,
                 run,
                 false,
                 &mut input,

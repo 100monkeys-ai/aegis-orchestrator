@@ -261,14 +261,14 @@ impl StandardStartWorkflowExecutionUseCase {
     ) -> Result<crate::application::git_repo_service::RunHoldGuard> {
         use crate::application::git_repo_service::{RunHoldGuard, RunRepositoryError};
         use crate::domain::execution::ExecutionError;
-        use crate::domain::git_repo::{parse_run_repositories, REPOSITORIES_INPUT_KEY};
-        let entries = match input.get(REPOSITORIES_INPUT_KEY) {
+        use crate::domain::git_repo::{parse_requested_repositories, REPOSITORIES_INPUT_KEY};
+        let requested = match input.get(REPOSITORIES_INPUT_KEY) {
             None => return Ok(RunHoldGuard::new(None, run.0)),
-            Some(value) => parse_run_repositories(value).map_err(|sentence| {
+            Some(value) => parse_requested_repositories(value).map_err(|sentence| {
                 anyhow::Error::new(ExecutionError::Refused(sentence.to_string()))
             })?,
         };
-        if entries.is_empty() {
+        if requested.is_empty() {
             return Ok(RunHoldGuard::new(None, run.0));
         }
         let Some(repositories) = self.run_repositories.get() else {
@@ -279,17 +279,29 @@ impl StandardStartWorkflowExecutionUseCase {
             .into());
         };
         let person = crate::application::execution::person_sub(identity);
+        let refused = |e: RunRepositoryError| match e {
+            RunRepositoryError::Refused(sentence) => {
+                anyhow::Error::new(ExecutionError::Refused(sentence))
+            }
+            RunRepositoryError::Failed(e) => {
+                anyhow::anyhow!("preparing the run's repositories failed: {e}")
+            }
+        };
+        // AEGIS ADR-141 F2a: a repository named by its URL becomes a binding
+        // of the person's before anything is held.
+        let entries = repositories
+            .resolve_requested(
+                tenant_id,
+                person.as_deref(),
+                crate::application::git_repo_service::zaru_tier_of(identity),
+                requested,
+            )
+            .await
+            .map_err(refused)?;
         let filled = repositories
             .prepare_for_run(tenant_id, person.as_deref(), run.0, &entries)
             .await
-            .map_err(|e| match e {
-                RunRepositoryError::Refused(sentence) => {
-                    anyhow::Error::new(ExecutionError::Refused(sentence))
-                }
-                RunRepositoryError::Failed(e) => {
-                    anyhow::anyhow!("preparing the run's repositories failed: {e}")
-                }
-            })?;
+            .map_err(refused)?;
         if let serde_json::Value::Object(map) = input {
             map.insert(
                 REPOSITORIES_INPUT_KEY.to_string(),

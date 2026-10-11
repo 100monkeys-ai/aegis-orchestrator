@@ -88,10 +88,7 @@ pub(crate) fn owner_of(identity: &UserIdentity) -> String {
 /// identity kind (operator, service account, tenant user) is not gated by a
 /// Zaru tier, so it is `Enterprise`.
 pub(crate) fn zaru_tier_of(identity: &UserIdentity) -> ZaruTier {
-    match &identity.identity_kind {
-        IdentityKind::ConsumerUser { zaru_tier, .. } => zaru_tier.clone(),
-        _ => ZaruTier::Enterprise,
-    }
+    aegis_orchestrator_core::application::git_repo_service::zaru_tier_of(Some(identity))
 }
 
 pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {

@@ -60,12 +60,12 @@ use crate::domain::credential::{
 };
 use crate::domain::git_host_keys::{host_keys_for, ssh_remote, SshHostKey};
 use crate::domain::git_repo::{
-    default_work_branch, is_mountable_label, validate_repo_url, CloneStrategy, GitRef,
-    GitRepoBinding, GitRepoBindingId, GitRepoBindingRepository, GitRepoEvent, GitRepoStatus,
-    RunAuthor, RunRepository,
+    default_work_branch, is_mountable_label, repository_name, same_repository, validate_repo_url,
+    CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId, GitRepoBindingRepository,
+    GitRepoEvent, GitRepoStatus, RepositoryByUrl, RequestedRepository, RunAuthor, RunRepository,
 };
 use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
-use crate::domain::iam::ZaruTier;
+use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use crate::domain::repository::RepositoryError;
 use crate::domain::secrets::{AccessContext, SensitiveString, SensitiveUrl};
 use crate::domain::shared_kernel::TenantId;
@@ -743,6 +743,99 @@ impl GitRepoService {
                 self.fail_refresh(binding, msg.clone()).await;
                 Err(GitRepoError::CloneFailed(msg))
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // A repository named by its URL (AEGIS ADR-141 F2a)
+    // -----------------------------------------------------------------------
+
+    /// The binding a run's entry naming a repository by its URL stands for:
+    /// the person's own binding of that URL and ref when they have one;
+    /// else one made from their one active GitHub credential, labelled with
+    /// the repository's name, its clone awaited. A clone that fails is
+    /// refused with the clone's own sentence and its binding removed.
+    async fn binding_for_url(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        tier: ZaruTier,
+        by_url: RepositoryByUrl,
+    ) -> Result<RunRepository, RunRepositoryError> {
+        let entry = |binding_id: GitRepoBindingId| RunRepository {
+            binding_id,
+            branch: by_url.branch.clone(),
+            author: None,
+            label: None,
+            git_ref: None,
+            started_from: None,
+        };
+        let Some(owner) = person else {
+            return Err(RunRepositoryError::Refused(
+                NO_GITHUB_CREDENTIAL.to_string(),
+            ));
+        };
+        let wanted_ref = GitRef::Branch(by_url.git_ref.clone());
+        if let Some(binding) = self
+            .list_bindings(tenant_id, owner)
+            .await?
+            .into_iter()
+            .find(|b| b.git_ref == wanted_ref && same_repository(b.repo_url.expose(), &by_url.url))
+        {
+            return Ok(entry(binding.id));
+        }
+        let credential = self.one_github_credential(tenant_id, owner).await?;
+        let label = repository_name(&by_url.url).ok_or_else(|| {
+            RunRepositoryError::Refused(crate::domain::git_repo::REPOSITORIES_SHAPE.to_string())
+        })?;
+        let mut cmd =
+            CreateGitRepoCommand::new(tenant_id.clone(), owner, tier, by_url.url.clone(), label);
+        cmd.credential_binding_id = Some(credential);
+        cmd.git_ref = wanted_ref;
+        let binding = self.create_binding(cmd).await.map_err(refusal_of)?;
+        if let Err(e) = self.clone_repo(&binding.id).await {
+            if let Err(error) = self.delete_binding(&binding.id, tenant_id, owner).await {
+                warn!(binding_id = %binding.id, %error, "the binding of a clone that failed could not be removed");
+            }
+            return Err(match e {
+                GitRepoError::CloneFailed(sentence) => RunRepositoryError::Refused(sentence),
+                other => refusal_of(other),
+            });
+        }
+        info!(binding_id = %binding.id, "a binding was made for a repository a run named by its URL");
+        Ok(entry(binding.id))
+    }
+
+    /// The person's one active GitHub credential binding, read by its
+    /// provider and state only.
+    async fn one_github_credential(
+        &self,
+        tenant_id: &TenantId,
+        owner: &str,
+    ) -> Result<CredentialBindingId, RunRepositoryError> {
+        let Some(repo) = self.credential_repo.as_ref() else {
+            return Err(RunRepositoryError::Refused(
+                NO_GITHUB_CREDENTIAL.to_string(),
+            ));
+        };
+        let github: Vec<CredentialBindingId> = repo
+            .find_by_owner(tenant_id, owner)
+            .await
+            .map_err(|e| GitRepoError::SecretResolutionFailed(e.to_string()))?
+            .into_iter()
+            .filter(|cb| {
+                cb.provider.as_str() == GITHUB_PROVIDER && cb.status == CredentialStatus::Active
+            })
+            .map(|cb| cb.id)
+            .collect();
+        match github.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(RunRepositoryError::Refused(
+                NO_GITHUB_CREDENTIAL.to_string(),
+            )),
+            several => Err(RunRepositoryError::Refused(several_github_credentials(
+                several.len(),
+            ))),
         }
     }
 
@@ -2017,6 +2110,37 @@ pub struct RunMount {
     pub mount: VolumeMount,
 }
 
+/// The tier a caller's git repository bindings are counted against: a
+/// consumer's own Zaru tier, and Enterprise for every other identity and
+/// for none.
+pub fn zaru_tier_of(identity: Option<&UserIdentity>) -> ZaruTier {
+    match identity.map(|identity| &identity.identity_kind) {
+        Some(IdentityKind::ConsumerUser { zaru_tier, .. }) => zaru_tier.clone(),
+        _ => ZaruTier::Enterprise,
+    }
+}
+
+/// The provider of a GitHub credential binding (AEGIS ADR-136 G1).
+pub const GITHUB_PROVIDER: &str = "github";
+
+/// The refusal of a repository named by its URL when its person holds no
+/// active GitHub credential to make its binding with (AEGIS ADR-141 F2a).
+pub const NO_GITHUB_CREDENTIAL: &str = "no active GitHub credential of yours";
+
+/// The refusal of a repository named by its URL when its person holds
+/// `count` active GitHub credentials, so which one makes its binding is not
+/// known (AEGIS ADR-141 F2a).
+pub fn several_github_credentials(count: usize) -> String {
+    format!(
+        "you have {count} active GitHub credentials, so which one reaches this repository is not known; link the repository with the one to use, then name its binding_id"
+    )
+}
+
+/// The refusal of a repository named by its URL on a node that cannot find
+/// or make its binding.
+pub const URL_NOT_RESOLVED: &str =
+    "this node cannot find a repository by its URL; name its binding_id";
+
 /// What a run needs of its repositories: prepared once when the run starts
 /// (checked, held, the work branch checked out), mounted in each of its
 /// agent executions, released when it ends (AEGIS ADR-136 G3 to G5).
@@ -2046,6 +2170,30 @@ pub trait RunRepositories: Send + Sync {
         entries: &[RunRepository],
     ) -> Result<Vec<RunMount>, RunRepositoryError>;
 
+    /// Before a run is prepared: each entry naming a repository by its URL
+    /// replaced by a binding of it (AEGIS ADR-141 F2a): the person's own
+    /// binding of that URL and ref, else one made from their one active
+    /// GitHub credential, its clone awaited. Entries naming a binding pass
+    /// as given; nothing is held. A node that cannot resolve a URL refuses
+    /// it.
+    async fn resolve_requested(
+        &self,
+        _tenant_id: &TenantId,
+        _person: Option<&str>,
+        _tier: ZaruTier,
+        requested: Vec<RequestedRepository>,
+    ) -> Result<Vec<RunRepository>, RunRepositoryError> {
+        requested
+            .into_iter()
+            .map(|entry| match entry {
+                RequestedRepository::Binding(entry) => Ok(entry),
+                RequestedRepository::Url(_) => {
+                    Err(RunRepositoryError::Refused(URL_NOT_RESOLVED.to_string()))
+                }
+            })
+            .collect()
+    }
+
     /// Release every binding `run` holds.
     fn release_run(&self, run: uuid::Uuid);
 
@@ -2056,6 +2204,26 @@ pub trait RunRepositories: Send + Sync {
 
 #[async_trait]
 impl RunRepositories for GitRepoService {
+    async fn resolve_requested(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        tier: ZaruTier,
+        requested: Vec<RequestedRepository>,
+    ) -> Result<Vec<RunRepository>, RunRepositoryError> {
+        let mut resolved = Vec::with_capacity(requested.len());
+        for entry in requested {
+            resolved.push(match entry {
+                RequestedRepository::Binding(entry) => entry,
+                RequestedRepository::Url(by_url) => {
+                    self.binding_for_url(tenant_id, person, tier.clone(), by_url)
+                        .await?
+                }
+            });
+        }
+        Ok(resolved)
+    }
+
     async fn prepare_for_run(
         &self,
         tenant_id: &TenantId,
@@ -2204,6 +2372,18 @@ impl GitRepoService {
 }
 
 /// The word a refusal uses for a binding's status (G3).
+/// A failed binding creation for a repository named by its URL, as the
+/// run's refusal: what the person can act on is refused in the service's
+/// own words; a store or secret failure is a failure.
+fn refusal_of(e: GitRepoError) -> RunRepositoryError {
+    match e {
+        GitRepoError::Repository(_) | GitRepoError::SecretResolutionFailed(_) => {
+            RunRepositoryError::Failed(e)
+        }
+        other => RunRepositoryError::Refused(other.to_string()),
+    }
+}
+
 fn status_word(status: &GitRepoStatus) -> &'static str {
     match status {
         GitRepoStatus::Pending => "pending",

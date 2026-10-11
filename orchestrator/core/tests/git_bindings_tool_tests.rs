@@ -652,8 +652,7 @@ async fn aegis_git_list_is_advertised_and_takes_no_arguments() {
     );
 }
 
-/// `aegis.workflow.run`'s advertised schema lists `repositories`: an array
-/// of `{binding_id, branch?}`, as the orchestrator parses it.
+/// `aegis.workflow.run`'s advertised schema lists `repositories`: an array of `{binding_id, branch?}` or `{url, ref?, branch?}`; the binding form is checked here, as the orchestrator parses it.
 #[tokio::test]
 async fn aegis_workflow_run_advertises_repositories() {
     let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
@@ -668,7 +667,7 @@ async fn aegis_workflow_run_advertises_repositories() {
         "aegis.workflow.run's schema does not list repositories: {}",
         run.input_schema
     );
-    let item = &repositories["items"];
+    let item = &repositories["items"]["oneOf"][0];
     assert_eq!(item["type"], "object", "{repositories}");
     assert_eq!(item["required"], json!(["binding_id"]), "{repositories}");
     assert_eq!(

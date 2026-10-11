@@ -4,16 +4,19 @@
 //!
 //! `aegis.task.execute`, `aegis.agent.generate`, `aegis.execute.intent`,
 //! `aegis.workflow.generate` and `aegis.workflow.run` each take a top-level
-//! `repositories: [{"binding_id": "<git repository binding id>", "branch":
-//! "<work branch>"?}]` beside `contexts`: the person's repositories for the
-//! run. It is kept in the execution input's reserved key
-//! [`REPOSITORIES_INPUT_KEY`], as `contexts` is, where the starts read it and
-//! an agent state or a child inherits it. `aegis.workflow.run`'s model-facing
-//! schema lists it; the other starting tools' schemas do not.
+//! `repositories` beside `contexts`: the person's repositories for the run,
+//! each `{"binding_id": "<git repository binding id>", "branch": "<work
+//! branch>"?}` or `{"url": "<repository URL>", "ref": "<branch>"?, "branch":
+//! "<work branch>"?}` (AEGIS ADR-141 F2a), whose binding is found or made
+//! when the run is prepared. It is kept in the execution input's reserved
+//! key [`REPOSITORIES_INPUT_KEY`], as `contexts` is, where the starts read it
+//! and an agent state or a child inherits it.
 
 use serde_json::Value;
 
-use crate::domain::git_repo::{parse_run_repositories, REPOSITORIES_INPUT_KEY, REPOSITORIES_SHAPE};
+use crate::domain::git_repo::{
+    parse_requested_repositories, RequestedRepository, REPOSITORIES_INPUT_KEY, REPOSITORIES_SHAPE,
+};
 use crate::domain::seal_session::SealSessionError;
 
 /// Parse the `repositories` argument of a starting tool's call.
@@ -24,16 +27,19 @@ pub(super) fn parse_repositories(args: &Value) -> Result<Option<Value>, SealSess
     let Some(raw) = args.get(REPOSITORIES_INPUT_KEY) else {
         return Ok(None);
     };
-    let entries = parse_run_repositories(raw)
+    let entries = parse_requested_repositories(raw)
         .map_err(|sentence| SealSessionError::InvalidArguments(sentence.to_string()))?;
-    // The author, label, ref and started_from are the platform's, written
-    // when the run's repositories are prepared: a caller never names one
-    // (AEGIS ADR-136 G5d, ADR-141 F3).
-    if entries.iter().any(|entry| {
-        entry.author.is_some()
-            || entry.label.is_some()
-            || entry.git_ref.is_some()
-            || entry.started_from.is_some()
+    // A binding entry's author, label, ref and started_from are the
+    // platform's, written when the run's repositories are prepared: a
+    // caller never names one (AEGIS ADR-136 G5d, ADR-141 F3).
+    if entries.iter().any(|entry| match entry {
+        RequestedRepository::Binding(entry) => {
+            entry.author.is_some()
+                || entry.label.is_some()
+                || entry.git_ref.is_some()
+                || entry.started_from.is_some()
+        }
+        RequestedRepository::Url(_) => false,
     }) {
         return Err(SealSessionError::InvalidArguments(
             REPOSITORIES_SHAPE.to_string(),
@@ -96,6 +102,24 @@ mod tests {
         );
     }
 
+    /// AEGIS ADR-141 F2a: an entry naming a repository by URL is kept as
+    /// given, beside one naming a binding.
+    #[test]
+    fn a_repository_named_by_url_is_kept_in_the_reserved_key_as_given() {
+        let args = json!({ "repositories": [
+            { "url": "https://github.com/100monkeys-ai/aegis-examples.git" },
+            { "url": "https://github.com/100monkeys-ai/aegis-examples.git", "ref": "main", "branch": "feature/x" },
+            { "binding_id": BINDING }
+        ] });
+        let mut input = json!({ "task": "x" });
+        carry_repositories(&args, &mut input)
+            .unwrap_or_else(|e| panic!("the entries naming a URL were refused: {e:?}"));
+        assert_eq!(
+            input["repositories"], args["repositories"],
+            "the entries were not kept as given"
+        );
+    }
+
     /// AEGIS ADR-136 G3: any other shape is refused with the sentence.
     #[test]
     fn any_other_shape_is_refused_with_the_sentence() {
@@ -106,13 +130,14 @@ mod tests {
             json!({ "repositories": [{ "binding_id": BINDING, "branch": 7 }] }),
             json!({ "repositories": [{ "binding_id": BINDING, "branch": "a..b" }] }),
             json!({ "repositories": [{ "binding_id": BINDING, "ref": "main" }] }),
+            json!({ "repositories": [{ "binding_id": BINDING, "url": "https://github.com/o/r.git" }] }),
             json!({ "repositories": [{}] }),
             json!({ "repositories": null }),
         ] {
             match parse_repositories(&bad) {
                 Err(SealSessionError::InvalidArguments(sentence)) => assert_eq!(
                     sentence,
-                    "'repositories' must be a list of objects naming a binding_id and, optionally, a branch",
+                    "'repositories' must be a list of objects naming a binding_id or a url and, optionally, a ref and a branch",
                     "the refusal of {bad} is not G3's sentence"
                 ),
                 other => panic!("{bad} was not refused with G3's sentence: {other:?}"),
@@ -132,7 +157,7 @@ mod tests {
             match parse_repositories(&args) {
                 Err(SealSessionError::InvalidArguments(sentence)) => assert_eq!(
                     sentence,
-                    "'repositories' must be a list of objects naming a binding_id and, optionally, a branch",
+                    "'repositories' must be a list of objects naming a binding_id or a url and, optionally, a ref and a branch",
                     "the refusal of the caller's author {author} is not G3's sentence"
                 ),
                 other => panic!("the caller's author {author} was not refused: {other:?}"),

@@ -534,7 +534,7 @@ pub const REPOSITORIES_INPUT_KEY: &str = "repositories";
 /// The refusal of a `repositories` value of any other shape (AEGIS ADR-136
 /// G3).
 pub const REPOSITORIES_SHAPE: &str =
-    "'repositories' must be a list of objects naming a binding_id and, optionally, a branch";
+    "'repositories' must be a list of objects naming a binding_id or a url and, optionally, a ref and a branch";
 
 /// One repository a run is given: the binding, the work branch the run
 /// works on, and the person its commits are authored as. A start with no
@@ -654,6 +654,129 @@ pub fn parse_run_repositories(
         });
     }
     Ok(entries)
+}
+
+/// One entry of a run's `repositories` as a caller may give it: a binding
+/// by its id (AEGIS ADR-136 G3), or a repository by its URL, whose binding
+/// the platform finds or makes before the run starts (AEGIS ADR-141 F2a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestedRepository {
+    Binding(RunRepository),
+    Url(RepositoryByUrl),
+}
+
+/// A repository named by its URL: `{"url": "<repository URL>", "ref":
+/// "<branch>"?, "branch": "<work branch>"?}`, `ref` `main` when not given
+/// (AEGIS ADR-141 F2a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryByUrl {
+    pub url: String,
+    pub git_ref: String,
+    pub branch: Option<String>,
+}
+
+/// Read a `repositories` value as a caller may give it: every entry G3
+/// admits, and beside them entries naming a repository by `url` with an
+/// optional `ref` (a branch name, default `main`) and `branch`. An entry
+/// naming both `binding_id` and `url`, a URL that is not an `https://` or
+/// `git@host:path` one or that carries user info, or anything else answers
+/// [`REPOSITORIES_SHAPE`].
+pub fn parse_requested_repositories(
+    value: &serde_json::Value,
+) -> Result<Vec<RequestedRepository>, &'static str> {
+    let serde_json::Value::Array(items) = value else {
+        return Err(REPOSITORIES_SHAPE);
+    };
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let serde_json::Value::Object(map) = item else {
+            return Err(REPOSITORIES_SHAPE);
+        };
+        if map.contains_key("url") {
+            entries.push(RequestedRepository::Url(parse_repository_by_url(map)?));
+        } else {
+            let mut entry = parse_run_repositories(&serde_json::Value::Array(vec![item.clone()]))?;
+            entries.push(RequestedRepository::Binding(entry.remove(0)));
+        }
+    }
+    Ok(entries)
+}
+
+/// One entry naming a repository by its URL: only `url`, `ref` and
+/// `branch`, the URL one a binding may name, with no user info, and naming
+/// a repository.
+fn parse_repository_by_url(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<RepositoryByUrl, &'static str> {
+    if map
+        .keys()
+        .any(|key| !matches!(key.as_str(), "url" | "ref" | "branch"))
+    {
+        return Err(REPOSITORIES_SHAPE);
+    }
+    let url = match map.get("url") {
+        Some(serde_json::Value::String(url))
+            if validate_repo_url(url).is_ok()
+                && !carries_user_info(url)
+                && repository_name(url).is_some() =>
+        {
+            url.clone()
+        }
+        _ => return Err(REPOSITORIES_SHAPE),
+    };
+    let branch_name = |key: &str| match map.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::String(name)) if is_branch_name(name) => Ok(Some(name.clone())),
+        Some(_) => Err(REPOSITORIES_SHAPE),
+    };
+    Ok(RepositoryByUrl {
+        url,
+        git_ref: branch_name("ref")?.unwrap_or_else(|| "main".to_string()),
+        branch: branch_name("branch")?,
+    })
+}
+
+/// Whether an `https://` URL carries user info (`user:token@`), which a run's
+/// entry, kept in its input, must not.
+fn carries_user_info(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .map(|rest| rest.split('/').next().unwrap_or("").contains('@'))
+        .unwrap_or(false)
+}
+
+/// The host, in lower case, and the path of a repository URL, without user
+/// info, a trailing `/` or `.git`; `None` for a URL of no known form.
+fn repository_location(url: &str) -> Option<(&'static str, String, String)> {
+    let url = url.trim();
+    let (form, host, path) = if let Some(rest) = url.strip_prefix("https://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        ("https", host, path)
+    } else {
+        let (host, path) = url.strip_prefix("git@")?.split_once(':')?;
+        ("ssh", host, path)
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path).trim_matches('/');
+    Some((form, host.to_ascii_lowercase(), path.to_string()))
+}
+
+/// The name of the repository at `url`: its last path segment without
+/// `.git`, when that can name a directory (AEGIS ADR-141 F2a).
+pub fn repository_name(url: &str) -> Option<String> {
+    let (_, _, path) = repository_location(url)?;
+    let name = path.rsplit('/').next()?;
+    is_mountable_label(name).then(|| name.to_string())
+}
+
+/// Whether two repository URLs name one repository: the same host, in any
+/// case, and the same path, with or without user info, a trailing `/` or
+/// `.git`.
+pub fn same_repository(a: &str, b: &str) -> bool {
+    match (repository_location(a), repository_location(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Whether `name` is a name git accepts for a branch (`refs/heads/<name>`).
@@ -1015,6 +1138,142 @@ mod tests {
                 None,
                 "{name:?} <{email:?}> made an author"
             );
+        }
+    }
+
+    /// AEGIS ADR-141 F2a: an entry naming a repository by URL is admitted
+    /// beside one naming a binding, its ref `main` when not given.
+    #[test]
+    fn a_repository_named_by_url_is_admitted_with_its_ref_defaulting_to_main() {
+        let value = serde_json::json!([
+            { "binding_id": RUN_BINDING },
+            { "url": "https://github.com/100monkeys-ai/aegis-examples.git" },
+            { "url": "git@github.com:100monkeys-ai/zaru-client.git", "ref": "develop", "branch": "feature/x" }
+        ]);
+        let entries = parse_requested_repositories(&value)
+            .unwrap_or_else(|e| panic!("the entries naming repositories by URL were refused: {e}"));
+        assert_eq!(
+            entries[1..],
+            [
+                RequestedRepository::Url(RepositoryByUrl {
+                    url: "https://github.com/100monkeys-ai/aegis-examples.git".to_string(),
+                    git_ref: "main".to_string(),
+                    branch: None,
+                }),
+                RequestedRepository::Url(RepositoryByUrl {
+                    url: "git@github.com:100monkeys-ai/zaru-client.git".to_string(),
+                    git_ref: "develop".to_string(),
+                    branch: Some("feature/x".to_string()),
+                }),
+            ],
+            "the URL entries were not read as given"
+        );
+        assert!(
+            matches!(&entries[0], RequestedRepository::Binding(entry) if entry.binding_id.0.to_string() == RUN_BINDING),
+            "the binding entry beside them was not read: {:?}",
+            entries[0]
+        );
+    }
+
+    /// AEGIS ADR-141 F2a: an entry naming both a binding and a URL, or a URL
+    /// of any other shape, is refused with the sentence; a prepared list
+    /// carries bindings only.
+    #[test]
+    fn a_url_entry_of_any_other_shape_is_refused_with_the_sentence() {
+        let mut admitted = Vec::new();
+        for entry in [
+            serde_json::json!({ "binding_id": RUN_BINDING, "url": "https://github.com/o/r.git" }),
+            serde_json::json!({ "url": "http://github.com/o/r.git" }),
+            serde_json::json!({ "url": "https://x-access-token:Mk9@github.com/o/r.git" }),
+            serde_json::json!({ "url": "https://github.com/" }),
+            serde_json::json!({ "url": 7 }),
+            serde_json::json!({ "url": "https://github.com/o/r.git", "ref": "a..b" }),
+            serde_json::json!({ "url": "https://github.com/o/r.git", "ref": 7 }),
+            serde_json::json!({ "url": "https://github.com/o/r.git", "branch": "a..b" }),
+            serde_json::json!({ "url": "https://github.com/o/r.git", "label": "r" }),
+            serde_json::json!({ "url": "https://github.com/o/r.git", "author": { "name": "A", "email": "a@b" } }),
+        ] {
+            if parse_requested_repositories(&serde_json::json!([entry])) != Err(REPOSITORIES_SHAPE)
+            {
+                admitted.push(entry);
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "an entry was not refused with the sentence: {admitted:?}"
+        );
+        assert_eq!(
+            parse_run_repositories(&serde_json::json!([{ "url": "https://github.com/o/r.git" }])),
+            Err(REPOSITORIES_SHAPE),
+            "a prepared list admitted an entry naming a URL"
+        );
+        assert_eq!(
+            REPOSITORIES_SHAPE,
+            "'repositories' must be a list of objects naming a binding_id or a url and, optionally, a ref and a branch"
+        );
+    }
+
+    /// AEGIS ADR-141 F2a: the label of a binding made for a URL is the
+    /// repository's name, and two spellings of one URL are one repository.
+    #[test]
+    fn a_repository_url_names_its_repository_and_matches_its_other_spellings() {
+        for (url, name) in [
+            (
+                "https://github.com/100monkeys-ai/aegis-examples.git",
+                "aegis-examples",
+            ),
+            (
+                "https://github.com/100monkeys-ai/aegis-examples",
+                "aegis-examples",
+            ),
+            (
+                "https://github.com/100monkeys-ai/aegis-examples/",
+                "aegis-examples",
+            ),
+            (
+                "git@github.com:100monkeys-ai/zaru-client.git",
+                "zaru-client",
+            ),
+        ] {
+            assert_eq!(repository_name(url).as_deref(), Some(name), "{url}");
+        }
+        assert!(same_repository(
+            "https://GitHub.com/100monkeys-ai/aegis-examples.git",
+            "https://github.com/100monkeys-ai/aegis-examples/"
+        ));
+        assert!(same_repository(
+            "https://x-access-token:Mk9@github.com/o/r.git",
+            "https://github.com/o/r"
+        ));
+        assert!(!same_repository(
+            "https://github.com/o/r.git",
+            "https://github.com/o/r2.git"
+        ));
+        assert!(!same_repository(
+            "https://github.com/o/r.git",
+            "https://gitlab.com/o/r.git"
+        ));
+    }
+
+    /// What `GET /v1/storage/git` answers for a binding's `git_ref`: the
+    /// derive's external tag, the variant's name keyed to its value.
+    #[test]
+    fn a_git_ref_serializes_as_its_variant_name_keyed_to_its_value() {
+        for (git_ref, wire) in [
+            (
+                GitRef::Branch("main".to_string()),
+                serde_json::json!({ "Branch": "main" }),
+            ),
+            (
+                GitRef::Tag("v1.0.0".to_string()),
+                serde_json::json!({ "Tag": "v1.0.0" }),
+            ),
+            (
+                GitRef::Commit("0123abc".to_string()),
+                serde_json::json!({ "Commit": "0123abc" }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&git_ref).unwrap(), wire, "{git_ref:?}");
         }
     }
 }
