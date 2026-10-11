@@ -161,6 +161,28 @@ impl ToolInvocationService {
         // AEGIS ADR-126, Update of 2026-10-07 (2), clauses 3 and 3a: the
         // conversation the run was started from, only as the facade wrote it.
         super::context_args::carry_conversation(args, &mut input);
+        // AEGIS ADR-143 S3: the attachments ride in the run's
+        // `input.attachments`, as `aegis.execute.intent` places them.
+        let attachments = super::attachment_args::parse_attachments(args)?;
+        if !attachments.is_empty() {
+            let attachments_json = serde_json::to_value(&attachments).map_err(|e| {
+                SealSessionError::InternalError(format!(
+                    "Failed to serialize attachments for workflow run: {e}"
+                ))
+            })?;
+            match input.as_object_mut() {
+                Some(obj) => {
+                    obj.insert("attachments".to_string(), attachments_json);
+                }
+                None => {
+                    let original = std::mem::replace(&mut input, serde_json::Value::Null);
+                    let mut wrapper = serde_json::Map::new();
+                    wrapper.insert("value".to_string(), original);
+                    wrapper.insert("attachments".to_string(), attachments_json);
+                    input = serde_json::Value::Object(wrapper);
+                }
+            }
+        }
         let blackboard = args.get("blackboard").cloned();
         let intent = args
             .get("intent")
