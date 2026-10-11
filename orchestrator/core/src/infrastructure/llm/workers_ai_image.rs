@@ -5,10 +5,12 @@
 //! Implements [`VisionProvider`] for an image model served by Cloudflare
 //! Workers AI. Workers AI's OpenAI-compatible API (`/ai/v1`) serves chat
 //! completions, embeddings and responses only; an image model is run at
-//! `/ai/run/<model>`, takes a multipart form and answers its image as base64
-//! in `result.image`. So an `openai-compatible` image generation alias whose
-//! endpoint is a Workers AI `/ai/v1` base ([`WorkersAiImageAdapter::serves`])
-//! is bound to this adapter, and every other endpoint keeps
+//! `/ai/run/<model>` and answers its image as base64 in `result.image`. Its
+//! request is a JSON body for every model but those `MULTIPART_MODELS`
+//! names, whose schema takes a multipart form. So an `openai-compatible`
+//! image generation alias whose endpoint is a Workers AI `/ai/v1` base
+//! ([`WorkersAiImageAdapter::serves`]) is bound to this adapter, and every
+//! other endpoint keeps
 //! [`super::openai::OpenAIAdapter`]'s `/images/generations`.
 //!
 //! The provider's configured `headers` (ADR-124 D3) are sent beside the
@@ -28,6 +30,13 @@ const WORKERS_AI_HOST: &str = "api.cloudflare.com";
 
 /// The end of the path of a Workers AI OpenAI-compatible base.
 const OPENAI_COMPATIBLE_SUFFIX: &str = "/ai/v1";
+
+/// The Workers AI image models whose input schema is a multipart form
+/// (`flux-2-dev`: "multipart object required"). Every other image model's
+/// schema is a JSON object (`flux-1-schnell`: `prompt` required, `steps` at
+/// most 8), and such a model refuses a multipart request with HTTP 400. The
+/// form is chosen by the model's name, never by the alias that names it.
+const MULTIPART_MODELS: &[&str] = &["@cf/black-forest-labs/flux-2-dev"];
 
 /// The prefix of every AI Gateway request header.
 const AI_GATEWAY_HEADER_PREFIX: &str = "cf-aig-";
@@ -52,7 +61,7 @@ pub struct WorkersAiImageAdapter {
 impl WorkersAiImageAdapter {
     /// Every header whose name starts with `cf-aig-` is dropped from
     /// `headers`, because the AI Gateway's OpenAI-compatible route does not
-    /// carry a multipart `/ai/run` request, and Workers AI answers such a
+    /// carry an `/ai/run` request, and Workers AI answers such a
     /// request that names a gateway with code 7000, "Invalid request body",
     /// before the model runs.
     pub fn new(endpoint: String, api_key: String, model: String, mut headers: HeaderMap) -> Self {
@@ -94,25 +103,45 @@ impl WorkersAiImageAdapter {
         format!("{base}/run/{}", self.model)
     }
 
-    /// One request: one image.
+    /// Whether the model's schema takes a multipart form rather than JSON.
+    fn takes_multipart(&self) -> bool {
+        MULTIPART_MODELS.contains(&self.model.as_str())
+    }
+
+    /// One request: one image. A multipart form of `prompt`, `width` and
+    /// `height` for a model [`MULTIPART_MODELS`] names; for every other, a
+    /// JSON body `{"prompt", "width"?, "height"?}`, the two sizes as numbers.
+    /// No `steps` is sent: [`ImageOptions`] carries none, so the model's
+    /// default holds.
     async fn generate_one(
         &self,
         url: &str,
         prompt: &str,
-        dimensions: Option<(&str, &str)>,
+        dimensions: Option<(u32, u32)>,
     ) -> Result<Image, VisionError> {
-        let mut form = reqwest::multipart::Form::new().text("prompt", prompt.to_string());
-        if let Some((width, height)) = dimensions {
-            form = form
-                .text("width", width.to_string())
-                .text("height", height.to_string());
-        }
-        let response = self
+        let request = self
             .client
             .post(url)
             .headers(self.headers.clone())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
+            .header("Authorization", format!("Bearer {}", self.api_key));
+        let request = if self.takes_multipart() {
+            let mut form = reqwest::multipart::Form::new().text("prompt", prompt.to_string());
+            if let Some((width, height)) = dimensions {
+                form = form
+                    .text("width", width.to_string())
+                    .text("height", height.to_string());
+            }
+            request.multipart(form)
+        } else {
+            let mut body = serde_json::Map::new();
+            body.insert("prompt".to_string(), prompt.into());
+            if let Some((width, height)) = dimensions {
+                body.insert("width".to_string(), width.into());
+                body.insert("height".to_string(), height.into());
+            }
+            request.json(&body)
+        };
+        let response = request
             .send()
             .await
             .map_err(|e| VisionError::Network(e.to_string()))?;
@@ -175,11 +204,15 @@ fn first_error_code(body: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// `<width>x<height>`, each a positive whole number, as its two parts.
-fn dimensions(size: &str) -> Option<(&str, &str)> {
+/// `<width>x<height>`, each a whole number of digits only, as its two parts.
+fn dimensions(size: &str) -> Option<(u32, u32)> {
     let (width, height) = size.split_once('x')?;
-    let whole = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    (whole(width) && whole(height)).then_some((width, height))
+    let whole = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u32>().ok())
+            .flatten()
+    };
+    Some((whole(width)?, whole(height)?))
 }
 
 #[async_trait]
@@ -274,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_size_names_width_and_height() {
-        assert_eq!(dimensions("1024x768"), Some(("1024", "768")));
+        assert_eq!(dimensions("1024x768"), Some((1024, 768)));
         for size in [
             "large",
             "1024",
@@ -283,6 +316,8 @@ mod tests {
             "1024x768x2",
             "-1x5",
             "10 x 10",
+            "+5x5",
+            "99999999999x5",
         ] {
             assert_eq!(dimensions(size), None, "{size}");
         }

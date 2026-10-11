@@ -282,6 +282,12 @@ mod workers_ai {
     /// Production's alias table names Workers AI in this form.
     const WORKERS_AI_ENDPOINT: &str = "https://api.cloudflare.com/client/v4/accounts/acct-1/ai/v1";
 
+    /// The one model whose schema takes a multipart form.
+    const FLUX_2_DEV: &str = "@cf/black-forest-labs/flux-2-dev";
+
+    /// A model whose schema takes a JSON body and refuses multipart.
+    const FLUX_1_SCHNELL: &str = "@cf/black-forest-labs/flux-1-schnell";
+
     /// The first bytes of a JPEG file, then a few more.
     const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIFfake-image";
 
@@ -307,6 +313,25 @@ mod workers_ai {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default()
                 .to_string()
+        }
+
+        /// The JSON body, after asserting the request is one: its content
+        /// type `application/json` and its body no multipart form.
+        fn json(&self) -> serde_json::Map<String, serde_json::Value> {
+            assert_eq!(
+                self.content_type(),
+                "application/json",
+                "the request is not JSON"
+            );
+            let body = String::from_utf8(self.body.to_vec()).expect("a text body");
+            assert!(
+                !body.contains("Content-Disposition: form-data"),
+                "the body is a multipart form: {body}"
+            );
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(serde_json::Value::Object(map)) => map,
+                other => panic!("the body is not a JSON object: {other:?}"),
+            }
         }
 
         /// The multipart form's fields, `(name, value)`, in their order.
@@ -398,9 +423,15 @@ mod workers_ai {
         )
     }
 
-    /// The adapter against the stand-in, for the flux model, with the
+    /// The adapter against the stand-in, for `flux-2-dev`, with the
     /// provider's AI Gateway headers and one other header.
     fn adapter(endpoint: &str) -> WorkersAiImageAdapter {
+        adapter_for(endpoint, FLUX_2_DEV)
+    }
+
+    /// The adapter against the stand-in, for `model`, with the provider's AI
+    /// Gateway headers and one other header.
+    fn adapter_for(endpoint: &str, model: &str) -> WorkersAiImageAdapter {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "cf-aig-gateway-id",
@@ -417,7 +448,7 @@ mod workers_ai {
         WorkersAiImageAdapter::new(
             endpoint.to_string(),
             "test-key".to_string(),
-            "@cf/black-forest-labs/flux-2-dev".to_string(),
+            model.to_string(),
             headers,
         )
     }
@@ -697,6 +728,173 @@ mod workers_ai {
                 (500, VisionError::Provider(m)) if m.contains("HTTP 500") => {}
                 _ => panic!("HTTP {status} mapped to {error:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flux_1_schnell_request_is_one_json_post_of_prompt_width_and_height() {
+        let (endpoint, seen) = stand_in(Answer::Image(JPEG)).await;
+
+        let answer = adapter_for(&endpoint, FLUX_1_SCHNELL)
+            .generate_image(
+                "a lighthouse at dusk",
+                &ImageOptions {
+                    size: Some("1024x768".to_string()),
+                    count: 1,
+                },
+            )
+            .await
+            .expect("the provider answers");
+
+        assert_eq!(answer.images.len(), 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "count 1 is one request");
+        let request = &seen[0];
+        assert_eq!(request.method, Method::POST);
+        assert_eq!(
+            request.path,
+            "/client/v4/accounts/acct-1/ai/run/@cf/black-forest-labs/flux-1-schnell"
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer test-key")
+        );
+        let body = request.json();
+        assert_eq!(
+            serde_json::Value::Object(body.clone()),
+            serde_json::json!({
+                "prompt": "a lighthouse at dusk",
+                "width": 1024,
+                "height": 768,
+            })
+        );
+        assert!(
+            !body.contains_key("steps"),
+            "steps is sent though none was given"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flux_1_schnell_request_with_no_size_carries_the_prompt_alone() {
+        let (endpoint, seen) = stand_in(Answer::Image(JPEG)).await;
+
+        adapter_for(&endpoint, FLUX_1_SCHNELL)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect("the provider answers");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "count 1 is one request");
+        assert_eq!(
+            serde_json::Value::Object(seen[0].json()),
+            serde_json::json!({"prompt": "a red bicycle"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flux_2_dev_request_stays_a_multipart_form() {
+        let (endpoint, seen) = stand_in(Answer::Image(PNG)).await;
+
+        adapter_for(&endpoint, FLUX_2_DEV)
+            .generate_image(
+                "a red bicycle",
+                &ImageOptions {
+                    size: Some("512x512".to_string()),
+                    count: 1,
+                },
+            )
+            .await
+            .expect("the provider answers");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "count 1 is one request");
+        assert!(
+            seen[0]
+                .content_type()
+                .starts_with("multipart/form-data; boundary="),
+            "the content type is {}",
+            seen[0].content_type()
+        );
+        assert_eq!(
+            seen[0].fields(),
+            vec![
+                ("prompt".to_string(), "a red bicycle".to_string()),
+                ("width".to_string(), "512".to_string()),
+                ("height".to_string(), "512".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_models_base64_jpeg_answer_is_an_image_jpeg() {
+        let (endpoint, seen) = stand_in(Answer::Image(JPEG)).await;
+
+        let answer = adapter_for(&endpoint, FLUX_1_SCHNELL)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect("the provider answers");
+
+        seen.lock().unwrap()[0].json();
+        assert_eq!(answer.images.len(), 1);
+        assert_eq!(answer.images[0].bytes, JPEG);
+        assert_eq!(answer.images[0].content_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn a_json_request_carries_no_ai_gateway_header_and_keeps_the_others() {
+        let (endpoint, seen) = stand_in(Answer::Image(JPEG)).await;
+
+        adapter_for(&endpoint, FLUX_1_SCHNELL)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect("the provider answers");
+
+        let seen = seen.lock().unwrap();
+        seen[0].json();
+        let gateway: Vec<&str> = seen[0]
+            .headers
+            .keys()
+            .map(|name| name.as_str())
+            .filter(|name| name.starts_with("cf-aig-"))
+            .collect();
+        assert!(
+            gateway.is_empty(),
+            "the /ai/run request carries AI Gateway headers: {gateway:?}"
+        );
+        assert_eq!(
+            seen[0]
+                .headers
+                .get("x-provider-header")
+                .and_then(|v| v.to_str().ok()),
+            Some("kept"),
+            "the provider's other header is not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_request_answered_500_with_code_7000_is_invalid_input() {
+        let (endpoint, seen) = stand_in(Answer::Error(
+            500,
+            r#"{"errors":[{"message":"Invalid request body","code":7000}],"success":false,"result":{},"messages":[]}"#,
+        ))
+        .await;
+
+        let error = adapter_for(&endpoint, FLUX_1_SCHNELL)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect_err("the provider refuses");
+
+        seen.lock().unwrap()[0].json();
+        match error {
+            VisionError::InvalidInput(message) => assert!(
+                message.starts_with("HTTP 500 Internal Server Error: ")
+                    && message.contains("Invalid request body"),
+                "the provider's message is lost: {message}"
+            ),
+            other => panic!("not InvalidInput: {other:?}"),
         }
     }
 
