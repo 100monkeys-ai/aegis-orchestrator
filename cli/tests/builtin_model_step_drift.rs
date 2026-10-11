@@ -109,3 +109,99 @@ fn transcribe_audio_is_a_builtin_workflow_on_the_published_image() {
         .collect();
     assert_eq!(images, vec![PUBLISHED.to_string()]);
 }
+
+/// The `TRANSCRIBE` state of a parsed `transcribe-audio`.
+fn transcribe_state(workflow: &Workflow) -> &StateKind {
+    &workflow
+        .spec
+        .states
+        .iter()
+        .find(|(name, _)| name.as_str() == "TRANSCRIBE")
+        .expect("transcribe-audio has a TRANSCRIBE state")
+        .1
+        .kind
+}
+
+/// ADR-143 S4 and T4: `transcribe-audio` reads the file attached to its run,
+/// through the run's `attachments` volume mounted read-only at `/input`; it
+/// declares no shared volume, and its program writes nothing into the mount
+/// (the transcript is the step's stdout).
+#[test]
+fn transcribe_audio_reads_the_runs_attachments_read_only() {
+    let workflow = WorkflowParser::parse_yaml(&transcribe_audio()).expect("the template parses");
+    assert!(
+        workflow.spec.storage.shared_volumes.is_empty(),
+        "transcribe-audio declares shared volumes: {:?}",
+        workflow
+            .spec
+            .storage
+            .shared_volumes
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let StateKind::ContainerRun {
+        command,
+        volumes,
+        workdir,
+        ..
+    } = transcribe_state(&workflow)
+    else {
+        panic!("TRANSCRIBE is not a ContainerRun");
+    };
+    let mounts: Vec<(&str, &str, bool)> = volumes
+        .iter()
+        .map(|m| (m.name.as_str(), m.mount_path.as_str(), m.read_only))
+        .collect();
+    assert_eq!(
+        mounts,
+        vec![("attachments", "/input", true)],
+        "TRANSCRIBE does not mount only the run's attachments, read-only at /input"
+    );
+    assert_eq!(
+        command,
+        &vec![
+            "transcribe".to_string(),
+            "/input/{{input.audio_path}}".to_string(),
+            "--out".to_string(),
+            "/tmp/transcript.txt".to_string(),
+        ],
+        "TRANSCRIBE's command does not read /input and write outside it"
+    );
+    assert!(
+        command.iter().skip(2).all(|arg| !arg.starts_with("/input")),
+        "TRANSCRIBE writes into its read-only mount: {command:?}"
+    );
+    assert!(
+        !workdir.as_deref().is_some_and(|w| w.starts_with("/input")),
+        "TRANSCRIBE's working directory is inside its read-only mount: {workdir:?}"
+    );
+}
+
+/// The startup deploy's case for this change: a `transcribe-audio` stored
+/// from the template that read a declared `audio` volume reads as drift
+/// against the template that reads the run's attachments, so the deploy
+/// re-registers the built-in.
+#[test]
+fn a_stored_transcribe_audio_on_the_audio_volume_reads_as_drift() {
+    let registry = registry();
+    let template = transcribe_audio();
+    let previous = template
+        .replace(
+            "  initial_state: TRANSCRIBE\n",
+            "  initial_state: TRANSCRIBE\n  storage:\n    shared_volumes:\n      - name: audio\n        storage_class: persistent\n",
+        )
+        .replace(
+            "        - name: attachments\n          mount_path: /input\n          read_only: true\n",
+            "        - name: audio\n          mount_path: /data\n",
+        );
+    assert_ne!(
+        previous, template,
+        "the template reads the run's attachments"
+    );
+    let stored = stored(&previous, &registry);
+    assert!(
+        !workflow_matches(&stored, &template, Some(&registry)).unwrap(),
+        "a transcribe-audio stored on the audio volume does not read as drift"
+    );
+}

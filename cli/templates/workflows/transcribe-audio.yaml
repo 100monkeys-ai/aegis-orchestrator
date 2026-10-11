@@ -5,8 +5,9 @@ metadata:
   version: "1.0.0"
   description: >-
     Transcribes one audio file to text with a pinned speech-to-text model, on
-    the CPU, with no network and no language model. The file is read from the
-    run's audio volume; the transcript is written beside it as transcript.txt
+    the CPU, with no network and no language model. The file is one attached
+    to the run, read where the run's attachments are mounted read-only; the
+    transcript is the step's standard output ({{TRANSCRIBE.output.stdout}})
     and is the run's answer.
   labels:
     category: platform
@@ -18,11 +19,11 @@ metadata:
       audio_path:
         type: string
         description: >-
-          The audio file's path inside the audio volume: letters, digits and
-          - . _ / only, not starting with / or containing "..". Any container
-          ffmpeg decodes (wav, mp3, m4a, ogg, flac, webm).
+          The name of the audio file attached to the run: letters, digits and
+          - . _ only, not containing "..". Any container ffmpeg decodes (wav,
+          mp3, m4a, ogg, flac, webm).
         maxLength: 512
-        pattern: "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/-]+$"
+        pattern: "^(?!.*\\.\\.)[A-Za-z0-9._-]+$"
     required:
       - audio_path
   output_schema:
@@ -39,23 +40,21 @@ metadata:
     exit_code: "{{TRANSCRIBE.exit_code}}"
 spec:
   initial_state: TRANSCRIBE
-  storage:
-    shared_volumes:
-      - name: audio
-        storage_class: persistent
   states:
     # A model step: the image is the registry's pinned speech-to-text model,
     # resolved at registration; it runs with no network, and the registry's
-    # entry sets its CPU, memory and timeout.
+    # entry sets its CPU, memory and timeout. It reads the run's attachments,
+    # mounted read-only at their names; the program needs an output path, so
+    # it writes the transcript outside the mount and prints it on stdout.
     TRANSCRIBE:
       kind: ContainerRun
       name: "Transcribe"
       image: "model:speech-to-text/whisper-base"
-      command: ["transcribe", "/data/{{input.audio_path}}", "--out", "/data/transcript.txt"]
-      workdir: /data
+      command: ["transcribe", "/input/{{input.audio_path}}", "--out", "/tmp/transcript.txt"]
       volumes:
-        - name: audio
-          mount_path: /data
+        - name: attachments
+          mount_path: /input
+          read_only: true
       shell: false
       transitions:
         - condition: exit_code_zero
