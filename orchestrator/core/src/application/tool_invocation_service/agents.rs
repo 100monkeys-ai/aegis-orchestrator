@@ -2,6 +2,15 @@ use super::attachment_args::parse_attachments;
 use super::*;
 
 impl ToolInvocationService {
+    /// The node's image generation aliases, none where no image generation
+    /// models are attached: an agent's model is never one (AEGIS ADR-143 I1).
+    fn image_generation_aliases(&self) -> Vec<String> {
+        self.image_generation
+            .as_ref()
+            .map(|models| models.image_generation_aliases())
+            .unwrap_or_default()
+    }
+
     pub(super) async fn invoke_aegis_agent_create_tool(
         &self,
         args: &mut Value,
@@ -20,7 +29,10 @@ impl ToolInvocationService {
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let tenant_id = Self::enforce_tenant_arg(args, _scope)?;
 
-        let manifest = match AgentManifestParser::parse_yaml(&manifest_yaml) {
+        let manifest = match AgentManifestParser::parse_yaml_for_node(
+            &manifest_yaml,
+            &self.image_generation_aliases(),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -339,7 +351,10 @@ impl ToolInvocationService {
 
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let manifest = match AgentManifestParser::parse_yaml(manifest_yaml) {
+        let manifest = match AgentManifestParser::parse_yaml_for_node(
+            manifest_yaml,
+            &self.image_generation_aliases(),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({

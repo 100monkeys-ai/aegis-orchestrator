@@ -757,7 +757,7 @@ mod tool {
             name: CONTEXT.to_string(),
             description: "image generation test".to_string(),
             capabilities: vec![Capability {
-                tool_pattern: TOOL.to_string(),
+                tool_pattern: "aegis.*".to_string(),
                 path_allowlist: None,
                 command_allowlist: None,
                 subcommand_allowlist: None,
@@ -789,7 +789,7 @@ spec:
     version: "3.11"
     isolation: inherit
     model: smart
-  tools: ["aegis.image.generate"]
+  tools: ["aegis.image.generate", "aegis.agent.create", "aegis.agent.update"]
 "#,
         )
         .unwrap();
@@ -977,6 +977,26 @@ spec:
                     1,
                     Vec::new(),
                     TOOL.to_string(),
+                    args,
+                )
+                .await?
+            {
+                ToolInvocationResult::Direct(value) => Ok(value),
+                other => panic!("the call was not answered directly: {other:?}"),
+            }
+        }
+
+        /// A call of `tool` inside the agent's run, on its iteration 1.
+        async fn call_in_run(&self, tool: &str, args: Value) -> Result<Value, SealSessionError> {
+            match self
+                .service
+                .invoke_tool_internal(
+                    &self.agent_id,
+                    self.run,
+                    TenantId::default(),
+                    1,
+                    Vec::new(),
+                    tool.to_string(),
                     args,
                 )
                 .await?
@@ -1202,5 +1222,42 @@ spec:
             f.images.calls.lock().unwrap().is_empty(),
             "a refused call reached the provider"
         );
+    }
+
+    /// `aegis.agent.create` and `aegis.agent.update` refuse a manifest whose
+    /// model is one of the node's image generation aliases, before anything
+    /// is deployed, with I1's sentence.
+    #[tokio::test]
+    async fn agent_create_and_update_refuse_an_image_alias_as_the_agents_model() {
+        let f = fixture(FakeImages::default(), true).await;
+        let manifest = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: painter
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    model: "artist"
+  task:
+    instruction: "Paint something"
+"#;
+        let sentence = "'artist' generates images; an agent's model must be a language model";
+        let mut wrong = Vec::new();
+        for tool in ["aegis.agent.create", "aegis.agent.update"] {
+            let told = match f
+                .call_in_run(tool, json!({"manifest_yaml": manifest}))
+                .await
+            {
+                Ok(answer) => answer.to_string(),
+                Err(e) => e.to_string(),
+            };
+            if !told.contains(sentence) {
+                wrong.push(format!("{tool} answered: {told}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
