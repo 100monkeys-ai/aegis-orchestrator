@@ -937,7 +937,7 @@ mod tool {
         NfsVolumeRegistry, VolumeRegistration,
     };
     use aegis_orchestrator_core::application::tool_invocation_service::{
-        ToolInvocationResult, ToolInvocationService,
+        GeneratedImageFile, ImageGenerateStep, ToolInvocationResult, ToolInvocationService,
     };
     use aegis_orchestrator_core::application::user_volume_service::UserVolumeService;
     use aegis_orchestrator_core::application::volume_manager::VolumeService;
@@ -1475,6 +1475,9 @@ spec:
         user_volumes: Arc<UserVolumeService>,
         fsal: Arc<AegisFSAL>,
         token: String,
+        /// The workflow execution the agent's run is a step of, when the
+        /// fixture is [`workflow_fixture`]'s.
+        workflow: uuid::Uuid,
         _root: tempfile::TempDir,
     }
 
@@ -1483,6 +1486,18 @@ spec:
     /// `/workspace`, and a conversation's session of [`PERSON`] with no
     /// execution record.
     async fn fixture(images: FakeImages, with_models: bool) -> Fixture {
+        fixture_with(images, with_models, false).await
+    }
+
+    /// As [`fixture`], the agent's run a step of a workflow execution whose
+    /// workspace volume, owned by that workflow execution, it mounts at
+    /// `/workspace`, as an Agent state's run does.
+    async fn workflow_fixture(images: FakeImages, with_models: bool) -> Fixture {
+        fixture_with(images, with_models, true).await
+    }
+
+    async fn fixture_with(images: FakeImages, with_models: bool, in_workflow: bool) -> Fixture {
+        let workflow = uuid::Uuid::new_v4();
         let root = tempfile::tempdir().unwrap();
         let volumes = Arc::new(InMemoryVolumeRepository::new());
         let fsal = Arc::new(AegisFSAL::new(
@@ -1494,19 +1509,43 @@ spec:
         let event_bus = Arc::new(EventBus::new(64));
         let tenant = TenantId::default();
 
+        // Its workspace volume: the run's own, or the workflow execution's.
+        let host = HostVolumes {
+            repo: volumes.clone(),
+        };
+        let run_id = ExecutionId::new();
+        let run_volume = host
+            .create_volume(
+                "workspace".to_string(),
+                tenant.clone(),
+                StorageClass::persistent(),
+                64,
+                if in_workflow {
+                    VolumeOwnership::WorkflowExecution {
+                        workflow_execution_id: workflow,
+                    }
+                } else {
+                    VolumeOwnership::Execution {
+                        execution_id: run_id,
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
         // The agent's run, on its first iteration.
         let agent = agent();
         let agent_id = agent.id;
         let mut run = Execution::new_with_id(
-            ExecutionId::new(),
+            run_id,
             agent_id,
             ExecutionInput {
                 intent: None,
                 input: json!({}),
-                workspace_volume_id: None,
-                workspace_volume_mount_path: None,
+                workspace_volume_id: in_workflow.then_some(run_volume),
+                workspace_volume_mount_path: in_workflow.then(|| PathBuf::from("/workspace")),
                 workspace_remote_path: None,
-                workflow_execution_id: None,
+                workflow_execution_id: in_workflow.then_some(workflow),
                 attachments: Vec::new(),
             },
             5,
@@ -1519,22 +1558,7 @@ spec:
         let executions = Arc::new(InMemoryExecutionRepository::new());
         executions.save_for_tenant(&tenant, &run).await.unwrap();
 
-        // Its workspace volume, registered as the run's at /workspace.
-        let host = HostVolumes {
-            repo: volumes.clone(),
-        };
-        let run_volume = host
-            .create_volume(
-                "workspace".to_string(),
-                tenant.clone(),
-                StorageClass::persistent(),
-                64,
-                VolumeOwnership::Execution {
-                    execution_id: run.id,
-                },
-            )
-            .await
-            .unwrap();
+        // The workspace volume, registered as the run's at /workspace.
         let mut volume = volumes.find_by_id(run_volume).await.unwrap().unwrap();
         volume.mark_attached().unwrap();
         volumes.save(&volume).await.unwrap();
@@ -1542,7 +1566,7 @@ spec:
         registry.register(VolumeRegistration {
             volume_id: run_volume,
             execution_id: run.id,
-            workflow_execution_id: None,
+            workflow_execution_id: in_workflow.then_some(workflow),
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy {
@@ -1620,6 +1644,7 @@ spec:
             user_volumes,
             fsal,
             token,
+            workflow,
             _root: root,
         }
     }
@@ -1918,5 +1943,155 @@ spec:
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // --- the workflow interpreter's step (AEGIS ADR-143 I5a) --------------
+
+    impl Fixture {
+        /// The workflow interpreter's image generation step on the fixture's
+        /// workflow execution.
+        async fn step(
+            &self,
+            step: ImageGenerateStep,
+        ) -> aegis_orchestrator_core::application::tool_invocation_service::ImageGenerateAnswer
+        {
+            self.service
+                .run_image_generate(&TenantId::default(), self.workflow, &step)
+                .await
+                .expect("the step answers")
+        }
+
+        /// The bytes at `path` of the workflow execution's volume.
+        async fn read_in_run(&self, path: &str) -> Vec<u8> {
+            let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new_for_workflow(
+                self.workflow,
+                self.run_volume,
+                "/",
+            );
+            let policy = FsalAccessPolicy {
+                read: vec!["/*".to_string()],
+                write: vec![],
+            };
+            self.fsal
+                .read(&handle, path, &policy, 0, 1 << 20)
+                .await
+                .unwrap_or_else(|e| panic!("{path} is not in the run's volume: {e}"))
+        }
+
+        /// The produced files of the agent's run, by path.
+        async fn produced(&self) -> Vec<(String, u64, String)> {
+            let run = self
+                .executions
+                .find_by_id_for_tenant(&TenantId::default(), self.run)
+                .await
+                .unwrap()
+                .unwrap();
+            run.iterations()
+                .iter()
+                .flat_map(|i| i.produced_files.iter())
+                .map(|p| (p.path.clone(), p.size_bytes, p.content_type.clone()))
+                .collect()
+        }
+    }
+
+    fn generated(volume: VolumeId, path: &str) -> GeneratedImageFile {
+        GeneratedImageFile {
+            volume_id: volume,
+            path: path.to_string(),
+            content_type: "image/png".to_string(),
+            size_bytes: PNG.len() as u64,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_writes_its_image_under_generated_of_the_runs_volume_and_answers_its_file() {
+        let f = workflow_fixture(FakeImages::default(), true).await;
+        let answer = f
+            .step(ImageGenerateStep {
+                prompt: "a lighthouse at dusk".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(answer.sentence, None, "{answer:?}");
+        assert_eq!(
+            answer.files,
+            vec![generated(f.run_volume, "generated/1.png")],
+            "the answer's files"
+        );
+        assert_eq!(f.read_in_run("/generated/1.png").await, PNG);
+        assert_eq!(
+            f.produced().await,
+            vec![(
+                "/workspace/generated/1.png".to_string(),
+                PNG.len() as u64,
+                "image/png".to_string()
+            )],
+            "the run's produced files"
+        );
+        let calls = f.images.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].0.as_str(), calls[0].1.as_str(), calls[0].2.count),
+            ("artist", "a lighthouse at dusk", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steps_path_is_where_its_images_go() {
+        let f = workflow_fixture(FakeImages::default(), true).await;
+        let answer = f
+            .step(ImageGenerateStep {
+                prompt: "a red bicycle".to_string(),
+                alias: Some("sketcher".to_string()),
+                size: Some("512x512".to_string()),
+                count: Some(2),
+                path: Some("pictures/bicycles/".to_string()),
+            })
+            .await;
+        assert_eq!(answer.sentence, None, "{answer:?}");
+        assert_eq!(
+            answer.files,
+            vec![
+                generated(f.run_volume, "pictures/bicycles/1.png"),
+                generated(f.run_volume, "pictures/bicycles/2.png"),
+            ],
+            "the answer's files"
+        );
+        for n in 1..=2 {
+            assert_eq!(
+                f.read_in_run(&format!("/pictures/bicycles/{n}.png")).await,
+                PNG
+            );
+        }
+        let calls = f.images.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "sketcher");
+        assert_eq!(calls[0].2.size.as_deref(), Some("512x512"));
+        assert_eq!(calls[0].2.count, 2);
+    }
+
+    #[tokio::test]
+    async fn a_step_on_a_node_with_no_image_generation_model_answers_so_and_writes_nothing() {
+        let f = workflow_fixture(FakeImages::default(), false).await;
+        let answer = f
+            .step(ImageGenerateStep {
+                prompt: "a cat".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            answer,
+            aegis_orchestrator_core::application::tool_invocation_service::ImageGenerateAnswer {
+                files: Vec::new(),
+                sentence: Some("this node has no image generation model".to_string()),
+            }
+        );
+        assert!(
+            f.produced().await.is_empty(),
+            "a refused step produced a file"
+        );
+        assert!(
+            f.images.calls.lock().unwrap().is_empty(),
+            "a refused step reached the provider"
+        );
     }
 }

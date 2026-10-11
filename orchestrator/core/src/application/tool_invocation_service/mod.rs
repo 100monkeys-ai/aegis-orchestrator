@@ -32,6 +32,7 @@ mod tasks;
 mod tests;
 mod workflows;
 
+pub use facade::{GeneratedImageFile, ImageGenerateAnswer, ImageGenerateError, ImageGenerateStep};
 pub use schedules::{schedule_run_view, schedule_view};
 
 use anyhow::Result;

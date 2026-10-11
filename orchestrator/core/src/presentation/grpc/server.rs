@@ -293,6 +293,35 @@ fn repository_action_response(
     }
 }
 
+/// An image generation step's answer as the worker reads it (AEGIS ADR-143
+/// I5a): the files written, or a refusal as its sentence with no file.
+fn image_generate_response(
+    answered: Result<
+        crate::application::tool_invocation_service::ImageGenerateAnswer,
+        crate::application::tool_invocation_service::ImageGenerateError,
+    >,
+) -> Result<Response<RunImageGenerateResponse>, Status> {
+    use crate::application::tool_invocation_service::ImageGenerateError;
+    match answered {
+        Ok(answer) => Ok(Response::new(RunImageGenerateResponse {
+            files: answer
+                .files
+                .into_iter()
+                .map(|file| GeneratedFile {
+                    volume_id: file.volume_id.to_string(),
+                    path: file.path,
+                    content_type: file.content_type,
+                    size_bytes: file.size_bytes,
+                })
+                .collect(),
+            sentence: answer.sentence,
+        })),
+        Err(e @ ImageGenerateError::RunNotFound(_)) => Err(Status::not_found(e.to_string())),
+        Err(e @ ImageGenerateError::NotConfigured(_)) => Err(Status::unavailable(e.to_string())),
+        Err(e @ ImageGenerateError::Failed(_)) => Err(Status::internal(e.to_string())),
+    }
+}
+
 fn normalize_judge_weight(weight: f32) -> f64 {
     if weight > 0.0 {
         weight as f64
@@ -1091,6 +1120,39 @@ impl AegisRuntime for AegisRuntimeService {
                 .run_repository_action(&tenant_id, run, &req.action, req.message.as_deref())
                 .await,
         )
+    }
+
+    /// The workflow interpreter's own image generation step (AEGIS ADR-143
+    /// I5a): images from a prompt with the node's image generation model,
+    /// written into the workflow execution's volume through the tool
+    /// invocation service, `aegis.image.generate`'s path. A refusal is
+    /// answered in the response's `sentence`.
+    async fn run_image_generate(
+        &self,
+        request: Request<RunImageGenerateRequest>,
+    ) -> Result<Response<RunImageGenerateResponse>, Status> {
+        let auth = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/RunImageGenerate")
+            .await?;
+        let tenant_id = Self::step_tenant(auth, &request, "");
+        let req = request.into_inner();
+        let run = uuid::Uuid::parse_str(&req.workflow_execution_id).map_err(|e| {
+            Status::invalid_argument(format!(
+                "invalid workflow_execution_id '{}': {e}",
+                req.workflow_execution_id
+            ))
+        })?;
+        let service = self.tool_invocation_service.as_ref().ok_or_else(|| {
+            Status::unavailable("image generation steps are not configured on this node")
+        })?;
+        let step = crate::application::tool_invocation_service::ImageGenerateStep {
+            prompt: req.prompt,
+            alias: req.alias,
+            size: req.size,
+            count: req.count,
+            path: req.path,
+        };
+        image_generate_response(service.run_image_generate(&tenant_id, run, &step).await)
     }
 
     /// Search for agents matching a natural-language query (ADR-075).
@@ -2980,6 +3042,49 @@ mod tests {
             .await
             .expect_err("a malformed workflow execution id was accepted");
         assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// AEGIS ADR-143 I5a: a node with no tool invocation service answers an
+    /// image generation step unavailable, and a workflow execution id that
+    /// is not one is refused before anything is read.
+    #[tokio::test]
+    async fn run_image_generate_needs_the_service_and_a_workflow_execution_id() {
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service);
+        let step = |workflow_execution_id: String| RunImageGenerateRequest {
+            workflow_execution_id,
+            prompt: "a lighthouse at dusk".to_string(),
+            alias: None,
+            size: None,
+            count: None,
+            path: None,
+        };
+
+        let unconfigured = service
+            .run_image_generate(Request::new(step(uuid::Uuid::new_v4().to_string())))
+            .await
+            .expect_err("a node with no tool invocation service answered a step");
+        assert_eq!(
+            unconfigured.code(),
+            tonic::Code::Unavailable,
+            "{unconfigured:?}"
+        );
+
+        let malformed = service
+            .run_image_generate(Request::new(step("not-a-run".to_string())))
+            .await
+            .expect_err("a malformed workflow execution id was accepted");
+        assert_eq!(
+            malformed.code(),
+            tonic::Code::InvalidArgument,
+            "{malformed:?}"
+        );
     }
 
     /// AEGIS ADR-141 F5: what a step answers reaches the worker field by
