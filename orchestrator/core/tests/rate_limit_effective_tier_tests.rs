@@ -163,9 +163,8 @@ async fn subscribed(pool: &PgPool, sub: &str, tenant: &TenantId, tier: &str) {
     .expect("store the subscription");
 }
 
-/// `count` charges of `resource` made an hour ago for `scope`, stored in
-/// the daily window as the window enforcer stores a charge
-/// (`window_start = charge time - window`).
+/// `count` charges of `resource` made an hour ago for `scope`, stored in a
+/// daily window opened an hour ago.
 async fn charged_today(pool: &PgPool, scope: &RateLimitScope, resource: &str, count: i64) {
     let (scope_type, scope_id) = PostgresWindowEnforcer::scope_parts(scope);
     sqlx::query(
@@ -176,7 +175,7 @@ async fn charged_today(pool: &PgPool, scope: &RateLimitScope, resource: &str, co
     .bind(scope_type)
     .bind(&scope_id)
     .bind(resource)
-    .bind(Utc::now() - Duration::hours(1) - Duration::days(1))
+    .bind(Utc::now() - Duration::hours(1))
     .bind(count)
     .execute(pool)
     .await
