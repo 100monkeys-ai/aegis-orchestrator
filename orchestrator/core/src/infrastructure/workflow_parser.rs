@@ -166,7 +166,7 @@ pub enum StateKindYaml {
     /// One of the workflow's own operations, run by the state machine itself.
     Action {
         /// The operation, a literal: update_blackboard, repository_diff,
-        /// repository_commit or repository_land.
+        /// repository_commit, repository_land or image_generate.
         action: String,
         /// The operation's arguments, templates rendered against the
         /// blackboard when the state runs.

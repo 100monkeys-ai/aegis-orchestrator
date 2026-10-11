@@ -1156,7 +1156,14 @@ pub enum ActionName {
     RepositoryCommit,
     /// Lands the run's commit on its repository's branch; gated.
     RepositoryLand,
+    /// Generates images from the argument `prompt` with one of the node's
+    /// image generation models and writes each as a file into the run's
+    /// workspace volume (AEGIS ADR-143 I5).
+    ImageGenerate,
 }
+
+/// Where `image_generate` writes its files when a state names no `path`.
+pub const IMAGE_GENERATE_DEFAULT_PATH: &str = "generated/";
 
 /// The arguments an action takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1165,6 +1172,12 @@ pub enum ActionArguments {
     Any,
     /// Exactly these keys, each of them required.
     Required(&'static [&'static str]),
+    /// These keys only: the `required` ones must be given, the `optional`
+    /// ones may be.
+    Declared {
+        required: &'static [&'static str],
+        optional: &'static [&'static str],
+    },
 }
 
 /// What an action needs from the run.
@@ -1174,15 +1187,20 @@ pub enum ActionNeed {
     Nothing,
     /// The run's repository (`spec.repositories` at least 1).
     RunRepository,
+    /// An alias with the capability `image_generation` on the node. The
+    /// manifest cannot say whether the node has one, so a workflow's
+    /// registration on the node checks it, never the parse.
+    ImageGenerationModel,
 }
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 4] = [
+    pub const ALL: [ActionName; 5] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
         ActionName::RepositoryLand,
+        ActionName::ImageGenerate,
     ];
 
     /// The literal a manifest writes.
@@ -1192,6 +1210,7 @@ impl ActionName {
             ActionName::RepositoryDiff => "repository_diff",
             ActionName::RepositoryCommit => "repository_commit",
             ActionName::RepositoryLand => "repository_land",
+            ActionName::ImageGenerate => "image_generate",
         }
     }
 
@@ -1217,6 +1236,10 @@ impl ActionName {
                 ActionArguments::Required(&[])
             }
             ActionName::RepositoryCommit => ActionArguments::Required(&["message"]),
+            ActionName::ImageGenerate => ActionArguments::Declared {
+                required: &["prompt"],
+                optional: &["alias", "size", "count", "path"],
+            },
         }
     }
 
@@ -1227,6 +1250,7 @@ impl ActionName {
             ActionName::RepositoryDiff
             | ActionName::RepositoryCommit
             | ActionName::RepositoryLand => ActionNeed::RunRepository,
+            ActionName::ImageGenerate => ActionNeed::ImageGenerationModel,
         }
     }
 
@@ -1240,9 +1264,12 @@ impl ActionName {
     /// the action does not declare, or a required one missing, is refused
     /// with its sentence.
     pub fn check_args(&self, args: &HashMap<String, String>) -> Result<(), String> {
-        let ActionArguments::Required(declared) = self.arguments() else {
-            return Ok(());
+        let (required, optional): (&[&str], &[&str]) = match self.arguments() {
+            ActionArguments::Any => return Ok(()),
+            ActionArguments::Required(required) => (required, &[]),
+            ActionArguments::Declared { required, optional } => (required, optional),
         };
+        let declared: Vec<&str> = required.iter().chain(optional).copied().collect();
         let mut keys: Vec<&String> = args.keys().collect();
         keys.sort();
         if let Some(key) = keys.into_iter().find(|k| !declared.contains(&k.as_str())) {
@@ -1256,7 +1283,7 @@ impl ActionName {
                 self.as_str()
             ));
         }
-        if let Some(missing) = declared.iter().find(|d| !args.contains_key(**d)) {
+        if let Some(missing) = required.iter().find(|d| !args.contains_key(**d)) {
             return Err(format!(
                 "action '{}' needs the argument '{missing}'",
                 self.as_str()

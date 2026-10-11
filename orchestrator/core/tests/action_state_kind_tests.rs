@@ -283,3 +283,122 @@ fn every_built_in_workflow_still_parses() {
     }
     assert!(parsed >= 5, "the built-ins were found: {parsed}");
 }
+
+// The action `image_generate` (AEGIS ADR-143 I5): a row of the actions'
+// table whose arguments are `prompt` (required), `alias`, `size`, `count` and
+// `path`, which needs an image generation model on the node and touches no
+// person's world. Whether the node has one is the registration's to refuse;
+// the parse reads the manifest only.
+
+/// `image_generate` with every argument it takes.
+fn image_generate_args() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("prompt", "a lighthouse at dusk, {{input.style}}"),
+        ("alias", "artist"),
+        ("size", "1024x1024"),
+        ("count", "{{input.count}}"),
+        ("path", "generated/covers/"),
+    ]
+}
+
+#[test]
+fn image_generate_parses_with_each_argument_and_round_trips() {
+    // Every argument, then the prompt alone, then the prompt with each
+    // optional argument on its own; none needs `spec.repositories`.
+    let every = image_generate_args();
+    let mut cases = vec![every.clone(), vec![every[0]]];
+    for optional in &every[1..] {
+        cases.push(vec![every[0], *optional]);
+    }
+    for args in cases {
+        let workflow = parse(&manifest("image_generate", &args, None));
+        let kind = step_kind(&workflow);
+        assert_eq!(kind["kind"], "Action", "{args:?}: {kind}");
+        assert_eq!(kind["action"], "image_generate", "{args:?}: {kind}");
+        for (key, value) in &args {
+            assert_eq!(kind["args"][key], *value, "{args:?}: {kind}");
+        }
+        assert_eq!(
+            kind["args"].as_object().map(|m| m.len()).unwrap_or(0),
+            args.len(),
+            "{args:?}: {kind}"
+        );
+
+        let yaml = WorkflowParser::to_yaml(&workflow).expect("the workflow serialises to YAML");
+        assert!(yaml.contains("action: image_generate"), "{yaml}");
+        let again = parse(&yaml);
+        assert_eq!(step_kind(&again), kind, "{args:?} round-trips: {yaml}");
+    }
+}
+
+#[test]
+fn image_generate_without_a_prompt_is_refused() {
+    for args in [vec![], vec![("alias", "artist"), ("count", "2")]] {
+        let sentence = refusal(&manifest("image_generate", &args, None));
+        assert!(
+            sentence.contains("action 'image_generate' needs the argument 'prompt'"),
+            "{args:?}: {sentence}"
+        );
+    }
+}
+
+#[test]
+fn image_generate_refuses_an_undeclared_argument() {
+    let sentence = refusal(&manifest(
+        "image_generate",
+        &[("prompt", "a lighthouse"), ("style", "oil")],
+        None,
+    ));
+    assert!(
+        sentence.contains(
+            "action 'image_generate' takes prompt, alias, size, count, path; 'style' is not one"
+        ),
+        "{sentence}"
+    );
+}
+
+#[test]
+fn image_generate_is_in_the_list_of_actions() {
+    let sentence = refusal(&manifest("image_edit", &[], None));
+    assert!(
+        sentence.contains(
+            "unknown action 'image_edit'; the actions are update_blackboard, repository_diff, repository_commit, repository_land, image_generate"
+        ),
+        "{sentence}"
+    );
+}
+
+#[test]
+fn the_mapper_sends_image_generate_as_kind_action_with_its_args_templates() {
+    let args = image_generate_args();
+    let workflow = parse(&manifest("image_generate", &args, None));
+    let definition =
+        TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
+            .expect("the workflow maps");
+    let state = serde_json::to_value(&definition.states["STEP"]).expect("the state serialises");
+    assert_eq!(state["kind"], "Action", "{state}");
+    assert_eq!(state["action"], "image_generate", "{state}");
+    let expected: serde_json::Map<String, serde_json::Value> = args
+        .iter()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::from(*v)))
+        .collect();
+    assert_eq!(
+        state["args"],
+        serde_json::Value::Object(expected),
+        "{state}"
+    );
+    assert!(state.get("command").is_none(), "{state}");
+
+    TemporalWorkflowMapper::validate_templates(&workflow).expect("the args templates are valid");
+    let broken = parse(&manifest(
+        "image_generate",
+        &[("prompt", "{{#if input.style}}a lighthouse")],
+        None,
+    ));
+    let error = TemporalWorkflowMapper::validate_templates(&broken)
+        .expect_err("an unclosed block in the prompt template is refused");
+    assert!(
+        format!("{error:#}").contains("Invalid template in state STEP args prompt"),
+        "{error:#}"
+    );
+}

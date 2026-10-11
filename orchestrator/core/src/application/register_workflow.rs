@@ -42,7 +42,8 @@ use crate::application::temporal_mapper::DEFAULT_WORKFLOW_VERSION;
 use crate::domain::repository::WorkflowRepository;
 use crate::domain::runtime_registry::StandardRuntimeRegistry;
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::WorkflowScope;
+use crate::domain::vision::{ImageGenerationModels, NO_IMAGE_GENERATION_MODEL};
+use crate::domain::workflow::{ActionNeed, StateKind, WorkflowScope};
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::{Context, Result};
@@ -114,12 +115,22 @@ pub struct StandardRegisterWorkflowUseCase {
     /// The runtime registry a model step's `model:` image resolves through
     /// (ADR-143 M3). Without one, a model step is refused.
     runtime_registry: Option<Arc<StandardRuntimeRegistry>>,
+    /// The node's image generation models, which an `image_generate` action
+    /// needs (ADR-143 I5). Without them, such a workflow is refused.
+    image_generation: Option<Arc<dyn ImageGenerationModels>>,
 }
 
 impl StandardRegisterWorkflowUseCase {
     /// Attach the runtime registry that resolves model steps' images.
     pub fn with_runtime_registry(mut self, registry: Arc<StandardRuntimeRegistry>) -> Self {
         self.runtime_registry = Some(registry);
+        self
+    }
+
+    /// Attach the node's image generation models, which a workflow's
+    /// `image_generate` action needs.
+    pub fn with_image_generation(mut self, models: Arc<dyn ImageGenerationModels>) -> Self {
+        self.image_generation = Some(models);
         self
     }
 
@@ -135,6 +146,7 @@ impl StandardRegisterWorkflowUseCase {
             event_bus,
             agent_service,
             runtime_registry: None,
+            image_generation: None,
         }
     }
 }
@@ -161,6 +173,25 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         workflow
             .resolve_model_images(self.runtime_registry.as_deref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Step 1c: an action that needs an image generation model registers
+        // only on a node that has one (ADR-143 I5). The manifest cannot say
+        // what the node holds, so this is the registration's check, not the
+        // parse's.
+        let needs_image_model = workflow.spec.states.values().any(|state| {
+            matches!(
+                &state.kind,
+                StateKind::Action { action, .. }
+                    if action.needs() == ActionNeed::ImageGenerationModel
+            )
+        });
+        let has_image_model = self
+            .image_generation
+            .as_ref()
+            .is_some_and(|models| !models.image_generation_aliases().is_empty());
+        if needs_image_model && !has_image_model {
+            anyhow::bail!("{NO_IMAGE_GENERATION_MODEL}");
+        }
 
         // Validate max_total_transitions ceiling
         if let Some(max_tt) = workflow.spec.max_total_transitions {
@@ -1125,5 +1156,139 @@ spec:
             "refusal was: {message}"
         );
         assert!(engine.calls().is_empty());
+    }
+
+    /// A workflow whose one state generates an image (ADR-143 I5).
+    const IMAGE_GENERATE_WORKFLOW_YAML: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: image-generate-registration
+  version: "1.0.0"
+spec:
+  initial_state: DRAW
+  states:
+    DRAW:
+      kind: Action
+      action: image_generate
+      args:
+        prompt: "a lighthouse at dusk"
+      transitions: []
+"#;
+
+    /// A node's models as `ProviderRegistry` builds them from its provider
+    /// block: the language model `default` and, when `with_image_alias`, the
+    /// image generation model `artist`.
+    fn node_models(with_image_alias: bool) -> Arc<dyn ImageGenerationModels> {
+        let image_alias = if with_image_alias {
+            r#"
+    - alias: "artist"
+      model: "m-image"
+      capabilities: ["image_generation"]
+      context_window: 0"#
+        } else {
+            ""
+        };
+        let providers: Vec<crate::domain::node_config::LLMProviderConfig> =
+            serde_yaml::from_str(&format!(
+                r#"- name: images
+  type: openai-compatible
+  endpoint: "http://127.0.0.1:9/v1"
+  api_key: "test-key"
+  models:
+    - alias: "default"
+      model: "m-chat"
+      capabilities: ["chat"]
+      context_window: 8192{image_alias}
+"#
+            ))
+            .expect("the providers block parses");
+        let mut manifest = crate::domain::node_config::NodeConfigManifest::default();
+        manifest.spec.llm_providers = providers;
+        Arc::new(
+            crate::infrastructure::llm::ProviderRegistry::from_config(&manifest)
+                .expect("the registry builds"),
+        )
+    }
+
+    fn image_registration_service(
+        engine: Arc<RecordingEngine>,
+        repo: Arc<InMemoryWorkflowRepository>,
+        models: Option<Arc<dyn ImageGenerationModels>>,
+    ) -> StandardRegisterWorkflowUseCase {
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo,
+            Arc::new(tokio::sync::RwLock::new(Some(engine))),
+            Arc::new(EventBus::new(8)),
+            test_agent_service(),
+        );
+        match models {
+            Some(models) => service.with_image_generation(models),
+            None => service,
+        }
+    }
+
+    /// ADR-143 I5: a node with no image generation alias refuses a workflow
+    /// with `image_generate`, before anything is sent or stored.
+    #[tokio::test]
+    async fn a_node_with_no_image_generation_model_refuses_an_image_generate_workflow() {
+        for models in [Some(node_models(false)), None] {
+            let engine = Arc::new(RecordingEngine::new());
+            let repo = Arc::new(InMemoryWorkflowRepository::new());
+            let wired = models.is_some();
+            let service = image_registration_service(engine.clone(), repo.clone(), models);
+
+            let message = service
+                .register_workflow(IMAGE_GENERATE_WORKFLOW_YAML, false)
+                .await
+                .expect_err("no image generation model, no image_generate")
+                .to_string();
+            assert_eq!(
+                message, "this node has no image generation model",
+                "models wired: {wired}"
+            );
+            assert!(engine.calls().is_empty(), "models wired: {wired}");
+            assert!(
+                repo.find_by_name_visible(&TenantId::consumer(), "image-generate-registration")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "models wired: {wired}"
+            );
+        }
+    }
+
+    /// ADR-143 I5: a node with an image generation alias admits it.
+    #[tokio::test]
+    async fn a_node_with_an_image_generation_model_admits_an_image_generate_workflow() {
+        let engine = Arc::new(RecordingEngine::new());
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let service = image_registration_service(engine.clone(), repo, Some(node_models(true)));
+
+        let registered = service
+            .register_workflow(IMAGE_GENERATE_WORKFLOW_YAML, false)
+            .await
+            .expect("the node has an image generation model");
+        assert_eq!(registered.name, "image-generate-registration");
+        let sent = serde_json::to_value(&engine.calls()[0]).unwrap();
+        assert_eq!(sent["states"]["DRAW"]["kind"], "Action", "{sent}");
+        assert_eq!(sent["states"]["DRAW"]["action"], "image_generate", "{sent}");
+    }
+
+    /// A workflow with no `image_generate` registers on a node with no
+    /// image generation model.
+    #[tokio::test]
+    async fn a_node_with_no_image_generation_model_admits_a_workflow_without_one() {
+        let engine = Arc::new(RecordingEngine::new());
+        let service = image_registration_service(
+            engine.clone(),
+            Arc::new(InMemoryWorkflowRepository::new()),
+            Some(node_models(false)),
+        );
+        service
+            .register_workflow(VALID_WORKFLOW_YAML, false)
+            .await
+            .expect("nothing in it generates an image");
+        assert_eq!(engine.calls().len(), 1);
     }
 }

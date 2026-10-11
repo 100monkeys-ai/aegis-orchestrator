@@ -1791,7 +1791,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             event_bus.clone(),
             agent_service.clone(),
         )
-        .with_runtime_registry(runtime_registry.clone()),
+        .with_runtime_registry(runtime_registry.clone())
+        .with_image_generation(llm_registry.clone()),
     );
 
     let start_workflow_execution_use_case = {
