@@ -3841,7 +3841,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             } else {
                 match deployed.as_ref() {
                     None => true,
-                    Some(workflow) => match builtins::workflow_matches(workflow, wf_template) {
+                    Some(workflow) => match builtins::workflow_matches(
+                        workflow,
+                        wf_template,
+                        Some(runtime_registry.as_ref()),
+                    ) {
                         Ok(true) => {
                             info!(
                                 "Built-in workflow '{}' v{} already up to date",

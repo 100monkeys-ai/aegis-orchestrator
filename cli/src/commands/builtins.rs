@@ -173,6 +173,10 @@ pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
         "the-forge",
         include_str!("../../templates/workflows/the-forge.yaml"),
     ),
+    (
+        "transcribe-audio",
+        include_str!("../../templates/workflows/transcribe-audio.yaml"),
+    ),
 ];
 
 /// All builtin templates that should be synced to disk.
@@ -311,15 +315,30 @@ pub fn agent_manifest_matches(
 /// Compare a deployed `Workflow` against an embedded YAML workflow template.
 /// Only the semantic content (`metadata` + `spec`) is compared — runtime
 /// fields (id, tenant_id, scope, timestamps) are intentionally excluded.
+///
+/// Registration resolves a model step's `model:<class>/<name>` image through
+/// the runtime registry before it stores the workflow (the pinned image, no
+/// network, the entry's command and resources). With `runtime_registry`, the
+/// template is resolved the same way before the comparison, so a stored model
+/// step equals its template, and a template or registry entry that changed
+/// reads as drift. Without one, the template is compared as written.
 pub fn workflow_matches(
     deployed: &aegis_orchestrator_core::domain::workflow::Workflow,
     embedded_yaml: &str,
+    runtime_registry: Option<
+        &aegis_orchestrator_core::domain::runtime_registry::StandardRuntimeRegistry,
+    >,
 ) -> Result<bool> {
-    let embedded =
+    let mut embedded =
         aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
             embedded_yaml,
         )
         .context("Failed to parse embedded built-in workflow template for drift comparison")?;
+    if let Some(registry) = runtime_registry {
+        embedded
+            .resolve_model_images(Some(registry))
+            .context("Failed to resolve embedded built-in workflow's model images")?;
+    }
     let deployed_v = serde_json::json!({
         "metadata": serde_json::to_value(&deployed.metadata)
             .context("Failed to canonicalise deployed workflow metadata")?,
@@ -472,7 +491,7 @@ async fn deploy_builtin_workflow(
             {
                 let deployed = aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(manifest_yaml)
                     .context("Failed to parse deployed built-in workflow YAML for drift comparison")?;
-                if workflow_matches(&deployed, template_yaml)? {
+                if workflow_matches(&deployed, template_yaml, None)? {
                     println!(
                         "  {} Built-in workflow '{}' already up to date",
                         "✓".dimmed(),
@@ -1550,7 +1569,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            workflow_matches(&workflow, INTENT_EXECUTION_WORKFLOW_TEMPLATE).unwrap(),
+            workflow_matches(&workflow, INTENT_EXECUTION_WORKFLOW_TEMPLATE, None).unwrap(),
             "identical embedded + deployed workflows must match"
         );
     }
@@ -1570,7 +1589,7 @@ mod tests {
             Some("MUTATED — simulates content drift from embedded template".to_string());
 
         assert!(
-            !workflow_matches(&deployed, INTENT_EXECUTION_WORKFLOW_TEMPLATE).unwrap(),
+            !workflow_matches(&deployed, INTENT_EXECUTION_WORKFLOW_TEMPLATE, None).unwrap(),
             "content drift in workflow metadata must be detected"
         );
     }

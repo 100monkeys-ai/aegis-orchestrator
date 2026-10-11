@@ -83,14 +83,14 @@ spec:
   # published by pipeline.yml under the tag its Dockerfile's versions give.
   #
   # speech-to-text/whisper-base: whisper.cpp with the whisper base model, from
-  # docker/Dockerfile.model-whisper. The entry is a comment until the image's
-  # first publish gives it a digest: digest filled after the first publish.
-  # models:
-  #   speech-to-text:
-  #     whisper-base:
-  #       image: "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:<digest>"
-  #       description: "Speech to text: whisper.cpp 1.9.4 with the whisper base model (multilingual), on the CPU, with ffmpeg to decode the audio"
-  #       resources:
-  #         cpu: 2000
-  #         memory: "1Gi"
-  #         timeout: "15m"
+  # docker/Dockerfile.model-whisper. The digest is the one the pipeline's first
+  # publish of the tag gave (Pipeline 38103657855).
+  models:
+    speech-to-text:
+      whisper-base:
+        image: "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:7ef552f84197b3c6a03efe059254e95517a05cf949e3454c04a9336a5090c88f"
+        description: "Speech to text: whisper.cpp 1.9.4 with the whisper base model (multilingual), on the CPU, with ffmpeg to decode the audio"
+        resources:
+          cpu: 2000
+          memory: "1Gi"
+          timeout: "15m"

@@ -324,12 +324,35 @@ fn transcribe_audio_template_parses_and_resolves() {
             "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@{DIGEST}"
         )]
     );
+
+    // The stack template's own registry resolves it to the published image.
+    let template_registry = StandardRuntimeRegistry::from_file(
+        repo_root().join("cli/templates/stack/runtime-registry.yaml"),
+    )
+    .expect("the stack template's registry loads");
+    let mut workflow = WorkflowParser::parse_yaml(&yaml).expect("the template parses");
+    workflow
+        .resolve_model_images(Some(&template_registry))
+        .expect("the template's model step resolves in the stack registry");
+    let images: Vec<String> = workflow
+        .spec
+        .states
+        .values()
+        .filter_map(|state| match &state.kind {
+            StateKind::ContainerRun { image, .. } => Some(image.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        images,
+        vec!["ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:7ef552f84197b3c6a03efe059254e95517a05cf949e3454c04a9336a5090c88f".to_string()]
+    );
 }
 
 /// S1, M4: the stack template's whisper entry names the tag
 /// `whisper-cpp-<WHISPER_CPP_VERSION>-<WHISPER_MODEL>` that
 /// `docker/Dockerfile.model-whisper`'s versions give and `pipeline.yml`
-/// publishes. Until the first publish gives its digest the entry is a comment.
+/// publishes, with the digest of that publish.
 #[test]
 fn the_template_whisper_tag_is_the_dockerfiles_versions() {
     let dockerfile =

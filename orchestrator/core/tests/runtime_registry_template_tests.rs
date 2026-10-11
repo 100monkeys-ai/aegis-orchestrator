@@ -104,3 +104,17 @@ fn renderer_tag_is_the_dockerfiles_versions() {
         "the registry's renderer image is not the tag the Dockerfile's versions give"
     );
 }
+
+/// ADR-143 M4, S1: the stack template's `speech-to-text/whisper-base` is the
+/// whisper image `pipeline.yml` published, by its tag and the digest of that
+/// first publish.
+#[test]
+fn template_registry_resolves_whisper_base_to_the_published_digest() {
+    let entry = registry()
+        .resolve_model("model:speech-to-text/whisper-base")
+        .expect("the stack template's registry names speech-to-text/whisper-base");
+    assert_eq!(
+        entry.image,
+        "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:7ef552f84197b3c6a03efe059254e95517a05cf949e3454c04a9336a5090c88f"
+    );
+}
