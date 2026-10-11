@@ -1998,13 +1998,14 @@ impl ToolInvocationService {
     /// `aegis.image.generate` (AEGIS ADR-143 I2): generate `count` images
     /// from `prompt` with the alias named, or the node's first image
     /// generation alias, and write each as a file. Inside an execution, to
-    /// the execution's workspace volume at `/workspace/generated/<n>.png`,
+    /// the execution's workspace volume at `/workspace/generated/<n>.<ext>`,
     /// each recorded as a produced file of the call's iteration; called out
     /// of band (a session whose execution has no record: a person's
     /// conversation), to the person's `chat-attachments` volume under
-    /// `generated/`. The answer is `{files: [{volume_id, path, content_type,
-    /// size_bytes}]}` and names no URL. Every refusal is answered before the
-    /// provider is called.
+    /// `generated/`. Each file's extension follows the image's content type
+    /// ([`generated_image_extension`]). The answer is `{files: [{volume_id,
+    /// path, content_type, size_bytes}]}` and names no URL. Every refusal is
+    /// answered before the provider is called.
     async fn invoke_aegis_image_generate_tool(
         &self,
         args: &Value,
@@ -2130,7 +2131,11 @@ impl ToolInvocationService {
                     })?;
                 let batch = uuid::Uuid::new_v4();
                 for (i, image) in generated.images.iter().enumerate() {
-                    let path = format!("generated/{batch}/{}.png", i + 1);
+                    let path = format!(
+                        "generated/{batch}/{}.{}",
+                        i + 1,
+                        generated_image_extension(&image.content_type)
+                    );
                     files
                         .write_file_for_tier(
                             &volume_id,
@@ -2299,7 +2304,11 @@ impl ToolInvocationService {
         };
         let mut produced = Vec::with_capacity(images.len());
         for (i, image) in images.iter().enumerate() {
-            let in_volume = format!("{dir}/{}.png", first + i);
+            let in_volume = format!(
+                "{dir}/{}.{}",
+                first + i,
+                generated_image_extension(&image.content_type)
+            );
             let write_failed = |e: crate::domain::fsal::FsalError| {
                 SealSessionError::InternalError(format!("saving a generated image failed: {e}"))
                     .answered(crate::domain::seal_session::CallerAnswer::Internal(
@@ -3312,6 +3321,18 @@ fn step_failure(e: SealSessionError) -> String {
     }
 }
 
+/// The file extension of a generated image whose bytes are of
+/// `content_type`: `jpg` for `image/jpeg`, `png` for `image/png`, `webp` for
+/// `image/webp`, and `png` for any other, so a file's name says what its
+/// bytes are.
+fn generated_image_extension(content_type: &str) -> &'static str {
+    match content_type {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    }
+}
+
 /// Where `aegis.image.generate` writes its files.
 enum GeneratedTarget {
     /// Inside an execution: its workspace volume, and the store its produced
@@ -3376,4 +3397,27 @@ pub enum ImageGenerateError {
     /// The provider, the volume or the record failed.
     #[error("{0}")]
     Failed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generated_image_extension;
+
+    #[test]
+    fn a_generated_images_extension_follows_its_content_type() {
+        for (content_type, extension) in [
+            ("image/jpeg", "jpg"),
+            ("image/png", "png"),
+            ("image/webp", "webp"),
+            ("image/gif", "png"),
+            ("application/octet-stream", "png"),
+            ("", "png"),
+        ] {
+            assert_eq!(
+                generated_image_extension(content_type),
+                extension,
+                "the extension of '{content_type}'"
+            );
+        }
+    }
 }

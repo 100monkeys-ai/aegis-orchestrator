@@ -13,6 +13,11 @@
 //! other endpoint keeps
 //! [`super::openai::OpenAIAdapter`]'s `/images/generations`.
 //!
+//! A model `FIXED_SIZE_MODELS` names takes no size field and refuses a
+//! request carrying one, so a size asked of it is accepted and not sent, and
+//! the image comes at the model's own size; every other model is sent the
+//! size asked.
+//!
 //! The provider's configured `headers` (ADR-124 D3) are sent beside the
 //! bearer `Authorization`, as the OpenAI adapter sends them, but for the AI
 //! Gateway's `cf-aig-*` headers, which [`WorkersAiImageAdapter::new`] drops.
@@ -37,6 +42,15 @@ const OPENAI_COMPATIBLE_SUFFIX: &str = "/ai/v1";
 /// most 8), and such a model refuses a multipart request with HTTP 400. The
 /// form is chosen by the model's name, never by the alias that names it.
 const MULTIPART_MODELS: &[&str] = &["@cf/black-forest-labs/flux-2-dev"];
+
+/// The Workers AI image models whose input schema takes no size field
+/// (`flux-1-schnell`: `prompt` required, `steps` at most 8, no `width` or
+/// `height`). Such a model refuses a body carrying `width` or `height` with
+/// HTTP 400 code 5006 ("Additional or unevaluated properties '/height,
+/// /width' at '/' not allowed"), so a size asked of it is accepted and not
+/// sent, and the image comes at the model's own size. Chosen by the model's
+/// name, as [`MULTIPART_MODELS`] chooses the form.
+const FIXED_SIZE_MODELS: &[&str] = &["@cf/black-forest-labs/flux-1-schnell"];
 
 /// The prefix of every AI Gateway request header.
 const AI_GATEWAY_HEADER_PREFIX: &str = "cf-aig-";
@@ -108,11 +122,18 @@ impl WorkersAiImageAdapter {
         MULTIPART_MODELS.contains(&self.model.as_str())
     }
 
+    /// Whether the model's schema takes a size: every model but those
+    /// [`FIXED_SIZE_MODELS`] names.
+    fn takes_size(&self) -> bool {
+        !FIXED_SIZE_MODELS.contains(&self.model.as_str())
+    }
+
     /// One request: one image. A multipart form of `prompt`, `width` and
     /// `height` for a model [`MULTIPART_MODELS`] names; for every other, a
     /// JSON body `{"prompt", "width"?, "height"?}`, the two sizes as numbers.
-    /// No `steps` is sent: [`ImageOptions`] carries none, so the model's
-    /// default holds.
+    /// `dimensions` is `None` for a model [`FIXED_SIZE_MODELS`] names, so its
+    /// request carries the prompt alone. No `steps` is sent: [`ImageOptions`]
+    /// carries none, so the model's default holds.
     async fn generate_one(
         &self,
         url: &str,
@@ -218,7 +239,9 @@ fn dimensions(size: &str) -> Option<(u32, u32)> {
 #[async_trait]
 impl VisionProvider for WorkersAiImageAdapter {
     /// One request per image, in sequence: a Workers AI image model answers
-    /// one image a run.
+    /// one image a run. A size not of the form `<width>x<height>` is refused
+    /// for every model; a well-formed size is sent to every model but those
+    /// `FIXED_SIZE_MODELS` names, which answer at their own size.
     async fn generate_image(
         &self,
         prompt: &str,
@@ -232,6 +255,7 @@ impl VisionProvider for WorkersAiImageAdapter {
                 ))
             })?),
         };
+        let dimensions = dimensions.filter(|_| self.takes_size());
         let url = self.run_url();
         let count = options.count.max(1);
         tracing::debug!(

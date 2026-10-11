@@ -285,8 +285,12 @@ mod workers_ai {
     /// The one model whose schema takes a multipart form.
     const FLUX_2_DEV: &str = "@cf/black-forest-labs/flux-2-dev";
 
-    /// A model whose schema takes a JSON body and refuses multipart.
+    /// A model whose schema takes a JSON body, refuses multipart, and takes
+    /// no size.
     const FLUX_1_SCHNELL: &str = "@cf/black-forest-labs/flux-1-schnell";
+
+    /// A model whose schema takes a JSON body with `width` and `height`.
+    const SDXL: &str = "@cf/stabilityai/stable-diffusion-xl-base-1.0";
 
     /// The first bytes of a JPEG file, then a few more.
     const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIFfake-image";
@@ -732,10 +736,10 @@ mod workers_ai {
     }
 
     #[tokio::test]
-    async fn a_flux_1_schnell_request_is_one_json_post_of_prompt_width_and_height() {
+    async fn a_json_model_outside_the_fixed_size_list_is_sent_prompt_width_and_height() {
         let (endpoint, seen) = stand_in(Answer::Image(JPEG)).await;
 
-        let answer = adapter_for(&endpoint, FLUX_1_SCHNELL)
+        let answer = adapter_for(&endpoint, SDXL)
             .generate_image(
                 "a lighthouse at dusk",
                 &ImageOptions {
@@ -753,7 +757,7 @@ mod workers_ai {
         assert_eq!(request.method, Method::POST);
         assert_eq!(
             request.path,
-            "/client/v4/accounts/acct-1/ai/run/@cf/black-forest-labs/flux-1-schnell"
+            "/client/v4/accounts/acct-1/ai/run/@cf/stabilityai/stable-diffusion-xl-base-1.0"
         );
         assert_eq!(
             request
@@ -775,6 +779,42 @@ mod workers_ai {
             !body.contains_key("steps"),
             "steps is sent though none was given"
         );
+    }
+
+    #[tokio::test]
+    async fn a_flux_1_schnell_request_asked_a_size_carries_the_prompt_alone_and_answers_the_image()
+    {
+        let (endpoint, seen) = stand_in(Answer::Image(JPEG)).await;
+
+        let answer = adapter_for(&endpoint, FLUX_1_SCHNELL)
+            .generate_image(
+                "a small grey monkey under a tree",
+                &ImageOptions {
+                    size: Some("1024x1024".to_string()),
+                    count: 1,
+                },
+            )
+            .await
+            .expect("the size is accepted and the provider answers");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "count 1 is one request");
+        assert_eq!(
+            seen[0].path,
+            "/client/v4/accounts/acct-1/ai/run/@cf/black-forest-labs/flux-1-schnell"
+        );
+        let body = seen[0].json();
+        assert!(
+            !body.contains_key("width") && !body.contains_key("height"),
+            "flux-1-schnell is sent a size it refuses: {body:?}"
+        );
+        assert_eq!(
+            serde_json::Value::Object(body),
+            serde_json::json!({"prompt": "a small grey monkey under a tree"})
+        );
+        assert_eq!(answer.images.len(), 1);
+        assert_eq!(answer.images[0].bytes, JPEG);
+        assert_eq!(answer.images[0].content_type, "image/jpeg");
     }
 
     #[tokio::test]
@@ -930,6 +970,9 @@ mod workers_ai {
 
 mod tool {
     use super::PNG;
+
+    /// The first bytes of a JPEG file, then a few more.
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIFfake-image";
     use aegis_orchestrator_core::application::agent::AgentLifecycleService;
     use aegis_orchestrator_core::application::execution::ExecutionService;
     use aegis_orchestrator_core::application::file_operations_service::FileOperationsService;
@@ -1000,11 +1043,13 @@ mod tool {
     // --- the provider, faked: no network -----------------------------------
 
     /// The node's image models: `artist` and `sketcher`, each answering
-    /// `count` copies of [`PNG`] and recording the calls.
+    /// `count` copies of [`PNG`] (of [`JPEG`] when `jpeg`) and recording the
+    /// calls.
     #[derive(Default)]
     struct FakeImages {
         calls: Mutex<Vec<(String, String, ImageOptions)>>,
         none: bool,
+        jpeg: bool,
     }
 
     struct FakeProvider {
@@ -1024,11 +1069,16 @@ mod tool {
                 prompt.to_string(),
                 options.clone(),
             ));
+            let (bytes, content_type) = if self.images.jpeg {
+                (JPEG, "image/jpeg")
+            } else {
+                (PNG, "image/png")
+            };
             Ok(ImageResponse {
                 images: (0..options.count)
                     .map(|_| Image {
-                        bytes: PNG.to_vec(),
-                        content_type: "image/png".to_string(),
+                        bytes: bytes.to_vec(),
+                        content_type: content_type.to_string(),
                     })
                     .collect(),
             })
@@ -1869,6 +1919,110 @@ spec:
         assert_eq!(calls[0].0, "sketcher");
         assert_eq!(calls[0].2.size.as_deref(), Some("512x512"));
         assert_eq!(calls[0].2.count, 1);
+    }
+
+    #[tokio::test]
+    async fn out_of_band_a_jpeg_is_named_jpg_and_a_png_png() {
+        for (jpeg, bytes, content_type, extension) in [
+            (true, JPEG, "image/jpeg", "jpg"),
+            (false, PNG, "image/png", "png"),
+        ] {
+            let f = fixture(
+                FakeImages {
+                    jpeg,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await;
+            let answer = f
+                .in_chat(json!({"prompt": "a small grey monkey", "size": "1024x1024"}))
+                .await
+                .expect("the conversation's call answers");
+            let files = files_of(&answer);
+            assert_eq!(files.len(), 1, "one image: {answer}");
+            let file = &files[0];
+            assert_eq!(file["content_type"], content_type);
+            let path = file["path"].as_str().expect("a path");
+            let batch = path
+                .strip_prefix("generated/")
+                .and_then(|rest| rest.strip_suffix(&format!("/1.{extension}")))
+                .unwrap_or_else(|| {
+                    panic!("{content_type} is not saved as generated/<batch>/1.{extension}: {path}")
+                });
+            assert!(
+                uuid::Uuid::parse_str(batch).is_ok(),
+                "the batch is not a uuid: {path}"
+            );
+            let attachments = f
+                .user_volumes
+                .find_or_provision_chat_attachments(&TenantId::default(), PERSON, &ZaruTier::Free)
+                .await
+                .unwrap();
+            let read = f
+                .files
+                .read_file(&attachments, &TenantId::default(), PERSON, path)
+                .await
+                .expect("the image is in the person's attachments");
+            assert_eq!(read.data, bytes, "{content_type}'s bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn in_a_run_a_jpeg_is_a_jpg_file_and_a_jpg_produced_file() {
+        let f = fixture(
+            FakeImages {
+                jpeg: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let answer = f
+            .in_run(json!({"prompt": "a lighthouse"}))
+            .await
+            .expect("the run's call answers");
+        assert_eq!(
+            files_of(&answer),
+            vec![json!({
+                "volume_id": f.run_volume.to_string(),
+                "path": "/workspace/generated/1.jpg",
+                "content_type": "image/jpeg",
+                "size_bytes": JPEG.len(),
+            })],
+            "the answer's files"
+        );
+        let handle =
+            aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(f.run, f.run_volume, "/");
+        let policy = FsalAccessPolicy {
+            read: vec!["/*".to_string()],
+            write: vec![],
+        };
+        let bytes = f
+            .fsal
+            .read(&handle, "/generated/1.jpg", &policy, 0, 1 << 20)
+            .await
+            .expect("the image is in the run's volume as 1.jpg");
+        assert_eq!(bytes, JPEG);
+        let run = f
+            .executions
+            .find_by_id_for_tenant(&TenantId::default(), f.run)
+            .await
+            .unwrap()
+            .unwrap();
+        let produced: Vec<(String, String)> = run.iterations()[0]
+            .produced_files
+            .iter()
+            .map(|p| (p.path.clone(), p.content_type.clone()))
+            .collect();
+        assert_eq!(
+            produced,
+            vec![(
+                "/workspace/generated/1.jpg".to_string(),
+                "image/jpeg".to_string()
+            )],
+            "the iteration's produced file"
+        );
     }
 
     #[tokio::test]
