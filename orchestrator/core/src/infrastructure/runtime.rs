@@ -443,6 +443,10 @@ pub struct ContainerRuntimeConfig {
     >,
 }
 
+/// The prefix `assets/bootstrap.py` puts on every debug line it writes to
+/// stderr; such lines are logs, never a failure's text.
+const BOOTSTRAP_DEBUG_PREFIX: &str = "[BOOTSTRAP DEBUG]";
+
 impl ContainerRuntime {
     pub async fn new(config: ContainerRuntimeConfig) -> Result<Self, RuntimeError> {
         let ContainerRuntimeConfig {
@@ -887,12 +891,23 @@ impl ContainerRuntime {
         stderr_logs: Vec<String>,
     ) -> Result<TaskOutput, RuntimeError> {
         if exit_code != 0 {
-            let error_msg = if !stderr_logs.is_empty() {
-                stderr_logs.join("\n")
-            } else {
-                format!("Bootstrap script exited with code {exit_code}")
-            };
-            Err(RuntimeError::ExecutionFailed(error_msg))
+            // The person reads the error, not the bootstrap's debug lines: the
+            // failure text is the last stderr line that is not a debug line,
+            // or the exit sentence; every stderr line stays in the logs.
+            // Chunks are joined first: a stream chunk may end mid-line.
+            let stderr = stderr_logs.concat();
+            let logs: Vec<String> = stderr
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+            let error = logs
+                .iter()
+                .rev()
+                .find(|line| !line.trim_start().starts_with(BOOTSTRAP_DEBUG_PREFIX))
+                .map(|line| line.trim().to_string())
+                .unwrap_or_else(|| format!("Bootstrap script exited with code {exit_code}"));
+            Err(RuntimeError::ExecutionFailedWithLogs { error, logs })
         } else {
             let result = serde_json::Value::String(stdout_logs.join(""));
             Ok(TaskOutput {
@@ -2550,18 +2565,80 @@ mod tests {
             vec!["Traceback ...\nFileNotFoundError: [Errno 2] No such file or directory: '/workspace'\n".to_string()],
         );
         match result {
-            Err(super::RuntimeError::ExecutionFailed(msg)) => assert!(
-                msg.contains("FileNotFoundError"),
-                "the failure carries the bootstrap's stderr: {msg}"
+            Err(super::RuntimeError::ExecutionFailedWithLogs { error, .. }) => assert!(
+                error.contains("FileNotFoundError"),
+                "the failure carries the bootstrap's error line: {error}"
             ),
-            other => panic!("expected ExecutionFailed, got {other:?}"),
+            other => panic!("expected ExecutionFailedWithLogs, got {other:?}"),
         }
 
         match ContainerRuntime::bootstrap_exec_result(127, Vec::new(), Vec::new()) {
-            Err(super::RuntimeError::ExecutionFailed(msg)) => {
-                assert_eq!(msg, "Bootstrap script exited with code 127")
+            Err(super::RuntimeError::ExecutionFailedWithLogs { error, logs }) => {
+                assert_eq!(error, "Bootstrap script exited with code 127");
+                assert!(logs.is_empty());
             }
-            other => panic!("expected ExecutionFailed, got {other:?}"),
+            other => panic!("expected ExecutionFailedWithLogs, got {other:?}"),
+        }
+    }
+
+    /// The failure text a person reads is the bootstrap's error line alone;
+    /// its `[BOOTSTRAP DEBUG]` lines are kept in the logs, never in the text
+    /// (production, 2026-10-10: "Failed to execute task: [BOOTSTRAP DEBUG]
+    /// execution_id=…" hid the error).
+    #[test]
+    fn bootstrap_failure_text_is_the_error_line_and_debug_lines_stay_in_logs() {
+        let result = ContainerRuntime::bootstrap_exec_result(
+            1,
+            Vec::new(),
+            vec![
+                "[BOOTSTRAP DEBUG] execution_id=f0b6ddb5 agent_id=2c54df3e\n".to_string(),
+                "[BOOTSTRAP DEBUG] orchestrator_url=http://aegis:8088\nRuntimeError: the model call failed\n"
+                    .to_string(),
+            ],
+        );
+        match result {
+            Err(err @ super::RuntimeError::ExecutionFailedWithLogs { .. }) => {
+                assert_eq!(
+                    err.to_string(),
+                    "Failed to execute task: RuntimeError: the model call failed"
+                );
+                let super::RuntimeError::ExecutionFailedWithLogs { logs, .. } = err else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    logs,
+                    vec![
+                        "[BOOTSTRAP DEBUG] execution_id=f0b6ddb5 agent_id=2c54df3e".to_string(),
+                        "[BOOTSTRAP DEBUG] orchestrator_url=http://aegis:8088".to_string(),
+                        "RuntimeError: the model call failed".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected ExecutionFailedWithLogs, got {other:?}"),
+        }
+    }
+
+    /// A bootstrap whose stderr holds only debug lines answers the runtime's
+    /// own exit sentence, with the debug lines in the logs.
+    #[test]
+    fn bootstrap_failure_with_only_debug_stderr_answers_the_exit_sentence() {
+        let result = ContainerRuntime::bootstrap_exec_result(
+            2,
+            Vec::new(),
+            vec!["[BOOTSTRAP DEBUG] a\n\n[BOOTSTRAP DEBUG] b\n".to_string()],
+        );
+        match result {
+            Err(super::RuntimeError::ExecutionFailedWithLogs { error, logs }) => {
+                assert_eq!(error, "Bootstrap script exited with code 2");
+                assert_eq!(
+                    logs,
+                    vec![
+                        "[BOOTSTRAP DEBUG] a".to_string(),
+                        "[BOOTSTRAP DEBUG] b".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected ExecutionFailedWithLogs, got {other:?}"),
         }
     }
 

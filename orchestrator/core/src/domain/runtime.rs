@@ -311,6 +311,11 @@ pub enum RuntimeError {
     /// (e.g. the agent process exited with a non-zero code or timed out).
     #[error("Failed to execute task: {0}")]
     ExecutionFailed(String),
+    /// The agent process exited non-zero: `error` is the sentence a person
+    /// reads (the process's last error line, or the exit sentence), and `logs`
+    /// is its whole standard error, kept as the execution's logs.
+    #[error("Failed to execute task: {error}")]
+    ExecutionFailedWithLogs { error: String, logs: Vec<String> },
     /// [`AgentRuntime::terminate`] could not stop or remove the instance.
     #[error("Failed to terminate instance: {0}")]
     TerminationFailed(String),

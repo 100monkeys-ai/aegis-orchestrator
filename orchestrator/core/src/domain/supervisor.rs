@@ -649,6 +649,13 @@ impl Supervisor {
             let output = match execution_result {
                 Ok(out) => out,
                 Err(e) => {
+                    if let RuntimeError::ExecutionFailedWithLogs { logs, .. } = &e {
+                        if !logs.is_empty() {
+                            observer
+                                .on_console_output(attempts as u8, "stderr", &logs.join("\n"))
+                                .await;
+                        }
+                    }
                     let error_msg = format!("Execution failed: {e}");
                     warn!("{}", error_msg);
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
@@ -1070,6 +1077,8 @@ mod tests {
         missing_outputs_output: Arc<Mutex<Vec<String>>>,
         /// What each iteration's verified outputs were.
         verified: Arc<Mutex<Vec<VerifiedOutputs>>>,
+        /// Each console output, as (iteration, stream, content), in order.
+        console: Arc<Mutex<Vec<(u8, String, String)>>>,
     }
 
     #[async_trait]
@@ -1078,7 +1087,12 @@ mod tests {
             self.iteration_starts.lock().await.push(iteration);
         }
 
-        async fn on_console_output(&self, _iteration: u8, _stream: &str, _content: &str) {}
+        async fn on_console_output(&self, iteration: u8, stream: &str, content: &str) {
+            self.console
+                .lock()
+                .await
+                .push((iteration, stream.to_string(), content.to_string()));
+        }
 
         async fn on_iteration_complete(&self, iteration: u8, _result: &str, _exit_code: i64) {
             self.iteration_completes.lock().await.push(iteration);
@@ -1355,6 +1369,54 @@ mod tests {
         let terminate_calls = runtime.terminate_calls.lock().await;
         assert_eq!(terminate_calls.len(), 1);
         assert_eq!(terminate_calls[0].as_str(), "instance-0");
+    }
+
+    /// A failed try's standard error reaches the execution's events as its
+    /// console output, and the failure reason is the error line alone.
+    #[tokio::test]
+    async fn failed_try_stderr_reaches_console_output_and_reason_is_the_error() {
+        let runtime = Arc::new(TestRuntime::new().with_spawn_success(1));
+        runtime
+            .execute_results
+            .lock()
+            .await
+            .push(Err(RuntimeError::ExecutionFailedWithLogs {
+                error: "RuntimeError: the model call failed".to_string(),
+                logs: vec![
+                    "[BOOTSTRAP DEBUG] execution_id=f0b6ddb5".to_string(),
+                    "[BOOTSTRAP DEBUG] agent_id=2c54df3e".to_string(),
+                    "RuntimeError: the model call failed".to_string(),
+                ],
+            }));
+
+        let supervisor = Supervisor::new(runtime.clone());
+        let observer = Arc::new(TestObserver::default());
+        let _ = supervisor
+            .run_loop(
+                create_test_config(),
+                create_test_input(),
+                1,
+                observer.clone(),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            *observer.console.lock().await,
+            vec![(
+                1u8,
+                "stderr".to_string(),
+                "[BOOTSTRAP DEBUG] execution_id=f0b6ddb5\n[BOOTSTRAP DEBUG] agent_id=2c54df3e\nRuntimeError: the model call failed".to_string()
+            )]
+        );
+        assert_eq!(
+            *observer.fail_reasons.lock().await,
+            vec![
+                "Execution failed: Failed to execute task: RuntimeError: the model call failed"
+                    .to_string()
+            ]
+        );
     }
 
     #[tokio::test]
