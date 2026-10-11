@@ -15,6 +15,7 @@ use crate::domain::fsal::FsalAccessPolicy;
 use crate::domain::repository::WorkflowExecutionRepository;
 use crate::domain::runtime::{ContainerStepConfig, ContainerStepError, ContainerStepRunner};
 use crate::domain::shared_kernel::VolumeId;
+pub use crate::domain::workflow::RUN_ATTACHMENTS_VOLUME;
 use crate::domain::workflow::{run_repository_volume, RUN_REPOSITORY_VOLUME};
 use crate::domain::workflow::{ContainerRunConfig, ParallelCompletionStrategy, StateName};
 use crate::infrastructure::event_bus::EventBus;
@@ -75,6 +76,9 @@ pub struct RunContainerStepUseCase {
     /// The runs' repositories a step may mount, and the gateway's registry
     /// it mounts them through (AEGIS ADR-141 F6). Unset: no step may.
     repositories: std::sync::OnceLock<(Arc<dyn StepRepositories>, NfsVolumeRegistry)>,
+    /// The runs' attachments a step may mount, and the gateway's registry it
+    /// mounts their copy through (AEGIS ADR-143 S4). Unset: no step may.
+    attachments: std::sync::OnceLock<(Arc<dyn StepAttachments>, NfsVolumeRegistry)>,
     /// The node's network for steps that reach public hosts (core's
     /// `spec.storage.git.step_network`, AEGIS ADR-141 F7, ADR-136 G12).
     egress_network: Option<String>,
@@ -181,6 +185,234 @@ pub fn step_run_holds_no_label(label: &str) -> String {
 const NO_GIT_REPOSITORY_SERVICE: &str =
     "this node has no git repository service, so a run cannot be given repositories";
 
+/// The refusal of an attachment whose volume is not its run's person's
+/// (AEGIS ADR-143 S4).
+pub const ATTACHMENT_NOT_YOURS: &str = "this attachment is not yours";
+
+/// The refusal of a step naming `attachments` in a run that carries none
+/// (AEGIS ADR-143 S4).
+pub const STEP_RUN_HAS_NO_ATTACHMENTS: &str =
+    "this step reads the run's attachments and the run has none";
+
+/// The refusal of a step naming `attachments` on a node whose steps are not
+/// given their runs' attachments.
+const NO_STEP_ATTACHMENTS: &str = "this node does not give steps their run's attachments";
+
+/// Why a run's attachments were not given to a step: a refusal in its own
+/// sentence, or a failure to copy them.
+#[derive(Debug, thiserror::Error)]
+pub enum RunAttachmentsError {
+    #[error("{0}")]
+    Refused(String),
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+/// The copy of a run's attachments made for one step (AEGIS ADR-143 S4):
+/// a volume owned by the workflow execution, each file at its `name`.
+#[derive(Debug, Clone)]
+pub struct StagedAttachments {
+    pub volume_id: VolumeId,
+    /// The volume's storage path, as the gateway registers it.
+    pub remote_path: String,
+}
+
+/// The attachments a workflow run carries, as a ContainerRun step of it
+/// mounts them (AEGIS ADR-143 S4).
+#[async_trait::async_trait]
+pub trait StepAttachments: Send + Sync {
+    /// Before any container: each attachment the workflow execution `run` of
+    /// `tenant_id` carries, its volume checked as the run's person's, copied
+    /// at its `name` into a volume owned by `run` and created for the step
+    /// `step`. `None`: the run carries none.
+    async fn stage_for_step(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        run: uuid::Uuid,
+        step: ExecutionId,
+    ) -> Result<Option<StagedAttachments>, RunAttachmentsError>;
+
+    /// Remove a step's copy when the step ends.
+    async fn remove_staged(&self, staged: &StagedAttachments);
+}
+
+/// [`StepAttachments`] read from the workflow execution's record: its
+/// `input.attachments`, each read as its person through the file service,
+/// copied through the FSAL as the workflow execution into a volume the
+/// volume service creates for the step.
+pub struct WorkflowRunAttachments {
+    workflow_executions: Arc<dyn WorkflowExecutionRepository>,
+    volumes: Arc<dyn crate::application::volume_manager::VolumeService>,
+    files: Arc<crate::application::file_operations_service::FileOperationsService>,
+    fsal: Arc<crate::domain::fsal::AegisFSAL>,
+}
+
+impl WorkflowRunAttachments {
+    pub fn new(
+        workflow_executions: Arc<dyn WorkflowExecutionRepository>,
+        volumes: Arc<dyn crate::application::volume_manager::VolumeService>,
+        files: Arc<crate::application::file_operations_service::FileOperationsService>,
+        fsal: Arc<crate::domain::fsal::AegisFSAL>,
+    ) -> Self {
+        Self {
+            workflow_executions,
+            volumes,
+            files,
+            fsal,
+        }
+    }
+
+    /// Write each `(name, bytes)` at `/<name>` of the step's new `volume`,
+    /// through the store the FSAL reads it from, as the file service
+    /// writes. Only the backends the volume service creates hold a copy.
+    async fn write_copies(
+        &self,
+        volume: &crate::domain::volume::Volume,
+        contents: &[(String, Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        use crate::domain::volume::VolumeBackend;
+        let storage = self.fsal.storage_provider();
+        for (name, data) in contents {
+            if name.is_empty() || name.contains('/') || name == ".." || name == "." {
+                anyhow::bail!("attachment '{name}' has no name a file can carry");
+            }
+            let path = match &volume.backend {
+                VolumeBackend::HostPath { path } => path.join(name).to_string_lossy().to_string(),
+                VolumeBackend::SeaweedFS { remote_path, .. } => format!("{remote_path}/{name}"),
+                VolumeBackend::OpenDal { .. } => format!(
+                    "/aegis/opendal/volumes/{}/{}/{name}",
+                    volume.tenant_id, volume.id
+                ),
+                VolumeBackend::Seal { .. } => {
+                    anyhow::bail!("a step's copy of its run's attachments needs local storage")
+                }
+            };
+            let handle = storage
+                .create_file(&path, 0o644)
+                .await
+                .map_err(|e| anyhow::anyhow!("attachment '{name}' could not be copied: {e}"))?;
+            let written = storage.write_at(&handle, 0, data).await;
+            let _ = storage.close_file(&handle).await;
+            written.map_err(|e| anyhow::anyhow!("attachment '{name}' could not be copied: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl StepAttachments for WorkflowRunAttachments {
+    async fn stage_for_step(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        run: uuid::Uuid,
+        step: ExecutionId,
+    ) -> Result<Option<StagedAttachments>, RunAttachmentsError> {
+        use crate::domain::execution::AttachmentRef;
+        use crate::domain::volume::{AccessMode, StorageClass, VolumeOwnership};
+        let Some(execution) = self
+            .workflow_executions
+            .find_by_id_for_tenant(tenant_id, ExecutionId(run))
+            .await
+            .map_err(|e| RunAttachmentsError::Failed(e.into()))?
+        else {
+            return Ok(None);
+        };
+        let attachments: Vec<AttachmentRef> = match execution.input.get("attachments") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
+                RunAttachmentsError::Failed(anyhow::anyhow!(
+                    "the run's attachments do not parse: {e}"
+                ))
+            })?,
+        };
+        if attachments.is_empty() {
+            return Ok(None);
+        }
+        let Some(person) = execution.initiating_user_sub.as_deref() else {
+            return Err(RunAttachmentsError::Refused(
+                ATTACHMENT_NOT_YOURS.to_string(),
+            ));
+        };
+        // Every attachment is checked before any is read or anything made.
+        for attachment in &attachments {
+            let volume = self
+                .fsal
+                .volume_repository()
+                .find_by_id(attachment.volume_id)
+                .await
+                .map_err(|e| RunAttachmentsError::Failed(e.into()))?;
+            let yours = volume.is_some_and(|v| {
+                &v.tenant_id == tenant_id
+                    && matches!(&v.ownership, VolumeOwnership::Persistent { owner } if owner == person)
+            });
+            if !yours {
+                return Err(RunAttachmentsError::Refused(
+                    ATTACHMENT_NOT_YOURS.to_string(),
+                ));
+            }
+        }
+        let mut contents = Vec::with_capacity(attachments.len());
+        for attachment in &attachments {
+            let content = self
+                .files
+                .read_file(&attachment.volume_id, tenant_id, person, &attachment.path)
+                .await
+                .map_err(|e| {
+                    RunAttachmentsError::Failed(anyhow::anyhow!(
+                        "attachment '{}' could not be read: {e}",
+                        attachment.name
+                    ))
+                })?;
+            contents.push((attachment.name.clone(), content.data));
+        }
+        let total: u64 = contents.iter().map(|(_, data)| data.len() as u64).sum();
+        let volume_id = self
+            .volumes
+            .create_volume(
+                format!(
+                    "step-attachments-{}-{}",
+                    step.0,
+                    uuid::Uuid::new_v4().simple()
+                ),
+                tenant_id.clone(),
+                StorageClass::ephemeral_hours(24),
+                total.div_ceil(1024 * 1024).max(1),
+                VolumeOwnership::workflow(run),
+            )
+            .await?;
+        let staged = async {
+            let volume = self.volumes.get_volume(volume_id).await?;
+            self.write_copies(&volume, &contents).await?;
+            anyhow::Ok(StagedAttachments {
+                volume_id,
+                remote_path: volume
+                    .to_mount(std::path::PathBuf::from("/"), AccessMode::ReadOnly)
+                    .remote_path,
+            })
+        }
+        .await;
+        match staged {
+            Ok(staged) => Ok(Some(staged)),
+            Err(e) => {
+                if let Err(removal) = self.volumes.delete_volume(volume_id).await {
+                    warn!(volume_id = %volume_id, error = %removal, "A step's copy of its run's attachments was not removed");
+                }
+                Err(RunAttachmentsError::Failed(e))
+            }
+        }
+    }
+
+    async fn remove_staged(&self, staged: &StagedAttachments) {
+        if let Err(e) = self.volumes.delete_volume(staged.volume_id).await {
+            warn!(
+                volume_id = %staged.volume_id,
+                error = %e,
+                "A step's copy of its run's attachments was not removed"
+            );
+        }
+    }
+}
+
 /// A volume registration the step replaced, put back when the step ends.
 type Replaced = (
     VolumeId,
@@ -192,6 +424,7 @@ impl RunContainerStepUseCase {
         Self {
             runner,
             repositories: std::sync::OnceLock::new(),
+            attachments: std::sync::OnceLock::new(),
             egress_network: None,
         }
     }
@@ -206,6 +439,17 @@ impl RunContainerStepUseCase {
         registry: NfsVolumeRegistry,
     ) {
         let _ = self.repositories.set((repositories, registry));
+    }
+
+    /// Let a step mount its run's attachments (AEGIS ADR-143 S4), their
+    /// copy registered with `registry`, the gateway agent states mount
+    /// through. Wired once at startup; a second call is ignored.
+    pub fn set_run_attachments(
+        &self,
+        attachments: Arc<dyn StepAttachments>,
+        registry: NfsVolumeRegistry,
+    ) {
+        let _ = self.attachments.set((attachments, registry));
     }
 
     /// The node's network for `network_mode: egress` steps (AEGIS ADR-141
@@ -232,25 +476,131 @@ impl RunContainerStepUseCase {
             input.network_mode = Some(network.clone());
         }
         let replaced = self.mount_run_repositories(&mut input).await?;
+        let staged = match self.mount_run_attachments(&mut input).await {
+            Ok(staged) => staged,
+            Err(refused) => {
+                self.put_back(replaced);
+                return Err(refused);
+            }
+        };
         let result = self.execute(input).await;
-        if let Some((_, registry)) = self.repositories.get() {
-            for (volume_id, found) in replaced {
-                match found {
-                    Some(context) => registry.register(VolumeRegistration {
-                        volume_id: context.volume_id,
-                        execution_id: context.execution_id,
-                        workflow_execution_id: context.workflow_execution_id,
-                        container_uid: context.container_uid,
-                        container_gid: context.container_gid,
-                        policy: context.policy,
-                        mount_point: context.mount_point,
-                        remote_path: context.remote_path,
-                    }),
-                    None => registry.deregister(volume_id),
-                }
+        self.put_back(replaced);
+        self.remove_attachments(staged).await;
+        Ok(result?)
+    }
+
+    /// Put back the registrations a step's repository mounts replaced.
+    fn put_back(&self, replaced: Vec<Replaced>) {
+        let Some((_, registry)) = self.repositories.get() else {
+            return;
+        };
+        for (volume_id, found) in replaced {
+            match found {
+                Some(context) => registry.register(VolumeRegistration {
+                    volume_id: context.volume_id,
+                    execution_id: context.execution_id,
+                    workflow_execution_id: context.workflow_execution_id,
+                    container_uid: context.container_uid,
+                    container_gid: context.container_gid,
+                    policy: context.policy,
+                    mount_point: context.mount_point,
+                    remote_path: context.remote_path,
+                }),
+                None => registry.deregister(volume_id),
             }
         }
-        Ok(result?)
+    }
+
+    /// Each volume entry naming the run's attachments (AEGIS ADR-143 S4)
+    /// becomes a copy of them, each at its `name`, in a volume owned by the
+    /// workflow execution and created for the step, registered read-only
+    /// with the gateway agent states mount through at the entry's
+    /// `mount_path`, for the step's length. Refused before any container
+    /// when an attachment is not the run's person's or the run has none.
+    async fn mount_run_attachments(
+        &self,
+        input: &mut RunContainerStepInput,
+    ) -> Result<Vec<StagedAttachments>, RunContainerStepError> {
+        let entries: Vec<usize> = input
+            .volumes
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.name == RUN_ATTACHMENTS_VOLUME)
+            .map(|(index, _)| index)
+            .collect();
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some((attachments, registry)) = self.attachments.get() else {
+            return Err(RunContainerStepError::Refused(
+                NO_STEP_ATTACHMENTS.to_string(),
+            ));
+        };
+        let Some(run) = input.workflow_execution_id else {
+            return Err(RunContainerStepError::Refused(
+                STEP_RUN_HAS_NO_ATTACHMENTS.to_string(),
+            ));
+        };
+        let mut staged_all: Vec<StagedAttachments> = Vec::with_capacity(entries.len());
+        for index in entries {
+            let refused = match attachments
+                .stage_for_step(&input.tenant_id, run, input.execution_id)
+                .await
+            {
+                Ok(Some(staged)) => {
+                    // Only read-only is allowed.
+                    let volume = &mut input.volumes[index];
+                    volume.read_only = true;
+                    registry.register(VolumeRegistration {
+                        volume_id: staged.volume_id,
+                        execution_id: input.execution_id,
+                        workflow_execution_id: Some(run),
+                        container_uid: 1000,
+                        container_gid: 1000,
+                        policy: FsalAccessPolicy {
+                            read: vec!["/*".to_string()],
+                            write: Vec::new(),
+                        },
+                        mount_point: std::path::PathBuf::from(&volume.mount_path),
+                        remote_path: staged.remote_path.clone(),
+                    });
+                    info!(
+                        execution_id = %input.execution_id,
+                        step_name = %input.name,
+                        volume_id = %staged.volume_id,
+                        mount_path = %volume.mount_path,
+                        "A step mounts its run's attachments"
+                    );
+                    volume.name = staged.volume_id.0.to_string();
+                    staged_all.push(staged);
+                    continue;
+                }
+                Ok(None) => RunContainerStepError::Refused(STEP_RUN_HAS_NO_ATTACHMENTS.to_string()),
+                Err(RunAttachmentsError::Refused(sentence)) => {
+                    RunContainerStepError::Refused(sentence)
+                }
+                Err(RunAttachmentsError::Failed(e)) => {
+                    RunContainerStepError::Step(ContainerStepError::VolumeMountFailed {
+                        volume: RUN_ATTACHMENTS_VOLUME.to_string(),
+                        error: e.to_string(),
+                    })
+                }
+            };
+            self.remove_attachments(staged_all).await;
+            return Err(refused);
+        }
+        Ok(staged_all)
+    }
+
+    /// Deregister and remove a step's copies of its run's attachments.
+    async fn remove_attachments(&self, staged: Vec<StagedAttachments>) {
+        let Some((attachments, registry)) = self.attachments.get() else {
+            return;
+        };
+        for copy in staged {
+            registry.deregister(copy.volume_id);
+            attachments.remove_staged(&copy).await;
+        }
     }
 
     /// Each volume entry naming the run's repository (AEGIS ADR-141 F6)

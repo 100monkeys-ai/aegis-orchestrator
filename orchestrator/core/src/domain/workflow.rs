@@ -406,9 +406,12 @@ impl Workflow {
                 };
 
                 for mount_name in mounts {
-                    // The run's repository is the run's, never a declared
-                    // volume (AEGIS ADR-141 F6).
-                    if run_repository_volume(mount_name).is_some() {
+                    // The run's repository and its attachments are the
+                    // run's, never declared volumes (AEGIS ADR-141 F6,
+                    // ADR-143 S4).
+                    if run_repository_volume(mount_name).is_some()
+                        || mount_name == RUN_ATTACHMENTS_VOLUME
+                    {
                         continue;
                     }
                     if !declared.contains(mount_name) {
@@ -806,6 +809,10 @@ pub struct WorkflowSpec {
 /// (AEGIS ADR-141 F6): `repository` for the run's first, `repository:<label>`
 /// for the one of that label.
 pub const RUN_REPOSITORY_VOLUME: &str = "repository";
+
+/// The volume name by which a ContainerRun step mounts, read-only, its run's
+/// attachments (AEGIS ADR-143 S4): the run's, never a declared volume.
+pub const RUN_ATTACHMENTS_VOLUME: &str = "attachments";
 
 /// Whether a ContainerRun volume entry names the run's repository rather
 /// than a declared volume (AEGIS ADR-141 F6), and the label it names, if any.

@@ -2592,6 +2592,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
         service.clone().release_runs_on_end();
     }
+    // A step mounts a copy of its run's attachments (AEGIS ADR-143 S4).
+    run_container_step_use_case.set_run_attachments(
+        Arc::new(
+            aegis_orchestrator_core::application::run_container_step::WorkflowRunAttachments::new(
+                workflow_execution_repo.clone(),
+                volume_service.clone(),
+                file_operations_service.clone(),
+                nfs_gateway.fsal().clone(),
+            ),
+        ),
+        nfs_gateway.volume_registry().clone(),
+    );
 
     // Initialize the Script persistence service (ADR-110 §D7). Enabled
     // when a Postgres pool is configured and migration 021 has been
