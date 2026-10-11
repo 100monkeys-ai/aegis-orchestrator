@@ -5,9 +5,9 @@
 //! of the charges inside the window, not one charge (AEGIS known defect
 //! `window-enforcer-counts-one-charge`).
 //!
-//! The enforcer stores each charge at `window_start = charge time - window`
-//! (Zaru ADR-0064 U1), so the charges inside a window are the rows whose
-//! `window_start >= now - 2 * window`.
+//! Each bucket is a fixed window (ADR-072 Update W1): a counter row is one
+//! window, keyed by its open time (`window_start`), and it counts while
+//! `now < window_start + window`.
 //!
 //! CI starts a PostgreSQL and sets `AEGIS_TEST_POSTGRES_URL` to a database a
 //! superuser can connect to. Each test creates its own database there and
@@ -118,8 +118,9 @@ fn policy(windows: &[(RateLimitBucket, u64)]) -> RateLimitPolicy {
     }
 }
 
-/// Store one charge as the enforcer stores it, made `ago` before now.
-async fn charge_made(pool: &PgPool, bucket: &str, window: Duration, ago: Duration) {
+/// Store one charge in a window of `bucket` opened `ago` before now, as the
+/// enforcer stores the charge that opens a window.
+async fn window_opened(pool: &PgPool, bucket: &str, ago: Duration) {
     let scope = scope();
     let (scope_type, scope_id) = PostgresWindowEnforcer::scope_parts(&scope);
     sqlx::query(
@@ -130,7 +131,7 @@ async fn charge_made(pool: &PgPool, bucket: &str, window: Duration, ago: Duratio
     .bind(scope_type)
     .bind(&scope_id)
     .bind(bucket)
-    .bind(Utc::now() - ago - window)
+    .bind(Utc::now() - ago)
     .execute(pool)
     .await
     .expect("store a charge");
@@ -150,7 +151,10 @@ async fn the_fourth_charge_in_an_hour_of_three_is_refused() {
             .await
             .unwrap_or_else(|e| panic!("charge {n} of 3 was refused: {e:?}"));
     }
-    let fourth = enforcer.check_and_increment(&scope(), &policy, 1).await;
+    let fourth = enforcer
+        .check_and_increment(&scope(), &policy, 1)
+        .await
+        .map_err(|refusal| (refusal.bucket, refusal.remaining));
     assert_eq!(
         fourth,
         Err((RateLimitBucket::Hourly, 0)),
@@ -182,18 +186,17 @@ async fn remaining_after_two_charges_is_the_limit_less_two() {
 }
 
 #[tokio::test]
-async fn a_charge_older_than_the_window_is_not_counted() {
+async fn a_closed_window_is_not_counted() {
     let Some(db) = TestDb::create().await else {
         return;
     };
     let enforcer = PostgresWindowEnforcer::new(db.pool.clone());
     let policy = policy(&[(RateLimitBucket::Hourly, 3)]);
-    let hour = Duration::hours(1);
 
-    // One charge 50 minutes ago is inside the hour; one 70 minutes ago, its
-    // row older than two windows, is not.
-    charge_made(&db.pool, "hourly", hour, Duration::minutes(50)).await;
-    charge_made(&db.pool, "hourly", hour, Duration::minutes(70)).await;
+    // A window opened 50 minutes ago with one charge is open; one opened 70
+    // minutes ago has closed.
+    window_opened(&db.pool, "hourly", Duration::minutes(50)).await;
+    window_opened(&db.pool, "hourly", Duration::minutes(70)).await;
 
     let remaining = enforcer.remaining(&scope(), &policy).await.unwrap();
     assert_eq!(remaining.get(&RateLimitBucket::Hourly), Some(&2));
@@ -204,7 +207,10 @@ async fn a_charge_older_than_the_window_is_not_counted() {
             .expect("the hour holds one charge, so two more pass");
     }
     assert_eq!(
-        enforcer.check_and_increment(&scope(), &policy, 1).await,
+        enforcer
+            .check_and_increment(&scope(), &policy, 1)
+            .await
+            .map_err(|refusal| (refusal.bucket, refusal.remaining)),
         Err((RateLimitBucket::Hourly, 0))
     );
 
@@ -226,7 +232,10 @@ async fn a_refusal_in_one_window_charges_no_window() {
             .expect("a charge under both limits");
     }
     assert_eq!(
-        enforcer.check_and_increment(&scope(), &policy, 1).await,
+        enforcer
+            .check_and_increment(&scope(), &policy, 1)
+            .await
+            .map_err(|refusal| (refusal.bucket, refusal.remaining)),
         Err((RateLimitBucket::Daily, 0))
     );
     let remaining = enforcer.remaining(&scope(), &policy).await.unwrap();
@@ -294,8 +303,8 @@ async fn the_per_minute_window_is_left_to_the_burst_enforcer() {
 
 // The counter cleanup (AEGIS known defect
 // `bananas-month-below-week-2026-10-10`): a row is deleted only when its
-// charge has left its own bucket's window, which is
-// `window_start < PostgresWindowEnforcer::window_lower_bound(now, bucket)`.
+// window has closed, which is
+// `window_start < PostgresWindowEnforcer::open_window_bound(now, bucket)`.
 
 const BUCKETS: [(RateLimitBucket, &str); 4] = [
     (RateLimitBucket::Hourly, "hourly"),
@@ -303,10 +312,6 @@ const BUCKETS: [(RateLimitBucket, &str); 4] = [
     (RateLimitBucket::Weekly, "weekly"),
     (RateLimitBucket::Monthly, "monthly"),
 ];
-
-fn window_of(bucket: RateLimitBucket) -> Duration {
-    Duration::seconds(bucket.window_seconds() as i64)
-}
 
 /// The rows stored under `bucket`, of any scope.
 async fn rows_in(pool: &PgPool, bucket: &str) -> i64 {
@@ -318,7 +323,7 @@ async fn rows_in(pool: &PgPool, bucket: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn after_the_cleanup_a_month_reads_a_charge_of_six_days_ago_and_at_least_the_week() {
+async fn after_the_cleanup_a_month_reads_its_window_of_six_days_ago_and_at_least_the_week() {
     let Some(db) = TestDb::create().await else {
         return;
     };
@@ -326,8 +331,10 @@ async fn after_the_cleanup_a_month_reads_a_charge_of_six_days_ago_and_at_least_t
     let limit = 100;
     let policy = policy(&BUCKETS.map(|(bucket, _)| (bucket, limit)));
 
-    for (bucket, name) in BUCKETS {
-        charge_made(&db.pool, name, window_of(bucket), Duration::days(6)).await;
+    // A window of every bucket opened six days ago: the hour and the day
+    // have closed, the week and the month are open.
+    for (_, name) in BUCKETS {
+        window_opened(&db.pool, name, Duration::days(6)).await;
     }
     enforcer
         .cleanup_expired_counters()
@@ -339,7 +346,7 @@ async fn after_the_cleanup_a_month_reads_a_charge_of_six_days_ago_and_at_least_t
     assert_eq!(
         used(RateLimitBucket::Monthly),
         1,
-        "the month must still read the charge of six days ago after the cleanup"
+        "the month must still read its window of six days ago after the cleanup"
     );
     assert!(
         used(RateLimitBucket::Monthly) >= used(RateLimitBucket::Weekly),
@@ -352,26 +359,14 @@ async fn after_the_cleanup_a_month_reads_a_charge_of_six_days_ago_and_at_least_t
 }
 
 #[tokio::test]
-async fn the_cleanup_deletes_a_monthly_charge_of_31_days_ago_and_a_weekly_of_8() {
+async fn the_cleanup_deletes_a_monthly_window_of_31_days_ago_and_a_weekly_of_8() {
     let Some(db) = TestDb::create().await else {
         return;
     };
     let enforcer = PostgresWindowEnforcer::new(db.pool.clone());
 
-    charge_made(
-        &db.pool,
-        "monthly",
-        window_of(RateLimitBucket::Monthly),
-        Duration::days(31),
-    )
-    .await;
-    charge_made(
-        &db.pool,
-        "weekly",
-        window_of(RateLimitBucket::Weekly),
-        Duration::days(8),
-    )
-    .await;
+    window_opened(&db.pool, "monthly", Duration::days(31)).await;
+    window_opened(&db.pool, "weekly", Duration::days(8)).await;
     enforcer
         .cleanup_expired_counters()
         .await
@@ -380,33 +375,26 @@ async fn the_cleanup_deletes_a_monthly_charge_of_31_days_ago_and_a_weekly_of_8()
     assert_eq!(
         rows_in(&db.pool, "monthly").await,
         0,
-        "a monthly charge of 31 days ago has left its month and must be deleted"
+        "a monthly window opened 31 days ago has closed and must be deleted"
     );
     assert_eq!(
         rows_in(&db.pool, "weekly").await,
         0,
-        "a weekly charge of 8 days ago has left its week and must be deleted"
+        "a weekly window opened 8 days ago has closed and must be deleted"
     );
 
     db.remove().await;
 }
 
 #[tokio::test]
-async fn the_cleanup_keeps_a_daily_charge_inside_its_day() {
+async fn the_cleanup_keeps_an_open_daily_window() {
     let Some(db) = TestDb::create().await else {
         return;
     };
     let enforcer = PostgresWindowEnforcer::new(db.pool.clone());
 
-    // A day old less an hour: a charge of exactly a day ago has just left
-    // its day by the reader's own bound, so the margin keeps it inside.
-    charge_made(
-        &db.pool,
-        "daily",
-        window_of(RateLimitBucket::Daily),
-        Duration::hours(23),
-    )
-    .await;
+    // A daily window opened 23 hours ago closes in an hour.
+    window_opened(&db.pool, "daily", Duration::hours(23)).await;
     enforcer
         .cleanup_expired_counters()
         .await
@@ -415,7 +403,7 @@ async fn the_cleanup_keeps_a_daily_charge_inside_its_day() {
     assert_eq!(
         rows_in(&db.pool, "daily").await,
         1,
-        "a daily charge inside its day must be kept"
+        "an open daily window must be kept"
     );
 
     db.remove().await;

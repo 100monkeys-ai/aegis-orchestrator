@@ -359,7 +359,8 @@ pub(crate) struct UserRateLimitUsageItem {
     pub current_count: i64,
     pub limit_value: i64,
     pub window_seconds: u64,
-    pub resets_at: DateTime<Utc>,
+    /// The open window's close; none when the bucket has no open window.
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 pub(crate) async fn get_user_rate_limit_usage_handler(
@@ -411,8 +412,11 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
 /// The counters are read under the key every writer writes for this
 /// identity: the identity's own tenant claim, as the execution, inner-loop
 /// and SEAL writers bind it, through the enforcer's own
-/// [`PostgresWindowEnforcer::scope_parts`]. Each window reads the sum of the
-/// rows inside it. Per-minute is counted only in memory by the burst
+/// [`PostgresWindowEnforcer::scope_parts`]. Each bucket reads its open
+/// window's count and its close as the reset, through the enforcer's own
+/// [`PostgresWindowEnforcer::open_window_bound`] and
+/// [`PostgresWindowEnforcer::window_close`]; a bucket with no open window
+/// reads zero and no reset. Per-minute is counted only in memory by the burst
 /// enforcer, so no per-minute item is reported.
 pub(crate) async fn user_rate_limit_usage(
     repo: &RateLimitOverrideRepository,
@@ -436,7 +440,7 @@ pub(crate) async fn user_rate_limit_usage(
         .map(|bucket| {
             (
                 bucket_to_str(bucket),
-                PostgresWindowEnforcer::window_lower_bound(now, bucket),
+                PostgresWindowEnforcer::open_window_bound(now, bucket),
             )
         })
         .collect();
@@ -447,6 +451,8 @@ pub(crate) async fn user_rate_limit_usage(
         .map(|w| {
             (
                 (w.resource_type, w.bucket),
+                // At most one window of a bucket is open at a time, so the
+                // oldest row at or above the open bound is the open window.
                 (w.total, w.oldest_window_start),
             )
         })
@@ -482,13 +488,11 @@ pub(crate) async fn user_rate_limit_usage(
             let bucket_str = bucket_to_str(bucket);
             let (current_count, resets_at) =
                 match sums.get(&(resource_str.clone(), bucket_str.clone())) {
-                    Some((total, oldest_window_start)) => {
-                        (*total, window_expiry(*oldest_window_start, bucket))
-                    }
-                    None => (
-                        0i64,
-                        now + chrono::Duration::seconds(window.window_seconds as i64),
+                    Some((total, opened_at)) => (
+                        *total,
+                        Some(PostgresWindowEnforcer::window_close(*opened_at, bucket)),
                     ),
+                    None => (0i64, None),
                 };
             items.push(UserRateLimitUsageItem {
                 resource_type: resource_str.clone(),
@@ -648,12 +652,6 @@ const STORED_BUCKETS: [RateLimitBucket; 4] = [
     RateLimitBucket::Weekly,
     RateLimitBucket::Monthly,
 ];
-
-/// When the charge stored with this `window_start` leaves the bucket's
-/// window: its charge time (`window_start + window`) plus the window.
-fn window_expiry(window_start: DateTime<Utc>, bucket: &RateLimitBucket) -> DateTime<Utc> {
-    window_start + chrono::Duration::seconds(2 * bucket.window_seconds() as i64)
-}
 
 fn bucket_to_str(bucket: &RateLimitBucket) -> String {
     match bucket {

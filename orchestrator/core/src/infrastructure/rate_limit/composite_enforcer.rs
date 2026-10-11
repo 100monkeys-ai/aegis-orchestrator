@@ -8,7 +8,8 @@
 //!
 //! Enforcement order:
 //! 1. **Burst check** (fast, in-memory) — fail-fast on per-minute exhaustion
-//! 2. **Window check** (PostgreSQL) — atomic increment of longer windows
+//! 2. **Window check** (PostgreSQL) — atomic increment of longer windows,
+//!    each a fixed window whose refusal names the seconds until it closes
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,8 +107,10 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
             Ok(pg_remaining) => {
                 remaining.extend(pg_remaining);
             }
-            Err((bucket, _)) => {
-                let retry_after = bucket.window_seconds();
+            Err(refusal) => {
+                // The refusing window's close, fixed when it opened (ADR-072).
+                let bucket = refusal.bucket;
+                let retry_after = refusal.retry_after_seconds;
                 let window_limit = policy.windows.get(&bucket).map(|w| w.limit).unwrap_or(0);
                 let decision = RateLimitDecision {
                     allowed: false,

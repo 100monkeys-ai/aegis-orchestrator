@@ -185,7 +185,7 @@ async fn identity_with_no_rows_reads_zero() {
 }
 
 #[tokio::test]
-async fn a_charge_older_than_the_window_is_not_counted() {
+async fn a_window_that_closed_is_not_counted_and_an_open_one_is() {
     let Some(db) = TestDb::create().await else {
         return;
     };
@@ -195,13 +195,10 @@ async fn a_charge_older_than_the_window_is_not_counted() {
         user_id: alice.sub.clone(),
     };
     let (scope_type, scope_id) = PostgresWindowEnforcer::scope_parts(&scope);
-    // A charge made two days ago, stored as the enforcer stores it: its
-    // `window_start` is the charge's time minus the bucket's window.
-    let charged_at = chrono::Utc::now() - chrono::Duration::days(2);
-    for (bucket, window) in [
-        ("daily", chrono::Duration::days(1)),
-        ("weekly", chrono::Duration::days(7)),
-    ] {
+    // A daily and a weekly window, each opened two days ago: the day has
+    // closed, the week is open.
+    let opened = chrono::Utc::now() - chrono::Duration::days(2);
+    for bucket in ["daily", "weekly"] {
         sqlx::query(
             "INSERT INTO rate_limit_counters \
              (scope_type, scope_id, resource_type, bucket, window_start, counter) \
@@ -210,10 +207,10 @@ async fn a_charge_older_than_the_window_is_not_counted() {
         .bind(scope_type)
         .bind(&scope_id)
         .bind(bucket)
-        .bind(charged_at - window)
+        .bind(opened)
         .execute(&db.pool)
         .await
-        .expect("insert the old charge");
+        .expect("insert the window");
     }
 
     let repo = RateLimitOverrideRepository::new(db.pool.clone());
@@ -224,12 +221,12 @@ async fn a_charge_older_than_the_window_is_not_counted() {
     assert_eq!(
         count(&items, "llm_call", "daily"),
         0,
-        "a charge two days old is outside the daily window"
+        "a daily window opened two days ago has closed"
     );
     assert_eq!(
         count(&items, "llm_call", "weekly"),
         1,
-        "a charge two days old is inside the weekly window"
+        "a weekly window opened two days ago is open"
     );
     db.remove().await;
 }
@@ -480,17 +477,22 @@ async fn a_record_over_the_hourly_limit_is_stored_and_the_get_reads_it() {
 
 #[tokio::test]
 async fn the_handlers_window_bound_is_the_enforcers_for_every_stored_bucket() {
-    // The reader and the writers share one bound: the handler calls the
-    // enforcer's `window_lower_bound` and keeps no copy of its own, so the two
-    // cannot drift apart.
+    // The reader and the writers share one open window: the handler calls
+    // the enforcer's `open_window_bound` and `window_close` and keeps no copy
+    // of its own, so the two cannot drift apart.
     let handler_source = include_str!("admin.rs");
     assert!(
-        !handler_source.contains("fn window_lower_bound("),
-        "the usage handler keeps its own copy of the read bound (`fn window_lower_bound` in admin.rs); it must call `PostgresWindowEnforcer::window_lower_bound`"
+        !handler_source.contains("fn open_window_bound(")
+            && !handler_source.contains("fn window_close("),
+        "the usage handler keeps its own copy of the open window (in admin.rs); it must call `PostgresWindowEnforcer`'s"
     );
     assert!(
-        handler_source.contains("PostgresWindowEnforcer::window_lower_bound(now, bucket)"),
-        "the usage handler does not call `PostgresWindowEnforcer::window_lower_bound(now, bucket)`"
+        handler_source.contains("PostgresWindowEnforcer::open_window_bound(now, bucket)"),
+        "the usage handler does not call `PostgresWindowEnforcer::open_window_bound(now, bucket)`"
+    );
+    assert!(
+        handler_source.contains("PostgresWindowEnforcer::window_close("),
+        "the usage handler does not call `PostgresWindowEnforcer::window_close`"
     );
 
     let Some(db) = TestDb::create().await else {
@@ -503,11 +505,11 @@ async fn the_handlers_window_bound_is_the_enforcers_for_every_stored_bucket() {
         user_id: alice.sub.clone(),
     };
     let (scope_type, scope_id) = PostgresWindowEnforcer::scope_parts(&scope);
-    // For every stored bucket, one charge a minute inside the enforcer's bound
-    // and one a minute outside it.
+    // For every stored bucket, a window opened a minute inside the enforcer's
+    // open bound and one a minute outside it.
     let now = chrono::Utc::now();
     for bucket in &super::STORED_BUCKETS {
-        let bound = PostgresWindowEnforcer::window_lower_bound(now, bucket);
+        let bound = PostgresWindowEnforcer::open_window_bound(now, bucket);
         for window_start in [
             bound + chrono::Duration::minutes(1),
             bound - chrono::Duration::minutes(1),
@@ -548,7 +550,7 @@ async fn the_handlers_window_bound_is_the_enforcers_for_every_stored_bucket() {
             .unwrap_or_else(|| panic!("the usage carries no llm_call {name} item"));
         assert_eq!(
             item.current_count, 1,
-            "the {name} read counts the charge inside the enforcer's bound and not the one outside it"
+            "the {name} read counts the open window and not the closed one"
         );
         assert_eq!(
             item.limit_value - remaining[bucket] as i64,
@@ -556,5 +558,153 @@ async fn the_handlers_window_bound_is_the_enforcers_for_every_stored_bucket() {
             "the handler's {name} count is the enforcer's"
         );
     }
+    db.remove().await;
+}
+
+// ----------------------------------------------------------------------
+// Fixed windows (AEGIS ADR-072 Update W1): the card reads the open window's
+// count and its close as the reset, and no reset for a bucket with no open
+// window.
+// ----------------------------------------------------------------------
+
+/// Store a counter row for `identity` under the writers' key.
+async fn counter_row(
+    pool: &PgPool,
+    identity: &UserIdentity,
+    resource: &str,
+    bucket: &str,
+    window_start: chrono::DateTime<chrono::Utc>,
+    count: i64,
+) {
+    let scope = RateLimitScope::User {
+        tenant_id: resolve_effective_tenant(Some(identity), None),
+        user_id: identity.sub.clone(),
+    };
+    let (scope_type, scope_id) = PostgresWindowEnforcer::scope_parts(&scope);
+    sqlx::query(
+        "INSERT INTO rate_limit_counters \
+         (scope_type, scope_id, resource_type, bucket, window_start, counter) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(scope_type)
+    .bind(&scope_id)
+    .bind(resource)
+    .bind(bucket)
+    .bind(window_start)
+    .bind(count)
+    .execute(pool)
+    .await
+    .expect("store a counter row");
+}
+
+/// The JSON a person's card reads for one item.
+fn item_json(items: &[UserRateLimitUsageItem], resource: &str, bucket: &str) -> serde_json::Value {
+    let item = items
+        .iter()
+        .find(|item| item.resource_type == resource && item.bucket == bucket)
+        .unwrap_or_else(|| panic!("the usage carries no {resource} {bucket} item"));
+    serde_json::to_value(item).expect("serialise the item")
+}
+
+fn resets_at(item: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    item["resets_at"]
+        .as_str()
+        .map(|s| s.parse().expect("a reset is a timestamp"))
+}
+
+#[tokio::test]
+async fn the_card_reads_the_open_windows_count_and_its_close_through_later_charges() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let alice = consumer("fixed-alice");
+    // A daily window of LLM calls opened 23 hours ago with 5 calls: it
+    // closes in an hour.
+    let opened = chrono::Utc::now() - chrono::Duration::hours(23);
+    counter_row(&db.pool, &alice, "llm_call", "daily", opened, 5).await;
+    write(&db.pool, &alice, RateLimitResourceType::LlmCall, 1).await;
+    write(&db.pool, &alice, RateLimitResourceType::LlmCall, 1).await;
+
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let items = user_rate_limit_usage(&repo, &alice)
+        .await
+        .expect("read the usage");
+    let daily = item_json(&items, "llm_call", "daily");
+    assert_eq!(
+        daily["current_count"], 7,
+        "the open window counts its 5 and the 2 charges after it"
+    );
+    let reset = resets_at(&daily).expect("an open window has a reset");
+    let close = opened + chrono::Duration::days(1);
+    assert!(
+        (reset - close).num_seconds().abs() <= 1,
+        "the card's reset is the open window's close {close}, not {reset}"
+    );
+    db.remove().await;
+}
+
+#[tokio::test]
+async fn a_bucket_with_no_open_window_reads_zero_and_no_reset() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let alice = consumer("fixed-alice");
+    // A daily window that opened 25 hours ago closed an hour ago.
+    counter_row(
+        &db.pool,
+        &alice,
+        "llm_call",
+        "daily",
+        chrono::Utc::now() - chrono::Duration::hours(25),
+        9,
+    )
+    .await;
+
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let items = user_rate_limit_usage(&repo, &alice)
+        .await
+        .expect("read the usage");
+    let daily = item_json(&items, "llm_call", "daily");
+    assert_eq!(daily["current_count"], 0, "a closed window counts nothing");
+    assert_eq!(
+        daily["resets_at"],
+        serde_json::Value::Null,
+        "a bucket with no open window shows no reset"
+    );
+    let never = item_json(&items, "agent_execution", "weekly");
+    assert_eq!(
+        never["resets_at"],
+        serde_json::Value::Null,
+        "a bucket never charged shows no reset"
+    );
+    db.remove().await;
+}
+
+#[tokio::test]
+async fn a_row_of_the_sliding_form_reads_on_the_card_as_a_closed_window() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let alice = consumer("fixed-alice");
+    // The sliding enforcer stored a charge made an hour ago at its time less
+    // the window: as a window it closed at the charge.
+    let charged = chrono::Utc::now() - chrono::Duration::hours(1);
+    counter_row(
+        &db.pool,
+        &alice,
+        "llm_token",
+        "daily",
+        charged - chrono::Duration::days(1),
+        2_900_000,
+    )
+    .await;
+
+    let repo = RateLimitOverrideRepository::new(db.pool.clone());
+    let items = user_rate_limit_usage(&repo, &alice)
+        .await
+        .expect("read the usage");
+    let daily = item_json(&items, "llm_token", "daily");
+    assert_eq!(daily["current_count"], 0, "the old row's window has closed");
+    assert_eq!(daily["resets_at"], serde_json::Value::Null);
     db.remove().await;
 }

@@ -19,6 +19,13 @@ use crate::domain::tenant::TenantId;
 // ---------------------------------------------------------------------------
 
 /// Time-window buckets for rate limiting.
+///
+/// Each bucket is a fixed window of [`RateLimitBucket::window_seconds`]: it
+/// opens at the first charge after the previous window's close and closes
+/// one window length later. Every charge inside it counts against the limit;
+/// at the close the count is zero, and the next charge opens the next
+/// window. The reset a person is shown is the window's close, fixed from the
+/// moment the window opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RateLimitBucket {
     PerMinute,
@@ -88,6 +95,7 @@ pub struct RateLimitDecision {
     pub resource_type: RateLimitResourceType,
     pub scope: RateLimitScope,
     pub exhausted_bucket: Option<RateLimitBucket>,
+    /// On a refusal, the seconds until the exhausted bucket's window closes.
     pub retry_after_seconds: Option<u64>,
     pub remaining: HashMap<RateLimitBucket, u64>,
 }
