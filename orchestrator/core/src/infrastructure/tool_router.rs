@@ -151,6 +151,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("mail.reply", "Replies in a thread of a connected mailbox: sends a plain-text message to the addresses in to and cc, threaded to the thread's newest message, with up to 10 of the person's own files attached (20 MiB together), then saves a copy in its Sent folder. Waits for the person's approval, which shows each attached file's name and size, before anything is sent; a file changed after the approval is not sent.").requires_approval(),
     BuiltinToolDefinition::new("mail.list", "Lists threads in one folder of a connected mailbox that match a query, newest first: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers each thread's id, subject, participants, latest date, message count, unread count, flag and labels, and the folder read. Marks nothing as read.").skip_judge(),
     BuiltinToolDefinition::new("mail.read", "Reads one thread in one folder of a connected mailbox: the inbox by default, or by folder its Sent, Drafts, Trash, Archive or all its mail. Answers every message of the thread in that folder, oldest first, with its uid, headers, flags, labels, plain-text body and attachments (each by name, type, size and part number, which mail.attachment saves), and the folder read; a thread's id is the same in every folder. Marks nothing as read.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.image.generate", "Generates images from a text prompt with one of the node's image generation models and saves each as a PNG file: inside a run in its workspace under /workspace/generated/, recorded as a file the run produced; from a conversation in your attachments under generated/. Answers each file's volume, path, type and size."),
     BuiltinToolDefinition::new("mail.attachment", "Saves one attachment of a message in a connected mailbox to your files: the message by its uid in one folder (the inbox by default) and the attachment by its part number, both as mail.read answered them. Answers the saved file's volume, path, name, type, size and SHA-256, and the text of a short text attachment. Marks nothing as read and changes nothing in the mailbox.").skip_judge(),
     BuiltinToolDefinition::new("mail.label", "Adds or removes labels on every message of a thread in a connected mailbox's inbox, flags or unflags it, and marks it read or unread."),
     BuiltinToolDefinition::new("mail.delete", "Moves every message of a thread in a connected mailbox's inbox to its Trash folder; deletes nothing permanently. Waits for the person's approval before anything is moved.").requires_approval(),
@@ -378,6 +379,7 @@ impl ToolRouter {
             "mail.delete" => Self::schema_mail_delete(),
             "mail.archive" => Self::schema_mail_archive(),
             "mail.attachment" => Self::schema_mail_attachment(),
+            "aegis.image.generate" => Self::schema_aegis_image_generate(),
             "mail.forward" => Self::schema_mail_forward(),
             "calendar.calendars" => Self::schema_calendar(CalendarShape::Calendars),
             "calendar.list" => Self::schema_calendar(CalendarShape::List),
@@ -1135,6 +1137,36 @@ impl ToolRouter {
                 }
             },
             "required": ["mailbox", "thread_id"]
+        })
+    }
+
+    /// JSON schema for the `aegis.image.generate` builtin tool (AEGIS ADR-143
+    /// I2): the prompt, and optionally the image generation alias, the size
+    /// and how many images, 1 to 4.
+    fn schema_aegis_image_generate() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "What the image shows."
+                },
+                "alias": {
+                    "type": "string",
+                    "description": "Optional: which of the node's image generation models; the node's first by default."
+                },
+                "size": {
+                    "type": "string",
+                    "description": "Optional: the image's size as the model takes it, such as 1024x1024; the model's default otherwise."
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4,
+                    "description": "Optional: how many images, 1 to 4; one by default."
+                }
+            },
+            "required": ["prompt"]
         })
     }
 

@@ -935,22 +935,38 @@ impl Execution {
         }
     }
 
-    /// Record the declared outputs an iteration left in the volume (O3).
+    /// Record the declared outputs an iteration left in the volume (O3),
+    /// merged by path into what the iteration already records: a file a tool
+    /// recorded during the iteration (an image `aegis.image.generate` wrote,
+    /// AEGIS ADR-143 I2) stays, and a path recorded again takes the later
+    /// record.
     pub fn store_produced_files(
         &mut self,
         iteration_number: u8,
         produced_files: Vec<ProducedFile>,
     ) -> Result<(), ExecutionError> {
-        if let Some(iter) = self
-            .iterations
+        let iter = self.iteration_mut(iteration_number)?;
+        iter.produced_files
+            .retain(|kept| !produced_files.iter().any(|new| new.path == kept.path));
+        iter.produced_files.extend(produced_files);
+        Ok(())
+    }
+
+    /// Record one file an iteration produced, merged by path as
+    /// [`Self::store_produced_files`] merges.
+    pub fn add_produced_file(
+        &mut self,
+        iteration_number: u8,
+        file: ProducedFile,
+    ) -> Result<(), ExecutionError> {
+        self.store_produced_files(iteration_number, vec![file])
+    }
+
+    fn iteration_mut(&mut self, iteration_number: u8) -> Result<&mut Iteration, ExecutionError> {
+        self.iterations
             .iter_mut()
             .find(|i| i.number == iteration_number)
-        {
-            iter.produced_files = produced_files;
-            Ok(())
-        } else {
-            Err(ExecutionError::IterationNotFound(iteration_number))
-        }
+            .ok_or(ExecutionError::IterationNotFound(iteration_number))
     }
 
     /// The files this execution produced: its last iteration's declared
@@ -1637,6 +1653,70 @@ mod tests {
     }
 
     // ── Produced files (AEGIS ADR-005, Update of 2026-10-06, O3) ──────────────
+
+    /// A file a tool recorded during an iteration (an image
+    /// `aegis.image.generate` wrote) stays when the iteration's declared
+    /// outputs are stored at its end: the two lists merge by path, the later
+    /// record of one path replacing the earlier. Every clause is reported.
+    #[test]
+    fn a_tool_recorded_file_survives_the_iterations_declared_outputs() {
+        let file = |path: &str, size_bytes: u64| ProducedFile {
+            path: path.to_string(),
+            size_bytes,
+            content_type: "image/png".to_string(),
+            volume_id: None,
+            path_in_volume: None,
+            declared: true,
+        };
+        let mut complaints: Vec<String> = Vec::new();
+        let mut exec = Execution::new(
+            AgentId::new(),
+            make_input("draw a cat"),
+            3,
+            "ctx".to_string(),
+        );
+        exec.start();
+        exec.start_iteration("act".to_string()).unwrap();
+        if let Err(e) = exec.add_produced_file(1, file("/workspace/generated/1.png", 10)) {
+            complaints.push(format!("add_produced_file refused iteration 1: {e}"));
+        }
+        if let Err(e) = exec.add_produced_file(1, file("/workspace/generated/2.png", 20)) {
+            complaints.push(format!("add_produced_file refused iteration 1: {e}"));
+        }
+        exec.complete_iteration("done".to_string());
+        exec.store_produced_files(
+            1,
+            vec![
+                file("/workspace/report.md", 30),
+                file("/workspace/generated/2.png", 21),
+            ],
+        )
+        .unwrap();
+        exec.complete();
+        let paths: Vec<(String, u64)> = exec
+            .produced_files()
+            .iter()
+            .map(|f| (f.path.clone(), f.size_bytes))
+            .collect();
+        let expected = vec![
+            ("/workspace/generated/1.png".to_string(), 10),
+            ("/workspace/report.md".to_string(), 30),
+            ("/workspace/generated/2.png".to_string(), 21),
+        ];
+        if paths != expected {
+            complaints.push(format!(
+                "the iteration's produced files are {paths:?}, not {expected:?}"
+            ));
+        }
+        if exec
+            .add_produced_file(9, file("/workspace/x.png", 1))
+            .is_ok()
+        {
+            complaints
+                .push("add_produced_file accepted an iteration that does not exist".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 
     /// An iteration stored before `produced_files` existed reads with none,
     /// and an execution answers its last iteration's produced files once it

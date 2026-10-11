@@ -13,6 +13,7 @@
 //! the provider registry is built, and to no `LLMProvider`.
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// The value of `ModelConfig.capabilities` that makes an alias an image
@@ -23,6 +24,25 @@ pub const IMAGE_GENERATION_CAPABILITY: &str = "image_generation";
 /// that generates images.
 pub fn agent_model_generates_images(alias: &str) -> String {
     format!("'{alias}' generates images; an agent's model must be a language model")
+}
+
+/// The refusal of an image generation call on a node with no image
+/// generation alias.
+pub const NO_IMAGE_GENERATION_MODEL: &str = "this node has no image generation model";
+
+/// The most images one image generation call asks for.
+pub const IMAGE_COUNT_MAX: u8 = 4;
+
+/// The node's image generation models: its aliases with the capability
+/// [`IMAGE_GENERATION_CAPABILITY`], each bound to a [`VisionProvider`].
+pub trait ImageGenerationModels: Send + Sync {
+    /// The aliases, in the order the node's configuration lists them; the
+    /// first is the default of a call that names none.
+    fn image_generation_aliases(&self) -> Vec<String>;
+
+    /// The provider an alias is bound to; `None` for an alias that is not an
+    /// image generation model.
+    fn image_provider(&self, alias: &str) -> Option<Arc<dyn VisionProvider>>;
 }
 
 /// What an image generation request asks for beside its prompt.

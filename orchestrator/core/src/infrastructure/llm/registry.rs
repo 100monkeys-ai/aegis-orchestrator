@@ -16,7 +16,7 @@ use crate::domain::node_config::{
     resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, NodeConfigManifest,
 };
 use crate::domain::secrets::SensitiveString;
-use crate::domain::vision::VisionProvider;
+use crate::domain::vision::{ImageGenerationModels, VisionProvider};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
@@ -1491,6 +1491,16 @@ impl ProviderRegistry {
 
 // Implement domain LLMProvider trait for infrastructure ProviderRegistry
 // This allows the infrastructure to be used through domain interfaces
+impl ImageGenerationModels for ProviderRegistry {
+    fn image_generation_aliases(&self) -> Vec<String> {
+        ProviderRegistry::image_generation_aliases(self)
+    }
+
+    fn image_provider(&self, alias: &str) -> Option<Arc<dyn VisionProvider>> {
+        ProviderRegistry::image_provider(self, alias)
+    }
+}
+
 #[async_trait]
 impl LLMProvider for ProviderRegistry {
     async fn generate(

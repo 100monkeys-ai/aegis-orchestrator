@@ -140,7 +140,18 @@ impl ToolInvocationService {
             execution_repository: None,
             goal_service: None,
             schedule_service: None,
+            image_generation: None,
         }
+    }
+
+    /// AEGIS ADR-143 I2: the node's image generation models, which
+    /// `aegis.image.generate` calls.
+    pub fn with_image_generation(
+        mut self,
+        models: Arc<dyn crate::domain::vision::ImageGenerationModels>,
+    ) -> Self {
+        self.image_generation = Some(models);
+        self
     }
 
     /// AEGIS ADR-129: re-check and audit the operator escalation of every
@@ -1984,6 +1995,329 @@ impl ToolInvocationService {
     /// the tool name matched an aegis.* handler, `None` if it should fall through
     /// to the builtin / gateway chain.
     #[allow(clippy::too_many_arguments)]
+    /// `aegis.image.generate` (AEGIS ADR-143 I2): generate `count` images
+    /// from `prompt` with the alias named, or the node's first image
+    /// generation alias, and write each as a file. Inside an execution, to
+    /// the execution's workspace volume at `/workspace/generated/<n>.png`,
+    /// each recorded as a produced file of the call's iteration; called out
+    /// of band (a session whose execution has no record: a person's
+    /// conversation), to the person's `chat-attachments` volume under
+    /// `generated/`. The answer is `{files: [{volume_id, path, content_type,
+    /// size_bytes}]}` and names no URL. Every refusal is answered before the
+    /// provider is called.
+    async fn invoke_aegis_image_generate_tool(
+        &self,
+        args: &Value,
+        execution_id: crate::domain::execution::ExecutionId,
+        iteration_number: u8,
+        tenant_id: &TenantId,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ToolInvocationResult, SealSessionError> {
+        use crate::domain::vision::{ImageOptions, VisionError, IMAGE_COUNT_MAX};
+
+        let prompt = args
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                SealSessionError::InvalidArguments(
+                    "'prompt' is required: what the image shows".to_string(),
+                )
+            })?;
+        let count = match args.get("count") {
+            None | Some(Value::Null) => 1,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (1..=u64::from(IMAGE_COUNT_MAX)).contains(n))
+                .map(|n| n as u8)
+                .ok_or_else(|| {
+                    SealSessionError::InvalidArguments(format!("'count' is 1 to {IMAGE_COUNT_MAX}"))
+                })?,
+        };
+        let size = args.get("size").and_then(Value::as_str).map(str::to_string);
+        let aliases = self
+            .image_generation
+            .as_ref()
+            .map(|models| models.image_generation_aliases())
+            .unwrap_or_default();
+        let Some(models) = self
+            .image_generation
+            .as_ref()
+            .filter(|_| !aliases.is_empty())
+        else {
+            return Err(SealSessionError::InvalidArguments(
+                crate::domain::vision::NO_IMAGE_GENERATION_MODEL.to_string(),
+            ));
+        };
+        let alias = match args.get("alias").and_then(Value::as_str) {
+            Some(alias) => alias.to_string(),
+            None => aliases[0].clone(),
+        };
+        let provider = models.image_provider(&alias).ok_or_else(|| {
+            SealSessionError::InvalidArguments(format!(
+                "'{alias}' is not an image generation model; the image generation models are {}",
+                aliases.join(", ")
+            ))
+        })?;
+
+        // Where the files go is settled before the provider is called.
+        let in_run = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .is_ok();
+        let target = if in_run {
+            let Some(executions) = self.execution_repository.as_ref() else {
+                return Err(SealSessionError::InternalError(
+                    "image generation in a run is not configured on this node".to_string(),
+                )
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Server,
+                )));
+            };
+            let volume = self
+                .volume_registry
+                .find_by_execution_and_path(execution_id, "/workspace/generated")
+                .or_else(|| {
+                    self.volume_registry
+                        .find_primary_workspace_by_execution(execution_id)
+                })
+                .ok_or_else(|| {
+                    SealSessionError::NotFound(format!(
+                        "No volume registered for execution {execution_id}"
+                    ))
+                    .answered(
+                        crate::domain::seal_session::CallerAnswer::Internal(
+                            crate::domain::seal_session::InternalFailure::Server,
+                        ),
+                    )
+                })?;
+            GeneratedTarget::Run {
+                executions: executions.clone(),
+                volume,
+            }
+        } else {
+            let user_id =
+                crate::application::execution::person_sub(caller_identity).ok_or_else(|| {
+                    SealSessionError::InvalidArguments(
+                        "image generation out of a run is for a person's conversation, and this call has no person".to_string(),
+                    )
+                })?;
+            let (Some(files), Some(volumes)) = (
+                self.file_operations_service.as_ref(),
+                self.user_volume_service.as_ref(),
+            ) else {
+                return Err(SealSessionError::InternalError(
+                    "image generation in a conversation is not configured on this node".to_string(),
+                )
+                .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Server,
+                )));
+            };
+            let tier = caller_identity
+                .and_then(|identity| match &identity.identity_kind {
+                    crate::domain::iam::IdentityKind::ConsumerUser { zaru_tier, .. } => {
+                        Some(zaru_tier.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(crate::domain::iam::ZaruTier::Free);
+            GeneratedTarget::Person {
+                files: files.clone(),
+                volumes: volumes.clone(),
+                user_id,
+                tier,
+            }
+        };
+
+        let generated = provider
+            .generate_image(prompt, &ImageOptions { size, count })
+            .await
+            .map_err(|e| match e {
+                VisionError::InvalidInput(message) => SealSessionError::InvalidArguments(format!(
+                    "the image generation model refused the request: {message}"
+                )),
+                other => SealSessionError::UpstreamUnavailable(format!(
+                    "the image generation model '{alias}' failed: {other}"
+                )),
+            })?;
+
+        let mut answered = Vec::with_capacity(generated.images.len());
+        match target {
+            GeneratedTarget::Run { executions, volume } => {
+                let policy = &volume.policy;
+                let first = self
+                    .fsal
+                    .readdir(
+                        volume.execution_id,
+                        volume.volume_id,
+                        "/generated",
+                        policy,
+                        None,
+                        None,
+                        volume.workflow_execution_id,
+                    )
+                    .await
+                    .map(|entries| entries.len())
+                    .unwrap_or(0)
+                    + 1;
+                let handle = crate::domain::fsal::AegisFileHandle::new(
+                    volume.execution_id,
+                    volume.volume_id,
+                    "/",
+                );
+                let mut produced = Vec::with_capacity(generated.images.len());
+                for (i, image) in generated.images.iter().enumerate() {
+                    let in_volume = format!("/generated/{}.png", first + i);
+                    let write_failed = |e: crate::domain::fsal::FsalError| {
+                        SealSessionError::InternalError(format!(
+                            "saving a generated image failed: {e}"
+                        ))
+                        .answered(
+                            crate::domain::seal_session::CallerAnswer::Internal(
+                                crate::domain::seal_session::InternalFailure::Server,
+                            ),
+                        )
+                    };
+                    self.fsal
+                        .create_file(crate::domain::fsal::CreateFsalFileRequest {
+                            execution_id: volume.execution_id,
+                            volume_id: volume.volume_id,
+                            path: &in_volume,
+                            policy,
+                            emit_event: false,
+                            caller_node_id: None,
+                            host_node_id: None,
+                            workflow_execution_id: volume.workflow_execution_id,
+                        })
+                        .await
+                        .map_err(write_failed)?;
+                    self.fsal
+                        .write(&handle, &in_volume, policy, 0, &image.bytes)
+                        .await
+                        .map_err(write_failed)?;
+                    let path = format!("/workspace{in_volume}");
+                    produced.push(crate::domain::execution::ProducedFile {
+                        path: path.clone(),
+                        size_bytes: image.bytes.len() as u64,
+                        content_type: image.content_type.clone(),
+                        volume_id: Some(volume.volume_id),
+                        path_in_volume: Some(in_volume),
+                        declared: true,
+                    });
+                    answered.push(serde_json::json!({
+                        "volume_id": volume.volume_id.to_string(),
+                        "path": path,
+                        "content_type": image.content_type,
+                        "size_bytes": image.bytes.len(),
+                    }));
+                }
+                self.record_generated_files(&executions, execution_id, iteration_number, produced)
+                    .await?;
+            }
+            GeneratedTarget::Person {
+                files,
+                volumes,
+                user_id,
+                tier,
+            } => {
+                let volume_id = volumes
+                    .find_or_provision_chat_attachments(tenant_id, &user_id, &tier)
+                    .await
+                    .map_err(|e| {
+                        SealSessionError::InternalError(format!(
+                            "the attachments volume failed: {e}"
+                        ))
+                        .answered(
+                            crate::domain::seal_session::CallerAnswer::Internal(
+                                crate::domain::seal_session::InternalFailure::Server,
+                            ),
+                        )
+                    })?;
+                let batch = uuid::Uuid::new_v4();
+                for (i, image) in generated.images.iter().enumerate() {
+                    let path = format!("generated/{batch}/{}.png", i + 1);
+                    files
+                        .write_file_for_tier(
+                            &volume_id,
+                            tenant_id,
+                            &user_id,
+                            &path,
+                            &image.bytes,
+                            &tier,
+                        )
+                        .await
+                        .map_err(|e| match e {
+                            crate::application::file_operations_service::FileOperationsError::FileTooLarge => {
+                                SealSessionError::InvalidArguments(
+                                    "a generated image is larger than your plan's file limit"
+                                        .to_string(),
+                                )
+                            }
+                            other => SealSessionError::InternalError(format!(
+                                "saving a generated image failed: {other}"
+                            ))
+                            .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                    crate::domain::seal_session::InternalFailure::Server,
+                )),
+                        })?;
+                    answered.push(serde_json::json!({
+                        "volume_id": volume_id.to_string(),
+                        "path": path,
+                        "content_type": image.content_type,
+                        "size_bytes": image.bytes.len(),
+                    }));
+                }
+            }
+        }
+        Ok(ToolInvocationResult::Direct(
+            serde_json::json!({ "files": answered }),
+        ))
+    }
+
+    /// Record `produced` on the call's iteration of the execution, or on its
+    /// current iteration where the call names none (a call over SEAL carries
+    /// iteration 0).
+    async fn record_generated_files(
+        &self,
+        executions: &Arc<dyn crate::domain::repository::ExecutionRepository>,
+        execution_id: crate::domain::execution::ExecutionId,
+        iteration_number: u8,
+        produced: Vec<crate::domain::execution::ProducedFile>,
+    ) -> Result<(), SealSessionError> {
+        let record_failed = |e: String| {
+            SealSessionError::InternalError(format!(
+                "recording a generated image as a produced file failed: {e}"
+            ))
+            .answered(crate::domain::seal_session::CallerAnswer::Internal(
+                crate::domain::seal_session::InternalFailure::Server,
+            ))
+        };
+        let mut execution = executions
+            .find_by_id_unscoped(execution_id)
+            .await
+            .map_err(|e| record_failed(e.to_string()))?
+            .ok_or_else(|| record_failed(format!("no execution {execution_id}")))?;
+        let iteration = if iteration_number == 0 {
+            execution
+                .iterations()
+                .last()
+                .map(|i| i.number)
+                .ok_or_else(|| record_failed("the execution has no iteration".to_string()))?
+        } else {
+            iteration_number
+        };
+        execution
+            .store_produced_files(iteration, produced)
+            .map_err(|e| record_failed(e.to_string()))?;
+        let tenant_id = execution.tenant_id.clone();
+        executions
+            .save_for_tenant(&tenant_id, &execution)
+            .await
+            .map_err(|e| record_failed(e.to_string()))
+    }
+
     async fn try_dispatch_aegis_tool(
         &self,
         tool_name: &str,
@@ -2027,6 +2361,16 @@ impl ToolInvocationService {
             );
         }
         match tool_name {
+            "aegis.image.generate" => Some(
+                self.invoke_aegis_image_generate_tool(
+                    args,
+                    execution_id,
+                    iteration_number,
+                    &tenant_scope.authenticated_tenant,
+                    caller_identity,
+                )
+                .await,
+            ),
             "aegis.agent.create" => {
                 // The calling agent's name reaches the generator's floor
                 // (AEGIS ADR-005 O7d).
@@ -2723,4 +3067,21 @@ fn edge_refusal(context: &str, e: crate::domain::edge::EdgeRouterError) -> SealS
         }
     };
     SealSessionError::InternalError(format!("{context}: {e}")).answered(answer)
+}
+
+/// Where `aegis.image.generate` writes its files.
+enum GeneratedTarget {
+    /// Inside an execution: its workspace volume, and the store its produced
+    /// files are recorded in.
+    Run {
+        executions: Arc<dyn crate::domain::repository::ExecutionRepository>,
+        volume: crate::infrastructure::nfs::server::NfsVolumeContext,
+    },
+    /// Out of band: the person's `chat-attachments` volume.
+    Person {
+        files: Arc<crate::application::file_operations_service::FileOperationsService>,
+        volumes: Arc<crate::application::user_volume_service::UserVolumeService>,
+        user_id: String,
+        tier: crate::domain::iam::ZaruTier,
+    },
 }

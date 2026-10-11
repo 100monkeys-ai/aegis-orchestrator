@@ -2135,7 +2135,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_tool_catalog(tool_catalog.clone())
         .with_runtime_registry(runtime_registry.clone())
         .with_program_runner(container_step_runner.clone())
-        .with_file_operations_service(file_operations_service.clone());
+        .with_file_operations_service(file_operations_service.clone())
+        .with_user_volume_service(user_volume_service.clone())
+        .with_image_generation(llm_registry.clone());
     if let Some(source) = &seal_gateway_operator_token {
         tool_invocation_service_builder =
             tool_invocation_service_builder.with_seal_gateway_operator_token(source.clone());

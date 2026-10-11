@@ -438,6 +438,7 @@ impl ToolInputContract {
             "mail.send" => &["mailbox", "to", "subject", "body"],
             "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],
             "mail.attachment" => &["mailbox", "uid", "part"],
+            "aegis.image.generate" => &["prompt"],
             "mail.forward" => &["mailbox", "thread_id", "to"],
             "calendar.calendars" => &["account"],
             "calendar.list" => &["account", "calendar_id"],

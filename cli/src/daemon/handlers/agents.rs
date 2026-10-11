@@ -142,6 +142,18 @@ pub(crate) async fn deploy_agent_handler(
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("agent:deploy")?;
     let manifest = manifest_refusing_spec_schedule(raw)?;
+    // An agent's model is a language model, never an image generation alias
+    // of the node (AEGIS ADR-143 I1).
+    aegis_orchestrator_core::infrastructure::agent_manifest_parser::AgentManifestParser::refuse_image_model(
+        &manifest,
+        &state.llm_registry.image_generation_aliases(),
+    )
+    .map_err(|refusal| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": refusal.to_string()})),
+        )
+    })?;
     let delegation = headers
         .get(TENANT_DELEGATION_HEADER)
         .and_then(|v| v.to_str().ok());

@@ -1052,3 +1052,158 @@ async fn the_daemons_tool_service_holds_the_git_repository_service_when_one_is_c
     let response = invoke_refusal_response(&error, &payload);
     assert_eq!(response.status().as_u16(), 503);
 }
+
+// ---------------------------------------------------------------------------
+// aegis.image.generate: the daemon's LLM registry and the person's volumes
+// ---------------------------------------------------------------------------
+
+/// A call of `aegis.image.generate` from a conversation.
+struct ImageEnvelope {
+    token: SensitiveString,
+}
+
+impl EnvelopeVerifier for ImageEnvelope {
+    fn security_token(&self) -> &SensitiveString {
+        &self.token
+    }
+    fn verify_signature(&self, _: &[u8]) -> Result<(), SealSessionError> {
+        Ok(())
+    }
+    fn extract_tool_name(&self) -> Option<String> {
+        Some("aegis.image.generate".to_string())
+    }
+    fn extract_arguments(&self) -> Option<Value> {
+        Some(json!({"prompt": "a lighthouse"}))
+    }
+    fn replay_nonce(&self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
+/// The daemon's tool service holds its LLM registry as the image generation
+/// models and the person's volume service, as `start_daemon` wires them
+/// (`.with_user_volume_service(user_volume_service.clone())
+/// .with_image_generation(llm_registry.clone())`): a conversation's call
+/// reaches the registry's image alias (one request at the loopback stand-in's
+/// `/images/generations`) and then the person's volumes (here a volume
+/// service that creates none). Without them the call answers that the node
+/// has no image generation model, and nothing is requested.
+#[tokio::test]
+async fn the_daemons_registry_and_volume_service_reach_aegis_image_generate() {
+    use aegis_orchestrator_core::domain::repository::VolumeRepository;
+    use aegis_orchestrator_core::infrastructure::llm::ProviderRegistry;
+    use base64::Engine;
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let app = axum::Router::new().route(
+        "/v1/images/generations",
+        axum::routing::post(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"data": [{
+                    "b64_json": base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nimage")
+                }]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut config = aegis_orchestrator_core::domain::node_config::NodeConfigManifest::default();
+    config.spec.llm_providers = serde_yaml::from_str(&format!(
+        r#"- name: images
+  type: openai-compatible
+  endpoint: "http://{addr}/v1"
+  api_key: "test-key"
+  models:
+    - alias: "image"
+      model: "m-image"
+      capabilities: ["image_generation"]
+      context_window: 0
+"#
+    ))
+    .unwrap();
+    let llm_registry = Arc::new(ProviderRegistry::from_config(&config).unwrap());
+    let user_volume_service = Arc::new(
+        aegis_orchestrator_core::application::user_volume_service::UserVolumeService::new(
+            Arc::new(InMemoryVolumeRepository::new()) as Arc<dyn VolumeRepository>,
+            Arc::new(NoVolumeService),
+            Arc::new(EventBus::new(16)),
+            aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
+        ),
+    );
+    let storage_root = std::env::temp_dir().join(format!(
+        "aegis-daemon-image-wiring-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let file_operations_service = Arc::new(
+        aegis_orchestrator_core::application::file_operations_service::FileOperationsService::new(
+            Arc::new(AegisFSAL::new(
+                Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+                Arc::new(InMemoryVolumeRepository::new()),
+                Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                Arc::new(NoOpPublisher),
+            )),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository::new()),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::InMemoryAgentRepository::new()),
+        ),
+    );
+    let token = format!("token-{}", uuid::Uuid::new_v4());
+    let session = || {
+        SealSession::new(
+            AgentId::new(),
+            ExecutionId::new(),
+            vec![],
+            token.clone(),
+            context(),
+            TenantId::for_consumer_user(USER).unwrap(),
+        )
+        .with_principal_metadata(
+            Some(USER.to_string()),
+            Some(USER.to_string()),
+            None,
+            None,
+        )
+    };
+
+    let (service, sessions) = unwired(None).await;
+    sessions.save(session()).await.unwrap();
+    let service = service
+        .with_file_operations_service(file_operations_service.clone())
+        .with_user_volume_service(user_volume_service.clone())
+        .with_image_generation(llm_registry.clone());
+    let error = service
+        .invoke_tool(&ImageEnvelope {
+            token: token.clone().into(),
+        })
+        .await
+        .expect_err("the volume service here creates no volume");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the registry's image alias was not called"
+    );
+    assert!(
+        error.to_string().contains("the attachments volume failed"),
+        "the person's volumes were not reached: {error}"
+    );
+
+    let (service, sessions) = unwired(None).await;
+    sessions.save(session()).await.unwrap();
+    let error = service
+        .with_file_operations_service(file_operations_service)
+        .invoke_tool(&ImageEnvelope {
+            token: token.clone().into(),
+        })
+        .await
+        .expect_err("refused with no image generation models");
+    assert!(
+        error
+            .to_string()
+            .contains("this node has no image generation model"),
+        "{error}"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "a request was sent");
+}
