@@ -104,6 +104,40 @@ impl SeaweedFSAdapter {
     fn build_url(&self, path: &str) -> String {
         format!("{}{}", self.filer_url, path)
     }
+
+    /// The filer's own entry for `path`: `GET <path>?metadata=true`, which
+    /// SeaweedFS answers with the entry as JSON for a file and a directory
+    /// alike (`weed/server/filer_server_handlers_read.go`,
+    /// `GetOrHeadHandler`). The filer's root has no entry of its own and is
+    /// a directory.
+    async fn entry_metadata(&self, path: &str) -> Result<FilerEntryMetadata, StorageError> {
+        if path.trim_matches('/').is_empty() {
+            return Ok(FilerEntryMetadata {
+                mode: GO_MODE_DIR,
+                mtime: None,
+            });
+        }
+
+        let response = self
+            .client
+            .get(self.build_url(path))
+            .header("Accept", "application/json")
+            .query(&[("metadata", "true")])
+            .send()
+            .await?;
+
+        match response.status() {
+            StatusCode::OK => {
+                let body = read_capped_body(response, SEAWEEDFS_MAX_RESPONSE_BYTES).await?;
+                serde_json::from_slice(&body)
+                    .map_err(|e| StorageError::Serialization(format!("metadata of {path}: {e}")))
+            }
+            StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path.to_string())),
+            status => Err(StorageError::Unknown(format!(
+                "Failed to stat {path}: HTTP {status}"
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -473,6 +507,27 @@ impl StorageProvider for SeaweedFSAdapter {
     }
 
     async fn stat(&self, path: &str) -> Result<FileAttributes, StorageError> {
+        // A HEAD cannot tell a directory from a file: the filer answers a
+        // HEAD of an existing directory with 200, as it does a file's,
+        // because it serves the directory's listing there. The kind is read
+        // from the filer's own entry metadata instead.
+        let entry = self.entry_metadata(path).await?;
+
+        if entry.is_directory() {
+            let mtime = entry.mtime_timestamp();
+            return Ok(FileAttributes {
+                file_type: FileType::Directory,
+                size: 4096,
+                mtime,
+                atime: mtime,
+                ctime: mtime,
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                nlink: 2,
+            });
+        }
+
         let url = self.build_url(path);
 
         let response = self.client.head(&url).send().await?;
@@ -673,6 +728,35 @@ struct DirectoryEntry {
     is_directory: bool,
 }
 
+/// Go's `os.ModeDir`, the bit the filer's `Mode` carries for a directory
+/// (`weed/filer/entry.go`, `Attr.IsDirectory`).
+const GO_MODE_DIR: u32 = 1 << 31;
+
+/// The fields `stat` reads from the filer's entry metadata: `Mode` is a Go
+/// `os.FileMode`, `Mtime` an RFC 3339 time.
+#[derive(Debug, Deserialize)]
+struct FilerEntryMetadata {
+    #[serde(rename = "Mode", default)]
+    mode: u32,
+
+    #[serde(rename = "Mtime", default)]
+    mtime: Option<String>,
+}
+
+impl FilerEntryMetadata {
+    fn is_directory(&self) -> bool {
+        self.mode & GO_MODE_DIR != 0
+    }
+
+    fn mtime_timestamp(&self) -> i64 {
+        self.mtime
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +898,122 @@ mod tests {
             result,
             Ok(4096),
             "get_usage must parse JSON when Accept header is present"
+        );
+    }
+
+    /// The filer's own answer for a directory: `GET <path>?metadata=true`
+    /// returns the entry as JSON, its `Mode` a Go `os.FileMode` carrying
+    /// `os.ModeDir` (`1 << 31`); here `ModeDir | 0o755`. A HEAD of the same
+    /// path answers 200 with no sign of the kind, as the filer does for a
+    /// directory (it serves the directory's listing).
+    const DIRECTORY_METADATA: &str = r#"{"FullPath":"/tenant/vol/repo/.git","Mtime":"2026-10-11T14:27:33.5Z","Crtime":"2026-10-11T14:27:33.5Z","Mode":2147484141,"Uid":0,"Gid":0,"Mime":"","FileSize":0,"Extended":null}"#;
+
+    async fn filer_answering(
+        path: &str,
+        metadata: &str,
+        head_length: usize,
+    ) -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", path)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "metadata".into(),
+                "true".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(metadata)
+            .create_async()
+            .await;
+        server
+            .mock("HEAD", path)
+            .with_status(200)
+            .with_header("last-modified", "Sun, 11 Oct 2026 14:27:33 GMT")
+            .with_header("content-length", &head_length.to_string())
+            .create_async()
+            .await;
+        server
+    }
+
+    /// Regression (clone-work-tree-io-error): `stat` answered every existing
+    /// path as a regular file, so the FUSE LOOKUP of a clone's `.git`
+    /// directory told the kernel it was a file and git's next `mkdir` under
+    /// it failed with EIO.
+    #[tokio::test]
+    async fn stat_reports_a_directory_the_filer_marks_as_one() {
+        let server = filer_answering("/tenant/vol/repo/.git", DIRECTORY_METADATA, 0).await;
+
+        let attrs = SeaweedFSAdapter::new(server.url())
+            .stat("/tenant/vol/repo/.git")
+            .await
+            .expect("stat of an existing directory");
+
+        assert_eq!(
+            (attrs.file_type, attrs.mode),
+            (FileType::Directory, 0o755),
+            "a directory the filer's metadata marks with ModeDir was not reported as a directory"
+        );
+    }
+
+    /// The root of a volume, as the FSAL names it (`<remote_path>/`), is a
+    /// directory.
+    #[tokio::test]
+    async fn stat_reports_a_volumes_root_as_a_directory() {
+        let server = filer_answering("/tenant/vol/", DIRECTORY_METADATA, 0).await;
+
+        let attrs = SeaweedFSAdapter::new(server.url())
+            .stat("/tenant/vol/")
+            .await
+            .expect("stat of a volume's root");
+
+        assert_eq!(
+            (attrs.file_type, attrs.mode),
+            (FileType::Directory, 0o755),
+            "the root of a volume was not reported as a directory"
+        );
+    }
+
+    /// A file stays a regular file, mode 0644, sized by its content-length.
+    #[tokio::test]
+    async fn stat_reports_a_file_with_its_content_length() {
+        let file_metadata = r#"{"FullPath":"/tenant/vol/repo/HEAD","Mtime":"2026-10-11T14:27:33Z","Mode":420,"FileSize":23,"chunks":[]}"#;
+        let server = filer_answering("/tenant/vol/repo/HEAD", file_metadata, 23).await;
+
+        let attrs = SeaweedFSAdapter::new(server.url())
+            .stat("/tenant/vol/repo/HEAD")
+            .await
+            .expect("stat of an existing file");
+
+        assert_eq!(
+            (attrs.file_type, attrs.mode, attrs.size),
+            (FileType::File, 0o644, 23),
+            "a file was not reported as a regular file with its content-length"
+        );
+    }
+
+    /// A path the filer does not hold is not found.
+    #[tokio::test]
+    async fn stat_of_a_missing_path_is_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/tenant/vol/absent")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        server
+            .mock("HEAD", "/tenant/vol/absent")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .stat("/tenant/vol/absent")
+            .await;
+
+        assert!(
+            matches!(result, Err(StorageError::FileNotFound(_))),
+            "expected FileNotFound, got {result:?}"
         );
     }
 

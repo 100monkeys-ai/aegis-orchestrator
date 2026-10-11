@@ -1772,6 +1772,128 @@ mod tests {
         assert_eq!(registry.read().await.len(), 1);
         assert!(registry.read().await.contains_key(&key));
     }
+
+    /// Regression (clone-work-tree-io-error): on a SeaweedFS volume the
+    /// LOOKUP of a directory the shell made (`git clone` making `.git`)
+    /// answered a regular file, because the filer's `stat` reported every
+    /// path as one; the kernel then failed git's next `mkdir` under it with
+    /// EIO. The fake filer answers as SeaweedFS does: MKDIR's ancestors and
+    /// `.keep`, a HEAD of the directory with 200, and its metadata with
+    /// `os.ModeDir` in `Mode`.
+    #[test]
+    fn a_directory_made_through_the_mount_looks_up_as_a_directory_on_seaweedfs() {
+        use crate::domain::events::StorageEvent;
+        use crate::domain::fsal::EventPublisher;
+        use crate::domain::repository::VolumeRepository;
+        use crate::domain::volume::{
+            FilerEndpoint, StorageClass, TenantId, Volume, VolumeBackend, VolumeOwnership,
+            VolumeStatus,
+        };
+        use crate::infrastructure::repositories::InMemoryVolumeRepository;
+        use crate::infrastructure::storage::seaweedfs::SeaweedFSAdapter;
+
+        struct NoEvents;
+
+        #[async_trait]
+        impl EventPublisher for NoEvents {
+            async fn publish_storage_event(&self, _: StorageEvent) {}
+        }
+
+        let volume_id = VolumeId::new();
+        let remote_path = format!("/volumes/{volume_id}");
+        let git_dir = format!("{remote_path}/.git");
+
+        let mut filer = mockito::Server::new();
+        filer.mock("POST", "/dir/").with_status(201).create();
+        filer
+            .mock("PUT", format!("{git_dir}/.keep").as_str())
+            .with_status(201)
+            .create();
+        filer
+            .mock("HEAD", git_dir.as_str())
+            .with_status(200)
+            .create();
+        filer
+            .mock("GET", git_dir.as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "metadata".into(),
+                "true".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"FullPath":"{git_dir}","Mtime":"2026-10-11T14:27:33Z","Mode":2147484141,"FileSize":0}}"#
+            ))
+            .create();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let step = ExecutionId::new();
+        let volume = Volume {
+            id: volume_id,
+            name: "repo".to_string(),
+            tenant_id: TenantId::consumer(),
+            storage_class: StorageClass::persistent(),
+            backend: VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new(filer.url()).unwrap(),
+                remote_path,
+            },
+            size_limit_bytes: 1_000_000,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::execution(step),
+            created_at: chrono::Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+            host_node_id: None,
+        };
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        rt.block_on(repo.save(&volume)).expect("volume saved");
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(SeaweedFSAdapter::new(filer.url())),
+            repo as Arc<dyn VolumeRepository>,
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoEvents),
+        ));
+
+        let mount = FuseFsal {
+            backend: Arc::new(DirectFsalBackend(fsal)),
+            context: FuseVolumeContext {
+                execution_id: step,
+                volume_id,
+                workflow_execution_id: None,
+                container_uid: 0,
+                container_gid: 0,
+                policy: FsalAccessPolicy {
+                    read: vec!["/*".to_string()],
+                    write: vec!["/*".to_string()],
+                },
+            },
+            inode_table: Arc::new(InodeTable::new()),
+            runtime: rt.handle().clone(),
+            last_completed_op_at: Arc::new(AtomicU64::new(0)),
+            in_flight_ops: Arc::new(AtomicU32::new(0)),
+            degraded: Arc::new(AtomicBool::new(false)),
+        };
+
+        mount
+            .make_directory(ROOT_INODE, ".git")
+            .expect("mkdir .git");
+        let looked_up = mount
+            .lookup_entry(ROOT_INODE, ".git")
+            .map(|attr| attr.kind)
+            .map_err(|errno| format!("{errno:?}"));
+
+        assert_eq!(
+            looked_up,
+            Ok(FuseFileType::Directory),
+            "LOOKUP of the directory the shell made did not answer a directory"
+        );
+    }
 }
 
 /// Regression (`clerk-fs-write-not-visible-to-cmd-run`, the triage run's
