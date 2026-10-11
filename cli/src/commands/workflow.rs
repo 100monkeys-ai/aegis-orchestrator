@@ -455,7 +455,15 @@ struct WorkflowGenerateOutput {
     generated_agents_root: String,
 }
 
-/// Validate a workflow manifest file
+/// Validate a workflow manifest file.
+///
+/// The manifest is parsed, which checks its structure and transitions. A
+/// cycle is not refused: a workflow loops by design (a refinement re-entering
+/// its generator, a gate sent back), and the engine bounds every loop, each
+/// state by its `max_state_visits` (5 when the manifest sets none, never over
+/// 20) and each run by its `max_total_transitions` (50 by default), so every
+/// state of every loop is bounded. The CLI's deploy of the built-ins holds the
+/// same rule.
 async fn validate_workflow(file: PathBuf, output_format: OutputFormat) -> Result<()> {
     use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 
@@ -468,10 +476,6 @@ async fn validate_workflow(file: PathBuf, output_format: OutputFormat) -> Result
     // Parse manifest
     let workflow =
         WorkflowParser::parse_file(&file).context("Failed to parse workflow manifest")?;
-
-    // Validate for cycles
-    use aegis_orchestrator_core::domain::workflow::WorkflowValidator;
-    WorkflowValidator::check_for_cycles(&workflow).context("Workflow validation failed")?;
 
     let terminal_count = workflow
         .spec
