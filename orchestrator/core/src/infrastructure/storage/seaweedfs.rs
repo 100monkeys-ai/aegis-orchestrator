@@ -153,63 +153,40 @@ impl StorageProvider for SeaweedFSAdapter {
             ));
         }
 
-        // SeaweedFS does NOT auto-create ancestor directories via the /dir/ API —
-        // it only does so when files are uploaded. We must explicitly create every
-        // ancestor from root down to the leaf so that intermediate paths exist
-        // before child directories are created.
-        let parts: Vec<&str> = path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let url = self.build_url("/dir/");
-
-        for depth in 1..=parts.len() {
-            let ancestor = format!("/{}", parts[..depth].join("/"));
-
-            let form = multipart::Form::new().text("path", ancestor.clone());
-
-            let response = self.client.post(&url).multipart(form).send().await?;
-
-            match response.status() {
-                StatusCode::CREATED | StatusCode::OK => {}
-                StatusCode::CONFLICT => {
-                    // Already exists — idempotent, continue
-                    tracing::debug!("Directory {} already exists, skipping", ancestor);
-                }
-                status => {
-                    let error_msg = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| format!("HTTP {status}"));
-                    return Err(StorageError::Unknown(format!(
-                        "Failed to create directory {ancestor}: {error_msg}"
-                    )));
-                }
-            }
+        // The filer's own mkdir: `POST <path>/` with no body
+        // (`weed/server/filer_server_handlers_write.go`, `PostHandler`, a
+        // path ending in `/` with no content). It makes every missing
+        // ancestor, answers 201 for a directory it made and 409 for a path
+        // it already holds. A multipart POST to `/dir/` is an upload into the
+        // filer's own `/dir`, which makes nothing at `path`; and no file is
+        // written into the directory, which a mount would show to the agent.
+        let dir = path.trim_end_matches('/');
+        if dir.is_empty() {
+            return Ok(());
         }
 
-        // SeaweedFS metadata-only directories are not physically present in the
-        // backing store until a file exists inside them. Write a zero-byte
-        // sentinel so that subsequent PUT requests to the directory succeed
-        // instead of returning "Directory not found".
-        let keep_path = format!("{}/.keep", path.trim_end_matches('/'));
-        let keep_url = self.build_url(&keep_path);
-        let keep_response = self
+        let response = self
             .client
-            .put(&keep_url)
-            .body(Vec::<u8>::new())
+            .post(self.build_url(&format!("{dir}/")))
             .send()
             .await?;
-        if !keep_response.status().is_success() {
-            let status = keep_response.status();
-            return Err(StorageError::Unknown(format!(
-                "Failed to write .keep sentinel to {keep_path}: HTTP {status}"
-            )));
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == StatusCode::CONFLICT {
+            tracing::debug!("Directory {} already exists, skipping", dir);
+            return Ok(());
         }
 
-        Ok(())
+        let body = read_capped_body(response, SEAWEEDFS_MAX_ERROR_BODY_BYTES)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .unwrap_or_default();
+        Err(StorageError::Unknown(format!(
+            "Failed to create directory {dir}: HTTP {status}: {body}"
+        )))
     }
 
     async fn delete_directory(&self, path: &str) -> Result<(), StorageError> {
@@ -220,12 +197,22 @@ impl StorageProvider for SeaweedFSAdapter {
             ));
         }
 
-        let url = self.build_url("/dir/");
+        // The filer's own delete of a directory: `DELETE <path>/` with
+        // `recursive=true`, which removes it with everything under it
+        // (`weed/server/filer_server_handlers_write.go`, `DeleteHandler`).
+        // `DELETE /dir/?path=<path>` is a delete of the filer's own `/dir`.
+        let dir = path.trim_end_matches('/');
+        if dir.is_empty() {
+            return Err(StorageError::InvalidPath(
+                "The filer's root is not deleted".to_string(),
+            ));
+        }
+        let url = self.build_url(&format!("{dir}/"));
 
         let response = self
             .client
             .delete(&url)
-            .query(&[("path", path), ("recursive", "true")])
+            .query(&[("recursive", "true")])
             .send()
             .await?;
 
@@ -1348,6 +1335,172 @@ mod tests {
         lock_created.assert_async().await;
         lock_written.assert_async().await;
         moved.assert_async().await;
+    }
+
+    /// The filer's own mkdir: `POST <path>/` with no body, answered with
+    /// `status` and `body` (`{"name":"<leaf>"}` with 201 for a directory it
+    /// made, 409 `{"error":"dir <path> already exists"}` for a path it holds).
+    async fn filer_making_directory(
+        server: &mut mockito::ServerGuard,
+        path: &str,
+        status: usize,
+        body: &str,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", format!("{path}/").as_str())
+            .match_body(mockito::Matcher::Exact(String::new()))
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await
+    }
+
+    /// Regression (clone-work-tree-io-error, the end-to-end harness against a
+    /// real filer on 2026-10-11): `create_directory` POSTed a multipart form
+    /// `path=<dir>` to `/dir/`, which the filer took as an upload into its
+    /// own `/dir` (201 `{"size":8}`) and which made nothing at `<dir>`
+    /// (`GET <dir>?metadata=true` 404); what made the directory was a `.keep`
+    /// file written into it, and every directory a clone made through the
+    /// mount then held a `.keep` that `git status` listed as untracked and
+    /// `git add -A` committed. A directory is made by the filer's own mkdir,
+    /// one request with no body, and no file is written into it.
+    #[tokio::test]
+    async fn create_directory_is_the_filers_own_mkdir_and_writes_no_file() {
+        let mut server = mockito::Server::new_async().await;
+        let others = refuse_every_other_request(&mut server).await;
+        let made = filer_making_directory(
+            &mut server,
+            "/tenant/vol/repo/src/lib",
+            201,
+            r#"{"name":"lib"}"#,
+        )
+        .await;
+        let other_posts = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(201)
+            .with_body(r#"{"size":8}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .create_directory("/tenant/vol/repo/src/lib")
+            .await;
+
+        assert_eq!(result, Ok(()), "the filer's mkdir answered 201");
+        made.assert_async().await;
+        other_posts.assert_async().await;
+        for mock in others {
+            mock.assert_async().await;
+        }
+    }
+
+    /// A directory the filer already holds answers 409; making it again is
+    /// not an error.
+    #[tokio::test]
+    async fn create_directory_of_a_directory_the_filer_holds_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let made = filer_making_directory(
+            &mut server,
+            "/tenant/vol/repo",
+            409,
+            r#"{"error":"dir /tenant/vol/repo already exists"}"#,
+        )
+        .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .create_directory("/tenant/vol/repo")
+            .await;
+
+        assert_eq!(result, Ok(()), "the filer holds the directory already");
+        made.assert_async().await;
+    }
+
+    /// A mkdir the filer refuses otherwise names its status and body.
+    #[tokio::test]
+    async fn create_directory_refused_by_the_filer_names_its_status_and_body() {
+        let mut server = mockito::Server::new_async().await;
+        filer_making_directory(
+            &mut server,
+            "/tenant/vol/repo",
+            500,
+            r#"{"error":"filer store unavailable"}"#,
+        )
+        .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .create_directory("/tenant/vol/repo")
+            .await;
+
+        assert_eq!(
+            result,
+            Err(StorageError::Unknown(
+                r#"Failed to create directory /tenant/vol/repo: HTTP 500 Internal Server Error: {"error":"filer store unavailable"}"#
+                    .to_string()
+            ))
+        );
+    }
+
+    /// Regression (clone-work-tree-io-error, the end-to-end harness against a
+    /// real filer on 2026-10-11): `delete_directory` sent
+    /// `DELETE /dir/?path=<dir>&recursive=true`, which the filer reads as a
+    /// delete of its own `/dir` (204) and which leaves `<dir>` in place
+    /// (`GET <dir>?metadata=true` 200), so `git rm -r src/lib` through the
+    /// mount answered success and `src/lib` was still there. A directory is
+    /// deleted by the filer's own delete of `<dir>/`, with everything in it.
+    #[tokio::test]
+    async fn delete_directory_is_the_filers_own_delete_of_the_directory() {
+        let mut server = mockito::Server::new_async().await;
+        let deleted = server
+            .mock("DELETE", "/tenant/vol/repo/src/lib/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "recursive".into(),
+                "true".into(),
+            ))
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let filers_own_dir = server
+            .mock("DELETE", "/dir/")
+            .match_query(mockito::Matcher::Any)
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .delete_directory("/tenant/vol/repo/src/lib")
+            .await;
+
+        assert_eq!(result, Ok(()), "the filer's delete answered 204");
+        deleted.assert_async().await;
+        filers_own_dir.assert_async().await;
+    }
+
+    /// The filer's root is never deleted: a delete of `/` would be a delete
+    /// of every volume.
+    #[tokio::test]
+    async fn delete_directory_of_the_filers_root_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let any = server
+            .mock("DELETE", mockito::Matcher::Any)
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .delete_directory("/")
+            .await;
+
+        assert!(
+            matches!(result, Err(StorageError::InvalidPath(_))),
+            "a delete of the filer's root was not refused: {result:?}"
+        );
+        any.assert_async().await;
     }
 
     /// Regression for security audit 002 §4.22. A hostile / compromised

@@ -72,6 +72,48 @@ impl InodeTable {
         self.forward.read().get(&inode).cloned()
     }
 
+    /// Re-key the inodes of `from`, and of every path under it, to the same
+    /// place under `to`, after the file system has moved `from` there.
+    ///
+    /// The kernel keeps a moved entry's inode under its new name, so the
+    /// inode must name the new path from then on: git writes `config.lock`
+    /// and renames it over `config`, then reads `config` through the inode
+    /// `config.lock` was created with. An inode `to` held before is
+    /// forgotten, as the file the move replaced. `handle_for` gives the
+    /// handle a path is allocated with.
+    pub fn rename(&self, from: &str, to: &str, handle_for: impl Fn(&str) -> AegisFileHandle) {
+        self.forget(to);
+
+        let mut forward = self.forward.write();
+        let mut reverse = self.reverse.write();
+        for (inode, (handle, path)) in forward.iter_mut() {
+            let Some(moved) = moved_path(path, from, to) else {
+                continue;
+            };
+            reverse.remove(&handle.path_hash);
+            *handle = handle_for(&moved);
+            reverse.insert(handle.path_hash, *inode);
+            debug!(inode = *inode, from = %path, to = %moved, "Re-keyed FUSE inode");
+            *path = moved;
+        }
+    }
+
+    /// Forget the inodes of `path` and of every path under it, after the file
+    /// system has removed it: a file made there again is a new file, with an
+    /// inode of its own.
+    pub fn forget(&self, path: &str) {
+        let mut forward = self.forward.write();
+        let mut reverse = self.reverse.write();
+        forward.retain(|inode, (handle, held)| {
+            if moved_path(held, path, path).is_none() {
+                return true;
+            }
+            reverse.remove(&handle.path_hash);
+            debug!(inode = *inode, path = %held, "Forgot FUSE inode");
+            false
+        });
+    }
+
     /// Reverse lookup: find the inode for a given path hash, if previously registered.
     #[expect(
         dead_code,
@@ -80,4 +122,15 @@ impl InodeTable {
     pub fn find_by_path_hash(&self, path_hash: u64) -> Option<u64> {
         self.reverse.read().get(&path_hash).copied()
     }
+}
+
+/// Where `path` is once `from` is moved to `to`: `to` for `from` itself, the
+/// same place under `to` for a path under `from`, and `None` for any other.
+fn moved_path(path: &str, from: &str, to: &str) -> Option<String> {
+    if path == from {
+        return Some(to.to_string());
+    }
+    let rest = path.strip_prefix(from.trim_end_matches('/'))?;
+    rest.starts_with('/')
+        .then(|| format!("{}{rest}", to.trim_end_matches('/')))
 }

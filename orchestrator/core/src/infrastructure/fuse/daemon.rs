@@ -800,6 +800,252 @@ impl FuseFsal {
 
         Ok(full_entries)
     }
+
+    /// GETATTR of the inode `ino`: the volume root's synthetic attributes, or
+    /// the attributes of the path the inode names.
+    fn attributes(&self, ino: u64) -> Result<FileAttr, Errno> {
+        debug!(ino = ino, "FUSE GETATTR");
+
+        if ino == ROOT_INODE {
+            // For the volume root, return synthetic attributes (same as NFS server pattern).
+            // SeaweedFS may not have the directory yet (created lazily on first write).
+            return Ok(self.root_attr());
+        }
+
+        let (_handle, path) = self.resolve_inode(ino).ok_or(Errno::ENOENT)?;
+
+        match self.block_on(self.backend.getattr(
+            self.context.execution_id,
+            self.context.volume_id,
+            &path,
+            self.context.container_uid,
+            self.context.container_gid,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(attrs) => {
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "getattr", "result" => "success").increment(1);
+                Ok(self.convert_attrs(&attrs, ino))
+            }
+            Err(e) => {
+                warn!(error = %e, ino = ino, path = %path, "FUSE getattr failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "getattr", "result" => "error").increment(1);
+                Err(Errno::ENOENT)
+            }
+        }
+    }
+
+    /// WRITE of `data` at `offset` into the inode `ino`, by the handle the
+    /// inode was allocated with.
+    fn write_data(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+        debug!(ino = ino, offset = offset, len = data.len(), "FUSE WRITE");
+
+        let (handle, path) = self.resolve_inode(ino).ok_or(Errno::ENOENT)?;
+
+        match self.block_on(
+            self.backend
+                .write(&handle, &path, &self.context.policy, offset, data),
+        ) {
+            Ok(bytes_written) => {
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "write", "result" => "success").increment(1);
+                metrics::counter!("aegis_fuse_bytes_written_total").increment(bytes_written as u64);
+                Ok(bytes_written as u32)
+            }
+            Err(e) => {
+                error!(error = %e, ino = ino, "FUSE write failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "write", "result" => "error").increment(1);
+                Err(fsal_error_to_errno(&e))
+            }
+        }
+    }
+
+    /// CREATE of the file `name` under the inode `parent`: the file's inode
+    /// is allocated with the handle the FSAL returns, and its attributes read.
+    fn create_entry(&self, parent: u64, name: &str) -> Result<FileAttr, Errno> {
+        debug!(parent = parent, name = %name, "FUSE CREATE");
+
+        let (_parent_handle, parent_path) = self.resolve_inode(parent).ok_or(Errno::ENOENT)?;
+
+        let file_path = Self::child_path(&parent_path, name);
+
+        let handle = match self.block_on(self.backend.create_file(
+            self.context.execution_id,
+            self.context.volume_id,
+            &file_path,
+            &self.context.policy,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(handle) => handle,
+            Err(e) => {
+                error!(error = %e, "FUSE create failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "create", "result" => "error").increment(1);
+                return Err(fsal_error_to_errno(&e));
+            }
+        };
+
+        let child_ino = self.inode_table.allocate(handle, file_path.clone());
+
+        // Get attrs for the newly created file
+        let attr = match self.block_on(self.backend.getattr(
+            self.context.execution_id,
+            self.context.volume_id,
+            &file_path,
+            self.context.container_uid,
+            self.context.container_gid,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(attrs) => self.convert_attrs(&attrs, child_ino),
+            Err(e) => {
+                // File was created but stat failed — unlikely but handle gracefully.
+                // Return a synthetic file attr rather than failing.
+                warn!(error = %e, path = %file_path, "FUSE create getattr failed — using synthetic attrs");
+                FileAttr {
+                    ino: INodeNo(child_ino),
+                    size: 0,
+                    blocks: 0,
+                    atime: SystemTime::now(),
+                    mtime: SystemTime::now(),
+                    ctime: SystemTime::now(),
+                    crtime: SystemTime::now(),
+                    kind: FuseFileType::RegularFile,
+                    perm: 0o644,
+                    nlink: 1,
+                    uid: self.owner().uid,
+                    gid: self.owner().gid,
+                    rdev: 0,
+                    blksize: 4096,
+                    flags: 0,
+                }
+            }
+        };
+        metrics::counter!("aegis_fuse_operations_total", "operation" => "create", "result" => "success").increment(1);
+        Ok(attr)
+    }
+
+    /// UNLINK of the file `name` under the inode `parent`.
+    fn remove_file(&self, parent: u64, name: &str) -> Result<(), Errno> {
+        debug!(parent = parent, name = %name, "FUSE UNLINK");
+
+        let (_parent_handle, parent_path) = self.resolve_inode(parent).ok_or(Errno::ENOENT)?;
+
+        let file_path = Self::child_path(&parent_path, name);
+
+        match self.block_on(self.backend.delete_file(
+            self.context.execution_id,
+            self.context.volume_id,
+            &file_path,
+            &self.context.policy,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(()) => {
+                self.inode_table.forget(&file_path);
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "unlink", "result" => "success").increment(1);
+                Ok(())
+            }
+            Err(e) => {
+                error!(error = %e, "FUSE unlink failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "unlink", "result" => "error").increment(1);
+                Err(fsal_error_to_errno(&e))
+            }
+        }
+    }
+
+    /// RMDIR of the directory `name` under the inode `parent`.
+    fn remove_directory(&self, parent: u64, name: &str) -> Result<(), Errno> {
+        debug!(parent = parent, name = %name, "FUSE RMDIR");
+
+        let (_parent_handle, parent_path) = self.resolve_inode(parent).ok_or(Errno::ENOENT)?;
+
+        let dir_path = Self::child_path(&parent_path, name);
+
+        // The storage deletes a directory with everything in it; RMDIR
+        // removes only an empty one. git counts on ENOTEMPTY: it removes a
+        // file, then tries `rmdir` of each directory above it.
+        match self.block_on(self.backend.readdir(
+            self.context.execution_id,
+            self.context.volume_id,
+            &dir_path,
+            &self.context.policy,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(entries) if !entries.is_empty() => {
+                debug!(path = %dir_path, entries = entries.len(), "FUSE RMDIR of a directory that is not empty");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "error").increment(1);
+                return Err(Errno::ENOTEMPTY);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(error = %e, "FUSE rmdir failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "error").increment(1);
+                return Err(fsal_error_to_errno(&e));
+            }
+        }
+
+        match self.block_on(self.backend.delete_directory(
+            self.context.execution_id,
+            self.context.volume_id,
+            &dir_path,
+            &self.context.policy,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(()) => {
+                self.inode_table.forget(&dir_path);
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "success").increment(1);
+                Ok(())
+            }
+            Err(e) => {
+                error!(error = %e, "FUSE rmdir failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "error").increment(1);
+                Err(fsal_error_to_errno(&e))
+            }
+        }
+    }
+
+    /// RENAME of `name` under the inode `parent` to `newname` under the
+    /// inode `newparent`.
+    fn rename_entry(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), Errno> {
+        debug!(
+            parent = parent,
+            name = %name,
+            newparent = newparent,
+            newname = %newname,
+            "FUSE RENAME"
+        );
+
+        let (_from_handle, from_parent_path) = self.resolve_inode(parent).ok_or(Errno::ENOENT)?;
+        let (_to_handle, to_parent_path) = self.resolve_inode(newparent).ok_or(Errno::ENOENT)?;
+
+        let from_path = Self::child_path(&from_parent_path, name);
+        let to_path = Self::child_path(&to_parent_path, newname);
+
+        match self.block_on(self.backend.rename(
+            self.context.execution_id,
+            self.context.volume_id,
+            &from_path,
+            &to_path,
+            &self.context.policy,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(()) => {
+                // The kernel keeps the moved entry's inode under its new
+                // name: the inode names the new path from now on.
+                self.inode_table
+                    .rename(&from_path, &to_path, |path| self.handle_for(path));
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "rename", "result" => "success").increment(1);
+                Ok(())
+            }
+            Err(e) => {
+                error!(error = %e, "FUSE rename failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "rename", "result" => "error").increment(1);
+                Err(fsal_error_to_errno(&e))
+            }
+        }
+    }
 }
 
 impl Filesystem for FuseFsal {
@@ -829,42 +1075,9 @@ impl Filesystem for FuseFsal {
             return;
         }
         let _guard = OpGuard::enter(self);
-        let ino: u64 = ino.into();
-        debug!(ino = ino, "FUSE GETATTR");
-
-        if ino == ROOT_INODE {
-            // For the volume root, return synthetic attributes (same as NFS server pattern).
-            // SeaweedFS may not have the directory yet (created lazily on first write).
-            reply.attr(&FUSE_TTL, &self.root_attr());
-            return;
-        }
-
-        let (_handle, path) = match self.resolve_inode(ino) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        match self.block_on(self.backend.getattr(
-            self.context.execution_id,
-            self.context.volume_id,
-            &path,
-            self.context.container_uid,
-            self.context.container_gid,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(attrs) => {
-                let fuse_attr = self.convert_attrs(&attrs, ino);
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "getattr", "result" => "success").increment(1);
-                reply.attr(&FUSE_TTL, &fuse_attr);
-            }
-            Err(e) => {
-                warn!(error = %e, ino = ino, path = %path, "FUSE getattr failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "getattr", "result" => "error").increment(1);
-                reply.error(Errno::ENOENT);
-            }
+        match self.attributes(ino.into()) {
+            Ok(attr) => reply.attr(&FUSE_TTL, &attr),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -907,31 +1120,9 @@ impl Filesystem for FuseFsal {
             return;
         }
         let _guard = OpGuard::enter(self);
-        let ino: u64 = ino.into();
-        debug!(ino = ino, offset = offset, len = data.len(), "FUSE WRITE");
-
-        let (handle, path) = match self.resolve_inode(ino) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        match self.block_on(
-            self.backend
-                .write(&handle, &path, &self.context.policy, offset, data),
-        ) {
-            Ok(bytes_written) => {
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "write", "result" => "success").increment(1);
-                metrics::counter!("aegis_fuse_bytes_written_total").increment(bytes_written as u64);
-                reply.written(bytes_written as u32);
-            }
-            Err(e) => {
-                error!(error = %e, ino = ino, "FUSE write failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "write", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-            }
+        match self.write_data(ino.into(), offset, data) {
+            Ok(written) => reply.written(written),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -991,86 +1182,15 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let parent_u64: u64 = parent.into();
-        debug!(parent = parent_u64, name = %name_str, "FUSE CREATE");
-
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let file_path = Self::child_path(&parent_path, name_str);
-
-        match self.block_on(self.backend.create_file(
-            self.context.execution_id,
-            self.context.volume_id,
-            &file_path,
-            &self.context.policy,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(handle) => {
-                let child_ino = self.inode_table.allocate(handle, file_path.clone());
-
-                // Get attrs for the newly created file
-                match self.block_on(self.backend.getattr(
-                    self.context.execution_id,
-                    self.context.volume_id,
-                    &file_path,
-                    self.context.container_uid,
-                    self.context.container_gid,
-                    self.context.workflow_execution_id,
-                )) {
-                    Ok(attrs) => {
-                        let fuse_attr = self.convert_attrs(&attrs, child_ino);
-                        metrics::counter!("aegis_fuse_operations_total", "operation" => "create", "result" => "success").increment(1);
-                        reply.created(
-                            &FUSE_TTL,
-                            &fuse_attr,
-                            Generation(0),
-                            FileHandle(0),
-                            FopenFlags::empty(),
-                        );
-                    }
-                    Err(e) => {
-                        // File was created but stat failed — unlikely but handle gracefully.
-                        // Return a synthetic file attr rather than failing.
-                        warn!(error = %e, path = %file_path, "FUSE create getattr failed — using synthetic attrs");
-                        let attr = FileAttr {
-                            ino: INodeNo(child_ino),
-                            size: 0,
-                            blocks: 0,
-                            atime: SystemTime::now(),
-                            mtime: SystemTime::now(),
-                            ctime: SystemTime::now(),
-                            crtime: SystemTime::now(),
-                            kind: FuseFileType::RegularFile,
-                            perm: 0o644,
-                            nlink: 1,
-                            uid: self.owner().uid,
-                            gid: self.owner().gid,
-                            rdev: 0,
-                            blksize: 4096,
-                            flags: 0,
-                        };
-                        metrics::counter!("aegis_fuse_operations_total", "operation" => "create", "result" => "success").increment(1);
-                        reply.created(
-                            &FUSE_TTL,
-                            &attr,
-                            Generation(0),
-                            FileHandle(0),
-                            FopenFlags::empty(),
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "FUSE create failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "create", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-            }
+        match self.create_entry(parent.into(), name_str) {
+            Ok(attr) => reply.created(
+                &FUSE_TTL,
+                &attr,
+                Generation(0),
+                FileHandle(0),
+                FopenFlags::empty(),
+            ),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1116,35 +1236,9 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let parent_u64: u64 = parent.into();
-        debug!(parent = parent_u64, name = %name_str, "FUSE UNLINK");
-
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let file_path = Self::child_path(&parent_path, name_str);
-
-        match self.block_on(self.backend.delete_file(
-            self.context.execution_id,
-            self.context.volume_id,
-            &file_path,
-            &self.context.policy,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(()) => {
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "unlink", "result" => "success").increment(1);
-                reply.ok();
-            }
-            Err(e) => {
-                error!(error = %e, "FUSE unlink failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "unlink", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-            }
+        match self.remove_file(parent.into(), name_str) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1162,35 +1256,9 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let parent_u64: u64 = parent.into();
-        debug!(parent = parent_u64, name = %name_str, "FUSE RMDIR");
-
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let dir_path = Self::child_path(&parent_path, name_str);
-
-        match self.block_on(self.backend.delete_directory(
-            self.context.execution_id,
-            self.context.volume_id,
-            &dir_path,
-            &self.context.policy,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(()) => {
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "success").increment(1);
-                reply.ok();
-            }
-            Err(e) => {
-                error!(error = %e, "FUSE rmdir failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-            }
+        match self.remove_directory(parent.into(), name_str) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1224,52 +1292,9 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let parent_u64: u64 = parent.into();
-        let newparent_u64: u64 = newparent.into();
-        debug!(
-            parent = parent_u64,
-            name = %name_str,
-            newparent = newparent_u64,
-            newname = %newname_str,
-            "FUSE RENAME"
-        );
-
-        let (_from_handle, from_parent_path) = match self.resolve_inode(parent_u64) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let (_to_handle, to_parent_path) = match self.resolve_inode(newparent_u64) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let from_path = Self::child_path(&from_parent_path, name_str);
-        let to_path = Self::child_path(&to_parent_path, newname_str);
-
-        match self.block_on(self.backend.rename(
-            self.context.execution_id,
-            self.context.volume_id,
-            &from_path,
-            &to_path,
-            &self.context.policy,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(()) => {
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "rename", "result" => "success").increment(1);
-                reply.ok();
-            }
-            Err(e) => {
-                error!(error = %e, "FUSE rename failed");
-                metrics::counter!("aegis_fuse_operations_total", "operation" => "rename", "result" => "error").increment(1);
-                reply.error(fsal_error_to_errno(&e));
-            }
+        match self.rename_entry(parent.into(), name_str, newparent.into(), newname_str) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1777,9 +1802,9 @@ mod tests {
     /// LOOKUP of a directory the shell made (`git clone` making `.git`)
     /// answered a regular file, because the filer's `stat` reported every
     /// path as one; the kernel then failed git's next `mkdir` under it with
-    /// EIO. The fake filer answers as SeaweedFS does: MKDIR's ancestors and
-    /// `.keep`, a HEAD of the directory with 200, and its metadata with
-    /// `os.ModeDir` in `Mode`.
+    /// EIO. The fake filer answers as SeaweedFS does: MKDIR as its own mkdir
+    /// (`POST <dir>/`), a HEAD of the directory with 200, and its metadata
+    /// with `os.ModeDir` in `Mode`.
     #[test]
     fn a_directory_made_through_the_mount_looks_up_as_a_directory_on_seaweedfs() {
         use crate::domain::events::StorageEvent;
@@ -1804,10 +1829,10 @@ mod tests {
         let git_dir = format!("{remote_path}/.git");
 
         let mut filer = mockito::Server::new();
-        filer.mock("POST", "/dir/").with_status(201).create();
         filer
-            .mock("PUT", format!("{git_dir}/.keep").as_str())
+            .mock("POST", format!("{git_dir}/").as_str())
             .with_status(201)
+            .with_body(r#"{"name":".git"}"#)
             .create();
         filer
             .mock("HEAD", git_dir.as_str())
@@ -2159,6 +2184,453 @@ mod handle_tests {
                 .read_data(report.unwrap(), 0, 4096)
                 .map_err(|errno| format!("{errno:?}")),
             Ok(THREAD_IDS.to_vec())
+        );
+    }
+}
+
+/// The inode a kernel holds for a file names that file across a rename and
+/// is let go on unlink: git's lock-file protocol (`config.lock` renamed over
+/// `config`, `index.lock` over `index`) depends on both.
+#[cfg(test)]
+mod inode_tests {
+    use super::*;
+    use crate::domain::fsal::FsalError;
+    use crate::domain::storage::{DirEntry, FileAttributes, StorageError};
+    use async_trait::async_trait;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const THREAD_IDS: &[u8] = b"<a@example.com>\n<b@example.com>\n";
+
+    /// A volume held in memory, answering as a POSIX file system does: a
+    /// rename moves a file or a directory with everything under it and
+    /// replaces a file at its destination.
+    #[derive(Default)]
+    struct MemoryVolume {
+        files: parking_lot::Mutex<BTreeMap<String, Vec<u8>>>,
+        directories: parking_lot::Mutex<BTreeSet<String>>,
+    }
+
+    fn missing(path: &str) -> FsalError {
+        FsalError::Storage(StorageError::FileNotFound(path.to_string()))
+    }
+
+    fn join(parent: &str, name: &str) -> String {
+        FuseFsal::child_path(parent, name)
+    }
+
+    #[async_trait]
+    impl FsalBackend for MemoryVolume {
+        async fn getattr(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            path: &str,
+            _: u32,
+            _: u32,
+            _: Option<uuid::Uuid>,
+        ) -> Result<FileAttributes, FsalError> {
+            let (file_type, size, mode, nlink) = if self.directories.lock().contains(path) {
+                (FileType::Directory, 4096, 0o755, 2)
+            } else {
+                let files = self.files.lock();
+                let data = files.get(path).ok_or_else(|| missing(path))?;
+                (FileType::File, data.len() as u64, 0o644, 1)
+            };
+            Ok(FileAttributes {
+                file_type,
+                size,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+                mode,
+                uid: 1000,
+                gid: 1000,
+                nlink,
+            })
+        }
+
+        async fn lookup(
+            &self,
+            parent: &AegisFileHandle,
+            parent_path: &str,
+            name: &str,
+        ) -> Result<AegisFileHandle, FsalError> {
+            let path = join(parent_path, name);
+            if !self.files.lock().contains_key(&path) && !self.directories.lock().contains(&path) {
+                return Err(missing(&path));
+            }
+            let execution_id = *parent
+                .execution_context
+                .execution_id()
+                .expect("the mount's handles name its execution");
+            Ok(AegisFileHandle::new(execution_id, parent.volume_id, &path))
+        }
+
+        async fn readdir(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            path: &str,
+            _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
+        ) -> Result<Vec<DirEntry>, FsalError> {
+            if !self.directories.lock().contains(path) {
+                return Err(missing(path));
+            }
+            let child = |held: &str| -> Option<String> {
+                let rest = held.strip_prefix(path)?.strip_prefix('/')?;
+                (!rest.is_empty() && !rest.contains('/')).then(|| rest.to_string())
+            };
+            let mut entries: Vec<DirEntry> = self
+                .files
+                .lock()
+                .keys()
+                .filter_map(|held| child(held))
+                .map(|name| DirEntry {
+                    name,
+                    file_type: FileType::File,
+                })
+                .collect();
+            entries.extend(
+                self.directories
+                    .lock()
+                    .iter()
+                    .filter_map(|held| child(held))
+                    .map(|name| DirEntry {
+                        name,
+                        file_type: FileType::Directory,
+                    }),
+            );
+            Ok(entries)
+        }
+
+        async fn read(
+            &self,
+            _: &AegisFileHandle,
+            path: &str,
+            _: &FsalAccessPolicy,
+            offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, FsalError> {
+            let files = self.files.lock();
+            let data = files.get(path).ok_or_else(|| missing(path))?;
+            let start = (offset as usize).min(data.len());
+            let end = (start + length).min(data.len());
+            Ok(data[start..end].to_vec())
+        }
+
+        async fn write(
+            &self,
+            _: &AegisFileHandle,
+            path: &str,
+            _: &FsalAccessPolicy,
+            offset: u64,
+            bytes: &[u8],
+        ) -> Result<usize, FsalError> {
+            let mut files = self.files.lock();
+            let data = files.get_mut(path).ok_or_else(|| missing(path))?;
+            let end = offset as usize + bytes.len();
+            if data.len() < end {
+                data.resize(end, 0);
+            }
+            data[offset as usize..end].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        async fn create_file(
+            &self,
+            execution_id: ExecutionId,
+            volume_id: VolumeId,
+            path: &str,
+            _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
+        ) -> Result<AegisFileHandle, FsalError> {
+            self.files.lock().insert(path.to_string(), Vec::new());
+            Ok(AegisFileHandle::new(execution_id, volume_id, path))
+        }
+
+        async fn create_directory(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            path: &str,
+            _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
+        ) -> Result<(), FsalError> {
+            self.directories.lock().insert(path.to_string());
+            Ok(())
+        }
+
+        async fn delete_file(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            path: &str,
+            _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
+        ) -> Result<(), FsalError> {
+            self.files
+                .lock()
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| missing(path))
+        }
+
+        async fn delete_directory(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            path: &str,
+            _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
+        ) -> Result<(), FsalError> {
+            // The storage's delete of a directory takes everything in it.
+            let under = |held: &str| {
+                held.strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            };
+            if !self.directories.lock().remove(path) {
+                return Err(missing(path));
+            }
+            self.files.lock().retain(|held, _| !under(held));
+            self.directories.lock().retain(|held| !under(held));
+            Ok(())
+        }
+
+        async fn rename(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            from: &str,
+            to: &str,
+            _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
+        ) -> Result<(), FsalError> {
+            let moved = |path: &str| -> Option<String> {
+                if path == from {
+                    Some(to.to_string())
+                } else {
+                    path.strip_prefix(from)
+                        .filter(|rest| rest.starts_with('/'))
+                        .map(|rest| format!("{to}{rest}"))
+                }
+            };
+            let mut files = self.files.lock();
+            let mut directories = self.directories.lock();
+            if !files.contains_key(from) && !directories.contains(from) {
+                return Err(missing(from));
+            }
+            let entries: Vec<(String, Vec<u8>)> = std::mem::take(&mut *files).into_iter().collect();
+            for (path, data) in entries {
+                files.insert(moved(&path).unwrap_or(path), data);
+            }
+            let dirs: Vec<String> = std::mem::take(&mut *directories).into_iter().collect();
+            for path in dirs {
+                directories.insert(moved(&path).unwrap_or(path));
+            }
+            Ok(())
+        }
+    }
+
+    /// A mount of a [`MemoryVolume`].
+    struct Fixture {
+        _rt: tokio::runtime::Runtime,
+        mount: FuseFsal,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let mount = FuseFsal {
+                backend: Arc::new(MemoryVolume::default()),
+                context: FuseVolumeContext {
+                    execution_id: ExecutionId::new(),
+                    volume_id: VolumeId::new(),
+                    workflow_execution_id: None,
+                    container_uid: 0,
+                    container_gid: 0,
+                    policy: FsalAccessPolicy::default(),
+                },
+                inode_table: Arc::new(InodeTable::new()),
+                runtime: rt.handle().clone(),
+                last_completed_op_at: Arc::new(AtomicU64::new(0)),
+                in_flight_ops: Arc::new(AtomicU32::new(0)),
+                degraded: Arc::new(AtomicBool::new(false)),
+            };
+            Self { _rt: rt, mount }
+        }
+    }
+
+    /// Regression (`clone-work-tree-io-error`, read on the box on
+    /// 2026-10-11): git writes `.git/config` as `config.lock` and renames it
+    /// over `config`. The kernel keeps the moved file's inode under its new
+    /// name, and the mount went on naming that inode by the old path, so the
+    /// GETATTR of `config` answered ENOENT and git died with "unknown error
+    /// occurred while reading the configuration files"; the next
+    /// `config.lock` was handed the moved file's inode as well.
+    #[test]
+    fn a_file_renamed_over_its_name_reads_through_the_inode_it_moved_with() {
+        let fixture = Fixture::new();
+        let mount = &fixture.mount;
+
+        let lock: u64 = mount
+            .create_entry(ROOT_INODE, "a.lock")
+            .expect("create a.lock")
+            .ino
+            .into();
+        mount.write_data(lock, 0, THREAD_IDS).expect("write a.lock");
+        mount
+            .rename_entry(ROOT_INODE, "a.lock", ROOT_INODE, "a")
+            .expect("rename a.lock to a");
+
+        assert_eq!(
+            mount
+                .attributes(lock)
+                .map(|attr| attr.size)
+                .map_err(|errno| format!("{errno:?}")),
+            Ok(THREAD_IDS.len() as u64),
+            "GETATTR of the moved file's inode did not answer the moved file"
+        );
+        assert_eq!(
+            mount
+                .read_data(lock, 0, 4096)
+                .map_err(|errno| format!("{errno:?}")),
+            Ok(THREAD_IDS.to_vec()),
+            "READ of the moved file's inode did not answer the moved bytes"
+        );
+
+        let next_lock: u64 = mount
+            .create_entry(ROOT_INODE, "a.lock")
+            .expect("create a.lock again")
+            .ino
+            .into();
+        assert_ne!(
+            next_lock, lock,
+            "a new a.lock was handed the inode of the file moved to a"
+        );
+    }
+
+    /// A directory renamed with a file inside it: the file's inode names the
+    /// file under the directory's new name.
+    #[test]
+    fn a_file_inside_a_renamed_directory_reads_through_its_own_inode() {
+        let fixture = Fixture::new();
+        let mount = &fixture.mount;
+
+        let dir: u64 = mount
+            .make_directory(ROOT_INODE, "tmp_pack")
+            .expect("mkdir tmp_pack")
+            .ino
+            .into();
+        let file: u64 = mount
+            .create_entry(dir, "pack")
+            .expect("create tmp_pack/pack")
+            .ino
+            .into();
+        mount.write_data(file, 0, THREAD_IDS).expect("write pack");
+        mount
+            .rename_entry(ROOT_INODE, "tmp_pack", ROOT_INODE, "pack")
+            .expect("rename tmp_pack to pack");
+
+        assert_eq!(
+            mount
+                .read_data(file, 0, 4096)
+                .map_err(|errno| format!("{errno:?}")),
+            Ok(THREAD_IDS.to_vec()),
+            "READ of a file inside the renamed directory did not answer its bytes"
+        );
+    }
+
+    /// A file removed and made again under the same name is a new file with
+    /// an inode of its own.
+    #[test]
+    fn a_file_made_again_after_unlink_is_given_a_new_inode() {
+        let fixture = Fixture::new();
+        let mount = &fixture.mount;
+
+        let first: u64 = mount
+            .create_entry(ROOT_INODE, "index.lock")
+            .expect("create index.lock")
+            .ino
+            .into();
+        mount
+            .remove_file(ROOT_INODE, "index.lock")
+            .expect("unlink index.lock");
+        let second: u64 = mount
+            .create_entry(ROOT_INODE, "index.lock")
+            .expect("create index.lock again")
+            .ino
+            .into();
+
+        assert_ne!(
+            second, first,
+            "a file made again after its unlink was handed the removed file's inode"
+        );
+    }
+
+    /// Regression (clone-work-tree-io-error, the end-to-end harness against a
+    /// real filer on 2026-10-11): git removes a file and then tries `rmdir`
+    /// of its directory, counting on ENOTEMPTY while the directory holds
+    /// other files (`dir.c`, `remove_path`). The mount's RMDIR is the
+    /// storage's delete of a directory with everything in it, so `git rm
+    /// data/000.txt` took the other 149 files of `data` with it. RMDIR of a
+    /// directory that is not empty is refused and removes nothing.
+    #[test]
+    fn rmdir_of_a_directory_that_holds_a_file_is_refused_and_removes_nothing() {
+        let fixture = Fixture::new();
+        let mount = &fixture.mount;
+
+        let data: u64 = mount
+            .make_directory(ROOT_INODE, "data")
+            .expect("mkdir data")
+            .ino
+            .into();
+        let kept: u64 = mount
+            .create_entry(data, "001.txt")
+            .expect("create data/001.txt")
+            .ino
+            .into();
+        mount
+            .write_data(kept, 0, THREAD_IDS)
+            .expect("write data/001.txt");
+
+        assert_eq!(
+            mount
+                .remove_directory(ROOT_INODE, "data")
+                .map_err(|errno| format!("{errno:?}")),
+            Err(format!("{:?}", Errno::ENOTEMPTY)),
+            "RMDIR of a directory holding a file was not refused with ENOTEMPTY"
+        );
+        assert_eq!(
+            mount
+                .read_data(kept, 0, 4096)
+                .map_err(|errno| format!("{errno:?}")),
+            Ok(THREAD_IDS.to_vec()),
+            "the refused RMDIR removed the file inside the directory"
+        );
+    }
+
+    /// RMDIR of an empty directory removes it.
+    #[test]
+    fn rmdir_of_an_empty_directory_removes_it() {
+        let fixture = Fixture::new();
+        let mount = &fixture.mount;
+
+        mount.make_directory(ROOT_INODE, "lib").expect("mkdir lib");
+
+        assert_eq!(
+            mount
+                .remove_directory(ROOT_INODE, "lib")
+                .map_err(|errno| format!("{errno:?}")),
+            Ok(())
+        );
+        assert!(
+            mount.lookup_entry(ROOT_INODE, "lib").is_err(),
+            "lib is still there after its RMDIR"
         );
     }
 }
