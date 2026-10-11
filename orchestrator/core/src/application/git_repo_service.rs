@@ -52,7 +52,9 @@ use crate::application::git_clone_executor::{
     GitCloneExecutor, ResolvedCredential, PUSH_FROM_A_VOLUME_GOES_TO_ORIGIN,
 };
 use crate::application::git_ssh_key::{attach_ssh_credentials, check_ssh_host_key};
-use crate::application::user_volume_service::{UserVolumeError, UserVolumeService};
+use crate::application::user_volume_service::{
+    clone_volume_size_for_tier, UserVolumeError, UserVolumeService, CLONE_VOLUME_NAME_PREFIX,
+};
 use crate::application::volume_manager::CreateUserVolumeCommand;
 use crate::domain::credential::{
     CredentialBindingId, CredentialBindingRepository, CredentialStatus, CredentialType,
@@ -76,11 +78,6 @@ use crate::infrastructure::secrets_manager::SecretsManager;
 // ============================================================================
 // Command Types
 // ============================================================================
-
-/// Default clone volume size — 500 MB. Intentionally conservative; users
-/// can bump via tier upgrades. The hard storage-quota gate lives in
-/// [`UserVolumeService`].
-const DEFAULT_CLONE_VOLUME_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Audit 002 §4.37.13 — name of the OpenBao Transit key used to encrypt
 /// webhook secrets at rest. The orchestrator pre-provisions this key at
@@ -473,13 +470,22 @@ impl GitRepoService {
             }
         }
 
+        // The clone volume counts against the bindings' allowance: a
+        // `chat-attachments` volume given the tier's whole budget is shrunk
+        // to the chat budget first (AEGIS ADR-136 Update G2c).
+        self.volume_service
+            .fit_chat_attachments_to_budget(&cmd.tenant_id, &cmd.owner, &cmd.zaru_tier)
+            .await?;
+        let clone_bytes =
+            clone_volume_size_for_tier(&self.volume_service.tier_limits, &cmd.zaru_tier)
+                .ok_or(UserVolumeError::UnknownTier)?;
         let volume = self
             .volume_service
             .create_volume(CreateUserVolumeCommand {
                 tenant_id: cmd.tenant_id.clone(),
                 owner_user_id: cmd.owner.clone(),
-                label: format!("git-{}", cmd.label),
-                size_limit_bytes: DEFAULT_CLONE_VOLUME_BYTES,
+                label: format!("{CLONE_VOLUME_NAME_PREFIX}{}", cmd.label),
+                size_limit_bytes: clone_bytes,
                 zaru_tier: cmd.zaru_tier.clone(),
             })
             .await?;

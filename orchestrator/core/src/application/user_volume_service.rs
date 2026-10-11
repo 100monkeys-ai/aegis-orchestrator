@@ -11,6 +11,7 @@ use chrono::Utc;
 
 use crate::application::volume_manager::{CreateUserVolumeCommand, VolumeService};
 use crate::domain::events::VolumeEvent;
+use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
 use crate::domain::iam::ZaruTier;
 use crate::domain::repository::{RepositoryError, VolumeRepository};
 use crate::domain::volume::{
@@ -87,18 +88,20 @@ pub const CHAT_ATTACHMENTS_VOLUME_NAME: &str = "chat-attachments";
 /// within the same tier budget.
 pub const CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
-/// Resolve the size to allocate for a lazy-provisioned `chat-attachments`
-/// volume from the person's tier. The volume's allocation must fit under the
-/// tier's `total_storage_bytes` budget; otherwise
-/// [`UserVolumeService::create_volume`] rejects the request with
-/// `StorageQuotaExceeded` even for an empty volume.
-///
-/// We allocate the full tier `total_storage_bytes` so the user gets as much
-/// chat-attachment headroom as their tier permits without exceeding it.
-/// (Free users can still create one extra volume because `max_volumes >= 2`,
-/// but that volume will compete with chat-attachments for the storage
-/// budget — a deliberate trade chosen over fragmenting the budget across
-/// volumes the user may never create.)
+/// The name prefix of a repository binding's clone volume (`git-<label>`).
+/// The quota check reads it to count a clone volume against the bindings'
+/// allowance rather than the chat-attachments budget (AEGIS ADR-136
+/// Update G2c).
+pub const CLONE_VOLUME_NAME_PREFIX: &str = "git-";
+
+/// The chat-attachments budget of a tier: its `total_storage_bytes` less the
+/// bindings' allowance (the tier's clone volume size times its
+/// `max_bindings`, [`GitRepoTierLimits::bindings_allowance_bytes`]), so a
+/// person whose `chat-attachments` volume holds the whole budget can still
+/// create every binding the tier allows (AEGIS ADR-136 Update G2c). It is
+/// the size a lazy-provisioned `chat-attachments` volume is given, and the
+/// size an older, larger one is shrunk to when its person creates a binding
+/// ([`UserVolumeService::fit_chat_attachments_to_budget`]).
 ///
 /// Unbounded tiers (Enterprise = `u64::MAX`) are clamped to
 /// [`CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES`] because a raw `u64::MAX` is
@@ -112,10 +115,21 @@ pub fn chat_attachments_volume_size_for_tier(
 ) -> Option<u64> {
     limits.limits.get(tier).map(|l| {
         if l.total_storage_bytes == u64::MAX {
-            CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES
-        } else {
-            l.total_storage_bytes
+            return CHAT_ATTACHMENTS_UNBOUNDED_TIER_CAP_BYTES;
         }
+        let allowance = GitRepoTierLimits::for_tier(tier.clone())
+            .bindings_allowance_bytes(l.total_storage_bytes)
+            .unwrap_or(0);
+        l.total_storage_bytes.saturating_sub(allowance)
+    })
+}
+
+/// The size of one repository binding's clone volume under `tier`
+/// ([`GitRepoTierLimits::clone_volume_bytes`] of the tier's budget). `None`
+/// for an unrecognized tier.
+pub fn clone_volume_size_for_tier(limits: &StorageTierLimits, tier: &ZaruTier) -> Option<u64> {
+    limits.limits.get(tier).map(|l| {
+        GitRepoTierLimits::for_tier(tier.clone()).clone_volume_bytes(l.total_storage_bytes)
     })
 }
 
@@ -175,6 +189,25 @@ impl UserVolumeService {
             .await?;
         if allocated_bytes.saturating_add(cmd.size_limit_bytes) > limit.total_storage_bytes {
             return Err(UserVolumeError::StorageQuotaExceeded);
+        }
+
+        // Quota: a clone volume counts against the bindings' allowance, never
+        // against the chat-attachments budget (AEGIS ADR-136 Update G2c).
+        if cmd.label.starts_with(CLONE_VOLUME_NAME_PREFIX) {
+            if let Some(allowance) = GitRepoTierLimits::for_tier(cmd.zaru_tier.clone())
+                .bindings_allowance_bytes(limit.total_storage_bytes)
+            {
+                let clone_bytes = self
+                    .volume_repo
+                    .find_by_owner(&cmd.tenant_id, &cmd.owner_user_id)
+                    .await?
+                    .iter()
+                    .filter(|v| v.name.starts_with(CLONE_VOLUME_NAME_PREFIX))
+                    .fold(0u64, |sum, v| sum.saturating_add(v.size_limit_bytes));
+                if clone_bytes.saturating_add(cmd.size_limit_bytes) > allowance {
+                    return Err(UserVolumeError::StorageQuotaExceeded);
+                }
+            }
         }
 
         // Uniqueness: name within owner namespace
@@ -250,6 +283,44 @@ impl UserVolumeService {
         })
         .await
         .map(|v| v.id)
+    }
+
+    /// Shrink the person's `chat-attachments` volume's stored size to their
+    /// tier's chat-attachments budget when it is larger (a volume provisioned
+    /// when it was given the tier's whole budget), so the bindings' allowance
+    /// is free for a binding's clone volume (AEGIS ADR-136 Update G2c). The
+    /// files stay; only `size_limit_bytes` changes. A volume at or under the
+    /// budget, or no such volume, changes nothing. An unrecognized tier
+    /// changes nothing and answers `UnknownTier`.
+    pub async fn fit_chat_attachments_to_budget(
+        &self,
+        tenant_id: &TenantId,
+        owner: &str,
+        tier: &ZaruTier,
+    ) -> Result<(), UserVolumeError> {
+        let budget = chat_attachments_volume_size_for_tier(&self.tier_limits, tier)
+            .ok_or(UserVolumeError::UnknownTier)?;
+        let Some(mut volume) = self
+            .volume_repo
+            .find_by_owner(tenant_id, owner)
+            .await?
+            .into_iter()
+            .find(|v| v.name == CHAT_ATTACHMENTS_VOLUME_NAME)
+        else {
+            return Ok(());
+        };
+        if volume.size_limit_bytes <= budget {
+            return Ok(());
+        }
+        tracing::info!(
+            volume_id = %volume.id,
+            from_bytes = volume.size_limit_bytes,
+            to_bytes = budget,
+            "chat-attachments volume shrunk to its tier's chat budget"
+        );
+        volume.size_limit_bytes = budget;
+        self.volume_repo.save(&volume).await?;
+        Ok(())
     }
 
     pub async fn list_volumes(

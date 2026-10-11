@@ -14,6 +14,12 @@
 
 use crate::domain::iam::ZaruTier;
 
+/// The largest clone volume a binding is given — 500 MiB. A tier whose
+/// storage budget is small gives each clone less (see
+/// [`GitRepoTierLimits::clone_volume_bytes`]); the hard storage-quota gate
+/// lives in `UserVolumeService`.
+pub const DEFAULT_CLONE_VOLUME_BYTES: u64 = 500 * 1024 * 1024;
+
 /// Tier-based limits applied to [`crate::domain::git_repo::GitRepoBinding`]
 /// creation and feature gating.
 ///
@@ -55,6 +61,33 @@ impl GitRepoTierLimits {
             },
         }
     }
+
+    /// The size of one binding's clone volume under a tier whose storage
+    /// budget is `total_storage_bytes` (AEGIS ADR-136 Update G2c):
+    /// `min(DEFAULT_CLONE_VOLUME_BYTES, total / (2 × max_bindings))`, so the
+    /// bindings never take more than half the budget. An unbounded tier
+    /// (no `max_bindings`, or a `u64::MAX` budget) gives
+    /// [`DEFAULT_CLONE_VOLUME_BYTES`].
+    pub fn clone_volume_bytes(&self, total_storage_bytes: u64) -> u64 {
+        match self.max_bindings {
+            Some(max) if max > 0 && total_storage_bytes != u64::MAX => {
+                DEFAULT_CLONE_VOLUME_BYTES.min(total_storage_bytes / (2 * u64::from(max)))
+            }
+            _ => DEFAULT_CLONE_VOLUME_BYTES,
+        }
+    }
+
+    /// The bindings' allowance: the clone volume's size times
+    /// `max_bindings`. `None` for an unbounded tier.
+    pub fn bindings_allowance_bytes(&self, total_storage_bytes: u64) -> Option<u64> {
+        match self.max_bindings {
+            Some(max) if total_storage_bytes != u64::MAX => Some(
+                self.clone_volume_bytes(total_storage_bytes)
+                    .saturating_mul(u64::from(max)),
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +116,26 @@ mod tests {
         assert_eq!(limits.max_bindings, Some(20));
         assert!(limits.auto_refresh);
         assert!(limits.sparse_checkout);
+    }
+
+    #[test]
+    fn the_clone_volume_and_the_allowance_per_tier() {
+        const MIB: u64 = 1024 * 1024;
+        let free = GitRepoTierLimits::for_tier(ZaruTier::Free);
+        assert_eq!(free.clone_volume_bytes(500 * MIB), 250 * MIB);
+        assert_eq!(free.bindings_allowance_bytes(500 * MIB), Some(250 * MIB));
+        let pro = GitRepoTierLimits::for_tier(ZaruTier::Pro);
+        assert_eq!(pro.clone_volume_bytes(10 * 1024 * MIB), 500 * MIB);
+        assert_eq!(
+            pro.bindings_allowance_bytes(10 * 1024 * MIB),
+            Some(2500 * MIB)
+        );
+        let enterprise = GitRepoTierLimits::for_tier(ZaruTier::Enterprise);
+        assert_eq!(
+            enterprise.clone_volume_bytes(u64::MAX),
+            DEFAULT_CLONE_VOLUME_BYTES
+        );
+        assert_eq!(enterprise.bindings_allowance_bytes(u64::MAX), None);
     }
 
     #[test]
