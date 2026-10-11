@@ -88,7 +88,7 @@ fn manifest_with(provider: LLMProviderConfig) -> NodeConfigManifest {
 async fn chat(registry: &ProviderRegistry) {
     let messages = [ChatMessage {
         role: "user".to_string(),
-        content: "hello".to_string(),
+        content: "hello".into(),
         tool_call_id: None,
         tool_calls: None,
     }];

@@ -6,8 +6,8 @@
 
 use super::openai::SentToolNames;
 use crate::domain::llm::{
-    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
-    LLMError, LLMProvider, ToolSchema,
+    carries_images, images_refused, ChatMessage, ChatResponse, ChatToolCall, FinishReason,
+    GenerationOptions, GenerationResponse, LLMError, LLMProvider, MessageContent, ToolSchema,
 };
 use crate::domain::secrets::SensitiveUrl;
 use async_trait::async_trait;
@@ -185,7 +185,7 @@ impl LLMProvider for GeminiAdapter {
     ) -> Result<GenerationResponse, LLMError> {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: prompt.to_string(),
+            content: MessageContent::from(prompt),
             tool_call_id: None,
             tool_calls: None,
         }];
@@ -203,10 +203,15 @@ impl LLMProvider for GeminiAdapter {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
+        // This adapter sends text only: an image part is refused before
+        // any request, and the registry names the alias in the refusal.
+        if carries_images(messages) {
+            return Err(images_refused("gemini"));
+        }
         let system_text = messages
             .iter()
             .filter(|m| m.role == "system")
-            .map(|m| m.content.as_str())
+            .map(|m| m.content.as_text())
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -224,7 +229,7 @@ impl LLMProvider for GeminiAdapter {
                     let mut parts = Vec::new();
                     if !m.content.is_empty() {
                         parts.push(GeminiPart {
-                            text: Some(m.content.clone()),
+                            text: Some(m.content.as_text()),
                             function_call: None,
                             function_response: None,
                             thought: None,
@@ -256,7 +261,7 @@ impl LLMProvider for GeminiAdapter {
                                     .clone()
                                     .unwrap_or_else(|| "tool_result".to_string()),
                                 response: serde_json::json!({
-                                    "content": m.content,
+                                    "content": m.content.as_text(),
                                 }),
                             }),
                             thought: None,
@@ -266,7 +271,7 @@ impl LLMProvider for GeminiAdapter {
                     GeminiContent {
                         role,
                         parts: vec![GeminiPart {
-                            text: Some(m.content.clone()),
+                            text: Some(m.content.as_text()),
                             function_call: None,
                             function_response: None,
                             thought: None,

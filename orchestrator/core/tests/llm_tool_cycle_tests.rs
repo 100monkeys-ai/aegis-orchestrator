@@ -63,7 +63,7 @@ async fn stand_in(answer: Value) -> (String, Bodies) {
 fn message(role: &str, content: &str) -> ChatMessage {
     ChatMessage {
         role: role.to_string(),
-        content: content.to_string(),
+        content: content.into(),
         tool_call_id: None,
         tool_calls: None,
     }
@@ -107,7 +107,7 @@ fn tool_cycle_history() -> Vec<ChatMessage> {
         message("user", "What port does the service listen on?"),
         ChatMessage {
             role: "assistant".to_string(),
-            content: String::new(),
+            content: String::new().into(),
             tool_call_id: None,
             tool_calls: Some(vec![ChatToolCall {
                 id: "call_1".to_string(),
@@ -117,7 +117,7 @@ fn tool_cycle_history() -> Vec<ChatMessage> {
         },
         ChatMessage {
             role: "tool".to_string(),
-            content: "port: 8443".to_string(),
+            content: "port: 8443".into(),
             tool_call_id: Some("call_1".to_string()),
             tool_calls: None,
         },
@@ -187,7 +187,7 @@ async fn an_assistant_message_with_text_keeps_it_and_other_roles_are_unchanged()
         message("user", "Read the config, then tell me the port."),
         ChatMessage {
             role: "assistant".to_string(),
-            content: "Reading the config now.".to_string(),
+            content: "Reading the config now.".into(),
             tool_call_id: None,
             tool_calls: Some(vec![ChatToolCall {
                 id: "call_2".to_string(),
@@ -197,7 +197,7 @@ async fn an_assistant_message_with_text_keeps_it_and_other_roles_are_unchanged()
         },
         ChatMessage {
             role: "tool".to_string(),
-            content: "port: 8443".to_string(),
+            content: "port: 8443".into(),
             tool_call_id: Some("call_2".to_string()),
             tool_calls: None,
         },

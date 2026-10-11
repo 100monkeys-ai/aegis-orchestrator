@@ -47,7 +47,11 @@ pub trait LLMProvider: Send + Sync {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
-        // Default: concatenate history into a single prompt and return as FinalText
+        // Default: concatenate history into a single prompt and return as FinalText.
+        // A single prompt has no image form.
+        if carries_images(messages) {
+            return Err(images_refused("a single-prompt provider"));
+        }
         let prompt = messages
             .iter()
             .map(|m| format!("{}: {}", m.role, m.content))
@@ -74,14 +78,184 @@ pub trait LLMProvider: Send + Sync {
 pub struct ChatMessage {
     /// Role: `"system"`, `"user"`, `"assistant"`, or `"tool"`.
     pub role: String,
-    /// Message content.
-    pub content: String,
+    /// Message content: text parts and image parts, in order.
+    pub content: MessageContent,
     /// Tool call ID (required when `role == "tool"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Tool calls requested by the assistant (required when `role == "assistant"` and it generated tool calls).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+/// A message's content: its parts in order, text and images interleaved
+/// (AEGIS ADR-046 D2). Content of one text part, the common case, is
+/// serialised as a plain string; content with an image as the array of parts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ContentWire", into = "ContentWire")]
+pub struct MessageContent {
+    parts: Vec<ContentPart>,
+}
+
+/// One part of a message's content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    /// Text.
+    Text { text: String },
+    /// An image, by URL or by its bytes, with its MIME type
+    /// (`image/png`, `image/jpeg`, …).
+    Image {
+        source: ImageSource,
+        mime_type: String,
+    },
+}
+
+/// Where an image part's image is: a URL the provider fetches, or its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSource {
+    /// A URL the provider can fetch.
+    Url(String),
+    /// The image's bytes, serialised as base64.
+    Bytes(#[serde(with = "base64_bytes")] Vec<u8>),
+}
+
+impl ImageSource {
+    /// The URL a provider is sent: the URL itself, or a `data:` URL of the
+    /// bytes with their MIME type.
+    pub fn url_for(&self, mime_type: &str) -> String {
+        use base64::Engine;
+        match self {
+            ImageSource::Url(url) => url.clone(),
+            ImageSource::Bytes(bytes) => format!(
+                "data:{mime_type};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ),
+        }
+    }
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(d)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The serialised form of [`MessageContent`]: a string, or the parts.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ContentWire {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl From<ContentWire> for MessageContent {
+    fn from(wire: ContentWire) -> Self {
+        match wire {
+            ContentWire::Text(text) => MessageContent::from(text),
+            ContentWire::Parts(parts) => MessageContent::from_parts(parts),
+        }
+    }
+}
+
+impl From<MessageContent> for ContentWire {
+    fn from(content: MessageContent) -> Self {
+        if content.has_images() || content.parts.len() > 1 {
+            ContentWire::Parts(content.parts)
+        } else {
+            ContentWire::Text(content.as_text())
+        }
+    }
+}
+
+impl MessageContent {
+    /// Content of these parts, in order.
+    pub fn from_parts(parts: Vec<ContentPart>) -> Self {
+        Self { parts }
+    }
+
+    /// The parts, in order.
+    pub fn parts(&self) -> &[ContentPart] {
+        &self.parts
+    }
+
+    /// Add parts after the last.
+    pub fn extend(&mut self, parts: impl IntoIterator<Item = ContentPart>) {
+        self.parts.extend(parts);
+    }
+
+    /// The text parts, joined by a blank line; images are left out.
+    pub fn as_text(&self) -> String {
+        self.parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Whether any part is an image.
+    pub fn has_images(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Image { .. }))
+    }
+
+    /// Whether the content holds no image and no text.
+    pub fn is_empty(&self) -> bool {
+        !self.has_images() && self.as_text().is_empty()
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(text: String) -> Self {
+        Self {
+            parts: vec![ContentPart::Text { text }],
+        }
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_string())
+    }
+}
+
+impl std::fmt::Display for MessageContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_text())
+    }
+}
+
+/// The words a refusal of an image part carries after the alias or model
+/// it names. The registry recognises an adapter's refusal by them and puts
+/// in the alias, which only it knows.
+pub const IMAGES_REFUSED: &str = "cannot read images: ";
+
+/// The refusal of an adapter whose provider is sent text only, for a
+/// request carrying an image part. Returned before any request is sent.
+pub fn images_refused(provider: &str) -> LLMError {
+    LLMError::InvalidInput(format!(
+        "{IMAGES_REFUSED}its provider, {provider}, is sent text only"
+    ))
+}
+
+/// Whether any of the messages carries an image part.
+pub fn carries_images(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|m| m.content.has_images())
 }
 
 /// JSON Schema description of a single tool available to the LLM.

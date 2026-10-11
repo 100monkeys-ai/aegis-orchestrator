@@ -9,8 +9,8 @@
 
 use super::openai::SentToolNames;
 use crate::domain::llm::{
-    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
-    LLMError, LLMProvider, ToolSchema,
+    carries_images, images_refused, ChatMessage, ChatResponse, ChatToolCall, FinishReason,
+    GenerationOptions, GenerationResponse, LLMError, LLMProvider, MessageContent, ToolSchema,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,7 @@ impl LLMProvider for OllamaAdapter {
     ) -> Result<GenerationResponse, LLMError> {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: prompt.to_string(),
+            content: MessageContent::from(prompt),
             tool_call_id: None,
             tool_calls: None,
         }];
@@ -114,11 +114,16 @@ impl LLMProvider for OllamaAdapter {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
+        // This adapter sends text only: an image part is refused before
+        // any request, and the registry names the alias in the refusal.
+        if carries_images(messages) {
+            return Err(images_refused("ollama"));
+        }
         let ollama_messages: Vec<OllamaChatMessage> = messages
             .iter()
             .map(|m| OllamaChatMessage {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: m.content.as_text(),
             })
             .collect();
 

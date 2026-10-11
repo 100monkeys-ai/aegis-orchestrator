@@ -15,8 +15,8 @@
 //! AI Gateway named by `cf-aig-gateway-id`.
 
 use crate::domain::llm::{
-    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
-    LLMError, LLMProvider, ToolSchema,
+    ChatMessage, ChatResponse, ChatToolCall, ContentPart, FinishReason, GenerationOptions,
+    GenerationResponse, LLMError, LLMProvider, MessageContent, ToolSchema,
 };
 use crate::domain::secrets::SensitiveUrl;
 use crate::domain::vision::{
@@ -173,13 +173,61 @@ struct OpenAIRequest {
 struct OpenAIMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<OpenAIContent>,
     /// Present when role == "assistant" and the model requested tool calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAIToolCall>>,
     /// Present when role == "tool" (result of a tool call).
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+/// A message's `content`: a string, or the Chat Completions array of parts
+/// when the message carries an image (`text` and `image_url` parts).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum OpenAIContent {
+    Text(String),
+    Parts(Vec<serde_json::Value>),
+}
+
+impl OpenAIContent {
+    /// The content as a request sends it: a string for text alone, the
+    /// array of parts when an image is among them, each image's URL its own
+    /// or a `data:` URL of its bytes.
+    fn of(content: &MessageContent) -> Self {
+        if !content.has_images() {
+            return OpenAIContent::Text(content.as_text());
+        }
+        OpenAIContent::Parts(
+            content
+                .parts()
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => {
+                        serde_json::json!({"type": "text", "text": text})
+                    }
+                    ContentPart::Image { source, mime_type } => serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": source.url_for(mime_type)},
+                    }),
+                })
+                .collect(),
+        )
+    }
+
+    /// The text of an answer's content; the text parts joined when the
+    /// provider answered an array.
+    fn into_text(self) -> String {
+        match self {
+            OpenAIContent::Text(text) => text,
+            OpenAIContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -257,7 +305,7 @@ impl LLMProvider for OpenAIAdapter {
     ) -> Result<GenerationResponse, LLMError> {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: prompt.to_string(),
+            content: MessageContent::from(prompt),
             tool_call_id: None,
             tool_calls: None,
         }];
@@ -293,7 +341,7 @@ impl LLMProvider for OpenAIAdapter {
                 {
                     None
                 } else {
-                    Some(m.content.clone())
+                    Some(OpenAIContent::of(&m.content))
                 },
                 tool_calls: m.tool_calls.as_ref().map(|tcs| {
                     tcs.iter()
@@ -450,7 +498,12 @@ impl LLMProvider for OpenAIAdapter {
             }
         }
 
-        let text = choice.message.content.clone().unwrap_or_default();
+        let text = choice
+            .message
+            .content
+            .clone()
+            .map(OpenAIContent::into_text)
+            .unwrap_or_default();
 
         // Fallback: If smaller models hallucinated the OpenAI JSON array inside raw text
         if let Some(start_idx) = text.find("[{\"function\":") {
@@ -691,7 +744,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: vec![OpenAIMessage {
                 role: "user".to_string(),
-                content: Some("Hello".to_string()),
+                content: Some(OpenAIContent::Text("Hello".to_string())),
                 tool_calls: None,
                 tool_call_id: None,
             }],

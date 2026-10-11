@@ -10,7 +10,7 @@
 
 use crate::domain::llm::{
     ChatMessage, ChatResponse, GenerationOptions, GenerationResponse, LLMError, LLMProvider,
-    ToolSchema,
+    ToolSchema, IMAGES_REFUSED,
 };
 use crate::domain::node_config::{
     resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, NodeConfigManifest,
@@ -96,6 +96,9 @@ pub struct ProviderRegistry {
     /// alias → per-model `temperature` override from config.
     /// When set, overrides `GenerationOptions::temperature` for calls on that alias.
     alias_temperatures: HashMap<String, f32>,
+    /// Aliases whose winning model entry carries the capability `vision`:
+    /// the aliases an image is shown to (AEGIS ADR-046 D2).
+    vision_aliases: std::collections::HashSet<String>,
     max_retries: u32,
     retry_delay_ms: u64,
     /// Wall-clock budget for the full retry+fallback loop in `generate_chat` /
@@ -163,6 +166,22 @@ fn with_fallback_note(primary: LLMError, note: &str) -> LLMError {
         LLMError::Network(msg) => LLMError::Network(format!("{msg}; {note}")),
         LLMError::Provider(msg) => LLMError::Provider(format!("{msg}; {note}")),
         other => LLMError::Provider(format!("{other}; {note}")),
+    }
+}
+
+/// The capability an alias's model entry declares when its model reads
+/// images (`ModelConfig.capabilities`).
+const VISION: &str = "vision";
+
+/// An adapter's refusal of an image part with the alias put in, when `e` is
+/// one (`llm::images_refused`); the adapter knows its provider, only the
+/// registry the alias.
+fn images_refused_for_alias(e: &LLMError, alias: &str) -> Option<LLMError> {
+    match e {
+        LLMError::InvalidInput(msg) if msg.starts_with(IMAGES_REFUSED) => {
+            Some(LLMError::InvalidInput(format!("alias '{alias}' {msg}")))
+        }
+        _ => None,
     }
 }
 
@@ -514,6 +533,7 @@ impl ProviderRegistry {
         let mut raw_api_keys: HashMap<String, Option<SensitiveString>> = HashMap::new();
         let mut alias_max_output_tokens: HashMap<String, u32> = HashMap::new();
         let mut alias_temperatures: HashMap<String, f32> = HashMap::new();
+        let mut vision_aliases = std::collections::HashSet::new();
         // alias → its winning entry's `fallback_alias`, for aliases whose adapter built.
         let mut fallback_alias_names: Vec<(String, String)> = Vec::new();
         // alias → its winning entry's window for a request in bytes (ADR-131 U16a).
@@ -558,6 +578,9 @@ impl ProviderRegistry {
                                     ),
                                 );
                                 raw_api_keys.insert(alias.clone(), provider_config.api_key.clone());
+                                if model_config.capabilities.iter().any(|c| c == VISION) {
+                                    vision_aliases.insert(alias.clone());
+                                }
                                 if let Some(max_tokens) = model_config.max_output_tokens {
                                     info!(
                                         "Alias '{}' max_output_tokens override: {}",
@@ -634,6 +657,7 @@ impl ProviderRegistry {
             raw_api_keys,
             alias_max_output_tokens,
             alias_temperatures,
+            vision_aliases,
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
             llm_overall_timeout_secs: config.spec.llm_selection.llm_overall_timeout_secs,
@@ -945,6 +969,10 @@ impl ProviderRegistry {
                             self.max_retries
                         );
                         return PrimaryEnd::TimeLimit(timeout);
+                    }
+
+                    if let Some(refusal) = images_refused_for_alias(&e, alias) {
+                        return PrimaryEnd::NonRetryable(refusal);
                     }
 
                     // Short-circuit on deterministic upstream rejections — retrying with
@@ -1471,6 +1499,12 @@ impl ProviderRegistry {
         self.alias_map.get(alias).map(|(model, _)| model.as_str())
     }
 
+    /// Whether the alias's model reads images: its model entry declares the
+    /// capability `vision`. An alias the table does not hold reads none.
+    pub fn alias_reads_images(&self, alias: &str) -> bool {
+        self.vision_aliases.contains(alias)
+    }
+
     /// Determine whether the API key for a given model alias is platform-managed
     /// or user-provided (BYOK).
     ///
@@ -1561,6 +1595,7 @@ impl ProviderRegistry {
             raw_api_keys: HashMap::new(),
             alias_max_output_tokens: HashMap::new(),
             alias_temperatures: HashMap::new(),
+            vision_aliases: std::collections::HashSet::new(),
             max_retries,
             retry_delay_ms,
             llm_overall_timeout_secs,
@@ -2887,7 +2922,7 @@ mod tests {
     fn user_message(content: String) -> Vec<ChatMessage> {
         vec![ChatMessage {
             role: "user".to_string(),
-            content,
+            content: content.into(),
             tool_call_id: None,
             tool_calls: None,
         }]

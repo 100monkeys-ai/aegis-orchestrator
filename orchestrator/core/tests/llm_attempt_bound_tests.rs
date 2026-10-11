@@ -130,7 +130,7 @@ models:
 async fn chat(registry: &ProviderRegistry) -> Result<ChatResponse, LLMError> {
     let messages = [ChatMessage {
         role: "user".to_string(),
-        content: "hello".to_string(),
+        content: "hello".into(),
         tool_call_id: None,
         tool_calls: None,
     }];

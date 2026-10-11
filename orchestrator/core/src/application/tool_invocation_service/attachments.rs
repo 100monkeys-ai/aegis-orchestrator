@@ -203,6 +203,27 @@ pub async fn invoke_aegis_attachment_read_tool(
     }
 }
 
+impl crate::application::tool_invocation_service::ToolInvocationService {
+    /// The bytes of one of an execution's attachments, read for its agent's
+    /// turn by the same tenant-checked path as `aegis.attachment.read`, so an
+    /// image reaches a model that reads images (AEGIS ADR-046 D2). The error
+    /// is a sentence the turn's note carries.
+    pub(crate) async fn read_turn_attachment(
+        &self,
+        tenant_id: &TenantId,
+        attachment: &crate::domain::execution::AttachmentRef,
+    ) -> Result<Vec<u8>, String> {
+        let Some(file_ops) = &self.file_operations_service else {
+            return Err("no file service is configured on this node".to_string());
+        };
+        file_ops
+            .read_attachment_for_tenant(&attachment.volume_id, tenant_id, &attachment.path)
+            .await
+            .map(|content| content.data)
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

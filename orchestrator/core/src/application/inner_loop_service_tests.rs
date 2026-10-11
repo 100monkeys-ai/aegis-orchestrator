@@ -939,7 +939,7 @@ fn last_tool_message(conversation: &[ChatMessage]) -> String {
         .iter()
         .rev()
         .find(|m| m.role == "tool")
-        .map(|m| m.content.clone())
+        .map(|m| m.content.as_text())
         .expect("a tool message")
 }
 
@@ -947,7 +947,7 @@ fn first_user_message(conversation: &[ChatMessage]) -> String {
     conversation
         .iter()
         .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
+        .map(|m| m.content.as_text())
         .expect("a user message")
 }
 
@@ -1533,7 +1533,7 @@ fn the_users_after_the_prompt(conversation: &[ChatMessage]) -> Vec<String> {
         .iter()
         .filter(|m| m.role == "user")
         .skip(1)
-        .map(|m| m.content.clone())
+        .map(|m| m.content.as_text())
         .collect()
 }
 

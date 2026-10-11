@@ -9,8 +9,8 @@
 
 use super::openai::SentToolNames;
 use crate::domain::llm::{
-    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
-    LLMError, LLMProvider, ToolSchema,
+    carries_images, images_refused, ChatMessage, ChatResponse, ChatToolCall, FinishReason,
+    GenerationOptions, GenerationResponse, LLMError, LLMProvider, MessageContent, ToolSchema,
 };
 use crate::domain::secrets::SensitiveUrl;
 use async_trait::async_trait;
@@ -151,7 +151,7 @@ impl LLMProvider for AnthropicAdapter {
     ) -> Result<GenerationResponse, LLMError> {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: prompt.to_string(),
+            content: MessageContent::from(prompt),
             tool_call_id: None,
             tool_calls: None,
         }];
@@ -169,15 +169,20 @@ impl LLMProvider for AnthropicAdapter {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
+        // This adapter sends text only: an image part is refused before
+        // any request, and the registry names the alias in the refusal.
+        if carries_images(messages) {
+            return Err(images_refused("anthropic"));
+        }
         // Map domain ChatMessage → Anthropic message.
         // role="system" is extracted to the top-level `system` parameter; Anthropic's
         // Messages API rejects system role entries inside the messages array.
         // role="tool" becomes a "tool_result" content-block array (Anthropic pattern).
         let system_prompt: Option<String> = {
-            let parts: Vec<&str> = messages
+            let parts: Vec<String> = messages
                 .iter()
                 .filter(|m| m.role == "system")
-                .map(|m| m.content.as_str())
+                .map(|m| m.content.as_text())
                 .collect();
             if parts.is_empty() {
                 None
@@ -194,7 +199,7 @@ impl LLMProvider for AnthropicAdapter {
                     let content = serde_json::json!([{
                         "type": "tool_result",
                         "tool_use_id": m.tool_call_id,
-                        "content": m.content,
+                        "content": m.content.as_text(),
                     }]);
                     AnthropicMessage {
                         role: "user".to_string(), // Anthropic requires user role for tool results
@@ -205,7 +210,7 @@ impl LLMProvider for AnthropicAdapter {
                     if !m.content.is_empty() {
                         content_blocks.push(serde_json::json!({
                             "type": "text",
-                            "text": m.content,
+                            "text": m.content.as_text(),
                         }));
                     }
                     for tc in m.tool_calls.as_ref().unwrap() {
@@ -223,7 +228,7 @@ impl LLMProvider for AnthropicAdapter {
                 } else {
                     AnthropicMessage {
                         role: m.role.clone(),
-                        content: serde_json::Value::String(m.content.clone()),
+                        content: serde_json::Value::String(m.content.as_text()),
                     }
                 }
             })

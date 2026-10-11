@@ -18,10 +18,10 @@ use crate::domain::dispatch::{
     AgentMessage, ConversationMessage, DispatchAction, DispatchId, OrchestratorMessage, ToolCall,
 };
 use crate::domain::events::{ExecutionEvent, RefusalLayer};
-use crate::domain::execution::{ExecutionId, Iteration, TrajectoryStep};
+use crate::domain::execution::{AttachmentRef, ExecutionId, Iteration, TrajectoryStep};
 use crate::domain::goal::{judge_context_or_default, JudgeContextSource};
 use crate::domain::iam::UserIdentity;
-use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
+use crate::domain::llm::{ChatMessage, ContentPart, GenerationOptions, ImageSource, ToolSchema};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::llm::registry::{ApiKeySource, ProviderRegistry};
 
@@ -108,6 +108,56 @@ struct ExecutionContext {
     /// `LlmInteraction` already showed (AEGIS ADR-131 U34d): the next one's
     /// prompt is the messages after them.
     conversation_shown: usize,
+    /// What the execution's attachments add to the first user message of
+    /// every model call of this try ([`turn_attachment_parts`]).
+    attachment_parts: Vec<ContentPart>,
+}
+
+/// The content an agent's turn adds for its execution's attachments (AEGIS
+/// ADR-046 D2): for each attachment of an `image/` MIME type, an image part
+/// with its bytes after a line naming it when the alias reads images, or a
+/// text note naming it when the alias does not, or when its bytes could not
+/// be read. `read` is called only for an image an alias that reads images is
+/// shown. An attachment that is not an image adds nothing: its reference is
+/// already in the prompt's input.
+pub fn turn_attachment_parts(
+    attachments: &[AttachmentRef],
+    alias: &str,
+    reads_images: bool,
+    mut read: impl FnMut(&AttachmentRef) -> Result<Vec<u8>, String>,
+) -> Vec<ContentPart> {
+    let mut parts = Vec::new();
+    for attachment in attachments
+        .iter()
+        .filter(|a| a.mime_type.starts_with("image/"))
+    {
+        let (name, mime_type) = (&attachment.name, &attachment.mime_type);
+        if !reads_images {
+            parts.push(ContentPart::Text {
+                text: format!(
+                    "The image {name} ({mime_type}) is attached and not shown to you: the model of alias '{alias}' does not read images."
+                ),
+            });
+            continue;
+        }
+        match read(attachment) {
+            Ok(bytes) => {
+                parts.push(ContentPart::Text {
+                    text: format!("The attached image {name}:"),
+                });
+                parts.push(ContentPart::Image {
+                    source: ImageSource::Bytes(bytes),
+                    mime_type: mime_type.clone(),
+                });
+            }
+            Err(error) => parts.push(ContentPart::Text {
+                text: format!(
+                    "The image {name} ({mime_type}) is attached and could not be read: {error}."
+                ),
+            }),
+        }
+    }
+    parts
 }
 
 /// The sentence a try fails with when the model answers text where it had to
@@ -549,6 +599,32 @@ impl InnerLoopService {
                     }
                 }
 
+                // The execution's image attachments, shown to a model that
+                // reads images and named to one that does not.
+                let attachments: &[AttachmentRef] = match exec_record {
+                    Ok(ref e) => &e.input.attachments,
+                    Err(_) => &[],
+                };
+                let reads_images = self.provider_registry.alias_reads_images(&model_alias);
+                let mut read = HashMap::new();
+                if reads_images {
+                    for a in attachments
+                        .iter()
+                        .filter(|a| a.mime_type.starts_with("image/"))
+                    {
+                        let bytes = self
+                            .tool_invocation_service
+                            .read_turn_attachment(&tenant_id, a)
+                            .await;
+                        read.insert(a.path.clone(), bytes);
+                    }
+                }
+                let attachment_parts =
+                    turn_attachment_parts(attachments, &model_alias, reads_images, |a| {
+                        read.remove(&a.path)
+                            .unwrap_or_else(|| Err("it was not read".to_string()))
+                    });
+
                 self.active_executions.write().await.insert(
                     execution_id.clone(),
                     ExecutionContext {
@@ -574,6 +650,7 @@ impl InnerLoopService {
                         tool_call_requirement,
                         tool_call_reminded: false,
                         conversation_shown: 0,
+                        attachment_parts,
                     },
                 );
 
@@ -724,6 +801,7 @@ impl InnerLoopService {
                 .call_llm(
                     &ctx.model_alias,
                     &ctx.conversation,
+                    &ctx.attachment_parts,
                     &tool_schemas,
                     ctx.user_identity.as_ref(),
                     &ctx.tenant_id,
@@ -1192,6 +1270,7 @@ impl InnerLoopService {
         &self,
         model_alias: &str,
         conversation: &[ConversationMessage],
+        attachment_parts: &[ContentPart],
         tool_schemas: &[Value],
         user_identity: Option<&UserIdentity>,
         // ADR-097 footgun #8: the parent execution's tenant is REQUIRED
@@ -1206,11 +1285,19 @@ impl InnerLoopService {
         llm_timeout_seconds: u64,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<LlmOutput> {
+        let first_user = conversation.iter().position(|m| m.role == "user");
         let chat_messages: Vec<ChatMessage> = conversation
             .iter()
-            .map(|m| ChatMessage {
+            .enumerate()
+            .map(|(i, m)| ChatMessage {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: {
+                    let mut content = crate::domain::llm::MessageContent::from(m.content.as_str());
+                    if Some(i) == first_user {
+                        content.extend(attachment_parts.iter().cloned());
+                    }
+                    content
+                },
                 tool_call_id: m.tool_call_id.clone(),
                 tool_calls: m.tool_calls.as_ref().map(|tcs| {
                     tcs.iter()
