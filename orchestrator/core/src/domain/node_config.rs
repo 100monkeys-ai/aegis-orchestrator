@@ -466,6 +466,16 @@ impl LLMProviderConfig {
     }
 }
 
+impl ModelConfig {
+    /// True for an image generation model: its capabilities carry
+    /// `image_generation`.
+    pub fn generates_images(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::domain::vision::IMAGE_GENERATION_CAPABILITY)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Model alias used in agent manifests (e.g., "default", "fast", "smart")
@@ -474,8 +484,11 @@ pub struct ModelConfig {
     /// Actual model identifier for the provider API
     pub model: String,
 
-    /// Model capabilities
-    pub capabilities: Vec<String>, // ["chat", "embedding", "reasoning", "vision"]
+    /// Model capabilities: `chat`, `embedding`, `reasoning`, `vision`,
+    /// `code`, or `image_generation`. An alias with `image_generation` is an
+    /// image generation model, bound to an image provider and never to a
+    /// language model (AEGIS ADR-143 I1).
+    pub capabilities: Vec<String>,
 
     /// Maximum context window size in tokens
     pub context_window: u32,

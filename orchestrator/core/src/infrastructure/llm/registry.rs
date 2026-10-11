@@ -16,6 +16,7 @@ use crate::domain::node_config::{
     resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, NodeConfigManifest,
 };
 use crate::domain::secrets::SensitiveString;
+use crate::domain::vision::VisionProvider;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
@@ -75,6 +76,10 @@ pub struct ProviderRegistry {
     alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)>,
     /// provider_name → adapter used for health checks (built from models.first()).
     providers: HashMap<String, Arc<dyn LLMProvider>>,
+    /// The node's image generation aliases, in the order the configuration
+    /// lists them, each bound to an image provider for its exact model and to
+    /// no `LLMProvider` (AEGIS ADR-143 I1, ADR-046 D1 and Alternative 2).
+    image_aliases: Vec<(String, Arc<dyn VisionProvider>)>,
     /// Fallback adapter resolved at construction time; used when primary exhausts retries,
     /// for an alias that is not in `alias_fallbacks`.
     fallback_provider: Option<(String, Arc<dyn LLMProvider>)>,
@@ -513,6 +518,7 @@ impl ProviderRegistry {
         let mut fallback_alias_names: Vec<(String, String)> = Vec::new();
         // alias → its winning entry's window for a request in bytes (ADR-131 U16a).
         let mut alias_window_bytes: HashMap<String, u64> = HashMap::new();
+        let mut image_aliases: Vec<(String, Arc<dyn VisionProvider>)> = Vec::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -522,6 +528,24 @@ impl ProviderRegistry {
                 let alias = &model_config.alias;
                 if let Some((winner_provider, winner_model, _, _)) = alias_candidates.get(alias) {
                     if winner_provider == &provider_config.name
+                        && winner_model == &model_config.model
+                        && model_config.generates_images()
+                    {
+                        // An image generation alias is bound to an image
+                        // provider and never to a language model.
+                        match Self::create_image_adapter(provider_config, winner_model) {
+                            Ok(adapter) => {
+                                info!("Alias '{}' generates images ({})", alias, winner_model);
+                                image_aliases.push((alias.clone(), adapter));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to create image adapter for alias '{}' ({}): {}",
+                                    alias, winner_model, e
+                                );
+                            }
+                        }
+                    } else if winner_provider == &provider_config.name
                         && winner_model == &model_config.model
                     {
                         match Self::create_adapter(provider_config, winner_model) {
@@ -604,6 +628,7 @@ impl ProviderRegistry {
         Ok(Self {
             alias_map,
             providers,
+            image_aliases,
             fallback_provider,
             alias_fallbacks,
             raw_api_keys,
@@ -661,6 +686,31 @@ impl ProviderRegistry {
         };
 
         Ok(provider)
+    }
+
+    /// Create the image provider for an image generation alias of `config`:
+    /// the `openai` and `openai-compatible` adapters, against the provider's
+    /// image generation endpoint. Any other provider type has none.
+    fn create_image_adapter(
+        config: &LLMProviderConfig,
+        model: &str,
+    ) -> anyhow::Result<Arc<dyn VisionProvider>> {
+        match config.provider_type.as_str() {
+            "openai" | "openai-compatible" => {
+                let endpoint = if config.endpoint.expose().is_empty() {
+                    "https://api.openai.com/v1".to_string()
+                } else {
+                    config.endpoint.expose().to_string()
+                };
+                Ok(Arc::new(OpenAIAdapter::new(
+                    endpoint,
+                    Self::resolve_api_key(&config.api_key)?,
+                    model.to_string(),
+                    Self::provider_headers(config)?,
+                )))
+            }
+            other => anyhow::bail!("provider type '{other}' has no image generation adapter"),
+        }
     }
 
     /// The provider's configured `headers` as a request header map (AEGIS
@@ -1394,6 +1444,25 @@ impl ProviderRegistry {
         self.alias_map.contains_key(alias)
     }
 
+    /// The node's image generation aliases, in the order its configuration
+    /// lists them: the first is the default of an image generation call that
+    /// names none (AEGIS ADR-143 I2).
+    pub fn image_generation_aliases(&self) -> Vec<String> {
+        self.image_aliases
+            .iter()
+            .map(|(alias, _)| alias.clone())
+            .collect()
+    }
+
+    /// The image provider an image generation alias is bound to; `None` for
+    /// any other alias.
+    pub fn image_provider(&self, alias: &str) -> Option<Arc<dyn VisionProvider>> {
+        self.image_aliases
+            .iter()
+            .find(|(name, _)| name == alias)
+            .map(|(_, adapter)| adapter.clone())
+    }
+
     /// The model a call on `alias` is sent to, read from the alias map this
     /// registry routes every call through (AEGIS ADR-124 D3): the winner of
     /// the selection strategy whose adapter was built. `None` for an alias
@@ -1476,6 +1545,7 @@ impl ProviderRegistry {
         Self {
             alias_map,
             providers,
+            image_aliases: Vec::new(),
             fallback_provider,
             alias_fallbacks: HashMap::new(),
             raw_api_keys: HashMap::new(),

@@ -19,6 +19,9 @@ use crate::domain::llm::{
     LLMError, LLMProvider, ToolSchema,
 };
 use crate::domain::secrets::SensitiveUrl;
+use crate::domain::vision::{
+    Image, ImageOptions, ImageResponse, Mask, VisionError, VisionProvider,
+};
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -507,6 +510,161 @@ impl LLMProvider for OpenAIAdapter {
         } else {
             Err(LLMError::Network(format!("HTTP {}", response.status())))
         }
+    }
+}
+
+// ─── Image generation (AEGIS ADR-046 D1, ADR-143 I1) ─────────────────────────
+
+/// The body of a request to `/images/generations`.
+#[derive(Serialize)]
+struct OpenAIImageRequest<'a> {
+    model: &'a str,
+    prompt: &'a str,
+    n: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIImageResponse {
+    data: Vec<OpenAIImageDatum>,
+}
+
+/// One image of the answer: its bytes in base64, or a URL to fetch them from.
+#[derive(Deserialize)]
+struct OpenAIImageDatum {
+    #[serde(default)]
+    b64_json: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// The content type of an image's bytes, read from the bytes; `image/png`,
+/// what the endpoint answers by default, when they name none.
+fn image_content_type(bytes: &[u8]) -> String {
+    infer::get(bytes)
+        .map(|kind| kind.mime_type().to_string())
+        .filter(|mime| mime.starts_with("image/"))
+        .unwrap_or_else(|| "image/png".to_string())
+}
+
+impl OpenAIAdapter {
+    /// The bytes of one image of the answer.
+    async fn image_bytes(&self, datum: &OpenAIImageDatum) -> Result<Vec<u8>, VisionError> {
+        use base64::Engine;
+        if let Some(b64) = &datum.b64_json {
+            return base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| {
+                    VisionError::Provider(format!("an image's b64_json is not base64: {e}"))
+                });
+        }
+        let Some(url) = &datum.url else {
+            return Err(VisionError::Provider(
+                "an image of the answer carries neither b64_json nor url".to_string(),
+            ));
+        };
+        // The URL is the provider's signed link to the file: fetched with no
+        // credential of the node's.
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| VisionError::Network(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(VisionError::Provider(format!(
+                "fetching an image of the answer answered HTTP {}",
+                response.status()
+            )));
+        }
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| VisionError::Network(format!("Failed to read an image: {e}")))
+    }
+}
+
+#[async_trait]
+impl VisionProvider for OpenAIAdapter {
+    async fn generate_image(
+        &self,
+        prompt: &str,
+        options: &ImageOptions,
+    ) -> Result<ImageResponse, VisionError> {
+        let url = format!("{}/images/generations", self.endpoint.trim_end_matches('/'));
+        let request = OpenAIImageRequest {
+            model: &self.model,
+            prompt,
+            n: options.count.max(1),
+            size: options.size.as_deref(),
+        };
+        tracing::debug!(
+            provider = "openai",
+            model = %self.model,
+            endpoint_url = %SensitiveUrl::new(url.as_str()),
+            count = request.n,
+            "image generation HTTP request"
+        );
+        let response = self
+            .client
+            .post(&url)
+            .headers(self.headers.clone())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| VisionError::Network(e.to_string()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            let excerpt: String = error_text.chars().take(512).collect();
+            tracing::warn!(
+                provider = "openai",
+                model = %self.model,
+                status = status.as_u16(),
+                body_excerpt = %excerpt,
+                "image generation upstream non-2xx"
+            );
+            return Err(match status.as_u16() {
+                400 => VisionError::InvalidInput(format!("HTTP {status}: {excerpt}")),
+                401 | 403 => VisionError::Authentication(excerpt),
+                429 => VisionError::RateLimit,
+                _ => VisionError::Provider(format!("HTTP {status}: {excerpt}")),
+            });
+        }
+
+        let answer: OpenAIImageResponse = response.json().await.map_err(|e| {
+            VisionError::Provider(format!("the image generation answer did not parse: {e}"))
+        })?;
+        let mut images = Vec::with_capacity(answer.data.len());
+        for datum in &answer.data {
+            let bytes = self.image_bytes(datum).await?;
+            images.push(Image {
+                content_type: image_content_type(&bytes),
+                bytes,
+            });
+        }
+        if images.is_empty() {
+            return Err(VisionError::Provider(
+                "the image generation answer carries no image".to_string(),
+            ));
+        }
+        Ok(ImageResponse { images })
+    }
+
+    async fn edit_image(
+        &self,
+        _image: &Image,
+        _prompt: &str,
+        _mask: Option<&Mask>,
+    ) -> Result<ImageResponse, VisionError> {
+        Err(VisionError::Unsupported(
+            "image editing is not offered by this provider's adapter".to_string(),
+        ))
     }
 }
 

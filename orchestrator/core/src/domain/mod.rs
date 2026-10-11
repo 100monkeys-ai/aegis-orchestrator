@@ -95,6 +95,7 @@ pub mod tenant;
 pub mod tool_approval;
 pub mod tool_requirement;
 pub mod validation;
+pub mod vision;
 pub mod volume;
 pub mod workflow;
 pub mod workflow_registry;

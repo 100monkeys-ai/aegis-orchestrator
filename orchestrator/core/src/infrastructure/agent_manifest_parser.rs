@@ -64,6 +64,33 @@ impl AgentManifestParser {
         Ok(manifest)
     }
 
+    /// Parse an agent manifest for a node whose image generation aliases are
+    /// `image_generation_aliases`: as [`Self::parse_yaml`], and refused when
+    /// its `spec.runtime.model` names one of them (AEGIS ADR-143 I1).
+    pub fn parse_yaml_for_node(
+        yaml: &str,
+        image_generation_aliases: &[String],
+    ) -> Result<AgentManifest> {
+        let manifest = Self::parse_yaml(yaml)?;
+        Self::refuse_image_model(&manifest, image_generation_aliases)?;
+        Ok(manifest)
+    }
+
+    /// Refuse a manifest whose `spec.runtime.model` is an image generation
+    /// alias: an agent's model must be a language model.
+    pub fn refuse_image_model(
+        manifest: &AgentManifest,
+        image_generation_aliases: &[String],
+    ) -> Result<()> {
+        let model = &manifest.spec.runtime.model;
+        if image_generation_aliases.iter().any(|alias| alias == model) {
+            return Err(anyhow!(
+                crate::domain::vision::agent_model_generates_images(model)
+            ));
+        }
+        Ok(())
+    }
+
     /// Parse agent manifest from YAML file
     pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<AgentManifest> {
         let yaml = std::fs::read_to_string(path.as_ref())
