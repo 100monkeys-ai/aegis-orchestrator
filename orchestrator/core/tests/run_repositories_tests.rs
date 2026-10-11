@@ -28,6 +28,9 @@
 //! | The person's name and email stored (G5d) | `a_run_started_by_a_person_with_a_name_and_email_stores_them_in_each_entry` |
 //! | No profile, or one unread (G5d) | `a_run_whose_person_has_no_profile_stores_no_author`, `a_profile_that_cannot_be_read_stores_no_author` |
 //! | A given author replaced (G5d) | `an_author_an_entry_carried_is_replaced_by_the_persons_own` |
+//! | A child of a run that has ended (G4) | `a_child_of_a_failed_run_is_refused_and_takes_no_hold` |
+//! | A container step of a run that has ended (G4) | `a_container_step_of_a_failed_run_is_refused_and_takes_no_hold` |
+//! | A child of a running run, after a restart (G4) | `a_child_of_a_running_run_mounts_and_holds_under_the_run` |
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -1206,5 +1209,329 @@ async fn an_author_an_entry_carried_is_replaced_by_the_persons_own() {
     assert_eq!(
         prepared[0].author, None,
         "the entry's given author survived a person with no profile"
+    );
+}
+
+// ===========================================================================
+// G4: a run that has ended mounts nothing and holds nothing
+// ===========================================================================
+
+/// The refusal of a mount for a run whose record has ended.
+const RUN_ENDED: &str = "this run has ended, so its repositories are released";
+
+/// A runtime that starts no container: a start that gets past its mounts
+/// fails in the supervisor's own task, after the start has answered.
+struct NoContainers;
+
+#[async_trait]
+impl aegis_orchestrator_core::domain::runtime::AgentRuntime for NoContainers {
+    async fn spawn(
+        &self,
+        _config: aegis_orchestrator_core::domain::runtime::RuntimeConfig,
+    ) -> Result<InstanceId, aegis_orchestrator_core::domain::runtime::RuntimeError> {
+        Err(
+            aegis_orchestrator_core::domain::runtime::RuntimeError::SpawnFailed(
+                "these tests start no container".to_string(),
+            ),
+        )
+    }
+    async fn execute(
+        &self,
+        _id: &InstanceId,
+        _input: aegis_orchestrator_core::domain::runtime::TaskInput,
+    ) -> Result<
+        aegis_orchestrator_core::domain::runtime::TaskOutput,
+        aegis_orchestrator_core::domain::runtime::RuntimeError,
+    > {
+        unreachable!("no container is spawned")
+    }
+    async fn terminate(
+        &self,
+        _id: &InstanceId,
+    ) -> Result<(), aegis_orchestrator_core::domain::runtime::RuntimeError> {
+        Ok(())
+    }
+    async fn status(
+        &self,
+        _id: &InstanceId,
+    ) -> Result<
+        aegis_orchestrator_core::domain::runtime::InstanceStatus,
+        aegis_orchestrator_core::domain::runtime::RuntimeError,
+    > {
+        unreachable!("no container is spawned")
+    }
+}
+
+/// A workflow run of `fx`'s tenant holding a Ready binding of `OWNER`'s, and
+/// the execution service its agent states start children through: the
+/// workflow execution `run` (its status `status`), its agent state `state`
+/// (the root of its children), and a judge agent a child runs.
+struct WorkflowRun {
+    executions: aegis_orchestrator_core::application::execution::StandardExecutionService,
+    workflows: Arc<
+        aegis_orchestrator_core::infrastructure::repositories::InMemoryWorkflowExecutionRepository,
+    >,
+    binding: GitRepoBindingId,
+    run: uuid::Uuid,
+    state: aegis_orchestrator_core::domain::execution::ExecutionId,
+    judge: aegis_orchestrator_core::domain::agent::AgentId,
+}
+
+impl WorkflowRun {
+    async fn start(fx: &Fixture) -> Self {
+        use aegis_orchestrator_core::domain::execution::{Execution, ExecutionId, ExecutionInput};
+        use aegis_orchestrator_core::domain::repository::{
+            AgentRepository, ExecutionRepository, WorkflowExecutionRepository,
+        };
+        use aegis_orchestrator_core::infrastructure::repositories::{
+            InMemoryAgentRepository, InMemoryExecutionRepository,
+            InMemoryWorkflowExecutionRepository,
+        };
+
+        let (binding, _) = fx.host_binding("aegis-examples", OWNER).await;
+        let run = uuid::Uuid::new_v4();
+        let entries = fx
+            .service
+            .prepare_for_run(&fx.tenant, Some(OWNER), run, &[entry(binding, None)])
+            .await
+            .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+        assert_eq!(fx.service.run_holding(&binding), Some(run));
+
+        let workflow =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: forge
+spec:
+  initial_state: ANALYZE
+  states:
+    ANALYZE:
+      kind: System
+      command: "true"
+      transitions: []
+"#,
+            )
+            .unwrap();
+        let mut workflow_execution =
+            aegis_orchestrator_core::domain::workflow::WorkflowExecution::new(
+                &workflow,
+                ExecutionId(run),
+                serde_json::json!({ "repositories": serde_json::to_value(&entries).unwrap() }),
+            );
+        workflow_execution.tenant_id = fx.tenant.clone();
+        workflow_execution.status =
+            aegis_orchestrator_core::domain::execution::ExecutionStatus::Running;
+        workflow_execution.initiating_user_sub = Some(OWNER.to_string());
+        let workflows = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        workflows
+            .save_for_tenant(&fx.tenant, &workflow_execution)
+            .await
+            .unwrap();
+
+        let agents = Arc::new(InMemoryAgentRepository::new());
+        let agent = |name: &str| {
+            aegis_orchestrator_core::domain::agent::Agent::new(
+                serde_yaml::from_str(&format!(
+                    r#"apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: {name}
+  version: "1.0.0"
+spec:
+  runtime:
+    image: ghcr.io/example/{name}:latest
+    isolation: docker
+  task:
+    instruction: "Run the {name} task"
+"#
+                ))
+                .unwrap(),
+            )
+        };
+        let analyst = agent("analyst");
+        let judge = agent("judge");
+        agents.save_for_tenant(&fx.tenant, &analyst).await.unwrap();
+        agents.save_for_tenant(&fx.tenant, &judge).await.unwrap();
+
+        let mut state = Execution::new(
+            analyst.id,
+            ExecutionInput {
+                intent: Some("analyze".to_string()),
+                input: serde_json::json!({
+                    "tenant_id": fx.tenant.as_str(),
+                    "repositories": serde_json::to_value(&entries).unwrap(),
+                }),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: Some(run),
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        state.initiating_user_sub = Some(OWNER.to_string());
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        execution_repo
+            .save_for_tenant(&fx.tenant, &state)
+            .await
+            .unwrap();
+
+        let executions =
+            aegis_orchestrator_core::application::execution::StandardExecutionService::new(
+                agents,
+                Arc::new(UnusedVolumeService),
+                Arc::new(
+                    aegis_orchestrator_core::domain::supervisor::Supervisor::new(Arc::new(
+                        NoContainers,
+                    )),
+                ),
+                execution_repo,
+                Arc::new(EventBus::new(64)),
+                Arc::new(
+                    aegis_orchestrator_core::domain::node_config::NodeConfigManifest::default(),
+                ),
+            )
+            .with_workflow_executions(workflows.clone());
+        executions.set_repositories(fx.service.clone() as Arc<dyn RunRepositories>);
+
+        Self {
+            executions,
+            workflows,
+            binding,
+            run,
+            state: state.id,
+            judge: judge.id,
+        }
+    }
+
+    /// The run's record ends with `status`, and the run's end releases its
+    /// repositories, as a workflow's end does.
+    async fn end(
+        &self,
+        fx: &Fixture,
+        status: aegis_orchestrator_core::domain::execution::ExecutionStatus,
+    ) {
+        use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
+        let mut record = self
+            .workflows
+            .find_by_id_for_tenant(
+                &fx.tenant,
+                aegis_orchestrator_core::domain::execution::ExecutionId(self.run),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        record.status = status;
+        self.workflows
+            .save_for_tenant(&fx.tenant, &record)
+            .await
+            .unwrap();
+        fx.service.release_run(self.run);
+        assert_eq!(fx.service.run_holding(&self.binding), None);
+    }
+
+    /// A judge child of the run's agent state, started as the state's agent
+    /// starts one.
+    async fn start_judge(
+        &self,
+    ) -> anyhow::Result<aegis_orchestrator_core::domain::execution::ExecutionId> {
+        use aegis_orchestrator_core::application::execution::ExecutionService;
+        self.executions
+            .start_child_execution(
+                self.judge,
+                aegis_orchestrator_core::domain::execution::ExecutionInput {
+                    intent: Some("judge".to_string()),
+                    input: serde_json::json!({}),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                    attachments: Vec::new(),
+                },
+                self.state,
+            )
+            .await
+    }
+}
+
+/// The run `bf30b918` of 2026-10-11: it failed and released its binding,
+/// and its still-running agent then started a judge child, which mounted
+/// the run's repositories and took the hold back for a run that had ended.
+#[tokio::test]
+async fn a_child_of_a_failed_run_is_refused_and_takes_no_hold() {
+    use aegis_orchestrator_core::domain::execution::ExecutionStatus;
+    for status in [
+        ExecutionStatus::Failed,
+        ExecutionStatus::Completed,
+        ExecutionStatus::Cancelled,
+    ] {
+        let fx = fixture().await;
+        let run = WorkflowRun::start(&fx).await;
+        run.end(&fx, status.clone()).await;
+
+        match run.start_judge().await {
+            Err(e) => assert_eq!(
+                e.to_string(),
+                format!("Execution refused: {RUN_ENDED}"),
+                "a child of a {status:?} run was refused otherwise"
+            ),
+            Ok(id) => panic!("a child of a {status:?} run started: {id}"),
+        }
+        assert_eq!(
+            fx.service.run_holding(&run.binding),
+            None,
+            "a child of a {status:?} run took the hold back"
+        );
+    }
+}
+
+/// A container step of a failed run mounts nothing and takes no hold.
+#[tokio::test]
+async fn a_container_step_of_a_failed_run_is_refused_and_takes_no_hold() {
+    use aegis_orchestrator_core::application::run_container_step::{
+        StepRepositories, WorkflowRunRepositories,
+    };
+    let fx = fixture().await;
+    let run = WorkflowRun::start(&fx).await;
+    run.end(
+        &fx,
+        aegis_orchestrator_core::domain::execution::ExecutionStatus::Failed,
+    )
+    .await;
+
+    let steps = WorkflowRunRepositories::new(
+        run.workflows.clone(),
+        fx.service.clone() as Arc<dyn RunRepositories>,
+    );
+    match steps.mounts_of_run(&fx.tenant, run.run).await {
+        Err(RunRepositoryError::Refused(sentence)) => assert_eq!(sentence, RUN_ENDED),
+        other => panic!("a container step of a failed run was not refused: {other:?}"),
+    }
+    assert_eq!(
+        fx.service.run_holding(&run.binding),
+        None,
+        "a container step of a failed run took the hold back"
+    );
+}
+
+/// The guard: a child of a run still running mounts its repositories, and
+/// takes the run's hold back when a restart cleared it.
+#[tokio::test]
+async fn a_child_of_a_running_run_mounts_and_holds_under_the_run() {
+    let fx = fixture().await;
+    let run = WorkflowRun::start(&fx).await;
+    // A core restart: the holds live in memory only.
+    fx.service.release_run(run.run);
+
+    run.start_judge()
+        .await
+        .unwrap_or_else(|e| panic!("a child of a running run was refused: {e}"));
+    assert_eq!(
+        fx.service.run_holding(&run.binding),
+        Some(run.run),
+        "a child of a running run did not hold under its run"
     );
 }

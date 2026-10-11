@@ -159,6 +159,19 @@ impl StepRepositories for WorkflowRunRepositories {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
+        // A run whose record has ended released its repositories when it
+        // ended; a mount would take the hold back with no later end to
+        // release it (AEGIS ADR-136 G4).
+        if matches!(
+            execution.status,
+            crate::domain::execution::ExecutionStatus::Completed
+                | crate::domain::execution::ExecutionStatus::Failed
+                | crate::domain::execution::ExecutionStatus::Cancelled
+        ) {
+            return Err(RunRepositoryError::Refused(
+                "this run has ended, so its repositories are released".to_string(),
+            ));
+        }
         self.repositories
             .mounts_for_run(
                 tenant_id,

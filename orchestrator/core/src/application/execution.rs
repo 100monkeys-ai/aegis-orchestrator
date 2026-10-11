@@ -7080,6 +7080,11 @@ impl StandardExecutionService {
     /// Before it is prepared, a repository named by its URL becomes a
     /// binding of the person's, counted against `identity`'s tier (AEGIS
     /// ADR-141 F2a); a run already prepared carries bindings only.
+    /// A run already prepared whose record has ended (its workflow
+    /// execution's, else its root agent execution's status is Completed,
+    /// Failed or Cancelled) mounts nothing: its end released its
+    /// repositories, and a mount would take the hold back with no later end
+    /// to release it (G4).
     async fn run_repository_mounts(
         &self,
         tenant_id: &TenantId,
@@ -7132,6 +7137,35 @@ impl StandardExecutionService {
             filled
         } else {
             // A run already prepared carries bindings only.
+            let workflow_execution = match &self.workflow_executions {
+                Some(workflow_executions) => workflow_executions
+                    .find_by_id_for_tenant(tenant_id, ExecutionId(run))
+                    .await
+                    .context("reading the run's workflow execution")?,
+                None => None,
+            };
+            let status = match workflow_execution {
+                Some(workflow_execution) => Some(workflow_execution.status),
+                None => self
+                    .repository
+                    .find_by_id_for_tenant(tenant_id, ExecutionId(run))
+                    .await
+                    .context("reading the run's root execution")?
+                    .map(|root| root.status),
+            };
+            if matches!(
+                status,
+                Some(
+                    ExecutionStatus::Completed
+                        | ExecutionStatus::Failed
+                        | ExecutionStatus::Cancelled
+                )
+            ) {
+                return Err(ExecutionError::Refused(
+                    "this run has ended, so its repositories are released".to_string(),
+                )
+                .into());
+            }
             Self::run_repository_entries(input)?
         };
         match repositories
