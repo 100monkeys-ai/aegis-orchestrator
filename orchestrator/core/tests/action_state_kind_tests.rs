@@ -206,3 +206,80 @@ fn the_mapper_validates_the_args_templates() {
         "{error:#}"
     );
 }
+
+/// A one-state manifest whose state `STEP` is `kind: System` with `command`
+/// written as a quoted YAML string.
+fn system_manifest(command: &str) -> String {
+    format!(
+        "apiVersion: 100monkeys.ai/v1\nkind: Workflow\nmetadata:\n  name: system-kind\n  version: \"1.0.0\"\nspec:\n  repositories: 1\n  initial_state: STEP\n  states:\n    STEP:\n      kind: System\n      command: \"{command}\"\n      transitions: []\n"
+    )
+}
+
+#[test]
+fn a_system_state_written_as_an_action_is_refused() {
+    for name in [
+        "update_blackboard",
+        "repository_diff",
+        "repository_commit",
+        "repository_land",
+    ] {
+        let sentence = refusal(&system_manifest(name));
+        assert!(
+            sentence.contains(&format!(
+                "a System state runs a shell command; '{name}' is an action: write kind: Action, action: {name}"
+            )),
+            "{name}: {sentence}"
+        );
+    }
+}
+
+#[test]
+fn a_system_state_written_as_an_action_with_surrounding_whitespace_is_refused() {
+    let sentence = refusal(&system_manifest("  repository_land \\n"));
+    assert!(
+        sentence.contains(
+            "a System state runs a shell command; 'repository_land' is an action: write kind: Action, action: repository_land"
+        ),
+        "{sentence}"
+    );
+}
+
+#[test]
+fn a_system_command_that_is_a_template_is_not_refused_at_parse() {
+    // The rendered form is the worker's to refuse.
+    let workflow = parse(&system_manifest("update_blackboard {{ x }}"));
+    let kind = step_kind(&workflow);
+    assert_eq!(kind["kind"], "System", "{kind}");
+    assert_eq!(kind["command"], "update_blackboard {{ x }}", "{kind}");
+}
+
+#[test]
+fn an_ordinary_shell_command_still_parses() {
+    let workflow = parse(&system_manifest(
+        "cargo test --workspace && echo update_blackboard",
+    ));
+    let kind = step_kind(&workflow);
+    assert_eq!(kind["kind"], "System", "{kind}");
+    assert_eq!(
+        kind["command"], "cargo test --workspace && echo update_blackboard",
+        "{kind}"
+    );
+}
+
+#[test]
+fn every_built_in_workflow_still_parses() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cli/templates/workflows");
+    let mut parsed = 0;
+    for entry in std::fs::read_dir(&dir).expect("the built-in workflows directory reads") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let yaml = std::fs::read_to_string(&path).expect("the built-in reads");
+        WorkflowParser::parse_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("{} parses: {e}", path.display()));
+        parsed += 1;
+    }
+    assert!(parsed >= 5, "the built-ins were found: {parsed}");
+}

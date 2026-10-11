@@ -496,15 +496,28 @@ impl WorkflowParser {
                 pre_execution_validator,
                 output_handler,
             },
+            // A System state runs a shell command; one written as an action
+            // is refused (AEGIS ADR-142 A8). No action name carries `{{`, so a
+            // template command is never refused here: its rendered form is
+            // the worker's to refuse.
             StateKindYaml::System {
                 command,
                 env,
                 workdir,
-            } => StateKind::System {
-                command,
-                env,
-                workdir,
-            },
+            } => {
+                let written = command.trim();
+                if let Ok(action) = ActionName::from_literal(written) {
+                    let name = action.as_str();
+                    return Err(WorkflowParseError::ValidationError(format!(
+                        "a System state runs a shell command; '{name}' is an action: write kind: Action, action: {name}"
+                    )));
+                }
+                StateKind::System {
+                    command,
+                    env,
+                    workdir,
+                }
+            }
             // The action is a literal and its arguments are declared
             // (AEGIS ADR-142 A1, A2).
             StateKindYaml::Action { action, args } => {
