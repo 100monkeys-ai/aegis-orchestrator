@@ -271,8 +271,8 @@ spec:
             {{{EXECUTE_TESTS.output.stdout}}}
 
     DIFF:
-      kind: System
-      command: "repository_diff"
+      kind: Action
+      action: repository_diff
       transitions:
         - condition: on_success
           target: AUDIT
@@ -360,9 +360,9 @@ spec:
           target: CODE
 
     COMMIT:
-      kind: System
-      command: "repository_commit"
-      env:
+      kind: Action
+      action: repository_commit
+      args:
         message: "the-forge: {{{first_line input.task}}}"
       transitions:
         - condition: on_failure
@@ -376,8 +376,8 @@ spec:
           target: LAND
 
     LAND:
-      kind: System
-      command: "repository_land"
+      kind: Action
+      action: repository_land
       transitions:
         - condition: on_success
           target: COMPLETE
@@ -385,9 +385,9 @@ spec:
           target: LAND_REFUSED
 
     COMPLETE:
-      kind: System
-      command: "update_blackboard"
-      env:
+      kind: Action
+      action: update_blackboard
+      args:
         outcome: "complete"
         commit_sha: "{{COMMIT.output.commit_sha}}"
         branch: "{{COMMIT.output.branch}}"
@@ -395,9 +395,9 @@ spec:
       transitions: []
 
     FAILED:
-      kind: System
-      command: "update_blackboard"
-      env:
+      kind: Action
+      action: update_blackboard
+      args:
         outcome: "failed"
         commit_sha: "{{COMMIT.output.commit_sha}}"
         branch: "{{repository.branch}}"
@@ -405,9 +405,9 @@ spec:
       transitions: []
 
     LAND_REFUSED:
-      kind: System
-      command: "update_blackboard"
-      env:
+      kind: Action
+      action: update_blackboard
+      args:
         outcome: "land_refused"
         commit_sha: "{{COMMIT.output.commit_sha}}"
         branch: "{{COMMIT.output.branch}}"

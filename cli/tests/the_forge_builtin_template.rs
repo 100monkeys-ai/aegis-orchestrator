@@ -1,6 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! The Forge as a built-in (AEGIS ADR-141 F1, F2, F4, F9, F10; Trigger T4).
+//! The Forge as a built-in (AEGIS ADR-141 F1, F2, F4, F9, F10; Trigger T4;
+//! its own steps are Action states, AEGIS ADR-142 A1 and A9).
 //!
 //! `cli/templates/workflows/the-forge.yaml` and its seven agents are listed in
 //! `BUILTIN_WORKFLOWS` and `BUILTIN_AGENTS`, parse through the orchestrator's
@@ -50,9 +51,10 @@ const WRITING_FS: [&str; 5] = [
 /// workflow's own steps.
 const GIT_WRITE_TOOLS: [&str; 3] = ["aegis.git.commit", "aegis.git.push", "aegis.git.land"];
 
-/// The commands a System state of the Forge may run: each is the workflow
-/// interpreter's own, and none is a shell command in the core process.
-const INTERPRETER_COMMANDS: [&str; 4] = [
+/// The actions an Action state of the Forge may perform: each is the
+/// workflow's own operation, run by the state machine with no model in the
+/// loop, and none is a shell command.
+const ACTIONS: [&str; 4] = [
     "repository_diff",
     "repository_commit",
     "repository_land",
@@ -243,7 +245,8 @@ fn the_forge_and_its_seven_agents_are_listed_and_parse() {
 
 /// F4 and F9: the states, their kinds and transitions as the record's table
 /// gives them; the two Human gates and no other; CODE's visit limit; AUDIT's
-/// weights and threshold; no System state a shell command; `draft_only` true
+/// weights and threshold; no System state, the workflow's own steps Action
+/// states of the four actions; `draft_only` true
 /// ending at COMPLETE after COMMIT.
 #[test]
 fn the_forges_states_are_f4s_table() {
@@ -264,13 +267,13 @@ fn the_forges_states_are_f4s_table() {
         ("TEST", "Agent tester-agent"),
         ("CODE", "Agent coder-agent"),
         ("EXECUTE_TESTS", "ContainerRun"),
-        ("DIFF", "System repository_diff"),
+        ("DIFF", "Action repository_diff"),
         ("AUDIT", "ParallelAgents"),
-        ("COMMIT", "System repository_commit"),
-        ("LAND", "System repository_land"),
-        ("COMPLETE", "System update_blackboard"),
-        ("FAILED", "System update_blackboard"),
-        ("LAND_REFUSED", "System update_blackboard"),
+        ("COMMIT", "Action repository_commit"),
+        ("LAND", "Action repository_land"),
+        ("COMPLETE", "Action update_blackboard"),
+        ("FAILED", "Action update_blackboard"),
+        ("LAND_REFUSED", "Action update_blackboard"),
     ]
     .into_iter()
     .map(|(n, k)| (n.to_string(), k.to_string()))
@@ -512,24 +515,27 @@ fn the_forges_states_are_f4s_table() {
         complaints.push("AUDIT's way back to CODE does not carry the three reports".to_string());
     }
 
-    // No System state of the Forge runs a shell command in the core process.
+    // No state of the Forge runs a shell command in the core process: it has
+    // no System state, and each of its own steps is an Action state.
     for (name, s) in &workflow.spec.states {
-        if let StateKind::System { command, .. } = &s.kind {
-            if !INTERPRETER_COMMANDS.contains(&command.trim()) {
-                complaints.push(format!(
-                    "{} runs the shell command {command}",
-                    name.as_str()
-                ));
+        match &s.kind {
+            StateKind::System { command, .. } => complaints.push(format!(
+                "{} is a System state running {command}",
+                name.as_str()
+            )),
+            StateKind::Action { action, .. } if !ACTIONS.contains(&action.as_str()) => {
+                complaints.push(format!("{} performs the action {action}", name.as_str()))
             }
+            _ => {}
         }
     }
 
     match &state(&workflow, "COMMIT").kind {
-        StateKind::System { env, .. } => {
-            if env.get("message").map(String::as_str)
+        StateKind::Action { args, .. } => {
+            if args.get("message").map(String::as_str)
                 != Some("the-forge: {{{first_line input.task}}}")
             {
-                complaints.push(format!("COMMIT's message is {:?}", env.get("message")));
+                complaints.push(format!("COMMIT's message is {:?}", args.get("message")));
             }
         }
         other => complaints.push(format!("COMMIT is {other:?}")),
@@ -541,15 +547,15 @@ fn the_forges_states_are_f4s_table() {
         ("LAND_REFUSED", "land_refused"),
     ] {
         match &state(&workflow, terminal).kind {
-            StateKind::System { env, .. } => {
-                if env.get("outcome").map(String::as_str) != Some(outcome) {
+            StateKind::Action { args, .. } => {
+                if args.get("outcome").map(String::as_str) != Some(outcome) {
                     complaints.push(format!(
                         "{terminal} writes outcome {:?}",
-                        env.get("outcome")
+                        args.get("outcome")
                     ));
                 }
                 for key in ["commit_sha", "branch", "sentence"] {
-                    if !env.contains_key(key) {
+                    if !args.contains_key(key) {
                         complaints.push(format!("{terminal} does not write {key}"));
                     }
                 }
