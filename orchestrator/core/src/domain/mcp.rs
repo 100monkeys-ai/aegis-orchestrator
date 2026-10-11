@@ -446,7 +446,7 @@ impl ToolInputContract {
             }
             "calendar.create" => &["account", "calendar_id", "title", "start", "end"],
             "calendar.respond" => &["account", "calendar_id", "event_id", "response"],
-            "aegis.tools.list" | "aegis.tools.search" => &[],
+            "aegis.tools.list" | "aegis.tools.search" | "aegis.git.list" => &[],
             _ => &[],
         }
     }

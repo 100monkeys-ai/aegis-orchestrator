@@ -163,6 +163,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("calendar.update", "Changes an event of a calendar of a connected calendar account that the account organises: only the title, start, end, description, location or attendees given; attendees given replace the list. A repeating event cannot be changed. Attendees may be sent an invitation or an update by the calendar's server. Waits for the person's approval before anything is changed.").requires_approval(),
     BuiltinToolDefinition::new("calendar.delete", "Deletes an event of a calendar of a connected calendar account that the account organises. A repeating event cannot be deleted. Waits for the person's approval before anything is changed.").requires_approval(),
     BuiltinToolDefinition::new("calendar.respond", "Answers an invitation to an event of a calendar of a connected calendar account: accepted, declined or tentative, as the account's attendee answer. Waits for the person's approval before anything is changed.").requires_approval(),
+    BuiltinToolDefinition::new("aegis.git.list", "Lists the caller's git repository bindings (redacted): each binding's id, repository URL, ref, state and label. A workflow run on a repository names a binding by its id in repositories.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.status", "Shows one of your run's repositories: its work branch, whether the tree is clean or changed, and the commit HEAD is on.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.diff", "Shows the changes in one of your run's repositories as a unified diff: unstaged by default, or what is staged.").skip_judge(),
     BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
@@ -385,6 +386,7 @@ impl ToolRouter {
             "calendar.update" => Self::schema_calendar_write(CalendarShape::Update),
             "calendar.delete" => Self::schema_calendar_write(CalendarShape::Delete),
             "calendar.respond" => Self::schema_calendar_write(CalendarShape::Respond),
+            "aegis.git.list" => Self::schema_aegis_git_list(),
             "aegis.git.status" => Self::schema_aegis_git(false, false),
             "aegis.git.diff" => Self::schema_aegis_git(false, true),
             "aegis.git.commit" => Self::schema_aegis_git(true, false),
@@ -1247,6 +1249,16 @@ impl ToolRouter {
     /// by its label; outside a run, `binding_id` names one of your git
     /// repository bindings. Neither is required, since each caller has one.
     /// `aegis.git.commit` adds `message`, `aegis.git.diff` adds `staged`.
+    /// JSON schema for the `aegis.git.list` builtin tool: no arguments; the
+    /// caller is the person whose bindings are listed.
+    fn schema_aegis_git_list() -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
     fn schema_aegis_git(message: bool, staged: bool) -> Value {
         let mut properties = serde_json::Map::new();
         properties.insert(
@@ -1551,6 +1563,25 @@ impl ToolRouter {
                 "version": {
                     "type": "string",
                     "description": "Optional semantic version of the workflow to execute. When omitted, the latest deployed version is used."
+                },
+                "repositories": {
+                    "type": "array",
+                    "description": "Optional: your git repositories for the run, each by the id of one of your git repository bindings (aegis.git.list lists them), with an optional work branch.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "binding_id": {
+                                "type": "string",
+                                "description": "The id of one of your git repository bindings."
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional work branch for the run."
+                            }
+                        },
+                        "required": ["binding_id"],
+                        "additionalProperties": false
+                    }
                 },
                 "tenant_id": {
                     "type": "string",
@@ -2978,6 +3009,9 @@ mod tests {
         // AEGIS ADR-136 G7: a run's read-only git tools, added
         // deliberately; commit and push stay judged.
         "aegis.git.status",
+        // The person's git repository bindings, read only, added
+        // deliberately.
+        "aegis.git.list",
         "aegis.git.diff",
         // AEGIS ADR-139 N11: the schedule tools that only read, added
         // deliberately; create, update, pause, resume and delete stay judged.

@@ -63,7 +63,10 @@ use aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider;
 use aegis_orchestrator_core::infrastructure::tool_router::ToolRouter;
 use aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter;
 
-use super::{daemon_seal_gateway_url, daemon_seal_gateway_wiring, daemon_seal_middleware};
+use super::{
+    daemon_git_repo_wiring, daemon_seal_gateway_url, daemon_seal_gateway_wiring,
+    daemon_seal_middleware,
+};
 use crate::daemon::handlers::seal::invoke_refusal_response;
 
 const USER: &str = "wiring-user-1";
@@ -791,4 +794,261 @@ mod remote_grounding {
             "{text}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The git repository service
+// ---------------------------------------------------------------------------
+
+/// No binding is stored: the test reads whether the tools reach the service.
+struct NoBindings;
+
+#[async_trait]
+impl aegis_orchestrator_core::domain::git_repo::GitRepoBindingRepository for NoBindings {
+    async fn save(
+        &self,
+        _: &aegis_orchestrator_core::domain::git_repo::GitRepoBinding,
+    ) -> Result<(), aegis_orchestrator_core::domain::repository::RepositoryError> {
+        Ok(())
+    }
+    async fn find_by_id(
+        &self,
+        _: &aegis_orchestrator_core::domain::git_repo::GitRepoBindingId,
+    ) -> Result<
+        Option<aegis_orchestrator_core::domain::git_repo::GitRepoBinding>,
+        aegis_orchestrator_core::domain::repository::RepositoryError,
+    > {
+        Ok(None)
+    }
+    async fn find_by_owner(
+        &self,
+        _: &TenantId,
+        _: &str,
+    ) -> Result<
+        Vec<aegis_orchestrator_core::domain::git_repo::GitRepoBinding>,
+        aegis_orchestrator_core::domain::repository::RepositoryError,
+    > {
+        Ok(vec![])
+    }
+    async fn find_by_volume_id(
+        &self,
+        _: &aegis_orchestrator_core::domain::volume::VolumeId,
+    ) -> Result<
+        Option<aegis_orchestrator_core::domain::git_repo::GitRepoBinding>,
+        aegis_orchestrator_core::domain::repository::RepositoryError,
+    > {
+        Ok(None)
+    }
+    async fn find_by_webhook_lookup_hash(
+        &self,
+        _: &str,
+    ) -> Result<
+        Option<aegis_orchestrator_core::domain::git_repo::GitRepoBinding>,
+        aegis_orchestrator_core::domain::repository::RepositoryError,
+    > {
+        Ok(None)
+    }
+    async fn count_by_owner(
+        &self,
+        _: &TenantId,
+        _: &str,
+    ) -> Result<u32, aegis_orchestrator_core::domain::repository::RepositoryError> {
+        Ok(0)
+    }
+    async fn delete(
+        &self,
+        _: &aegis_orchestrator_core::domain::git_repo::GitRepoBindingId,
+    ) -> Result<(), aegis_orchestrator_core::domain::repository::RepositoryError> {
+        Ok(())
+    }
+}
+
+/// No volume is created, attached or read through this service: listing a
+/// person's volumes reads the volume repository.
+struct NoVolumeService;
+
+#[async_trait]
+impl aegis_orchestrator_core::application::volume_manager::VolumeService for NoVolumeService {
+    async fn create_volume(
+        &self,
+        _: String,
+        _: TenantId,
+        _: aegis_orchestrator_core::domain::volume::StorageClass,
+        _: u64,
+        _: aegis_orchestrator_core::domain::volume::VolumeOwnership,
+    ) -> Result<aegis_orchestrator_core::domain::volume::VolumeId> {
+        anyhow::bail!("not exercised")
+    }
+    async fn get_volume(
+        &self,
+        _: aegis_orchestrator_core::domain::volume::VolumeId,
+    ) -> Result<aegis_orchestrator_core::domain::volume::Volume> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_volumes_by_tenant(
+        &self,
+        _: TenantId,
+    ) -> Result<Vec<aegis_orchestrator_core::domain::volume::Volume>> {
+        Ok(vec![])
+    }
+    async fn list_volumes_by_ownership(
+        &self,
+        _: &aegis_orchestrator_core::domain::volume::VolumeOwnership,
+    ) -> Result<Vec<aegis_orchestrator_core::domain::volume::Volume>> {
+        Ok(vec![])
+    }
+    async fn attach_volume(
+        &self,
+        _: aegis_orchestrator_core::domain::volume::VolumeId,
+        _: aegis_orchestrator_core::domain::runtime::InstanceId,
+        _: std::path::PathBuf,
+        _: aegis_orchestrator_core::domain::volume::AccessMode,
+    ) -> Result<aegis_orchestrator_core::domain::volume::VolumeMount> {
+        anyhow::bail!("not exercised")
+    }
+    async fn detach_volume(
+        &self,
+        _: aegis_orchestrator_core::domain::volume::VolumeId,
+        _: aegis_orchestrator_core::domain::runtime::InstanceId,
+    ) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+    async fn delete_volume(
+        &self,
+        _: aegis_orchestrator_core::domain::volume::VolumeId,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn get_volume_usage(
+        &self,
+        _: aegis_orchestrator_core::domain::volume::VolumeId,
+    ) -> Result<u64> {
+        Ok(0)
+    }
+    async fn cleanup_expired_volumes(&self) -> Result<usize> {
+        Ok(0)
+    }
+    async fn create_volumes_for_execution(
+        &self,
+        _: ExecutionId,
+        _: TenantId,
+        _: &[aegis_orchestrator_core::domain::agent::VolumeSpec],
+        _: &str,
+    ) -> Result<Vec<aegis_orchestrator_core::domain::volume::Volume>> {
+        Ok(vec![])
+    }
+    async fn persist_external_volume(
+        &self,
+        _: aegis_orchestrator_core::domain::volume::VolumeId,
+        _: String,
+        _: TenantId,
+        _: String,
+        _: u64,
+        _: aegis_orchestrator_core::domain::volume::VolumeOwnership,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A git repository service as the daemon builds one, over stores holding
+/// nothing.
+fn git_repo_service() -> Arc<aegis_orchestrator_core::application::git_repo_service::GitRepoService>
+{
+    use aegis_orchestrator_core::domain::repository::VolumeRepository;
+    let event_bus = Arc::new(EventBus::new(16));
+    let volumes = Arc::new(InMemoryVolumeRepository::new());
+    let user_volumes = Arc::new(
+        aegis_orchestrator_core::application::user_volume_service::UserVolumeService::new(
+            volumes.clone() as Arc<dyn VolumeRepository>,
+            Arc::new(NoVolumeService),
+            event_bus.clone(),
+            aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
+        ),
+    );
+    let secrets = Arc::new(
+        aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager::from_store(
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::secrets_manager::TestSecretStore::new(),
+            ),
+            event_bus.clone(),
+        ),
+    );
+    let storage_root =
+        std::env::temp_dir().join(format!("aegis-daemon-git-wiring-{}", uuid::Uuid::new_v4()));
+    let fsal = Arc::new(AegisFSAL::new(
+        Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+        volumes as Arc<dyn VolumeRepository>,
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(NoOpPublisher),
+    ));
+    let clone_executor = Arc::new(
+        aegis_orchestrator_core::application::git_clone_executor::GitCloneExecutor::new(
+            secrets.clone(),
+            fsal,
+            None,
+        ),
+    );
+    Arc::new(
+        aegis_orchestrator_core::application::git_repo_service::GitRepoService::new(
+            Arc::new(NoBindings),
+            user_volumes,
+            clone_executor,
+            secrets,
+            event_bus,
+        ),
+    )
+}
+
+/// The daemon's tool invocation service holds the git repository service
+/// when one is configured: a person's `aegis.git.list` reaches it and is
+/// answered their bindings (none here), not that the service is not
+/// configured. With none configured, the tool answers 503
+/// `SERVICE_UNAVAILABLE`, as the routes do.
+#[tokio::test]
+async fn the_daemons_tool_service_holds_the_git_repository_service_when_one_is_configured() {
+    let token = format!("token-{}", uuid::Uuid::new_v4());
+    let session = || {
+        SealSession::new(
+            AgentId::new(),
+            ExecutionId::new(),
+            vec![],
+            token.clone(),
+            context(),
+            TenantId::for_consumer_user(USER).unwrap(),
+        )
+        .with_principal_metadata(
+            Some(USER.to_string()),
+            Some(USER.to_string()),
+            None,
+            None,
+        )
+    };
+    let envelope = || Envelope {
+        token: token.clone().into(),
+        tool: "aegis.git.list".to_string(),
+    };
+
+    let (service, sessions) = unwired(None).await;
+    sessions.save(session()).await.unwrap();
+    let service = daemon_git_repo_wiring(service, Some(&git_repo_service()));
+    let answer = service.invoke_tool(&envelope()).await.unwrap_or_else(|e| {
+        panic!("aegis.git.list did not reach the configured git repository service: {e}")
+    });
+    assert_eq!(answer, json!([]), "{answer}");
+
+    let (service, sessions) = unwired(None).await;
+    sessions.save(session()).await.unwrap();
+    let service = daemon_git_repo_wiring(service, None);
+    let error = service
+        .invoke_tool(&envelope())
+        .await
+        .expect_err("refused with no git repository service");
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "aegis.git.list", "arguments": {}},
+    });
+    let response = invoke_refusal_response(&error, &payload);
+    assert_eq!(response.status().as_u16(), 503);
 }

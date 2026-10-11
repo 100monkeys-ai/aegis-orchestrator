@@ -8,8 +8,8 @@
 //! "<work branch>"?}]` beside `contexts`: the person's repositories for the
 //! run. It is kept in the execution input's reserved key
 //! [`REPOSITORIES_INPUT_KEY`], as `contexts` is, where the starts read it and
-//! an agent state or a child inherits it. The tools' model-facing schemas do
-//! not list it.
+//! an agent state or a child inherits it. `aegis.workflow.run`'s model-facing
+//! schema lists it; the other starting tools' schemas do not.
 
 use serde_json::Value;
 

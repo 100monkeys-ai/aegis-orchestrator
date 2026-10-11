@@ -535,6 +535,23 @@ pub(crate) fn daemon_seal_gateway_url(
     })
 }
 
+/// The git repository service's part of the daemon's tool invocation
+/// service: the `aegis.git.*` tools answer through the same service the
+/// `/v1/storage/git` routes use. With none configured (no Postgres pool)
+/// the tools answer that the service is not configured, as the routes do.
+pub(crate) fn daemon_git_repo_wiring(
+    mut tool_invocation_service_builder: aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService,
+    git_repo_service: Option<
+        &Arc<aegis_orchestrator_core::application::git_repo_service::GitRepoService>,
+    >,
+) -> aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService {
+    if let Some(service) = git_repo_service {
+        tool_invocation_service_builder =
+            tool_invocation_service_builder.with_git_repo_service(service.clone());
+    }
+    tool_invocation_service_builder
+}
+
 /// The SEAL gateway's part of the daemon's tool invocation service (AEGIS
 /// ADR-132 H1, H4, H8): the CA its certificate is verified against, the
 /// remote MCP servers it serves by name, and the credential store each
@@ -2389,85 +2406,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tool_invocation_service_builder =
         tool_invocation_service_builder.with_schedule_service(schedule_service.clone());
 
-    let tool_invocation_service = Arc::new(tool_invocation_service_builder);
-
-    // A remote server's token is grounded through the SEAL gateway when it is
-    // stored, rotated or introspected (AEGIS ADR-132 (7a) S2): the credential
-    // service, built before the tool invocation service that makes the call,
-    // is handed it now, weakly, with the remote servers' names.
-    if let (Some(credentials), Some(gateway)) =
-        (&grounded_credentials, config.spec.seal_gateway.as_ref())
-    {
-        let service = Arc::downgrade(&tool_invocation_service);
-        let grounding: std::sync::Weak<dyn RemoteServerGrounding> = service;
-        daemon_remote_grounding(credentials, gateway, grounding)?;
-    }
-
-    info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
-
-    // Initial tool catalog population + periodic refresh loop
-    {
-        let tis = tool_invocation_service.clone();
-        let catalog = tool_catalog.clone();
-        if let Ok(tools) = tis.get_available_tools().await {
-            catalog.refresh_from(tools).await;
-            tracing::info!("Tool catalog populated with initial tool set");
-        }
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // skip immediate first tick (already populated above)
-            loop {
-                interval.tick().await;
-                if let Ok(tools) = tis.get_available_tools().await {
-                    catalog.refresh_from(tools).await;
-                    tracing::debug!("Tool catalog refreshed");
-                }
-            }
-        });
-    }
-
-    let (inner_loop_service, llm_registry) = share_llm_registry(llm_registry, |registry| {
-        let mut ils = daemon_inner_loop_service(
-            tool_invocation_service.clone(),
-            execution_service.clone(),
-            registry,
-            judge_context.clone(),
-        );
-        if let (Some(ref enforcer), Some(ref resolver)) =
-            (&rate_limit_enforcer, &rate_limit_resolver)
-        {
-            ils = ils.with_rate_limiting(enforcer.clone(), resolver.clone());
-        }
-        Arc::new(ils)
-    });
-
-    let workflow_scope_service = Arc::new(
-        aegis_orchestrator_core::application::workflow_scope::WorkflowScopeService::new(
-            workflow_repo.clone(),
-            event_bus.clone(),
-        ),
-    );
-
-    let agent_scope_service = Arc::new(
-        aegis_orchestrator_core::application::agent_scope::AgentScopeService::new(
-            agent_repo.clone(),
-            event_bus.clone(),
-        ),
-    );
-
-    // Tenant repository — shared between TenantProvisioningService and colony handlers.
-    let colony_tenant_repo: Option<Arc<dyn aegis_orchestrator_core::domain::repository::TenantRepository>> =
-        db_pool.as_ref().map(|pool| {
-            Arc::new(
-                aegis_orchestrator_core::infrastructure::repositories::postgres_tenant::PostgresTenantRepository::new(pool.clone()),
-            ) as Arc<dyn aegis_orchestrator_core::domain::repository::TenantRepository>
-        });
-
-    // Tenant Provisioning Service (ADR-097) is constructed AFTER the
-    // EffectiveTierService below, because provisioning delegates the
-    // `zaru_tier` Keycloak attribute write to it. Placeholder binding kept
-    // here so the variable is in scope for the AppState assembly below.
-
     // Initialize git repo service (ADR-081 Waves A2 / A3). Requires a
     // Postgres pool for the binding repository; left as `None` when the
     // pool is absent. The handlers return 503 in that case.
@@ -2555,6 +2493,89 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         };
         Arc::new(service)
     });
+    // The aegis.git.* tools answer through the service the routes use.
+    tool_invocation_service_builder =
+        daemon_git_repo_wiring(tool_invocation_service_builder, git_repo_service.as_ref());
+
+    let tool_invocation_service = Arc::new(tool_invocation_service_builder);
+
+    // A remote server's token is grounded through the SEAL gateway when it is
+    // stored, rotated or introspected (AEGIS ADR-132 (7a) S2): the credential
+    // service, built before the tool invocation service that makes the call,
+    // is handed it now, weakly, with the remote servers' names.
+    if let (Some(credentials), Some(gateway)) =
+        (&grounded_credentials, config.spec.seal_gateway.as_ref())
+    {
+        let service = Arc::downgrade(&tool_invocation_service);
+        let grounding: std::sync::Weak<dyn RemoteServerGrounding> = service;
+        daemon_remote_grounding(credentials, gateway, grounding)?;
+    }
+
+    info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
+
+    // Initial tool catalog population + periodic refresh loop
+    {
+        let tis = tool_invocation_service.clone();
+        let catalog = tool_catalog.clone();
+        if let Ok(tools) = tis.get_available_tools().await {
+            catalog.refresh_from(tools).await;
+            tracing::info!("Tool catalog populated with initial tool set");
+        }
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // skip immediate first tick (already populated above)
+            loop {
+                interval.tick().await;
+                if let Ok(tools) = tis.get_available_tools().await {
+                    catalog.refresh_from(tools).await;
+                    tracing::debug!("Tool catalog refreshed");
+                }
+            }
+        });
+    }
+
+    let (inner_loop_service, llm_registry) = share_llm_registry(llm_registry, |registry| {
+        let mut ils = daemon_inner_loop_service(
+            tool_invocation_service.clone(),
+            execution_service.clone(),
+            registry,
+            judge_context.clone(),
+        );
+        if let (Some(ref enforcer), Some(ref resolver)) =
+            (&rate_limit_enforcer, &rate_limit_resolver)
+        {
+            ils = ils.with_rate_limiting(enforcer.clone(), resolver.clone());
+        }
+        Arc::new(ils)
+    });
+
+    let workflow_scope_service = Arc::new(
+        aegis_orchestrator_core::application::workflow_scope::WorkflowScopeService::new(
+            workflow_repo.clone(),
+            event_bus.clone(),
+        ),
+    );
+
+    let agent_scope_service = Arc::new(
+        aegis_orchestrator_core::application::agent_scope::AgentScopeService::new(
+            agent_repo.clone(),
+            event_bus.clone(),
+        ),
+    );
+
+    // Tenant repository — shared between TenantProvisioningService and colony handlers.
+    let colony_tenant_repo: Option<Arc<dyn aegis_orchestrator_core::domain::repository::TenantRepository>> =
+        db_pool.as_ref().map(|pool| {
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_tenant::PostgresTenantRepository::new(pool.clone()),
+            ) as Arc<dyn aegis_orchestrator_core::domain::repository::TenantRepository>
+        });
+
+    // Tenant Provisioning Service (ADR-097) is constructed AFTER the
+    // EffectiveTierService below, because provisioning delegates the
+    // `zaru_tier` Keycloak attribute write to it. Placeholder binding kept
+    // here so the variable is in scope for the AppState assembly below.
+
     // A run's repositories are prepared, mounted and released by the git
     // repository service (AEGIS ADR-136 G3 to G5).
     if let Some(service) = git_repo_service.as_ref() {
