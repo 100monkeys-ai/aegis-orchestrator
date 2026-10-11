@@ -399,12 +399,20 @@ mod workers_ai {
     }
 
     /// The adapter against the stand-in, for the flux model, with the
-    /// provider's gateway header.
+    /// provider's AI Gateway headers and one other header.
     fn adapter(endpoint: &str) -> WorkersAiImageAdapter {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "cf-aig-gateway-id",
             reqwest::header::HeaderValue::from_static("inference-test"),
+        );
+        headers.insert(
+            "cf-aig-metadata",
+            reqwest::header::HeaderValue::from_static("{\"team\":\"test\"}"),
+        );
+        headers.insert(
+            "x-provider-header",
+            reqwest::header::HeaderValue::from_static("kept"),
         );
         WorkersAiImageAdapter::new(
             endpoint.to_string(),
@@ -509,13 +517,6 @@ mod workers_ai {
                 Some("Bearer test-key")
             );
             assert_eq!(
-                request
-                    .headers
-                    .get("cf-aig-gateway-id")
-                    .and_then(|v| v.to_str().ok()),
-                Some("inference-test")
-            );
-            assert_eq!(
                 request.fields(),
                 vec![
                     ("prompt".to_string(), "a lighthouse at dusk".to_string()),
@@ -524,6 +525,44 @@ mod workers_ai {
                 ]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_run_request_carries_no_ai_gateway_header_and_keeps_the_others() {
+        let (endpoint, seen) = stand_in(Answer::Image(PNG)).await;
+
+        adapter(&endpoint)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect("the provider answers");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "count 1 is one request");
+        let gateway: Vec<&str> = seen[0]
+            .headers
+            .keys()
+            .map(|name| name.as_str())
+            .filter(|name| name.starts_with("cf-aig-"))
+            .collect();
+        assert!(
+            gateway.is_empty(),
+            "the /ai/run request carries AI Gateway headers: {gateway:?}"
+        );
+        assert_eq!(
+            seen[0]
+                .headers
+                .get("x-provider-header")
+                .and_then(|v| v.to_str().ok()),
+            Some("kept"),
+            "the provider's other header is not sent"
+        );
+        assert_eq!(
+            seen[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer test-key")
+        );
     }
 
     #[tokio::test]
@@ -595,6 +634,52 @@ mod workers_ai {
                 "the provider's message is lost: {message}"
             ),
             other => panic!("not InvalidInput: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workers_ai_500_with_code_7000_is_invalid_input_with_its_message() {
+        let (endpoint, _) = stand_in(Answer::Error(
+            500,
+            r#"{"errors":[{"message":"Invalid request body","code":7000}],"success":false,"result":{},"messages":[]}"#,
+        ))
+        .await;
+
+        let error = adapter(&endpoint)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect_err("the provider refuses");
+
+        match error {
+            VisionError::InvalidInput(message) => assert!(
+                message.starts_with("HTTP 500 Internal Server Error: ")
+                    && message.contains("Invalid request body"),
+                "the provider's message is lost: {message}"
+            ),
+            other => panic!("not InvalidInput: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workers_ai_500_with_any_other_code_is_a_provider_error() {
+        let (endpoint, _) = stand_in(Answer::Error(
+            500,
+            r#"{"errors":[{"message":"AiError: AiError: Internal server error","code":3043}],"success":false,"result":{},"messages":[]}"#,
+        ))
+        .await;
+
+        let error = adapter(&endpoint)
+            .generate_image("a red bicycle", &ImageOptions::default())
+            .await
+            .expect_err("the provider fails");
+
+        match error {
+            VisionError::Provider(message) => assert!(
+                message.starts_with("HTTP 500 Internal Server Error: ")
+                    && message.contains("Internal server error"),
+                "the provider's message is lost: {message}"
+            ),
+            other => panic!("not Provider: {other:?}"),
         }
     }
 

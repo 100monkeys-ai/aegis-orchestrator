@@ -12,7 +12,8 @@
 //! [`super::openai::OpenAIAdapter`]'s `/images/generations`.
 //!
 //! The provider's configured `headers` (ADR-124 D3) are sent beside the
-//! bearer `Authorization`, as the OpenAI adapter sends them.
+//! bearer `Authorization`, as the OpenAI adapter sends them, but for the AI
+//! Gateway's `cf-aig-*` headers, which [`WorkersAiImageAdapter::new`] drops.
 
 use super::openai::image_content_type;
 use crate::domain::secrets::SensitiveUrl;
@@ -20,13 +21,20 @@ use crate::domain::vision::{
     Image, ImageOptions, ImageResponse, Mask, VisionError, VisionProvider,
 };
 use async_trait::async_trait;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderName};
 
 /// The host of the Cloudflare API, which serves Workers AI.
 const WORKERS_AI_HOST: &str = "api.cloudflare.com";
 
 /// The end of the path of a Workers AI OpenAI-compatible base.
 const OPENAI_COMPATIBLE_SUFFIX: &str = "/ai/v1";
+
+/// The prefix of every AI Gateway request header.
+const AI_GATEWAY_HEADER_PREFIX: &str = "cf-aig-";
+
+/// The Workers AI error code of a request body it refuses before the model
+/// runs ("Invalid request body"), answered with HTTP 500.
+const INVALID_REQUEST_BODY: u64 = 7000;
 
 pub struct WorkersAiImageAdapter {
     client: reqwest::Client,
@@ -36,13 +44,26 @@ pub struct WorkersAiImageAdapter {
     /// The Workers AI model name, for example
     /// `@cf/black-forest-labs/flux-2-dev`.
     model: String,
-    /// The provider's configured request headers, sent on every request
-    /// beside `Authorization`.
+    /// The provider's configured request headers but the AI Gateway's, sent
+    /// on every request beside `Authorization`.
     headers: HeaderMap,
 }
 
 impl WorkersAiImageAdapter {
-    pub fn new(endpoint: String, api_key: String, model: String, headers: HeaderMap) -> Self {
+    /// Every header whose name starts with `cf-aig-` is dropped from
+    /// `headers`, because the AI Gateway's OpenAI-compatible route does not
+    /// carry a multipart `/ai/run` request, and Workers AI answers such a
+    /// request that names a gateway with code 7000, "Invalid request body",
+    /// before the model runs.
+    pub fn new(endpoint: String, api_key: String, model: String, mut headers: HeaderMap) -> Self {
+        let gateway: Vec<HeaderName> = headers
+            .keys()
+            .filter(|name| name.as_str().starts_with(AI_GATEWAY_HEADER_PREFIX))
+            .cloned()
+            .collect();
+        for name in gateway {
+            headers.remove(&name);
+        }
         Self {
             client: reqwest::Client::new(),
             endpoint,
@@ -109,6 +130,9 @@ impl WorkersAiImageAdapter {
             );
             return Err(match status.as_u16() {
                 400 => VisionError::InvalidInput(format!("HTTP {status}: {excerpt}")),
+                500 if first_error_code(&error_text) == Some(INVALID_REQUEST_BODY) => {
+                    VisionError::InvalidInput(format!("HTTP {status}: {excerpt}"))
+                }
                 401 | 403 => VisionError::Authentication(excerpt),
                 429 => VisionError::RateLimit,
                 _ => VisionError::Provider(format!("HTTP {status}: {excerpt}")),
@@ -138,6 +162,17 @@ impl WorkersAiImageAdapter {
             bytes,
         })
     }
+}
+
+/// The first `errors[].code` of a Workers AI error body, when the body is
+/// JSON and carries one.
+fn first_error_code(body: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("errors")?
+        .get(0)?
+        .get("code")?
+        .as_u64()
 }
 
 /// `<width>x<height>`, each a positive whole number, as its two parts.
