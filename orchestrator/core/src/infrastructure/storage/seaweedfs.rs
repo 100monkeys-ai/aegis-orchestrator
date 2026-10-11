@@ -37,6 +37,9 @@ use std::time::Duration;
 /// than this MUST be issued via ranged `read_at` against the upper layers.
 const SEAWEEDFS_MAX_RESPONSE_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Ceiling for an error body the filer answers, read only to name it.
+const SEAWEEDFS_MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
+
 /// Stream the response body chunk-by-chunk, enforcing a running byte cap.
 /// Returns `StorageError::Unknown` the moment the running count exceeds
 /// `max_bytes` — without buffering further chunks.
@@ -359,10 +362,10 @@ impl StorageProvider for SeaweedFSAdapter {
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
                 let dirs = listing
-                    .entries
+                    .into_entries()
                     .into_iter()
-                    .filter(|e| e.is_directory)
-                    .map(|e| e.name)
+                    .filter(DirectoryEntry::is_directory)
+                    .map(|e| e.full_path)
                     .collect();
 
                 Ok(dirs)
@@ -587,11 +590,11 @@ impl StorageProvider for SeaweedFSAdapter {
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
                 let entries = listing
-                    .entries
-                    .into_iter()
+                    .into_entries()
+                    .iter()
                     .map(|e| DirEntry {
-                        name: e.name.rsplit('/').next().unwrap_or(&e.name).to_string(),
-                        file_type: if e.is_directory {
+                        name: e.name().to_string(),
+                        file_type: if e.is_directory() {
                             FileType::Directory
                         } else {
                             FileType::File
@@ -641,53 +644,46 @@ impl StorageProvider for SeaweedFSAdapter {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
-        // SeaweedFS doesn't have a native rename operation via HTTP API
-        // We implement it as copy + delete
-        // Note: This is not atomic, but acceptable for Phase 1
+        // The filer's own move: `POST <to>?mv.from=<from>` with no body
+        // (`weed/server/filer_server_handlers_write.go`, `PostHandler` and
+        // `move`). It moves a file or a directory with everything under it,
+        // replaces an existing file at `to`, and answers 204. A POST without
+        // `mv.from` is an upload, which the filer refuses unless it is
+        // multipart.
+        let response = self
+            .client
+            .post(self.build_url(to))
+            .query(&[("mv.from", from)])
+            .send()
+            .await?;
 
-        // 1. Check source exists
-        let from_url = self.build_url(from);
-        let check_response = self.client.head(&from_url).send().await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
 
-        if !check_response.status().is_success() {
+        let body = read_capped_body(response, SEAWEEDFS_MAX_ERROR_BODY_BYTES)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .unwrap_or_default();
+
+        if status == StatusCode::NOT_FOUND || is_missing_move_source(status, &body) {
             return Err(StorageError::FileNotFound(from.to_string()));
         }
 
-        // 2. Read source file
-        let read_response = self.client.get(&from_url).send().await?;
-
-        if !read_response.status().is_success() {
-            return Err(StorageError::Unknown(format!(
-                "Failed to read source file {from}"
-            )));
-        }
-
-        // 4.22: cap the rename copy at the per-response hard ceiling.
-        let data = read_capped_body(read_response, SEAWEEDFS_MAX_RESPONSE_BYTES).await?;
-
-        // 3. Write to destination
-        let to_url = self.build_url(to);
-        let write_response = self.client.post(&to_url).body(data).send().await?;
-
-        if !write_response.status().is_success() {
-            return Err(StorageError::Unknown(format!(
-                "Failed to write destination file {to}"
-            )));
-        }
-
-        // 4. Delete source
-        let delete_response = self.client.delete(&from_url).send().await?;
-
-        if !delete_response.status().is_success() {
-            // Rename semantics: if delete fails, both files exist - this is an error
-            // Don't leave orphaned files; fail the rename operation
-            return Err(StorageError::Unknown(format!(
-                "Rename from {from} to {to} failed on cleanup: source file still exists"
-            )));
-        }
-
-        Ok(())
+        Err(StorageError::Unknown(format!(
+            "Failed to move {from} to {to}: HTTP {status}: {body}"
+        )))
     }
+}
+
+/// The filer answers a move from a path it does not hold with 400 and
+/// `failed to get src entry '…', err: filer: no entry is found in filer
+/// store` (`FilerServer.move`; `filer_pb.ErrNotFound`).
+fn is_missing_move_source(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && body.contains("failed to get src entry")
+        && body.contains("no entry is found in filer store")
 }
 
 // ============================================================================
@@ -703,29 +699,52 @@ struct DirectoryStatus {
     file_count: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// The filer's listing for `GET <dir>` with `Accept: application/json`
+/// (`weed/server/filer_server_handlers_read_dir.go`,
+/// `listDirectoryHandler`): `{"Version", "Path", "Entries", "Limit",
+/// "LastFileName", "ShouldDisplayLoadMore", "EmptyFolder"}`. `Entries` is
+/// `null` for an empty directory. Every field has a default, so a listing
+/// never fails to decode on an absent key.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct DirectoryListing {
-    #[serde(rename = "Path", default)]
+    #[serde(rename = "Path")]
     path: String,
 
-    #[serde(rename = "Entries", default)]
-    entries: Vec<DirectoryEntry>,
+    #[serde(rename = "Entries")]
+    entries: Option<Vec<DirectoryEntry>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl DirectoryListing {
+    fn into_entries(self) -> Vec<DirectoryEntry> {
+        self.entries.unwrap_or_default()
+    }
+}
+
+/// One entry of the listing, the filer's `Entry` (`weed/filer/entry.go`):
+/// its kind is `Mode`'s `os.ModeDir` bit, as `stat` reads it; the filer
+/// sends no `IsDirectory` key.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct DirectoryEntry {
     #[serde(rename = "FullPath")]
-    name: String,
+    full_path: String,
 
     #[serde(rename = "Mtime")]
-    mtime: String,
+    mtime: Option<String>,
 
     #[serde(rename = "Mode")]
     mode: u32,
+}
 
-    #[serde(default)]
-    #[serde(rename = "IsDirectory")]
-    is_directory: bool,
+impl DirectoryEntry {
+    fn is_directory(&self) -> bool {
+        self.mode & GO_MODE_DIR != 0
+    }
+
+    fn name(&self) -> &str {
+        self.full_path.rsplit('/').next().unwrap_or(&self.full_path)
+    }
 }
 
 /// Go's `os.ModeDir`, the bit the filer's `Mode` carries for a directory
@@ -809,14 +828,15 @@ mod tests {
 
     #[test]
     fn test_directory_listing_with_entries_deserializes() {
-        // Canonical SeaweedFS filer response shape
-        let json = r#"{"Version":"2.x","Path":"/foo","Entries":[{"FullPath":"/foo/bar","Mtime":"2026-01-01T00:00:00Z","Mode":0,"IsDirectory":true}],"Limit":100}"#;
+        // The filer's listing: a directory's kind is `Mode`'s `os.ModeDir`
+        let json = r#"{"Version":"2.x","Path":"/foo","Entries":[{"FullPath":"/foo/bar","Mtime":"2026-01-01T00:00:00Z","Mode":2147484141}],"Limit":100}"#;
         let listing: DirectoryListing =
             serde_json::from_str(json).expect("should deserialize canonical filer response");
         assert_eq!(listing.path, "/foo");
-        assert_eq!(listing.entries.len(), 1);
-        assert_eq!(listing.entries[0].name, "/foo/bar");
-        assert!(listing.entries[0].is_directory);
+        let entries = listing.into_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].full_path, "/foo/bar");
+        assert!(entries[0].is_directory());
     }
 
     #[test]
@@ -826,7 +846,7 @@ mod tests {
         let listing: DirectoryListing =
             serde_json::from_str(json).expect("should deserialize when Entries is absent");
         assert_eq!(listing.path, "/foo");
-        assert!(listing.entries.is_empty());
+        assert!(listing.into_entries().is_empty());
     }
 
     // Regression: readdir and list_directories must send Accept: application/json so that
@@ -1015,6 +1035,319 @@ mod tests {
             matches!(result, Err(StorageError::FileNotFound(_))),
             "expected FileNotFound, got {result:?}"
         );
+    }
+
+    /// Mocks every request method on any path as an error the test must
+    /// never see, so a rename that sends anything but the one move fails.
+    async fn refuse_every_other_request(server: &mut mockito::ServerGuard) -> Vec<mockito::Mock> {
+        let mut mocks = Vec::new();
+        for method in ["HEAD", "GET", "PUT", "DELETE"] {
+            mocks.push(
+                server
+                    .mock(method, mockito::Matcher::Any)
+                    .with_status(599)
+                    .expect(0)
+                    .create_async()
+                    .await,
+            );
+        }
+        mocks
+    }
+
+    /// The filer's move: `POST <to>?mv.from=<from>` with no body, answered
+    /// with `status` and `body` (`FilerServer.move` answers 204 for a move it
+    /// made).
+    async fn filer_moving(
+        server: &mut mockito::ServerGuard,
+        from: &str,
+        to: &str,
+        status: usize,
+        body: &str,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", to)
+            .match_query(mockito::Matcher::UrlEncoded("mv.from".into(), from.into()))
+            .match_body(mockito::Matcher::Exact(String::new()))
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await
+    }
+
+    /// Regression (clone-work-tree-io-error): `rename` copied the source with
+    /// a raw-body POST, which the filer refuses (it reads a POST without
+    /// `mv.from` as a multipart upload), so git's lockfile rename of
+    /// `.git/config.lock` over `.git/config` failed with EIO. A rename is the
+    /// filer's own move, one request with no body.
+    #[tokio::test]
+    async fn rename_is_one_move_by_the_filer_with_no_body() {
+        let mut server = mockito::Server::new_async().await;
+        let others = refuse_every_other_request(&mut server).await;
+        let other_posts = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(599)
+            .expect(0)
+            .create_async()
+            .await;
+        let moved = filer_moving(
+            &mut server,
+            "/tenant/vol/repo/.git/config.lock",
+            "/tenant/vol/repo/.git/config",
+            204,
+            "",
+        )
+        .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .rename(
+                "/tenant/vol/repo/.git/config.lock",
+                "/tenant/vol/repo/.git/config",
+            )
+            .await;
+
+        assert_eq!(result, Ok(()), "the filer's move answered 204");
+        moved.assert_async().await;
+        other_posts.assert_async().await;
+        for mock in others {
+            mock.assert_async().await;
+        }
+    }
+
+    /// A move the filer refuses surfaces the filer's status and its body.
+    #[tokio::test]
+    async fn rename_refused_by_the_filer_names_its_status_and_body() {
+        let mut server = mockito::Server::new_async().await;
+        let _others = refuse_every_other_request(&mut server).await;
+        let filer_error = r#"{"error":"failed to move entry from '/tenant/vol/a' to '/tenant/vol/b', err: store unavailable"}"#;
+        let _moved = filer_moving(
+            &mut server,
+            "/tenant/vol/a",
+            "/tenant/vol/b",
+            500,
+            filer_error,
+        )
+        .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .rename("/tenant/vol/a", "/tenant/vol/b")
+            .await;
+
+        match result {
+            Err(StorageError::Unknown(message)) => assert!(
+                message.contains("500") && message.contains("store unavailable"),
+                "the refusal did not name the filer's status and body: {message}"
+            ),
+            other => panic!("expected the filer's refusal, got {other:?}"),
+        }
+    }
+
+    /// A missing source is not found. The filer answers a move from a path
+    /// it does not hold with 400 and "failed to get src entry …: filer: no
+    /// entry is found in filer store" (`FilerServer.move`).
+    #[tokio::test]
+    async fn rename_of_a_missing_source_is_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let moved = filer_moving(
+            &mut server,
+            "/tenant/vol/absent",
+            "/tenant/vol/b",
+            400,
+            r#"{"error":"failed to get src entry '/tenant/vol/absent', err: filer: no entry is found in filer store"}"#,
+        )
+        .await;
+
+        let result = SeaweedFSAdapter::new(server.url())
+            .rename("/tenant/vol/absent", "/tenant/vol/b")
+            .await;
+
+        assert_eq!(
+            result,
+            Err(StorageError::FileNotFound("/tenant/vol/absent".to_string())),
+            "a move from a missing source was not FileNotFound"
+        );
+        moved.assert_async().await;
+    }
+
+    /// The filer's listing as `listDirectoryHandler` writes it for
+    /// `Accept: application/json`: each entry is the filer's `Entry`, its
+    /// kind in `Mode` (`os.ModeDir` for a directory), and no `IsDirectory`
+    /// key anywhere.
+    const GIT_DIRECTORY_LISTING: &str = r#"{"Version":"30GB 3.97","Path":"/tenant/vol/repo/.git","Entries":[{"FullPath":"/tenant/vol/repo/.git/config","Mtime":"2026-10-11T16:40:46Z","Crtime":"2026-10-11T16:40:46Z","Ctime":"0001-01-01T00:00:00Z","Atime":"0001-01-01T00:00:00Z","Mode":420,"Uid":0,"Gid":0,"Mime":"","TtlSec":0,"UserName":"","GroupNames":null,"SymlinkTarget":"","Md5":null,"FileSize":92,"Rdev":0,"Inode":0,"Extended":null,"chunks":[{"file_id":"3,01637037d6","size":92,"modified_ts_ns":1760200846000000000}],"HardLinkId":null,"HardLinkCounter":0,"Content":null,"Remote":null,"Quota":0,"WORMEnforcedAtTsNs":0},{"FullPath":"/tenant/vol/repo/.git/hooks","Mtime":"2026-10-11T16:40:46Z","Crtime":"2026-10-11T16:40:46Z","Ctime":"0001-01-01T00:00:00Z","Atime":"0001-01-01T00:00:00Z","Mode":2147484141,"Uid":0,"Gid":0,"Mime":"","TtlSec":0,"UserName":"","GroupNames":null,"SymlinkTarget":"","Md5":null,"FileSize":0,"Rdev":0,"Inode":0,"Extended":null,"HardLinkId":null,"HardLinkCounter":0,"Content":null,"Remote":null,"Quota":0,"WORMEnforcedAtTsNs":0}],"Limit":100000,"LastFileName":"hooks","ShouldDisplayLoadMore":false,"EmptyFolder":false}"#;
+
+    async fn filer_listing(path: &str, listing: &str) -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", path)
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(listing)
+            .create_async()
+            .await;
+        server
+    }
+
+    /// Regression (seaweedfs-readdir-isdirectory-key): the listing's kind was
+    /// read from an `IsDirectory` key the filer never sends, so every entry
+    /// was listed as a file.
+    #[tokio::test]
+    async fn readdir_reports_the_kind_the_filers_mode_carries() {
+        let server = filer_listing("/tenant/vol/repo/.git", GIT_DIRECTORY_LISTING).await;
+
+        let entries = SeaweedFSAdapter::new(server.url())
+            .readdir("/tenant/vol/repo/.git")
+            .await
+            .expect("readdir of the filer's listing");
+
+        let kinds: Vec<(String, FileType)> =
+            entries.into_iter().map(|e| (e.name, e.file_type)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("config".to_string(), FileType::File),
+                ("hooks".to_string(), FileType::Directory),
+            ],
+            "the listing's kinds were not read from each entry's Mode"
+        );
+    }
+
+    /// `list_directories` keeps exactly the entries whose `Mode` marks a
+    /// directory.
+    #[tokio::test]
+    async fn list_directories_keeps_the_entries_the_filers_mode_marks_as_directories() {
+        let server = filer_listing("/tenant/vol/repo/.git", GIT_DIRECTORY_LISTING).await;
+
+        let dirs = SeaweedFSAdapter::new(server.url())
+            .list_directories("/tenant/vol/repo/.git")
+            .await
+            .expect("list_directories of the filer's listing");
+
+        assert_eq!(
+            dirs,
+            vec!["/tenant/vol/repo/.git/hooks".to_string()],
+            "the directories were not those whose Mode carries ModeDir"
+        );
+    }
+
+    /// An empty directory's listing: the filer writes `"Entries":null` (its
+    /// entries are a nil slice), and a listing may carry no `Entries` key at
+    /// all, or an entry with no `Mtime` or `Mode`. Each decodes.
+    #[tokio::test]
+    async fn readdir_decodes_a_listing_with_no_entries_or_absent_keys() {
+        for (listing, expected) in [
+            (
+                r#"{"Version":"30GB 3.97","Path":"/tenant/vol/repo/.git/hooks","Entries":null,"Limit":100000,"LastFileName":"","ShouldDisplayLoadMore":false,"EmptyFolder":true}"#,
+                vec![],
+            ),
+            (r#"{"Path":"/tenant/vol/repo/.git/hooks"}"#, vec![]),
+            (
+                r#"{"Entries":[{"FullPath":"/tenant/vol/repo/.git/hooks/README"}]}"#,
+                vec![("README".to_string(), FileType::File)],
+            ),
+        ] {
+            let server = filer_listing("/tenant/vol/repo/.git/hooks", listing).await;
+
+            let result = SeaweedFSAdapter::new(server.url())
+                .readdir("/tenant/vol/repo/.git/hooks")
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|e| (e.name, e.file_type))
+                        .collect::<Vec<_>>()
+                });
+
+            assert_eq!(result, Ok(expected), "the listing {listing} did not decode");
+        }
+    }
+
+    /// Git's lockfile sequence through the `StorageProvider` trait, as a
+    /// clone writes `.git/config`: create `config.lock`, write it, rename it
+    /// over the existing `config` (the filer's move replaces an existing
+    /// file, `moveSelfEntry`), then stat `config` and read the new size.
+    #[tokio::test]
+    async fn git_lockfile_sequence_replaces_the_destination() {
+        let config = b"[core]\n\trepositoryformatversion = 0\n";
+        let mut server = mockito::Server::new_async().await;
+        let lock_created = server
+            .mock("PUT", "/tenant/vol/repo/.git/config.lock")
+            .match_body(mockito::Matcher::Exact(String::new()))
+            .with_status(201)
+            .expect(1)
+            .create_async()
+            .await;
+        let lock_written = server
+            .mock("PUT", "/tenant/vol/repo/.git/config.lock")
+            .match_body(mockito::Matcher::Exact(
+                String::from_utf8(config.to_vec()).unwrap(),
+            ))
+            .with_status(201)
+            .expect(1)
+            .create_async()
+            .await;
+        let moved = filer_moving(
+            &mut server,
+            "/tenant/vol/repo/.git/config.lock",
+            "/tenant/vol/repo/.git/config",
+            204,
+            "",
+        )
+        .await;
+        let config_metadata = format!(
+            r#"{{"FullPath":"/tenant/vol/repo/.git/config","Mtime":"2026-10-11T16:40:46Z","Mode":420,"FileSize":{}}}"#,
+            config.len()
+        );
+        server
+            .mock("GET", "/tenant/vol/repo/.git/config")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "metadata".into(),
+                "true".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(&config_metadata)
+            .create_async()
+            .await;
+        server
+            .mock("HEAD", "/tenant/vol/repo/.git/config")
+            .with_status(200)
+            .with_header("last-modified", "Sun, 11 Oct 2026 16:40:46 GMT")
+            .with_header("content-length", &config.len().to_string())
+            .create_async()
+            .await;
+
+        let provider: Box<dyn StorageProvider> = Box::new(SeaweedFSAdapter::new(server.url()));
+        let handle = provider
+            .create_file("/tenant/vol/repo/.git/config.lock", 0o644)
+            .await
+            .expect("create config.lock");
+        let written = provider
+            .write_at(&handle, 0, config)
+            .await
+            .expect("write config.lock");
+        provider
+            .rename(
+                "/tenant/vol/repo/.git/config.lock",
+                "/tenant/vol/repo/.git/config",
+            )
+            .await
+            .expect("rename config.lock over config");
+        let attrs = provider
+            .stat("/tenant/vol/repo/.git/config")
+            .await
+            .expect("stat config");
+
+        assert_eq!(written, config.len());
+        assert_eq!(
+            (attrs.file_type, attrs.size),
+            (FileType::File, config.len() as u64),
+            "config did not read the size written to config.lock"
+        );
+        lock_created.assert_async().await;
+        lock_written.assert_async().await;
+        moved.assert_async().await;
     }
 
     /// Regression for security audit 002 §4.22. A hostile / compromised
