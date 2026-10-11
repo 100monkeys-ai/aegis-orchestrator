@@ -14,12 +14,9 @@
 //! drops it at the end. In CI (`CI` set) a missing URL fails the test;
 //! elsewhere it says it was skipped and passes.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use aegis_orchestrator_core::domain::rate_limit::{
-    RateLimitBucket, RateLimitPolicy, RateLimitResourceType, RateLimitScope, RateLimitWindow,
-};
+use aegis_orchestrator_core::domain::rate_limit::{RateLimitBucket, RateLimitScope};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::rate_limit::PostgresWindowEnforcer;
 use chrono::{DateTime, Duration, Utc};
@@ -115,25 +112,6 @@ fn scope(user: &str) -> RateLimitScope {
     }
 }
 
-fn policy() -> RateLimitPolicy {
-    RateLimitPolicy {
-        resource_type: RateLimitResourceType::LlmToken,
-        windows: [RateLimitBucket::Weekly, RateLimitBucket::Monthly]
-            .map(|bucket| {
-                (
-                    bucket,
-                    RateLimitWindow {
-                        limit: 1_000_000,
-                        window_seconds: bucket.window_seconds(),
-                        burst: None,
-                    },
-                )
-            })
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-    }
-}
-
 /// Store one bucket's row of a charge of `counter` made at `charge`, as the
 /// enforcer stores it.
 async fn row(
@@ -165,18 +143,24 @@ async fn row(
     .expect("store a counter row");
 }
 
-/// The week's and the month's sums for `user`, as the enforcer reads them.
+/// The week's and the month's sums of the rows stored for `user`: the rows
+/// the migration writes, not a window's reading of them.
 async fn week_and_month(pool: &PgPool, user: &str) -> (u64, u64) {
-    let policy = policy();
-    let remaining = PostgresWindowEnforcer::new(pool.clone())
-        .remaining(&scope(user), &policy)
+    let scope = scope(user);
+    let (_, scope_id) = PostgresWindowEnforcer::scope_parts(&scope);
+    let mut sums = [0u64; 2];
+    for (sum, bucket) in sums.iter_mut().zip(["weekly", "monthly"]) {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(counter),0)::BIGINT FROM rate_limit_counters WHERE scope_id = $1 AND bucket = $2",
+        )
+        .bind(&scope_id)
+        .bind(bucket)
+        .fetch_one(pool)
         .await
-        .expect("read the windows");
-    let used = |bucket| 1_000_000 - remaining[&bucket];
-    (
-        used(RateLimitBucket::Weekly),
-        used(RateLimitBucket::Monthly),
-    )
+        .expect("sum the stored rows");
+        *sum = total as u64;
+    }
+    (sums[0], sums[1])
 }
 
 async fn monthly_rows(pool: &PgPool, user: &str) -> i64 {
