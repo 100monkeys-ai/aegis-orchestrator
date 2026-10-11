@@ -213,6 +213,10 @@ impl VolumeContextLookup for NfsVolumeRegistry {
         self.lookup(volume_id)
             .and_then(|ctx| ctx.workflow_execution_id)
     }
+
+    fn lookup_execution_id(&self, volume_id: VolumeId) -> Option<ExecutionId> {
+        self.lookup(volume_id).map(|ctx| ctx.execution_id)
+    }
 }
 
 /// NFS Gateway application service

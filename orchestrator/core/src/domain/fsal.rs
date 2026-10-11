@@ -320,11 +320,15 @@ pub trait EventPublisher: Send + Sync {
 /// Domain-layer abstraction for querying the NFS volume registry.
 ///
 /// Used by `AegisFSAL::authorize()` to resolve `VolumeOwnership::WorkflowExecution`
-/// without the domain layer depending on the application layer (`NfsVolumeRegistry`).
-/// The application layer provides the concrete implementation.
+/// and `VolumeOwnership::Persistent` without the domain layer depending on the
+/// application layer (`NfsVolumeRegistry`). The application layer provides the
+/// concrete implementation.
 pub trait VolumeContextLookup: Send + Sync {
     /// Returns the `workflow_execution_id` registered for the given volume, if any.
     fn lookup_workflow_execution_id(&self, volume_id: VolumeId) -> Option<uuid::Uuid>;
+
+    /// Returns the execution registered for the given volume, if any.
+    fn lookup_execution_id(&self, volume_id: VolumeId) -> Option<ExecutionId>;
 }
 
 /// Borrowed read-only access to an existing volume, exposed under a distinct alias volume ID.
@@ -519,7 +523,17 @@ impl AegisFSAL {
                     .map(|ctx_wf_id| ctx_wf_id == *wf_id)
                     .unwrap_or(false)
             }
-            _ => false, // Persistent volumes require user-level auth
+            // A person's persistent volume is open to the one execution the
+            // orchestrator registered for it (a git clone step, a run that
+            // mounts the binding), and only while that registration holds.
+            crate::domain::volume::VolumeOwnership::Persistent { .. } => execution_id
+                .zip(
+                    self.volume_context_lookup
+                        .as_ref()
+                        .and_then(|lookup| lookup.lookup_execution_id(volume_id)),
+                )
+                .map(|(eid, registered)| eid == registered)
+                .unwrap_or(false),
         };
 
         if !is_owner {
@@ -1854,6 +1868,10 @@ mod tests {
     impl VolumeContextLookup for StubVolumeContextLookup {
         fn lookup_workflow_execution_id(&self, _volume_id: VolumeId) -> Option<uuid::Uuid> {
             self.wf_id
+        }
+
+        fn lookup_execution_id(&self, _volume_id: VolumeId) -> Option<ExecutionId> {
+            None
         }
     }
 

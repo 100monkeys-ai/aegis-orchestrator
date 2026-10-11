@@ -1812,6 +1812,10 @@ mod handle_tests {
                 .filter(|(registered, _)| *registered == volume_id)
                 .map(|(_, workflow)| workflow)
         }
+
+        fn lookup_execution_id(&self, _volume_id: VolumeId) -> Option<ExecutionId> {
+            None
+        }
     }
 
     fn all_paths() -> FsalAccessPolicy {
