@@ -2084,6 +2084,14 @@ spec:
                 {
                     wrong.push(format!("count is not 1 to 4: {schema}"));
                 }
+                let size = schema["properties"]["size"]["description"]
+                    .as_str()
+                    .unwrap_or_default();
+                for needle in ["<width>x<height>", "flux-1-schnell", "not sent"] {
+                    if !size.contains(needle) {
+                        wrong.push(format!("the size description names no {needle}: {size}"));
+                    }
+                }
             }
             None => wrong.push(format!("{TOOL} is not listed")),
         }
@@ -2097,6 +2105,29 @@ spec:
             wrong.push(format!("{TOOL} is gated"));
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Each file is named by its content type (`.jpg` for `image/jpeg`), so
+    /// the description names no PNG and names each extension.
+    #[tokio::test]
+    async fn aegis_image_generate_description_names_each_file_by_its_type_and_no_png() {
+        let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+        let tools = router.list_tools().await.unwrap();
+        let description = tools
+            .iter()
+            .find(|t| t.name == TOOL)
+            .map(|t| t.description.clone())
+            .unwrap_or_default();
+        let mut wrong = Vec::new();
+        if description.to_lowercase().contains("png file") || description.contains("PNG") {
+            wrong.push("the description names a PNG".to_string());
+        }
+        for needle in ["named by its type", ".jpg", ".png", ".webp"] {
+            if !description.contains(needle) {
+                wrong.push(format!("the description names no {needle}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}\n{description}");
     }
 
     #[tokio::test]
