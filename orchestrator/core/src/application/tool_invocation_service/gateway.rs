@@ -261,7 +261,9 @@ impl ToolInvocationService {
             .unwrap_or_default();
         let contexts_of_run = contexts.clone();
         // Zaru ADR-0055 D16: a declared context the dispatch filled with a
-        // binding brings its server's tools; an undeclared one brings none.
+        // binding brings its server's tools, unless `spec.tools` names some
+        // of them, when the run sees exactly those; an undeclared one brings
+        // none.
         let filled_contexts: Vec<String> = agent
             .manifest
             .spec
@@ -269,6 +271,9 @@ impl ToolInvocationService {
             .iter()
             .map(|declared| declared.service.trim().to_string())
             .filter(|service| contexts.is_filled(service))
+            .filter(|service| {
+                crate::domain::agent::context_brings_whole_server(service, &declared_tools)
+            })
             .collect();
         if declared_tools.is_empty() && filled_contexts.is_empty() {
             return Ok(Vec::new());
