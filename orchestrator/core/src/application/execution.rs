@@ -8763,7 +8763,9 @@ impl ExecutionService for StandardExecutionService {
         };
 
         // AEGIS ADR-136 G4: the run's repositories at `/workspace/<label>`,
-        // checked with the child's own volumes.
+        // checked with the child's own volumes. The mounts from
+        // `declared_mounts` on are the run's, not the child's own.
+        let declared_mounts = own_volume_mounts.len();
         own_volume_mounts.extend(repository_mounts);
 
         // Validate own volume mount paths (must be under /workspace, no overlaps with each other
@@ -8774,18 +8776,26 @@ impl ExecutionService for StandardExecutionService {
                 .map(|m| m.mount_point.to_string_lossy().to_string())
                 .collect();
 
-            for mount in &own_volume_mounts {
+            for (index, mount) in own_volume_mounts.iter().enumerate() {
                 let path = mount.mount_point.to_string_lossy().to_string();
                 if !(path == "/workspace" || path.starts_with("/workspace/")) {
                     return Err(anyhow!(
                         "Invalid mount path '{path}': all mounts must be /workspace or /workspace/*"
                     ));
                 }
+                // AEGIS ADR-136 G4: a run's repository may sit beneath an
+                // inherited mount, as it sat beneath the parent's own
+                // `/workspace` volume the judge inherits; a child's own
+                // declared volume may not.
+                let is_run_repository = index >= declared_mounts;
                 // Own volumes must not overlap with inherited mount paths.
                 for inh in &inherited_paths {
                     let a = path.trim_end_matches('/');
                     let b = inh.trim_end_matches('/');
-                    if a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+                    let nested_under_inherited = a.starts_with(&format!("{b}/"));
+                    if a == b
+                        || (nested_under_inherited && !is_run_repository)
+                        || b.starts_with(&format!("{a}/"))
                     {
                         return Err(anyhow!(
                             "Child execution own mount '{}' overlaps with inherited mount '{}'",

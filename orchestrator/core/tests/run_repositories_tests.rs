@@ -1220,15 +1220,34 @@ async fn an_author_an_entry_carried_is_replaced_by_the_persons_own() {
 const RUN_ENDED: &str = "this run has ended, so its repositories are released";
 
 /// A runtime that starts no container: a start that gets past its mounts
-/// fails in the supervisor's own task, after the start has answered.
-struct NoContainers;
+/// fails in the supervisor's own task, after the start has answered. It
+/// keeps each container's configuration it was asked for.
+#[derive(Default)]
+struct NoContainers {
+    asked: Mutex<Vec<aegis_orchestrator_core::domain::runtime::RuntimeConfig>>,
+}
+
+impl NoContainers {
+    /// The mounts of the first container asked for, waited on: the
+    /// supervisor asks in its own task.
+    async fn first_mounts(&self) -> Vec<VolumeMount> {
+        for _ in 0..200 {
+            if let Some(config) = self.asked.lock().unwrap().first() {
+                return config.volumes.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no container was asked for");
+    }
+}
 
 #[async_trait]
 impl aegis_orchestrator_core::domain::runtime::AgentRuntime for NoContainers {
     async fn spawn(
         &self,
-        _config: aegis_orchestrator_core::domain::runtime::RuntimeConfig,
+        config: aegis_orchestrator_core::domain::runtime::RuntimeConfig,
     ) -> Result<InstanceId, aegis_orchestrator_core::domain::runtime::RuntimeError> {
+        self.asked.lock().unwrap().push(config);
         Err(
             aegis_orchestrator_core::domain::runtime::RuntimeError::SpawnFailed(
                 "these tests start no container".to_string(),
@@ -1275,10 +1294,136 @@ struct WorkflowRun {
     run: uuid::Uuid,
     state: aegis_orchestrator_core::domain::execution::ExecutionId,
     judge: aegis_orchestrator_core::domain::agent::AgentId,
+    runtime: Arc<NoContainers>,
+}
+
+/// The tester's own volume, as `cli/templates/agents/tester-agent.yaml`
+/// declares it.
+const TESTER_WORKSPACE: &str = r#"
+  tools: ["cmd.run"]
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+      mount_path: "/workspace"
+      access_mode: "read-write"
+      size_limit: "2Gi"
+"#;
+
+/// How a run's agent state and its judge are declared beyond the plain
+/// shape: the state's agent with the tester's `/workspace` volume, provisioned
+/// and registered with the NFS gateway as a running state's is, and a judge
+/// labelled `role: judge`, declaring its own volume at `judge_volume`.
+struct TesterShape {
+    judge_volume: Option<&'static str>,
+}
+
+/// A volume service holding the tester's provisioned `/workspace` volume and
+/// provisioning a judge's own declared volumes as it is asked.
+struct TesterVolumes {
+    tester: Volume,
+}
+
+#[async_trait]
+impl VolumeService for TesterVolumes {
+    async fn create_volume(
+        &self,
+        _name: String,
+        _tenant_id: TenantId,
+        _storage_class: StorageClass,
+        _size_limit_mb: u64,
+        _ownership: VolumeOwnership,
+    ) -> anyhow::Result<VolumeId> {
+        unreachable!("a judge's volumes are created for its execution")
+    }
+    async fn get_volume(&self, id: VolumeId) -> anyhow::Result<Volume> {
+        if id == self.tester.id {
+            return Ok(self.tester.clone());
+        }
+        Err(anyhow::anyhow!("no volume {id}"))
+    }
+    async fn list_volumes_by_tenant(&self, _tenant_id: TenantId) -> anyhow::Result<Vec<Volume>> {
+        Ok(vec![self.tester.clone()])
+    }
+    async fn list_volumes_by_ownership(
+        &self,
+        ownership: &VolumeOwnership,
+    ) -> anyhow::Result<Vec<Volume>> {
+        Ok(if *ownership == self.tester.ownership {
+            vec![self.tester.clone()]
+        } else {
+            Vec::new()
+        })
+    }
+    async fn attach_volume(
+        &self,
+        _volume_id: VolumeId,
+        _instance_id: InstanceId,
+        _mount_point: PathBuf,
+        _access_mode: AccessMode,
+    ) -> anyhow::Result<VolumeMount> {
+        unreachable!()
+    }
+    async fn detach_volume(
+        &self,
+        _volume_id: VolumeId,
+        _instance_id: InstanceId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn delete_volume(&self, _volume_id: VolumeId) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn get_volume_usage(&self, _volume_id: VolumeId) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn cleanup_expired_volumes(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+    async fn create_volumes_for_execution(
+        &self,
+        execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        tenant_id: TenantId,
+        volume_specs: &[aegis_orchestrator_core::domain::agent::VolumeSpec],
+        _storage_mode: &str,
+    ) -> anyhow::Result<Vec<Volume>> {
+        Ok(volume_specs
+            .iter()
+            .map(|spec| {
+                let mut volume = Volume::new(
+                    spec.name.clone(),
+                    tenant_id.clone(),
+                    StorageClass::persistent(),
+                    VolumeBackend::HostPath {
+                        path: PathBuf::from("/tmp/judge-volume"),
+                    },
+                    1024 * 1024,
+                    VolumeOwnership::execution(execution_id),
+                )
+                .unwrap();
+                volume.mark_available().unwrap();
+                volume
+            })
+            .collect())
+    }
+    async fn persist_external_volume(
+        &self,
+        _volume_id: VolumeId,
+        _name: String,
+        _tenant_id: TenantId,
+        _remote_path: String,
+        _size_limit_bytes: u64,
+        _ownership: VolumeOwnership,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl WorkflowRun {
     async fn start(fx: &Fixture) -> Self {
+        Self::start_with(fx, None).await
+    }
+
+    async fn start_with(fx: &Fixture, tester: Option<TesterShape>) -> Self {
         use aegis_orchestrator_core::domain::execution::{Execution, ExecutionId, ExecutionInput};
         use aegis_orchestrator_core::domain::repository::{
             AgentRepository, ExecutionRepository, WorkflowExecutionRepository,
@@ -1330,27 +1475,47 @@ spec:
             .unwrap();
 
         let agents = Arc::new(InMemoryAgentRepository::new());
-        let agent = |name: &str| {
+        let agent = |name: &str, labels: &str, rest: &str| {
             aegis_orchestrator_core::domain::agent::Agent::new(
                 serde_yaml::from_str(&format!(
                     r#"apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: {name}
-  version: "1.0.0"
+  version: "1.0.0"{labels}
 spec:
   runtime:
     image: ghcr.io/example/{name}:latest
     isolation: docker
   task:
-    instruction: "Run the {name} task"
-"#
+    instruction: "Run the {name} task"{rest}"#
                 ))
                 .unwrap(),
             )
         };
-        let analyst = agent("analyst");
-        let judge = agent("judge");
+        let (analyst, judge) = match &tester {
+            None => (agent("analyst", "", "\n"), agent("judge", "", "\n")),
+            Some(shape) => {
+                let judge_rest = match shape.judge_volume {
+                    None => "\n".to_string(),
+                    Some(path) => format!(
+                        r#"
+  tools: ["cmd.run"]
+  volumes:
+    - name: scratch
+      storage_class: ephemeral
+      mount_path: "{path}"
+      access_mode: "read-write"
+      size_limit: "1Gi"
+"#
+                    ),
+                };
+                (
+                    agent("tester", "", TESTER_WORKSPACE),
+                    agent("judge", "\n  labels:\n    role: judge", &judge_rest),
+                )
+            }
+        };
         agents.save_for_tenant(&fx.tenant, &analyst).await.unwrap();
         agents.save_for_tenant(&fx.tenant, &judge).await.unwrap();
 
@@ -1379,22 +1544,75 @@ spec:
             .await
             .unwrap();
 
-        let executions =
-            aegis_orchestrator_core::application::execution::StandardExecutionService::new(
+        let runtime = Arc::new(NoContainers::default());
+        let supervisor =
+            Arc::new(aegis_orchestrator_core::domain::supervisor::Supervisor::new(runtime.clone()));
+        let executions = match tester {
+            None => aegis_orchestrator_core::application::execution::StandardExecutionService::new(
                 agents,
                 Arc::new(UnusedVolumeService),
-                Arc::new(
-                    aegis_orchestrator_core::domain::supervisor::Supervisor::new(Arc::new(
-                        NoContainers,
-                    )),
-                ),
+                supervisor,
                 execution_repo,
                 Arc::new(EventBus::new(64)),
                 Arc::new(
                     aegis_orchestrator_core::domain::node_config::NodeConfigManifest::default(),
                 ),
-            )
-            .with_workflow_executions(workflows.clone());
+            ),
+            Some(_) => {
+                use aegis_orchestrator_core::application::nfs_gateway::{
+                    EventBusPublisher, NfsGatewayService, VolumeRegistration,
+                };
+                // The tester's `/workspace` volume, provisioned for its
+                // execution and registered with the gateway at its mount.
+                let mut tester_volume = Volume::new(
+                    "workspace".to_string(),
+                    fx.tenant.clone(),
+                    StorageClass::persistent(),
+                    VolumeBackend::HostPath {
+                        path: PathBuf::from("/tmp/tester-volume"),
+                    },
+                    1024 * 1024,
+                    VolumeOwnership::execution(state.id),
+                )
+                .unwrap();
+                tester_volume.mark_available().unwrap();
+                let event_bus = Arc::new(EventBus::new(64));
+                let gateway = Arc::new(NfsGatewayService::new(
+                    unused_storage_provider(),
+                    Arc::new(InMemoryVolumeRepository::new()) as Arc<dyn VolumeRepository>,
+                    Arc::new(EventBusPublisher::new(event_bus.clone())),
+                    Some(0),
+                ));
+                gateway.register_volume(VolumeRegistration {
+                    volume_id: tester_volume.id,
+                    execution_id: state.id,
+                    workflow_execution_id: None,
+                    container_uid: 1000,
+                    container_gid: 1000,
+                    policy: aegis_orchestrator_core::domain::fsal::FsalAccessPolicy {
+                        read: vec!["/*".to_string()],
+                        write: vec!["/*".to_string()],
+                    },
+                    mount_point: PathBuf::from("/workspace"),
+                    remote_path: String::new(),
+                });
+                let mut config =
+                    aegis_orchestrator_core::domain::node_config::NodeConfigManifest::default();
+                config.spec.storage = Some(Default::default());
+                aegis_orchestrator_core::application::execution::StandardExecutionService::new(
+                    agents,
+                    Arc::new(TesterVolumes {
+                        tester: tester_volume,
+                    }),
+                    supervisor,
+                    execution_repo,
+                    event_bus,
+                    Arc::new(config),
+                )
+                .with_nfs_gateway(gateway)
+            }
+        }
+        .with_workflow_executions(workflows.clone());
         executions.set_repositories(fx.service.clone() as Arc<dyn RunRepositories>);
 
         Self {
@@ -1404,6 +1622,7 @@ spec:
             run,
             state: state.id,
             judge: judge.id,
+            runtime,
         }
     }
 
@@ -1534,4 +1753,64 @@ async fn a_child_of_a_running_run_mounts_and_holds_under_the_run() {
         Some(run.run),
         "a child of a running run did not hold under its run"
     );
+}
+
+// ===========================================================================
+// G4: a judge of an agent with its own `/workspace` mounts the run's
+// repositories beneath the volume it inherits
+// ===========================================================================
+
+/// The run `beadefb9` of 2026-10-12: the tester declares its own volume at
+/// `/workspace`, which its judge inherits read-only; the run's repository at
+/// `/workspace/aegis-examples` is the run's, as it was beneath the tester's
+/// own `/workspace`, and the judge mounts both.
+#[tokio::test]
+async fn a_judge_of_a_tester_mounts_the_runs_repository_beneath_its_inherited_workspace() {
+    let fx = fixture().await;
+    let run = WorkflowRun::start_with(&fx, Some(TesterShape { judge_volume: None })).await;
+
+    run.start_judge()
+        .await
+        .unwrap_or_else(|e| panic!("the tester's judge was refused: {e}"));
+
+    let mounts: Vec<(String, AccessMode)> = run
+        .runtime
+        .first_mounts()
+        .await
+        .iter()
+        .map(|m| (m.mount_point.display().to_string(), m.access_mode))
+        .collect();
+    assert_eq!(
+        mounts,
+        vec![
+            ("/workspace".to_string(), AccessMode::ReadOnly),
+            (
+                "/workspace/aegis-examples".to_string(),
+                AccessMode::ReadWrite
+            ),
+        ],
+        "the judge's container was not given the inherited workspace and the run's repository"
+    );
+}
+
+/// The guard: a judge's own declared volume nested under the volume it
+/// inherits is still refused.
+#[tokio::test]
+async fn a_judges_own_volume_beneath_its_inherited_workspace_is_refused() {
+    let fx = fixture().await;
+    let run = WorkflowRun::start_with(
+        &fx,
+        Some(TesterShape {
+            judge_volume: Some("/workspace/x"),
+        }),
+    )
+    .await;
+
+    match run.start_judge().await {
+        Err(e) => assert_eq!(
+            e.to_string(),
+            "Child execution own mount '/workspace/x' overlaps with inherited mount '/workspace'"
+        ),
+        Ok(id) => panic!("a judge's own volume beneath its inherited workspace started: {id}"),
+    }
 }
