@@ -509,12 +509,11 @@ impl Supervisor {
         // Track iteration history for context in subsequent attempts
         let mut iteration_history: Vec<serde_json::Value> = Vec::new();
 
-        // Why the last iteration's declared outputs failed it, if they did:
-        // the reason the execution ends with past max retries (O2).
-        let mut outputs_failure: Option<String> = None;
+        // How the last iteration ended, in the person's words: the reason the
+        // execution ends with past max retries.
+        let mut last_end: Option<AttemptEnd> = None;
 
         while attempts < max_retries {
-            outputs_failure = None;
             // Check cancellation before each iteration
             if cancellation_token.is_cancelled() {
                 info!("Execution cancelled before iteration {}", attempts + 1);
@@ -557,6 +556,7 @@ impl Supervisor {
                     let error_msg = format!("Failed to spawn instance: {e}");
                     warn!("{}", error_msg);
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
+                    last_end = Some(AttemptEnd::Cause(spawn_failure_cause(&e)));
 
                     // Record spawn failure in history
                     iteration_history.push(serde_json::json!({
@@ -659,6 +659,7 @@ impl Supervisor {
                     let error_msg = format!("Execution failed: {e}");
                     warn!("{}", error_msg);
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
+                    last_end = Some(AttemptEnd::Cause(execution_failure_cause(&e)));
 
                     // Record execution failure in history
                     iteration_history.push(serde_json::json!({
@@ -741,7 +742,7 @@ impl Supervisor {
                         "validation_reason": reason,
                         "feedback": reason
                     }));
-                    outputs_failure = Some(reason);
+                    last_end = Some(AttemptEnd::OutputsMissing(reason));
                     continue;
                 }
             }
@@ -845,6 +846,9 @@ impl Supervisor {
                             .as_ref()
                             .and_then(|g| serde_json::to_string_pretty(g).ok())
                             .unwrap_or_else(|| blocking_reason.clone());
+                        last_end = Some(AttemptEnd::Cause(format!(
+                            "the last attempt's output was rejected: {blocking_reason}"
+                        )));
                         iteration_history.push(serde_json::json!({
                             "iteration": attempts,
                             "output": stdout,
@@ -879,6 +883,9 @@ impl Supervisor {
                             error = %e,
                             "Validation pipeline error — treating iteration as failed"
                         );
+                        last_end = Some(AttemptEnd::Cause(format!(
+                            "the last attempt failed validation: {e:#}"
+                        )));
                         iteration_history.push(serde_json::json!({
                             "iteration": attempts,
                             "output": stdout,
@@ -905,10 +912,9 @@ impl Supervisor {
             }
         }
 
-        Err(RuntimeError::ExecutionFailed(match outputs_failure {
-            Some(reason) => format!("Max retries exceeded: {reason}"),
-            None => "Max retries exceeded".to_string(),
-        }))
+        Err(RuntimeError::ExecutionFailed(max_retries_exceeded(
+            attempts, last_end,
+        )))
     }
 
     fn extract_execution_context(
@@ -927,6 +933,82 @@ impl Supervisor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+/// How the last iteration of a loop that ran out of retries ended.
+enum AttemptEnd {
+    /// Its declared outputs were missing: the sentence the execution has
+    /// always ended with past max retries (ADR-005, Update of 2026-10-06, O2).
+    OutputsMissing(String),
+    /// Any other end, as a clause that completes "the last attempt …".
+    Cause(String),
+}
+
+/// The error a loop that ran out of retries ends with: how many attempts it
+/// made and how the last one ended, so the person reading the failure learns
+/// why without reading the orchestrator's log.
+fn max_retries_exceeded(attempts: u32, last_end: Option<AttemptEnd>) -> String {
+    let plural = if attempts == 1 { "" } else { "s" };
+    match last_end {
+        Some(AttemptEnd::OutputsMissing(reason)) => format!("Max retries exceeded: {reason}"),
+        Some(AttemptEnd::Cause(cause)) => {
+            format!("Max retries exceeded after {attempts} attempt{plural}; {cause}")
+        }
+        None => "Max retries exceeded".to_string(),
+    }
+}
+
+/// "the last attempt could not start: …", with the spawn's own error.
+fn spawn_failure_cause(error: &RuntimeError) -> String {
+    let detail = match error {
+        RuntimeError::SpawnFailed(detail) => detail.clone(),
+        other => other.to_string(),
+    };
+    format!("the last attempt could not start: {detail}")
+}
+
+/// At most this many lines of a failed process's standard error are named.
+const STDERR_TAIL_LINES: usize = 5;
+/// At most this many characters of a failed process's standard error are named.
+const STDERR_TAIL_CHARS: usize = 2_000;
+
+/// "the last attempt …" for an execution that returned an error: a timeout
+/// names its bound; a failed process names its error line and the end of its
+/// standard error, without the bootstrap's debug lines.
+fn execution_failure_cause(error: &RuntimeError) -> String {
+    match error {
+        RuntimeError::TimedOut(seconds) => {
+            format!("the last attempt ran past its time limit of {seconds} s and was stopped")
+        }
+        RuntimeError::ExecutionFailedWithLogs { error, logs } => {
+            let tail = stderr_tail(logs);
+            if tail.is_empty() || tail == *error {
+                format!("the last attempt failed: {error}")
+            } else {
+                format!("the last attempt failed: {error}; the end of its standard error:\n{tail}")
+            }
+        }
+        RuntimeError::ExecutionFailed(detail) => format!("the last attempt failed: {detail}"),
+        other => format!("the last attempt failed: {other}"),
+    }
+}
+
+/// The last lines of a process's standard error that are not the bootstrap's
+/// own debug lines, bounded by [`STDERR_TAIL_LINES`] and [`STDERR_TAIL_CHARS`].
+fn stderr_tail(logs: &[String]) -> String {
+    let lines: Vec<&str> = logs
+        .iter()
+        .map(|line| line.trim_end())
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with("[BOOTSTRAP "))
+        .collect();
+    let tail = lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].join("\n");
+    let chars = tail.chars().count();
+    if chars <= STDERR_TAIL_CHARS {
+        tail
+    } else {
+        let kept: String = tail.chars().skip(chars - STDERR_TAIL_CHARS).collect();
+        format!("…{kept}")
     }
 }
 
@@ -2203,5 +2285,201 @@ mod tests {
             other => complaints.push(format!("the execution ended {other:?}")),
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    // ── The ending past max retries names how the last attempt ended ─────────
+
+    /// Runs the loop and answers the error it ended with, or why it did not.
+    async fn final_error(
+        runtime: Arc<TestRuntime>,
+        config: RuntimeConfig,
+        max_retries: u32,
+        pipeline: Option<Arc<ValidationPipeline>>,
+    ) -> Result<String, String> {
+        match Supervisor::new(runtime)
+            .run_loop(
+                config,
+                create_test_input(),
+                max_retries,
+                Arc::new(TestObserver::default()),
+                CancellationToken::new(),
+                pipeline,
+            )
+            .await
+        {
+            Err(RuntimeError::ExecutionFailed(reason)) => Ok(reason),
+            other => Err(format!("the execution ended {other:?}")),
+        }
+    }
+
+    /// Every attempt that could not start: the ending names the attempts and
+    /// the last spawn's error, in the singular for one attempt.
+    #[tokio::test]
+    async fn past_max_retries_after_spawn_errors_the_ending_names_the_last_spawn_error() {
+        let mut complaints = Vec::new();
+        for (attempts, expected) in [
+            (
+                3,
+                "Max retries exceeded after 3 attempts; the last attempt could not start: \
+                 Resource exhausted",
+            ),
+            (
+                1,
+                "Max retries exceeded after 1 attempt; the last attempt could not start: \
+                 Resource exhausted",
+            ),
+        ] {
+            let runtime = Arc::new(TestRuntime::new());
+            for _ in 0..attempts {
+                runtime
+                    .spawn_results
+                    .lock()
+                    .await
+                    .push(Err(RuntimeError::SpawnFailed(
+                        "Resource exhausted".to_string(),
+                    )));
+            }
+            match final_error(runtime, create_test_config(), attempts, None).await {
+                Ok(reason) if reason == expected => {}
+                Ok(reason) => complaints.push(format!("expected {expected:?}, got {reason:?}")),
+                Err(other) => complaints.push(other),
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Every attempt cut off at the iteration's bound: the ending says so,
+    /// with the bound.
+    #[tokio::test]
+    async fn past_max_retries_after_iteration_timeouts_the_ending_names_the_bound() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(2)
+                .with_execute_success(vec!["never".to_string(), "never".to_string()])
+                .with_execute_delay(Duration::from_secs(3600)),
+        );
+        let mut config = create_test_config();
+        config.execution.iteration_timeout = Some("1s".to_string());
+        config.resources.timeout_seconds = Some(60);
+
+        let reason = final_error(runtime, config, 2, None).await;
+
+        assert_eq!(
+            reason,
+            Ok(
+                "Max retries exceeded after 2 attempts; the last attempt ran past its time \
+                limit of 1 s and was stopped"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Every attempt's process failed: the ending names the last one's error
+    /// and the end of its standard error, without the bootstrap's debug lines;
+    /// a process that wrote no error line is named by its exit code.
+    #[tokio::test]
+    async fn past_max_retries_after_failed_executions_the_ending_names_the_error_and_stderr_tail() {
+        let traceback = RuntimeError::ExecutionFailedWithLogs {
+            error: "ModuleNotFoundError: No module named 'requests'".to_string(),
+            logs: vec![
+                "[BOOTSTRAP DEBUG] execution_id=9ba643ba".to_string(),
+                "Traceback (most recent call last):".to_string(),
+                "  File \"/app/main.py\", line 1, in <module>".to_string(),
+                "    import requests".to_string(),
+                "ModuleNotFoundError: No module named 'requests'".to_string(),
+                "[BOOTSTRAP DEBUG] exiting".to_string(),
+            ],
+        };
+        let killed = RuntimeError::ExecutionFailedWithLogs {
+            error: "Bootstrap script exited with code 137".to_string(),
+            logs: vec!["[BOOTSTRAP DEBUG] execution_id=9ba643ba".to_string()],
+        };
+        let mut complaints = Vec::new();
+        for (last, expected) in [
+            (
+                traceback,
+                "Max retries exceeded after 2 attempts; the last attempt failed: \
+                 ModuleNotFoundError: No module named 'requests'; the end of its standard \
+                 error:\nTraceback (most recent call last):\n  File \"/app/main.py\", line 1, \
+                 in <module>\n    import requests\nModuleNotFoundError: No module named \
+                 'requests'",
+            ),
+            (
+                killed,
+                "Max retries exceeded after 2 attempts; the last attempt failed: Bootstrap \
+                 script exited with code 137",
+            ),
+        ] {
+            let runtime = Arc::new(TestRuntime::new().with_spawn_success(2));
+            {
+                let mut results = runtime.execute_results.lock().await;
+                results.push(Err(RuntimeError::ExecutionFailed(
+                    "the first attempt's error".to_string(),
+                )));
+                results.push(Err(last));
+            }
+            match final_error(runtime, create_test_config(), 2, None).await {
+                Ok(reason) if reason == expected => {}
+                Ok(reason) => complaints.push(format!("expected {expected:?}, got {reason:?}")),
+                Err(other) => complaints.push(other),
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Every attempt's validation errored, as when its judge ran out of time:
+    /// the ending names the last validation error.
+    #[tokio::test]
+    async fn past_max_retries_after_validation_errors_the_ending_names_the_last_validation_error() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(3)
+                .with_execute_success(vec!["the draft".to_string(); 3]),
+        );
+        let judge_failed = || {
+            Err(anyhow::anyhow!(
+                "Judge 'email-draft-judge' execution failed or was cancelled"
+            ))
+        };
+        let pipeline = semantic_pipeline(vec![judge_failed(), judge_failed(), judge_failed()]);
+
+        let reason = final_error(runtime, create_test_config(), 3, Some(pipeline)).await;
+
+        assert_eq!(
+            reason,
+            Ok(
+                "Max retries exceeded after 3 attempts; the last attempt failed validation: \
+                Judge 'email-draft-judge' execution failed or was cancelled"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Every attempt's output was scored below the bar: the ending names the
+    /// last verdict's reason.
+    #[tokio::test]
+    async fn past_max_retries_after_rejected_outputs_the_ending_names_the_last_verdict() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(3)
+                .with_execute_success(vec!["the draft".to_string(); 3]),
+        );
+        let pipeline = semantic_pipeline(vec![
+            Ok(verdict(0.1, "the draft is empty")),
+            Ok(verdict(0.3, "the draft is short")),
+            Ok(verdict(0.2, "the draft names no recipient")),
+        ]);
+
+        let reason = final_error(runtime, create_test_config(), 3, Some(pipeline)).await;
+
+        assert_eq!(
+            reason,
+            Ok(
+                "Max retries exceeded after 3 attempts; the last attempt's output was \
+                rejected: Validation score 0.20 below minimum 0.70: the draft names no \
+                recipient"
+                    .to_string()
+            )
+        );
     }
 }
