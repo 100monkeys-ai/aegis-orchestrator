@@ -1160,6 +1160,322 @@ async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_succe
     }));
 }
 
+// =============================================================================
+// `aegis.workflow.create` registers the manifest for the caller's tenant, as
+// `aegis.workflow.update` does (AEGIS row `workflow-create-tenant-unscoped`).
+// =============================================================================
+
+/// A judge verdict that clears the create tool's default thresholds.
+const PASSING_JUDGE_VERDICT: &str =
+    r#"{"valid": true, "score": 1.0, "confidence": 1.0, "feedback": "The workflow is sound."}"#;
+
+/// Every child execution it starts has already completed with
+/// [`PASSING_JUDGE_VERDICT`], so a workflow's semantic validation passes.
+struct PassingJudgeExecutionService;
+
+#[async_trait]
+impl ExecutionService for PassingJudgeExecutionService {
+    async fn start_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("PassingJudgeExecutionService::start_execution not exercised in this test")
+    }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        Ok(execution_id)
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        Ok(ExecutionId::new())
+    }
+    async fn get_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<Execution> {
+        let mut exec = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: None,
+                input: serde_json::Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            3,
+            "aegis-system-operator".to_string(),
+        );
+        exec.start();
+        exec.start_iteration("validate".to_string()).unwrap();
+        exec.complete_iteration(PASSING_JUDGE_VERDICT.to_string());
+        exec.complete();
+        Ok(exec)
+    }
+    async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!(
+            "PassingJudgeExecutionService::get_execution_unscoped not exercised in this test"
+        )
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        anyhow::bail!(
+            "PassingJudgeExecutionService::get_iterations_for_tenant not exercised in this test"
+        )
+    }
+    async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("PassingJudgeExecutionService::cancel_execution not exercised in this test")
+    }
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("PassingJudgeExecutionService::stream_execution not exercised in this test")
+    }
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!(
+            "PassingJudgeExecutionService::stream_agent_events not exercised in this test"
+        )
+    }
+    async fn list_executions_for_tenant(
+        &self,
+        _: &TenantId,
+        _: Option<AgentId>,
+        _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
+    ) -> Result<Vec<Execution>> {
+        anyhow::bail!(
+            "PassingJudgeExecutionService::list_executions_for_tenant not exercised in this test"
+        )
+    }
+    async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("PassingJudgeExecutionService::delete_execution not exercised in this test")
+    }
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "PassingJudgeExecutionService::record_llm_interaction not exercised in this test"
+        )
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "PassingJudgeExecutionService::store_iteration_trajectory not exercised in this test"
+        )
+    }
+}
+
+/// Registers a manifest into a workflow repository for the tenant it is given,
+/// as the standard use case persists it, without a workflow engine. Its
+/// tenant-less `register_workflow` is the trait's own.
+struct RepositoryRegisterWorkflowUseCase {
+    repository: Arc<InMemoryWorkflowRepository>,
+}
+
+#[async_trait]
+impl crate::application::register_workflow::RegisterWorkflowUseCase
+    for RepositoryRegisterWorkflowUseCase
+{
+    async fn register_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        yaml_manifest: &str,
+        _force: bool,
+        scope: crate::domain::workflow::WorkflowScope,
+    ) -> Result<crate::application::register_workflow::RegisteredWorkflow> {
+        let mut workflow = WorkflowParser::parse_yaml(yaml_manifest)?;
+        workflow.scope = scope;
+        workflow.tenant_id = tenant_id.clone();
+        self.repository
+            .save_for_tenant(tenant_id, &workflow)
+            .await?;
+        Ok(crate::application::register_workflow::RegisteredWorkflow {
+            workflow_id: workflow.id.to_string(),
+            name: workflow.metadata.name.clone(),
+            version: workflow.metadata.version.clone().unwrap_or_default(),
+            status: "registered".to_string(),
+            registered_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// A tool service whose workflow authoring registers into `repository` and
+/// whose semantic validation passes with the judge `test-agent`.
+fn workflow_authoring_service(
+    repository: Arc<InMemoryWorkflowRepository>,
+) -> ToolInvocationService {
+    let judge = test_agent_with_tools(&[]);
+    let lifecycle: Arc<dyn AgentLifecycleService> =
+        Arc::new(FilteringAgentLifecycleService { agent: judge });
+    let execution_service: Arc<dyn ExecutionService> = Arc::new(PassingJudgeExecutionService);
+    let event_bus = Arc::new(crate::infrastructure::event_bus::EventBus::new(1024));
+    let validation_service = Arc::new(
+        crate::application::validation_service::ValidationService::new(
+            event_bus.clone(),
+            execution_service.clone(),
+            lifecycle.clone(),
+        ),
+    );
+    let (fsal, volume_registry, _storage_root) = test_fsal_deps();
+    ToolInvocationService::new(
+        Arc::new(InMemorySealSessionRepository::new()),
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new()),
+        Arc::new(SealMiddleware::new()),
+        Arc::new(ToolRouter::new(vec![])),
+        fsal,
+        volume_registry,
+        lifecycle,
+        execution_service,
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+        event_bus,
+        None,
+    )
+    .with_workflow_authoring(
+        Arc::new(RepositoryRegisterWorkflowUseCase {
+            repository: repository.clone(),
+        }),
+        validation_service,
+    )
+    .with_workflow_repository(repository)
+}
+
+#[tokio::test]
+async fn workflow_create_registers_for_the_callers_tenant() {
+    let repository = Arc::new(InMemoryWorkflowRepository::new());
+    let service = workflow_authoring_service(repository.clone());
+    let alice = TenantId::for_consumer_user("alice-sub").unwrap();
+    let bob = TenantId::for_consumer_user("bob-sub").unwrap();
+
+    let mut args = serde_json::json!({
+        "manifest_yaml": test_workflow_manifest_yaml("alices-flow"),
+        "judge_agents": ["test-agent"],
+    });
+    let result = service
+        .invoke_aegis_workflow_create_tool(
+            &mut args,
+            ExecutionId::new(),
+            AgentId::new(),
+            1,
+            &[],
+            &consumer_tenant_scope(alice.clone()),
+        )
+        .await
+        .expect("workflow create should return a result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["deployed"], true, "payload: {payload}");
+    assert!(
+        repository
+            .find_by_name_for_tenant(&alice, "alices-flow")
+            .await
+            .unwrap()
+            .is_some(),
+        "a workflow created from Alice's scope must be registered in Alice's tenant"
+    );
+    assert!(
+        repository
+            .find_by_name_for_tenant(&bob, "alices-flow")
+            .await
+            .unwrap()
+            .is_none(),
+        "a workflow created from Alice's scope must not be visible to Bob's tenant"
+    );
+    assert!(
+        repository
+            .find_by_name_for_tenant(&TenantId::consumer(), "alices-flow")
+            .await
+            .unwrap()
+            .is_none(),
+        "a workflow created from Alice's scope must not land in the shared consumer tenant"
+    );
+}
+
+#[tokio::test]
+async fn workflow_create_refuses_a_tenant_the_caller_cannot_name() {
+    let repository = Arc::new(InMemoryWorkflowRepository::new());
+    let service = workflow_authoring_service(repository.clone());
+    let alice = TenantId::for_consumer_user("alice-sub").unwrap();
+    let bob = TenantId::for_consumer_user("bob-sub").unwrap();
+
+    let mut args = serde_json::json!({
+        "manifest_yaml": test_workflow_manifest_yaml("named-elsewhere"),
+        "judge_agents": ["test-agent"],
+        "tenant_id": bob.as_str(),
+    });
+    let err = service
+        .invoke_aegis_workflow_create_tool(
+            &mut args,
+            ExecutionId::new(),
+            AgentId::new(),
+            1,
+            &[],
+            &consumer_tenant_scope(alice.clone()),
+        )
+        .await
+        .expect_err("a create naming another tenant must be refused");
+    assert!(
+        matches!(err, SealSessionError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {err:?}"
+    );
+
+    let mut update_args = serde_json::json!({
+        "manifest_yaml": test_workflow_manifest_yaml("named-elsewhere"),
+        "tenant_id": bob.as_str(),
+    });
+    let update_err = service
+        .invoke_aegis_workflow_update_tool(
+            &mut update_args,
+            ExecutionId::new(),
+            AgentId::new(),
+            &consumer_tenant_scope(alice.clone()),
+        )
+        .await
+        .expect_err("an update naming another tenant is refused");
+    assert_eq!(
+        std::mem::discriminant(&err),
+        std::mem::discriminant(&update_err),
+        "create must refuse as update refuses"
+    );
+
+    for tenant in [&alice, &bob, &TenantId::consumer()] {
+        assert!(
+            repository
+                .find_by_name_for_tenant(tenant, "named-elsewhere")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused create must register nothing (tenant {tenant})"
+        );
+    }
+}
+
 #[test]
 fn build_tool_audit_history_includes_schema_validate_and_get_evidence() {
     let execution_id = ExecutionId::new();

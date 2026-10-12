@@ -1459,6 +1459,10 @@ impl ToolInvocationService {
         }
     }
 
+    /// Validate a workflow manifest deterministically and by its judges, then
+    /// register it in the caller's tenant, resolved from the scope as
+    /// `aegis.workflow.update` resolves it; a tenant the caller may not name
+    /// is refused before anything is validated or registered.
     pub(super) async fn invoke_aegis_workflow_create_tool(
         &self,
         args: &mut Value,
@@ -1663,7 +1667,12 @@ impl ToolInvocationService {
         }
 
         match register_workflow_use_case
-            .register_workflow(&manifest_yaml, force)
+            .register_workflow_for_tenant(
+                &tenant_id,
+                &manifest_yaml,
+                force,
+                crate::domain::workflow::WorkflowScope::Tenant,
+            )
             .await
         {
             Ok(registered) => {
