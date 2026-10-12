@@ -1298,6 +1298,15 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
+        // The write reads the file it splices into: the empty `config.lock`
+        // the create made.
+        server
+            .mock("GET", "/tenant/vol/repo/.git/config.lock")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
         let lock_written = server
             .mock("PUT", "/tenant/vol/repo/.git/config.lock")
             .match_body(mockito::Matcher::Exact(
