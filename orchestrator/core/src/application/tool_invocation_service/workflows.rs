@@ -1621,7 +1621,9 @@ impl ToolInvocationService {
             })),
         };
 
-        let semantic_consensus = validation_service
+        // A judge that fails is the manifest's semantic validation failing,
+        // answered to the caller in the words the judges' failure gives.
+        let semantic_consensus = match validation_service
             .validate_with_judges(
                 execution_id,
                 agent_id,
@@ -1641,9 +1643,20 @@ impl ToolInvocationService {
                 &tenant_id,
             )
             .await
-            .map_err(|e| {
-                SealSessionError::InternalError(format!("Workflow semantic validation failed: {e}"))
-            })?;
+        {
+            Ok(consensus) => consensus,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.create",
+                    "deterministic_validation": {"passed": true},
+                    "semantic_validation": {
+                        "passed": false,
+                        "error": format!("Workflow semantic validation failed: {e:#}"),
+                    },
+                    "deployed": false
+                })));
+            }
+        };
 
         let semantic_passed = semantic_consensus.final_score >= min_score
             && semantic_consensus.consensus_confidence >= min_confidence;

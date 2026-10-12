@@ -78,6 +78,7 @@ use crate::domain::goal::{
     judge_context_or_default, JudgeContext, JudgeContextSource, OverLimit,
     JUDGE_PROMPT_RESERVE_BYTES,
 };
+use crate::domain::repository::RepositoryError;
 use crate::domain::shared_kernel::TenantId;
 use crate::domain::validation::{
     extract_json_from_text, read_judge_verdict, GradientResult, GradientValidator, JudgeFault,
@@ -448,18 +449,26 @@ async fn judge_bound(
     Ok(JudgeBound::of(source, &judge.manifest))
 }
 
-/// Start the judge as a fresh child execution with `input`, wait for it, and
-/// read its last output as a verdict. The outer error is the run itself failing
+/// The security context a judge started as a top-level execution runs under:
+/// the one the tool surface starts a chat session's other executions under
+/// (`aegis.agent.generate`), unless the judge's manifest names its own.
+const TOP_LEVEL_JUDGE_SECURITY_CONTEXT: &str = "aegis-system-agent-runtime";
+
+/// Start the judge as a fresh execution with `input`, wait for it, and read
+/// its last output as a verdict. The outer error is the run itself failing
 /// (start, poll, timeout, the judge failed or cancelled); the inner is a verdict
 /// that cannot be read.
+///
+/// The judge is a child of the execution it validates when that execution is
+/// stored. When it is stored nowhere, as a Zaru chat session's execution id
+/// minted at attestation is not, no child can be started of it, and the judge
+/// is started instead as a top-level execution in the caller's tenant (see
+/// [`start_judge`]).
 async fn run_judge_once(
     run: &JudgeRun<'_>,
     input: ExecutionInput,
 ) -> Result<std::result::Result<GradientResult, JudgeFault>> {
-    let exec_id = run
-        .service
-        .start_child_execution(run.judge_id, input, run.parent_execution_id)
-        .await?;
+    let exec_id = start_judge(run, input).await?;
 
     let max_attempts = calculate_max_attempts(run.timeout_seconds, run.poll_interval_ms)?;
     let mut attempts = 0;
@@ -496,6 +505,74 @@ async fn run_judge_once(
             }
         }
     }
+}
+
+/// Start the judge as a child of `run.parent_execution_id`; when that child
+/// is refused and the parent is stored nowhere (the unscoped lookup answers
+/// none), start it instead as a top-level execution in `run.tenant_id` under
+/// [`TOP_LEVEL_JUDGE_SECURITY_CONTEXT`], with the same input and the tenant
+/// written onto it. A refused child of a stored parent stays refused, with
+/// the child start's own error.
+async fn start_judge(run: &JudgeRun<'_>, input: ExecutionInput) -> Result<ExecutionId> {
+    let child_refused = match run
+        .service
+        .start_child_execution(run.judge_id, input.clone(), run.parent_execution_id)
+        .await
+    {
+        Ok(exec_id) => return Ok(exec_id),
+        Err(e) => e,
+    };
+    if parent_is_stored(run.service, run.parent_execution_id).await? {
+        return Err(child_refused);
+    }
+    tracing::info!(
+        judge_agent = %run.judge_name,
+        parent_execution_id = %run.parent_execution_id,
+        tenant_id = %run.tenant_id.as_str(),
+        "Judge's parent execution is stored nowhere — starting the judge as a top-level execution"
+    );
+    run.service
+        .start_execution(
+            run.judge_id,
+            in_tenant(input, run.tenant_id),
+            TOP_LEVEL_JUDGE_SECURITY_CONTEXT.to_string(),
+            None,
+        )
+        .await
+}
+
+/// Whether `id` names a stored execution. The unscoped lookup answers a
+/// missing execution with an error that carries no repository error, or a
+/// repository `NotFound`; any other repository error is the lookup failing,
+/// and is returned.
+async fn parent_is_stored(service: &dyn ExecutionService, id: ExecutionId) -> Result<bool> {
+    match service.get_execution_unscoped(id).await {
+        Ok(_) => Ok(true),
+        Err(e) => match e
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<RepositoryError>())
+        {
+            None | Some(RepositoryError::NotFound(_)) => Ok(false),
+            Some(_) => Err(e.context(format!("reading the judge's parent execution {id}"))),
+        },
+    }
+}
+
+/// `input` carrying `tenant_id`, as every top-level execution must: written
+/// onto an object input, and a plain input wrapped as `{ "input": <it> }`,
+/// as the tool surface wraps a plain dispatch input.
+fn in_tenant(mut input: ExecutionInput, tenant_id: &TenantId) -> ExecutionInput {
+    let tenant = serde_json::Value::String(tenant_id.as_str().to_string());
+    match &mut input.input {
+        serde_json::Value::Object(map) => {
+            map.insert("tenant_id".to_string(), tenant);
+        }
+        other => {
+            let plain = std::mem::take(other);
+            input.input = serde_json::json!({ "input": plain, "tenant_id": tenant });
+        }
+    }
+    input
 }
 
 /// Run a judge; when its verdict cannot be read, run it once more as a fresh

@@ -409,3 +409,243 @@ async fn test_validation_event_streaming() {
     let result = handle.await.unwrap();
     assert!(result.is_ok());
 }
+
+// =============================================================================
+// A judge whose parent is not a stored execution (a Zaru chat session's
+// minted execution id) starts as a top-level execution in the caller's tenant;
+// a judge whose parent is stored stays its child (AEGIS row
+// `workflow-create-internal-error`).
+// =============================================================================
+
+/// Holds the executions in `stored`, as the repository's unscoped lookup
+/// answers them; refuses a child of any other id as the standard service
+/// does; records every start.
+struct StoredExecutionsService {
+    stored: std::collections::HashSet<ExecutionId>,
+    child_starts: std::sync::Mutex<Vec<ExecutionId>>,
+    top_level_starts: std::sync::Mutex<Vec<(ExecutionInput, String)>>,
+}
+
+impl StoredExecutionsService {
+    fn new(stored: &[ExecutionId]) -> Self {
+        Self {
+            stored: stored.iter().copied().collect(),
+            child_starts: std::sync::Mutex::new(Vec::new()),
+            top_level_starts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionService for StoredExecutionsService {
+    async fn start_child_execution(
+        &self,
+        _agent_id: AgentId,
+        _input: ExecutionInput,
+        parent_execution_id: ExecutionId,
+    ) -> anyhow::Result<ExecutionId> {
+        if !self.stored.contains(&parent_execution_id) {
+            anyhow::bail!("Parent execution {parent_execution_id} not found");
+        }
+        self.child_starts.lock().unwrap().push(parent_execution_id);
+        Ok(ExecutionId::new())
+    }
+    async fn start_execution(
+        &self,
+        _agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+        _identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+    ) -> anyhow::Result<ExecutionId> {
+        self.top_level_starts
+            .lock()
+            .unwrap()
+            .push((input, security_context_name));
+        Ok(ExecutionId::new())
+    }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+        identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
+    ) -> anyhow::Result<ExecutionId> {
+        MockExecutionService
+            .start_execution_with_id(
+                execution_id,
+                agent_id,
+                input,
+                security_context_name,
+                identity,
+            )
+            .await
+    }
+    async fn get_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> anyhow::Result<Execution> {
+        MockExecutionService
+            .get_execution_for_tenant(tenant_id, id)
+            .await
+    }
+    async fn get_execution_unscoped(&self, id: ExecutionId) -> anyhow::Result<Execution> {
+        if !self.stored.contains(&id) {
+            anyhow::bail!("Execution not found");
+        }
+        MockExecutionService
+            .get_execution_for_tenant(&TenantId::system(), id)
+            .await
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        exec_id: ExecutionId,
+    ) -> anyhow::Result<Vec<Iteration>> {
+        MockExecutionService
+            .get_iterations_for_tenant(tenant_id, exec_id)
+            .await
+    }
+    async fn cancel_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        MockExecutionService
+            .cancel_execution_for_tenant(tenant_id, id)
+            .await
+    }
+    async fn stream_execution(
+        &self,
+        id: ExecutionId,
+    ) -> anyhow::Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<ExecutionEvent>> + Send>>,
+    > {
+        MockExecutionService.stream_execution(id).await
+    }
+    async fn stream_agent_events(
+        &self,
+        id: AgentId,
+    ) -> anyhow::Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<DomainEvent>> + Send>>,
+    > {
+        MockExecutionService.stream_agent_events(id).await
+    }
+    async fn list_executions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: Option<AgentId>,
+        workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Execution>> {
+        MockExecutionService
+            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit)
+            .await
+    }
+    async fn delete_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        MockExecutionService
+            .delete_execution_for_tenant(tenant_id, id)
+            .await
+    }
+    async fn record_llm_interaction(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        interaction: LlmInteraction,
+    ) -> anyhow::Result<()> {
+        MockExecutionService
+            .record_llm_interaction(execution_id, iteration, interaction)
+            .await
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        trajectory: Vec<aegis_orchestrator_core::domain::execution::TrajectoryStep>,
+    ) -> anyhow::Result<()> {
+        MockExecutionService
+            .store_iteration_trajectory(execution_id, iteration, trajectory)
+            .await
+    }
+}
+
+fn judged_request() -> aegis_orchestrator_core::domain::validation::ValidationRequest {
+    aegis_orchestrator_core::domain::validation::ValidationRequest {
+        content: "fn test() {}".to_string(),
+        criteria: "valid rust".to_string(),
+        context: None,
+    }
+}
+
+#[tokio::test]
+async fn a_judge_whose_parent_is_in_no_repository_runs_top_level_in_the_callers_tenant() {
+    let exec_service = Arc::new(StoredExecutionsService::new(&[]));
+    let val_service = ValidationService::new(
+        Arc::new(EventBus::with_default_capacity()),
+        exec_service.clone(),
+        Arc::new(MockAgentLifecycleService),
+    );
+    let tenant = TenantId::for_consumer_user("alice-sub").unwrap();
+
+    let consensus = val_service
+        .validate_with_judges(
+            ExecutionId::new(),
+            AgentId::new(),
+            0,
+            judged_request(),
+            vec![(AgentId::new(), 1.0)],
+            None,
+            5,
+            10,
+            &tenant,
+        )
+        .await
+        .expect("a judge of an unstored parent must still reach a consensus");
+    assert!(consensus.final_score > 0.9, "consensus: {consensus:?}");
+
+    assert!(exec_service.child_starts.lock().unwrap().is_empty());
+    let starts = exec_service.top_level_starts.lock().unwrap();
+    assert_eq!(starts.len(), 1, "the judge starts once, top-level");
+    let (input, security_context_name) = &starts[0];
+    assert_eq!(security_context_name, "aegis-system-agent-runtime");
+    assert_eq!(
+        input.input.get("tenant_id").and_then(|v| v.as_str()),
+        Some(tenant.as_str()),
+        "the top-level judge runs in the caller's tenant: {:?}",
+        input.input
+    );
+}
+
+#[tokio::test]
+async fn a_judge_whose_parent_is_stored_stays_its_child() {
+    let parent = ExecutionId::new();
+    let exec_service = Arc::new(StoredExecutionsService::new(&[parent]));
+    let val_service = ValidationService::new(
+        Arc::new(EventBus::with_default_capacity()),
+        exec_service.clone(),
+        Arc::new(MockAgentLifecycleService),
+    );
+
+    val_service
+        .validate_with_judges(
+            parent,
+            AgentId::new(),
+            0,
+            judged_request(),
+            vec![(AgentId::new(), 1.0)],
+            None,
+            5,
+            10,
+            &TenantId::system(),
+        )
+        .await
+        .expect("a judge of a stored parent reaches a consensus");
+
+    assert_eq!(*exec_service.child_starts.lock().unwrap(), vec![parent]);
+    assert!(exec_service.top_level_starts.lock().unwrap().is_empty());
+}

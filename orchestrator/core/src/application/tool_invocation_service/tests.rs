@@ -1329,10 +1329,17 @@ impl crate::application::register_workflow::RegisterWorkflowUseCase
 fn workflow_authoring_service(
     repository: Arc<InMemoryWorkflowRepository>,
 ) -> ToolInvocationService {
+    workflow_authoring_service_over(repository, Arc::new(PassingJudgeExecutionService))
+}
+
+/// [`workflow_authoring_service`] whose judges run on `execution_service`.
+fn workflow_authoring_service_over(
+    repository: Arc<InMemoryWorkflowRepository>,
+    execution_service: Arc<dyn ExecutionService>,
+) -> ToolInvocationService {
     let judge = test_agent_with_tools(&[]);
     let lifecycle: Arc<dyn AgentLifecycleService> =
         Arc::new(FilteringAgentLifecycleService { agent: judge });
-    let execution_service: Arc<dyn ExecutionService> = Arc::new(PassingJudgeExecutionService);
     let event_bus = Arc::new(crate::infrastructure::event_bus::EventBus::new(1024));
     let validation_service = Arc::new(
         crate::application::validation_service::ValidationService::new(
@@ -1474,6 +1481,243 @@ async fn workflow_create_refuses_a_tenant_the_caller_cannot_name() {
             "a refused create must register nothing (tenant {tenant})"
         );
     }
+}
+
+// =============================================================================
+// `aegis.workflow.create` from a Zaru chat session, whose execution id is
+// minted at attestation and stored nowhere (AEGIS row
+// `workflow-create-internal-error`).
+// =============================================================================
+
+/// Stores no execution, as a chat session's minted id is stored nowhere: a
+/// child of any parent is refused as the standard service refuses it, and the
+/// unscoped lookup answers none. A top-level judge start succeeds; the judge
+/// then completes with [`PASSING_JUDGE_VERDICT`], or fails when
+/// `judge_fails`.
+struct ChatSessionJudgeExecutionService {
+    judge_fails: bool,
+}
+
+#[async_trait]
+impl ExecutionService for ChatSessionJudgeExecutionService {
+    async fn start_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        Ok(ExecutionId::new())
+    }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+        identity: Option<&crate::domain::iam::UserIdentity>,
+    ) -> Result<ExecutionId> {
+        PassingJudgeExecutionService
+            .start_execution_with_id(
+                execution_id,
+                agent_id,
+                input,
+                security_context_name,
+                identity,
+            )
+            .await
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        parent_execution_id: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("Parent execution {parent_execution_id} not found")
+    }
+    async fn get_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Execution> {
+        let mut exec = PassingJudgeExecutionService
+            .get_execution_for_tenant(tenant_id, id)
+            .await?;
+        if self.judge_fails {
+            exec.fail("the judge's model was unreachable".to_string());
+        }
+        Ok(exec)
+    }
+    async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("Execution not found")
+    }
+    async fn get_iterations_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        exec_id: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        PassingJudgeExecutionService
+            .get_iterations_for_tenant(tenant_id, exec_id)
+            .await
+    }
+    async fn cancel_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        PassingJudgeExecutionService
+            .cancel_execution_for_tenant(tenant_id, id)
+            .await
+    }
+    async fn stream_execution(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        PassingJudgeExecutionService.stream_execution(id).await
+    }
+    async fn stream_agent_events(
+        &self,
+        id: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        PassingJudgeExecutionService.stream_agent_events(id).await
+    }
+    async fn list_executions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: Option<AgentId>,
+        workflow_id: Option<crate::domain::workflow::WorkflowId>,
+        limit: usize,
+    ) -> Result<Vec<Execution>> {
+        PassingJudgeExecutionService
+            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit)
+            .await
+    }
+    async fn delete_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        PassingJudgeExecutionService
+            .delete_execution_for_tenant(tenant_id, id)
+            .await
+    }
+    async fn record_llm_interaction(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        interaction: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        PassingJudgeExecutionService
+            .record_llm_interaction(execution_id, iteration, interaction)
+            .await
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        PassingJudgeExecutionService
+            .store_iteration_trajectory(execution_id, iteration, trajectory)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn workflow_create_from_a_chat_session_with_an_unstored_execution_id_deploys() {
+    let repository = Arc::new(InMemoryWorkflowRepository::new());
+    let service = workflow_authoring_service_over(
+        repository.clone(),
+        Arc::new(ChatSessionJudgeExecutionService { judge_fails: false }),
+    );
+    let alice = TenantId::for_consumer_user("alice-sub").unwrap();
+
+    let mut args = serde_json::json!({
+        "manifest_yaml": test_workflow_manifest_yaml("chat-deployed-flow"),
+        "judge_agents": ["test-agent"],
+    });
+    let result = service
+        .invoke_aegis_workflow_create_tool(
+            &mut args,
+            ExecutionId::new(),
+            AgentId::new(),
+            1,
+            &[],
+            &consumer_tenant_scope(alice.clone()),
+        )
+        .await
+        .expect("a create from a chat session must answer, not fail");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["deployed"], true, "payload: {payload}");
+    assert_eq!(
+        payload["semantic_validation"]["passed"], true,
+        "payload: {payload}"
+    );
+    assert!(
+        repository
+            .find_by_name_for_tenant(&alice, "chat-deployed-flow")
+            .await
+            .unwrap()
+            .is_some(),
+        "the workflow must be registered in Alice's tenant"
+    );
+}
+
+#[tokio::test]
+async fn workflow_create_answers_a_failed_judge_as_a_failed_semantic_validation() {
+    let repository = Arc::new(InMemoryWorkflowRepository::new());
+    let service = workflow_authoring_service_over(
+        repository.clone(),
+        Arc::new(ChatSessionJudgeExecutionService { judge_fails: true }),
+    );
+    let alice = TenantId::for_consumer_user("alice-sub").unwrap();
+
+    let mut args = serde_json::json!({
+        "manifest_yaml": test_workflow_manifest_yaml("judged-badly-flow"),
+        "judge_agents": ["test-agent"],
+    });
+    let result = service
+        .invoke_aegis_workflow_create_tool(
+            &mut args,
+            ExecutionId::new(),
+            AgentId::new(),
+            1,
+            &[],
+            &consumer_tenant_scope(alice.clone()),
+        )
+        .await
+        .expect("a judge failure must be answered to the caller, not raised as an internal error");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+    assert_eq!(payload["deployed"], false, "payload: {payload}");
+    assert_eq!(
+        payload["deterministic_validation"]["passed"], true,
+        "payload: {payload}"
+    );
+    assert_eq!(
+        payload["semantic_validation"]["passed"], false,
+        "payload: {payload}"
+    );
+    let error = payload["semantic_validation"]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the judges' words must be answered: {payload}"));
+    assert!(
+        error.contains("Insufficient judges succeeded: 0 of 1 required"),
+        "error: {error}"
+    );
+    assert!(
+        repository
+            .find_by_name_for_tenant(&alice, "judged-badly-flow")
+            .await
+            .unwrap()
+            .is_none(),
+        "a workflow its judges did not pass must not be registered"
+    );
 }
 
 #[test]
