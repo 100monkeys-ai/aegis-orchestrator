@@ -70,6 +70,13 @@ pub(crate) async fn get_execution_handler(
 /// account takes the tenant it names in `X-Tenant-Id` — the Temporal
 /// worker's status poll of a user's agent execution — and every other
 /// identity keeps its own tenant whatever the header says.
+///
+/// The answer is `{id, agent_id, status, tenant_id}`. Once the execution has
+/// ended (Completed, Failed or Cancelled) it also carries `final_output`, the
+/// output of the last iteration that has one, and `error`, the execution's
+/// error, each `null` when there is none, so a caller that finds the run
+/// already over (the worker re-attaching to it) reads what it produced. A
+/// Pending or Running execution carries neither key.
 pub(crate) async fn execution_status(
     execution_repo: &dyn ExecutionRepository,
     identity: Option<&UserIdentity>,
@@ -89,15 +96,28 @@ pub(crate) async fn execution_status(
             .await
     };
     match exec_result {
-        Ok(Some(exec)) => (
-            StatusCode::OK,
-            axum::Json(serde_json::json!({
+        Ok(Some(exec)) => {
+            use aegis_orchestrator_core::domain::execution::ExecutionStatus;
+            let mut body = serde_json::json!({
                 "id": exec.id.0,
                 "agent_id": exec.agent_id.0,
                 "status": format!("{:?}", exec.status),
                 "tenant_id": exec.tenant_id.as_str(),
-            })),
-        ),
+            });
+            if matches!(
+                exec.status,
+                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+            ) {
+                let final_output = exec
+                    .iterations
+                    .iter()
+                    .rev()
+                    .find_map(|iteration| iteration.output.as_deref());
+                body["final_output"] = serde_json::json!(final_output);
+                body["error"] = serde_json::json!(exec.error);
+            }
+            (StatusCode::OK, axum::Json(body))
+        }
         // Audit 002 §4.37.6 — collapse not-found / not-visible to 404 instead
         // of returning 200 with an error body.
         Ok(None) => (
@@ -444,11 +464,11 @@ mod tests {
 
     use super::execution_status;
     use crate::daemon::handlers::test_support::{
-        consumer, identity_provider, serve, service_account,
+        consumer, identity_provider, operator, serve, service_account,
     };
     use aegis_orchestrator_core::domain::agent::AgentId;
     use aegis_orchestrator_core::domain::execution::{Execution, ExecutionId, ExecutionInput};
-    use aegis_orchestrator_core::domain::iam::UserIdentity;
+    use aegis_orchestrator_core::domain::iam::{AegisRole, UserIdentity};
     use aegis_orchestrator_core::domain::repository::ExecutionRepository;
     use aegis_orchestrator_core::domain::shared_kernel::TenantId;
     use aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository;
@@ -588,6 +608,92 @@ mod tests {
         )
         .await;
         assert_eq!(status.as_u16(), 404);
+    }
+
+    /// The owner's running execution, ended by `end`, as the Temporal
+    /// worker's poll (a service account naming the tenant) and an
+    /// operator's cross-tenant read each see it.
+    async fn ended_status_reads(end: impl FnOnce(&mut Execution)) -> [(u16, serde_json::Value); 2] {
+        let repo = InMemoryExecutionRepository::new();
+        let (tenant, id) = owner_execution(&repo).await;
+        let mut execution = repo
+            .find_by_id_for_tenant(&tenant, id)
+            .await
+            .unwrap()
+            .expect("the owner's execution");
+        end(&mut execution);
+        repo.save_for_tenant(&tenant, &execution).await.unwrap();
+        let worker =
+            execution_status(&repo, Some(&service_account()), Some(tenant.as_str()), id.0).await;
+        let operator_read =
+            execution_status(&repo, Some(&operator(AegisRole::Operator)), None, id.0).await;
+        [
+            (worker.0.as_u16(), worker.1 .0),
+            (operator_read.0.as_u16(), operator_read.1 .0),
+        ]
+    }
+
+    /// A completed execution answers the output of its last iteration and
+    /// no error, so a worker re-attaching to it after it ended answers what
+    /// it produced.
+    #[tokio::test]
+    async fn a_completed_execution_answers_its_last_iterations_output() {
+        for (status, body) in ended_status_reads(|execution| {
+            execution.max_iterations = 2;
+            execution.start_iteration("first".to_string()).unwrap();
+            execution.complete_iteration("first answer".to_string());
+            execution.start_iteration("second".to_string()).unwrap();
+            execution.complete_iteration("second answer".to_string());
+            execution.complete();
+        })
+        .await
+        {
+            assert_eq!(status, 200, "body: {body}");
+            assert_eq!(body["status"], "Completed");
+            assert_eq!(body["final_output"], "second answer", "body: {body}");
+            assert!(
+                body.get("error").is_some_and(|error| error.is_null()),
+                "a completed execution answers `error: null`: {body}"
+            );
+        }
+    }
+
+    /// A failed execution answers its error.
+    #[tokio::test]
+    async fn a_failed_execution_answers_its_error() {
+        for (status, body) in ended_status_reads(|execution| {
+            execution.fail("the model refused the request".to_string());
+        })
+        .await
+        {
+            assert_eq!(status, 200, "body: {body}");
+            assert_eq!(body["status"], "Failed");
+            assert_eq!(
+                body["error"], "the model refused the request",
+                "body: {body}"
+            );
+            assert!(
+                body.get("final_output")
+                    .is_some_and(|output| output.is_null()),
+                "a failed execution with no output answers `final_output: null`: {body}"
+            );
+        }
+    }
+
+    /// A running execution carries neither key, so a poller sees the shape
+    /// it saw before until the run ends.
+    #[tokio::test]
+    async fn a_running_execution_carries_no_output_and_no_error() {
+        let repo = InMemoryExecutionRepository::new();
+        let (tenant, id) = owner_execution(&repo).await;
+        for identity in [service_account(), operator(AegisRole::Operator)] {
+            let (status, body) =
+                execution_status(&repo, Some(&identity), Some(tenant.as_str()), id.0).await;
+            assert_eq!(status.as_u16(), 200, "body: {:?}", body.0);
+            assert_eq!(body.0["status"], "Running");
+            assert!(body.0.get("final_output").is_none(), "body: {:?}", body.0);
+            assert!(body.0.get("error").is_none(), "body: {:?}", body.0);
+        }
     }
 }
 
