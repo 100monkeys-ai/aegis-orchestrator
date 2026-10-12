@@ -114,6 +114,7 @@ fn node(provider_type: &str, endpoint: &str) -> NodeConfigManifest {
 }
 
 fn registry(manifest: &NodeConfigManifest) -> ProviderRegistry {
+    log_capture::install();
     ProviderRegistry::from_config(manifest).expect("registry builds")
 }
 
@@ -265,6 +266,122 @@ fn an_agent_whose_model_generates_images_is_refused_at_parse() {
     assert_eq!(manifest.spec.runtime.model, "default");
 }
 
+/// The log capture of this binary's tests: one subscriber, the global
+/// default, installed by every helper that builds an image adapter before it
+/// builds one, so no adapter callsite registers before it exists.
+///
+/// `tracing` caches each callsite's interest once, on whichever thread first
+/// reaches it, and while at most one dispatcher is registered it asks only
+/// that thread's default. A per-test `set_default` left that answer to
+/// whichever test reached the callsite first: another test's thread, with no
+/// subscriber, cached the retry WARN as never, and the capturing test saw no
+/// WARN line. Every thread's default is this subscriber, so the interest is
+/// always its own, and a capture keeps only the events emitted inside its own
+/// span, on whatever thread the instrumented future is polled.
+mod log_capture {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
+    /// Each capture's span id and the lines captured inside it.
+    static CAPTURES: Mutex<Vec<(u64, Arc<Mutex<String>>)>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        /// The spans entered on this thread, innermost last.
+        static ENTERED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Install the subscriber as the binary's global default, once; every
+    /// caller returns after it is installed.
+    pub(crate) fn install() {
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(Global)
+                .expect("no other global subscriber in this test binary");
+        });
+    }
+
+    struct Global;
+
+    struct Fields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    impl tracing::Subscriber for Global {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(NEXT_SPAN.fetch_add(1, Ordering::Relaxed))
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let Ok(Some(lines)) = ENTERED.try_with(|entered| {
+                let captures = CAPTURES.lock().unwrap();
+                entered.borrow().iter().rev().find_map(|span| {
+                    captures
+                        .iter()
+                        .find(|(id, _)| id == span)
+                        .map(|(_, lines)| lines.clone())
+                })
+            }) else {
+                return;
+            };
+            let mut line = event.metadata().level().to_string();
+            event.record(&mut Fields(&mut line));
+            line.push('\n');
+            lines.lock().unwrap().push_str(&line);
+        }
+        fn enter(&self, span: &tracing::span::Id) {
+            let _ = ENTERED.try_with(|entered| entered.borrow_mut().push(span.into_u64()));
+        }
+        fn exit(&self, span: &tracing::span::Id) {
+            let _ = ENTERED.try_with(|entered| {
+                let mut entered = entered.borrow_mut();
+                if let Some(at) = entered.iter().rposition(|id| *id == span.into_u64()) {
+                    entered.remove(at);
+                }
+            });
+        }
+    }
+
+    /// Every event logged inside one span, as `<LEVEL> <fields>` lines.
+    pub(crate) struct Captured {
+        span: tracing::Span,
+        lines: Arc<Mutex<String>>,
+    }
+
+    impl Captured {
+        pub(crate) fn new() -> Self {
+            install();
+            let span = tracing::info_span!("log_capture");
+            let id = span.id().expect("the global subscriber enables the span");
+            let lines = Arc::new(Mutex::new(String::new()));
+            CAPTURES
+                .lock()
+                .unwrap()
+                .push((id.into_u64(), lines.clone()));
+            Self { span, lines }
+        }
+
+        /// The span whose events this capture keeps.
+        pub(crate) fn span(&self) -> tracing::Span {
+            self.span.clone()
+        }
+
+        pub(crate) fn lines(&self) -> String {
+            self.lines.lock().unwrap().clone()
+        }
+    }
+}
+
 // ===========================================================================
 // A Workers AI image model (AEGIS ADR-143 Update I1a)
 // ===========================================================================
@@ -279,6 +396,7 @@ mod workers_ai {
     use base64::Engine;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tracing::Instrument;
 
     /// Production's alias table names Workers AI in this form.
     const WORKERS_AI_ENDPOINT: &str = "https://api.cloudflare.com/client/v4/accounts/acct-1/ai/v1";
@@ -457,6 +575,7 @@ mod workers_ai {
     /// The adapter against the stand-in, for `model`, with the provider's AI
     /// Gateway headers and one other header.
     fn adapter_for(endpoint: &str, model: &str) -> WorkersAiImageAdapter {
+        super::log_capture::install();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "cf-aig-gateway-id",
@@ -1123,43 +1242,29 @@ mod workers_ai {
         assert_eq!(seen.lock().unwrap().len(), 1, "a timeout is not retried");
     }
 
-    /// Every event the adapter logs, as `<LEVEL> <fields>` lines.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<String>>);
-
-    struct Fields<'a>(&'a mut String);
-
-    impl tracing::field::Visit for Fields<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write as _;
-            let _ = write!(self.0, " {}={:?}", field.name(), value);
-        }
-    }
-
-    impl tracing::Subscriber for Captured {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut line = event.metadata().level().to_string();
-            event.record(&mut Fields(&mut line));
-            line.push('\n');
-            self.0.lock().unwrap().push_str(&line);
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
     #[tokio::test]
     async fn each_retried_attempt_logs_its_status_and_code_and_a_success_logs_one_info_line_without_the_prompt(
     ) {
-        let captured = Captured::default();
-        let _logs = tracing::subscriber::set_default(captured.clone());
+        let captured = super::log_capture::Captured::new();
+        // Another call on another thread first, as another test's would be:
+        // it reaches the WARN callsite before this test's call does, and its
+        // lines are not this capture's.
+        std::thread::spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the other thread")
+                .block_on(async {
+                    let (endpoint, _) =
+                        stand_in_answering(vec![Answer::Error(429, CAPACITY), Answer::Image(JPEG)])
+                            .await;
+                    generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+                        .await
+                        .expect("the retry answers the image");
+                })
+        })
+        .join()
+        .expect("the other thread's call");
         let (endpoint, _) = stand_in_answering(vec![
             Answer::Error(429, CAPACITY),
             Answer::Error(503, UNKNOWN_INTERNAL),
@@ -1168,10 +1273,11 @@ mod workers_ai {
         .await;
 
         generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+            .instrument(captured.span())
             .await
             .expect("the second retry answers the image");
 
-        let logs = captured.0.lock().unwrap().clone();
+        let logs = captured.lines();
         let warns: Vec<&str> = logs.lines().filter(|l| l.starts_with("WARN")).collect();
         assert_eq!(warns.len(), 2, "{logs}");
         for (warn, (attempt, status, code)) in warns.iter().zip([(1, 429, 3040), (2, 503, 3048)]) {
