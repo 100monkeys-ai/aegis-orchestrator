@@ -2980,6 +2980,75 @@ async fn a_declared_filled_context_lists_its_servers_tools_and_an_undeclared_one
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
 
+/// A filled declared context brings its whole server only when the
+/// manifest's `spec.tools` names none of that server's tools: an agent
+/// naming `nuclear-notes.pages.read` sees exactly that tool of the server,
+/// and one naming no tool sees every tool the server lists for the binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filled_context_brings_only_the_named_tools_when_the_manifest_names_some() {
+    const NOTES: &str = "nuclear-notes";
+    let stub = StubGateway::new(vec![], remote_result()).with_tools_for(
+        CHOSEN,
+        &["pages.read", "search.literal", "me.set_current_workspace"],
+    );
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    let chosen = vault
+        .bind(
+            &tenant,
+            USER,
+            NOTES,
+            CredentialType::Secret,
+            &[("value", CHOSEN)],
+            &[],
+        )
+        .await;
+    let contexts = Some(json!({ NOTES: chosen.0.to_string() }));
+
+    let mut complaints = Vec::new();
+    for (case, tools, expected) in [
+        (
+            "names one tool of the server",
+            vec!["nuclear-notes.pages.read"],
+            vec!["nuclear-notes.pages.read"],
+        ),
+        (
+            "names no tool",
+            vec![],
+            vec![
+                "nuclear-notes.lookup",
+                "nuclear-notes.me.set_current_workspace",
+                "nuclear-notes.pages.read",
+                "nuclear-notes.search.literal",
+            ],
+        ),
+    ] {
+        let h = harness(Setup {
+            agent_tools: tools,
+            agent_contexts: vec![(NOTES, true)],
+            ca: Some(tls.ca_path.clone()),
+            credentials: Some(vault.service.clone()),
+            remote_servers: vec![NOTES.to_string()],
+            contexts: contexts.clone(),
+            ..Setup::gateway(&url)
+        })
+        .await;
+        let listed = h
+            .service
+            .get_available_tools_for_agent_run(&h.tenant, h.agent_id, h.execution, CONTEXT)
+            .await
+            .unwrap();
+        if names(&listed) != expected {
+            complaints.push(format!(
+                "{case}: listed {:?}, expected {expected:?}",
+                names(&listed)
+            ));
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
 // ---------------------------------------------------------------------------
 // AEGIS ADR-132 S7, S8: a conversation's call to a remote server, out of band
 // from any execution

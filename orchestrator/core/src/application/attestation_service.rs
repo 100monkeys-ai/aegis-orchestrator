@@ -303,17 +303,36 @@ impl AttestationServiceImpl {
                         {
                             Ok(agent) => {
                                 let tools = agent.manifest.spec.tools.clone();
-                                let mut patterns: Vec<String> = if tools.is_empty() {
+                                // Zaru ADR-0055 D16: each declared context the
+                                // dispatch filled adds its server's tools unless
+                                // `spec.tools` names some of them, as at the
+                                // session's pre-creation; decided on `spec.tools`
+                                // alone, never on the fallback below.
+                                let mut from_contexts = tools.clone();
+                                crate::domain::agent::add_filled_context_patterns(
+                                    &mut from_contexts,
+                                    &agent.manifest.spec.contexts,
+                                    &execution.input.contexts(),
+                                );
+                                if tools.is_empty() {
                                     tracing::debug!(
                                         execution_id = %exec_id_str,
                                         agent_id = %execution.agent_id,
                                         "Agent manifest has empty tools list; falling back to security context capabilities"
                                     );
-                                    security_context
+                                    let mut patterns: Vec<String> = security_context
                                         .capabilities
                                         .iter()
                                         .map(|c| c.tool_pattern.clone())
-                                        .collect()
+                                        .collect();
+                                    if !patterns.iter().any(|pattern| pattern == "*") {
+                                        for pattern in from_contexts {
+                                            if !patterns.contains(&pattern) {
+                                                patterns.push(pattern);
+                                            }
+                                        }
+                                    }
+                                    patterns
                                 } else {
                                     tracing::debug!(
                                         execution_id = %exec_id_str,
@@ -321,17 +340,8 @@ impl AttestationServiceImpl {
                                         tools = ?tools,
                                         "Derived allowed_tool_patterns from agent manifest spec.tools"
                                     );
-                                    tools
-                                };
-                                // Zaru ADR-0055 D16: each declared context the
-                                // dispatch filled adds its server's tools, as at
-                                // the session's pre-creation.
-                                crate::domain::agent::add_filled_context_patterns(
-                                    &mut patterns,
-                                    &agent.manifest.spec.contexts,
-                                    &execution.input.contexts(),
-                                );
-                                patterns
+                                    from_contexts
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(

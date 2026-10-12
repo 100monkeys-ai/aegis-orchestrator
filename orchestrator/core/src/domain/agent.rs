@@ -387,10 +387,24 @@ pub struct ContextDeclaration {
     pub required: bool,
 }
 
+/// Whether a filled declared context `service` brings every tool of its
+/// server to a run whose manifest declares `tools` (Zaru ADR-0055 D16, its
+/// Update of 2026-10-12): only when `tools` names no tool of that server.
+/// When it names some, the run sees exactly those. `<service>.*` names the
+/// whole server and does not narrow it.
+pub fn context_brings_whole_server(service: &str, tools: &[String]) -> bool {
+    let prefix = format!("{service}.");
+    let whole = format!("{service}.*");
+    !tools
+        .iter()
+        .any(|tool| tool.starts_with(&prefix) && *tool != whole)
+}
+
 /// Add `<service>.*` to a SEAL session's tool patterns for each context
-/// `declared` that `contexts` fills with a binding (Zaru ADR-0055 D16), so
-/// the session's patterns and the run's tool list agree. Patterns that
-/// already allow every tool are left as they are.
+/// `declared` that `contexts` fills with a binding and whose server the
+/// patterns name no tool of ([`context_brings_whole_server`]; Zaru ADR-0055
+/// D16), so the session's patterns and the run's tool list agree. Patterns
+/// that already allow every tool are left as they are.
 pub fn add_filled_context_patterns(
     patterns: &mut Vec<String>,
     declared: &[ContextDeclaration],
@@ -402,7 +416,10 @@ pub fn add_filled_context_patterns(
     for context in declared {
         let service = context.service.trim();
         let pattern = format!("{service}.*");
-        if contexts.is_filled(service) && !patterns.contains(&pattern) {
+        if contexts.is_filled(service)
+            && context_brings_whole_server(service, patterns)
+            && !patterns.contains(&pattern)
+        {
             patterns.push(pattern);
         }
     }
@@ -1250,6 +1267,28 @@ impl AgentManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A filled declared context adds no `<service>.*` when the patterns
+    /// already name a tool of that service; with none named it still does.
+    #[test]
+    fn a_filled_context_adds_no_whole_server_pattern_when_a_tool_of_it_is_named() {
+        let declared = vec![ContextDeclaration {
+            service: "nuclear-notes".to_string(),
+            required: true,
+        }];
+        let contexts =
+            crate::domain::execution::ExecutionContexts::from_value(Some(&serde_json::json!({
+                "nuclear-notes": "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e"
+            })));
+
+        let mut named = vec!["nuclear-notes.pages.read".to_string()];
+        add_filled_context_patterns(&mut named, &declared, &contexts);
+        assert_eq!(named, vec!["nuclear-notes.pages.read"]);
+
+        let mut unnamed = vec!["mail.read".to_string()];
+        add_filled_context_patterns(&mut unnamed, &declared, &contexts);
+        assert_eq!(unnamed, vec!["mail.read", "nuclear-notes.*"]);
+    }
 
     fn make_manifest(name: &str) -> AgentManifest {
         AgentManifest {
