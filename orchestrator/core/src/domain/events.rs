@@ -702,6 +702,17 @@ pub enum WorkflowEvent {
         state_name: String,
         entered_at: DateTime<Utc>,
     },
+    /// A Human state posed its gate: the worker waits for the person's
+    /// response. `prompt` is the gate's question rendered against the
+    /// blackboard; `default_response` is what the gate answers on timeout.
+    /// Informational: it moves no execution state.
+    WorkflowHumanInputRequested {
+        execution_id: ExecutionId,
+        state_name: Option<String>,
+        prompt: String,
+        default_response: Option<String>,
+        requested_at: DateTime<Utc>,
+    },
     WorkflowStateExited {
         execution_id: ExecutionId,
         state_name: String,

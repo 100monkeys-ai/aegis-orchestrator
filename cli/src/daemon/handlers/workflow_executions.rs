@@ -96,6 +96,9 @@ pub(crate) fn workflow_event_message(event: &WorkflowEvent) -> String {
         WorkflowEvent::WorkflowStateEntered { state_name, .. } => {
             format!("Entered workflow state {state_name}")
         }
+        WorkflowEvent::WorkflowHumanInputRequested { prompt, .. } => {
+            format!("Waiting for human input: {prompt}")
+        }
         WorkflowEvent::WorkflowStateExited { state_name, .. } => {
             format!("Exited workflow state {state_name}")
         }
@@ -170,6 +173,7 @@ pub(crate) fn workflow_event_type_name(event: &WorkflowEvent) -> &'static str {
         WorkflowEvent::WorkflowScopeChanged { .. } => "WorkflowScopeChanged",
         WorkflowEvent::WorkflowExecutionStarted { .. } => "WorkflowExecutionStarted",
         WorkflowEvent::WorkflowStateEntered { .. } => "WorkflowStateEntered",
+        WorkflowEvent::WorkflowHumanInputRequested { .. } => "HumanInputRequested",
         WorkflowEvent::WorkflowStateExited { .. } => "WorkflowStateExited",
         WorkflowEvent::WorkflowIterationStarted { .. } => "WorkflowIterationStarted",
         WorkflowEvent::WorkflowIterationCompleted { .. } => "WorkflowIterationCompleted",
@@ -230,6 +234,18 @@ pub(crate) fn workflow_event_view_from_domain(
             Some(state_name.clone()),
             None,
             entered_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowHumanInputRequested {
+            execution_id,
+            state_name,
+            requested_at,
+            ..
+        } => (
+            execution_id.0,
+            state_name.clone(),
+            None,
+            requested_at.to_rfc3339(),
             serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
         ),
         WorkflowEvent::WorkflowStateExited {

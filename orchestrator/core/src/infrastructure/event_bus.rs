@@ -205,6 +205,7 @@ impl DomainEvent {
             DomainEvent::Workflow(event) => Some(match event {
                 WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
                 | WorkflowEvent::WorkflowStateEntered { execution_id, .. }
+                | WorkflowEvent::WorkflowHumanInputRequested { execution_id, .. }
                 | WorkflowEvent::WorkflowStateExited { execution_id, .. }
                 | WorkflowEvent::WorkflowIterationStarted { execution_id, .. }
                 | WorkflowEvent::WorkflowIterationCompleted { execution_id, .. }
@@ -473,6 +474,7 @@ impl DomainEvent {
                 WorkflowEvent::WorkflowRegistered { registered_at, .. } => *registered_at,
                 WorkflowEvent::WorkflowExecutionStarted { started_at, .. } => *started_at,
                 WorkflowEvent::WorkflowStateEntered { entered_at, .. } => *entered_at,
+                WorkflowEvent::WorkflowHumanInputRequested { requested_at, .. } => *requested_at,
                 WorkflowEvent::WorkflowStateExited { exited_at, .. } => *exited_at,
                 WorkflowEvent::WorkflowIterationStarted { started_at, .. } => *started_at,
                 WorkflowEvent::WorkflowIterationCompleted { completed_at, .. } => *completed_at,
@@ -730,6 +732,9 @@ impl DomainEvent {
                 WorkflowEvent::WorkflowRegistered { .. } => "workflow_registered",
                 WorkflowEvent::WorkflowExecutionStarted { .. } => "workflow_execution_started",
                 WorkflowEvent::WorkflowStateEntered { .. } => "workflow_state_entered",
+                WorkflowEvent::WorkflowHumanInputRequested { .. } => {
+                    "workflow_human_input_requested"
+                }
                 WorkflowEvent::WorkflowStateExited { .. } => "workflow_state_exited",
                 WorkflowEvent::WorkflowIterationStarted { .. } => "workflow_iteration_started",
                 WorkflowEvent::WorkflowIterationCompleted { .. } => "workflow_iteration_completed",
@@ -1530,6 +1535,7 @@ impl WorkflowEventReceiver {
         match event {
             WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
             | WorkflowEvent::WorkflowStateEntered { execution_id, .. }
+            | WorkflowEvent::WorkflowHumanInputRequested { execution_id, .. }
             | WorkflowEvent::WorkflowStateExited { execution_id, .. }
             | WorkflowEvent::WorkflowIterationStarted { execution_id, .. }
             | WorkflowEvent::WorkflowIterationCompleted { execution_id, .. }

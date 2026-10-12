@@ -233,6 +233,14 @@ pub struct TemporalEventPayload {
     #[serde(default)]
     pub actual_visits: Option<u32>,
 
+    /// The gate's question, rendered against the blackboard (HumanInputRequested)
+    #[serde(default)]
+    pub prompt: Option<String>,
+
+    /// The response the gate answers on timeout (HumanInputRequested)
+    #[serde(default)]
+    pub default_response: Option<String>,
+
     /// Event timestamp
     pub timestamp: String,
 }
@@ -585,6 +593,21 @@ impl TemporalEventMapper {
                     failed_at_state,
                     reason,
                     failed_at: timestamp,
+                })
+            }
+
+            "HumanInputRequested" => {
+                let prompt = payload
+                    .prompt
+                    .clone()
+                    .ok_or_else(|| anyhow!("prompt required for HumanInputRequested event"))?;
+
+                Ok(WorkflowEvent::WorkflowHumanInputRequested {
+                    execution_id,
+                    state_name: payload.state_name.clone(),
+                    prompt,
+                    default_response: payload.default_response.clone(),
+                    requested_at: timestamp,
                 })
             }
 
@@ -954,6 +977,7 @@ impl TemporalEventListener {
         let execution_id_obj = match &domain_event {
             WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
             | WorkflowEvent::WorkflowStateEntered { execution_id, .. }
+            | WorkflowEvent::WorkflowHumanInputRequested { execution_id, .. }
             | WorkflowEvent::WorkflowStateExited { execution_id, .. }
             | WorkflowEvent::WorkflowIterationStarted { execution_id, .. }
             | WorkflowEvent::WorkflowIterationCompleted { execution_id, .. }
@@ -1922,5 +1946,62 @@ mod tests {
             receiver.recv().await.unwrap(),
             DomainEvent::Workflow(WorkflowEvent::WorkflowStateEntered { .. })
         ));
+    }
+
+    /// The worker's Human state emits HumanInputRequested with the gate's
+    /// rendered prompt and its default response (`aegis-temporal-worker`
+    /// `bdc865ab`, `src/workflows/aegis-workflow.ts` 1052-1062). The mapper
+    /// answered "Unknown event_type" for it, the route answered 400 and the
+    /// run failed at its first gate.
+    #[test]
+    fn a_human_input_request_maps_to_the_gate_event() {
+        let workflow = build_test_workflow("listener-human-gate");
+        let execution_id = ExecutionId::new();
+        let payload = worker_payload(
+            execution_id,
+            &workflow,
+            7,
+            "HumanInputRequested",
+            json!({
+                "prompt": "Approve the requirements for the add command?",
+                "default_response": "reject",
+            }),
+        );
+
+        let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
+        let WorkflowEvent::WorkflowHumanInputRequested {
+            execution_id: mapped_id,
+            state_name,
+            prompt,
+            default_response,
+            requested_at,
+        } = event
+        else {
+            panic!("expected WorkflowHumanInputRequested, got {event:?}");
+        };
+        assert_eq!(mapped_id, execution_id);
+        assert_eq!(state_name, None);
+        assert_eq!(prompt, "Approve the requirements for the add command?");
+        assert_eq!(default_response.as_deref(), Some("reject"));
+        assert_eq!(requested_at.to_rfc3339(), "2026-10-04T06:00:00+00:00");
+    }
+
+    #[test]
+    fn a_human_input_request_without_a_prompt_is_refused() {
+        let workflow = build_test_workflow("listener-human-gate");
+        let payload = worker_payload(
+            ExecutionId::new(),
+            &workflow,
+            7,
+            "HumanInputRequested",
+            json!({ "default_response": "reject" }),
+        );
+
+        let err = TemporalEventMapper::to_domain_event(&payload).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("prompt required for HumanInputRequested event"),
+            "unexpected refusal: {err}"
+        );
     }
 }
