@@ -278,6 +278,7 @@ mod workers_ai {
     use axum::Router;
     use base64::Engine;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// Production's alias table names Workers AI in this form.
     const WORKERS_AI_ENDPOINT: &str = "https://api.cloudflare.com/client/v4/accounts/acct-1/ai/v1";
@@ -372,11 +373,22 @@ mod workers_ai {
         NoImage,
         /// The status and the body, as given.
         Error(u16, &'static str),
+        /// No answer: the request is held open for an hour.
+        Hang,
     }
 
     /// Answer every request on a loopback port with `answer`, recording it.
     /// Returns a Workers AI `/ai/v1` base on that port and the record.
     async fn stand_in(answer: Answer) -> (String, Seen) {
+        stand_in_answering(vec![answer]).await
+    }
+
+    /// Answer the n-th request on a loopback port with `answers[n]`, every
+    /// request past the last with the last, recording each. Returns a
+    /// Workers AI `/ai/v1` base on that port and the record.
+    async fn stand_in_answering(answers: Vec<Answer>) -> (String, Seen) {
+        assert!(!answers.is_empty(), "the stand-in needs an answer");
+        let answers = Arc::new(answers);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback listener");
@@ -386,14 +398,19 @@ mod workers_ai {
         let app = Router::new().fallback(
             move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
                 let record = record.clone();
-                let answer = answer.clone();
+                let answers = answers.clone();
                 async move {
-                    record.lock().unwrap().push(Request {
-                        method,
-                        path: uri.path().to_string(),
-                        headers,
-                        body,
-                    });
+                    let answer = {
+                        let mut record = record.lock().unwrap();
+                        let n = record.len();
+                        record.push(Request {
+                            method,
+                            path: uri.path().to_string(),
+                            headers,
+                            body,
+                        });
+                        answers[n.min(answers.len() - 1)].clone()
+                    };
                     match answer {
                         Answer::Image(bytes) => (
                             StatusCode::OK,
@@ -413,6 +430,10 @@ mod workers_ai {
                         ),
                         Answer::Error(status, text) => {
                             (StatusCode::from_u16(status).unwrap(), text.to_string())
+                        }
+                        Answer::Hang => {
+                            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                            (StatusCode::OK, String::new())
                         }
                     }
                 }
@@ -455,6 +476,7 @@ mod workers_ai {
             model.to_string(),
             headers,
         )
+        .with_retry_waits(Duration::ZERO, Duration::ZERO)
     }
 
     fn blank() -> Image {
@@ -962,6 +984,224 @@ mod workers_ai {
         }
         assert!(seen.lock().unwrap().is_empty(), "a request was sent");
     }
+
+    // --- a capacity refusal, a transient 503, a model that does not answer --
+
+    /// Workers AI's answer to a model at capacity (read 2026-10-12, request
+    /// `48d5797c`).
+    const CAPACITY: &str = r#"{"errors":[{"message":"AiError: AiError: Capacity temporarily exceeded, please try again. (4db1b541-22cb-47f7-aa3a-7ea39fe97ee8)","code":3040}],"success":false,"result":{},"messages":[]}"#;
+
+    /// Workers AI's transient 503 (read 2026-10-12, request `f4f10968`).
+    const UNKNOWN_INTERNAL: &str = r#"{"errors":[{"message":"AiError: AiError: Unknown internal error (03a011fe-1633-48a6-be6a-a7fd92786d3d)","code":3048}],"success":false,"result":{},"messages":[]}"#;
+
+    /// One image of `flux-1-schnell`, bounded so that an adapter that never
+    /// answers fails the test rather than hanging it.
+    async fn generate(adapter: &WorkersAiImageAdapter) -> Result<Vec<Image>, VisionError> {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            adapter.generate_image("a grey monkey reading", &ImageOptions::default()),
+        )
+        .await
+        .expect("the adapter did not answer within 10 s")
+        .map(|answer| answer.images)
+    }
+
+    #[tokio::test]
+    async fn a_429_then_a_200_answers_the_image_after_one_retry() {
+        let (endpoint, seen) =
+            stand_in_answering(vec![Answer::Error(429, CAPACITY), Answer::Image(JPEG)]).await;
+
+        let images = generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+            .await
+            .expect("the retry answers the image");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].bytes, JPEG);
+        assert_eq!(seen.lock().unwrap().len(), 2, "one request, one retry");
+    }
+
+    #[tokio::test]
+    async fn a_429_then_a_429_answers_the_rate_limit_refusal_after_one_retry() {
+        let (endpoint, seen) = stand_in_answering(vec![Answer::Error(429, CAPACITY)]).await;
+
+        let error = generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+            .await
+            .expect_err("the model stays at capacity");
+
+        assert!(matches!(error, VisionError::RateLimit), "{error:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "a 429 is retried once");
+    }
+
+    #[tokio::test]
+    async fn a_503_then_a_200_answers_the_image_after_one_retry() {
+        let (endpoint, seen) = stand_in_answering(vec![
+            Answer::Error(503, UNKNOWN_INTERNAL),
+            Answer::Image(JPEG),
+        ])
+        .await;
+
+        let images = generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+            .await
+            .expect("the retry answers the image");
+
+        assert_eq!(images[0].bytes, JPEG);
+        assert_eq!(seen.lock().unwrap().len(), 2, "one request, one retry");
+    }
+
+    /// The sequence production saw on 2026-10-12 at 03:42Z: a 429, a 503,
+    /// then the image.
+    #[tokio::test]
+    async fn a_429_then_a_503_then_a_200_answers_the_image_after_two_retries() {
+        let (endpoint, seen) = stand_in_answering(vec![
+            Answer::Error(429, CAPACITY),
+            Answer::Error(503, UNKNOWN_INTERNAL),
+            Answer::Image(JPEG),
+        ])
+        .await;
+
+        let images = generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+            .await
+            .expect("the second retry answers the image");
+
+        assert_eq!(images[0].bytes, JPEG);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_503_then_a_503_answers_the_provider_error_after_one_retry() {
+        let (endpoint, seen) = stand_in_answering(vec![Answer::Error(503, UNKNOWN_INTERNAL)]).await;
+
+        let error = generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+            .await
+            .expect_err("the model keeps failing");
+
+        match error {
+            VisionError::Provider(message) => {
+                assert!(message.contains("HTTP 503"), "{message}")
+            }
+            other => panic!("not Provider: {other:?}"),
+        }
+        assert_eq!(seen.lock().unwrap().len(), 2, "a 503 is retried once");
+    }
+
+    #[tokio::test]
+    async fn any_other_failure_is_not_retried() {
+        for (status, body) in [
+            (400u16, "refused"),
+            (401, "refused"),
+            (500, UNKNOWN_INTERNAL),
+            (502, "bad gateway"),
+        ] {
+            let (endpoint, seen) = stand_in_answering(vec![Answer::Error(status, body)]).await;
+            generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+                .await
+                .expect_err("the provider fails");
+            assert_eq!(seen.lock().unwrap().len(), 1, "HTTP {status} was retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_that_does_not_answer_within_the_request_timeout_is_a_network_error_naming_the_time(
+    ) {
+        let (endpoint, seen) = stand_in_answering(vec![Answer::Hang]).await;
+        let adapter = adapter_for(&endpoint, FLUX_1_SCHNELL)
+            .with_timeouts(Duration::from_secs(2), Duration::from_millis(300));
+
+        let error = generate(&adapter)
+            .await
+            .expect_err("the model does not answer");
+
+        match error {
+            VisionError::Network(message) => assert!(
+                message
+                    .starts_with("the image model did not answer: the request timed out after 0.")
+                    && message.ends_with(" s"),
+                "{message}"
+            ),
+            other => panic!("not Network: {other:?}"),
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1, "a timeout is not retried");
+    }
+
+    /// Every event the adapter logs, as `<LEVEL> <fields>` lines.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<String>>);
+
+    struct Fields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    impl tracing::Subscriber for Captured {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = event.metadata().level().to_string();
+            event.record(&mut Fields(&mut line));
+            line.push('\n');
+            self.0.lock().unwrap().push_str(&line);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn each_retried_attempt_logs_its_status_and_code_and_a_success_logs_one_info_line_without_the_prompt(
+    ) {
+        let captured = Captured::default();
+        let _logs = tracing::subscriber::set_default(captured.clone());
+        let (endpoint, _) = stand_in_answering(vec![
+            Answer::Error(429, CAPACITY),
+            Answer::Error(503, UNKNOWN_INTERNAL),
+            Answer::Image(JPEG),
+        ])
+        .await;
+
+        generate(&adapter_for(&endpoint, FLUX_1_SCHNELL))
+            .await
+            .expect("the second retry answers the image");
+
+        let logs = captured.0.lock().unwrap().clone();
+        let warns: Vec<&str> = logs.lines().filter(|l| l.starts_with("WARN")).collect();
+        assert_eq!(warns.len(), 2, "{logs}");
+        for (warn, (attempt, status, code)) in warns.iter().zip([(1, 429, 3040), (2, 503, 3048)]) {
+            for field in [
+                format!(" attempt={attempt}"),
+                format!(" status={status}"),
+                format!(" code={code}"),
+            ] {
+                assert!(warn.contains(&field), "no{field} in: {warn}");
+            }
+        }
+        let infos: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.starts_with("INFO") && l.contains("image generated"))
+            .collect();
+        assert_eq!(infos.len(), 1, "{logs}");
+        for field in [
+            format!(" model={FLUX_1_SCHNELL}"),
+            " count=1".to_string(),
+            " content_type=image/jpeg".to_string(),
+            format!(" bytes={}", JPEG.len()),
+            " elapsed_ms=".to_string(),
+        ] {
+            assert!(infos[0].contains(&field), "no{field} in: {}", infos[0]);
+        }
+        assert!(
+            !logs.contains("grey monkey"),
+            "the prompt reached the log: {logs}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -1055,6 +1295,8 @@ mod tool {
         calls: Mutex<Vec<(String, String, ImageOptions)>>,
         none: bool,
         jpeg: bool,
+        /// Answer every call as the provider's rate limit (HTTP 429).
+        rate_limited: bool,
     }
 
     struct FakeProvider {
@@ -1074,6 +1316,9 @@ mod tool {
                 prompt.to_string(),
                 options.clone(),
             ));
+            if self.images.rate_limited {
+                return Err(VisionError::RateLimit);
+            }
             let (bytes, content_type) = if self.images.jpeg {
                 (JPEG, "image/jpeg")
             } else {
@@ -2085,6 +2330,40 @@ spec:
             assert!(
                 told.contains("this node has no image generation model"),
                 "with the models attached {with_models}: {told}"
+            );
+        }
+    }
+
+    /// A provider's rate limit reaches the caller in the person's words, in
+    /// a run and out of band. The tool error codes have no rate-limit code
+    /// of an upstream's own, so the code is the upstream failure's, whose
+    /// answer carries `Retry-After`.
+    #[tokio::test]
+    async fn a_providers_rate_limit_is_answered_the_image_model_is_busy() {
+        let f = fixture(
+            FakeImages {
+                rate_limited: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        for (place, result) in [
+            ("in a run", f.in_run(json!({"prompt": "a cat"})).await),
+            ("out of band", f.in_chat(json!({"prompt": "a cat"})).await),
+        ] {
+            let error = result.expect_err("the provider is at its rate limit");
+            assert!(
+                error
+                    .to_string()
+                    .ends_with("The image model is busy; try again in a moment."),
+                "{place}: {error}"
+            );
+            let refusal = error.refusal();
+            assert_eq!(
+                (refusal.http_status, refusal.code),
+                (503, "UPSTREAM_UNAVAILABLE"),
+                "{place}"
             );
         }
     }

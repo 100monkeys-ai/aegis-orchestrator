@@ -21,6 +21,15 @@
 //! The provider's configured `headers` (ADR-124 D3) are sent beside the
 //! bearer `Authorization`, as the OpenAI adapter sends them, but for the AI
 //! Gateway's `cf-aig-*` headers, which [`WorkersAiImageAdapter::new`] drops.
+//!
+//! A model at capacity (HTTP 429) and a transient internal error (HTTP 503)
+//! are each retried once, after one second, then two; every non-2xx is logged at
+//! WARN with its attempt, status and error code, and a generation that
+//! answers its images is logged once at INFO with the model, the count, the
+//! content type, the bytes and the elapsed milliseconds, never the prompt.
+//! The client is bounded by 10 s to connect and 120 s a request; a
+//! request that outlasts either is a [`VisionError::Network`] naming the
+//! time it waited.
 
 use super::openai::image_content_type;
 use crate::domain::secrets::SensitiveUrl;
@@ -29,6 +38,7 @@ use crate::domain::vision::{
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName};
+use std::time::{Duration, Instant};
 
 /// The host of the Cloudflare API, which serves Workers AI.
 const WORKERS_AI_HOST: &str = "api.cloudflare.com";
@@ -59,6 +69,31 @@ const AI_GATEWAY_HEADER_PREFIX: &str = "cf-aig-";
 /// runs ("Invalid request body"), answered with HTTP 500.
 const INVALID_REQUEST_BODY: u64 = 7000;
 
+/// The bound on connecting to Workers AI.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The bound on one request, from its sending to the last byte of its answer.
+/// `flux-1-schnell` answered a 1024x1024 image in 2.0 s and `flux-2-dev`
+/// failed after 11 to 31 s by the direct requests of 2026-10-11; 120 s holds
+/// the slowest with room, and a request that outlasts it is a network error.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The waits before the first and the second retry. A model at capacity
+/// (HTTP 429, code 3040) and a transient internal error (HTTP 503, code
+/// 3048) are each retried once; on 2026-10-12 a 429 then a 503 were followed
+/// by an image on the third call, about six seconds apart.
+const RETRY_WAITS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+
+/// A client bounded by `connect` and `request`. Building fails only where
+/// `reqwest::Client::new` panics, when the TLS backend cannot start.
+fn client(connect: Duration, request: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .timeout(request)
+        .build()
+        .expect("the TLS backend starts")
+}
+
 pub struct WorkersAiImageAdapter {
     client: reqwest::Client,
     /// The provider's endpoint, a Workers AI `/ai/v1` base.
@@ -70,6 +105,8 @@ pub struct WorkersAiImageAdapter {
     /// The provider's configured request headers but the AI Gateway's, sent
     /// on every request beside `Authorization`.
     headers: HeaderMap,
+    /// The waits before the first and the second retry.
+    retry_waits: [Duration; 2],
 }
 
 impl WorkersAiImageAdapter {
@@ -88,12 +125,27 @@ impl WorkersAiImageAdapter {
             headers.remove(&name);
         }
         Self {
-            client: reqwest::Client::new(),
+            client: client(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
             endpoint,
             api_key,
             model,
             headers,
+            retry_waits: RETRY_WAITS,
         }
+    }
+
+    /// The adapter with its client bounded by `connect` to connect and by
+    /// `request` for a whole request, in place of 10 s and 120 s.
+    pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
+        self.client = client(connect, request);
+        self
+    }
+
+    /// The adapter waiting `first` before its first retry and `second`
+    /// before its second, in place of one second and two.
+    pub fn with_retry_waits(mut self, first: Duration, second: Duration) -> Self {
+        self.retry_waits = [first, second];
+        self
     }
 
     /// Whether `endpoint` is a Workers AI OpenAI-compatible base: host
@@ -134,12 +186,61 @@ impl WorkersAiImageAdapter {
     /// `dimensions` is `None` for a model [`FIXED_SIZE_MODELS`] names, so its
     /// request carries the prompt alone. No `steps` is sent: [`ImageOptions`]
     /// carries none, so the model's default holds.
+    ///
+    /// A 429 and a 503 are each retried once, after [`RETRY_WAITS`]' first
+    /// wait for the first retry and its second for the second; the last
+    /// failure is the answer. Every non-2xx is logged at WARN with its
+    /// attempt, status and error code.
     async fn generate_one(
         &self,
         url: &str,
         prompt: &str,
         dimensions: Option<(u32, u32)>,
     ) -> Result<Image, VisionError> {
+        let mut retried_429 = false;
+        let mut retried_503 = false;
+        let mut attempt: u8 = 1;
+        loop {
+            let failure = match self.attempt(url, prompt, dimensions, attempt).await {
+                Ok(image) => return Ok(image),
+                Err(failure) => failure,
+            };
+            let retry = match failure.status {
+                Some(429) if !retried_429 => {
+                    retried_429 = true;
+                    true
+                }
+                Some(503) if !retried_503 => {
+                    retried_503 = true;
+                    true
+                }
+                _ => false,
+            };
+            if !retry {
+                return Err(failure.error);
+            }
+            let wait = self.retry_waits[usize::from(attempt - 1).min(1)];
+            tracing::info!(
+                provider = "workers-ai",
+                model = %self.model,
+                attempt,
+                wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                "image generation retrying"
+            );
+            tokio::time::sleep(wait).await;
+            attempt += 1;
+        }
+    }
+
+    /// One request, answered with its image, or with its failure and the
+    /// HTTP status it carried, if any.
+    async fn attempt(
+        &self,
+        url: &str,
+        prompt: &str,
+        dimensions: Option<(u32, u32)>,
+        attempt: u8,
+    ) -> Result<Image, Failure> {
         let request = self
             .client
             .post(url)
@@ -162,55 +263,109 @@ impl WorkersAiImageAdapter {
             }
             request.json(&body)
         };
+        let started = Instant::now();
         let response = request
             .send()
             .await
-            .map_err(|e| VisionError::Network(e.to_string()))?;
+            .map_err(|e| Failure::network(e, started.elapsed()))?;
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             let error_text = response.text().await.unwrap_or_default();
             let excerpt: String = error_text.chars().take(512).collect();
+            let code = first_error_code(&error_text);
             tracing::warn!(
                 provider = "workers-ai",
                 model = %self.model,
+                attempt,
                 status = status.as_u16(),
+                code = %code.map_or_else(|| "none".to_string(), |c| c.to_string()),
+                retry_after = %retry_after.as_deref().unwrap_or("none"),
                 body_excerpt = %excerpt,
                 "image generation upstream non-2xx"
             );
-            return Err(match status.as_u16() {
+            let error = match status.as_u16() {
                 400 => VisionError::InvalidInput(format!("HTTP {status}: {excerpt}")),
-                500 if first_error_code(&error_text) == Some(INVALID_REQUEST_BODY) => {
+                500 if code == Some(INVALID_REQUEST_BODY) => {
                     VisionError::InvalidInput(format!("HTTP {status}: {excerpt}"))
                 }
                 401 | 403 => VisionError::Authentication(excerpt),
                 429 => VisionError::RateLimit,
                 _ => VisionError::Provider(format!("HTTP {status}: {excerpt}")),
+            };
+            return Err(Failure {
+                status: Some(status.as_u16()),
+                error,
             });
         }
 
         let answer: serde_json::Value = response.json().await.map_err(|e| {
-            VisionError::Provider(format!("the Workers AI answer did not parse: {e}"))
+            if e.is_timeout() {
+                Failure::network(e, started.elapsed())
+            } else {
+                Failure::from(VisionError::Provider(format!(
+                    "the Workers AI answer did not parse: {e}"
+                )))
+            }
         })?;
         let Some(b64) = answer
             .get("result")
             .and_then(|result| result.get("image"))
             .and_then(serde_json::Value::as_str)
         else {
-            return Err(VisionError::Provider(
+            return Err(Failure::from(VisionError::Provider(
                 "the Workers AI answer carries no result.image".to_string(),
-            ));
+            )));
         };
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
             .map_err(|e| {
-                VisionError::Provider(format!("the answer's result.image is not base64: {e}"))
+                Failure::from(VisionError::Provider(format!(
+                    "the answer's result.image is not base64: {e}"
+                )))
             })?;
         Ok(Image {
             content_type: image_content_type(&bytes),
             bytes,
         })
+    }
+}
+
+/// A failed request: its error, and the HTTP status it was answered with,
+/// if it was answered.
+struct Failure {
+    status: Option<u16>,
+    error: VisionError,
+}
+
+impl From<VisionError> for Failure {
+    fn from(error: VisionError) -> Self {
+        Self {
+            status: None,
+            error,
+        }
+    }
+}
+
+impl Failure {
+    /// A request that did not reach Workers AI or whose answer did not
+    /// arrive; a timeout names the time it waited.
+    fn network(e: reqwest::Error, elapsed: Duration) -> Self {
+        let message = if e.is_timeout() {
+            format!(
+                "the image model did not answer: the request timed out after {:.1} s",
+                elapsed.as_secs_f64()
+            )
+        } else {
+            e.to_string()
+        };
+        Self::from(VisionError::Network(message))
     }
 }
 
@@ -265,10 +420,22 @@ impl VisionProvider for WorkersAiImageAdapter {
             count,
             "image generation HTTP request"
         );
+        let started = Instant::now();
         let mut images = Vec::with_capacity(usize::from(count));
         for _ in 0..count {
             images.push(self.generate_one(&url, prompt, dimensions).await?);
         }
+        let mut content_types: Vec<&str> = images.iter().map(|i| i.content_type.as_str()).collect();
+        content_types.dedup();
+        tracing::info!(
+            provider = "workers-ai",
+            model = %self.model,
+            count = images.len(),
+            content_type = %content_types.join(","),
+            bytes = images.iter().map(|i| i.bytes.len()).sum::<usize>(),
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "image generated"
+        );
         Ok(ImageResponse { images })
     }
 

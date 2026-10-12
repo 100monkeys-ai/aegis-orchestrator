@@ -2255,6 +2255,14 @@ impl ToolInvocationService {
                 VisionError::InvalidInput(message) => SealSessionError::InvalidArguments(format!(
                     "the image generation model refused the request: {message}"
                 )),
+                // A provider's rate limit, already retried by the adapter, is
+                // told in the person's words under the upstream failure's
+                // code, whose answer carries `Retry-After`: the tool error
+                // codes have no rate-limit code of an upstream's own
+                // (`RATE_LIMIT_EXCEEDED` is the caller's own policy limit).
+                VisionError::RateLimit => SealSessionError::UpstreamUnavailable(
+                    "The image model is busy; try again in a moment.".to_string(),
+                ),
                 other => SealSessionError::UpstreamUnavailable(format!(
                     "the image generation model '{}' failed: {other}",
                     request.alias
