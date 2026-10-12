@@ -890,6 +890,74 @@ impl AegisFSAL {
         Ok(bytes_written)
     }
 
+    /// Set a file's length (truncate): a `size` below the length cuts the
+    /// file there, and one beyond it extends the file with zero bytes. It is
+    /// a write, under the write policy as `write` is, and a growth past the
+    /// volume's quota is refused as a write's would be.
+    pub async fn truncate(
+        &self,
+        handle: &AegisFileHandle,
+        path: &str,
+        policy: &FsalAccessPolicy,
+        size: u64,
+    ) -> Result<(), FsalError> {
+        // 1. Authorize and get volume for quota checking
+        let volume = self.authorize_handle(handle).await?;
+
+        // 2. Sanitize path and enforce the write policy
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
+        let path_string = canonical.to_str().unwrap().replace("\\", "/");
+        let path_str = path_string.as_str();
+        if let Err(e) = self.enforce_write_policy(policy, path_str) {
+            self.emit_policy_violation(
+                PolicyViolationContext {
+                    execution_id: handle.execution_id().copied(),
+                    workflow_execution_id: handle.workflow_execution_id(),
+                    volume_id: handle.volume_id,
+                    operation: "write",
+                    caller_node_id: None,
+                    host_node_id: None,
+                },
+                path_str,
+                &e,
+            )
+            .await;
+            return Err(e);
+        }
+        let full_path = self.routed_storage_path(&volume, path_str);
+
+        // 3. A truncate that grows the file is held to the quota by its growth
+        let current_size = self.storage_provider.stat(&full_path).await?.size;
+        if size > current_size {
+            let usage_path = self.routed_usage_path(&volume);
+            let current_usage = self.storage_provider.get_usage(&usage_path).await?;
+            let requested_bytes = size - current_size;
+            if current_usage.saturating_add(requested_bytes) > volume.size_limit_bytes {
+                let available_bytes = volume.size_limit_bytes.saturating_sub(current_usage);
+                self.event_publisher
+                    .publish_storage_event(StorageEvent::QuotaExceeded {
+                        execution_id: handle.execution_id().copied(),
+                        workflow_execution_id: handle.workflow_execution_id(),
+                        volume_id: handle.volume_id,
+                        requested_bytes,
+                        available_bytes,
+                        exceeded_at: Utc::now(),
+                        caller_node_id: None,
+                        host_node_id: None,
+                    })
+                    .await;
+                return Err(FsalError::QuotaExceeded {
+                    requested_bytes,
+                    available_bytes,
+                });
+            }
+        }
+
+        // 4. Set the length via the storage provider
+        self.storage_provider.truncate(&full_path, size).await?;
+        Ok(())
+    }
+
     /// Create a file
     pub async fn create_file(
         &self,

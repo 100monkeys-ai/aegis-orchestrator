@@ -258,4 +258,35 @@ impl StorageProvider for LocalHostStorageProvider {
         let to_path = self.resolve_path(to);
         std::fs::rename(from_path, to_path).map_err(|e| StorageError::IoError(e.to_string()))
     }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), StorageError> {
+        let fs_path = self.resolve_path(path);
+        let file = File::options()
+            .write(true)
+            .open(&fs_path)
+            .map_err(|e| StorageError::FileNotFound(e.to_string()))?;
+        file.set_len(size)
+            .map_err(|e| StorageError::IoError(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `truncate` cuts a file below its length and extends it with zero
+    /// bytes beyond it, as an `O_TRUNC` open or `truncate(2)` through a
+    /// mount of a host-path volume asks.
+    #[tokio::test]
+    async fn truncate_cuts_and_extends_a_file_on_the_host() {
+        let root = tempfile::tempdir().expect("scratch root");
+        std::fs::write(root.path().join("f"), b"0123456789").expect("fixture");
+        let provider = LocalHostStorageProvider::new(root.path()).expect("provider");
+
+        provider.truncate("/f", 3).await.expect("truncate to 3");
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"012");
+
+        provider.truncate("/f", 5).await.expect("truncate to 5");
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"012\0\0");
+    }
 }

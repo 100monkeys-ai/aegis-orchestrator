@@ -271,6 +271,26 @@ pub trait StorageProvider: Send + Sync {
     /// * `Ok(())` if renamed successfully
     /// * `Err(StorageError)` if rename failed
     async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError>;
+
+    /// Set a file's length (truncate)
+    ///
+    /// A `size` below the file's length cuts it there; a `size` beyond it
+    /// extends the file with zero bytes; a `size` equal to it leaves it as
+    /// it is. POSIX `truncate(2)`, as a FUSE `setattr` with a size asks.
+    ///
+    /// # Arguments
+    /// * `path` - Remote file path
+    /// * `size` - The file's new length in bytes
+    ///
+    /// # Returns
+    /// * `Ok(())` if the file now holds `size` bytes
+    /// * `Err(StorageError)` if the backend cannot set the length
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), StorageError> {
+        let _ = (path, size);
+        Err(StorageError::Unknown(
+            "truncate is not supported by this storage backend".to_string(),
+        ))
+    }
 }
 
 /// Storage errors

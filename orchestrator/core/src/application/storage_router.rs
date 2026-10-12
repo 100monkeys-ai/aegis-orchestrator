@@ -133,6 +133,10 @@ impl StorageProvider for StorageRouter {
         self.provider_for_path(path)?.create_file(path, mode).await
     }
 
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), StorageError> {
+        self.provider_for_path(path)?.truncate(path, size).await
+    }
+
     async fn delete_file(&self, path: &str) -> Result<(), StorageError> {
         self.provider_for_path(path)?.delete_file(path).await
     }

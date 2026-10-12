@@ -23,7 +23,8 @@ use crate::domain::volume::VolumeId;
 use crate::infrastructure::aegis_runtime_proto::{
     fsal_service_client::FsalServiceClient, FsalAccessPolicy as ProtoPolicy,
     FsalCreateFileRequest as ProtoCreateFile, FsalGetattrRequest, FsalLookupRequest,
-    FsalMutateRequest, FsalReadRequest, FsalReaddirRequest, FsalRenameRequest, FsalWriteRequest,
+    FsalMutateRequest, FsalReadRequest, FsalReaddirRequest, FsalRenameRequest, FsalTruncateRequest,
+    FsalWriteRequest,
 };
 
 use super::fsal_backend::FsalBackend;
@@ -260,6 +261,34 @@ impl FsalBackend for GrpcFsalBackend {
         .into_inner();
 
         Ok(resp.bytes_written as usize)
+    }
+
+    async fn truncate(
+        &self,
+        handle: &AegisFileHandle,
+        path: &str,
+        policy: &FsalAccessPolicy,
+        size: u64,
+    ) -> Result<(), FsalError> {
+        tokio::time::timeout(
+            GRPC_CALL_TIMEOUT,
+            self.client.clone().truncate(FsalTruncateRequest {
+                execution_id: handle
+                    .execution_id()
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
+                volume_id: handle.volume_id.0.to_string(),
+                path: path.to_string(),
+                policy: policy_to_proto(policy),
+                size,
+                workflow_execution_id: wf_id_to_proto(handle.workflow_execution_id()),
+            }),
+        )
+        .await
+        .map_err(timeout_to_fsal_error)?
+        .map_err(grpc_to_fsal_error)?;
+
+        Ok(())
     }
 
     async fn create_file(

@@ -384,3 +384,224 @@ fn git_clones_commits_and_logs_through_a_fuse_mount_of_a_seaweedfs_volume() {
     );
     assert!(clean_after, "the tree is not clean after the commit");
 }
+
+/// A volume on the filer, mounted through the FUSE daemon as the clone
+/// step's container mounts it: the step's execution registered for it, the
+/// container's root, every path readable and writable.
+struct Mounted {
+    _mount: Box<dyn std::any::Any>,
+    mountpoint: PathBuf,
+}
+
+fn mount_a_volume(rt: &tokio::runtime::Runtime, filer_url: &str, scratch: &Path) -> Mounted {
+    let step = ExecutionId::new();
+    let mut volume = Volume::new(
+        "git-repo-binding".to_string(),
+        TenantId::default(),
+        StorageClass::persistent(),
+        VolumeBackend::SeaweedFS {
+            filer_endpoint: FilerEndpoint::new(filer_url).unwrap(),
+            remote_path: String::new(),
+        },
+        500 * 1024 * 1024,
+        VolumeOwnership::persistent("e2e"),
+    )
+    .unwrap();
+    let remote_path = format!("/aegis/volumes/u-e2e/{}", volume.id);
+    volume.backend = VolumeBackend::SeaweedFS {
+        filer_endpoint: FilerEndpoint::new(filer_url).unwrap(),
+        remote_path: remote_path.clone(),
+    };
+    volume.mark_available().unwrap();
+    let volume_id = volume.id;
+
+    let repository = Arc::new(InMemoryVolumeRepository::new());
+    rt.block_on(repository.save(&volume)).unwrap();
+    let registry = NfsVolumeRegistry::new();
+    registry.register(VolumeRegistration {
+        volume_id,
+        execution_id: step,
+        workflow_execution_id: None,
+        container_uid: 0,
+        container_gid: 0,
+        policy: FsalAccessPolicy::default(),
+        mount_point: PathBuf::from("/workspace"),
+        remote_path: remote_path.clone(),
+    });
+    let fsal = AegisFSAL::new(
+        Arc::new(SeaweedFSAdapter::new(filer_url)),
+        repository as Arc<dyn VolumeRepository>,
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(NoEvents),
+    )
+    .with_volume_context_lookup(Arc::new(registry.clone()));
+
+    let mountpoint = scratch.join("workspace");
+    let daemon = FuseFsalDaemon::new(Arc::new(fsal));
+    let mount = {
+        let _entered = rt.enter();
+        daemon
+            .mount(
+                &mountpoint,
+                FuseVolumeContext {
+                    execution_id: step,
+                    volume_id,
+                    workflow_execution_id: None,
+                    container_uid: 0,
+                    container_gid: 0,
+                    policy: FsalAccessPolicy {
+                        read: vec!["/*".to_string()],
+                        write: vec!["/*".to_string()],
+                    },
+                },
+            )
+            .expect("the FUSE daemon mounts the volume")
+    };
+    println!("mounted {remote_path} at {}", mountpoint.display());
+    Mounted {
+        _mount: Box::new((mount, daemon)),
+        mountpoint,
+    }
+}
+
+/// The filer the harness runs against, or `None` when it is not enabled.
+fn enabled_filer() -> Option<String> {
+    if std::env::var(ENABLE).as_deref() != Ok("1") {
+        println!(
+            "skipped: set {ENABLE}=1 with a SeaweedFS filer at {FILER} (default http://localhost:8888), /dev/fuse and fusermount3"
+        );
+        return None;
+    }
+    Some(std::env::var(FILER).unwrap_or_else(|_| "http://localhost:8888".to_string()))
+}
+
+fn harness_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("runtime")
+}
+
+/// Regression (`forge-clone-index-pack-failed`): once the source has moved,
+/// the work-branch step's `git fetch` in the clone receives a thin pack, and
+/// `index-pack --fix-thin` rewrites the pack's header at offset 0. The
+/// SeaweedFS adapter replaced the whole file with a write at offset 0, so
+/// the fetch failed "Unexpected tail checksum ... index-pack failed". The
+/// fetch through the mount exits 0.
+#[test]
+fn git_fetch_after_the_source_moved_succeeds_through_a_fuse_mount_of_a_seaweedfs_volume() {
+    let Some(filer_url) = enabled_filer() else {
+        return;
+    };
+    let rt = harness_runtime();
+    let scratch = tempfile::tempdir_in("/tmp").expect("scratch");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let bare = source_repository(scratch.path(), &home);
+    let url = format!("file://{}", bare.display());
+    let mounted = mount_a_volume(&rt, &filer_url, scratch.path());
+
+    let tree = mounted.mountpoint.join("repo");
+    let tree_arg = tree.to_str().unwrap().to_string();
+    let mut runs = Vec::new();
+
+    // The clone step's script (`clone_step`).
+    runs.push(g(
+        &home,
+        &mounted.mountpoint,
+        &[
+            "clone",
+            "--depth=1",
+            "--filter=blob:limit=10M",
+            "--branch",
+            "main",
+            "--",
+            &url,
+            &tree_arg,
+        ],
+    ));
+
+    // The source moves on: a new commit pushed to it from elsewhere.
+    let pusher = scratch.path().join("pusher");
+    assert!(
+        git(
+            &home,
+            scratch.path(),
+            &["clone", "--quiet", &url, pusher.to_str().unwrap()]
+        )
+        .ok(),
+        "the pusher's clone is made"
+    );
+    std::fs::write(
+        pusher.join("src/main.rs"),
+        "fn main() {\n    println!(\"moved\");\n}\n",
+    )
+    .unwrap();
+    std::fs::write(pusher.join("MOVED.md"), "the source moved on\n").unwrap();
+    for args in [
+        vec!["add", "-A"],
+        vec!["commit", "--quiet", "-m", "third"],
+        vec!["push", "--quiet", "origin", "main"],
+    ] {
+        assert!(git(&home, &pusher, &args).ok(), "the source moves on");
+    }
+
+    // The work-branch step's fetch (`work_branch_step`).
+    runs.push(g(
+        &home,
+        &tree,
+        &[
+            "fetch",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    ));
+    runs.push(g(
+        &home,
+        &tree,
+        &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
+    ));
+    runs.push(g(&home, &tree, &["fsck", "--connectivity-only"]));
+
+    drop(mounted);
+
+    let failed: Vec<String> = runs.iter().filter(|r| !r.ok()).map(Ran::describe).collect();
+    assert!(
+        failed.is_empty(),
+        "git failed through the mount:\n{}",
+        failed.join("\n\n")
+    );
+}
+
+/// An `O_TRUNC` open of an existing file through the mount (`fopen "w"`, as
+/// git writes `FETCH_HEAD`) followed by a shorter write leaves exactly the
+/// shorter content, with no tail of the old.
+#[test]
+fn a_shorter_rewrite_of_a_file_through_a_fuse_mount_of_a_seaweedfs_volume_leaves_no_tail() {
+    let Some(filer_url) = enabled_filer() else {
+        return;
+    };
+    let rt = harness_runtime();
+    let scratch = tempfile::tempdir_in("/tmp").expect("scratch");
+    let mounted = mount_a_volume(&rt, &filer_url, scratch.path());
+    let file = mounted.mountpoint.join("FETCH_HEAD");
+
+    std::fs::write(&file, "0123456789\n").expect("the long content is written");
+    std::fs::write(&file, "ab\n").expect("the short content is written");
+    let read = std::fs::read_to_string(&file);
+    let length = std::fs::metadata(&file).map(|m| m.len());
+
+    drop(mounted);
+
+    assert_eq!(
+        read.as_deref().ok(),
+        Some("ab\n"),
+        "the rewrite through the mount kept a tail of the old content"
+    );
+    assert_eq!(
+        length.ok(),
+        Some(3),
+        "the file's length is not the new content's"
+    );
+}

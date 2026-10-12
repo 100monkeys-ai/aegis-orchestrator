@@ -858,6 +858,50 @@ impl FuseFsal {
         }
     }
 
+    /// SETATTR of the inode `ino`: a `size` sets the file's length through
+    /// the FSAL's truncate (an `O_TRUNC` open and `truncate(2)` arrive here
+    /// as a size), then the attributes are read back. Mode, owner and times
+    /// are not stored: UID/GID squashing makes chmod and chown no-ops.
+    fn set_attributes(&self, ino: u64, size: Option<u64>) -> Result<FileAttr, Errno> {
+        debug!(ino = ino, size = ?size, "FUSE SETATTR");
+
+        if ino == ROOT_INODE {
+            return if size.is_some() {
+                Err(Errno::EISDIR)
+            } else {
+                Ok(self.root_attr())
+            };
+        }
+
+        let (handle, path) = self.resolve_inode(ino).ok_or(Errno::ENOENT)?;
+
+        if let Some(size) = size {
+            if let Err(e) =
+                self.block_on(
+                    self.backend
+                        .truncate(&handle, &path, &self.context.policy, size),
+                )
+            {
+                error!(error = %e, ino = ino, size = size, "FUSE truncate failed");
+                metrics::counter!("aegis_fuse_operations_total", "operation" => "truncate", "result" => "error").increment(1);
+                return Err(fsal_error_to_errno(&e));
+            }
+            metrics::counter!("aegis_fuse_operations_total", "operation" => "truncate", "result" => "success").increment(1);
+        }
+
+        match self.block_on(self.backend.getattr(
+            self.context.execution_id,
+            self.context.volume_id,
+            &path,
+            self.context.container_uid,
+            self.context.container_gid,
+            self.context.workflow_execution_id,
+        )) {
+            Ok(attrs) => Ok(self.convert_attrs(&attrs, ino)),
+            Err(_) => Err(Errno::ENOENT),
+        }
+    }
+
     /// CREATE of the file `name` under the inode `parent`: the file's inode
     /// is allocated with the handle the FSAL returns, and its attributes read.
     fn create_entry(&self, parent: u64, name: &str) -> Result<FileAttr, Errno> {
@@ -1305,7 +1349,7 @@ impl Filesystem for FuseFsal {
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
-        _size: Option<u64>,
+        size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
@@ -1321,38 +1365,9 @@ impl Filesystem for FuseFsal {
             return;
         }
         let _guard = OpGuard::enter(self);
-        // FSAL does not support chmod/chown/truncate as discrete operations.
-        // Return current attributes unchanged (UID/GID squashing makes this a no-op).
-        let ino: u64 = ino.into();
-        debug!(ino = ino, "FUSE SETATTR (no-op, returning current attrs)");
-
-        if ino == ROOT_INODE {
-            reply.attr(&FUSE_TTL, &self.root_attr());
-            return;
-        }
-
-        let (_handle, path) = match self.resolve_inode(ino) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        match self.block_on(self.backend.getattr(
-            self.context.execution_id,
-            self.context.volume_id,
-            &path,
-            self.context.container_uid,
-            self.context.container_gid,
-            self.context.workflow_execution_id,
-        )) {
-            Ok(attrs) => {
-                reply.attr(&FUSE_TTL, &self.convert_attrs(&attrs, ino));
-            }
-            Err(_) => {
-                reply.error(Errno::ENOENT);
-            }
+        match self.set_attributes(ino.into(), size) {
+            Ok(attr) => reply.attr(&FUSE_TTL, &attr),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1509,6 +1524,16 @@ mod tests {
             _: u64,
             _: &[u8],
         ) -> Result<usize, FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn truncate(
+            &self,
+            _: &AegisFileHandle,
+            _: &str,
+            _: &FsalAccessPolicy,
+            _: u64,
+        ) -> Result<(), FsalError> {
             unimplemented!("stub")
         }
 
@@ -1918,6 +1943,132 @@ mod tests {
             Ok(FuseFileType::Directory),
             "LOOKUP of the directory the shell made did not answer a directory"
         );
+    }
+
+    /// Regression (`forge-clone-index-pack-failed`): SETATTR ignored its
+    /// size, so an `O_TRUNC` open or `truncate(2)` through the mount left the
+    /// file as it was. A SETATTR with a size sets the file's length on the
+    /// filer: size 3 of a 10-byte file PUTs its first 3 bytes.
+    #[test]
+    fn setattr_with_a_size_truncates_the_file_on_seaweedfs() {
+        use crate::domain::events::StorageEvent;
+        use crate::domain::fsal::EventPublisher;
+        use crate::domain::repository::VolumeRepository;
+        use crate::domain::volume::{
+            FilerEndpoint, StorageClass, TenantId, Volume, VolumeBackend, VolumeOwnership,
+            VolumeStatus,
+        };
+        use crate::infrastructure::repositories::InMemoryVolumeRepository;
+        use crate::infrastructure::storage::seaweedfs::SeaweedFSAdapter;
+
+        struct NoEvents;
+
+        #[async_trait]
+        impl EventPublisher for NoEvents {
+            async fn publish_storage_event(&self, _: StorageEvent) {}
+        }
+
+        let volume_id = VolumeId::new();
+        let remote_path = format!("/volumes/{volume_id}");
+        let file = format!("{remote_path}/FETCH_HEAD");
+
+        let mut filer = mockito::Server::new();
+        filer
+            .mock("GET", file.as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "metadata".into(),
+                "true".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"FullPath":"{file}","Mtime":"2026-10-12T20:02:15Z","Mode":420,"FileSize":10}}"#
+            ))
+            .create();
+        filer
+            .mock("HEAD", file.as_str())
+            .with_status(200)
+            .with_header("content-length", "10")
+            .create();
+        filer
+            .mock("GET", file.as_str())
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("0123456789")
+            .create();
+        let put = filer
+            .mock("PUT", file.as_str())
+            .match_body(mockito::Matcher::Exact("012".to_string()))
+            .with_status(201)
+            .expect(1)
+            .create();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let step = ExecutionId::new();
+        let volume = Volume {
+            id: volume_id,
+            name: "repo".to_string(),
+            tenant_id: TenantId::consumer(),
+            storage_class: StorageClass::persistent(),
+            backend: VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new(filer.url()).unwrap(),
+                remote_path,
+            },
+            size_limit_bytes: 1_000_000,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::execution(step),
+            created_at: chrono::Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+            host_node_id: None,
+        };
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        rt.block_on(repo.save(&volume)).expect("volume saved");
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(SeaweedFSAdapter::new(filer.url())),
+            repo as Arc<dyn VolumeRepository>,
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoEvents),
+        ));
+
+        let mount = FuseFsal {
+            backend: Arc::new(DirectFsalBackend(fsal)),
+            context: FuseVolumeContext {
+                execution_id: step,
+                volume_id,
+                workflow_execution_id: None,
+                container_uid: 0,
+                container_gid: 0,
+                policy: FsalAccessPolicy {
+                    read: vec!["/*".to_string()],
+                    write: vec!["/*".to_string()],
+                },
+            },
+            inode_table: Arc::new(InodeTable::new()),
+            runtime: rt.handle().clone(),
+            last_completed_op_at: Arc::new(AtomicU64::new(0)),
+            in_flight_ops: Arc::new(AtomicU32::new(0)),
+            degraded: Arc::new(AtomicBool::new(false)),
+        };
+
+        let ino: u64 = mount
+            .lookup_entry(ROOT_INODE, "FETCH_HEAD")
+            .expect("lookup FETCH_HEAD")
+            .ino
+            .into();
+        let set = mount
+            .set_attributes(ino, Some(3))
+            .map(|_| ())
+            .map_err(|errno| format!("{errno:?}"));
+
+        assert_eq!(set, Ok(()), "SETATTR with a size failed");
+        put.assert();
     }
 }
 
@@ -2335,6 +2486,19 @@ mod inode_tests {
             }
             data[offset as usize..end].copy_from_slice(bytes);
             Ok(bytes.len())
+        }
+
+        async fn truncate(
+            &self,
+            _: &AegisFileHandle,
+            path: &str,
+            _: &FsalAccessPolicy,
+            size: u64,
+        ) -> Result<(), FsalError> {
+            let mut files = self.files.lock();
+            let data = files.get_mut(path).ok_or_else(|| missing(path))?;
+            data.resize(size as usize, 0);
+            Ok(())
         }
 
         async fn create_file(

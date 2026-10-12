@@ -2098,7 +2098,8 @@ use crate::infrastructure::aegis_runtime_proto::{
     FsalLookupRequest as ProtoLookupReq, FsalLookupResponse, FsalMutateRequest as ProtoMutateReq,
     FsalMutateResponse, FsalReadRequest as ProtoReadReq, FsalReadResponse,
     FsalReaddirRequest as ProtoReaddirReq, FsalReaddirResponse,
-    FsalRenameRequest as ProtoRenameReq, FsalWriteRequest as ProtoWriteReq, FsalWriteResponse,
+    FsalRenameRequest as ProtoRenameReq, FsalTruncateRequest as ProtoTruncateReq,
+    FsalWriteRequest as ProtoWriteReq, FsalWriteResponse,
 };
 
 /// gRPC implementation of `FsalService` that delegates to the shared `AegisFSAL`.
@@ -2369,6 +2370,32 @@ impl FsalServiceTrait for FsalGrpcService {
         Ok(Response::new(FsalWriteResponse {
             bytes_written: bytes_written as u32,
         }))
+    }
+
+    async fn truncate(
+        &self,
+        request: Request<ProtoTruncateReq>,
+    ) -> Result<Response<FsalMutateResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+        let handle = if let Some(wf_uuid) = wf_id {
+            crate::domain::fsal::AegisFileHandle::new_for_workflow(wf_uuid, volume_id, &req.path)
+        } else {
+            crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.path)
+        };
+
+        self.fsal
+            .truncate(&handle, &req.path, &policy, req.size)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalMutateResponse {}))
     }
 
     async fn create_file(

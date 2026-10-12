@@ -82,6 +82,15 @@ pub trait FsalBackend: Send + Sync + 'static {
         data: &[u8],
     ) -> Result<usize, FsalError>;
 
+    /// Set a file's length: cut below it, zero-extend beyond it.
+    async fn truncate(
+        &self,
+        handle: &AegisFileHandle,
+        path: &str,
+        policy: &FsalAccessPolicy,
+        size: u64,
+    ) -> Result<(), FsalError>;
+
     /// Create a file and return its handle.
     async fn create_file(
         &self,
@@ -214,6 +223,16 @@ impl FsalBackend for DirectFsalBackend {
         data: &[u8],
     ) -> Result<usize, FsalError> {
         self.0.write(handle, path, policy, offset, data).await
+    }
+
+    async fn truncate(
+        &self,
+        handle: &AegisFileHandle,
+        path: &str,
+        policy: &FsalAccessPolicy,
+        size: u64,
+    ) -> Result<(), FsalError> {
+        self.0.truncate(handle, path, policy, size).await
     }
 
     async fn create_file(

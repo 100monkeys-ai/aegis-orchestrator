@@ -196,6 +196,18 @@ impl StorageProvider for OpenDalStorageProvider {
     async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
         self.operator.rename(from, to).await.map_err(Into::into)
     }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), StorageError> {
+        // An object is written whole: read it, cut or zero-extend it, and
+        // write it back.
+        let mut content = self.operator.read(path).await?.to_vec();
+        if content.len() as u64 == size {
+            return Ok(());
+        }
+        content.resize(size as usize, 0);
+        self.operator.write(path, content).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -434,5 +446,20 @@ mod tests {
             .health_check()
             .await
             .expect("health_check against an existing scratch root should succeed");
+    }
+
+    /// `truncate` cuts an object below its length and extends it with zero
+    /// bytes beyond it, as an `O_TRUNC` open through a mount asks.
+    #[tokio::test]
+    async fn truncate_cuts_and_extends_an_object() {
+        let (tmp, provider) = scratch();
+        let root = tmp.path();
+        place(root, "v/f", "0123456789");
+
+        provider.truncate("v/f", 3).await.expect("truncate to 3");
+        assert_eq!(std::fs::read(root.join("v/f")).unwrap(), b"012");
+
+        provider.truncate("v/f", 5).await.expect("truncate to 5");
+        assert_eq!(std::fs::read(root.join("v/f")).unwrap(), b"012\0\0");
     }
 }

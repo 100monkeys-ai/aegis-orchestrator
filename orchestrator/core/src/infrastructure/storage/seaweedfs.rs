@@ -108,6 +108,24 @@ impl SeaweedFSAdapter {
         format!("{}{}", self.filer_url, path)
     }
 
+    /// The whole content of the file at `url`, for a write that splices
+    /// into it or a truncate that cuts or extends it. A file the filer does
+    /// not have reads as empty, as a write creates it; any other failure is
+    /// an error, never an empty file, so a failed read cannot replace a
+    /// file's content with only the bytes being written.
+    async fn existing_content(&self, url: &str, path: &str) -> Result<Vec<u8>, StorageError> {
+        let response = self.client.get(url).send().await?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Ok(Vec::new()),
+            status if status.is_success() => {
+                read_capped_body(response, SEAWEEDFS_MAX_RESPONSE_BYTES).await
+            }
+            status => Err(StorageError::Unknown(format!(
+                "Failed to read file {path} before writing it: HTTP {status}"
+            ))),
+        }
+    }
+
     /// The filer's own entry for `path`: `GET <path>?metadata=true`, which
     /// SeaweedFS answers with the entry as JSON for a file and a directory
     /// alike (`weed/server/filer_server_handlers_read.go`,
@@ -443,39 +461,18 @@ impl StorageProvider for SeaweedFSAdapter {
 
         let url = self.build_url(&path);
 
-        // For simplicity, we'll read existing content, modify, and write back
-        // A production implementation would use proper partial write support
-        // or append-only writes for efficiency
-
-        let mut content = if offset > 0 {
-            // Read existing content if we're writing at an offset.
-            // 4.22: capped streaming read instead of unbounded `.bytes()`.
-            let response = self.client.get(&url).send().await;
-            if let Ok(resp) = response {
-                if resp.status().is_success() {
-                    read_capped_body(resp, SEAWEEDFS_MAX_RESPONSE_BYTES)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Extend content if needed
-        if content.len() < offset as usize {
-            content.resize(offset as usize, 0);
+        // The filer stores a file whole: a write is a read of the existing
+        // content, the data spliced in at `offset`, and a PUT of the result.
+        // The existing content is read at every offset, 0 included: git's
+        // `index-pack --fix-thin` rewrites a pack's 12-byte header at offset
+        // 0, and a write there must keep everything after it.
+        let mut content = self.existing_content(&url, &path).await?;
+        let offset = offset as usize;
+        let end = offset + data.len();
+        if content.len() < end {
+            content.resize(end, 0);
         }
-
-        // Write data at offset
-        if offset as usize + data.len() > content.len() {
-            content.resize(offset as usize + data.len(), 0);
-        }
-        content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+        content[offset..end].copy_from_slice(data);
 
         // Write back to SeaweedFS
         let response = self.client.put(&url).body(content).send().await?;
@@ -661,6 +658,42 @@ impl StorageProvider for SeaweedFSAdapter {
         Err(StorageError::Unknown(format!(
             "Failed to move {from} to {to}: HTTP {status}: {body}"
         )))
+    }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), StorageError> {
+        let url = self.build_url(path);
+        let response = self.client.get(&url).send().await?;
+        let mut content = match response.status() {
+            status if status.is_success() => {
+                read_capped_body(response, SEAWEEDFS_MAX_RESPONSE_BYTES).await?
+            }
+            StatusCode::NOT_FOUND => return Err(StorageError::FileNotFound(path.to_string())),
+            status => {
+                return Err(StorageError::Unknown(format!(
+                    "Failed to read file {path} before truncating it: HTTP {status}"
+                )))
+            }
+        };
+        if size > SEAWEEDFS_MAX_RESPONSE_BYTES {
+            return Err(StorageError::Unknown(format!(
+                "Failed to truncate file {path}: {size} bytes exceeds the {SEAWEEDFS_MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
+        if content.len() as u64 == size {
+            return Ok(());
+        }
+        content.resize(size as usize, 0);
+
+        let response = self.client.put(&url).body(content).send().await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(StorageError::Unknown(format!(
+                "Failed to truncate file {}: HTTP {}",
+                path,
+                response.status()
+            )))
+        }
     }
 }
 
@@ -1593,5 +1626,117 @@ mod tests {
         // Verify deletion
         let result = adapter.get_usage(path).await;
         assert!(matches!(result, Err(StorageError::NotFound(_))));
+    }
+
+    /// A filer holding `content` at `path`, answering a plain GET of it.
+    async fn filer_holding(server: &mut mockito::ServerGuard, path: &str, content: &[u8]) {
+        server
+            .mock("GET", path)
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body(content)
+            .create_async()
+            .await;
+    }
+
+    /// The one PUT of `path` whose body must be exactly `body`.
+    async fn filer_expecting_put(
+        server: &mut mockito::ServerGuard,
+        path: &str,
+        body: &[u8],
+    ) -> mockito::Mock {
+        server
+            .mock("PUT", path)
+            .match_body(mockito::Matcher::from(body.to_vec()))
+            .with_status(201)
+            .expect(1)
+            .create_async()
+            .await
+    }
+
+    /// Regression (`forge-clone-index-pack-failed`): `write_at` read the
+    /// existing content only for an offset above 0, so git's
+    /// `index-pack --fix-thin` rewriting a pack's 12-byte header at offset 0
+    /// replaced the whole pack with those 12 bytes. A write at 0 shorter than
+    /// the file keeps its tail.
+    #[tokio::test]
+    async fn write_at_offset_zero_keeps_the_rest_of_the_file() {
+        let mut server = mockito::Server::new_async().await;
+        filer_holding(&mut server, "/v/pack", b"0123456789").await;
+        let put = filer_expecting_put(&mut server, "/v/pack", b"AB23456789").await;
+        let adapter = SeaweedFSAdapter::new(server.url());
+
+        let written = adapter
+            .write_at(&FileHandle(b"/v/pack".to_vec()), 0, b"AB")
+            .await;
+
+        assert_eq!(written, Ok(2));
+        put.assert_async().await;
+    }
+
+    /// A write past the end extends the file, zero-filling any gap.
+    #[tokio::test]
+    async fn write_at_past_the_end_extends_the_file() {
+        let mut server = mockito::Server::new_async().await;
+        filer_holding(&mut server, "/v/f", b"0123").await;
+        let put = filer_expecting_put(&mut server, "/v/f", b"0123\0\0XY").await;
+        let adapter = SeaweedFSAdapter::new(server.url());
+
+        let written = adapter
+            .write_at(&FileHandle(b"/v/f".to_vec()), 6, b"XY")
+            .await;
+
+        assert_eq!(written, Ok(2));
+        put.assert_async().await;
+    }
+
+    /// A failed read of the existing content is an error, never an empty
+    /// file: nothing is written over the file.
+    #[tokio::test]
+    async fn write_at_refuses_when_the_existing_content_cannot_be_read() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/v/f")
+            .with_status(500)
+            .create_async()
+            .await;
+        let put = server
+            .mock("PUT", mockito::Matcher::Any)
+            .with_status(201)
+            .expect(0)
+            .create_async()
+            .await;
+        let adapter = SeaweedFSAdapter::new(server.url());
+
+        let written = adapter
+            .write_at(&FileHandle(b"/v/f".to_vec()), 0, b"AB")
+            .await;
+
+        assert!(written.is_err(), "the write went ahead: {written:?}");
+        put.assert_async().await;
+    }
+
+    /// `truncate` below the length cuts the file there.
+    #[tokio::test]
+    async fn truncate_below_the_length_cuts_the_file() {
+        let mut server = mockito::Server::new_async().await;
+        filer_holding(&mut server, "/v/f", b"0123456789").await;
+        let put = filer_expecting_put(&mut server, "/v/f", b"012").await;
+        let adapter = SeaweedFSAdapter::new(server.url());
+
+        assert_eq!(adapter.truncate("/v/f", 3).await, Ok(()));
+        put.assert_async().await;
+    }
+
+    /// `truncate` beyond the length extends the file with zero bytes.
+    #[tokio::test]
+    async fn truncate_beyond_the_length_extends_the_file_with_zeros() {
+        let mut server = mockito::Server::new_async().await;
+        filer_holding(&mut server, "/v/f", b"ab").await;
+        let put = filer_expecting_put(&mut server, "/v/f", b"ab\0\0\0").await;
+        let adapter = SeaweedFSAdapter::new(server.url());
+
+        assert_eq!(adapter.truncate("/v/f", 5).await, Ok(()));
+        put.assert_async().await;
     }
 }
