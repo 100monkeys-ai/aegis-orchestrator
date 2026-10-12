@@ -137,6 +137,15 @@ pub fn iteration_timeout(execution: &crate::domain::agent::ExecutionStrategy) ->
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_ITERATION_TIMEOUT_SECONDS))
 }
 
+/// The wait before the next try after a try whose execution failed:
+/// 15 s after the first failed try, doubled for each try after it, never
+/// more than 120 s. A failed execution is most often an upstream refusal
+/// (a model provider's 503 once the model layer's own retries are spent),
+/// and a try started at once meets the same burst again.
+pub fn failed_execution_backoff(failed: u32) -> Duration {
+    Duration::from_secs((15u64 << failed.saturating_sub(1).min(3)).min(120))
+}
+
 #[async_trait]
 pub trait SupervisorObserver: Send + Sync {
     async fn on_iteration_start(&self, iteration: u8, prompt: &str);
@@ -666,6 +675,25 @@ impl Supervisor {
                         "iteration": attempts,
                         "error": error_msg
                     }));
+
+                    if attempts < max_retries {
+                        let wait = failed_execution_backoff(attempts);
+                        info!(
+                            iteration = attempts,
+                            wait_secs = wait.as_secs(),
+                            "Waiting before the next try after a failed execution"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = cancellation_token.cancelled() => {
+                                info!(
+                                    iteration = attempts,
+                                    "Execution cancelled while waiting before the next try"
+                                );
+                                return Err(RuntimeError::Cancelled);
+                            }
+                        }
+                    }
 
                     continue;
                 }
@@ -1547,6 +1575,7 @@ mod tests {
     /// iteration gets a fresh container and the same bound.
     #[tokio::test]
     async fn iteration_whose_bootstrap_never_returns_is_ended_at_the_iteration_bound() {
+        tokio::time::pause();
         let runtime = Arc::new(
             TestRuntime::new()
                 .with_spawn_success(2)
@@ -1560,7 +1589,7 @@ mod tests {
         config.execution.iteration_timeout = Some("1s".to_string());
         config.resources.timeout_seconds = Some(60);
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let result = supervisor
             .run_loop(
                 config,
@@ -1578,8 +1607,8 @@ mod tests {
             "{result:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(10),
-            "each iteration ends at its 1 s bound, not the execution's 60 s: {elapsed:?}"
+            elapsed < Duration::from_secs(20),
+            "each iteration ends at its 1 s bound, with the 15 s wait between the tries, not the execution's 60 s: {elapsed:?}"
         );
         assert_eq!(*observer.iteration_fails.lock().await, vec![1, 2]);
         let terminated: Vec<String> = runtime
@@ -2480,6 +2509,138 @@ mod tests {
                 recipient"
                     .to_string()
             )
+        );
+    }
+
+    /// A runtime whose tries fail by their execution, as a model provider's
+    /// 503 does once the model layer's own retries are spent, a set number
+    /// of times before a try answers. The time of each spawn is kept.
+    struct FailingThenAnsweringRuntime {
+        failures_left: Mutex<u32>,
+        spawn_times: Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl FailingThenAnsweringRuntime {
+        fn new(failures: u32) -> Self {
+            Self {
+                failures_left: Mutex::new(failures),
+                spawn_times: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentRuntime for FailingThenAnsweringRuntime {
+        async fn spawn(&self, _config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+            let mut times = self.spawn_times.lock().await;
+            times.push(tokio::time::Instant::now());
+            Ok(InstanceId::new(format!("instance-{}", times.len())))
+        }
+
+        async fn execute(
+            &self,
+            _id: &InstanceId,
+            _input: TaskInput,
+        ) -> Result<TaskOutput, RuntimeError> {
+            let mut failures_left = self.failures_left.lock().await;
+            if *failures_left > 0 {
+                *failures_left -= 1;
+                return Err(RuntimeError::ExecutionFailedWithLogs {
+                    error: "RuntimeError: the model answered HTTP 503, code 3045".to_string(),
+                    logs: vec![],
+                });
+            }
+            Ok(TaskOutput {
+                result: serde_json::Value::String("answered".to_string()),
+                logs: vec![],
+                tool_calls: vec![],
+                exit_code: 0,
+                trajectory: vec![],
+            })
+        }
+
+        async fn terminate(&self, _id: &InstanceId) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn status(&self, id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: "running".to_string(),
+                uptime_seconds: 0,
+                memory_usage_mb: 0,
+                cpu_usage_percent: 0.0,
+            })
+        }
+    }
+
+    /// A try that fails by its execution is followed by a wait before the
+    /// next try: 15 s after the first failure, 30 s after the second, so a
+    /// burst of upstream refusals is not met again at once by every try.
+    #[tokio::test]
+    async fn a_failed_execution_waits_15_s_then_30_s_before_the_next_tries() {
+        tokio::time::pause();
+        let runtime = Arc::new(FailingThenAnsweringRuntime::new(2));
+        let supervisor = Supervisor::new(runtime.clone());
+        let observer = Arc::new(TestObserver::default());
+
+        let result = supervisor
+            .run_loop(
+                create_test_config(),
+                create_test_input(),
+                5,
+                observer.clone(),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+
+        assert_eq!(result.expect("the third try answers"), "answered");
+        assert_eq!(*observer.iteration_fails.lock().await, vec![1, 2]);
+        let times = runtime.spawn_times.lock().await.clone();
+        assert_eq!(times.len(), 3, "three tries were spawned");
+        let gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps[0] >= Duration::from_secs(15) && gaps[1] >= Duration::from_secs(30),
+            "the tries after a failed execution started {gaps:?} apart, expected at least 15 s then 30 s"
+        );
+    }
+
+    /// Cancelling the execution while the supervisor waits after a failed
+    /// execution ends it as cancelled, with no further try spawned.
+    #[tokio::test]
+    async fn cancelling_during_the_wait_after_a_failed_execution_returns_cancelled() {
+        tokio::time::pause();
+        let runtime = Arc::new(FailingThenAnsweringRuntime::new(1));
+        let supervisor = Supervisor::new(runtime.clone());
+        let observer = Arc::new(TestObserver::default());
+
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            canceller.cancel();
+        });
+
+        let result = supervisor
+            .run_loop(
+                create_test_config(),
+                create_test_input(),
+                3,
+                observer.clone(),
+                token,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(RuntimeError::Cancelled)),
+            "cancelled during the wait after the failed try, the execution ended {result:?}"
+        );
+        assert_eq!(
+            runtime.spawn_times.lock().await.len(),
+            1,
+            "no try is spawned after the cancel"
         );
     }
 }
