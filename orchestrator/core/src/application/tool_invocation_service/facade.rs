@@ -2275,6 +2275,21 @@ impl ToolInvocationService {
         dir: &str,
         images: &[crate::domain::vision::Image],
     ) -> Result<Vec<crate::domain::execution::ProducedFile>, SealSessionError> {
+        let produced = self.write_generated_files(volume, dir, images).await?;
+        self.record_generated_files(executions, execution_id, iteration_number, produced.clone())
+            .await?;
+        Ok(produced)
+    }
+
+    /// Write each image into `volume` under `dir`, numbered on from the files
+    /// already there, as the volume's execution or, for a volume of a
+    /// workflow execution, as that workflow execution; recording nothing.
+    async fn write_generated_files(
+        &self,
+        volume: &crate::infrastructure::nfs::server::NfsVolumeContext,
+        dir: &str,
+        images: &[crate::domain::vision::Image],
+    ) -> Result<Vec<crate::domain::execution::ProducedFile>, SealSessionError> {
         let policy = &volume.policy;
         let first = self
             .fsal
@@ -2341,8 +2356,6 @@ impl ToolInvocationService {
                 declared: true,
             });
         }
-        self.record_generated_files(executions, execution_id, iteration_number, produced.clone())
-            .await?;
         Ok(produced)
     }
 
@@ -2350,11 +2363,18 @@ impl ToolInvocationService {
     /// I5a): `aegis.image.generate`'s call for the workflow execution `run`.
     /// Generates `count` images (default 1) from the step's `prompt` and
     /// writes them into the workflow execution's volume under the step's
-    /// `path` (default `generated/`), each recorded as a produced file of the
-    /// run's latest agent execution, as the tool records a run's. A refusal
-    /// the tool would answer its caller (no image generation model, the
-    /// count, the size, an empty prompt) is the answer's `sentence`, with no
-    /// file written; a run with no agent execution or no volume is
+    /// `path` (default `generated/`). In a run with an agent execution, the
+    /// volume is the one its latest agent execution mounted, and each image
+    /// is recorded as a produced file of that execution, as the tool records
+    /// a run's. In a run with none (an `image_generate` state before or
+    /// without any Agent state), the volume is one the workflow execution
+    /// owns (found, else made for it: `workflow_owned_volume`), and
+    /// no produced file is recorded, there being no agent execution to
+    /// record it on; the answer's `files` are the record. A refusal the tool
+    /// would answer its caller (no image generation model, the count, the
+    /// size, an empty prompt), a run whose record has ended, and a run with
+    /// no volume where none can be made are the answer's `sentence`, with no
+    /// file written; a run with no record is
     /// [`ImageGenerateError::RunNotFound`]; a provider failure is
     /// [`ImageGenerateError::Failed`] in the provider's words.
     pub async fn run_image_generate(
@@ -2387,42 +2407,72 @@ impl ToolInvocationService {
             Err(sentence) => return Ok(refused(sentence.to_string())),
         };
 
+        let runs =
+            self.workflow_execution_repo
+                .as_ref()
+                .ok_or(ImageGenerateError::NotConfigured(
+                    "the workflow execution store",
+                ))?;
+        let record = runs
+            .find_by_id_for_tenant(tenant_id, crate::domain::execution::ExecutionId(run))
+            .await
+            .map_err(|e| ImageGenerateError::Failed(e.to_string()))?
+            .ok_or_else(|| {
+                ImageGenerateError::RunNotFound(format!("workflow execution {run} is not found"))
+            })?;
+        if matches!(
+            record.status,
+            crate::domain::execution::ExecutionStatus::Completed
+                | crate::domain::execution::ExecutionStatus::Failed
+                | crate::domain::execution::ExecutionStatus::Cancelled
+        ) {
+            return Ok(refused(STEP_RUN_HAS_ENDED.to_string()));
+        }
+
+        // Where the files go is settled before the provider is called.
         let executions = self
             .execution_repository
             .as_ref()
             .ok_or(ImageGenerateError::NotConfigured("the execution store"))?;
-        let execution = executions
+        let agent_execution = executions
             .find_by_workflow_execution_for_tenant(tenant_id, run)
             .await
             .map_err(|e| ImageGenerateError::Failed(e.to_string()))?
-            .pop()
-            .ok_or_else(|| {
-                ImageGenerateError::RunNotFound(format!(
-                    "workflow execution {run} has no agent execution to write into"
-                ))
-            })?;
-        let volume = self.workflow_run_volume(&execution, run).ok_or_else(|| {
-            ImageGenerateError::RunNotFound(format!(
-                "workflow execution {run} has no volume to write into"
-            ))
-        })?;
+            .pop();
+        let (volume, record_on) = match agent_execution {
+            Some(execution) => match self.workflow_run_volume(&execution, run) {
+                Some(volume) => (volume, Some(execution.id)),
+                None => return Ok(refused(STEP_RUN_HAS_NO_VOLUME.to_string())),
+            },
+            None => match self.workflow_owned_volume(tenant_id, run).await {
+                Some(volume) => (volume, None),
+                None => return Ok(refused(STEP_RUN_HAS_NO_VOLUME.to_string())),
+            },
+        };
 
         let generated = match Self::generate_images(&request).await {
             Ok(generated) => generated,
             Err(SealSessionError::InvalidArguments(sentence)) => return Ok(refused(sentence)),
             Err(other) => return Err(ImageGenerateError::Failed(step_failure(other))),
         };
-        let produced = self
-            .write_generated_to_run(
-                executions,
-                execution.id,
-                0,
-                &volume,
-                &dir,
-                &generated.images,
-            )
-            .await
-            .map_err(|e| ImageGenerateError::Failed(step_failure(e)))?;
+        let produced = match record_on {
+            Some(execution_id) => {
+                self.write_generated_to_run(
+                    executions,
+                    execution_id,
+                    0,
+                    &volume,
+                    &dir,
+                    &generated.images,
+                )
+                .await
+            }
+            None => {
+                self.write_generated_files(&volume, &dir, &generated.images)
+                    .await
+            }
+        }
+        .map_err(|e| ImageGenerateError::Failed(step_failure(e)))?;
         Ok(ImageGenerateAnswer {
             files: produced
                 .into_iter()
@@ -2487,6 +2537,111 @@ impl ToolInvocationService {
                         .unwrap_or_default(),
                 })
             })
+    }
+
+    /// The volume the workflow execution `run` of `tenant_id` owns for its
+    /// steps' files when no agent execution of it has mounted one: the
+    /// volume registered with the gateway for `run` at `/workspace` and
+    /// owned by `run`; else the run's own `workspace-<run>` volume in the
+    /// store, owned by `run`; else one made for it by the volume service,
+    /// owned by `run`, as a step's copy of its run's attachments is made.
+    /// A volume found in the store or made is registered with the gateway
+    /// for `run` at `/workspace`, so a later step finds it and the gateway
+    /// serves it as the workflow execution's. `None`: none is found and none
+    /// can be made (no volume service on this node, or its creation failed).
+    async fn workflow_owned_volume(
+        &self,
+        tenant_id: &TenantId,
+        run: uuid::Uuid,
+    ) -> Option<crate::infrastructure::nfs::server::NfsVolumeContext> {
+        use crate::domain::volume::{StorageClass, VolumeOwnership, VolumeStatus};
+        let owner = VolumeOwnership::workflow(run);
+        let store = self.fsal.volume_repository();
+        let the_runs = |volume: &crate::domain::volume::Volume| {
+            volume.ownership == owner
+                && &volume.tenant_id == tenant_id
+                && matches!(
+                    volume.status,
+                    VolumeStatus::Available | VolumeStatus::Attached
+                )
+        };
+
+        let mut registered: Vec<_> = self
+            .volume_registry
+            .list_volumes()
+            .into_iter()
+            .filter_map(|id| self.volume_registry.lookup(id))
+            .filter(|ctx| {
+                ctx.workflow_execution_id == Some(run)
+                    && ctx.mount_point == std::path::Path::new(RUN_VOLUME_MOUNT)
+            })
+            .collect();
+        registered.sort_by_key(|ctx| ctx.volume_id.to_string());
+        for ctx in registered {
+            if let Ok(Some(volume)) = store.find_by_id(ctx.volume_id).await {
+                if the_runs(&volume) {
+                    return Some(ctx);
+                }
+            }
+        }
+
+        let name = format!("workspace-{run}");
+        let stored = match store.find_by_ownership(&owner).await {
+            Ok(volumes) => volumes
+                .into_iter()
+                .find(|volume| volume.name == name && the_runs(volume)),
+            Err(e) => {
+                tracing::warn!(workflow_execution_id = %run, error = %e, "The volumes a run owns could not be read");
+                None
+            }
+        };
+        let volume = match stored {
+            Some(volume) => volume,
+            None => {
+                let volumes = &self.user_volume_service.as_ref()?.volume_service;
+                let made = async {
+                    let id = volumes
+                        .create_volume(
+                            name,
+                            tenant_id.clone(),
+                            StorageClass::ephemeral_hours(24),
+                            RUN_VOLUME_SIZE_MB,
+                            owner,
+                        )
+                        .await?;
+                    volumes.get_volume(id).await
+                }
+                .await;
+                match made {
+                    Ok(volume) => volume,
+                    Err(e) => {
+                        tracing::warn!(workflow_execution_id = %run, error = %e, "A run's volume for its generated images could not be made");
+                        return None;
+                    }
+                }
+            }
+        };
+        let mount_point = PathBuf::from(RUN_VOLUME_MOUNT);
+        let registration = crate::application::nfs_gateway::VolumeRegistration {
+            volume_id: volume.id,
+            execution_id: crate::domain::execution::ExecutionId(run),
+            workflow_execution_id: Some(run),
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: crate::domain::fsal::FsalAccessPolicy {
+                read: vec!["/*".to_string()],
+                write: vec!["/*".to_string()],
+            },
+            remote_path: volume
+                .to_mount(
+                    mount_point.clone(),
+                    crate::domain::volume::AccessMode::ReadWrite,
+                )
+                .remote_path,
+            mount_point,
+        };
+        self.volume_registry.register(registration);
+        self.volume_registry.lookup(volume.id)
     }
 
     /// Record `produced` on the call's iteration of the execution, or on its
@@ -3295,6 +3450,21 @@ struct ImageRequest {
 /// names none.
 const STEP_PATH_OUTSIDE_THE_RUN: &str = "'path' must name a directory inside the run's volume";
 
+/// The refusal of an image generation step in a run whose record has ended.
+const STEP_RUN_HAS_ENDED: &str = "this run has ended";
+
+/// The refusal of an image generation step in a run with no volume, where
+/// none can be made.
+const STEP_RUN_HAS_NO_VOLUME: &str = "this run has no volume to write into";
+
+/// Where a workflow execution's own volume is registered with the gateway,
+/// as an agent state's workspace is.
+const RUN_VOLUME_MOUNT: &str = "/workspace";
+
+/// The size of a volume made for a workflow execution's generated images,
+/// as a workflow workspace's.
+const RUN_VOLUME_SIZE_MB: u64 = 256;
+
 /// A workflow step's `path` as a volume-local directory: `/generated` when
 /// absent; refused when it names no directory or climbs out of the volume.
 fn step_directory(path: Option<&str>) -> Result<String, &'static str> {
@@ -3387,8 +3557,7 @@ pub struct ImageGenerateAnswer {
 /// Why the step did not answer.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageGenerateError {
-    /// The workflow execution has no agent execution or no volume to write
-    /// into.
+    /// The workflow execution has no record.
     #[error("{0}")]
     RunNotFound(String),
     /// What the step needs is not configured on this node.

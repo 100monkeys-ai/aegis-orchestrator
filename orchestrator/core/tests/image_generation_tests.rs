@@ -986,12 +986,14 @@ mod tool {
     use aegis_orchestrator_core::application::volume_manager::VolumeService;
     use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
     use aegis_orchestrator_core::domain::events::{ExecutionEvent, StorageEvent};
+    use aegis_orchestrator_core::domain::execution::ExecutionStatus;
     use aegis_orchestrator_core::domain::execution::{
         Execution, ExecutionId, ExecutionInput, Iteration,
     };
     use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher, FsalAccessPolicy};
     use aegis_orchestrator_core::domain::iam::ZaruTier;
     use aegis_orchestrator_core::domain::mcp::ToolInputContract;
+    use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
     use aegis_orchestrator_core::domain::repository::{
         AgentVersion, ExecutionRepository, VolumeRepository,
     };
@@ -1018,15 +1020,18 @@ mod tool {
         AccessMode, StorageClass, StorageTierLimits, Volume, VolumeBackend, VolumeMount,
         VolumeOwnership,
     };
+    use aegis_orchestrator_core::domain::workflow::WorkflowExecution;
     use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
     use aegis_orchestrator_core::infrastructure::repositories::{
         InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryVolumeRepository,
+        InMemoryWorkflowExecutionRepository,
     };
     use aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware;
     use aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository;
     use aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository;
     use aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider;
     use aegis_orchestrator_core::infrastructure::tool_router::ToolRouter;
+    use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
     use anyhow::Result;
     use async_trait::async_trait;
     use futures::Stream;
@@ -1526,8 +1531,16 @@ spec:
         fsal: Arc<AegisFSAL>,
         token: String,
         /// The workflow execution the agent's run is a step of, when the
-        /// fixture is [`workflow_fixture`]'s.
+        /// fixture is [`workflow_fixture`]'s; in [`fixture`]'s, a workflow
+        /// execution with no agent execution and no volume.
         workflow: uuid::Uuid,
+        /// The workflow executions' store, holding [`Self::workflow`]'s
+        /// record, running.
+        workflow_runs: Arc<InMemoryWorkflowExecutionRepository>,
+        /// The volumes' store.
+        volumes: Arc<InMemoryVolumeRepository>,
+        /// The gateway's registry of mounted volumes.
+        registry: NfsVolumeRegistry,
         _root: tempfile::TempDir,
     }
 
@@ -1648,6 +1661,34 @@ spec:
         let contexts = Arc::new(InMemorySecurityContextRepository::new());
         contexts.save(context()).await.unwrap();
 
+        // The workflow execution's record, running.
+        let workflow_runs = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let mut workflow_run = WorkflowExecution::new(
+            &WorkflowParser::parse_yaml(
+                r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: draw
+spec:
+  initial_state: DRAW
+  states:
+    DRAW:
+      kind: System
+      command: "true"
+      transitions: []
+"#,
+            )
+            .unwrap(),
+            ExecutionId(workflow),
+            json!({}),
+        );
+        workflow_run.tenant_id = tenant.clone();
+        workflow_run.initiating_user_sub = Some(PERSON.to_string());
+        workflow_runs
+            .save_for_tenant(&tenant, &workflow_run)
+            .await
+            .unwrap();
+
         let files = Arc::new(FileOperationsService::new(
             fsal.clone(),
             executions.clone() as Arc<dyn ExecutionRepository>,
@@ -1668,7 +1709,7 @@ spec:
             Arc::new(SealMiddleware::new()),
             Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers())),
             fsal.clone(),
-            registry,
+            registry.clone(),
             Arc::new(OneAgent(agent)),
             Arc::new(Executions(HashMap::from([(run.id, run.clone())]))),
             Arc::new(
@@ -1678,6 +1719,7 @@ spec:
             None,
         )
         .with_execution_repository(executions.clone())
+        .with_workflow_execution_repo(workflow_runs.clone())
         .with_file_operations_service(files.clone())
         .with_user_volume_service(user_volumes.clone());
         if with_models {
@@ -1695,6 +1737,9 @@ spec:
             fsal,
             token,
             workflow,
+            workflow_runs,
+            volumes,
+            registry,
             _root: root,
         }
     }
@@ -2246,6 +2291,197 @@ spec:
         assert!(
             f.images.calls.lock().unwrap().is_empty(),
             "a refused step reached the provider"
+        );
+    }
+
+    // --- a run with no agent execution (AEGIS ADR-143 I5a) ----------------
+
+    impl Fixture {
+        /// The volumes the workflow execution owns.
+        async fn workflow_volumes(&self) -> Vec<Volume> {
+            self.volumes
+                .find_by_ownership(&VolumeOwnership::workflow(self.workflow))
+                .await
+                .unwrap()
+        }
+
+        /// The bytes at `path` of `volume`, read as the workflow execution.
+        async fn read_as_run(&self, volume: VolumeId, path: &str) -> Vec<u8> {
+            let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new_for_workflow(
+                self.workflow,
+                volume,
+                "/",
+            );
+            let policy = FsalAccessPolicy {
+                read: vec!["/*".to_string()],
+                write: vec![],
+            };
+            self.fsal
+                .read(&handle, path, &policy, 0, 1 << 20)
+                .await
+                .unwrap_or_else(|e| panic!("{path} is not in volume {volume}: {e}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_in_a_run_with_no_agent_execution_writes_into_a_volume_the_run_owns() {
+        // The workflow execution has no agent execution and no volume.
+        let f = fixture(FakeImages::default(), true).await;
+        assert!(f.workflow_volumes().await.is_empty());
+
+        let answer = f
+            .step(ImageGenerateStep {
+                prompt: "a lighthouse at dusk".to_string(),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(answer.sentence, None, "{answer:?}");
+        let owned = f.workflow_volumes().await;
+        assert_eq!(owned.len(), 1, "the volumes the run owns: {owned:?}");
+        let volume = owned[0].id;
+        assert_eq!(
+            answer.files,
+            vec![generated(volume, "generated/1.png")],
+            "the answer's files"
+        );
+        assert_eq!(f.read_as_run(volume, "/generated/1.png").await, PNG);
+        let registered = f
+            .registry
+            .lookup(volume)
+            .expect("the run's volume is registered with the gateway");
+        assert_eq!(registered.workflow_execution_id, Some(f.workflow));
+        assert!(
+            f.produced().await.is_empty(),
+            "a file of a run with no agent execution was recorded on another execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_in_a_run_with_no_agent_execution_writes_into_the_volume_the_run_already_owns() {
+        let f = fixture(FakeImages::default(), true).await;
+        let host = HostVolumes {
+            repo: f.volumes.clone(),
+        };
+        let existing = host
+            .create_volume(
+                format!("workspace-{}", f.workflow),
+                TenantId::default(),
+                StorageClass::ephemeral_hours(24),
+                64,
+                VolumeOwnership::workflow(f.workflow),
+            )
+            .await
+            .unwrap();
+        f.registry.register(VolumeRegistration {
+            volume_id: existing,
+            execution_id: ExecutionId(f.workflow),
+            workflow_execution_id: Some(f.workflow),
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: FsalAccessPolicy {
+                read: vec!["/*".to_string()],
+                write: vec!["/*".to_string()],
+            },
+            mount_point: PathBuf::from("/workspace"),
+            remote_path: String::new(),
+        });
+
+        let first = f
+            .step(ImageGenerateStep {
+                prompt: "a lighthouse at dusk".to_string(),
+                ..Default::default()
+            })
+            .await;
+        let second = f
+            .step(ImageGenerateStep {
+                prompt: "a lighthouse at dawn".to_string(),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(first.sentence, None, "{first:?}");
+        assert_eq!(first.files, vec![generated(existing, "generated/1.png")]);
+        assert_eq!(second.sentence, None, "{second:?}");
+        assert_eq!(second.files, vec![generated(existing, "generated/2.png")]);
+        for n in 1..=2 {
+            assert_eq!(
+                f.read_as_run(existing, &format!("/generated/{n}.png"))
+                    .await,
+                PNG
+            );
+        }
+        let owned: Vec<VolumeId> = f.workflow_volumes().await.iter().map(|v| v.id).collect();
+        assert_eq!(owned, vec![existing], "the volumes the run owns");
+    }
+
+    #[tokio::test]
+    async fn a_step_in_a_run_that_has_ended_answers_so_and_writes_nothing() {
+        let f = fixture(FakeImages::default(), true).await;
+        let mut record = f
+            .workflow_runs
+            .find_by_id_for_tenant(&TenantId::default(), ExecutionId(f.workflow))
+            .await
+            .unwrap()
+            .unwrap();
+        record.status = ExecutionStatus::Completed;
+        f.workflow_runs
+            .save_for_tenant(&TenantId::default(), &record)
+            .await
+            .unwrap();
+
+        let answer = f
+            .step(ImageGenerateStep {
+                prompt: "a cat".to_string(),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(
+            answer,
+            aegis_orchestrator_core::application::tool_invocation_service::ImageGenerateAnswer {
+                files: Vec::new(),
+                sentence: Some("this run has ended".to_string()),
+            }
+        );
+        assert!(
+            f.workflow_volumes().await.is_empty(),
+            "an ended run was made a volume"
+        );
+        assert!(
+            f.images.calls.lock().unwrap().is_empty(),
+            "an ended run's step reached the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_in_a_run_with_an_agent_execution_writes_into_its_volume_as_a_produced_file() {
+        let f = workflow_fixture(FakeImages::default(), true).await;
+        let answer = f
+            .step(ImageGenerateStep {
+                prompt: "a lighthouse at dusk".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(answer.sentence, None, "{answer:?}");
+        assert_eq!(
+            answer.files,
+            vec![generated(f.run_volume, "generated/1.png")]
+        );
+        assert_eq!(
+            f.produced().await,
+            vec![(
+                "/workspace/generated/1.png".to_string(),
+                PNG.len() as u64,
+                "image/png".to_string()
+            )],
+            "the agent execution's produced files"
+        );
+        let owned: Vec<VolumeId> = f.workflow_volumes().await.iter().map(|v| v.id).collect();
+        assert_eq!(
+            owned,
+            vec![f.run_volume],
+            "a run with an agent execution was made a volume of its own"
         );
     }
 }
