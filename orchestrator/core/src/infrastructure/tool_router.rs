@@ -574,6 +574,16 @@ impl ToolRouter {
                 "path": {
                     "type": "string",
                     "description": "Absolute or relative POSIX path of the file to read."
+                },
+                "line_start": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "First line to return, counted from 1. Give line_start, line_end or both to read only those lines (both included); the answer ends with a line naming the range and the file's line count. Omit both to read the whole file."
+                },
+                "line_end": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Last line to return, included. Without line_start the range starts at line 1; without line_end it runs to the file's last line."
                 }
             },
             "required": ["path"]
@@ -3231,6 +3241,31 @@ mod tests {
             missing.is_empty(),
             "these starting tools do not advertise repositories in both forms: {missing:?}"
         );
+    }
+
+    /// `fs.read` declares the line range it honours: one-based, inclusive,
+    /// both optional, with `path` still the only required argument.
+    #[test]
+    fn fs_read_schema_declares_its_one_based_inclusive_line_range() {
+        let schema = ToolRouter::schema_for_builtin("fs.read");
+        assert_eq!(schema["required"], json!(["path"]));
+        for key in ["line_start", "line_end"] {
+            let property = &schema["properties"][key];
+            assert_eq!(
+                property["type"],
+                json!("integer"),
+                "fs.read's schema must declare {key} as an integer, got {schema}"
+            );
+            assert_eq!(property["minimum"], json!(1), "{key} is one-based");
+        }
+        let start = schema["properties"]["line_start"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        let end = schema["properties"]["line_end"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(start.contains("counted from 1"), "line_start: {start}");
+        assert!(end.contains("included"), "line_end: {end}");
     }
 
     #[test]

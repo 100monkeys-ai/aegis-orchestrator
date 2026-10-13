@@ -61,6 +61,85 @@ fn to_volume_relative(mount_point: &Path, path: &str) -> String {
     path.to_string()
 }
 
+/// A one-based line number of an `fs.read` call: absent when the key is
+/// missing or null, refused when it is anything but a whole number of 1 or
+/// more.
+fn line_number_arg(args: &Value, key: &str) -> Result<Option<usize>, SealSessionError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .and_then(|n| usize::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                SealSessionError::InvalidArguments(format!(
+                    "Invalid tool arguments: {key} must be a whole number of 1 or more, counted from the file's first line; got {value}."
+                ))
+            }),
+    }
+}
+
+/// The answer of `fs.read` for the file's bytes `data`. Without `line_start`
+/// and `line_end` it is the whole file. With either, it is the lines from
+/// `line_start` (default 1) to `line_end` (default the last), one-based and
+/// inclusive, followed by a line naming the range and the file's line count,
+/// so that a long file can be read in parts.
+fn read_answer(path_arg: &str, data: &[u8], args: &Value) -> Result<Value, SealSessionError> {
+    let content = String::from_utf8_lossy(data).to_string();
+    let first = line_number_arg(args, "line_start")?;
+    let last = line_number_arg(args, "line_end")?;
+    if first.is_none() && last.is_none() {
+        return Ok(serde_json::json!({
+            "status": "success",
+            "path": path_arg,
+            "content": content,
+            "size_bytes": data.len()
+        }));
+    }
+    let first = first.unwrap_or(1);
+    if let Some(last) = last {
+        if last < first {
+            return Err(SealSessionError::InvalidArguments(format!(
+                "Invalid tool arguments: line_end ({last}) is before line_start ({first})."
+            )));
+        }
+    }
+
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let line_count = lines.len();
+    if first > line_count {
+        return Ok(serde_json::json!({
+            "status": "success",
+            "path": path_arg,
+            "content": format!(
+                "No lines: the range starts at line {first} and {path_arg} has {line_count} lines."
+            ),
+            "line_start": first,
+            "line_end": last.unwrap_or(first),
+            "line_count": line_count,
+            "size_bytes": data.len()
+        }));
+    }
+    let last = last.unwrap_or(line_count).min(line_count);
+    let mut selected: String = lines[first - 1..last].concat();
+    if !selected.ends_with('\n') {
+        selected.push('\n');
+    }
+    selected.push_str(&format!(
+        "Lines {first} to {last} of {line_count} in {path_arg}."
+    ));
+    Ok(serde_json::json!({
+        "status": "success",
+        "path": path_arg,
+        "content": selected,
+        "line_start": first,
+        "line_end": last,
+        "line_count": line_count,
+        "size_bytes": data.len()
+    }))
+}
+
 pub async fn invoke_fs_tool(
     tool_name: &str,
     args: &Value,
@@ -122,13 +201,7 @@ pub async fn invoke_fs_tool(
                 .await
                 .map_err(|e| fsal_refusal("FSAL read error", path_arg, e))?;
 
-            let content = String::from_utf8_lossy(&data).to_string();
-            Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "status": "success",
-                "path": path_arg,
-                "content": content,
-                "size_bytes": data.len()
-            })))
+            read_answer(path_arg, &data, args).map(ToolInvocationResult::Direct)
         }
         "fs.list" => {
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
@@ -525,4 +598,115 @@ async fn invoke_glob(
         "matches": matches,
         "count": matches.len()
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A file of `n` lines, `line 1` to `line n`, each ending in a newline.
+    fn numbered_lines(n: usize) -> String {
+        (1..=n).map(|i| format!("line {i}\n")).collect()
+    }
+
+    #[test]
+    fn fs_read_with_a_range_returns_only_those_lines_and_names_the_range() {
+        let file = numbered_lines(20);
+        let answer = read_answer(
+            "/workspace/notes.txt",
+            file.as_bytes(),
+            &json!({"path": "/workspace/notes.txt", "line_start": 5, "line_end": 8}),
+        )
+        .expect("a range inside the file is read");
+        let content = answer["content"].as_str().unwrap_or_default();
+        assert_eq!(
+            content,
+            "line 5\nline 6\nline 7\nline 8\nLines 5 to 8 of 20 in /workspace/notes.txt.",
+            "fs.read with line_start 5 and line_end 8 must return those four lines and a line naming the range and the file's line count"
+        );
+        assert_eq!(answer["line_start"], json!(5));
+        assert_eq!(answer["line_end"], json!(8));
+        assert_eq!(answer["line_count"], json!(20));
+        assert_eq!(answer["size_bytes"], json!(file.len()));
+    }
+
+    #[test]
+    fn fs_read_without_a_range_returns_the_whole_file_as_before() {
+        let file = numbered_lines(20);
+        let answer = read_answer(
+            "/workspace/notes.txt",
+            file.as_bytes(),
+            &json!({"path": "/workspace/notes.txt"}),
+        )
+        .expect("a whole file is read");
+        assert_eq!(
+            answer,
+            json!({
+                "status": "success",
+                "path": "/workspace/notes.txt",
+                "content": file,
+                "size_bytes": file.len()
+            })
+        );
+    }
+
+    #[test]
+    fn fs_read_range_open_at_one_end_reads_from_the_first_or_to_the_last_line() {
+        let file = numbered_lines(20);
+        let to_end = read_answer("/w/f", file.as_bytes(), &json!({"line_start": 19}))
+            .expect("line_start alone reads to the end");
+        assert_eq!(
+            to_end["content"],
+            json!("line 19\nline 20\nLines 19 to 20 of 20 in /w/f.")
+        );
+        let from_start = read_answer("/w/f", file.as_bytes(), &json!({"line_end": 2}))
+            .expect("line_end alone reads from line 1");
+        assert_eq!(
+            from_start["content"],
+            json!("line 1\nline 2\nLines 1 to 2 of 20 in /w/f.")
+        );
+    }
+
+    #[test]
+    fn fs_read_range_past_the_end_is_cut_at_the_last_line_or_says_the_file_is_shorter() {
+        let file = "a\nb\nc"; // three lines, the last with no newline
+        let cut = read_answer(
+            "/w/f",
+            file.as_bytes(),
+            &json!({"line_start": 2, "line_end": 99}),
+        )
+        .expect("a range running past the end is read to the last line");
+        assert_eq!(cut["content"], json!("b\nc\nLines 2 to 3 of 3 in /w/f."));
+        assert_eq!(cut["line_end"], json!(3));
+        let beyond = read_answer(
+            "/w/f",
+            file.as_bytes(),
+            &json!({"line_start": 10, "line_end": 12}),
+        )
+        .expect("a range after the last line is answered, not refused");
+        assert_eq!(
+            beyond["content"],
+            json!("No lines: the range starts at line 10 and /w/f has 3 lines.")
+        );
+    }
+
+    #[test]
+    fn fs_read_refuses_a_range_that_is_not_one_based_or_runs_backwards() {
+        let file = numbered_lines(5);
+        for args in [
+            json!({"line_start": 0}),
+            json!({"line_end": -1}),
+            json!({"line_start": "2"}),
+            json!({"line_start": 4, "line_end": 2}),
+        ] {
+            assert!(
+                matches!(
+                    read_answer("/w/f", file.as_bytes(), &args),
+                    Err(SealSessionError::InvalidArguments(_))
+                ),
+                "fs.read must refuse {args} as invalid arguments"
+            );
+        }
+    }
 }
